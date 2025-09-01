@@ -1,0 +1,101 @@
+server:
+  http_port: 8080
+  tcp_ports: []
+  api_port: 8081
+  api_enabled: true
+  worker_threads: 4
+  io_uring_queue_depth: 256
+  connection_pool_size: 64
+  buffer_pool_size: 64MB
+http_routes:
+- host: localhost:8080
+  path: /
+  backend:
+    address: 127.0.0.1
+    port: 3001
+    health_check_path: /health
+- host: localhost:8080
+  path: /index.html
+  backends:
+  - address: 127.0.0.1
+    port: 3001
+    health_check_path: /health
+  - address: 127.0.0.1
+    port: 3002
+    health_check_path: /health
+  - address: 127.0.0.1
+    port: 3003
+    health_check_path: /health
+- host: localhost:8080
+  path: /api.json
+  backend:
+    address: 127.0.0.1
+    port: 3001
+    health_check_path: /health
+- host: localhost:8080
+  path: /users.json
+  backend:
+    address: 127.0.0.1
+    port: 3002
+    health_check_path: /health
+- host: localhost:8080
+  path: /dataset.json
+  backend:
+    address: 127.0.0.1
+    port: 3003
+    health_check_path: /health
+- host: localhost:8080
+  path: /health
+  backend:
+    address: 127.0.0.1
+    port: 3001
+    health_check_path: /health
+- host: localhost
+  path: /api.json
+  backend:
+    address: 127.0.0.1
+    port: 3001
+    health_check_path: /health
+- host: localhost
+  path: /users.json
+  backend:
+    address: 127.0.0.1
+    port: 3002
+    health_check_path: /health
+tcp_routes:
+- port: 2222
+  backends:
+  - address: 127.0.0.1
+    port: 22
+    health_check_path: null
+  load_balance_strategy: round_robin
+observability:
+  logging:
+    level: debug
+    format: pretty
+    output: stdout
+  metrics:
+    enabled: true
+    port: 9091
+    path: /metrics
+  health_check:
+    enabled: true
+    interval: 15s
+    timeout: 10s
+    failure_threshold: 5
+    success_threshold: 2
+performance:
+  backend_response_timeout: 30s
+  connection_pool_size: 64
+  max_requests_per_connection: 100
+  standard_buffer_size: 8KB
+  large_buffer_size: 16KB
+  header_buffer_size: 4KB
+  connection_max_age: 5m
+  circuit_breaker_timeout: 15s
+  keep_alive_timeout: 10s
+  circuit_breaker_failure_threshold: 5
+  max_retries: 3
+  tcp_nodelay: true
+  so_reuseport: true
+  cpu_affinity: null

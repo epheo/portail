@@ -1,0 +1,17 @@
+.git/
+target/*
+!target/release/
+target/release/*
+!target/release/portail
+tests/
+certs/
+deploy/
+benches/
+gateway-api-conformance/
+conformance-results.log
+programs/*.o
+*.md
+.containerignore
+.gitignore
+.claude/
+.github/

@@ -1,0 +1,124 @@
+server:
+  http_port: 8080
+  tcp_ports: []
+  api_port: 8081
+  api_enabled: true
+  worker_threads: 8
+  io_uring_queue_depth: 512
+  connection_pool_size: 128
+  buffer_pool_size: 128MB
+http_routes:
+- host: api.microservices.local
+  path: /auth
+  backend:
+    address: auth-service
+    port: 8001
+    health_check_path: /health
+- host: api.microservices.local
+  path: /users
+  backend:
+    address: user-service
+    port: 8002
+    health_check_path: /health
+- host: api.microservices.local
+  path: /orders
+  backend:
+    address: order-service
+    port: 8003
+    health_check_path: /health
+- host: api.microservices.local
+  path: /payments
+  backend:
+    address: payment-service
+    port: 8004
+    health_check_path: /health
+- host: admin.microservices.local
+  path: /
+  backend:
+    address: admin-dashboard
+    port: 3000
+    health_check_path: /status
+tcp_routes:
+- port: 5432
+  backends:
+  - address: postgres-primary
+    port: 5432
+    health_check_path: null
+  - address: postgres-replica-1
+    port: 5432
+    health_check_path: null
+  - address: postgres-replica-2
+    port: 5432
+    health_check_path: null
+  load_balance_strategy: least_connections
+- port: 6379
+  backends:
+  - address: redis-cluster-1
+    port: 6379
+    health_check_path: null
+  - address: redis-cluster-2
+    port: 6379
+    health_check_path: null
+  - address: redis-cluster-3
+    port: 6379
+    health_check_path: null
+  load_balance_strategy: round_robin
+- port: 3306
+  backends:
+  - address: mysql-primary
+    port: 3306
+    health_check_path: null
+  - address: mysql-replica
+    port: 3306
+    health_check_path: null
+  load_balance_strategy: least_connections
+- port: 27017
+  backends:
+  - address: mongodb-shard-1
+    port: 27017
+    health_check_path: null
+  - address: mongodb-shard-2
+    port: 27017
+    health_check_path: null
+  - address: mongodb-shard-3
+    port: 27017
+    health_check_path: null
+  load_balance_strategy: round_robin
+observability:
+  logging:
+    level: info
+    format: json
+    output: stdout
+  metrics:
+    enabled: true
+    port: 9090
+    path: /metrics
+  health_check:
+    enabled: true
+    interval: 15s
+    timeout: 5s
+    failure_threshold: 3
+    success_threshold: 2
+performance:
+  backend_response_timeout: 10s
+  connection_pool_size: 128
+  max_requests_per_connection: 200
+  standard_buffer_size: 8KB
+  large_buffer_size: 16KB
+  header_buffer_size: 4KB
+  connection_max_age: 5m
+  circuit_breaker_timeout: 10s
+  keep_alive_timeout: 5s
+  circuit_breaker_failure_threshold: 5
+  max_retries: 2
+  tcp_nodelay: true
+  so_reuseport: true
+  cpu_affinity:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7

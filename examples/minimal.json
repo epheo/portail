@@ -1,0 +1,59 @@
+{
+  "server": {
+    "http_port": 8080,
+    "tcp_ports": [],
+    "api_port": 8081,
+    "api_enabled": true,
+    "worker_threads": 2,
+    "io_uring_queue_depth": 128,
+    "connection_pool_size": 32,
+    "buffer_pool_size": "32MB"
+  },
+  "http_routes": [
+    {
+      "host": "localhost:8080",
+      "path": "/api.json",
+      "backend": {
+        "address": "127.0.0.1",
+        "port": 3001,
+        "health_check_path": "/health"
+      }
+    }
+  ],
+  "tcp_routes": [],
+  "observability": {
+    "logging": {
+      "level": "info",
+      "format": "pretty",
+      "output": "stdout"
+    },
+    "metrics": {
+      "enabled": false,
+      "port": 9091,
+      "path": "/metrics"
+    },
+    "health_check": {
+      "enabled": true,
+      "interval": "30s",
+      "timeout": "5s",
+      "failure_threshold": 3,
+      "success_threshold": 2
+    }
+  },
+  "performance": {
+    "backend_response_timeout": "5s",
+    "connection_pool_size": 32,
+    "max_requests_per_connection": 50,
+    "standard_buffer_size": "4KB",
+    "large_buffer_size": "8KB",
+    "header_buffer_size": "2KB",
+    "connection_max_age": "1m",
+    "circuit_breaker_timeout": "5s",
+    "keep_alive_timeout": "5s",
+    "circuit_breaker_failure_threshold": 3,
+    "max_retries": 1,
+    "tcp_nodelay": true,
+    "so_reuseport": true,
+    "cpu_affinity": null
+  }
+}

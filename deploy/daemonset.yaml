@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: portail
+  namespace: portail-system
+  labels:
+    app: portail
+spec:
+  selector:
+    matchLabels:
+      app: portail
+  template:
+    metadata:
+      labels:
+        app: portail
+    spec:
+      serviceAccountName: portail-controller
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: portail
+        image: quay.io/epheo/portail:latest
+        imagePullPolicy: Always
+        args: ["--kubernetes"]
+        securityContext:
+          capabilities:
+            add:
+              - NET_BIND_SERVICE
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP

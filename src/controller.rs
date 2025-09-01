@@ -1,0 +1,130 @@
+use anyhow::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use tracing::info;
+
+use crate::routing::RouteTable;
+use crate::config::UringRessConfig;
+
+pub struct MVPGatewayController {
+    // Future: kube_client: Client,
+    pub config_manager: Arc<ConfigManager>,
+    config: Option<UringRessConfig>,
+}
+
+impl MVPGatewayController {
+    pub fn new() -> Result<Self> {
+        let config_manager = Arc::new(ConfigManager::new());
+        
+        Ok(Self {
+            config_manager,
+            config: None,
+        })
+    }
+    
+    pub fn new_with_config(config: UringRessConfig) -> Result<Self> {
+        let config_manager = Arc::new(ConfigManager::new());
+        
+        Ok(Self {
+            config_manager,
+            config: Some(config),
+        })
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        info!("Starting MVP Gateway Controller (Control Plane)");
+        
+        // Future Phase 2: Initialize Gateway API watchers
+        // self.start_gateway_api_watchers().await?;
+        
+        if let Some(ref config) = self.config {
+            // Use file-based configuration
+            self.setup_configured_routes(config).await?;
+            info!("Routes loaded from configuration file");
+        } else {
+            // Start with empty route table - ready for dynamic API configuration
+            let empty_route_table = RouteTable::new();
+            self.config_manager.update_routes(empty_route_table).await?;
+            info!("Started with empty route table - ready for dynamic configuration");
+        }
+        
+        info!("MVP Gateway Controller started");
+        Ok(())
+    }
+
+    
+    async fn setup_configured_routes(&self, config: &UringRessConfig) -> Result<()> {
+        info!("Setting up routes from configuration file");
+        
+        // Convert configuration to route table using zero-overhead conversion
+        let route_table = config.to_route_table()
+            .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
+        
+        // Update the atomic route table
+        self.config_manager.update_routes(route_table).await?;
+        
+        info!("Configured routes loaded: {} HTTP routes, {} TCP routes", 
+              config.http_routes.len(), 
+              config.tcp_routes.len());
+        Ok(())
+    }
+}
+
+pub struct ConfigManager {
+    current_routes: Arc<AtomicPtr<RouteTable>>,
+    // Future: update_channel: broadcast::Sender<ConfigUpdate>,
+    // Future: version: AtomicU64,
+}
+
+impl ConfigManager {
+    pub fn new() -> Self {
+        let empty_route_table = Box::new(RouteTable::new());
+        let current_routes = Arc::new(AtomicPtr::new(Box::into_raw(empty_route_table)));
+        
+        Self {
+            current_routes,
+        }
+    }
+
+    pub async fn update_routes(&self, route_table: RouteTable) -> Result<()> {
+        info!("Updating route configuration");
+        
+        // Atomic route table update
+        let new_table = Box::new(route_table);
+        let old_ptr = self.current_routes.swap(Box::into_raw(new_table), Ordering::AcqRel);
+        
+        // Clean up old table
+        if !old_ptr.is_null() {
+            // SAFETY: old_ptr was returned by a previous swap operation and is guaranteed
+            // to be a valid pointer to a RouteTable that was allocated using Box::into_raw.
+            // The null check ensures we don't double-free.
+            unsafe {
+                let _ = Box::from_raw(old_ptr);
+            }
+        }
+        
+        info!("Route configuration updated atomically");
+        Ok(())
+    }
+
+    pub fn get_routes(&self) -> Arc<AtomicPtr<RouteTable>> {
+        self.current_routes.clone()
+    }
+}
+
+// Future structures for Phase 2
+#[allow(dead_code)]
+pub struct MVPConfig {
+    // gateways: HashMap<String, GatewayConfig>,
+    // http_routes: HashMap<String, HTTPRouteConfig>,
+    // tcp_routes: HashMap<String, TCPRouteConfig>,
+    // backends: HashMap<String, BackendConfig>,
+    // compiled_routes: RouteTable,
+}
+
+#[allow(dead_code)]
+pub enum ConfigUpdate {
+    Routes,
+    Gateways,
+    Backends,
+}

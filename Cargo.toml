@@ -1,0 +1,86 @@
+[package]
+name = "uringress"
+version = "0.1.0"
+edition = "2021"
+authors = ["UringRess Contributors"]
+description = "Ultra-High-Performance Kubernetes Gateway API Controller built for io_uring"
+license = "Apache-2.0"
+repository = "https://github.com/your-org/uringress"
+
+[dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs"] }
+io-uring = "0.6"
+socket2 = "0.5"
+libc = "0.2"
+fnv = "1.0"
+memchr = "2.6"
+bytes = "1.7"
+http = "1.1"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.13"
+hyper = { version = "1.4", features = ["client", "http1", "http2"] }
+hyper-util = "0.1"
+
+# Configuration and CLI dependencies
+serde_yaml = "0.9"
+clap = { version = "4.0", features = ["derive"] }
+tokio-util = "0.7"
+
+# Kubernetes dependencies
+kube = { version = "0.93", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.22", features = ["v1_30"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+num_cpus = "1.16"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+# Profiling dependencies
+flamegraph = "0.6"
+dhat = "0.3"
+pprof = { version = "0.13", features = ["flamegraph", "protobuf-codec"] }
+
+[[bench]]
+name = "routing_bench"
+harness = false
+
+[[bench]]
+name = "parsing_bench"
+harness = false
+
+[[bench]]
+name = "end_to_end_bench"
+harness = false
+
+[[bench]]
+name = "allocation_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Release build optimized for production
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+lto = false  # Disable LTO for better symbol visibility
+
+[profile.bench]
+debug = true
+
+# Profiling-optimized release build  
+[profile.profiling]
+inherits = "release"
+debug = 2          # Full debug info
+strip = false      # Keep all symbols
+lto = false        # Disable link-time optimization for symbol visibility
+opt-level = 3      # Keep high optimization
+codegen-units = 1  # Single codegen unit for better profiling
+overflow-checks = false
