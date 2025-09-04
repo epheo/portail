@@ -41,7 +41,7 @@ impl RouteTable {
         if likely(self.http_routes.contains_key(&host_hash)) {
             let host_entry = unsafe { self.http_routes.get(&host_hash).unwrap_unchecked() };
             
-            // Optimized path matching: use radix tree lookup for common prefixes
+            // Path matching: use radix tree lookup for common prefixes
             let backend = self.find_best_path_match(&host_entry.path_routes, path)
                 .unwrap_or(&host_entry.default_backend);
             
@@ -67,13 +67,13 @@ impl RouteTable {
         Err(anyhow!("No TCP route configured for port {}", server_port))
     }
     
-    /// Optimized path matching using prefix tree concepts
+    /// Path matching using prefix tree concepts
     #[inline(always)]
     fn find_best_path_match<'a>(&self, path_routes: &'a [PathRoute], path: &str) -> Option<&'a BackendPool> {
         let path_bytes = path.as_bytes();
         let mut best_match: Option<(&PathRoute, usize)> = None;
         
-        // Linear search optimized with early termination and SIMD-style matching
+        // Linear search with early termination and SIMD-style matching
         for route in path_routes {
             let prefix_bytes = route.prefix.as_bytes();
             
@@ -82,7 +82,7 @@ impl RouteTable {
                 continue;
             }
             
-            // Use optimized byte comparison for prefix matching
+            // Use byte comparison for prefix matching
             if self.fast_prefix_match(path_bytes, prefix_bytes) {
                 let match_len = prefix_bytes.len();
                 
@@ -96,7 +96,7 @@ impl RouteTable {
         best_match.map(|(route, _)| &route.backend)
     }
     
-    /// Ultra-fast prefix matching using manual loop unrolling
+    /// Prefix matching using manual loop unrolling
     #[inline(always)]
     fn fast_prefix_match(&self, path: &[u8], prefix: &[u8]) -> bool {
         if prefix.is_empty() {
@@ -114,7 +114,7 @@ impl RouteTable {
             3 => path[0] == prefix[0] && path[1] == prefix[1] && path[2] == prefix[2],
             4 => path[0] == prefix[0] && path[1] == prefix[1] && path[2] == prefix[2] && path[3] == prefix[3],
             _ => {
-                // Use SIMD-optimized comparison for longer prefixes
+                // Use SIMD comparison for longer prefixes
                 path[..prefix.len()] == *prefix
             }
         }
@@ -242,16 +242,6 @@ impl BackendPool {
                 let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize % self.backends.len();
                 Ok(&self.backends[index])
             }
-            LoadBalanceStrategy::LeastConnections => {
-                // For now, fallback to round robin
-                // TODO: Implement connection tracking
-                if self.backends.is_empty() {
-                    return Err(anyhow!("No backends available"));
-                }
-                
-                let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize % self.backends.len();
-                Ok(&self.backends[index])
-            }
         }
     }
 }
@@ -259,8 +249,6 @@ impl BackendPool {
 #[derive(Debug, Clone)]
 pub enum LoadBalanceStrategy {
     RoundRobin,
-    #[allow(dead_code)]
-    LeastConnections,
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +291,7 @@ impl Backend {
     
 }
 
-/// Ultra-optimized FNV hash with minimal overhead for sub-100ns performance
+/// FNV hash implementation with minimal overhead for sub-100ns performance
 #[inline(always)]
 pub fn fnv_hash(data: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
@@ -313,7 +301,7 @@ pub fn fnv_hash(data: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     
     // Simple tight loop - let the compiler optimize
-    // This is faster than manual unrolling for small strings (typical hostnames)
+    // Simple loop allows compiler optimization for small strings (typical hostnames)
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);

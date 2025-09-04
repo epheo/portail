@@ -8,18 +8,48 @@ use std::net::SocketAddr;
 use tracing::{info, debug, warn, error};
 
 use crate::routing::{RouteTable, Backend};
-use crate::runtime_config::RuntimeConfig;
+use crate::runtime_config::{RuntimeConfig, self as runtime_config};
+use crate::parser::{ConnectionType, HttpResponseInfo};
 
-/// Simple HTTP request parser state for zero-overhead parsing
+/// Pre-generated HTTP error responses to eliminate allocations in hot paths
+const HTTP_400_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\n400 Bad Request\n";
+const HTTP_404_RESPONSE: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found\n";
+const HTTP_500_RESPONSE: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 25\r\nConnection: close\r\n\r\n500 Internal Server Error\n";
+const HTTP_502_RESPONSE: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway\n";
+const HTTP_503_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable\n";
+
+/// HTTP request parser state for zero-overhead parsing with keep-alive tracking
 #[derive(Debug)]
 pub struct HttpRequestParser {
-    // Empty state struct - parsing is done directly in parse_http_headers_fast()
-    // This exists only to maintain the connection state machine type safety
+    /// Number of requests processed on this connection
+    pub requests_processed: u32,
+    /// Whether keep-alive is enabled for this connection
+    pub keep_alive_enabled: bool,
+    /// Connection preference from last parsed request
+    pub connection_preference: ConnectionType,
 }
 
 impl HttpRequestParser {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            requests_processed: 0,
+            keep_alive_enabled: true, // Default to keep-alive for HTTP/1.1
+            connection_preference: ConnectionType::Default,
+        }
+    }
+    
+    /// Check if connection should be kept alive based on request count and preferences
+    
+    /// Mark a request as processed and update keep-alive state
+    #[inline(always)]
+    pub fn mark_request_processed(&mut self, connection_type: ConnectionType) {
+        self.requests_processed += 1;
+        self.connection_preference = connection_type;
+        
+        // Disable keep-alive if explicitly requested to close
+        if connection_type == ConnectionType::Close {
+            self.keep_alive_enabled = false;
+        }
     }
 }
 
@@ -36,6 +66,10 @@ pub struct UringWorker {
     buffer_ring: BufferRing,
     // Track active TCP connections to prevent double-close
     active_tcp_connections: HashSet<(RawFd, RawFd)>,
+    // HTTP connection pool: backend_addr -> Vec<RawFd>
+    http_connection_pool: HashMap<SocketAddr, Vec<RawFd>>,
+    // Track backend addresses for HTTP connections: backend_fd -> backend_addr
+    http_backend_addresses: HashMap<RawFd, SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -88,6 +122,14 @@ enum ConnectionState {
         buffer_id: u16,
         response_size: usize,
     },
+    /// HTTP connection waiting for next request (keep-alive)
+    HttpWaitingForNextRequest {
+        client_fd: RawFd,
+        backend_fd: RawFd,
+        server_port: u16,
+        parser: HttpRequestParser,
+        buffer_id: u16,
+    },
     /// HTTP request being written to backend
     HttpWritingToBackend {
         client_fd: RawFd,
@@ -103,6 +145,15 @@ enum ConnectionState {
         server_port: u16,
         buffer_id: u16,
         bytes_to_write: usize,
+    },
+    /// HTTP response being written to client with response info for keep-alive decision
+    HttpWritingToClientWithResponseInfo {
+        client_fd: RawFd,
+        backend_fd: RawFd,
+        server_port: u16,
+        buffer_id: u16,
+        bytes_to_write: usize,
+        response_info: HttpResponseInfo,
     },
 }
 
@@ -227,23 +278,7 @@ impl BufferRing {
         }
     }
     
-    /// Get the ring ID for io_uring operations
-    fn ring_id(&self) -> u16 {
-        self.ring_id
-    }
     
-    /// Temporary compatibility method - to be removed
-    fn get_buffer(&mut self) -> Option<Box<[u8]>> {
-        // Temporary stub - return None to fail gracefully during transition
-        warn!("Using deprecated buffer method - buffer ring operations not yet implemented");
-        None
-    }
-    
-    /// Temporary compatibility method - to be removed  
-    fn return_buffer(&mut self, _buffer: Box<[u8]>) {
-        // Temporary stub - do nothing during transition
-        warn!("Using deprecated buffer return method - buffer ring operations not yet implemented");
-    }
 }
 
 impl UringWorker {
@@ -277,6 +312,8 @@ impl UringWorker {
             next_user_data: 1,
             buffer_ring,
             active_tcp_connections: HashSet::new(),
+            http_connection_pool: HashMap::new(),
+            http_backend_addresses: HashMap::new(),
         })
     }
     
@@ -290,12 +327,17 @@ impl UringWorker {
         
         let routes = unsafe { &*routes_ptr };
         
-        // Always listen on HTTP port (8080)
-        self.setup_listener(8080)?;
-        
-        // Listen on all TCP route ports
-        for &port in routes.get_tcp_ports().iter() {
+        // Listen on all configured Gateway listeners
+        let listener_ports: Vec<u16> = self.config.listeners.keys().copied().collect();
+        for port in listener_ports {
             self.setup_listener(port)?;
+        }
+        
+        // Also listen on any additional TCP route ports not covered by Gateway listeners
+        for &port in routes.get_tcp_ports().iter() {
+            if !self.config.listeners.contains_key(&port) {
+                self.setup_listener(port)?;
+            }
         }
         
         info!("Worker {} setup listeners for ports: {:?}", 
@@ -305,7 +347,7 @@ impl UringWorker {
     }
     
     fn setup_listener(&mut self, port: u16) -> Result<()> {
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+        let addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
         
         // Create socket and set SO_REUSEPORT BEFORE binding
         let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
@@ -417,6 +459,16 @@ impl UringWorker {
                         ConnectionState::Listening { .. } => {
                             // Listening socket failures are handled separately
                         }
+                        ConnectionState::HttpWaitingForNextRequest { client_fd, backend_fd, buffer_id, .. } => {
+                            // Keep-alive connection failed, clean up
+                            self.buffer_ring.return_buffer_id(buffer_id);
+                            self.cleanup_http_connection(client_fd, backend_fd);
+                        }
+                        ConnectionState::HttpWritingToClientWithResponseInfo { client_fd, backend_fd, buffer_id, .. } => {
+                            // HTTP write with response info failed, clean up
+                            self.buffer_ring.return_buffer_id(buffer_id);
+                            self.cleanup_http_connection(client_fd, backend_fd);
+                        }
                     }
                 }
                 continue;
@@ -449,10 +501,27 @@ impl UringWorker {
                         self.handle_http_error_response_completion(user_data, result, client_fd, buffer_id, response_size)?;
                     }
                     ConnectionState::HttpWritingToBackend { client_fd, backend_fd, server_port, buffer_id, bytes_to_write } => {
-                        self.handle_http_write_completion(user_data, result, client_fd, backend_fd, buffer_id, bytes_to_write, true)?;
+                        self.handle_http_write_completion(user_data, result, client_fd, backend_fd, server_port, buffer_id, bytes_to_write, true)?;
                     }
                     ConnectionState::HttpWritingToClient { client_fd, backend_fd, server_port, buffer_id, bytes_to_write } => {
-                        self.handle_http_write_completion(user_data, result, client_fd, backend_fd, buffer_id, bytes_to_write, false)?;
+                        self.handle_http_write_completion(user_data, result, client_fd, backend_fd, server_port, buffer_id, bytes_to_write, false)?;
+                    }
+                    ConnectionState::HttpWaitingForNextRequest { client_fd, server_port, parser, backend_fd: _backend_fd, buffer_id } => {
+                        // New HTTP request arrived on keep-alive connection
+                        debug!("Processing keep-alive HTTP request: {} bytes on client_fd={}", result, client_fd);
+                        
+                        if result <= 0 {
+                            debug!("Client closed keep-alive connection");
+                            self.buffer_ring.return_buffer_id(buffer_id);
+                            unsafe { libc::close(client_fd) };
+                        } else {
+                            // Process the HTTP request using the buffer from the read operation
+                            self.handle_http_data(user_data, result, client_fd, server_port, parser, None, buffer_id)?;
+                        }
+                    }
+                    ConnectionState::HttpWritingToClientWithResponseInfo { client_fd, backend_fd, server_port, buffer_id, bytes_to_write, response_info } => {
+                        // HTTP write with response info completed - use keep-alive logic
+                        self.handle_http_write_completion_with_response_info(user_data, result, client_fd, backend_fd, server_port, buffer_id, bytes_to_write, response_info)?;
                     }
                 }
             }
@@ -521,87 +590,27 @@ impl UringWorker {
         
         debug!("Protocol detection read {} bytes on port {}", bytes_read, server_port);
         
-        // TODO: Replace with eBPF-based protocol detection for production
-        // 
-        // Future eBPF Architecture:
-        // ========================
-        // 1. eBPF TC (Traffic Control) hooks will inspect packets at kernel level
-        // 2. Protocol classification happens before userspace receives data:
-        //    - HTTP/1.1: "GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH " + path + " HTTP/"
-        //    - HTTP/2: Connection preface "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"  
-        //    - gRPC: HTTP/2 + Content-Type: application/grpc*
-        //    - TLS: Handshake signature (0x16 0x03 0x01/0x02/0x03)
-        //    - Raw TCP/UDP: Fallback for unrecognized protocols
-        // 3. eBPF map stores routing decisions, eliminating userspace protocol detection
-        // 4. Zero-copy forwarding with kernel-level route table updates
-        // 5. Support for Gateway API multi-protocol listeners on same ports
-        //
-        // Current MVP Implementation:
-        // ===========================
-        // Route-table-first logic with hardcoded HTTP assumption for development
         
-        // Check route table first for explicit TCP routes
-        let routes_ptr = self.routes.load(Ordering::Acquire);
-        if !routes_ptr.is_null() {
-            let routes = unsafe { &*routes_ptr };
-            if routes.has_tcp_route(server_port) {
-                // Explicit TCP route configured - handle as TCP proxy
-                self.start_tcp_forwarding_with_data(client_fd, server_port, buffer_id, bytes_read as usize)?;
-                return Ok(());
+        // Gateway API listener-based protocol detection - single codepath execution
+        match self.config.get_protocol(server_port) {
+            Some(runtime_config::Protocol::HTTP) | Some(runtime_config::Protocol::HTTPS) => {
+                // HTTP/HTTPS listener configured - handle as HTTP proxy
+                self.start_http_processing_with_data(client_fd, server_port, buffer_id, bytes_read as usize)?;
             }
-        }
-        
-        // Hardcoded protocol detection for MVP (will be replaced by eBPF inspection)
-        if server_port == 8080 {
-            // Port 8080 = HTTP
-            self.start_http_processing_with_data(client_fd, server_port, buffer_id, bytes_read as usize)?;
-        } else {
-            // All other ports = TCP
-            self.start_tcp_forwarding_with_data(client_fd, server_port, buffer_id, bytes_read as usize)?;
+            Some(runtime_config::Protocol::TCP) | Some(runtime_config::Protocol::UDP) => {
+                // TCP/UDP listener configured - handle as TCP proxy
+                self.start_tcp_forwarding_with_data(client_fd, server_port, buffer_id, bytes_read as usize)?;
+            }
+            None => {
+                // No listener configured for this port - reject connection
+                error!("No listener configured for port {}", server_port);
+                return Err(anyhow!("No listener configured for port {}", server_port));
+            }
         }
         
         Ok(())
     }
     
-    fn start_http_processing(&mut self, client_fd: RawFd, server_port: u16) -> Result<()> {
-        debug!("Starting HTTP processing for fd={} on port {}", client_fd, server_port);
-        
-        if let Some(buffer_id) = self.buffer_ring.get_buffer_id() {
-            let user_data = self.next_user_data;
-            self.next_user_data += 1;
-            
-            let parser = HttpRequestParser::new();
-            self.connections.insert(user_data, ConnectionState::HttpConnection {
-                client_fd,
-                server_port,
-                parser,
-                backend_fd: None,
-                buffer_id,
-            });
-        
-            // Get buffer ID from stored state
-            let buffer_id = if let Some(ConnectionState::HttpConnection { buffer_id, .. }) = self.connections.get(&user_data) {
-                *buffer_id
-            } else {
-                return Err(anyhow!("Failed to get buffer ID for HTTP connection"));
-            };
-            
-            // Continue reading HTTP request
-            let buffer_ptr = self.buffer_ring.get_buffer_ptr(buffer_id);
-            let buffer_size = self.buffer_ring.buffer_size;
-            let read_op = opcode::ReadFixed::new(types::Fd(client_fd), buffer_ptr, buffer_size, buffer_id)
-                .build()
-                .user_data(user_data);
-            
-            unsafe {
-                if self.ring.submission().push(&read_op).is_err() {
-                    return Err(anyhow!("Failed to submit HTTP read"));
-                }
-            }
-        }
-        
-        Ok(())
-    }
     
     /// Start HTTP processing with initial data already read during protocol detection
     fn start_http_processing_with_data(&mut self, client_fd: RawFd, server_port: u16, buffer_id: u16, data_length: usize) -> Result<()> {
@@ -713,12 +722,16 @@ impl UringWorker {
     }
     
     fn connect_to_backend(&self, backend: &Backend) -> Result<RawFd> {
+        self.connect_to_backend_addr(backend.socket_addr)
+    }
+
+    /// Connect to backend using socket address directly (zero-allocation)
+    fn connect_to_backend_addr(&self, backend_socket_addr: SocketAddr) -> Result<RawFd> {
         let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
-        // Use blocking connect for simplicity in this initial implementation
-        // TODO: Implement proper async connect with io_uring
+        // Use blocking connect for simplicity in this implementation
         socket.set_nonblocking(false)?;
         
-        let addr = socket2::SockAddr::from(backend.socket_addr);
+        let addr = socket2::SockAddr::from(backend_socket_addr);
         
         match socket.connect(&addr) {
             Ok(()) => {
@@ -731,13 +744,93 @@ impl UringWorker {
                     libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
                 }
                 
-                debug!("Successfully connected to backend {} on fd={}", backend.socket_addr, fd);
+                debug!("Successfully connected to backend {} on fd={}", backend_socket_addr, fd);
                 Ok(fd)
             }
             Err(e) => {
-                error!("Failed to connect to backend {}: {}", backend.socket_addr, e);
+                error!("Failed to connect to backend {}: {}", backend_socket_addr, e);
                 Err(anyhow!("Backend connection failed: {}", e))
             }
+        }
+    }
+    
+    /// Get a pooled HTTP connection or create a new one
+    fn get_or_create_http_connection(&mut self, backend: &Backend) -> Result<RawFd> {
+        self.get_or_create_http_connection_to_addr(backend.socket_addr)
+    }
+
+    /// Get or create HTTP connection using socket address directly (zero-allocation)
+    fn get_or_create_http_connection_to_addr(&mut self, backend_socket_addr: SocketAddr) -> Result<RawFd> {
+        // Try to get a connection from the pool first
+        if let Some(pool) = self.http_connection_pool.get_mut(&backend_socket_addr) {
+            if let Some(fd) = pool.pop() {
+                // Verify the connection is still valid by checking if it's writable
+                let mut poll_fd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                };
+                
+                unsafe {
+                    let poll_result = libc::poll(&mut poll_fd, 1, 0);
+                    if poll_result > 0 && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR)) == 0 {
+                        debug!("Reusing pooled HTTP connection to {} on fd={}", backend_socket_addr, fd);
+                        return Ok(fd);
+                    } else {
+                        debug!("Pooled HTTP connection to {} on fd={} is stale, closing", backend_socket_addr, fd);
+                        libc::close(fd);
+                        self.http_backend_addresses.remove(&fd);
+                    }
+                }
+            }
+        }
+        
+        // No valid pooled connection available, create a new one
+        debug!("Creating new HTTP connection to {}", backend_socket_addr);
+        let backend_fd = self.connect_to_backend_addr(backend_socket_addr)?;
+        self.http_backend_addresses.insert(backend_fd, backend_socket_addr);
+        Ok(backend_fd)
+    }
+    
+    /// Return an HTTP connection to the pool for reuse
+    fn return_http_connection_to_pool(&mut self, backend_fd: RawFd) {
+        const MAX_POOLED_CONNECTIONS_PER_BACKEND: usize = 32;
+        
+        if let Some(&backend_addr) = self.http_backend_addresses.get(&backend_fd) {
+            let pool = self.http_connection_pool.entry(backend_addr).or_insert_with(Vec::new);
+            
+            if pool.len() < MAX_POOLED_CONNECTIONS_PER_BACKEND {
+                debug!("Returning HTTP connection to {} (fd={}) to pool", backend_addr, backend_fd);
+                pool.push(backend_fd);
+                return;
+            } else {
+                debug!("HTTP connection pool for {} is full, closing connection fd={}", backend_addr, backend_fd);
+            }
+        } else {
+            debug!("Backend address not found for fd={}, closing connection", backend_fd);
+        }
+        
+        // Connection not pooled, close it
+        unsafe { libc::close(backend_fd); }
+        self.http_backend_addresses.remove(&backend_fd);
+    }
+    
+    /// Close HTTP connection and cleanup tracking
+    fn close_http_connection(&mut self, backend_fd: RawFd) {
+        unsafe { libc::close(backend_fd); }
+        self.http_backend_addresses.remove(&backend_fd);
+    }
+    
+    /// Updated HTTP connection cleanup that supports pooling
+    fn cleanup_http_connection_pooled(&mut self, client_fd: RawFd, backend_fd: RawFd, should_pool: bool) {
+        debug!("Cleaning up HTTP connection: client_fd={}, backend_fd={}, should_pool={}", client_fd, backend_fd, should_pool);
+        
+        unsafe { libc::close(client_fd); }
+        
+        if should_pool {
+            self.return_http_connection_to_pool(backend_fd);
+        } else {
+            self.close_http_connection(backend_fd);
         }
     }
     
@@ -838,7 +931,7 @@ impl UringWorker {
         Ok(())
     }
     
-    fn handle_http_data(&mut self, user_data: u64, bytes_read: i32, client_fd: RawFd, server_port: u16, _parser: HttpRequestParser, backend_fd: Option<RawFd>, buffer_id: u16) -> Result<()> {
+    fn handle_http_data(&mut self, user_data: u64, bytes_read: i32, client_fd: RawFd, server_port: u16, mut parser: HttpRequestParser, backend_fd: Option<RawFd>, buffer_id: u16) -> Result<()> {
         if bytes_read <= 0 {
             debug!("Client closed HTTP connection");
             self.buffer_ring.return_buffer_id(buffer_id);
@@ -857,22 +950,25 @@ impl UringWorker {
         
         // Parse HTTP request using actual buffer content
         match crate::parser::parse_http_headers_fast(request_data) {
-            Ok((method, path, host)) => {
-                debug!("Parsed HTTP request: {} {} Host: {:?}", method, path, host);
+            Ok((method, path, host, connection_type)) => {
+                debug!("Parsed HTTP request: {} {} Host: {:?} Connection: {:?}", method, path, host, connection_type);
                 
                 // Route the HTTP request
                 debug!("Attempting to route HTTP request to host: {:?}, path: {}", host, path);
                 match self.route_http_request(host, path) {
                     Ok(backend) => {
-                        // Clone backend info to avoid borrow checker issues
-                        let backend_clone = backend.clone();
+                        // Extract socket address to avoid borrow checker issues
+                        let backend_socket_addr = backend.socket_addr;
+                        
+                        // Update parser state with connection preference
+                        parser.mark_request_processed(connection_type);
                         
                         if let Some(existing_backend_fd) = backend_fd {
-                            // Already connected to a backend, forward the request
-                            self.forward_http_request_to_backend(user_data, client_fd, existing_backend_fd, server_port, buffer_id, bytes_read as usize)?;
+                            // Already connected to a backend, forward the request  
+                            self.forward_http_request_to_backend(user_data, client_fd, existing_backend_fd, server_port, buffer_id, bytes_read as usize, parser)?;
                         } else {
-                            // Need to connect to backend first
-                            self.connect_and_forward_http_request(user_data, client_fd, server_port, &backend_clone, buffer_id, bytes_read as usize)?;
+                            // Need to connect to backend first - use socket address directly
+                            self.connect_and_forward_http_request_to_addr(user_data, client_fd, server_port, backend_socket_addr, buffer_id, bytes_read as usize, parser)?;
                         }
                     }
                     Err(e) => {
@@ -923,12 +1019,46 @@ impl UringWorker {
         
         debug!("Backend->Client: Forwarding {} bytes", bytes_read);
         
-        // Check if this is an HTTP connection - only port 8080 is HTTP
-        let is_http = server_port == 8080;
+        // Check if this is an HTTP connection - use Gateway API protocol detection
+        let is_http = matches!(self.config.get_protocol(server_port), 
+                              Some(runtime_config::Protocol::HTTP) | Some(runtime_config::Protocol::HTTPS));
+        debug!("handle_tcp_backend_data: server_port={}, is_http={}", server_port, is_http);
         
         if is_http {
-            // HTTP response - use HTTP write (will close connection after write)
-            self.submit_http_write_to_client(client_fd, backend_fd, server_port, buffer_id, bytes_read as usize)?;
+            // HTTP response - parse headers to check for keep-alive support
+            let response_data = self.buffer_ring.get_buffer_content(buffer_id, bytes_read as usize);
+            
+            // Debug: Log the actual response data to understand why parsing is failing
+            let preview_len = std::cmp::min(200, response_data.len());
+            let response_preview = String::from_utf8_lossy(&response_data[..preview_len]);
+            debug!("HTTP response preview ({} bytes total): {:?}", bytes_read, response_preview);
+            
+            match crate::parser::parse_http_response_headers(response_data) {
+                Ok(response_info) => {
+                    debug!("Parsed HTTP response: status={}, connection={:?}, content_length={:?}, complete={}", 
+                           response_info.status_code, response_info.connection_type, 
+                           response_info.content_length, response_info.is_complete);
+                    
+                    // Forward response to client with connection info for keep-alive decision
+                    self.submit_http_write_to_client_with_response_info(client_fd, backend_fd, server_port, buffer_id, bytes_read as usize, response_info)?;
+                }
+                Err(e) => {
+                    warn!("Failed to parse HTTP response headers: {}", e);
+                    debug!("Response content (first {} bytes): {:?}", preview_len, response_preview);
+                    
+                    // Create fallback response info that defaults to closing connection
+                    // This is safer than the old fallback that completely bypassed keep-alive logic
+                    let fallback_response_info = HttpResponseInfo {
+                        status_code: 200, // Assume success if we can't parse
+                        connection_type: ConnectionType::Close, // Close connection on parse failure for safety
+                        content_length: Some(bytes_read as usize), // Use actual response size
+                        is_complete: true, // Assume complete since we have the data
+                    };
+                    
+                    debug!("Using fallback response info with connection close for safety");
+                    self.submit_http_write_to_client_with_response_info(client_fd, backend_fd, server_port, buffer_id, bytes_read as usize, fallback_response_info)?;
+                }
+            }
             // No need to continue reading - HTTP response complete
         } else {
             // TCP traffic - use TCP write (persistent connection)
@@ -1048,18 +1178,20 @@ impl UringWorker {
         Ok(())
     }
     
-    /// Zero-copy write to client using io_uring (HTTP)
-    fn submit_http_write_to_client(&mut self, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, bytes_to_write: usize) -> Result<()> {
+    
+    /// Zero-copy write to client using io_uring (HTTP with response info for keep-alive)
+    fn submit_http_write_to_client_with_response_info(&mut self, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, bytes_to_write: usize, response_info: HttpResponseInfo) -> Result<()> {
         let user_data = self.next_user_data;
         self.next_user_data += 1;
         
-        // Store HTTP write state with buffer ID  
-        self.connections.insert(user_data, ConnectionState::HttpWritingToClient {
+        // Store HTTP write state with response info for keep-alive decision
+        self.connections.insert(user_data, ConnectionState::HttpWritingToClientWithResponseInfo {
             client_fd,
             backend_fd,
             server_port,
             buffer_id,
             bytes_to_write,
+            response_info,
         });
         
         // Get buffer reference for write operation
@@ -1077,15 +1209,15 @@ impl UringWorker {
         
         unsafe {
             if self.ring.submission().push(&write_op).is_err() {
-                return Err(anyhow!("Failed to submit HTTP write to client"));
+                return Err(anyhow!("Failed to submit HTTP write to client with response info"));
             }
         }
         
         Ok(())
     }
     
-    /// Handle completion of io_uring write operations
-    fn handle_tcp_write_completion(&mut self, _user_data: u64, bytes_written: i32, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, expected_bytes: usize, to_backend: bool) -> Result<()> {
+    /// Handle completion of io_uring write operations with proper partial write handling
+    fn handle_tcp_write_completion(&mut self, _user_data: u64, bytes_written: i32, client_fd: RawFd, backend_fd: RawFd, _server_port: u16, buffer_id: u16, expected_bytes: usize, to_backend: bool) -> Result<()> {
         if bytes_written < 0 {
             error!("Write operation failed with error: {}", bytes_written);
             self.buffer_ring.return_buffer_id(buffer_id);
@@ -1093,50 +1225,151 @@ impl UringWorker {
             return Ok(());
         }
         
-        if bytes_written as usize != expected_bytes {
-            warn!("Partial write: {} bytes written, {} expected", bytes_written, expected_bytes);
-            // TODO: Handle partial writes by continuing the write operation
+        let written = bytes_written as usize;
+        if written < expected_bytes {
+            // Partial write - continue writing remaining data
+            warn!("Partial write: {} bytes written, {} expected, continuing write", written, expected_bytes);
+            
+            let remaining_bytes = expected_bytes - written;
+            let user_data = self.next_user_data;
+            self.next_user_data += 1;
+            
+            // Update connection state to continue writing from offset
+            let connection_state = if to_backend {
+                ConnectionState::TcpWritingToBackend {
+                    client_fd,
+                    backend_fd,
+                    server_port: _server_port,
+                    buffer_id,
+                    bytes_to_write: remaining_bytes,
+                }
+            } else {
+                ConnectionState::TcpWritingToClient {
+                    client_fd,
+                    backend_fd,
+                    server_port: _server_port,
+                    buffer_id,
+                    bytes_to_write: remaining_bytes,
+                }
+            };
+            
+            self.connections.insert(user_data, connection_state);
+            
+            // Continue writing from offset
+            let buffer_ptr = self.buffer_ring.get_buffer_ptr(buffer_id);
+            let offset_ptr = unsafe { buffer_ptr.add(written) };
+            let target_fd = if to_backend { backend_fd } else { client_fd };
+            
+            let write_op = opcode::WriteFixed::new(
+                types::Fd(target_fd),
+                offset_ptr,
+                remaining_bytes as u32,
+                buffer_id
+            )
+            .build()
+            .user_data(user_data);
+            
+            unsafe {
+                if self.ring.submission().push(&write_op).is_err() {
+                    error!("Failed to submit continuation write");
+                    self.buffer_ring.return_buffer_id(buffer_id);
+                    self.cleanup_tcp_connection(client_fd, backend_fd);
+                }
+            }
+            
+            return Ok(());
         }
         
         debug!("Write completed: {} bytes {}", 
                bytes_written, 
                if to_backend { "to backend" } else { "to client" });
         
-        // Return buffer to pool after successful write
+        // Return buffer to pool after successful complete write
         self.buffer_ring.return_buffer_id(buffer_id);
         
         Ok(())
     }
     
-    /// Handle completion of HTTP write operations (zero-overhead connection cleanup)
-    fn handle_http_write_completion(&mut self, _user_data: u64, bytes_written: i32, client_fd: RawFd, backend_fd: RawFd, buffer_id: u16, expected_bytes: usize, to_backend: bool) -> Result<()> {
-        // Return buffer to pool
-        self.buffer_ring.return_buffer_id(buffer_id);
-        
+    /// Handle completion of HTTP write operations with proper partial write handling
+    fn handle_http_write_completion(&mut self, _user_data: u64, bytes_written: i32, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, expected_bytes: usize, to_backend: bool) -> Result<()> {
         if bytes_written < 0 {
             error!("HTTP write operation failed with error: {}", bytes_written);
-            // Close both connections on error
+            // Return buffer and close connections on error
+            self.buffer_ring.return_buffer_id(buffer_id);
             self.cleanup_http_connection(client_fd, backend_fd);
             return Ok(());
         }
         
-        if bytes_written as usize != expected_bytes {
-            warn!("Partial HTTP write: {} bytes written, {} expected", bytes_written, expected_bytes);
-            // TODO: Handle partial writes by continuing the write operation
+        let written = bytes_written as usize;
+        if written < expected_bytes {
+            // Partial write - continue writing remaining data
+            warn!("Partial HTTP write: {} bytes written, {} expected, continuing write", written, expected_bytes);
+            
+            let remaining_bytes = expected_bytes - written;
+            let user_data = self.next_user_data;
+            self.next_user_data += 1;
+            
+            // Update connection state to continue writing from offset
+            let connection_state = if to_backend {
+                ConnectionState::HttpWritingToBackend {
+                    client_fd,
+                    backend_fd,
+                    server_port,
+                    buffer_id,
+                    bytes_to_write: remaining_bytes,
+                }
+            } else {
+                ConnectionState::HttpWritingToClient {
+                    client_fd,
+                    backend_fd,
+                    server_port,
+                    buffer_id,
+                    bytes_to_write: remaining_bytes,
+                }
+            };
+            
+            self.connections.insert(user_data, connection_state);
+            
+            // Continue writing from offset
+            let buffer_ptr = self.buffer_ring.get_buffer_ptr(buffer_id);
+            let offset_ptr = unsafe { buffer_ptr.add(written) };
+            let target_fd = if to_backend { backend_fd } else { client_fd };
+            
+            let write_op = opcode::WriteFixed::new(
+                types::Fd(target_fd),
+                offset_ptr,
+                remaining_bytes as u32,
+                buffer_id
+            )
+            .build()
+            .user_data(user_data);
+            
+            unsafe {
+                if self.ring.submission().push(&write_op).is_err() {
+                    error!("Failed to submit HTTP continuation write");
+                    self.buffer_ring.return_buffer_id(buffer_id);
+                    self.cleanup_http_connection(client_fd, backend_fd);
+                }
+            }
+            
+            return Ok(());
         }
         
         debug!("HTTP write completed: {} bytes {}", 
                bytes_written, 
                if to_backend { "to backend" } else { "to client" });
         
+        // Return buffer to pool after successful complete write
+        self.buffer_ring.return_buffer_id(buffer_id);
+        
         if to_backend {
             // HTTP request sent to backend - start reading response
-            if let Err(e) = self.submit_http_backend_read(client_fd, backend_fd, 0) {
+            if let Err(e) = self.submit_http_backend_read(client_fd, backend_fd, server_port) {
                 error!("Failed to start reading HTTP response from backend: {}", e);
                 self.cleanup_http_connection(client_fd, backend_fd);
             }
         } else {
-            // HTTP response sent to client - close connection (zero-overhead)
+            // HTTP response sent to client - close connection (will be replaced by keep-alive logic)
             debug!("HTTP response forwarded to client, closing connection");
             self.cleanup_http_connection(client_fd, backend_fd);
         }
@@ -1144,13 +1377,151 @@ impl UringWorker {
         Ok(())
     }
     
-    /// Clean up HTTP connection (close both client and backend)
-    fn cleanup_http_connection(&mut self, client_fd: RawFd, backend_fd: RawFd) {
-        debug!("Cleaning up HTTP connection: client_fd={}, backend_fd={}", client_fd, backend_fd);
-        unsafe {
-            libc::close(client_fd);
-            libc::close(backend_fd);
+    /// Handle HTTP write completion with response info for keep-alive decision and proper partial write handling
+    fn handle_http_write_completion_with_response_info(&mut self, _user_data: u64, bytes_written: i32, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, expected_bytes: usize, response_info: HttpResponseInfo) -> Result<()> {
+        if bytes_written < 0 {
+            error!("HTTP write operation failed with error: {}", bytes_written);
+            // Return buffer and close connections on error
+            self.buffer_ring.return_buffer_id(buffer_id);
+            self.cleanup_http_connection(client_fd, backend_fd);
+            return Ok(());
         }
+        
+        let written = bytes_written as usize;
+        if written < expected_bytes {
+            // Partial write - continue writing remaining data
+            warn!("Partial HTTP write with response info: {} bytes written, {} expected, continuing write", written, expected_bytes);
+            
+            let remaining_bytes = expected_bytes - written;
+            let user_data = self.next_user_data;
+            self.next_user_data += 1;
+            
+            // Continue writing with same response info for final keep-alive decision
+            self.connections.insert(user_data, ConnectionState::HttpWritingToClientWithResponseInfo {
+                client_fd,
+                backend_fd,
+                server_port,
+                buffer_id,
+                bytes_to_write: remaining_bytes,
+                response_info,
+            });
+            
+            // Continue writing from offset
+            let buffer_ptr = self.buffer_ring.get_buffer_ptr(buffer_id);
+            let offset_ptr = unsafe { buffer_ptr.add(written) };
+            
+            let write_op = opcode::WriteFixed::new(
+                types::Fd(client_fd),
+                offset_ptr,
+                remaining_bytes as u32,
+                buffer_id
+            )
+            .build()
+            .user_data(user_data);
+            
+            unsafe {
+                if self.ring.submission().push(&write_op).is_err() {
+                    error!("Failed to submit HTTP continuation write with response info");
+                    self.buffer_ring.return_buffer_id(buffer_id);
+                    self.cleanup_http_connection(client_fd, backend_fd);
+                }
+            }
+            
+            return Ok(());
+        }
+        
+        debug!("HTTP response with headers sent to client: {} bytes", bytes_written);
+        
+        // Return buffer to pool after successful complete write
+        self.buffer_ring.return_buffer_id(buffer_id);
+        
+        // Key decision point: Check if we should keep client connection alive
+        // This implements client-side keep-alive independent of backend behavior
+        
+        // Keep-alive logic: consider status code and connection headers
+        let should_keep_alive = response_info.connection_type != ConnectionType::Close && 
+                                response_info.status_code < 400;  // Don't keep-alive on client/server errors
+        
+        if should_keep_alive {
+            debug!("Response allows keep-alive - setting up connection for next request");
+            debug!("Response info: status={}, connection={:?}, content_length={:?}", 
+                   response_info.status_code, response_info.connection_type, response_info.content_length);
+            
+            // Close backend connection (HTTP is request/response, not persistent)
+            self.close_http_connection(backend_fd);
+            
+            // Setup keep-alive read for next HTTP request from client
+            if let Err(e) = self.setup_http_keepalive_read(client_fd, server_port) {
+                error!("Failed to setup keep-alive read: {}", e);
+                // If we can't setup keep-alive, close the client connection
+                unsafe { libc::close(client_fd) };
+            }
+        } else {
+            debug!("Response indicates connection should close (status={}, connection={:?})", 
+                   response_info.status_code, response_info.connection_type);
+            // Close both connections
+            self.close_http_connection(backend_fd);
+            unsafe { libc::close(client_fd) };
+        }
+        
+        Ok(())
+    }
+    
+    /// Setup HTTP keep-alive read for next request on the same client connection
+    fn setup_http_keepalive_read(&mut self, client_fd: RawFd, server_port: u16) -> Result<()> {
+        debug!("Setting up keep-alive read for next HTTP request on client_fd={}", client_fd);
+        
+        // Allocate a new buffer for the next request
+        if let Some(buffer_id) = self.buffer_ring.get_buffer_id() {
+            let user_data = self.next_user_data;
+            self.next_user_data += 1;
+            
+            // Create a fresh parser for the next request
+            let parser = HttpRequestParser::new();
+            
+            // Transition to waiting for next request state
+            // Note: backend_fd is set to 0 since we don't have a backend connection yet
+            self.connections.insert(user_data, ConnectionState::HttpWaitingForNextRequest {
+                client_fd,
+                backend_fd: 0, // Will be established when we get the next request
+                server_port,
+                parser,
+                buffer_id,
+            });
+            
+            // Start reading the next HTTP request from client
+            let buffer_ptr = self.buffer_ring.get_buffer_ptr(buffer_id);
+            let buffer_size = self.buffer_ring.buffer_size;
+            
+            let read_op = opcode::ReadFixed::new(types::Fd(client_fd), buffer_ptr, buffer_size, buffer_id)
+                .build()
+                .user_data(user_data);
+            
+            unsafe {
+                if self.ring.submission().push(&read_op).is_err() {
+                    // Failed to submit read, clean up
+                    self.buffer_ring.return_buffer_id(buffer_id);
+                    self.connections.remove(&user_data);
+                    return Err(anyhow!("Failed to submit keep-alive read"));
+                }
+            }
+            
+            debug!("Keep-alive read operation submitted for client_fd={}", client_fd);
+            Ok(())
+        } else {
+            Err(anyhow!("No buffer available for keep-alive read"))
+        }
+    }
+    
+    /// Clean up HTTP connection with intelligent connection pooling decision
+    fn cleanup_http_connection(&mut self, client_fd: RawFd, backend_fd: RawFd) {
+        // Since we don't have response info here, use conservative approach:
+        // Pool backend connections for reuse, but close client connections
+        // This is safe because:
+        // 1. Backend connections can be reused for future requests
+        // 2. Client connections without explicit keep-alive should be closed
+        // 3. Keep-alive decisions are made in handle_http_write_completion_with_response_info
+        self.cleanup_http_connection_pooled(client_fd, backend_fd, true);
     }
     
     /// Submit read operation for HTTP backend response
@@ -1214,9 +1585,13 @@ impl UringWorker {
         debug!("Route table: {} HTTP routes, default backend: {}", routes.http_routes.len(), routes.default_http_backend.is_some());
         
         if let Some(host_str) = host {
-            // Calculate FNV hash of host header
-            let host_hash = crate::routing::fnv_hash(host_str);
-            debug!("Calculated host hash for '{}': {}", host_str, host_hash);
+            // Normalize host header by removing port (Gateway API compliance)
+            let normalized_host = crate::config::normalize_host_header(host_str);
+            debug!("Host header: '{}' → normalized: '{}'", host_str, normalized_host);
+            
+            // Calculate FNV hash of normalized host header
+            let host_hash = crate::routing::fnv_hash(&normalized_host);
+            debug!("Calculated host hash for '{}': {}", normalized_host, host_hash);
             let result = routes.route_http_request(host_hash, path);
             debug!("Route lookup result: {:?}", result.as_ref().map(|_| "Found").map_err(|e| e.to_string()));
             result
@@ -1234,11 +1609,16 @@ impl UringWorker {
     }
     
     /// Connect to backend and forward HTTP request
-    fn connect_and_forward_http_request(&mut self, user_data: u64, client_fd: RawFd, server_port: u16, backend: &Backend, buffer_id: u16, request_size: usize) -> Result<()> {
-        debug!("Connecting to HTTP backend: {}", backend.socket_addr);
+    fn connect_and_forward_http_request(&mut self, user_data: u64, client_fd: RawFd, server_port: u16, backend: &Backend, buffer_id: u16, request_size: usize, parser: HttpRequestParser) -> Result<()> {
+        self.connect_and_forward_http_request_to_addr(user_data, client_fd, server_port, backend.socket_addr, buffer_id, request_size, parser)
+    }
+
+    /// Connect and forward HTTP request to backend using socket address directly (zero-allocation)
+    fn connect_and_forward_http_request_to_addr(&mut self, user_data: u64, client_fd: RawFd, server_port: u16, backend_socket_addr: SocketAddr, buffer_id: u16, request_size: usize, parser: HttpRequestParser) -> Result<()> {
+        debug!("Connecting to HTTP backend: {}", backend_socket_addr);
         
-        // Connect to backend (blocking for now, TODO: async connect)
-        match self.connect_to_backend(backend) {
+        // Connect to backend using connection pool
+        match self.get_or_create_http_connection_to_addr(backend_socket_addr) {
             Ok(backend_fd) => {
                 debug!("Connected to HTTP backend on fd={}", backend_fd);
                 
@@ -1246,12 +1626,12 @@ impl UringWorker {
                 // since they use cleanup_http_connection() instead of cleanup_tcp_connection()
                 
                 // Forward the request to backend
-                self.forward_http_request_to_backend(user_data, client_fd, backend_fd, server_port, buffer_id, request_size)?;
+                self.forward_http_request_to_backend(user_data, client_fd, backend_fd, server_port, buffer_id, request_size, parser)?;
                 
                 // Note: HTTP write completion handler will start reading response from backend
             }
             Err(e) => {
-                error!("Failed to connect to HTTP backend {}: {}", backend.socket_addr, e);
+                error!("Failed to connect to HTTP backend {}: {}", backend_socket_addr, e);
                 self.send_http_error_response(client_fd, 502, "Bad Gateway")?;
                 self.buffer_ring.return_buffer_id(buffer_id);
                 unsafe { libc::close(client_fd) };
@@ -1262,7 +1642,7 @@ impl UringWorker {
     }
     
     /// Forward HTTP request to backend using zero-copy write
-    fn forward_http_request_to_backend(&mut self, _user_data: u64, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, request_size: usize) -> Result<()> {
+    fn forward_http_request_to_backend(&mut self, _user_data: u64, client_fd: RawFd, backend_fd: RawFd, server_port: u16, buffer_id: u16, request_size: usize, _parser: HttpRequestParser) -> Result<()> {
         debug!("Forwarding HTTP request to backend: {} bytes", request_size);
         
         // Submit HTTP-specific zero-copy write to backend (will close connection after response)
@@ -1274,17 +1654,24 @@ impl UringWorker {
     }
     
     /// Send HTTP error response to client
-    fn send_http_error_response(&mut self, client_fd: RawFd, status_code: u16, status_text: &str) -> Result<()> {
-        let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{} {}\n",
-            status_code, status_text, status_text.len() + status_code.to_string().len() + 2, status_code, status_text
-        );
+    fn send_http_error_response(&mut self, client_fd: RawFd, status_code: u16, _status_text: &str) -> Result<()> {
+        let response_bytes = match status_code {
+            400 => HTTP_400_RESPONSE,
+            404 => HTTP_404_RESPONSE,
+            500 => HTTP_500_RESPONSE,
+            502 => HTTP_502_RESPONSE,
+            503 => HTTP_503_RESPONSE,
+            _ => {
+                // For uncommon status codes, fall back to minimal allocation
+                warn!("Using fallback error response for status code: {}", status_code);
+                HTTP_500_RESPONSE // Default to 500 for unknown codes
+            }
+        };
         
-        debug!("Sending HTTP error response: {} {}", status_code, status_text);
+        debug!("Sending HTTP error response: {}", status_code);
         
         // Get buffer for error response
         if let Some(buffer_id) = self.buffer_ring.get_buffer_id() {
-            let response_bytes = response.as_bytes();
             
             if response_bytes.len() <= self.buffer_ring.buffer_size as usize {
                 // Write response content to fixed buffer

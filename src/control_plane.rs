@@ -12,8 +12,6 @@ use crate::config::UringRessConfig;
 pub struct ControlPlane {
     pub config_manager: Arc<ConfigManager>,
     config: Option<UringRessConfig>,
-    api_port: Option<u16>,
-    api_disabled: bool,
 }
 
 impl ControlPlane {
@@ -23,19 +21,15 @@ impl ControlPlane {
         Ok(Self {
             config_manager,
             config: None,
-            api_port: None,
-            api_disabled: true,
         })
     }
     
-    pub fn new_with_config(config: UringRessConfig, api_port: Option<u16>, api_disabled: bool) -> Result<Self> {
+    pub fn new_with_config(config: UringRessConfig) -> Result<Self> {
         let config_manager = Arc::new(ConfigManager::new());
         
         Ok(Self {
             config_manager,
             config: Some(config),
-            api_port,
-            api_disabled,
         })
     }
 
@@ -55,15 +49,6 @@ impl ControlPlane {
             info!("Started with empty route table - ready for dynamic configuration");
         }
         
-        // TODO: Start API server if enabled
-        if !self.api_disabled {
-            if let Some(port) = self.api_port {
-                info!("API server would start on port {} (not implemented yet)", port);
-            }
-        }
-        
-        // TODO: Future Gateway API integration
-        // self.start_gateway_api_watchers().await?;
         
         info!("Control Plane started successfully");
         Ok(())
@@ -140,18 +125,3 @@ impl ConfigManager {
     }
 }
 
-// Future structures for Gateway API integration
-#[allow(dead_code)]
-pub struct GatewayApiController {
-    // kube_client: Client,
-    // gateway_watcher: Watcher<Gateway>,
-    // http_route_watcher: Watcher<HTTPRoute>,
-    // tcp_route_watcher: Watcher<TCPRoute>,
-}
-
-#[allow(dead_code)]
-pub enum ConfigUpdate {
-    Routes,
-    Gateways,
-    Backends,
-}

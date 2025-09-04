@@ -1,6 +1,5 @@
 use anyhow::Result;
 use tracing::{info, error};
-use std::time::Duration;
 
 mod routing;
 mod parser;
@@ -42,7 +41,7 @@ fn main() -> Result<()> {
         info!("Loading configuration from file: {:?}", config_path);
         
         // Convert to runtime config - zero overhead after startup
-        let runtime_config = uringress_config.performance.to_runtime_config();
+        let runtime_config = uringress_config.performance.to_runtime_config(&uringress_config.gateway);
         info!("Configuration loaded successfully from file");
         
         (runtime_config, Some(uringress_config))
@@ -74,7 +73,7 @@ fn main() -> Result<()> {
     
     // Extract to compile-time equivalent constants - NO function calls
     let num_workers: usize = if let Some(ref config) = use_file_routes {
-        config.server.worker_threads
+        config.gateway.worker_threads
     } else {
         args.workers.unwrap_or_else(|| {
             std::env::var("WORKER_THREADS")
@@ -86,25 +85,6 @@ fn main() -> Result<()> {
     
     // Verbose level already used for early logging initialization
     
-    // Extract API server configuration - zero overhead
-    let api_port: Option<u16> = if let Some(ref config) = use_file_routes {
-        Some(config.server.api_port)
-    } else {
-        args.api_port.or_else(|| {
-            std::env::var("API_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-    };
-    
-    let api_disabled: bool = if let Some(ref config) = use_file_routes {
-        !config.server.api_enabled
-    } else {
-        args.no_api || 
-            std::env::var("DISABLE_API")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false)
-    };
     
     // Runtime config already loaded above from file or environment
     // Logging already initialized early in main()
@@ -127,7 +107,7 @@ fn main() -> Result<()> {
             
             // Create control plane
             let control_plane = if let Some(config) = use_file_routes {
-                ControlPlane::new_with_config(config, api_port, api_disabled)?
+                ControlPlane::new_with_config(config)?
             } else {
                 ControlPlane::new()?
             };
@@ -240,10 +220,10 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
                 println!("Configuration Summary:");
                 println!("  HTTP Routes: {}", config.http_routes.len());
                 println!("  TCP Routes: {}", config.tcp_routes.len());
-                println!("  Worker Threads: {}", config.server.worker_threads);
-                println!("  HTTP Port: {}", config.server.http_port);
+                println!("  Worker Threads: {}", config.gateway.worker_threads);
+                println!("  HTTP Listeners: {:?}", config.gateway.listeners.iter().filter(|l| matches!(l.protocol, config::Protocol::HTTP | config::Protocol::HTTPS)).map(|l| l.port).collect::<Vec<_>>());
                 
-                println!("  API Port: {}", config.server.api_port);
+                println!("  API Port: {}", config.gateway.api_port);
                 
                 info!("Configuration check completed");
             }
@@ -420,7 +400,7 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
     // Determine output format and content
     let (output_content, format_name) = if let Some(output_path) = &args.output {
         // Auto-detect format from file extension
-        let (output_content, format_name) = match output_path.extension().and_then(|ext| ext.to_str()) {
+        let (output_content, _format_name) = match output_path.extension().and_then(|ext| ext.to_str()) {
             Some("json") => {
                 let content = config.to_json_pretty()
                     .map_err(|e| anyhow::anyhow!("Failed to serialize config to JSON: {}", e))?;
@@ -465,48 +445,22 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
 
 /// Load runtime config from environment variables (fallback mode)
 fn load_runtime_config_from_env() -> RuntimeConfig {
-    let connection_pool_size: usize = std::env::var("CONNECTION_POOL_SIZE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-    let max_requests_per_connection: u32 = std::env::var("MAX_REQUESTS_PER_CONNECTION")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    use std::collections::HashMap;
+    use runtime_config::{ListenerInfo, Protocol};
+    
+    let http_port: u16 = std::env::var("HTTP_PORT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
     let standard_buffer_size: usize = std::env::var("STANDARD_BUFFER_SIZE")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
-    let large_buffer_size: usize = std::env::var("LARGE_BUFFER_SIZE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(16384);
-    let header_buffer_size: usize = std::env::var("HEADER_BUFFER_SIZE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let connection_max_age = Duration::from_secs(
-        std::env::var("CONNECTION_MAX_AGE_SECS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(120)
-    );
-    let backend_response_timeout = Duration::from_secs(
-        std::env::var("BACKEND_RESPONSE_TIMEOUT_SECS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(10)
-    );
-    let circuit_breaker_timeout = Duration::from_secs(
-        std::env::var("CIRCUIT_BREAKER_TIMEOUT_SECS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(10)
-    );
-    let keep_alive_timeout = Duration::from_secs(
-        std::env::var("KEEP_ALIVE_TIMEOUT_SECS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(5)
-    );
-    let circuit_breaker_failure_threshold: u32 = std::env::var("CIRCUIT_BREAKER_FAILURE_THRESHOLD")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let max_retries: u32 = std::env::var("MAX_RETRIES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    
+    // Create default HTTP listener for environment variable mode
+    let mut listeners = HashMap::new();
+    listeners.insert(http_port, ListenerInfo {
+        protocol: Protocol::HTTP,
+    });
     
     RuntimeConfig::new(
-        connection_pool_size,
-        max_requests_per_connection,
+        listeners,
         standard_buffer_size,
-        large_buffer_size,
-        header_buffer_size,
-        connection_max_age,
-        backend_response_timeout,
-        circuit_breaker_timeout,
-        keep_alive_timeout,
-        circuit_breaker_failure_threshold,
-        max_retries,
     )
 }

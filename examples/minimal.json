@@ -1,23 +1,50 @@
 {
-  "server": {
-    "http_port": 8080,
-    "tcp_ports": [],
+  "gateway": {
+    "name": "minimal-gateway",
+    "listeners": [
+      {
+        "name": "http",
+        "protocol": "HTTP",
+        "port": 8080
+      }
+    ],
+    "worker_threads": 2,
     "api_port": 8081,
     "api_enabled": true,
-    "worker_threads": 2,
     "io_uring_queue_depth": 128,
     "connection_pool_size": 32,
     "buffer_pool_size": "32MB"
   },
   "http_routes": [
     {
-      "host": "localhost:8080",
-      "path": "/api.json",
-      "backend": {
-        "address": "127.0.0.1",
-        "port": 3001,
-        "health_check_path": "/health"
-      }
+      "parent_refs": [
+        {
+          "name": "minimal-gateway",
+          "section_name": "http"
+        }
+      ],
+      "hostnames": [
+        "localhost"
+      ],
+      "rules": [
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/api.json"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "api-service",
+              "port": 3001,
+              "weight": 1
+            }
+          ]
+        }
+      ]
     }
   ],
   "tcp_routes": [],

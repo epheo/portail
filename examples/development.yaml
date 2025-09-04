@@ -1,74 +1,118 @@
-server:
-  http_port: 8080
-  tcp_ports: []
+gateway:
+  name: development-gateway
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 8080
+  - name: tcp-ssh
+    protocol: TCP
+    port: 2222
+  worker_threads: 4
   api_port: 8081
   api_enabled: true
-  worker_threads: 4
   io_uring_queue_depth: 256
   connection_pool_size: 64
   buffer_pool_size: 64MB
 http_routes:
-- host: localhost:8080
-  path: /
-  backend:
-    address: 127.0.0.1
-    port: 3001
-    health_check_path: /health
-- host: localhost:8080
-  path: /index.html
-  backends:
-  - address: 127.0.0.1
-    port: 3001
-    health_check_path: /health
-  - address: 127.0.0.1
-    port: 3002
-    health_check_path: /health
-  - address: 127.0.0.1
-    port: 3003
-    health_check_path: /health
-- host: localhost:8080
-  path: /api.json
-  backend:
-    address: 127.0.0.1
-    port: 3001
-    health_check_path: /health
-- host: localhost:8080
-  path: /users.json
-  backend:
-    address: 127.0.0.1
-    port: 3002
-    health_check_path: /health
-- host: localhost:8080
-  path: /dataset.json
-  backend:
-    address: 127.0.0.1
-    port: 3003
-    health_check_path: /health
-- host: localhost:8080
-  path: /health
-  backend:
-    address: 127.0.0.1
-    port: 3001
-    health_check_path: /health
-- host: localhost
-  path: /api.json
-  backend:
-    address: 127.0.0.1
-    port: 3001
-    health_check_path: /health
-- host: localhost
-  path: /users.json
-  backend:
-    address: 127.0.0.1
-    port: 3002
-    health_check_path: /health
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backend_refs:
+    - name: frontend-service
+      port: 3001
+      weight: 1
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /index.html
+    backend_refs:
+    - name: frontend-service-1
+      port: 3001
+      weight: 1
+    - name: frontend-service-2
+      port: 3002
+      weight: 1
+    - name: frontend-service-3
+      port: 3003
+      weight: 1
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api.json
+    backend_refs:
+    - name: api-service
+      port: 3001
+      weight: 1
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /users.json
+    backend_refs:
+    - name: users-service
+      port: 3002
+      weight: 1
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /dataset.json
+    backend_refs:
+    - name: dataset-service
+      port: 3003
+      weight: 1
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /health
+    backend_refs:
+    - name: api-service
+      port: 3001
+      weight: 1
 tcp_routes:
-- port: 2222
-  backends:
-  - address: 127.0.0.1
-    port: 22
-    health_check_path: null
-  load_balance_strategy: round_robin
+- parent_refs:
+  - name: development-gateway
+    section_name: tcp-ssh
+  rules:
+  - backend_refs:
+    - name: ssh-service
+      port: 22
+      weight: 1
 observability:
   logging:
     level: debug

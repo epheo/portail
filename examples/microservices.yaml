@@ -1,89 +1,140 @@
-server:
-  http_port: 8080
-  tcp_ports: []
+gateway:
+  name: microservices-gateway
+  listeners:
+  - name: http-8080
+    protocol: HTTP
+    port: 8080
+  - name: tcp-5432
+    protocol: TCP
+    port: 5432
+  - name: tcp-6379
+    protocol: TCP
+    port: 6379
+  - name: tcp-3306
+    protocol: TCP
+    port: 3306
+  - name: tcp-27017
+    protocol: TCP
+    port: 27017
+  worker_threads: 8
   api_port: 8081
   api_enabled: true
-  worker_threads: 8
   io_uring_queue_depth: 512
   connection_pool_size: 128
   buffer_pool_size: 128MB
 http_routes:
-- host: api.microservices.local
-  path: /auth
-  backend:
-    address: auth-service
-    port: 8001
-    health_check_path: /health
-- host: api.microservices.local
-  path: /users
-  backend:
-    address: user-service
-    port: 8002
-    health_check_path: /health
-- host: api.microservices.local
-  path: /orders
-  backend:
-    address: order-service
-    port: 8003
-    health_check_path: /health
-- host: api.microservices.local
-  path: /payments
-  backend:
-    address: payment-service
-    port: 8004
-    health_check_path: /health
-- host: admin.microservices.local
-  path: /
-  backend:
-    address: admin-dashboard
-    port: 3000
-    health_check_path: /status
+- parent_refs:
+  - name: microservices-gateway
+    section_name: http-8080
+    port: 8080
+  hostnames:
+  - api.microservices.local
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /auth
+    backend_refs:
+    - name: auth-service
+      port: 8001
+      weight: 100
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /users
+    backend_refs:
+    - name: user-service
+      port: 8002
+      weight: 100
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /orders
+    backend_refs:
+    - name: order-service
+      port: 8003
+      weight: 100
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /payments
+    backend_refs:
+    - name: payment-service
+      port: 8004
+      weight: 100
+- parent_refs:
+  - name: microservices-gateway
+    section_name: http-8080
+    port: 8080
+  hostnames:
+  - admin.microservices.local
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backend_refs:
+    - name: admin-dashboard
+      port: 3000
+      weight: 100
 tcp_routes:
-- port: 5432
-  backends:
-  - address: postgres-primary
+- parent_refs:
+  - name: microservices-gateway
+    section_name: tcp-5432
     port: 5432
-    health_check_path: null
-  - address: postgres-replica-1
-    port: 5432
-    health_check_path: null
-  - address: postgres-replica-2
-    port: 5432
-    health_check_path: null
-  load_balance_strategy: least_connections
-- port: 6379
-  backends:
-  - address: redis-cluster-1
+  rules:
+  - backend_refs:
+    - name: postgres-primary
+      port: 5432
+      weight: 50
+    - name: postgres-replica-1
+      port: 5432
+      weight: 25
+    - name: postgres-replica-2
+      port: 5432
+      weight: 25
+- parent_refs:
+  - name: microservices-gateway
+    section_name: tcp-6379
     port: 6379
-    health_check_path: null
-  - address: redis-cluster-2
-    port: 6379
-    health_check_path: null
-  - address: redis-cluster-3
-    port: 6379
-    health_check_path: null
-  load_balance_strategy: round_robin
-- port: 3306
-  backends:
-  - address: mysql-primary
+  rules:
+  - backend_refs:
+    - name: redis-cluster-1
+      port: 6379
+      weight: 33
+    - name: redis-cluster-2
+      port: 6379
+      weight: 33
+    - name: redis-cluster-3
+      port: 6379
+      weight: 34
+- parent_refs:
+  - name: microservices-gateway
+    section_name: tcp-3306
     port: 3306
-    health_check_path: null
-  - address: mysql-replica
-    port: 3306
-    health_check_path: null
-  load_balance_strategy: least_connections
-- port: 27017
-  backends:
-  - address: mongodb-shard-1
+  rules:
+  - backend_refs:
+    - name: mysql-primary
+      port: 3306
+      weight: 70
+    - name: mysql-replica
+      port: 3306
+      weight: 30
+- parent_refs:
+  - name: microservices-gateway
+    section_name: tcp-27017
     port: 27017
-    health_check_path: null
-  - address: mongodb-shard-2
-    port: 27017
-    health_check_path: null
-  - address: mongodb-shard-3
-    port: 27017
-    health_check_path: null
-  load_balance_strategy: round_robin
+  rules:
+  - backend_refs:
+    - name: mongodb-shard-1
+      port: 27017
+      weight: 33
+    - name: mongodb-shard-2
+      port: 27017
+      weight: 33
+    - name: mongodb-shard-3
+      port: 27017
+      weight: 34
 observability:
   logging:
     level: info

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "uringress")]
-#[command(about = "Ultra-High-Performance Kubernetes Gateway API Controller")]
-#[command(long_about = "UringRess is an ultra-high-performance Kubernetes Gateway API Controller built exclusively for io_uring-enabled Linux environments. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.")]
+#[command(about = "High-Performance Kubernetes Gateway API Controller")]
+#[command(long_about = "UringRess is a high-performance Kubernetes Gateway API Controller built exclusively for io_uring-enabled Linux environments. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.")]
 pub struct Args {
     /// Configuration file path (JSON or YAML format)
     #[arg(short, long, value_name = "FILE")]

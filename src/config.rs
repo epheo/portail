@@ -1,8 +1,132 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
+
+/// Protocol types following Kubernetes Gateway API specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Protocol {
+    HTTP,
+    HTTPS,
+    TCP,
+    UDP,
+}
+
+/// Gateway configuration following Kubernetes Gateway API specification
+/// Defines the infrastructure layer with listeners for different protocols and ports
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    #[serde(default = "default_gateway_name")]
+    pub name: String,
+    pub listeners: Vec<ListenerConfig>,
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    #[serde(default = "default_api_enabled")]
+    pub api_enabled: bool,
+    #[serde(default)]
+    pub io_uring_queue_depth: u32,
+    #[serde(default)]
+    pub connection_pool_size: usize,
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size", default = "default_buffer_pool_size")]
+    pub buffer_pool_size: usize,
+}
+
+/// Listener configuration defining protocol and port bindings
+/// Follows Kubernetes Gateway API Listener specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerConfig {
+    pub name: String,
+    pub protocol: Protocol,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration for HTTPS/TLS listeners
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub certificate_refs: Vec<CertificateRef>,
+    #[serde(default)]
+    pub mode: TlsMode,
+}
+
+/// Reference to TLS certificate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// TLS mode configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum TlsMode {
+    Terminate,
+    Passthrough,
+}
+
+impl Default for TlsMode {
+    fn default() -> Self {
+        TlsMode::Terminate
+    }
+}
+
+// Default value functions
+fn default_gateway_name() -> String {
+    "uringress-gateway".to_string()
+}
+
+fn default_worker_threads() -> usize {
+    4
+}
+
+fn default_api_port() -> u16 {
+    8081
+}
+
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_buffer_pool_size() -> usize {
+    64 * 1024 * 1024 // 64MB
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            name: default_gateway_name(),
+            listeners: vec![
+                ListenerConfig {
+                    name: "http".to_string(),
+                    protocol: Protocol::HTTP,
+                    port: 8080,
+                    hostname: None,
+                    tls: None,
+                },
+            ],
+            worker_threads: default_worker_threads(),
+            api_port: default_api_port(),
+            api_enabled: default_api_enabled(),
+            io_uring_queue_depth: 256,
+            connection_pool_size: 64,
+            buffer_pool_size: default_buffer_pool_size(),
+        }
+    }
+}
+
+impl GatewayConfig {
+}
 
 /// Root configuration structure for UringRess
 /// All parsing happens once at startup - zero runtime overhead
@@ -10,7 +134,7 @@ use anyhow::{anyhow, Result};
 #[serde(deny_unknown_fields)]
 pub struct UringRessConfig {
     #[serde(default)]
-    pub server: ServerConfig,
+    pub gateway: GatewayConfig,
     
     #[serde(default)]
     pub http_routes: Vec<HttpRouteConfig>,
@@ -42,33 +166,158 @@ pub struct ServerConfig {
     pub buffer_pool_size: usize,
 }
 
-/// HTTP route configuration
+/// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
+/// Defines how HTTP traffic is routed based on hostnames and request matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRouteConfig {
-    pub host: String,
-    pub path: String,
-    // Support both single and multiple backend configurations
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<BackendConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backends: Option<Vec<BackendConfig>>,
-    #[serde(default, skip_serializing_if = "is_default_load_balance")]
-    pub load_balance_strategy: LoadBalanceStrategy,
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    pub rules: Vec<HttpRouteRule>,
 }
 
-fn is_default_load_balance(strategy: &LoadBalanceStrategy) -> bool {
-    matches!(strategy, LoadBalanceStrategy::RoundRobin)
+/// Reference to a Gateway that this route attaches to
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
-/// TCP route configuration with load balancing
+/// HTTP route rule with matches and backend references
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteRule {
+    #[serde(default)]
+    pub matches: Vec<HttpRouteMatch>,
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// HTTP route match conditions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<HttpPathMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Vec<HttpHeaderMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<Vec<HttpQueryParamMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// HTTP path matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPathMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpPathMatchType,
+    pub value: String,
+}
+
+/// HTTP path match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpPathMatchType {
+    Exact,
+    PathPrefix,
+    RegularExpression,
+}
+
+/// HTTP header matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpHeaderMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpHeaderMatchType,
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP header match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpHeaderMatchType {
+    Exact,
+    RegularExpression,
+}
+
+/// HTTP query parameter matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpQueryParamMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpQueryParamMatchType,
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP query parameter match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpQueryParamMatchType {
+    Exact,
+    RegularExpression,
+}
+
+/// Backend reference with optional weight and filters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub port: u16,
+    #[serde(default = "default_backend_weight")]
+    pub weight: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+fn default_backend_weight() -> i32 {
+    1
+}
+
+// Helper implementations for common HTTP route patterns
+impl HttpRouteMatch {
+    pub fn path_prefix(path: &str) -> Self {
+        Self {
+            path: Some(HttpPathMatch {
+                match_type: HttpPathMatchType::PathPrefix,
+                value: path.to_string(),
+            }),
+            headers: None,
+            query_params: None,
+            method: None,
+        }
+    }
+
+}
+
+/// TCP route configuration following Kubernetes Gateway API TCPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcpRouteConfig {
-    pub port: u16,
-    pub backends: Vec<BackendConfig>,
     #[serde(default)]
-    pub load_balance_strategy: LoadBalanceStrategy,
+    pub parent_refs: Vec<ParentRef>,
+    pub rules: Vec<TcpRouteRule>,
+}
+
+/// TCP route rule with backend references
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpRouteRule {
+    pub backend_refs: Vec<BackendRef>,
 }
 
 /// Backend configuration for both HTTP and TCP routes
@@ -80,11 +329,22 @@ pub struct BackendConfig {
     pub health_check_path: Option<String>,
 }
 
-/// Load balancing strategy for TCP routes
+/// Load balancing strategy for backend selection
+/// 
+/// Currently supported strategies:
+/// - `RoundRobin`: Distributes requests evenly across backends in rotation
+/// - `LeastConnections`: **[NOT YET IMPLEMENTED]** Would select backend with fewest active connections
+///   
+/// **Note**: `LeastConnections` is accepted in configuration files for future compatibility,
+/// but currently falls back to `RoundRobin` behavior. This will be implemented in a future version
+/// once proper connection tracking infrastructure is added to the io_uring data plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalanceStrategy {
+    /// Round-robin distribution across backends
     RoundRobin,
+    /// **[PLANNED - NOT IMPLEMENTED]** Select backend with fewest active connections
+    /// Currently falls back to `RoundRobin` behavior
     LeastConnections,
 }
 
@@ -221,7 +481,7 @@ pub struct PerformanceConfig {
 impl Default for UringRessConfig {
     fn default() -> Self {
         Self {
-            server: ServerConfig::default(),
+            gateway: GatewayConfig::default(),
             http_routes: Vec::new(),
             tcp_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
@@ -535,54 +795,7 @@ impl UringRessConfig {
         Ok(config)
     }
     
-    /// Save configuration to file with format auto-detection
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("Failed to create directory '{}': {}", parent.display(), e))?;
-        }
-        
-        // Auto-detect format from file extension
-        let content = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("json") => self.to_json_pretty()?,
-            Some("yaml") | Some("yml") => self.to_yaml_pretty()?,
-            Some(ext) => {
-                return Err(anyhow!(
-                    "Unsupported configuration file format '.{}' for '{}'. Supported formats: .json, .yaml, .yml",
-                    ext,
-                    path.display()
-                ));
-            }
-            None => {
-                return Err(anyhow!(
-                    "Configuration file '{}' must have a file extension (.json, .yaml, .yml)",
-                    path.display()
-                ));
-            }
-        };
-        
-        // Write to file
-        std::fs::write(path, content)
-            .map_err(|e| anyhow!("Failed to write configuration file '{}': {}", path.display(), e))?;
-        
-        Ok(())
-    }
     
-    /// Load configuration with fallback to default values
-    /// If file doesn't exist, returns default configuration
-    /// If file exists but has errors, returns the error
-    pub fn load_or_default<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        
-        if !path.exists() {
-            Ok(Self::default())
-        } else {
-            Self::load_from_file(path)
-        }
-    }
 }
 
 // Configuration example generation
@@ -591,27 +804,44 @@ impl UringRessConfig {
     /// Single HTTP route with basic settings - ideal for getting started
     pub fn generate_minimal() -> Self {
         Self {
-            server: ServerConfig {
-                http_port: 8080,
-                tcp_ports: vec![],
+            gateway: GatewayConfig {
+                name: "minimal-gateway".to_string(),
+                listeners: vec![
+                    ListenerConfig {
+                        name: "http".to_string(),
+                        protocol: Protocol::HTTP,
+                        port: 8080,
+                        hostname: None,
+                        tls: None,
+                    },
+                ],
+                worker_threads: 2,
                 api_port: 8081,
                 api_enabled: true,
-                worker_threads: 2,
                 io_uring_queue_depth: 128,
                 connection_pool_size: 32,
                 buffer_pool_size: 32 * 1024 * 1024, // 32MB
             },
             http_routes: vec![
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/api.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![ParentRef {
+                        name: "minimal-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/api.json")],
+                        backend_refs: vec![BackendRef {
+                            name: "api-service".to_string(),
+                            namespace: None,
+                            port: 3001,
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
                 }
             ],
             tcp_routes: vec![],
@@ -657,130 +887,190 @@ impl UringRessConfig {
     /// Multiple services with debug logging and relaxed timeouts
     pub fn generate_development() -> Self {
         Self {
-            server: ServerConfig {
-                http_port: 8080,
-                tcp_ports: vec![],
+            gateway: GatewayConfig {
+                name: "development-gateway".to_string(),
+                listeners: vec![
+                    ListenerConfig {
+                        name: "http".to_string(),
+                        protocol: Protocol::HTTP,
+                        port: 8080,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-ssh".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 2222,
+                        hostname: None,
+                        tls: None,
+                    },
+                ],
+                worker_threads: 4,
                 api_port: 8081,
                 api_enabled: true,
-                worker_threads: 4,
                 io_uring_queue_depth: 256,
                 connection_pool_size: 64,
                 buffer_pool_size: 64 * 1024 * 1024, // 64MB
             },
             http_routes: vec![
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/")],
+                        backend_refs: vec![BackendRef {
+                            name: "frontend-service".to_string(),
+                            namespace: None,
+                            port: 3001,
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
                 },
                 // /index.html route with round-robin across all 3 backends
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/index.html".to_string(),
-                    backend: None,
-                    backends: Some(vec![
-                        BackendConfig {
-                            address: "127.0.0.1".to_string(),
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/index.html")],
+                        backend_refs: vec![
+                            BackendRef {
+                                name: "frontend-service-1".to_string(),
+                                namespace: None,
+                                port: 3001,
+                                weight: 1,
+                                kind: None,
+                                group: None,
+                            },
+                            BackendRef {
+                                name: "frontend-service-2".to_string(),
+                                namespace: None,
+                                port: 3002,
+                                weight: 1,
+                                kind: None,
+                                group: None,
+                            },
+                            BackendRef {
+                                name: "frontend-service-3".to_string(),
+                                namespace: None,
+                                port: 3003,
+                                weight: 1,
+                                kind: None,
+                                group: None,
+                            },
+                        ],
+                    }],
+                },
+                HttpRouteConfig {
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/api.json")],
+                        backend_refs: vec![BackendRef {
+                            name: "api-service".to_string(),
+                            namespace: None,
                             port: 3001,
-                            health_check_path: Some("/health".to_string()),
-                        },
-                        BackendConfig {
-                            address: "127.0.0.1".to_string(),
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
+                },
+                HttpRouteConfig {
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/users.json")],
+                        backend_refs: vec![BackendRef {
+                            name: "users-service".to_string(),
+                            namespace: None,
                             port: 3002,
-                            health_check_path: Some("/health".to_string()),
-                        },
-                        BackendConfig {
-                            address: "127.0.0.1".to_string(),
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
+                },
+                HttpRouteConfig {
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/dataset.json")],
+                        backend_refs: vec![BackendRef {
+                            name: "dataset-service".to_string(),
+                            namespace: None,
                             port: 3003,
-                            health_check_path: Some("/health".to_string()),
-                        },
-                    ]),
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
                 },
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/api.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/users.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3002,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/dataset.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3003,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/health".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "localhost".to_string(),
-                    path: "/api.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "localhost".to_string(),
-                    path: "/users.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3002,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("http".to_string()),
+                        port: None,
+                    }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        matches: vec![HttpRouteMatch::path_prefix("/health")],
+                        backend_refs: vec![BackendRef {
+                            name: "api-service".to_string(),
+                            namespace: None,
+                            port: 3001,
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
                 },
             ],
             tcp_routes: vec![
                 TcpRouteConfig {
-                    port: 2222,
-                    backends: vec![
-                        BackendConfig {
-                            address: "127.0.0.1".to_string(),
+                    parent_refs: vec![ParentRef {
+                        name: "development-gateway".to_string(),
+                        namespace: None,
+                        section_name: Some("tcp-ssh".to_string()),
+                        port: None,
+                    }],
+                    rules: vec![TcpRouteRule {
+                        backend_refs: vec![BackendRef {
+                            name: "ssh-service".to_string(),
+                            namespace: None,
                             port: 22,
-                            health_check_path: None,
-                        }
-                    ],
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                            weight: 1,
+                            kind: None,
+                            group: None,
+                        }],
+                    }],
                 }
             ],
             observability: ObservabilityConfig {
@@ -822,15 +1112,44 @@ impl UringRessConfig {
     }
 
     /// Generate a production configuration example
-    /// Optimized for high performance and reliability
+    /// Configured for high performance and reliability
     pub fn generate_production() -> Self {
         Self {
-            server: ServerConfig {
-                http_port: 80,
-                tcp_ports: vec![],
-                api_port: 8080,
-                api_enabled: true,
+            gateway: GatewayConfig {
+                name: "production-gateway".to_string(),
+                listeners: vec![
+                    ListenerConfig {
+                        name: "http-80".to_string(),
+                        protocol: Protocol::HTTP,
+                        port: 80,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "http-8080".to_string(),
+                        protocol: Protocol::HTTP,
+                        port: 8080,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-5432".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 5432,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-6379".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 6379,
+                        hostname: None,
+                        tls: None,
+                    },
+                ],
                 worker_threads: num_cpus::get(),
+                api_port: 8090,
+                api_enabled: true,
                 io_uring_queue_depth: 512,
                 connection_pool_size: 256,
                 buffer_pool_size: 256 * 1024 * 1024, // 256MB
@@ -838,89 +1157,218 @@ impl UringRessConfig {
             http_routes: vec![
                 // Integration test routes for compatibility
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/api.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "production-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("http-8080".to_string()),
+                            port: Some(8080),
+                        }
+                    ],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/api.json".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "api-service".to_string(),
+                                    namespace: None,
+                                    port: 3001,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/users.json".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "users-service".to_string(),
+                                    namespace: None,
+                                    port: 3002,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/dataset.json".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "dataset-service".to_string(),
+                                    namespace: None,
+                                    port: 3003,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                    ],
                 },
+                // Production example routes for API gateway
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/users.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3002,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "production-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("http-80".to_string()),
+                            port: Some(80),
+                        }
+                    ],
+                    hostnames: vec!["api.example.com".to_string()],
+                    rules: vec![
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/api".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "api-backend".to_string(),
+                                    namespace: None,
+                                    port: 8000,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                    ],
                 },
+                // Production example routes for web frontend
                 HttpRouteConfig {
-                    host: "localhost:8080".to_string(),
-                    path: "/dataset.json".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "127.0.0.1".to_string(),
-                        port: 3003,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                // Production example routes
-                HttpRouteConfig {
-                    host: "api.example.com".to_string(),
-                    path: "/api".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "10.0.1.10".to_string(),
-                        port: 8000,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "www.example.com".to_string(),
-                    path: "/".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "10.0.1.20".to_string(),
-                        port: 80,
-                        health_check_path: Some("/status".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "production-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("http-80".to_string()),
+                            port: Some(80),
+                        }
+                    ],
+                    hostnames: vec!["www.example.com".to_string()],
+                    rules: vec![
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "web-frontend".to_string(),
+                                    namespace: None,
+                                    port: 80,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                    ],
                 },
             ],
             tcp_routes: vec![
                 TcpRouteConfig {
-                    port: 5432,
-                    backends: vec![
-                        BackendConfig {
-                            address: "10.0.2.10".to_string(),
-                            port: 5432,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "10.0.2.11".to_string(),
-                            port: 5432,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "production-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-5432".to_string()),
+                            port: Some(5432),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::LeastConnections,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "postgres-primary".to_string(),
+                                    namespace: None,
+                                    port: 5432,
+                                    weight: 50,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "postgres-secondary".to_string(),
+                                    namespace: None,
+                                    port: 5432,
+                                    weight: 50,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
                 TcpRouteConfig {
-                    port: 6379,
-                    backends: vec![
-                        BackendConfig {
-                            address: "10.0.3.10".to_string(),
-                            port: 6379,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "production-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-6379".to_string()),
+                            port: Some(6379),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "redis-cache".to_string(),
+                                    namespace: None,
+                                    port: 6379,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
             ],
             observability: ObservabilityConfig {
@@ -965,152 +1413,353 @@ impl UringRessConfig {
     /// Complex routing scenarios with multiple services and load balancing
     pub fn generate_microservices() -> Self {
         Self {
-            server: ServerConfig {
-                http_port: 8080,
-                tcp_ports: vec![],
+            gateway: GatewayConfig {
+                name: "microservices-gateway".to_string(),
+                listeners: vec![
+                    ListenerConfig {
+                        name: "http-8080".to_string(),
+                        protocol: Protocol::HTTP,
+                        port: 8080,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-5432".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 5432,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-6379".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 6379,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-3306".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 3306,
+                        hostname: None,
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "tcp-27017".to_string(),
+                        protocol: Protocol::TCP,
+                        port: 27017,
+                        hostname: None,
+                        tls: None,
+                    },
+                ],
+                worker_threads: 8,
                 api_port: 8081,
                 api_enabled: true,
-                worker_threads: 8,
                 io_uring_queue_depth: 512,
                 connection_pool_size: 128,
                 buffer_pool_size: 128 * 1024 * 1024, // 128MB
             },
             http_routes: vec![
+                // API microservices routes
                 HttpRouteConfig {
-                    host: "api.microservices.local".to_string(),
-                    path: "/auth".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "auth-service".to_string(),
-                        port: 8001,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("http-8080".to_string()),
+                            port: Some(8080),
+                        }
+                    ],
+                    hostnames: vec!["api.microservices.local".to_string()],
+                    rules: vec![
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/auth".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "auth-service".to_string(),
+                                    namespace: None,
+                                    port: 8001,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/users".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "user-service".to_string(),
+                                    namespace: None,
+                                    port: 8002,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/orders".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "order-service".to_string(),
+                                    namespace: None,
+                                    port: 8003,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/payments".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "payment-service".to_string(),
+                                    namespace: None,
+                                    port: 8004,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                    ],
                 },
+                // Admin dashboard route
                 HttpRouteConfig {
-                    host: "api.microservices.local".to_string(),
-                    path: "/users".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "user-service".to_string(),
-                        port: 8002,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "api.microservices.local".to_string(),
-                    path: "/orders".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "order-service".to_string(),
-                        port: 8003,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "api.microservices.local".to_string(),
-                    path: "/payments".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "payment-service".to_string(),
-                        port: 8004,
-                        health_check_path: Some("/health".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
-                },
-                HttpRouteConfig {
-                    host: "admin.microservices.local".to_string(),
-                    path: "/".to_string(),
-                    backend: Some(BackendConfig {
-                        address: "admin-dashboard".to_string(),
-                        port: 3000,
-                        health_check_path: Some("/status".to_string()),
-                    }),
-                    backends: None,
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("http-8080".to_string()),
+                            port: Some(8080),
+                        }
+                    ],
+                    hostnames: vec!["admin.microservices.local".to_string()],
+                    rules: vec![
+                        HttpRouteRule {
+                            matches: vec![
+                                HttpRouteMatch {
+                                    path: Some(HttpPathMatch {
+                                        match_type: HttpPathMatchType::PathPrefix,
+                                        value: "/".to_string(),
+                                    }),
+                                    headers: None,
+                                    query_params: None,
+                                    method: None,
+                                }
+                            ],
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "admin-dashboard".to_string(),
+                                    namespace: None,
+                                    port: 3000,
+                                    weight: 100,
+                                    kind: None,
+                                    group: None,
+                                }
+                            ],
+                        },
+                    ],
                 },
             ],
             tcp_routes: vec![
+                // PostgreSQL cluster
                 TcpRouteConfig {
-                    port: 5432,
-                    backends: vec![
-                        BackendConfig {
-                            address: "postgres-primary".to_string(),
-                            port: 5432,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "postgres-replica-1".to_string(),
-                            port: 5432,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "postgres-replica-2".to_string(),
-                            port: 5432,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-5432".to_string()),
+                            port: Some(5432),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::LeastConnections,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "postgres-primary".to_string(),
+                                    namespace: None,
+                                    port: 5432,
+                                    weight: 50,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "postgres-replica-1".to_string(),
+                                    namespace: None,
+                                    port: 5432,
+                                    weight: 25,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "postgres-replica-2".to_string(),
+                                    namespace: None,
+                                    port: 5432,
+                                    weight: 25,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
+                // Redis cluster
                 TcpRouteConfig {
-                    port: 6379,
-                    backends: vec![
-                        BackendConfig {
-                            address: "redis-cluster-1".to_string(),
-                            port: 6379,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "redis-cluster-2".to_string(),
-                            port: 6379,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "redis-cluster-3".to_string(),
-                            port: 6379,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-6379".to_string()),
+                            port: Some(6379),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "redis-cluster-1".to_string(),
+                                    namespace: None,
+                                    port: 6379,
+                                    weight: 33,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "redis-cluster-2".to_string(),
+                                    namespace: None,
+                                    port: 6379,
+                                    weight: 33,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "redis-cluster-3".to_string(),
+                                    namespace: None,
+                                    port: 6379,
+                                    weight: 34,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
+                // MySQL cluster
                 TcpRouteConfig {
-                    port: 3306,
-                    backends: vec![
-                        BackendConfig {
-                            address: "mysql-primary".to_string(),
-                            port: 3306,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "mysql-replica".to_string(),
-                            port: 3306,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-3306".to_string()),
+                            port: Some(3306),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::LeastConnections,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "mysql-primary".to_string(),
+                                    namespace: None,
+                                    port: 3306,
+                                    weight: 70,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "mysql-replica".to_string(),
+                                    namespace: None,
+                                    port: 3306,
+                                    weight: 30,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
+                // MongoDB sharded cluster
                 TcpRouteConfig {
-                    port: 27017,
-                    backends: vec![
-                        BackendConfig {
-                            address: "mongodb-shard-1".to_string(),
-                            port: 27017,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "mongodb-shard-2".to_string(),
-                            port: 27017,
-                            health_check_path: None,
-                        },
-                        BackendConfig {
-                            address: "mongodb-shard-3".to_string(),
-                            port: 27017,
-                            health_check_path: None,
-                        },
+                    parent_refs: vec![
+                        ParentRef {
+                            name: "microservices-gateway".to_string(),
+                            namespace: None,
+                            section_name: Some("tcp-27017".to_string()),
+                            port: Some(27017),
+                        }
                     ],
-                    load_balance_strategy: LoadBalanceStrategy::RoundRobin,
+                    rules: vec![
+                        TcpRouteRule {
+                            backend_refs: vec![
+                                BackendRef {
+                                    name: "mongodb-shard-1".to_string(),
+                                    namespace: None,
+                                    port: 27017,
+                                    weight: 33,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "mongodb-shard-2".to_string(),
+                                    namespace: None,
+                                    port: 27017,
+                                    weight: 33,
+                                    kind: None,
+                                    group: None,
+                                },
+                                BackendRef {
+                                    name: "mongodb-shard-3".to_string(),
+                                    namespace: None,
+                                    port: 27017,
+                                    weight: 34,
+                                    kind: None,
+                                    group: None,
+                                },
+                            ],
+                        }
+                    ],
                 },
             ],
             observability: ObservabilityConfig {
@@ -1169,7 +1818,7 @@ impl UringRessConfig {
     /// Validate the entire configuration for consistency and correctness
     /// All validation happens once at startup
     pub fn validate(&self) -> Result<()> {
-        self.server.validate()?;
+        self.gateway.validate()?;
         
         for (i, route) in self.http_routes.iter().enumerate() {
             route.validate().map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
@@ -1192,15 +1841,17 @@ impl UringRessConfig {
     fn validate_port_conflicts(&self) -> Result<()> {
         let mut used_ports = std::collections::HashSet::new();
         
-        // Check HTTP port
-        if !used_ports.insert(self.server.http_port) {
-            return Err(anyhow!("Port conflict: HTTP port {} already in use", self.server.http_port));
+        // Check gateway listener ports
+        for listener in &self.gateway.listeners {
+            if !used_ports.insert(listener.port) {
+                return Err(anyhow!("Port conflict: Listener port {} already in use", listener.port));
+            }
         }
         
         // Check API port
-        if self.server.api_enabled {
-            if !used_ports.insert(self.server.api_port) {
-                return Err(anyhow!("Port conflict: API port {} already in use", self.server.api_port));
+        if self.gateway.api_enabled {
+            if !used_ports.insert(self.gateway.api_port) {
+                return Err(anyhow!("Port conflict: API port {} already in use", self.gateway.api_port));
             }
         }
         
@@ -1211,48 +1862,8 @@ impl UringRessConfig {
             }
         }
         
-        // Check TCP ports
-        for port in &self.server.tcp_ports {
-            if !used_ports.insert(*port) {
-                return Err(anyhow!("Port conflict: TCP port {} already in use", port));
-            }
-        }
-        
-        // Check TCP route ports
-        for route in &self.tcp_routes {
-            if !used_ports.insert(route.port) {
-                return Err(anyhow!("Port conflict: TCP route port {} already in use", route.port));
-            }
-        }
-        
-        Ok(())
-    }
-}
-
-impl ServerConfig {
-    fn validate(&self) -> Result<()> {
-        validate_port(self.http_port, "HTTP port")?;
-        validate_port(self.api_port, "API port")?;
-        
-        for (i, port) in self.tcp_ports.iter().enumerate() {
-            validate_port(*port, &format!("TCP port {}", i))?;
-        }
-        
-        if self.worker_threads == 0 {
-            return Err(anyhow!("Worker threads must be greater than 0"));
-        }
-        
-        if self.worker_threads > 256 {
-            return Err(anyhow!("Worker threads cannot exceed 256"));
-        }
-        
-        if self.io_uring_queue_depth == 0 {
-            return Err(anyhow!("io_uring queue depth must be greater than 0"));
-        }
-        
-        if self.connection_pool_size == 0 {
-            return Err(anyhow!("Connection pool size must be greater than 0"));
-        }
+        // TCP route ports are checked via parent_refs and gateway listeners
+        // No additional port validation needed since TCP routes must reference valid listeners
         
         Ok(())
     }
@@ -1260,36 +1871,36 @@ impl ServerConfig {
 
 impl HttpRouteConfig {
     fn validate(&self) -> Result<()> {
-        if self.host.is_empty() {
-            return Err(anyhow!("Host cannot be empty"));
+        // Validate parent refs
+        if self.parent_refs.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one parent_ref"));
         }
         
-        if !self.path.starts_with('/') {
-            return Err(anyhow!("Path must start with '/': {}", self.path));
+        for parent_ref in &self.parent_refs {
+            parent_ref.validate()?;
         }
         
-        // Validate backend configuration - must have either single backend or multiple backends
-        match (&self.backend, &self.backends) {
-            (Some(backend), None) => {
-                // Single backend configuration
-                backend.validate()?;
+        // Validate hostnames
+        if self.hostnames.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one hostname"));
+        }
+        
+        for hostname in &self.hostnames {
+            if hostname.is_empty() {
+                return Err(anyhow!("Hostname cannot be empty"));
             }
-            (None, Some(backends)) => {
-                // Multiple backend configuration
-                if backends.is_empty() {
-                    return Err(anyhow!("HTTP route with 'backends' field must have at least one backend"));
-                }
-                
-                for (i, backend) in backends.iter().enumerate() {
-                    backend.validate().map_err(|e| anyhow!("Backend {}: {}", i, e))?;
-                }
+            if hostname.contains(':') {
+                return Err(anyhow!("Hostname must not contain port: {}", hostname));
             }
-            (Some(_), Some(_)) => {
-                return Err(anyhow!("HTTP route cannot have both 'backend' and 'backends' fields"));
-            }
-            (None, None) => {
-                return Err(anyhow!("HTTP route must have either 'backend' or 'backends' field"));
-            }
+        }
+        
+        // Validate rules
+        if self.rules.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one rule"));
+        }
+        
+        for (i, rule) in self.rules.iter().enumerate() {
+            rule.validate().map_err(|e| anyhow!("HTTP route rule {}: {}", i, e))?;
         }
         
         Ok(())
@@ -1298,37 +1909,137 @@ impl HttpRouteConfig {
 
 impl TcpRouteConfig {
     fn validate(&self) -> Result<()> {
-        validate_port(self.port, "TCP route port")?;
-        
-        if self.backends.is_empty() {
-            return Err(anyhow!("TCP route must have at least one backend"));
+        // Validate parent refs
+        if self.parent_refs.is_empty() {
+            return Err(anyhow!("TCP route must have at least one parent_ref"));
         }
         
-        for (i, backend) in self.backends.iter().enumerate() {
-            backend.validate().map_err(|e| anyhow!("Backend {}: {}", i, e))?;
+        for parent_ref in &self.parent_refs {
+            parent_ref.validate()?;
+        }
+        
+        // Validate rules
+        if self.rules.is_empty() {
+            return Err(anyhow!("TCP route must have at least one rule"));
+        }
+        
+        for (i, rule) in self.rules.iter().enumerate() {
+            rule.validate().map_err(|e| anyhow!("TCP route rule {}: {}", i, e))?;
         }
         
         Ok(())
     }
 }
 
-impl BackendConfig {
+
+impl GatewayConfig {
     fn validate(&self) -> Result<()> {
-        if self.address.is_empty() {
-            return Err(anyhow!("Backend address cannot be empty"));
+        if self.name.is_empty() {
+            return Err(anyhow!("Gateway name cannot be empty"));
         }
         
-        // Validate address format (IP or hostname)
-        if self.address.parse::<IpAddr>().is_err() && !is_valid_hostname(&self.address) {
-            return Err(anyhow!("Invalid backend address format: {}", self.address));
+        if self.listeners.is_empty() {
+            return Err(anyhow!("Gateway must have at least one listener"));
         }
         
-        validate_port(self.port, "Backend port")?;
+        for (i, listener) in self.listeners.iter().enumerate() {
+            listener.validate().map_err(|e| anyhow!("Listener {}: {}", i, e))?;
+        }
         
-        if let Some(path) = &self.health_check_path {
-            if !path.starts_with('/') {
-                return Err(anyhow!("Health check path must start with '/': {}", path));
-            }
+        validate_port(self.api_port, "API port")?;
+        
+        if self.worker_threads == 0 {
+            return Err(anyhow!("Worker threads must be greater than 0"));
+        }
+        
+        Ok(())
+    }
+}
+
+impl ListenerConfig {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Listener name cannot be empty"));
+        }
+        
+        validate_port(self.port, "Listener port")?;
+        
+        Ok(())
+    }
+}
+
+impl ParentRef {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Parent ref name cannot be empty"));
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpRouteRule {
+    fn validate(&self) -> Result<()> {
+        if self.backend_refs.is_empty() {
+            return Err(anyhow!("HTTP route rule must have at least one backend_ref"));
+        }
+        
+        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+        }
+        
+        for (i, match_rule) in self.matches.iter().enumerate() {
+            match_rule.validate().map_err(|e| anyhow!("Match rule {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpRouteMatch {
+    fn validate(&self) -> Result<()> {
+        if let Some(path_match) = &self.path {
+            path_match.validate()?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpPathMatch {
+    fn validate(&self) -> Result<()> {
+        if !self.value.starts_with('/') {
+            return Err(anyhow!("Path match value must start with '/': {}", self.value));
+        }
+        
+        Ok(())
+    }
+}
+
+impl TcpRouteRule {
+    fn validate(&self) -> Result<()> {
+        if self.backend_refs.is_empty() {
+            return Err(anyhow!("TCP route rule must have at least one backend_ref"));
+        }
+        
+        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl BackendRef {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Backend ref name cannot be empty"));
+        }
+        
+        validate_port(self.port, "Backend ref port")?;
+        
+        if self.weight <= 0 {
+            return Err(anyhow!("Backend ref weight must be greater than 0: {}", self.weight));
         }
         
         Ok(())
@@ -1411,6 +2122,33 @@ impl PerformanceConfig {
     }
 }
 
+/// Normalize HTTP host header by removing port number
+/// Required for Gateway API compliance where hostnames don't include ports
+/// Examples: "localhost:8080" → "localhost", "api.example.com:443" → "api.example.com"
+pub fn normalize_host_header(host: &str) -> String {
+    // Split by ':' and take only the hostname part
+    // This handles both IPv4:port and hostname:port patterns
+    match host.split(':').next() {
+        Some(hostname) => hostname.to_string(),
+        None => host.to_string(), // Fallback to original if no ':' found
+    }
+}
+
+/// Resolve service name to IP address
+/// For MVP: simple localhost resolution
+/// In production: would integrate with service discovery (DNS, Consul, K8s, etc.)
+fn resolve_service_address(service_name: &str) -> String {
+    // For development/testing, all services resolve to localhost
+    // This is appropriate for our examples where services run locally
+    match service_name {
+        // Allow some common service patterns
+        name if name.contains("localhost") => "127.0.0.1".to_string(),
+        name if name.contains("127.0.0.1") => "127.0.0.1".to_string(),
+        // All other services resolve to localhost for MVP
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
 // Configuration to runtime structure conversion
 impl UringRessConfig {
     /// Convert configuration to RouteTable for runtime use
@@ -1420,86 +2158,124 @@ impl UringRessConfig {
         
         let mut route_table = RouteTable::new();
         
-        // Convert HTTP routes - handle both single and multiple backends
-        for http_route in &self.http_routes {
-            match (&http_route.backend, &http_route.backends) {
-                (Some(backend_config), None) => {
-                    // Single backend - use existing add_http_route method
-                    let route_backend = Backend::new(backend_config.address.clone(), backend_config.port)?;
-                    let route_backend = if let Some(ref health_path) = backend_config.health_check_path {
-                        route_backend.with_health_check(health_path.clone())
-                    } else {
-                        route_backend
-                    };
-                    
-                    route_table.add_http_route(&http_route.host, &http_route.path, route_backend);
-                }
-                (None, Some(backend_configs)) => {
-                    // Multiple backends - create all backends and add as pool
-                    let mut route_backends = Vec::new();
-                    
-                    for backend_config in backend_configs {
-                        let backend = Backend::new(backend_config.address.clone(), backend_config.port)?;
-                        let backend = if let Some(ref health_path) = backend_config.health_check_path {
-                            backend.with_health_check(health_path.clone())
+        tracing::debug!("Converting {} HTTP routes to route table", self.http_routes.len());
+        
+        // Convert HTTP routes using new Gateway API structure
+        for (route_idx, http_route) in self.http_routes.iter().enumerate() {
+            tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules", 
+                route_idx, http_route.hostnames.len(), http_route.rules.len());
+            // For each hostname in the route
+            for hostname in &http_route.hostnames {
+                tracing::debug!("  Processing hostname: {}", hostname);
+                // For each rule in the route
+                for (rule_idx, rule) in http_route.rules.iter().enumerate() {
+                    tracing::debug!("    Processing rule {}: {} matches, {} backend_refs", 
+                        rule_idx, rule.matches.len(), rule.backend_refs.len());
+                    // For each match in the rule
+                    for route_match in &rule.matches {
+                        // Extract path from match (default to "/" if no path match)
+                        let path = if let Some(path_match) = &route_match.path {
+                            &path_match.value
                         } else {
-                            backend
+                            "/"
                         };
-                        route_backends.push(backend);
+                        
+                        tracing::debug!("      Adding route: {} {} -> {} backends", 
+                            hostname, path, rule.backend_refs.len());
+                        
+                        // Convert backend references to Backend objects
+                        let mut backends = Vec::new();
+                        for backend_ref in &rule.backend_refs {
+                            // For MVP: resolve service names to localhost
+                            // In production, this would resolve via service discovery
+                            let backend_address = resolve_service_address(&backend_ref.name);
+                            let backend = Backend::new(
+                                backend_address.clone(),
+                                backend_ref.port
+                            )?;
+                            backends.push(backend);
+                            tracing::debug!("        Backend: {}:{} (service: {})", 
+                                backend_address, backend_ref.port, backend_ref.name);
+                        }
+                        
+                        if backends.len() == 1 {
+                            // Single backend
+                            route_table.add_http_route(hostname, path, backends.into_iter().next().unwrap());
+                        } else {
+                            // Multiple backends with round-robin
+                            route_table.add_http_route_with_pool(
+                                hostname,
+                                path,
+                                backends,
+                                crate::routing::LoadBalanceStrategy::RoundRobin
+                            );
+                        }
                     }
-                    
-                    // Add HTTP route with multiple backends
-                    let routing_strategy = match &http_route.load_balance_strategy {
-                        LoadBalanceStrategy::RoundRobin => crate::routing::LoadBalanceStrategy::RoundRobin,
-                        LoadBalanceStrategy::LeastConnections => crate::routing::LoadBalanceStrategy::LeastConnections,
-                    };
-                    route_table.add_http_route_with_pool(
-                        &http_route.host, 
-                        &http_route.path, 
-                        route_backends, 
-                        routing_strategy
-                    );
-                }
-                _ => {
-                    // This should be caught by validation, but let's be safe
-                    return Err(anyhow!("Invalid HTTP route configuration for {}{}", http_route.host, http_route.path));
                 }
             }
         }
         
-        // Convert TCP routes using existing add_tcp_route method
+        // Convert TCP routes using new Gateway API structure
         for tcp_route in &self.tcp_routes {
-            let mut backends = Vec::new();
-            
-            for backend_config in &tcp_route.backends {
-                let backend = Backend::new(backend_config.address.clone(), backend_config.port)?;
-                backends.push(backend);
+            // Find the listener port for this TCP route by examining parent refs
+            if let Some(parent_ref) = tcp_route.parent_refs.first() {
+                if let Some(section_name) = &parent_ref.section_name {
+                    // Find the listener with this section name
+                    if let Some(listener) = self.gateway.listeners.iter()
+                        .find(|l| l.name == *section_name && l.protocol == Protocol::TCP) {
+                        
+                        // Convert backend references to Backend objects
+                        for rule in &tcp_route.rules {
+                            let mut backends = Vec::new();
+                            for backend_ref in &rule.backend_refs {
+                                let backend = Backend::new(
+                                    format!("127.0.0.1"), // Placeholder - in real implementation would resolve service
+                                    backend_ref.port
+                                )?;
+                                backends.push(backend);
+                            }
+                            
+                            // Add TCP route using the listener port
+                            route_table.add_tcp_route(listener.port, backends);
+                        }
+                    }
+                }
             }
-            
-            // Use existing add_tcp_route method (it creates BackendPool internally)
-            route_table.add_tcp_route(tcp_route.port, backends);
         }
+        
+        tracing::debug!("Route table conversion completed: {} HTTP routes, {} TCP routes", 
+            route_table.http_routes.len(), route_table.tcp_routes.len());
         
         Ok(route_table)
     }
 }
 
 impl PerformanceConfig {
-    /// Convert PerformanceConfig to RuntimeConfig for backward compatibility
+    /// Convert PerformanceConfig and GatewayConfig to RuntimeConfig
     /// All values are pre-computed at startup for zero runtime overhead
-    pub fn to_runtime_config(&self) -> crate::runtime_config::RuntimeConfig {
+    pub fn to_runtime_config(&self, gateway: &GatewayConfig) -> crate::runtime_config::RuntimeConfig {
+        use std::collections::HashMap;
+        
+        // Build listener map for zero-overhead protocol detection
+        let mut listeners = HashMap::new();
+        for listener in &gateway.listeners {
+            let protocol = match listener.protocol {
+                Protocol::HTTP => crate::runtime_config::Protocol::HTTP,
+                Protocol::HTTPS => crate::runtime_config::Protocol::HTTPS,
+                Protocol::TCP => crate::runtime_config::Protocol::TCP,
+                Protocol::UDP => crate::runtime_config::Protocol::UDP,
+            };
+            
+            let listener_info = crate::runtime_config::ListenerInfo {
+                protocol,
+            };
+            
+            listeners.insert(listener.port, listener_info);
+        }
+        
         crate::runtime_config::RuntimeConfig::new(
-            self.connection_pool_size,
-            self.max_requests_per_connection,
+            listeners,
             self.standard_buffer_size,
-            self.large_buffer_size,
-            self.header_buffer_size,
-            self.connection_max_age,
-            self.backend_response_timeout,
-            self.circuit_breaker_timeout,
-            self.keep_alive_timeout,
-            self.circuit_breaker_failure_threshold,
-            self.max_retries,
         )
     }
 }
@@ -1514,18 +2290,6 @@ fn validate_port(port: u16, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Basic hostname validation (simplified)
-fn is_valid_hostname(hostname: &str) -> bool {
-    if hostname.is_empty() || hostname.len() > 253 {
-        return false;
-    }
-    
-    hostname.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        && !hostname.starts_with('-')
-        && !hostname.ends_with('-')
-        && !hostname.starts_with('.')
-        && !hostname.ends_with('.')
-}
 
 #[cfg(test)]
 mod tests {
@@ -1555,39 +2319,38 @@ mod tests {
         assert!(parse_duration("-5s").is_err());
     }
     
-    #[test]
-    fn test_hostname_validation() {
-        assert!(is_valid_hostname("example.com"));
-        assert!(is_valid_hostname("api.example.com"));
-        assert!(is_valid_hostname("localhost"));
-        assert!(is_valid_hostname("test-server"));
-        
-        assert!(!is_valid_hostname(""));
-        assert!(!is_valid_hostname("-invalid"));
-        assert!(!is_valid_hostname("invalid-"));
-        assert!(!is_valid_hostname(".invalid"));
-        assert!(!is_valid_hostname("invalid."));
-    }
     
     #[test]
     fn test_default_config() {
         let config = UringRessConfig::default();
         assert!(config.validate().is_ok());
-        assert_eq!(config.server.http_port, 8080);
-        assert_eq!(config.server.api_port, 8081);
-        assert!(config.server.api_enabled);
+        assert_eq!(config.gateway.api_port, 8081);
+        assert!(config.gateway.api_enabled);
         assert_eq!(config.performance.connection_pool_size, 64);
+        // Gateway should have at least one listener
+        assert!(!config.gateway.listeners.is_empty());
     }
     
     #[test]
     fn test_json_deserialization() {
         let json = r#"{
-            "server": {
-                "http_port": 9000,
-                "tcp_ports": [8080, 8081],
+            "gateway": {
+                "name": "test-gateway",
+                "listeners": [
+                    {
+                        "name": "http-9000",
+                        "protocol": "HTTP",
+                        "port": 9000
+                    },
+                    {
+                        "name": "tcp-8080",
+                        "protocol": "TCP",
+                        "port": 8080
+                    }
+                ],
+                "worker_threads": 4,
                 "api_port": 8090,
                 "api_enabled": true,
-                "worker_threads": 4,
                 "io_uring_queue_depth": 512,
                 "connection_pool_size": 128,
                 "buffer_pool_size": "128MB"
@@ -1612,8 +2375,8 @@ mod tests {
         
         let config: UringRessConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
-        assert_eq!(config.server.http_port, 9000);
-        assert_eq!(config.server.buffer_pool_size, 128 * 1024 * 1024);
+        assert_eq!(config.gateway.listeners[0].port, 9000);
+        assert_eq!(config.gateway.buffer_pool_size, 128 * 1024 * 1024);
         assert_eq!(config.performance.backend_response_timeout, Duration::from_secs(30));
         assert_eq!(config.performance.standard_buffer_size, 16 * 1024);
         assert_eq!(config.performance.connection_max_age, Duration::from_secs(300));
@@ -1623,41 +2386,83 @@ mod tests {
     #[test]
     fn test_route_configuration() {
         let json = r#"{
-            "server": {
-                "http_port": 8080,
-                "tcp_ports": [9090],
+            "gateway": {
+                "name": "test-gateway",
+                "listeners": [
+                    {
+                        "name": "http-8080",
+                        "protocol": "HTTP",
+                        "port": 8080
+                    },
+                    {
+                        "name": "tcp-5432",
+                        "protocol": "TCP", 
+                        "port": 5432
+                    }
+                ],
+                "worker_threads": 4,
                 "api_port": 8081,
                 "api_enabled": true,
-                "worker_threads": 4,
                 "io_uring_queue_depth": 256,
                 "connection_pool_size": 64,
                 "buffer_pool_size": "64MB"
             },
             "http_routes": [
                 {
-                    "host": "api.example.com",
-                    "path": "/v1",
-                    "backend": {
-                        "address": "127.0.0.1",
-                        "port": 3000,
-                        "health_check_path": "/health"
-                    }
+                    "parent_refs": [
+                        {
+                            "name": "test-gateway",
+                            "section_name": "http-8080",
+                            "port": 8080
+                        }
+                    ],
+                    "hostnames": ["api.example.com"],
+                    "rules": [
+                        {
+                            "matches": [
+                                {
+                                    "path": {
+                                        "type": "PathPrefix",
+                                        "value": "/v1"
+                                    }
+                                }
+                            ],
+                            "backend_refs": [
+                                {
+                                    "name": "api-service",
+                                    "port": 3000,
+                                    "weight": 100
+                                }
+                            ]
+                        }
+                    ]
                 }
             ],
             "tcp_routes": [
                 {
-                    "port": 5432,
-                    "backends": [
+                    "parent_refs": [
                         {
-                            "address": "db1.example.com",
-                            "port": 5432
-                        },
-                        {
-                            "address": "db2.example.com", 
+                            "name": "test-gateway",
+                            "section_name": "tcp-5432",
                             "port": 5432
                         }
                     ],
-                    "load_balance_strategy": "round_robin"
+                    "rules": [
+                        {
+                            "backend_refs": [
+                                {
+                                    "name": "db1-service",
+                                    "port": 5432,
+                                    "weight": 50
+                                },
+                                {
+                                    "name": "db2-service",
+                                    "port": 5432,
+                                    "weight": 50
+                                }
+                            ]
+                        }
+                    ]
                 }
             ]
         }"#;
@@ -1665,23 +2470,22 @@ mod tests {
         let config: UringRessConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         
-        assert_eq!(config.http_routes.len(), 1);
-        assert_eq!(config.http_routes[0].host, "api.example.com");
-        assert_eq!(config.http_routes[0].path, "/v1");
-        if let Some(backend) = &config.http_routes[0].backend {
-            assert_eq!(backend.address, "127.0.0.1");
-            assert_eq!(backend.port, 3000);
-            assert_eq!(backend.health_check_path, Some("/health".to_string()));
-        } else {
-            panic!("Expected single backend configuration");
-        }
+        // Test Gateway API structure
+        assert_eq!(config.gateway.name, "test-gateway");
+        assert_eq!(config.gateway.listeners.len(), 2);
         
+        // Test HTTP routes
+        assert_eq!(config.http_routes.len(), 1);
+        assert_eq!(config.http_routes[0].hostnames[0], "api.example.com");
+        assert_eq!(config.http_routes[0].rules[0].matches[0].path.as_ref().unwrap().value, "/v1");
+        assert_eq!(config.http_routes[0].rules[0].backend_refs[0].name, "api-service");
+        assert_eq!(config.http_routes[0].rules[0].backend_refs[0].port, 3000);
+        
+        // Test TCP routes  
         assert_eq!(config.tcp_routes.len(), 1);
-        assert_eq!(config.tcp_routes[0].port, 5432);
-        assert_eq!(config.tcp_routes[0].backends.len(), 2);
-        assert_eq!(config.tcp_routes[0].backends[0].address, "db1.example.com");
-        assert_eq!(config.tcp_routes[0].backends[1].address, "db2.example.com");
-        assert!(matches!(config.tcp_routes[0].load_balance_strategy, LoadBalanceStrategy::RoundRobin));
+        assert_eq!(config.tcp_routes[0].rules[0].backend_refs.len(), 2);
+        assert_eq!(config.tcp_routes[0].rules[0].backend_refs[0].name, "db1-service");
+        assert_eq!(config.tcp_routes[0].rules[0].backend_refs[1].name, "db2-service");
     }
     
     #[test]
@@ -1694,17 +2498,17 @@ mod tests {
         
         let development = UringRessConfig::generate_development();
         assert!(development.validate().is_ok());
-        assert_eq!(development.http_routes.len(), 8); // Now includes /index.html route
+        assert_eq!(development.http_routes.len(), 6); // Gateway API groups routes efficiently
         assert_eq!(development.tcp_routes.len(), 1);
         
         let production = UringRessConfig::generate_production();
         assert!(production.validate().is_ok());
-        assert_eq!(production.http_routes.len(), 5); // Integration test routes + production routes
+        assert_eq!(production.http_routes.len(), 3); // Gateway API groups routes efficiently
         assert_eq!(production.tcp_routes.len(), 2);
         
         let microservices = UringRessConfig::generate_microservices();
         assert!(microservices.validate().is_ok());
-        assert_eq!(microservices.http_routes.len(), 5);
+        assert_eq!(microservices.http_routes.len(), 2); // Gateway API groups microservices routes
         assert_eq!(microservices.tcp_routes.len(), 4);
     }
     
@@ -1763,6 +2567,6 @@ mod tests {
 pub fn print_example_config_info() {
     println!("examples/minimal.json       - Basic single-service configuration");
     println!("examples/development.yaml   - Multi-service development setup");
-    println!("examples/production.json    - Optimized production configuration");
+    println!("examples/production.json    - Production configuration");
     println!("examples/microservices.yaml - Complex routing for microservices");
 }

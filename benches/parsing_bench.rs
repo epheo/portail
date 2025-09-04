@@ -12,7 +12,7 @@ fn parsing_benchmark(c: &mut Criterion) {
     
     let malformed_request = b"INVALID REQUEST FORMAT WITHOUT PROPER HEADERS\r\n\r\n";
     
-    // Fast parsing benchmarks - Target: <1μs for simple requests
+    // Fast parsing benchmarks - Target: <300ns for simple requests (single-pass optimization)
     c.bench_function("parse_headers_fast_simple", |b| {
         b.iter(|| {
             black_box(parse_http_headers_fast(simple_request))

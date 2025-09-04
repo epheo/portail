@@ -54,8 +54,8 @@ fn test_http_parsing_performance() {
     
     println!("HTTP parsing average time: {}ns", avg_time_ns);
     
-    // Target: <1000ns (1μs) per parse for simple requests
-    assert!(avg_time_ns < 1000, "HTTP parsing too slow: {}ns > 1000ns", avg_time_ns);
+    // Target: <300ns per parse with single-pass optimization
+    assert!(avg_time_ns < 300, "HTTP parsing too slow: {}ns > 300ns", avg_time_ns);
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn test_end_to_end_request_latency() {
     for _ in 0..iterations {
         for request in &requests {
             // End-to-end: Parse + Route + Backend Selection
-            let (_method, path, host) = parse_http_headers_fast(request).unwrap();
+            let (_method, path, host, _connection) = parse_http_headers_fast(request).unwrap();
             if let Some(host) = host {
                 let host_hash = fnv_hash(host);
                 let _ = table.route_http_request(host_hash, path);
@@ -192,7 +192,7 @@ fn test_throughput_estimate() {
     let start = Instant::now();
     
     for _ in 0..iterations {
-        let (_method, path, host) = parse_http_headers_fast(request).unwrap();
+        let (_method, path, host, _connection) = parse_http_headers_fast(request).unwrap();
         if let Some(host) = host {
             let host_hash = fnv_hash(host);
             let _ = table.route_http_request(host_hash, path);
@@ -229,7 +229,7 @@ fn test_memory_efficiency() {
     let result = parse_http_headers_fast(request);
     assert!(result.is_ok());
     
-    let (method, path, host) = result.unwrap();
+    let (method, path, host, _connection) = result.unwrap();
     assert_eq!(method, "GET");
     assert_eq!(path, "/test");
     assert_eq!(host, Some("api.com"));

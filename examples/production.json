@@ -1,88 +1,209 @@
 {
-  "server": {
-    "http_port": 80,
-    "tcp_ports": [],
-    "api_port": 8080,
-    "api_enabled": true,
+  "gateway": {
+    "name": "production-gateway",
+    "listeners": [
+      {
+        "name": "http-80",
+        "protocol": "HTTP",
+        "port": 80
+      },
+      {
+        "name": "http-8080",
+        "protocol": "HTTP",
+        "port": 8080
+      },
+      {
+        "name": "tcp-5432",
+        "protocol": "TCP",
+        "port": 5432
+      },
+      {
+        "name": "tcp-6379",
+        "protocol": "TCP",
+        "port": 6379
+      }
+    ],
     "worker_threads": 20,
+    "api_port": 8090,
+    "api_enabled": true,
     "io_uring_queue_depth": 512,
     "connection_pool_size": 256,
     "buffer_pool_size": "256MB"
   },
   "http_routes": [
     {
-      "host": "localhost:8080",
-      "path": "/api.json",
-      "backend": {
-        "address": "127.0.0.1",
-        "port": 3001,
-        "health_check_path": "/health"
-      }
+      "parent_refs": [
+        {
+          "name": "production-gateway",
+          "section_name": "http-8080",
+          "port": 8080
+        }
+      ],
+      "hostnames": [
+        "localhost"
+      ],
+      "rules": [
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/api.json"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "api-service",
+              "port": 3001,
+              "weight": 100
+            }
+          ]
+        },
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/users.json"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "users-service",
+              "port": 3002,
+              "weight": 100
+            }
+          ]
+        },
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/dataset.json"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "dataset-service",
+              "port": 3003,
+              "weight": 100
+            }
+          ]
+        }
+      ]
     },
     {
-      "host": "localhost:8080",
-      "path": "/users.json",
-      "backend": {
-        "address": "127.0.0.1",
-        "port": 3002,
-        "health_check_path": "/health"
-      }
+      "parent_refs": [
+        {
+          "name": "production-gateway",
+          "section_name": "http-80",
+          "port": 80
+        }
+      ],
+      "hostnames": [
+        "api.example.com"
+      ],
+      "rules": [
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/api"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "api-backend",
+              "port": 8000,
+              "weight": 100
+            }
+          ]
+        }
+      ]
     },
     {
-      "host": "localhost:8080",
-      "path": "/dataset.json",
-      "backend": {
-        "address": "127.0.0.1",
-        "port": 3003,
-        "health_check_path": "/health"
-      }
-    },
-    {
-      "host": "api.example.com",
-      "path": "/api",
-      "backend": {
-        "address": "10.0.1.10",
-        "port": 8000,
-        "health_check_path": "/health"
-      }
-    },
-    {
-      "host": "www.example.com",
-      "path": "/",
-      "backend": {
-        "address": "10.0.1.20",
-        "port": 80,
-        "health_check_path": "/status"
-      }
+      "parent_refs": [
+        {
+          "name": "production-gateway",
+          "section_name": "http-80",
+          "port": 80
+        }
+      ],
+      "hostnames": [
+        "www.example.com"
+      ],
+      "rules": [
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "web-frontend",
+              "port": 80,
+              "weight": 100
+            }
+          ]
+        }
+      ]
     }
   ],
   "tcp_routes": [
     {
-      "port": 5432,
-      "backends": [
+      "parent_refs": [
         {
-          "address": "10.0.2.10",
-          "port": 5432,
-          "health_check_path": null
-        },
-        {
-          "address": "10.0.2.11",
-          "port": 5432,
-          "health_check_path": null
+          "name": "production-gateway",
+          "section_name": "tcp-5432",
+          "port": 5432
         }
       ],
-      "load_balance_strategy": "least_connections"
+      "rules": [
+        {
+          "backend_refs": [
+            {
+              "name": "postgres-primary",
+              "port": 5432,
+              "weight": 50
+            },
+            {
+              "name": "postgres-secondary",
+              "port": 5432,
+              "weight": 50
+            }
+          ]
+        }
+      ]
     },
     {
-      "port": 6379,
-      "backends": [
+      "parent_refs": [
         {
-          "address": "10.0.3.10",
-          "port": 6379,
-          "health_check_path": null
+          "name": "production-gateway",
+          "section_name": "tcp-6379",
+          "port": 6379
         }
       ],
-      "load_balance_strategy": "round_robin"
+      "rules": [
+        {
+          "backend_refs": [
+            {
+              "name": "redis-cache",
+              "port": 6379,
+              "weight": 100
+            }
+          ]
+        }
+      ]
     }
   ],
   "observability": {
