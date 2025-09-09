@@ -131,7 +131,7 @@ pub extern "C" fn profile_e2e_pipeline_direct() {
     for _ in 0..100_000 {
         for request in &requests {
             // Complete pipeline: Parse -> Hash -> Route -> Buffer
-            if let Ok((method, path, host)) = parse_http_headers_fast(request) {
+            if let Ok((method, path, host, _)) = parse_http_headers_fast(request) {
                 if let Some(host) = host {
                     let host_hash = fnv_hash(host);
                     if let Ok(_backend) = table.route_http_request(host_hash, path) {
@@ -210,4 +210,125 @@ fn test_all_isolated_profiling() {
     profile_e2e_pipeline_direct();
     
     println!("=== All Isolated Profiling Tests Complete ===");
+}
+
+/// Real workload integration test for runtime flamegraph generation
+/// WARNING: This test profiles the CLIENT (curl) side, not the server!
+/// For server-side profiling, use: tests/integration/profiling/profile_server_runtime.sh
+#[test]
+fn test_runtime_flamegraph_with_real_workload() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::path::Path;
+    
+    println!("=== Starting Real Workload Runtime Flamegraph Test ===");
+    
+    // Ensure profiling binary exists (avoid cargo compilation during profiling)
+    let binary_path = "./target/profiling/uringress";
+    if !Path::new(binary_path).exists() {
+        panic!("UringRess profiling binary not found at {}\nBuild it first: cargo build --profile profiling", binary_path);
+    }
+    
+    // Start pre-built UringRess binary directly (NO cargo run - avoids compilation profiling)
+    println!("1. Starting pre-built UringRess server...");
+    let mut server = Command::new(binary_path)
+        .args(&["--config", "examples/development.yaml"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start pre-built UringRess server");
+    
+    // Give server time to start
+    thread::sleep(Duration::from_secs(3));
+    
+    // Check if server is responding
+    for i in 0..10 {
+        if let Ok(response) = std::process::Command::new("curl")
+            .args(&["-s", "--connect-timeout", "1", "http://localhost:8080/health"])
+            .output() 
+        {
+            if response.status.success() {
+                println!("✓ UringRess server is ready");
+                break;
+            }
+        }
+        if i == 9 {
+            server.kill().unwrap();
+            panic!("UringRess server failed to start");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    
+    // Generate realistic HTTP workload for sustained profiling
+    println!("2. Generating realistic HTTP workload for 30 seconds...");
+    
+    let running = Arc::new(AtomicBool::new(true));
+    let mut handles = vec![];
+    
+    // Multiple concurrent load generators
+    for worker_id in 0..4 {
+        let running_clone = running.clone();
+        let handle = thread::spawn(move || {
+            let endpoints = [
+                "http://localhost:8080/api.json",
+                "http://localhost:8080/users.json", 
+                "http://localhost:8080/health",
+                "http://localhost:8080/dataset.json",
+            ];
+            
+            let mut requests = 0;
+            while running_clone.load(Ordering::Relaxed) {
+                for endpoint in &endpoints {
+                    if !running_clone.load(Ordering::Relaxed) { break; }
+                    
+                    // Make HTTP request
+                    let _ = std::process::Command::new("curl")
+                        .args(&["-s", "--max-time", "2", endpoint])
+                        .output();
+                    
+                    requests += 1;
+                    
+                    // Brief pause to maintain realistic load pattern
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            println!("Worker {} completed {} requests", worker_id, requests);
+        });
+        handles.push(handle);
+    }
+    
+    // Run workload for 30 seconds to get substantial profiling data
+    thread::sleep(Duration::from_secs(30));
+    
+    println!("3. Stopping workload generation...");
+    running.store(false, Ordering::Relaxed);
+    
+    // Wait for all workers to finish
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    println!("4. Stopping UringRess server...");
+    server.kill().unwrap();
+    let _ = server.wait();
+    
+    println!("✓ Real workload runtime flamegraph test completed successfully");
+    println!(""); 
+    println!("⚠️  WARNING: This test profiles CLIENT-SIDE operations (curl), not server!");
+    println!("");
+    println!("This test exercises:");
+    println!("- Real network I/O operations FROM CLIENT PERSPECTIVE");
+    println!("- HTTP request generation and response parsing"); 
+    println!("- Client connection management");
+    println!("- Concurrent client request processing");
+    println!("- Realistic client load patterns and timing");
+    println!("");
+    println!("❌ INCORRECT: This will profile curl, not UringRess server:");
+    println!("cargo flamegraph --profile profiling --output tests/integration/reports/cpu/runtime_workload.svg \\");
+    println!("  --test isolated_performance_profiling -- test_runtime_flamegraph_with_real_workload --nocapture");
+    println!("");
+    println!("✅ CORRECT: For server-side profiling use:");
+    println!("tests/integration/profiling/profile_server_runtime.sh");
 }

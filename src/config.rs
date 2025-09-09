@@ -13,6 +13,54 @@ pub enum Protocol {
     UDP,
 }
 
+/// Worker specialization configuration for optimized protocol handling
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerProtocol {
+    Http1,
+    Http2,
+    Tcp,
+}
+
+/// Individual worker configuration for protocol-specific optimization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// Worker ID (0-based index)
+    pub id: usize,
+    
+    /// Protocols this worker specializes in
+    pub protocols: Vec<WorkerProtocol>,
+    
+    /// Buffer size for this worker (optimized per protocol)
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub buffer_size: usize,
+    
+    /// Number of buffers to allocate for this worker
+    #[serde(default = "default_buffer_count")]
+    pub buffer_count: u16,
+    
+    /// Enable TCP_NODELAY for immediate packet transmission
+    #[serde(default)]
+    pub tcp_nodelay: bool,
+    
+    /// Enable TCP keepalive for connection health monitoring
+    #[serde(default)]
+    pub tcp_keepalive: bool,
+    
+    /// TCP keepalive idle time before first probe
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration", default = "default_tcp_keepalive_idle")]
+    pub tcp_keepalive_idle: Duration,
+    
+    /// TCP keepalive probe interval
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration", default = "default_tcp_keepalive_interval")]
+    pub tcp_keepalive_interval: Duration,
+    
+    /// TCP keepalive probe count
+    #[serde(default = "default_tcp_keepalive_probes")]
+    pub tcp_keepalive_probes: u32,
+}
+
 /// Gateway configuration following Kubernetes Gateway API specification
 /// Defines the infrastructure layer with listeners for different protocols and ports
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +69,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_name")]
     pub name: String,
     pub listeners: Vec<ListenerConfig>,
+    
+    /// Optional worker-specific configurations for protocol optimization
+    /// If not specified, falls back to worker_threads with default configurations
+    pub workers: Option<Vec<WorkerConfig>>,
+    
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
     #[serde(default = "default_api_port")]
@@ -33,6 +86,8 @@ pub struct GatewayConfig {
     pub connection_pool_size: usize,
     #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size", default = "default_buffer_pool_size")]
     pub buffer_pool_size: usize,
+    #[serde(default = "default_network_interface")]
+    pub network_interface: Option<String>,
 }
 
 /// Listener configuration defining protocol and port bindings
@@ -47,6 +102,10 @@ pub struct ListenerConfig {
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 /// TLS configuration for HTTPS/TLS listeners
@@ -102,6 +161,26 @@ fn default_buffer_pool_size() -> usize {
     64 * 1024 * 1024 // 64MB
 }
 
+fn default_network_interface() -> Option<String> {
+    None // Auto-detect or use "eth0" as fallback in implementation
+}
+
+fn default_buffer_count() -> u16 {
+    64 // Balanced between memory usage and performance
+}
+
+fn default_tcp_keepalive_idle() -> Duration {
+    Duration::from_secs(7200) // 2 hours - RFC default
+}
+
+fn default_tcp_keepalive_interval() -> Duration {
+    Duration::from_secs(75) // 75 seconds between probes - RFC default
+}
+
+fn default_tcp_keepalive_probes() -> u32 {
+    9 // 9 probes before considering connection dead - RFC default
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -113,19 +192,182 @@ impl Default for GatewayConfig {
                     port: 8080,
                     hostname: None,
                     tls: None,
+                    address: None,
+                    interface: None,
                 },
             ],
+            workers: None, // Use default worker configuration
             worker_threads: default_worker_threads(),
             api_port: default_api_port(),
             api_enabled: default_api_enabled(),
             io_uring_queue_depth: 256,
             connection_pool_size: 64,
             buffer_pool_size: default_buffer_pool_size(),
+            network_interface: default_network_interface(),
         }
     }
 }
 
 impl GatewayConfig {
+    /// Get effective worker configurations, generating defaults if none specified
+    pub fn get_worker_configs(&self) -> Vec<WorkerConfig> {
+        if let Some(ref workers) = self.workers {
+            workers.clone()
+        } else {
+            self.generate_default_worker_configs()
+        }
+    }
+    
+    /// Generate default worker configurations based on worker_threads
+    /// Creates protocol-specialized workers for optimal performance
+    fn generate_default_worker_configs(&self) -> Vec<WorkerConfig> {
+        let mut workers = Vec::with_capacity(self.worker_threads);
+        
+        // Strategy: Create balanced worker distribution
+        // - 50% HTTP workers (optimized for small buffers, low latency)
+        // - 50% TCP workers (optimized for large buffers, high throughput)
+        let http_workers = (self.worker_threads + 1) / 2; // Round up for HTTP
+        let tcp_workers = self.worker_threads - http_workers;
+        
+        // HTTP workers (small buffers for low latency)
+        for id in 0..http_workers {
+            workers.push(WorkerConfig {
+                id,
+                protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                buffer_size: 8192,  // 8KB for HTTP headers/small responses
+                buffer_count: default_buffer_count(),
+                tcp_nodelay: false, // HTTP can benefit from Nagle's algorithm
+                tcp_keepalive: false, // HTTP uses application-level keep-alive
+                tcp_keepalive_idle: default_tcp_keepalive_idle(),
+                tcp_keepalive_interval: default_tcp_keepalive_interval(),
+                tcp_keepalive_probes: default_tcp_keepalive_probes(),
+            });
+        }
+        
+        // TCP workers (large buffers for bulk transfers like SCP)
+        for id in http_workers..self.worker_threads {
+            workers.push(WorkerConfig {
+                id,
+                protocols: vec![WorkerProtocol::Tcp],
+                buffer_size: 65536, // 64KB for bulk data transfers
+                buffer_count: 16,   // Fewer buffers due to larger size
+                tcp_nodelay: true,  // Immediate transmission for interactive protocols
+                tcp_keepalive: true, // Enable connection health monitoring
+                tcp_keepalive_idle: Duration::from_secs(600), // 10 minutes for faster detection
+                tcp_keepalive_interval: Duration::from_secs(60), // 1 minute between probes
+                tcp_keepalive_probes: 5, // Fewer probes for faster timeout
+            });
+        }
+        
+        workers
+    }
+    
+    /// Get the effective number of workers
+    pub fn get_worker_count(&self) -> usize {
+        if let Some(ref workers) = self.workers {
+            workers.len()
+        } else {
+            self.worker_threads
+        }
+    }
+    
+    /// Validate worker configurations for consistency and correctness
+    pub fn validate_worker_configs(&self) -> Result<(), String> {
+        let worker_configs = self.get_worker_configs();
+        
+        if worker_configs.is_empty() {
+            return Err("At least one worker must be configured".to_string());
+        }
+        
+        // Check for unique and sequential worker IDs
+        let mut ids: Vec<usize> = worker_configs.iter().map(|w| w.id).collect();
+        ids.sort_unstable();
+        
+        for (expected, &actual) in ids.iter().enumerate() {
+            if expected != actual {
+                return Err(format!("Worker IDs must be sequential starting from 0. Expected {}, found {}", expected, actual));
+            }
+        }
+        
+        // Validate individual worker configurations
+        for worker in &worker_configs {
+            self.validate_single_worker_config(worker)?;
+        }
+        
+        // Ensure at least one worker supports each protocol if listeners require them
+        self.validate_protocol_coverage(&worker_configs)?;
+        
+        Ok(())
+    }
+    
+    /// Validate a single worker configuration
+    fn validate_single_worker_config(&self, worker: &WorkerConfig) -> Result<(), String> {
+        // Validate buffer size (minimum 1KB, maximum 1MB)
+        if worker.buffer_size < 1024 {
+            return Err(format!("Worker {}: buffer_size must be at least 1KB, got {}", worker.id, worker.buffer_size));
+        }
+        if worker.buffer_size > 1024 * 1024 {
+            return Err(format!("Worker {}: buffer_size must be at most 1MB, got {}", worker.id, worker.buffer_size));
+        }
+        
+        // Validate buffer count (minimum 1, maximum 1024)
+        if worker.buffer_count == 0 {
+            return Err(format!("Worker {}: buffer_count must be at least 1", worker.id));
+        }
+        if worker.buffer_count > 1024 {
+            return Err(format!("Worker {}: buffer_count must be at most 1024, got {}", worker.id, worker.buffer_count));
+        }
+        
+        // Validate protocol list is not empty
+        if worker.protocols.is_empty() {
+            return Err(format!("Worker {}: must support at least one protocol", worker.id));
+        }
+        
+        // Validate TCP keepalive settings if enabled
+        if worker.tcp_keepalive {
+            if worker.tcp_keepalive_idle.as_secs() == 0 {
+                return Err(format!("Worker {}: tcp_keepalive_idle must be > 0 when keepalive is enabled", worker.id));
+            }
+            if worker.tcp_keepalive_interval.as_secs() == 0 {
+                return Err(format!("Worker {}: tcp_keepalive_interval must be > 0 when keepalive is enabled", worker.id));
+            }
+            if worker.tcp_keepalive_probes == 0 {
+                return Err(format!("Worker {}: tcp_keepalive_probes must be > 0 when keepalive is enabled", worker.id));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Validate that required protocols are covered by at least one worker
+    fn validate_protocol_coverage(&self, workers: &[WorkerConfig]) -> Result<(), String> {
+        // Check for HTTP coverage if we have HTTP listeners
+        let has_http_listeners = self.listeners.iter().any(|l| matches!(l.protocol, Protocol::HTTP | Protocol::HTTPS));
+        
+        if has_http_listeners {
+            let has_http_workers = workers.iter().any(|w| 
+                w.protocols.contains(&WorkerProtocol::Http1) || 
+                w.protocols.contains(&WorkerProtocol::Http2)
+            );
+            
+            if !has_http_workers {
+                return Err("HTTP listeners configured but no workers support HTTP protocols".to_string());
+            }
+        }
+        
+        // Check for TCP coverage if we have TCP listeners
+        let has_tcp_listeners = self.listeners.iter().any(|l| l.protocol == Protocol::TCP);
+        
+        if has_tcp_listeners {
+            let has_tcp_workers = workers.iter().any(|w| w.protocols.contains(&WorkerProtocol::Tcp));
+            
+            if !has_tcp_workers {
+                return Err("TCP listeners configured but no workers support TCP protocol".to_string());
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 /// Root configuration structure for UringRess
@@ -813,14 +1055,18 @@ impl UringRessConfig {
                         port: 8080,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                 ],
+                workers: None, // Uses default: 1 HTTP worker (8KB buffers) + 1 TCP worker (64KB buffers)
                 worker_threads: 2,
                 api_port: 8081,
                 api_enabled: true,
                 io_uring_queue_depth: 128,
                 connection_pool_size: 32,
                 buffer_pool_size: 32 * 1024 * 1024, // 32MB
+                network_interface: Some("eth0".to_string()),
             },
             http_routes: vec![
                 HttpRouteConfig {
@@ -896,6 +1142,8 @@ impl UringRessConfig {
                         port: 8080,
                         hostname: None,
                         tls: None,
+                        address: Some("127.0.0.1".to_string()),
+                        interface: Some("lo".to_string()),
                     },
                     ListenerConfig {
                         name: "tcp-ssh".to_string(),
@@ -903,14 +1151,65 @@ impl UringRessConfig {
                         port: 2222,
                         hostname: None,
                         tls: None,
+                        address: Some("127.0.0.1".to_string()),
+                        interface: Some("lo".to_string()),
                     },
                 ],
-                worker_threads: 4,
+                workers: Some(vec![
+                    // HTTP workers - optimized for low latency
+                    WorkerConfig {
+                        id: 0,
+                        protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                        buffer_size: 8192,  // 8KB for HTTP headers
+                        buffer_count: 64,
+                        tcp_nodelay: false,
+                        tcp_keepalive: false,
+                        tcp_keepalive_idle: Duration::from_secs(7200),
+                        tcp_keepalive_interval: Duration::from_secs(75),
+                        tcp_keepalive_probes: 9,
+                    },
+                    WorkerConfig {
+                        id: 1,
+                        protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                        buffer_size: 8192,  // 8KB for HTTP headers  
+                        buffer_count: 64,
+                        tcp_nodelay: false,
+                        tcp_keepalive: false,
+                        tcp_keepalive_idle: Duration::from_secs(7200),
+                        tcp_keepalive_interval: Duration::from_secs(75),
+                        tcp_keepalive_probes: 9,
+                    },
+                    // TCP workers - optimized for bulk transfers (SCP, rsync, large file transfers)
+                    WorkerConfig {
+                        id: 2,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 65536, // 64KB for bulk data transfers
+                        buffer_count: 16,   // Fewer buffers due to larger size
+                        tcp_nodelay: true,  // Immediate transmission for interactive protocols
+                        tcp_keepalive: true, // Enable connection health monitoring
+                        tcp_keepalive_idle: Duration::from_secs(600), // 10 minutes for faster detection
+                        tcp_keepalive_interval: Duration::from_secs(60), // 1 minute between probes
+                        tcp_keepalive_probes: 5, // Fewer probes for faster timeout
+                    },
+                    WorkerConfig {
+                        id: 3,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 65536, // 64KB for bulk data transfers
+                        buffer_count: 16,   // Fewer buffers due to larger size
+                        tcp_nodelay: true,  // Immediate transmission for interactive protocols
+                        tcp_keepalive: true, // Enable connection health monitoring
+                        tcp_keepalive_idle: Duration::from_secs(600), // 10 minutes for faster detection
+                        tcp_keepalive_interval: Duration::from_secs(60), // 1 minute between probes
+                        tcp_keepalive_probes: 5, // Fewer probes for faster timeout
+                    },
+                ]),
+                worker_threads: 4, // Explicit worker count matches workers array
                 api_port: 8081,
                 api_enabled: true,
                 io_uring_queue_depth: 256,
                 connection_pool_size: 64,
                 buffer_pool_size: 64 * 1024 * 1024, // 64MB
+                network_interface: Some("eth0".to_string()),
             },
             http_routes: vec![
                 HttpRouteConfig {
@@ -1124,6 +1423,8 @@ impl UringRessConfig {
                         port: 80,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "http-8080".to_string(),
@@ -1131,6 +1432,8 @@ impl UringRessConfig {
                         port: 8080,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-5432".to_string(),
@@ -1138,6 +1441,8 @@ impl UringRessConfig {
                         port: 5432,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-6379".to_string(),
@@ -1145,14 +1450,57 @@ impl UringRessConfig {
                         port: 6379,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                 ],
-                worker_threads: num_cpus::get(),
+                workers: Some({
+                    let cpu_count = num_cpus::get();
+                    let mut workers = Vec::with_capacity(cpu_count);
+                    
+                    // Production: 50% HTTP workers, 50% TCP workers for balanced workload
+                    let http_workers = cpu_count / 2;
+                    let tcp_workers = cpu_count - http_workers;
+                    
+                    // HTTP workers - optimized for high-concurrency web traffic
+                    for id in 0..http_workers {
+                        workers.push(WorkerConfig {
+                            id,
+                            protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                            buffer_size: 8192,  // 8KB for HTTP headers and small responses
+                            buffer_count: 128,  // More buffers for high concurrency
+                            tcp_nodelay: false, // HTTP can benefit from Nagle's algorithm
+                            tcp_keepalive: false, // HTTP uses application-level keep-alive
+                            tcp_keepalive_idle: Duration::from_secs(7200),
+                            tcp_keepalive_interval: Duration::from_secs(75),
+                            tcp_keepalive_probes: 9,
+                        });
+                    }
+                    
+                    // TCP workers - optimized for high-throughput bulk transfers  
+                    for id in http_workers..cpu_count {
+                        workers.push(WorkerConfig {
+                            id,
+                            protocols: vec![WorkerProtocol::Tcp],
+                            buffer_size: 131072, // 128KB for maximum throughput
+                            buffer_count: 32,   // Balanced buffer count for production
+                            tcp_nodelay: true,  // Immediate transmission for protocols like SCP
+                            tcp_keepalive: true, // Production-grade connection monitoring
+                            tcp_keepalive_idle: Duration::from_secs(300), // 5 minutes for faster detection
+                            tcp_keepalive_interval: Duration::from_secs(30), // 30 seconds between probes
+                            tcp_keepalive_probes: 3, // Aggressive timeout for production
+                        });
+                    }
+                    
+                    workers
+                }),
+                worker_threads: num_cpus::get(), // Match dynamic worker count
                 api_port: 8090,
                 api_enabled: true,
                 io_uring_queue_depth: 512,
                 connection_pool_size: 256,
                 buffer_pool_size: 256 * 1024 * 1024, // 256MB
+                network_interface: Some("eth0".to_string()),
             },
             http_routes: vec![
                 // Integration test routes for compatibility
@@ -1422,6 +1770,8 @@ impl UringRessConfig {
                         port: 8080,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-5432".to_string(),
@@ -1429,6 +1779,8 @@ impl UringRessConfig {
                         port: 5432,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-6379".to_string(),
@@ -1436,6 +1788,8 @@ impl UringRessConfig {
                         port: 6379,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-3306".to_string(),
@@ -1443,6 +1797,8 @@ impl UringRessConfig {
                         port: 3306,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                     ListenerConfig {
                         name: "tcp-27017".to_string(),
@@ -1450,14 +1806,111 @@ impl UringRessConfig {
                         port: 27017,
                         hostname: None,
                         tls: None,
+                        address: None,
+                        interface: None,
                     },
                 ],
+                workers: Some(vec![
+                    // HTTP workers - optimized for API microservices
+                    WorkerConfig {
+                        id: 0,
+                        protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                        buffer_size: 8192,  // 8KB for REST API responses
+                        buffer_count: 96,   // High buffer count for API burst traffic
+                        tcp_nodelay: true,  // Low latency for API calls
+                        tcp_keepalive: false,
+                        tcp_keepalive_idle: Duration::from_secs(7200),
+                        tcp_keepalive_interval: Duration::from_secs(75),
+                        tcp_keepalive_probes: 9,
+                    },
+                    WorkerConfig {
+                        id: 1,
+                        protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                        buffer_size: 8192,  // 8KB for REST API responses
+                        buffer_count: 96,   // High buffer count for API burst traffic
+                        tcp_nodelay: true,  // Low latency for API calls
+                        tcp_keepalive: false,
+                        tcp_keepalive_idle: Duration::from_secs(7200),
+                        tcp_keepalive_interval: Duration::from_secs(75),
+                        tcp_keepalive_probes: 9,
+                    },
+                    // Database connection workers - PostgreSQL optimized
+                    WorkerConfig {
+                        id: 2,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 32768, // 32KB for database query results
+                        buffer_count: 32,
+                        tcp_nodelay: true,  // Fast database query responses
+                        tcp_keepalive: true, // Monitor long-running queries
+                        tcp_keepalive_idle: Duration::from_secs(1800), // 30 minutes for DB connections
+                        tcp_keepalive_interval: Duration::from_secs(60),
+                        tcp_keepalive_probes: 3,
+                    },
+                    WorkerConfig {
+                        id: 3,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 32768, // 32KB for database query results
+                        buffer_count: 32,
+                        tcp_nodelay: true,  // Fast database query responses
+                        tcp_keepalive: true, // Monitor long-running queries
+                        tcp_keepalive_idle: Duration::from_secs(1800), // 30 minutes for DB connections
+                        tcp_keepalive_interval: Duration::from_secs(60),
+                        tcp_keepalive_probes: 3,
+                    },
+                    // Redis/Cache workers - optimized for key-value operations
+                    WorkerConfig {
+                        id: 4,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 16384, // 16KB for Redis commands/responses
+                        buffer_count: 48,
+                        tcp_nodelay: true,  // Ultra-low latency for cache hits
+                        tcp_keepalive: true,
+                        tcp_keepalive_idle: Duration::from_secs(900), // 15 minutes for cache connections
+                        tcp_keepalive_interval: Duration::from_secs(30),
+                        tcp_keepalive_probes: 3,
+                    },
+                    WorkerConfig {
+                        id: 5,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 16384, // 16KB for Redis commands/responses
+                        buffer_count: 48,
+                        tcp_nodelay: true,  // Ultra-low latency for cache hits
+                        tcp_keepalive: true,
+                        tcp_keepalive_idle: Duration::from_secs(900), // 15 minutes for cache connections
+                        tcp_keepalive_interval: Duration::from_secs(30),
+                        tcp_keepalive_probes: 3,
+                    },
+                    // MongoDB workers - optimized for document operations
+                    WorkerConfig {
+                        id: 6,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 65536, // 64KB for large documents
+                        buffer_count: 24,
+                        tcp_nodelay: true,  // Fast document queries
+                        tcp_keepalive: true,
+                        tcp_keepalive_idle: Duration::from_secs(1200), // 20 minutes for document DB
+                        tcp_keepalive_interval: Duration::from_secs(45),
+                        tcp_keepalive_probes: 3,
+                    },
+                    WorkerConfig {
+                        id: 7,
+                        protocols: vec![WorkerProtocol::Tcp],
+                        buffer_size: 65536, // 64KB for large documents
+                        buffer_count: 24,
+                        tcp_nodelay: true,  // Fast document queries
+                        tcp_keepalive: true,
+                        tcp_keepalive_idle: Duration::from_secs(1200), // 20 minutes for document DB
+                        tcp_keepalive_interval: Duration::from_secs(45),
+                        tcp_keepalive_probes: 3,
+                    },
+                ]),
                 worker_threads: 8,
                 api_port: 8081,
                 api_enabled: true,
                 io_uring_queue_depth: 512,
                 connection_pool_size: 128,
                 buffer_pool_size: 128 * 1024 * 1024, // 128MB
+                network_interface: Some("eth0".to_string()),
             },
             http_routes: vec![
                 // API microservices routes
@@ -1820,6 +2273,10 @@ impl UringRessConfig {
     pub fn validate(&self) -> Result<()> {
         self.gateway.validate()?;
         
+        // Validate worker configurations
+        self.gateway.validate_worker_configs()
+            .map_err(|e| anyhow!("Worker configuration validation failed: {}", e))?;
+        
         for (i, route) in self.http_routes.iter().enumerate() {
             route.validate().map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
         }
@@ -1963,6 +2420,23 @@ impl ListenerConfig {
         }
         
         validate_port(self.port, "Listener port")?;
+        
+        // Validate interface name if specified
+        if let Some(ref interface) = self.interface {
+            if interface.is_empty() {
+                return Err(anyhow!("Interface name cannot be empty when specified"));
+            }
+            
+            // Basic interface name validation (Linux interface naming rules)
+            if interface.len() > 15 {
+                return Err(anyhow!("Interface name '{}' is too long (max 15 characters)", interface));
+            }
+            
+            // Interface names cannot contain certain characters
+            if interface.contains(' ') || interface.contains('/') || interface.contains(':') {
+                return Err(anyhow!("Interface name '{}' contains invalid characters", interface));
+            }
+        }
         
         Ok(())
     }
@@ -2253,7 +2727,7 @@ impl UringRessConfig {
 impl PerformanceConfig {
     /// Convert PerformanceConfig and GatewayConfig to RuntimeConfig
     /// All values are pre-computed at startup for zero runtime overhead
-    pub fn to_runtime_config(&self, gateway: &GatewayConfig) -> crate::runtime_config::RuntimeConfig {
+    pub fn to_runtime_config(&self, gateway: &GatewayConfig) -> Result<crate::runtime_config::RuntimeConfig> {
         use std::collections::HashMap;
         
         // Build listener map for zero-overhead protocol detection
@@ -2266,17 +2740,26 @@ impl PerformanceConfig {
                 Protocol::UDP => crate::runtime_config::Protocol::UDP,
             };
             
+            // Parse the address if provided
+            let address = if let Some(ref addr_str) = listener.address {
+                Some(addr_str.parse().map_err(|e| anyhow::anyhow!("Invalid listener address {}: {}", addr_str, e))?)
+            } else {
+                None
+            };
+            
             let listener_info = crate::runtime_config::ListenerInfo {
                 protocol,
+                address,
+                interface: listener.interface.clone(),
             };
             
             listeners.insert(listener.port, listener_info);
         }
         
-        crate::runtime_config::RuntimeConfig::new(
+        Ok(crate::runtime_config::RuntimeConfig::new(
             listeners,
             self.standard_buffer_size,
-        )
+        ))
     }
 }
 
@@ -2348,7 +2831,7 @@ mod tests {
                         "port": 8080
                     }
                 ],
-                "worker_threads": 4,
+                "worker_threads": 8,
                 "api_port": 8090,
                 "api_enabled": true,
                 "io_uring_queue_depth": 512,
@@ -2400,7 +2883,7 @@ mod tests {
                         "port": 5432
                     }
                 ],
-                "worker_threads": 4,
+                "worker_threads": 8,
                 "api_port": 8081,
                 "api_enabled": true,
                 "io_uring_queue_depth": 256,
@@ -2527,46 +3010,18 @@ mod tests {
         assert!(parsed_yaml.validate().is_ok());
     }
     
-    #[test]
-    #[ignore] // Run with cargo test generate_example_files -- --ignored
-    fn generate_example_files() {
-        use std::fs;
-        
-        // Create examples directory if it doesn't exist
-        fs::create_dir_all("examples").unwrap();
-        
-        // Generate minimal.json
-        let minimal = UringRessConfig::generate_minimal();
-        let json = minimal.to_json_pretty().unwrap();
-        fs::write("examples/minimal.json", json).unwrap();
-        
-        // Generate development.yaml
-        let development = UringRessConfig::generate_development();
-        let yaml = development.to_yaml_pretty().unwrap();
-        fs::write("examples/development.yaml", yaml).unwrap();
-        
-        // Generate production.json
-        let production = UringRessConfig::generate_production();
-        let json = production.to_json_pretty().unwrap();
-        fs::write("examples/production.json", json).unwrap();
-        
-        // Generate microservices.yaml
-        let microservices = UringRessConfig::generate_microservices();
-        let yaml = microservices.to_yaml_pretty().unwrap();
-        fs::write("examples/microservices.yaml", yaml).unwrap();
-        
-        println!("Generated example configuration files:");
-        println!("- examples/minimal.json");
-        println!("- examples/development.yaml");
-        println!("- examples/production.json");
-        println!("- examples/microservices.yaml");
-    }
+    
 }
 
 /// Print information about example configurations for CLI help
 pub fn print_example_config_info() {
-    println!("examples/minimal.json       - Basic single-service configuration");
-    println!("examples/development.yaml   - Multi-service development setup");
-    println!("examples/production.json    - Production configuration");
-    println!("examples/microservices.yaml - Complex routing for microservices");
+    println!("examples/minimal.json       - Basic single-service setup with default worker configuration");
+    println!("examples/development.yaml   - Multi-service development with explicit worker configs (SCP-optimized)");
+    println!("examples/production.json    - Production configuration with CPU-scaled workers");
+    println!("examples/microservices.yaml - Complex routing with database-optimized workers");
+    println!();
+    println!("🚀 Worker Configuration Features:");
+    println!("  • Protocol specialization: HTTP workers (8KB buffers) vs TCP workers (64KB+ buffers)");
+    println!("  • TCP optimization: tcp_nodelay for immediate transmission, aggressive keepalive");
+    println!("  • SCP performance: TCP workers solve stalling issues with large buffer optimization");
 }

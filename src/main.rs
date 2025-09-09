@@ -1,5 +1,8 @@
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::{info, error, warn};
+use std::time::Duration;
+use std::fs::OpenOptions;
+use std::path::Path;
 
 mod routing;
 mod parser;
@@ -9,12 +12,50 @@ mod cli;
 mod config;
 mod control_plane;
 mod uring_worker;
+mod ebpf;
 
 use control_plane::ControlPlane;
 use uring_worker::UringDataPlane;
 use runtime_config::RuntimeConfig;
 use cli::Args;
 use config::UringRessConfig;
+
+/// Parse duration string (e.g., "30s", "2m", "1h") to Duration
+fn parse_duration(duration_str: &str) -> Result<Duration> {
+    let duration_str = duration_str.trim();
+    
+    if duration_str.is_empty() {
+        return Err(anyhow::anyhow!("Duration cannot be empty"));
+    }
+    
+    // Extract number and unit
+    let (number_part, unit_part) = if let Some(pos) = duration_str.find(|c: char| c.is_alphabetic()) {
+        duration_str.split_at(pos)
+    } else {
+        // No unit, assume seconds
+        (duration_str, "s")
+    };
+    
+    let number: u64 = number_part.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid number in duration: {}", number_part))?;
+    
+    let duration = match unit_part {
+        "s" | "sec" | "second" | "seconds" => Duration::from_secs(number),
+        "m" | "min" | "minute" | "minutes" => Duration::from_secs(number * 60),
+        "h" | "hour" | "hours" => Duration::from_secs(number * 3600),
+        _ => return Err(anyhow::anyhow!("Invalid duration unit: {}. Use s, m, or h", unit_part)),
+    };
+    
+    if duration.as_secs() == 0 {
+        return Err(anyhow::anyhow!("Duration must be greater than 0"));
+    }
+    
+    if duration.as_secs() > 3600 {
+        return Err(anyhow::anyhow!("Duration cannot exceed 1 hour"));
+    }
+    
+    Ok(duration)
+}
 
 fn main() -> Result<()> {
     // Parse CLI arguments once at startup - startup overhead only
@@ -23,6 +64,21 @@ fn main() -> Result<()> {
     // Validate CLI arguments (before logging init)
     if let Err(error) = args.validate() {
         eprintln!("Invalid arguments: {}", error);
+        std::process::exit(1);
+    }
+    
+    // Handle config generation mode BEFORE eBPF validation - no eBPF needed for config generation
+    if args.is_generation_mode() {
+        // Initialize minimal logging for generation mode
+        init_logging(args.verbose);
+        return handle_generation_mode(&args);
+    }
+    
+    // FIRST: Validate eBPF system requirements - fail fast if not met
+    // Single codepath architecture: either works completely or fails completely
+    if let Err(e) = ebpf::validate_system_requirements() {
+        eprintln!("eBPF system requirements not met: {}", e);
+        eprintln!("UringRess uses single codepath architecture with no fallback behavior.");
         std::process::exit(1);
     }
     
@@ -41,7 +97,7 @@ fn main() -> Result<()> {
         info!("Loading configuration from file: {:?}", config_path);
         
         // Convert to runtime config - zero overhead after startup
-        let runtime_config = uringress_config.performance.to_runtime_config(&uringress_config.gateway);
+        let runtime_config = uringress_config.performance.to_runtime_config(&uringress_config.gateway)?;
         info!("Configuration loaded successfully from file");
         
         (runtime_config, Some(uringress_config))
@@ -66,22 +122,92 @@ fn main() -> Result<()> {
         return handle_example_config_mode(&args);
     }
     
-    // Handle config generation mode (after logging is initialized)
-    if args.is_generation_mode() {
-        return handle_generation_mode(&args);
-    }
-    
-    // Extract to compile-time equivalent constants - NO function calls
-    let num_workers: usize = if let Some(ref config) = use_file_routes {
-        config.gateway.worker_threads
+
+    // Handle CPU profiling mode
+    let profile_duration = if let Some(duration_str) = &args.profile_cpu {
+        Some(parse_duration(duration_str)?)
     } else {
-        args.workers.unwrap_or_else(|| {
+        None
+    };
+    
+    // Extract worker configurations - use dynamic configs if available, fallback to default generation
+    let worker_configs = if let Some(ref config) = use_file_routes {
+        config.gateway.get_worker_configs()
+    } else {
+        // Generate default worker configs for environment-based setup
+        let num_workers = args.workers.unwrap_or_else(|| {
             std::env::var("WORKER_THREADS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(4)
-        })
+                .unwrap_or(8)
+        });
+        
+        use crate::config::{WorkerConfig, WorkerProtocol};
+        use std::time::Duration;
+        
+        // Create balanced HTTP/TCP worker distribution for environment setup
+        let mut configs = Vec::with_capacity(num_workers);
+        let http_workers = (num_workers + 1) / 2; // Round up for HTTP
+        
+        // HTTP workers (first half)
+        for id in 0..http_workers {
+            configs.push(WorkerConfig {
+                id,
+                protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                buffer_size: 8192,  // 8KB for HTTP
+                buffer_count: 64,
+                tcp_nodelay: false,
+                tcp_keepalive: false,
+                tcp_keepalive_idle: Duration::from_secs(7200),
+                tcp_keepalive_interval: Duration::from_secs(75),
+                tcp_keepalive_probes: 9,
+            });
+        }
+        
+        // TCP workers (second half)
+        for id in http_workers..num_workers {
+            configs.push(WorkerConfig {
+                id,
+                protocols: vec![WorkerProtocol::Tcp],
+                buffer_size: 65536, // 64KB for TCP bulk transfers
+                buffer_count: 16,
+                tcp_nodelay: true,
+                tcp_keepalive: true,
+                tcp_keepalive_idle: Duration::from_secs(600),
+                tcp_keepalive_interval: Duration::from_secs(60),
+                tcp_keepalive_probes: 5,
+            });
+        }
+        
+        configs
     };
+    
+    // Validate worker configurations
+    if let Some(ref config) = use_file_routes {
+        // File-based configs are already validated in load_from_file
+    } else {
+        // Validate environment-generated worker configs
+        use crate::config::GatewayConfig;
+        let temp_gateway = GatewayConfig {
+            name: "temp".to_string(),
+            listeners: vec![],
+            workers: Some(worker_configs.clone()),
+            worker_threads: worker_configs.len(),
+            api_port: 8081,
+            api_enabled: false,
+            io_uring_queue_depth: 256,
+            connection_pool_size: 64,
+            buffer_pool_size: 64 * 1024 * 1024,
+            network_interface: None,
+        };
+        
+        if let Err(e) = temp_gateway.validate_worker_configs() {
+            eprintln!("Worker configuration validation failed: {}", e);
+            std::process::exit(1);
+        }
+        
+        info!("Worker configurations validated successfully");
+    }
     
     // Verbose level already used for early logging initialization
     
@@ -89,6 +215,76 @@ fn main() -> Result<()> {
     // Runtime config already loaded above from file or environment
     // Logging already initialized early in main()
     
+    // Initialize CPU profiling if requested
+    let profiler_guard = if let Some(duration) = profile_duration {
+        info!("Starting CPU profiling for {} seconds", duration.as_secs());
+        info!("Flamegraph will be generated automatically after profiling");
+        
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let output_dir = std::path::Path::new("tests/integration/reports/cpu");
+        std::fs::create_dir_all(output_dir)?;
+        let flamegraph_path = output_dir.join(format!("uringress_runtime_{}.svg", timestamp));
+        
+        // Start pprof CPU profiler - keep guard alive in main thread
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(1000) // 1000 Hz sampling
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to start profiler: {}", e))?;
+            
+        info!("CPU profiler started successfully");
+        
+        // Schedule flamegraph generation after profiling duration
+        let guard_clone = std::sync::Arc::new(std::sync::Mutex::new(Some(guard)));
+        let guard_for_thread = guard_clone.clone();
+        let flamegraph_path_for_thread = flamegraph_path.clone();
+        
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            info!("Profiling duration completed, generating flamegraph...");
+            
+            if let Ok(mut guard_opt) = guard_for_thread.lock() {
+                if let Some(guard) = guard_opt.take() {
+                    info!("Building profiling report...");
+                    match guard.report().build() {
+                        Ok(report) => {
+                            // Get sample count for debugging
+                            let samples = report.data.keys().len();
+                            info!("Profiling report built with {} unique stack traces", samples);
+                            
+                            if samples == 0 {
+                                info!("⚠ No samples collected - application may have been idle or profiling duration too short");
+                            } else {
+                                // Generate flamegraph
+                                let mut flamegraph_data = Vec::new();
+                                match report.flamegraph(&mut flamegraph_data) {
+                                    Ok(_) => {
+                                        info!("Flamegraph data generated, size: {} bytes", flamegraph_data.len());
+                                        
+                                        // Write to file
+                                        match std::fs::write(&flamegraph_path_for_thread, &flamegraph_data) {
+                                            Ok(_) => {
+                                                info!("✓ Flamegraph saved to: {}", flamegraph_path_for_thread.display());
+                                                info!("🔥 CPU profiling complete! 🔥");
+                                            }
+                                            Err(e) => error!("Failed to write flamegraph file: {}", e),
+                                        }
+                                    }
+                                    Err(e) => error!("Failed to generate flamegraph: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => error!("Failed to build profiling report: {}", e),
+                    }
+                }
+            }
+        });
+        
+        Some((guard_clone, flamegraph_path, duration))
+    } else {
+        None
+    };
+
     // Create hybrid runtime architecture: Tokio control plane + raw io_uring data plane
     info!("Starting UringRess with hybrid runtime architecture");
     info!("Control Plane: Tokio runtime for kube-rs compatibility");
@@ -106,25 +302,43 @@ fn main() -> Result<()> {
             info!("Starting Control Plane with Tokio runtime");
             
             // Create control plane
-            let control_plane = if let Some(config) = use_file_routes {
+            let mut control_plane = if let Some(config) = use_file_routes {
                 ControlPlane::new_with_config(config)?
             } else {
                 ControlPlane::new()?
             };
             
-            // Start control plane
+            // Start control plane with eBPF integration
             control_plane.start().await?;
             
             // Get routing table reference for data plane
-            let routing_table = control_plane.config_manager.get_routes();
+            let routing_table = control_plane.get_routes();
             
-            // Start data plane in separate threads with raw io_uring
-            let mut data_plane = UringDataPlane::new(num_workers);
+            // Start data plane in separate threads with raw io_uring and eBPF awareness
+            let mut data_plane = UringDataPlane::new(worker_configs.clone());
             data_plane.start(routing_table, runtime_config)?;
+            
+            // Attach SO_REUSEPORT eBPF programs to worker sockets
+            if let Some(listener_fds) = data_plane.get_listener_fds() {
+                info!("Attaching SO_REUSEPORT eBPF programs to {} worker sockets", listener_fds.len());
+                control_plane.attach_worker_reuseport_programs(&listener_fds)?;
+                info!("SO_REUSEPORT eBPF programs attached successfully - address-aware distribution enabled");
+                
+                // Release workers to start event loops after eBPF attachment
+                data_plane.start_workers_after_ebpf_attachment()?;
+                info!("Worker event loops started - ready to accept connections");
+            } else {
+                return Err(anyhow::anyhow!(
+                    "No listener FDs collected from data plane. \
+                    \nSingle codepath architecture requires eBPF socket attachment. \
+                    \nCause: Workers failed to create listeners or coordination error. \
+                    \nSolution: Check worker initialization logs above."
+                ));
+            }
             
             info!("UringRess hybrid architecture ready");
             info!("Control Plane: Tokio runtime (1 thread)");
-            info!("Data Plane: Raw io_uring ({} workers)", num_workers);
+            info!("Data Plane: Raw io_uring ({} workers)", worker_configs.len());
             
             // Wait for shutdown signal
             control_plane.wait_for_shutdown().await?;
@@ -143,6 +357,11 @@ fn main() -> Result<()> {
             error!("Control plane thread panicked: {:?}", e);
             return Err(anyhow::anyhow!("Control plane thread panicked"));
         }
+    }
+    
+    // Profiling guard cleanup (flamegraph is generated in background thread now)
+    if let Some((_guard, _flamegraph_path, _duration)) = profiler_guard {
+        info!("CPU profiling completed in background thread");
     }
     
     info!("UringRess shutdown complete");
@@ -237,6 +456,26 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Create a file writer for logging, creating parent directories if needed
+fn create_log_file_writer(path: &str) -> Result<std::fs::File> {
+    let log_path = Path::new(path);
+    
+    // Create parent directories if they don't exist
+    if let Some(parent) = log_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("Failed to create log directory {}: {}", parent.display(), e))?;
+        }
+    }
+    
+    // Open file with create and append options
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open log file {}: {}", path, e))
+}
+
 /// Initialize logging from config file settings with CLI verbose override
 fn init_logging_from_config(logging_config: &config::LoggingConfig, verbose_level: u8) {
     use tracing_subscriber::{fmt, EnvFilter};
@@ -281,8 +520,14 @@ fn init_logging_from_config(logging_config: &config::LoggingConfig, verbose_leve
                 LogOutput::Stdout => subscriber.init(),
                 LogOutput::Stderr => subscriber.with_writer(std::io::stderr).init(),
                 LogOutput::File(path) => {
-                    eprintln!("Warning: File logging not yet implemented, using stderr. Requested file: {}", path);
-                    subscriber.with_writer(std::io::stderr).init();
+                    match create_log_file_writer(path) {
+                        Ok(file) => subscriber.with_writer(file).init(),
+                        Err(e) => {
+                            eprintln!("Error: Failed to create log file '{}': {}", path, e);
+                            eprintln!("Falling back to stderr for logging");
+                            subscriber.with_writer(std::io::stderr).init();
+                        }
+                    }
                 }
             }
         }
@@ -301,8 +546,14 @@ fn init_logging_from_config(logging_config: &config::LoggingConfig, verbose_leve
                 LogOutput::Stdout => subscriber.init(),
                 LogOutput::Stderr => subscriber.with_writer(std::io::stderr).init(),
                 LogOutput::File(path) => {
-                    eprintln!("Warning: File logging not yet implemented, using stderr. Requested file: {}", path);
-                    subscriber.with_writer(std::io::stderr).init();
+                    match create_log_file_writer(path) {
+                        Ok(file) => subscriber.with_writer(file).init(),
+                        Err(e) => {
+                            eprintln!("Error: Failed to create log file '{}': {}", path, e);
+                            eprintln!("Falling back to stderr for logging");
+                            subscriber.with_writer(std::io::stderr).init();
+                        }
+                    }
                 }
             }
         }
@@ -321,8 +572,14 @@ fn init_logging_from_config(logging_config: &config::LoggingConfig, verbose_leve
                 LogOutput::Stdout => subscriber.init(),
                 LogOutput::Stderr => subscriber.with_writer(std::io::stderr).init(),
                 LogOutput::File(path) => {
-                    eprintln!("Warning: File logging not yet implemented, using stderr. Requested file: {}", path);
-                    subscriber.with_writer(std::io::stderr).init();
+                    match create_log_file_writer(path) {
+                        Ok(file) => subscriber.with_writer(file).init(),
+                        Err(e) => {
+                            eprintln!("Error: Failed to create log file '{}': {}", path, e);
+                            eprintln!("Falling back to stderr for logging");
+                            subscriber.with_writer(std::io::stderr).init();
+                        }
+                    }
                 }
             }
         }
@@ -457,6 +714,8 @@ fn load_runtime_config_from_env() -> RuntimeConfig {
     let mut listeners = HashMap::new();
     listeners.insert(http_port, ListenerInfo {
         protocol: Protocol::HTTP,
+        address: None, // Default to wildcard for environment variable mode
+        interface: None, // No interface binding for environment variable mode
     });
     
     RuntimeConfig::new(

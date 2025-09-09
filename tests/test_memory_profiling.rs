@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use uringress::parser::parse_http_headers_fast;
 use uringress::routing::{RouteTable, Backend, fnv_hash};
 use uringress::backend::PooledBuffer;
@@ -36,7 +36,7 @@ fn test_memory_profiling_parser_allocations() {
             // This should not allocate - all data should be string slices
             let result = parse_http_headers_fast(request);
             match result {
-                Ok((method, path, host)) => {
+                Ok((method, path, host, _)) => {
                     // Use the results to prevent optimization
                     std::hint::black_box((method.len(), path.len(), host.map(|h| h.len())));
                 }
@@ -159,7 +159,7 @@ fn test_memory_profiling_end_to_end_allocations() {
     // Warm up the full pipeline
     for _ in 0..100 {
         for request in &requests {
-            if let Ok((_, path, host)) = parse_http_headers_fast(request.as_bytes()) {
+            if let Ok((_, path, host, _)) = parse_http_headers_fast(request.as_bytes()) {
                 if let Some(host) = host {
                     let host_hash = fnv_hash(host);
                     let _ = table.route_http_request(host_hash, path);
@@ -181,7 +181,7 @@ fn test_memory_profiling_end_to_end_allocations() {
             // Full pipeline: parse + hash + route
             // This should have minimal allocations in steady state
             match parse_http_headers_fast(request.as_bytes()) {
-                Ok((method, path, host)) => {
+                Ok((method, path, host, _)) => {
                     if let Some(host) = host {
                         let host_hash = fnv_hash(host);
                         let result = table.route_http_request(host_hash, path);
@@ -273,7 +273,7 @@ fn test_memory_profiling_stress_test() {
     println!("Warming up memory pools and caches...");
     for _ in 0..100 {
         for request in &requests {
-            if let Ok((_, path, host)) = parse_http_headers_fast(request.as_bytes()) {
+            if let Ok((_, path, host, _)) = parse_http_headers_fast(request.as_bytes()) {
                 if let Some(host) = host {
                     let host_hash = fnv_hash(host);
                     let _ = table.route_http_request(host_hash, path);
@@ -296,7 +296,7 @@ fn test_memory_profiling_stress_test() {
         for request in &requests {
             // Full pipeline processing
             match parse_http_headers_fast(request.as_bytes()) {
-                Ok((method, path, host)) => {
+                Ok((method, path, host, _)) => {
                     if let Some(host) = host {
                         let host_hash = fnv_hash(host);
                         match table.route_http_request(host_hash, path) {

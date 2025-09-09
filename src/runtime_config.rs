@@ -4,6 +4,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ListenerInfo {
     pub protocol: Protocol,
+    pub address: Option<std::net::IpAddr>,
+    pub interface: Option<String>,
 }
 
 /// Protocol types for runtime use (simplified from config::Protocol)

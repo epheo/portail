@@ -64,6 +64,11 @@ pub struct Args {
     #[arg(help = "Output file path for generated configuration (stdout if not specified)")]
     #[arg(requires = "generate_config")]
     pub output: Option<PathBuf>,
+
+    /// Enable CPU profiling for specified duration (e.g., "30s", "1m")
+    #[arg(long, value_name = "DURATION")]
+    #[arg(help = "Enable CPU profiling and generate flamegraph for specified duration")]
+    pub profile_cpu: Option<String>,
 }
 
 impl Args {
@@ -150,6 +155,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert!(args.validate().is_ok());
 
@@ -164,6 +170,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert!(args.validate().is_ok());
 
@@ -178,6 +185,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert!(args.validate().is_err());
     }
@@ -195,6 +203,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert!(args.validate().is_err());
 
@@ -209,6 +218,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert!(args.validate().is_err());
     }
@@ -227,6 +237,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            profile_cpu: None,
         };
         assert_eq!(args.workers.unwrap(), 8);
     }

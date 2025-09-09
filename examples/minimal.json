@@ -8,12 +8,14 @@
         "port": 8080
       }
     ],
+    "workers": null,
     "worker_threads": 2,
     "api_port": 8081,
     "api_enabled": true,
     "io_uring_queue_depth": 128,
     "connection_pool_size": 32,
-    "buffer_pool_size": "32MB"
+    "buffer_pool_size": "32MB",
+    "network_interface": "eth0"
   },
   "http_routes": [
     {

@@ -41,7 +41,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         b.iter(|| {
             for request in requests {
                 // Parse HTTP request
-                let (method, path, host) = parse_http_headers_fast(request).unwrap();
+                let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
                 
                 // Route request
                 if let Some(host) = host {
@@ -57,7 +57,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
     c.bench_function("e2e_single_auth_request", |b| {
         let request = b"POST /login HTTP/1.1\r\nHost: auth.api.com\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n";
         b.iter(|| {
-            let (method, path, host) = parse_http_headers_fast(request).unwrap();
+            let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
             if let Some(host) = host {
                 let host_hash = fnv_hash(host);
                 let backend = table.route_http_request(host_hash, path);
@@ -69,7 +69,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
     c.bench_function("e2e_single_product_search", |b| {
         let request = b"GET /search?q=electronics&category=phones&sort=price HTTP/1.1\r\nHost: products.api.com\r\nAccept: application/json\r\nUser-Agent: mobile-app/2.1\r\n\r\n";
         b.iter(|| {
-            let (method, path, host) = parse_http_headers_fast(request).unwrap();
+            let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
             if let Some(host) = host {
                 let host_hash = fnv_hash(host);
                 let backend = table.route_http_request(host_hash, path);
@@ -86,7 +86,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         health_table.add_http_route("api.com", "/health", health_backend);
         
         b.iter(|| {
-            let (method, path, host) = parse_http_headers_fast(request).unwrap();
+            let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
             if let Some(host) = host {
                 let host_hash = fnv_hash(host);
                 let backend = health_table.route_http_request(host_hash, path);
@@ -99,7 +99,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
     c.bench_function("e2e_404_route_processing", |b| {
         let request = b"GET /nonexistent HTTP/1.1\r\nHost: unknown.api.com\r\n\r\n";
         b.iter(|| {
-            let (method, path, host) = parse_http_headers_fast(request).unwrap();
+            let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
             if let Some(host) = host {
                 let host_hash = fnv_hash(host);
                 let backend = table.route_http_request(host_hash, path);
@@ -135,7 +135,7 @@ fn throughput_simulation(c: &mut Criterion) {
             // Process 800 requests to popular services
             for _ in 0..800 {
                 for request in popular_requests.iter().take(4) { // Cycle through top 4 services
-                    let (method, path, host) = parse_http_headers_fast(request.as_bytes()).unwrap();
+                    let (method, path, host, _) = parse_http_headers_fast(request.as_bytes()).unwrap();
                     if let Some(host) = host {
                         let host_hash = fnv_hash(host);
                         let backend = table.route_http_request(host_hash, path);
@@ -146,7 +146,7 @@ fn throughput_simulation(c: &mut Criterion) {
             
             // Process 200 requests to regular services
             for request in regular_requests.iter().take(200) {
-                let (method, path, host) = parse_http_headers_fast(request.as_bytes()).unwrap();
+                let (method, path, host, _) = parse_http_headers_fast(request.as_bytes()).unwrap();
                 if let Some(host) = host {
                     let host_hash = fnv_hash(host);
                     let backend = table.route_http_request(host_hash, path);
@@ -173,7 +173,7 @@ fn latency_scenarios(c: &mut Criterion) {
     for (name, request) in &scenarios {
         c.bench_function(&format!("latency_scenario_{}", name), |b| {
             b.iter(|| {
-                let (method, path, host) = parse_http_headers_fast(request).unwrap();
+                let (method, path, host, _) = parse_http_headers_fast(request).unwrap();
                 if let Some(host) = host {
                     let host_hash = fnv_hash(host);
                     let backend = table.route_http_request(host_hash, path);

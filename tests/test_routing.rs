@@ -23,7 +23,7 @@ fn test_route_table_creation() {
     assert!(table.http_routes.is_empty());
     assert!(table.tcp_routes.is_empty());
     assert!(table.default_http_backend.is_none());
-    assert!(table.default_tcp_backend.is_none());
+    // Note: RouteTable doesn't have default_tcp_backend field in current implementation
 }
 
 #[test]

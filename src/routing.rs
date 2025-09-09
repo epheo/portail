@@ -291,7 +291,10 @@ impl Backend {
     
 }
 
-/// FNV hash implementation with minimal overhead for sub-100ns performance
+/// FNV hash implementation for Rust layer host-based routing
+/// Note: eBPF also implements FNV hash for worker selection - both are needed
+/// - eBPF FNV: Address + protocol → worker selection (kernel space)
+/// - Rust FNV: Host header → route table lookup (user space)
 #[inline(always)]
 pub fn fnv_hash(data: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
@@ -300,8 +303,7 @@ pub fn fnv_hash(data: &str) -> u64 {
     let bytes = data.as_bytes();
     let mut hash = FNV_OFFSET_BASIS;
     
-    // Simple tight loop - let the compiler optimize
-    // Simple loop allows compiler optimization for small strings (typical hostnames)
+    // Simple tight loop - matches eBPF implementation pattern
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);

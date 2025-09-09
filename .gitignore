@@ -1,2 +1,7 @@
 target/
+
 tests/integration/test-content/
+
+programs/*.o
+
+

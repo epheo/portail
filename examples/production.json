@@ -23,12 +23,285 @@
         "port": 6379
       }
     ],
+    "workers": [
+      {
+        "id": 0,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 1,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 2,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 3,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 4,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 5,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 6,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 7,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 8,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 9,
+        "protocols": [
+          "http1",
+          "http2"
+        ],
+        "buffer_size": "8KB",
+        "buffer_count": 128,
+        "tcp_nodelay": false,
+        "tcp_keepalive": false,
+        "tcp_keepalive_idle": "2h",
+        "tcp_keepalive_interval": "1m",
+        "tcp_keepalive_probes": 9
+      },
+      {
+        "id": 10,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 11,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 12,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 13,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 14,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 15,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 16,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 17,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 18,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      },
+      {
+        "id": 19,
+        "protocols": [
+          "tcp"
+        ],
+        "buffer_size": "128KB",
+        "buffer_count": 32,
+        "tcp_nodelay": true,
+        "tcp_keepalive": true,
+        "tcp_keepalive_idle": "5m",
+        "tcp_keepalive_interval": "30s",
+        "tcp_keepalive_probes": 3
+      }
+    ],
     "worker_threads": 20,
     "api_port": 8090,
     "api_enabled": true,
     "io_uring_queue_depth": 512,
     "connection_pool_size": 256,
-    "buffer_pool_size": "256MB"
+    "buffer_pool_size": "256MB",
+    "network_interface": "eth0"
   },
   "http_routes": [
     {

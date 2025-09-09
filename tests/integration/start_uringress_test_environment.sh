@@ -19,7 +19,8 @@ else
 fi
 
 # Use absolute paths for all binaries and directories
-URINGRESS_BINARY="$PROJECT_ROOT/target/release/uringress"
+# Use profiling binary for meaningful flamegraphs with debug symbols
+URINGRESS_BINARY="$PROJECT_ROOT/target/profiling/uringress"
 TEST_CONTENT_DIR="$SCRIPT_DIR/test-content"
 INTEGRATION_DIR="$SCRIPT_DIR"
 
@@ -83,11 +84,19 @@ check_dependencies() {
         exit 1
     fi
     
-    # Check UringRess binary
+    # Check UringRess binary - build if needed
     if [[ ! -f ${URINGRESS_BINARY} ]]; then
-        print_status $RED "ERROR: UringRess binary not found at ${URINGRESS_BINARY}"
-        print_status $YELLOW "Please build UringRess first: cargo build --release"
-        exit 1
+        print_status $YELLOW "UringRess profiling binary not found, building it..."
+        print_status $BLUE "Running: cargo build --profile profiling"
+        cd "$PROJECT_ROOT"
+        if cargo build --profile profiling; then
+            print_status $GREEN "✓ UringRess profiling binary built successfully"
+        else
+            print_status $RED "✗ Failed to build UringRess profiling binary"
+            exit 1
+        fi
+    else
+        print_status $GREEN "✓ UringRess profiling binary found"
     fi
     
     # Check other required tools
@@ -278,7 +287,16 @@ create_tmux_session() {
     
     # Start UringRess
     print_status $BLUE "Starting UringRess..."
-    tmux send-keys -t ${SESSION_NAME}:uringress "echo 'UringRess Proxy Server' && echo 'Starting with configuration from development.yaml...' && cd '$PROJECT_ROOT' && '$URINGRESS_BINARY' --config '$PROJECT_ROOT/examples/development.yaml' 2>&1 | tee /tmp/uringress-test.log" Enter
+    
+    # Check if profiling is requested
+    local profile_args=""
+    if [[ "${2:-}" == "profile" ]]; then
+        local profile_duration="${3:-30s}"
+        profile_args="--profile-cpu $profile_duration"
+        print_status $BLUE "Profiling enabled for duration: $profile_duration"
+    fi
+    
+    tmux send-keys -t ${SESSION_NAME}:uringress "echo 'UringRess Proxy Server' && echo 'Starting with configuration from development.yaml...' && cd '$PROJECT_ROOT' && '$URINGRESS_BINARY' --config '$PROJECT_ROOT/examples/development.yaml' $profile_args 2>&1 | tee /tmp/uringress-test.log" Enter
     
     # Create testing window
     tmux new-window -t ${SESSION_NAME} -n "testing"
@@ -474,22 +492,24 @@ show_usage() {
     cat <<EOF
 ${BLUE}UringRess tmux Test Environment${NC}
 
-${GREEN}Usage:${NC} $0 [command]
+${GREEN}Usage:${NC} $0 [command] [options]
 
 ${GREEN}Commands:${NC}
-    ${YELLOW}start${NC}     - Start the complete test environment
-    ${YELLOW}attach${NC}    - Attach to existing tmux session
-    ${YELLOW}stop${NC}      - Stop all services and kill tmux session
-    ${YELLOW}status${NC}    - Show status of all services
-    ${YELLOW}test${NC}      - Run automated tests (session must be running)
-    ${YELLOW}logs${NC}      - Show UringRess logs
+    ${YELLOW}start${NC}                    - Start the complete test environment
+    ${YELLOW}start profile [duration]${NC} - Start with CPU profiling enabled (e.g., "30s", "2m")
+    ${YELLOW}attach${NC}                   - Attach to existing tmux session
+    ${YELLOW}stop${NC}                     - Stop all services and kill tmux session
+    ${YELLOW}status${NC}                   - Show status of all services
+    ${YELLOW}test${NC}                     - Run automated tests (session must be running)
+    ${YELLOW}logs${NC}                     - Show UringRess logs
 
 ${GREEN}Examples:${NC}
-    $0 start          # Start everything
-    $0 attach         # Attach to running session
-    $0 test           # Run automated tests
-    $0 status         # Check what's running
-    $0 stop           # Clean shutdown
+    $0 start                 # Start everything
+    $0 start profile 60s     # Start with 60-second CPU profiling
+    $0 attach                # Attach to running session
+    $0 test                  # Run automated tests
+    $0 status                # Check what's running
+    $0 stop                  # Clean shutdown
 
 ${GREEN}tmux Navigation:${NC}
     Ctrl+b, 0-3       # Switch between windows

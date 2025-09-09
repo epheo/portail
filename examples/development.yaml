@@ -4,15 +4,63 @@ gateway:
   - name: http
     protocol: HTTP
     port: 8080
+    address: 127.0.0.1
+    interface: lo
   - name: tcp-ssh
     protocol: TCP
     port: 2222
+    address: 127.0.0.1
+    interface: lo
+  workers:
+  - id: 0
+    protocols:
+    - http1
+    - http2
+    buffer_size: 8KB
+    buffer_count: 64
+    tcp_nodelay: false
+    tcp_keepalive: false
+    tcp_keepalive_idle: 2h
+    tcp_keepalive_interval: 1m
+    tcp_keepalive_probes: 9
+  - id: 1
+    protocols:
+    - http1
+    - http2
+    buffer_size: 8KB
+    buffer_count: 64
+    tcp_nodelay: false
+    tcp_keepalive: false
+    tcp_keepalive_idle: 2h
+    tcp_keepalive_interval: 1m
+    tcp_keepalive_probes: 9
+  - id: 2
+    protocols:
+    - tcp
+    buffer_size: 64KB
+    buffer_count: 16
+    tcp_nodelay: true
+    tcp_keepalive: true
+    tcp_keepalive_idle: 10m
+    tcp_keepalive_interval: 1m
+    tcp_keepalive_probes: 5
+  - id: 3
+    protocols:
+    - tcp
+    buffer_size: 64KB
+    buffer_count: 16
+    tcp_nodelay: true
+    tcp_keepalive: true
+    tcp_keepalive_idle: 10m
+    tcp_keepalive_interval: 1m
+    tcp_keepalive_probes: 5
   worker_threads: 4
   api_port: 8081
   api_enabled: true
   io_uring_queue_depth: 256
   connection_pool_size: 64
   buffer_pool_size: 64MB
+  network_interface: eth0
 http_routes:
 - parent_refs:
   - name: development-gateway
@@ -116,8 +164,8 @@ tcp_routes:
 observability:
   logging:
     level: debug
-    format: pretty
-    output: stdout
+    format: compact
+    output: !file "/var/log/uringress/uringress.log"
   metrics:
     enabled: true
     port: 9091

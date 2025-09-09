@@ -149,9 +149,10 @@ test_throughput_ab() {
     for concurrency in 1 10 25 50; do
         echo "Testing with $concurrency concurrent connections (1000 requests):"
         
-        local ab_output=$(ab -n 1000 -c $concurrency -q "$PROXY_URL/api.json" 2>/dev/null)
+        local ab_output=$(timeout 30s ab -n 1000 -c $concurrency -k "$PROXY_URL/api.json" 2>&1)
+        local ab_exit_code=$?
         
-        if [[ $? -eq 0 ]]; then
+        if [[ $ab_exit_code -eq 0 ]]; then
             echo "$ab_output" | grep -E "(Requests per second|Time per request|Failed requests|Transfer rate)" | sed 's/^/  /'
             # Capture RPS for summary (take the 50 concurrent test as most representative)
             if [[ $concurrency -eq 50 ]]; then
@@ -249,7 +250,7 @@ test_memory_usage() {
     echo -e "${BLUE}=== Memory Usage Test ===${NC}"
     echo "Monitoring UringRess memory usage during load..."
     
-    local uringress_pid=$(pgrep -f "uringress" 2>/dev/null || echo "")
+    local uringress_pid=$(pgrep -f "target/release/uringress" 2>/dev/null || pgrep -f "/uringress --config" 2>/dev/null || echo "")
     if [[ -z "$uringress_pid" ]]; then
         echo -e "${RED}UringRess process not found${NC}"
         return
@@ -274,7 +275,7 @@ test_memory_usage() {
         local monitor_pid=$!
         
         # Run load test
-        ab -n 3000 -c 20 -q "$PROXY_URL/api.json" > /dev/null 2>&1
+        timeout 30s ab -n 3000 -c 20 -k "$PROXY_URL/api.json" > /dev/null 2>&1
         
         # Stop monitoring
         kill $monitor_pid 2>/dev/null || true

@@ -51,7 +51,8 @@ fn bench_buffer_reuse(c: &mut Criterion) {
             buffer.copy_from_slice(&vec![0u8; 1024]);
         }
         
-        // TODO: Implement buffer pool stats for profiling analysis
+        // Initialize buffer pool stats tracking
+        uringress::backend::reset_pool_stats();
         
         b.iter(|| {
             for _ in 0..100 {
@@ -60,7 +61,10 @@ fn bench_buffer_reuse(c: &mut Criterion) {
             }
         });
         
-        // TODO: Add buffer pool reuse rate validation when stats are implemented
+        // Validate buffer pool reuse rate
+        let reuse_rate = uringress::backend::get_reuse_rate();
+        println!("Buffer reuse rate: {:.2}%", reuse_rate);
+        assert!(reuse_rate > 85.0, "Buffer reuse rate should be >85% but was {:.2}%", reuse_rate);
     });
     
     group.finish();
@@ -104,7 +108,10 @@ fn bench_zero_allocation_validation(c: &mut Criterion) {
             buffer.copy_from_slice(&vec![0u8; 1024]);
         }
         
-        // TODO: Track pre-benchmark buffer pool stats
+        // Track pre-benchmark buffer pool stats
+        let (initial_pool_size, initial_reuse_count, initial_total) = uringress::backend::get_pool_stats();
+        println!("Initial buffer pool stats - Size: {}, Reuse: {}, Total: {}", 
+                 initial_pool_size, initial_reuse_count, initial_total);
         
         b.iter(|| {
             // Simulate typical request processing
@@ -113,9 +120,21 @@ fn bench_zero_allocation_validation(c: &mut Criterion) {
             black_box(buffer.as_mut_vec().len())
         });
         
-        // TODO: Validate steady state has zero new allocations
+        // Validate steady state has high reuse rate (indicating minimal new allocations)
+        let (final_pool_size, final_reuse_count, final_total) = uringress::backend::get_pool_stats();
+        let steady_state_reuse_rate = if final_total > initial_total {
+            ((final_reuse_count - initial_reuse_count) as f64 / (final_total - initial_total) as f64) * 100.0
+        } else {
+            0.0
+        };
         
-        // TODO: Add allocation rate validation when stats are implemented
+        println!("Steady state buffer pool stats - Size: {}, Reuse: {}, Total: {}", 
+                 final_pool_size, final_reuse_count, final_total);
+        println!("Steady state reuse rate: {:.2}%", steady_state_reuse_rate);
+        
+        // In steady state, we expect very high reuse rates (>99%)
+        assert!(steady_state_reuse_rate > 99.0, 
+               "Steady state should have >99% reuse rate but was {:.2}%", steady_state_reuse_rate);
     });
     
     group.finish();

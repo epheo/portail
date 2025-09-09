@@ -99,7 +99,7 @@ fn test_cpu_profiling_end_to_end_hot_path() {
     for _ in 0..iterations {
         for request in &requests {
             // Parse request
-            let (_, path, host) = parse_http_headers_fast(request.as_bytes()).unwrap();
+            let (_, path, host, _) = parse_http_headers_fast(request.as_bytes()).unwrap();
             
             // Route request
             if let Some(host) = host {
@@ -194,7 +194,7 @@ fn test_cpu_profiling_stress_test() {
         for request in &requests {
             // Full pipeline: parse + route + select backend
             match parse_http_headers_fast(request.as_bytes()) {
-                Ok((_, path, host)) => {
+                Ok((_, path, host, _)) => {
                     if let Some(host) = host {
                         let host_hash = fnv_hash(host);
                         let result = table.route_http_request(host_hash, path);

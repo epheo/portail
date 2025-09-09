@@ -32,35 +32,32 @@ pub struct HeaderInfo<'a> {
     pub content_length: Option<usize>,
 }
 
-/// HTTP header parsing with zero allocations
-/// Returns (method, path, host, connection) as string slices referencing the original buffer
-/// Target: <300ns parsing time for typical requests (true single-pass optimization)
+/// HTTP header parsing for Rust application layer
+/// Returns only (path, host, connection) - eBPF handles protocol detection
+/// Note: Method detection removed since eBPF handles protocol classification
 #[inline(always)]
-pub fn parse_http_headers_fast(request: &[u8]) -> Result<(&str, &str, Option<&str>, ConnectionType)> {
+pub fn parse_http_headers_for_routing(request: &[u8]) -> Result<(&str, Option<&str>, ConnectionType)> {
     // Fast bounds check
     if request.len() < 16 {  // Minimum for "GET / HTTP/1.1\r\n\r\n"
         return Err(anyhow!("Request too short"));
     }
 
-    // Single-pass parsing: extract method, path, and find host in one scan
-    parse_http_single_pass(request)
+    // Extract only what Rust routing layer needs (not method - eBPF handles that)
+    parse_http_for_routing(request)
 }
 
-/// Single-pass HTTP parsing that combines method, path, host, and connection extraction
-/// Eliminates multiple scans through the request data for maximum performance
+/// Simplified HTTP parsing for routing layer - eBPF handles protocol detection
+/// Only extracts path and headers needed by Rust application layer
 #[inline(always)]
-fn parse_http_single_pass(request: &[u8]) -> Result<(&str, &str, Option<&str>, ConnectionType)> {
+fn parse_http_for_routing(request: &[u8]) -> Result<(&str, Option<&str>, ConnectionType)> {
     let mut pos = 0;
     
-    // Parse method (first token before space)
+    // Skip method (eBPF already classified this as HTTP)
     let method_end = find_next_space(request, pos)
         .ok_or_else(|| anyhow!("Invalid request line: no space after method"))?;
-    
-    // SAFETY: HTTP method contains only ASCII chars
-    let method = unsafe { std::str::from_utf8_unchecked(&request[0..method_end]) };
     pos = method_end + 1;
     
-    // Parse path (second token before space)
+    // Parse path (needed for routing)
     let path_end = find_next_space(request, pos)
         .ok_or_else(|| anyhow!("Invalid request line: no space after path"))?;
     
@@ -68,20 +65,10 @@ fn parse_http_single_pass(request: &[u8]) -> Result<(&str, &str, Option<&str>, C
     let path = unsafe { std::str::from_utf8_unchecked(&request[pos..path_end]) };
     pos = path_end + 1;
     
-    // Validate HTTP version is present (third token)
-    let version_start = pos;
+    // Skip HTTP version validation (eBPF already validated)
     let mut version_end = pos;
     while version_end < request.len() && request[version_end] != b'\r' {
         version_end += 1;
-    }
-    
-    if version_end == version_start {
-        return Err(anyhow!("Invalid request line: missing HTTP version"));
-    }
-    
-    // Basic validation that it looks like HTTP version
-    if version_end - version_start < 8 || !request[version_start..version_start + 5].eq_ignore_ascii_case(b"HTTP/") {
-        return Err(anyhow!("Invalid request line: malformed HTTP version"));
     }
     
     // Find end of request line and start of headers
@@ -92,12 +79,14 @@ fn parse_http_single_pass(request: &[u8]) -> Result<(&str, &str, Option<&str>, C
         return Err(anyhow!("Invalid request line: missing CRLF"));
     }
     
-    // Single-pass header extraction for Host and Connection
+    // Extract only headers needed for routing (Host and Connection)
     let headers_section = &request[pos..];
     let (host, connection) = extract_request_headers(headers_section)?;
     
-    Ok((method, path, host, connection))
+    Ok((path, host, connection))
 }
+
+
 
 
 /// Universal high-performance header parser for both requests and responses
@@ -162,7 +151,7 @@ fn extract_headers<'a>(headers: &'a [u8], parser_type: ParserType) -> Result<Hea
             }
         }
         // Content-Length header check (responses only) - requires 15 bytes minimum
-        else if needs_content_length && content_length.is_none() && pos + 14 < headers.len() &&
+        if needs_content_length && content_length.is_none() && pos + 14 < headers.len() &&
            (headers[pos] | 0x20) == b'c' &&
            (headers[pos + 1] | 0x20) == b'o' &&
            (headers[pos + 2] | 0x20) == b'n' &&
@@ -307,14 +296,6 @@ fn extract_headers<'a>(headers: &'a [u8], parser_type: ParserType) -> Result<Hea
         content_length,
     })
 }
-
-/// Compatibility wrapper for existing request parsing code
-#[inline(always)]
-fn extract_request_headers(headers: &[u8]) -> Result<(Option<&str>, ConnectionType)> {
-    let header_info = extract_headers(headers, ParserType::Request)?;
-    Ok((header_info.host, header_info.connection_type))
-}
-
 
 /// HTTP response information
 #[derive(Debug, Clone)]
@@ -471,5 +452,10 @@ fn find_next_space(data: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-
+/// Compatibility wrapper for existing request parsing code
+#[inline(always)]
+fn extract_request_headers(headers: &[u8]) -> Result<(Option<&str>, ConnectionType)> {
+    let header_info = extract_headers(headers, ParserType::Request)?;
+    Ok((header_info.host, header_info.connection_type))
+}
 
