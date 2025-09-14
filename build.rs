@@ -1,41 +1,80 @@
-use std::env;
-use std::path::Path;
+use std::{env, fs, path::PathBuf, process::Command};
+use anyhow::{Result, anyhow, Context};
 
-fn main() {
-    println!("cargo:rerun-if-changed=uringress-ebpf/src/main.rs");
-    println!("cargo:rerun-if-changed=uringress-ebpf/.cargo/config.toml");
+fn main() -> Result<()> {
+    println!("cargo:warning=Building eBPF program from source...");
     
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let dest = format!("{}/sk_reuseport", out_dir);
+    // Set up paths
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
+        .map_err(|_| anyhow!("CARGO_MANIFEST_DIR not set"))?;
+    let out_dir = env::var("OUT_DIR")
+        .map_err(|_| anyhow!("OUT_DIR not set"))?;
+    let ebpf_dir = PathBuf::from(&manifest_dir).join("uringress-ebpf");
     
-    // Always ensure we have the latest eBPF binary embedded
-    println!("cargo:warning=Ensuring latest eBPF program is embedded...");
+    // Add dependency tracking
+    println!("cargo:rerun-if-changed={}", ebpf_dir.join("src").display());
+    println!("cargo:rerun-if-changed={}", ebpf_dir.join("Cargo.toml").display());
     
-    let workspace_src = "uringress-ebpf/target/bpfel-unknown-none/release/sk_reuseport";
-    let mut copied = false;
-    
-    if Path::new(workspace_src).exists() {
-        match std::fs::copy(workspace_src, &dest) {
-            Ok(bytes) => {
-                println!("cargo:warning=✅ eBPF program embedded: {} ({} bytes)", workspace_src, bytes);
-                copied = true;
-            }
-            Err(e) => {
-                println!("cargo:warning=❌ Failed to copy eBPF binary: {}", e);
-            }
-        }
+    // Determine target architecture  
+    let endian = env::var("CARGO_CFG_TARGET_ENDIAN")
+        .map_err(|_| anyhow!("CARGO_CFG_TARGET_ENDIAN not set"))?;
+    let target = if endian == "big" {
+        "bpfeb-unknown-none"
+    } else if endian == "little" {
+        "bpfel-unknown-none"
     } else {
-        println!("cargo:warning=❌ eBPF binary not found at: {}", workspace_src);
-        println!("cargo:warning=Please build it first with:");
-        println!("cargo:warning=  cd uringress-ebpf && cargo +nightly build --release -Z build-std=core");
+        return Err(anyhow!("unsupported endian={endian:?}"));
+    };
+    
+    let arch = env::var("CARGO_CFG_TARGET_ARCH")
+        .map_err(|_| anyhow!("CARGO_CFG_TARGET_ARCH not set"))?;
+    
+    // Build the eBPF program directly
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "+nightly",
+        "build",
+        "--release",
+        "--target", target,
+        "-Z", "build-std=core",
+        "--bin", "sk_reuseport"
+    ])
+    .current_dir(&ebpf_dir)
+    .env("CARGO_CFG_BPF_TARGET_ARCH", &arch)
+    .env("RUSTFLAGS", "-C debuginfo=2 -C link-arg=--btf");
+    
+    // Remove RUSTC env vars that might interfere with nightly toolchain selection
+    cmd.env_remove("RUSTC")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    
+    println!("cargo:warning=Running: {:?}", cmd);
+    let output = cmd.output()
+        .with_context(|| format!("failed to execute cargo build for eBPF"))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!("eBPF build failed:\nstdout: {}\nstderr: {}", stdout, stderr));
     }
     
-    if !copied {
-        println!("cargo:warning=eBPF binary not found at any location, creating empty stub");
-        println!("cargo:warning=To build with working eBPF:");
-        println!("cargo:warning=  1. cd uringress-ebpf");
-        println!("cargo:warning=  2. cargo +nightly build --release -Z build-std=core");
-        println!("cargo:warning=  3. cd .. && cargo build --release");
-        std::fs::write(&dest, b"").unwrap();
+    // Find and copy the built binary
+    let ebpf_binary_path = ebpf_dir
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("sk_reuseport");
+    
+    if !ebpf_binary_path.exists() {
+        return Err(anyhow!("eBPF binary not found at: {}", ebpf_binary_path.display()));
     }
+    
+    // Copy to OUT_DIR where the main program expects it
+    let dest_path = PathBuf::from(out_dir).join("sk_reuseport");
+    fs::copy(&ebpf_binary_path, &dest_path)
+        .with_context(|| format!("failed to copy eBPF binary to {}", dest_path.display()))?;
+    
+    let binary_size = fs::metadata(&dest_path)?.len();
+    println!("cargo:warning=✅ eBPF program built and embedded successfully ({} bytes)", binary_size);
+    
+    Ok(())
 }

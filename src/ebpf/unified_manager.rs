@@ -4,11 +4,22 @@
 
 use anyhow::{anyhow, Result};
 use aya::{
+    maps::ReusePortSockArray,
     programs::SkReuseport,
     Ebpf,
 };
-use std::os::unix::io::{RawFd, BorrowedFd};
+use std::os::unix::io::{RawFd, AsRawFd, BorrowedFd};
 use tracing::{info, debug, warn};
+
+/// Simple wrapper for RawFd that implements AsRawFd for ReusePortSockArray::set()
+/// This allows us to pass raw file descriptors to the socket array map
+struct SocketFdWrapper(RawFd);
+
+impl AsRawFd for SocketFdWrapper {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 /// Simplified eBPF manager for SO_REUSEPORT program only
 /// Required component - no optional wrapping or fallback behavior
@@ -43,9 +54,9 @@ impl UnifiedEbpfManager {
         
         {
             let prog: &mut SkReuseport = bpf
-                .program_mut("select_socket")
+                .program_mut("address_aware_worker_selector")
                 .ok_or_else(|| {
-                    anyhow!("SO_REUSEPORT program 'select_socket' not found. Available: {:?}", available_programs)
+                    anyhow!("SO_REUSEPORT program 'address_aware_worker_selector' not found. Available: {:?}", available_programs)
                 })?
                 .try_into()
                 .map_err(|e| anyhow!("Failed to convert to SkReuseport: {}", e))?;
@@ -71,7 +82,7 @@ impl UnifiedEbpfManager {
         
         // Get program reference (upstream pattern - fresh mutable reference each time)
         let program: &mut SkReuseport = self.bpf
-            .program_mut("select_socket")
+            .program_mut("address_aware_worker_selector")
             .ok_or_else(|| anyhow!("SO_REUSEPORT program not found"))?
             .try_into()
             .map_err(|e| anyhow!("Failed to convert to SkReuseport: {}", e))?;
@@ -96,53 +107,93 @@ impl UnifiedEbpfManager {
         Ok(())
     }
     
-    pub fn update_protocol_worker_configs(&mut self, _configs: &[((std::net::IpAddr, u8), u32)]) -> Result<()> {
-        debug!("Protocol worker config update (stub implementation)");
+    
+    
+    
+    
+    /// Update socket array map with worker socket file descriptors using worker-ID-based indexing
+    /// This ensures worker N's socket is placed at index N in the socket array for correct selection
+    pub fn update_worker_socket_array_by_worker_id(&mut self, worker_socket_map: &std::collections::BTreeMap<u32, RawFd>) -> Result<()> {
+        info!("🔧 SOCKET_ARRAY_DEBUG: Starting worker-ID-based socket array population");
+        
+        // Log the worker-to-socket mapping
+        for (&worker_id, &socket_fd) in worker_socket_map {
+            info!("🔧 SOCKET_ARRAY_DEBUG: Worker {} -> socket_fd={}", worker_id, socket_fd);
+        }
+        
+        // Get worker_socket_array using correct aya-rs ReusePortSockArray pattern
+        info!("🔧 SOCKET_ARRAY_DEBUG: Attempting to get worker_socket_array map");
+        let mut worker_socket_array: ReusePortSockArray<_> = ReusePortSockArray::try_from(
+            self.bpf.map_mut("worker_socket_array")
+                .ok_or_else(|| {
+                    warn!("❌ SOCKET_ARRAY_DEBUG: worker_socket_array map not found!");
+                    anyhow!("worker_socket_array not found")
+                })?
+        ).map_err(|e| {
+            warn!("❌ SOCKET_ARRAY_DEBUG: Failed to convert worker_socket_array: {}", e);
+            anyhow!("Failed to convert worker_socket_array: {}", e)
+        })?;
+        
+        info!("✅ SOCKET_ARRAY_DEBUG: Successfully obtained ReusePortSockArray map");
+        
+        // Populate socket array using worker IDs as indices
+        let mut successful_insertions: u32 = 0;
+        for (&worker_id, &socket_fd) in worker_socket_map {
+            info!("🔧 SOCKET_ARRAY_DEBUG: Processing Worker {} socket_fd={}", worker_id, socket_fd);
+            
+            if socket_fd <= 0 {
+                warn!("❌ SOCKET_ARRAY_DEBUG: Invalid socket FD {} for worker {}, skipping", socket_fd, worker_id);
+                continue;
+            }
+            
+            if worker_id >= 8 {
+                warn!("❌ SOCKET_ARRAY_DEBUG: Worker ID {} exceeds socket array size (8), skipping", worker_id);
+                continue;
+            }
+            
+            info!("✅ SOCKET_ARRAY_DEBUG: Socket FD {} is valid, creating wrapper", socket_fd);
+            
+            // Create AsRawFd wrapper for the raw file descriptor
+            let socket_wrapper = SocketFdWrapper(socket_fd);
+            
+            info!("🔧 SOCKET_ARRAY_DEBUG: Calling socket_array.set({}, socket_fd={}, flags=0)", worker_id, socket_fd);
+            
+            // Use worker ID directly as the index in the socket array
+            match worker_socket_array.set(worker_id, &socket_wrapper, 0) {
+                Ok(()) => {
+                    info!("✅ SOCKET_ARRAY_DEBUG: Successfully added Worker {} socket fd={} at index={}", 
+                          worker_id, socket_fd, worker_id);
+                    successful_insertions += 1;
+                }
+                Err(e) => {
+                    warn!("❌ SOCKET_ARRAY_DEBUG: Failed to add Worker {} socket {} at index {}: {}", 
+                          worker_id, socket_fd, worker_id, e);
+                    return Err(anyhow!("Failed to add Worker {} socket {} at index {}: {}", 
+                                      worker_id, socket_fd, worker_id, e));
+                }
+            }
+        }
+        
+        info!("🎉 SOCKET_ARRAY_DEBUG: Worker-ID-based socket array population completed!");
+        info!("🎉 SOCKET_ARRAY_DEBUG: - Total workers: {}", worker_socket_map.len());
+        info!("🎉 SOCKET_ARRAY_DEBUG: - Successful insertions: {}", successful_insertions);
+        
+        // Log final mapping for verification
+        for (&worker_id, &socket_fd) in worker_socket_map {
+            info!("🎉 SOCKET_ARRAY_DEBUG: Index {} = Worker {} socket_fd={}", 
+                  worker_id, worker_id, socket_fd);
+        }
+        
+        if successful_insertions == 0 {
+            warn!("❌ SOCKET_ARRAY_DEBUG: WARNING - No sockets were successfully inserted into the array!");
+        }
+        
         Ok(())
     }
     
-    pub fn update_worker_capabilities(&mut self, _capabilities: &[(u32, u8)]) -> Result<()> {
-        debug!("Worker capabilities update (stub implementation)");
-        Ok(())
-    }
     
-    pub fn update_runtime_configuration(&mut self, worker_count: u32) -> Result<()> {
-        debug!("Runtime config update: {} workers (stub implementation)", worker_count);
-        Ok(())
-    }
     
-    pub fn update_gateway_protocol_configs(&mut self, _configs: &[((std::net::IpAddr, u16), Vec<u8>)]) -> Result<()> {
-        debug!("Gateway protocol config update (stub implementation)");
-        Ok(())
-    }
     
-    pub fn update_listener_protocol_configs(&mut self, _configs: &[(std::net::IpAddr, u16, u8)]) -> Result<()> {
-        debug!("Listener protocol config update (stub implementation)");
-        Ok(())
-    }
-    
-    pub fn get_worker_debug_metrics(&self, worker_id: u32) -> Result<super::maps::AddressAwareWorkerStats> {
-        debug!("Getting debug metrics for worker {} (stub implementation)", worker_id);
-        // Return a default struct for now
-        Ok(super::maps::AddressAwareWorkerStats {
-            total_packets: 0,
-            total_bytes: 0,
-            http_requests: 0,
-            tcp_connections: 0,
-            active_connections: 0,
-            address_assignments: 0,
-            last_selected_worker: 0,
-            last_protocol: 0,
-            last_dest_addr: 0,
-            debug_flags: 0,
-            selection_failures: 0,
-        })
-    }
-    
-    pub fn get_all_worker_debug_metrics(&self) -> Result<Vec<(u32, super::maps::AddressAwareWorkerStats)>> {
-        debug!("Getting all worker debug metrics (stub implementation)");
-        Ok(vec![])
-    }
     
 }
 

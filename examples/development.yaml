@@ -1,3 +1,6 @@
+# Generated development configuration (YAML)
+# Use --output <file> to save to a file
+
 gateway:
   name: development-gateway
   listeners:
@@ -13,47 +16,25 @@ gateway:
     interface: lo
   workers:
   - id: 0
-    protocols:
-    - http1
-    - http2
+    protocol: HTTP
     buffer_size: 8KB
-    buffer_count: 64
+    buffer_count: 256
     tcp_nodelay: false
-    tcp_keepalive: false
-    tcp_keepalive_idle: 2h
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 9
   - id: 1
-    protocols:
-    - http1
-    - http2
+    protocol: HTTP
     buffer_size: 8KB
-    buffer_count: 64
+    buffer_count: 256
     tcp_nodelay: false
-    tcp_keepalive: false
-    tcp_keepalive_idle: 2h
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 9
   - id: 2
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 64KB
     buffer_count: 16
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 10m
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 5
   - id: 3
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 64KB
     buffer_count: 16
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 10m
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 5
   worker_threads: 4
   api_port: 8081
   api_enabled: true
@@ -61,6 +42,12 @@ gateway:
   connection_pool_size: 64
   buffer_pool_size: 64MB
   network_interface: eth0
+backend_pool:
+  default_pool_size: 10
+  tcp_keepalive: true
+  tcp_keepalive_idle: 10m
+  tcp_keepalive_interval: 1m
+  tcp_keepalive_probes: 5
 http_routes:
 - parent_refs:
   - name: development-gateway
@@ -165,7 +152,7 @@ observability:
   logging:
     level: debug
     format: compact
-    output: !file "/var/log/uringress/uringress.log"
+    output: stdout
   metrics:
     enabled: true
     port: 9091

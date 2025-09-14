@@ -1,21 +1,21 @@
 use anyhow::Result;
-use tracing::{info, error, warn};
+use tracing::{info, error};
 use std::time::Duration;
 use std::fs::OpenOptions;
 use std::path::Path;
 
 mod routing;
-mod parser;
-mod controller;
 mod runtime_config;
 mod cli;
 mod config;
 mod control_plane;
 mod uring_worker;
+mod uring_data_plane;
 mod ebpf;
+mod backend_pool;
 
 use control_plane::ControlPlane;
-use uring_worker::UringDataPlane;
+use uring_data_plane::UringDataPlane;
 use runtime_config::RuntimeConfig;
 use cli::Args;
 use config::UringRessConfig;
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     }
     
     // Load configuration first to determine logging settings
-    let (runtime_config, use_file_routes) = if let Some(config_path) = &args.config {
+    let (runtime_config, use_file_routes, performance_config) = if let Some(config_path) = &args.config {
         // Load configuration file using zero-overhead parsing
         let uringress_config = UringRessConfig::load_from_file(config_path)
             .map_err(|e| {
@@ -100,8 +100,9 @@ fn main() -> Result<()> {
         let runtime_config = uringress_config.performance.to_runtime_config(&uringress_config.gateway)?;
         info!("Configuration loaded successfully from file");
         
-        (runtime_config, Some(uringress_config))
+        (runtime_config, Some(uringress_config.clone()), uringress_config.performance)
     } else {
+        use crate::config::PerformanceConfig;
         // Initialize basic logging for environment/CLI-only mode
         init_logging(args.verbose);
         
@@ -109,7 +110,9 @@ fn main() -> Result<()> {
         
         // Use environment variable parsing for runtime config, but no routes
         let runtime_config = load_runtime_config_from_env();
-        (runtime_config, None)
+        // Create default performance config for environment mode
+        let performance_config = PerformanceConfig::default();
+        (runtime_config, None, performance_config)
     };
     
     // Handle validation modes that exit early (after logging is initialized)
@@ -142,8 +145,7 @@ fn main() -> Result<()> {
                 .unwrap_or(8)
         });
         
-        use crate::config::{WorkerConfig, WorkerProtocol};
-        use std::time::Duration;
+        use crate::config::{WorkerConfig, Protocol};
         
         // Create balanced HTTP/TCP worker distribution for environment setup
         let mut configs = Vec::with_capacity(num_workers);
@@ -153,14 +155,10 @@ fn main() -> Result<()> {
         for id in 0..http_workers {
             configs.push(WorkerConfig {
                 id,
-                protocols: vec![WorkerProtocol::Http1, WorkerProtocol::Http2],
+                protocol: Protocol::HTTP,
                 buffer_size: 8192,  // 8KB for HTTP
-                buffer_count: 64,
+                buffer_count: 256,  // Increased for high concurrent load
                 tcp_nodelay: false,
-                tcp_keepalive: false,
-                tcp_keepalive_idle: Duration::from_secs(7200),
-                tcp_keepalive_interval: Duration::from_secs(75),
-                tcp_keepalive_probes: 9,
             });
         }
         
@@ -168,24 +166,18 @@ fn main() -> Result<()> {
         for id in http_workers..num_workers {
             configs.push(WorkerConfig {
                 id,
-                protocols: vec![WorkerProtocol::Tcp],
+                protocol: Protocol::TCP,
                 buffer_size: 65536, // 64KB for TCP bulk transfers
                 buffer_count: 16,
                 tcp_nodelay: true,
-                tcp_keepalive: true,
-                tcp_keepalive_idle: Duration::from_secs(600),
-                tcp_keepalive_interval: Duration::from_secs(60),
-                tcp_keepalive_probes: 5,
             });
         }
         
         configs
     };
     
-    // Validate worker configurations
-    if let Some(ref config) = use_file_routes {
-        // File-based configs are already validated in load_from_file
-    } else {
+    // Validate worker configurations  
+    if use_file_routes.is_none() {
         // Validate environment-generated worker configs
         use crate::config::GatewayConfig;
         let temp_gateway = GatewayConfig {
@@ -290,6 +282,9 @@ fn main() -> Result<()> {
     info!("Control Plane: Tokio runtime for kube-rs compatibility");
     info!("Data Plane: Raw io_uring for maximum performance");
     
+    // Capture performance config before moving into control plane thread
+    let performance_config_for_thread = performance_config.clone();
+    
     // Start control plane in dedicated Tokio runtime
     let control_plane_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -302,8 +297,8 @@ fn main() -> Result<()> {
             info!("Starting Control Plane with Tokio runtime");
             
             // Create control plane
-            let mut control_plane = if let Some(config) = use_file_routes {
-                ControlPlane::new_with_config(config)?
+            let mut control_plane = if let Some(ref config) = use_file_routes {
+                ControlPlane::new_with_config(config.clone())?
             } else {
                 ControlPlane::new()?
             };
@@ -316,7 +311,13 @@ fn main() -> Result<()> {
             
             // Start data plane in separate threads with raw io_uring and eBPF awareness
             let mut data_plane = UringDataPlane::new(worker_configs.clone());
-            data_plane.start(routing_table, runtime_config)?;
+            // Get backend pool config - use default if no config file
+            let backend_pool_config = if let Some(ref config) = use_file_routes {
+                &config.backend_pool
+            } else {
+                &crate::config::BackendPoolConfig::default()
+            };
+            data_plane.start(routing_table, runtime_config, performance_config_for_thread, backend_pool_config)?;
             
             // Attach SO_REUSEPORT eBPF programs to worker sockets
             if let Some(listener_fds) = data_plane.get_listener_fds() {
@@ -588,22 +589,37 @@ fn init_logging_from_config(logging_config: &config::LoggingConfig, verbose_leve
 
 /// Initialize logging with appropriate level based on verbosity (CLI-only mode)
 fn init_logging(verbose_level: u8) {
-    if verbose_level == 0 {
-        // Fast path: use original simple initialization for default case
-        // This is identical to the original code before CLI changes
-        tracing_subscriber::fmt::init();
+    use tracing_subscriber::{fmt, EnvFilter};
+    
+    // In release mode, default to WARN level for performance
+    // In debug mode, default to INFO level
+    #[cfg(debug_assertions)]
+    let default_level = match verbose_level {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    
+    #[cfg(not(debug_assertions))]
+    let default_level = match verbose_level {
+        0 => "warn",  // Release mode: only warnings and errors
+        1 => "info",  // Release mode with -v: include info
+        2 => "debug", // Release mode with -vv: include debug
+        _ => "trace", // Release mode with -vvv: include trace
+    };
+    
+    // Allow RUST_LOG to override CLI verbosity
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    
+    if verbose_level == 0 && cfg!(not(debug_assertions)) {
+        // Fast path for release builds without verbosity
+        fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .compact()
+            .init();
     } else {
-        // Only use complex EnvFilter when --verbose specified (rare case)
-        use tracing_subscriber::{fmt, EnvFilter};
-        
-        let default_level = match verbose_level {
-            1 => "debug", 
-            _ => "trace",
-        };
-        
-        // Allow RUST_LOG to override CLI verbosity
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(default_level));
         
         fmt()
             .with_env_filter(filter)
@@ -707,8 +723,6 @@ fn load_runtime_config_from_env() -> RuntimeConfig {
     
     let http_port: u16 = std::env::var("HTTP_PORT")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
-    let standard_buffer_size: usize = std::env::var("STANDARD_BUFFER_SIZE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
     
     // Create default HTTP listener for environment variable mode
     let mut listeners = HashMap::new();
@@ -720,6 +734,5 @@ fn load_runtime_config_from_env() -> RuntimeConfig {
     
     RuntimeConfig::new(
         listeners,
-        standard_buffer_size,
     )
 }

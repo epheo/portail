@@ -1,6 +1,6 @@
 use std::time::Instant;
-use uringress::parser::parse_http_headers_fast;
-use uringress::routing::{RouteTable, Backend, fnv_hash};
+use uringress::uring_worker::unified_http_parser::UnifiedHttpParser;
+use uringress::routing::{RouteTable, Backend, FnvRouterHasher, RouterHasher};
 
 /// Performance validation tests for MVP targets
 /// These tests validate that we meet our performance goals
@@ -14,12 +14,13 @@ fn test_fnv_hash_performance() {
         "microservice.enterprise.example.com",
     ];
     
+    let hasher = FnvRouterHasher;
     let iterations = 10000;
     let start = Instant::now();
     
     for _ in 0..iterations {
         for host in &hosts {
-            let _ = fnv_hash(host);
+            let _ = hasher.hash(host);
         }
     }
     
@@ -45,7 +46,7 @@ fn test_http_parsing_performance() {
     
     for _ in 0..iterations {
         for request in &requests {
-            let _ = parse_http_headers_fast(request);
+            let _ = UnifiedHttpParser::extract_routing_info(request);
         }
     }
     
@@ -73,13 +74,14 @@ fn test_route_lookup_performance() {
         .map(|i| format!("host{}.example.com", i))
         .collect();
     
+    let hasher = FnvRouterHasher;
     let iterations = 10000;
     let start = Instant::now();
     
     for _ in 0..iterations {
         for host in &test_hosts {
-            let host_hash = fnv_hash(host);
-            let _ = table.route_http_request(host_hash, "/api/test");
+            let host_hash = hasher.hash(host);
+            let _ = table.find_http_backend_pool(host_hash, "/api/test");
         }
     }
     
@@ -108,13 +110,14 @@ fn test_o1_route_lookup_scalability() {
         }
         
         let test_host = format!("host{}.example.com", size / 2);
-        let host_hash = fnv_hash(&test_host);
+        let hasher = FnvRouterHasher;
+        let host_hash = hasher.hash(&test_host);
         
         let iterations = 1000;
         let start = Instant::now();
         
         for _ in 0..iterations {
-            let _ = table.route_http_request(host_hash, "/api/test");
+            let _ = table.find_http_backend_pool(host_hash, "/api/test");
         }
         
         let elapsed = start.elapsed();
@@ -162,11 +165,10 @@ fn test_end_to_end_request_latency() {
     for _ in 0..iterations {
         for request in &requests {
             // End-to-end: Parse + Route + Backend Selection
-            let (_method, path, host, _connection) = parse_http_headers_fast(request).unwrap();
-            if let Some(host) = host {
-                let host_hash = fnv_hash(host);
-                let _ = table.route_http_request(host_hash, path);
-            }
+            let info = UnifiedHttpParser::extract_routing_info(request).unwrap();
+            let hasher = FnvRouterHasher;
+            let host_hash = hasher.hash(info.host);
+            let _ = table.find_http_backend_pool(host_hash, info.path);
         }
     }
     
@@ -191,12 +193,11 @@ fn test_throughput_estimate() {
     let iterations = 100000;
     let start = Instant::now();
     
+    let hasher = FnvRouterHasher;
     for _ in 0..iterations {
-        let (_method, path, host, _connection) = parse_http_headers_fast(request).unwrap();
-        if let Some(host) = host {
-            let host_hash = fnv_hash(host);
-            let _ = table.route_http_request(host_hash, path);
-        }
+        let info = UnifiedHttpParser::extract_routing_info(request).unwrap();
+        let host_hash = hasher.hash(info.host);
+        let _ = table.find_http_backend_pool(host_hash, info.path);
     }
     
     let elapsed = start.elapsed();
@@ -221,18 +222,17 @@ fn test_memory_efficiency() {
     
     // Warm up
     for _ in 0..1000 {
-        let _ = parse_http_headers_fast(request);
+        let _ = UnifiedHttpParser::extract_routing_info(request);
     }
     
     // The actual test would require memory profiling tools
     // For now, just verify basic functionality works
-    let result = parse_http_headers_fast(request);
+    let result = UnifiedHttpParser::extract_routing_info(request);
     assert!(result.is_ok());
     
-    let (method, path, host, _connection) = result.unwrap();
-    assert_eq!(method, "GET");
-    assert_eq!(path, "/test");
-    assert_eq!(host, Some("api.com"));
+    let info = result.unwrap();
+    assert_eq!(info.path, "/test");
+    assert_eq!(info.host, "api.com");
     
     println!("Memory efficiency test: Basic allocation test passed");
 }
@@ -260,11 +260,12 @@ fn test_concurrent_route_lookup_safety() {
         let handle = thread::spawn(move || {
             let mut successful_lookups = 0;
             
+            let hasher = FnvRouterHasher;
             for i in 0..1000 {
                 let host = format!("host{}.example.com", (i + thread_id * 25) % 100);
-                let host_hash = fnv_hash(&host);
+                let host_hash = hasher.hash(&host);
                 
-                if table_clone.route_http_request(host_hash, "/api/test").is_ok() {
+                if table_clone.find_http_backend_pool(host_hash, "/api/test").is_ok() {
                     successful_lookups += 1;
                 }
             }

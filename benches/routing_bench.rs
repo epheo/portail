@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use uringress::routing::{RouteTable, Backend, fnv_hash};
+use uringress::routing::{RouteTable, Backend, FnvRouterHasher, RouterHasher};
 use std::time::Duration;
 
 fn routing_benchmark(c: &mut Criterion) {
@@ -31,16 +31,18 @@ fn routing_benchmark(c: &mut Criterion) {
     
     // FNV Hash Performance - Target: <10ns (sub-microsecond)
     c.bench_function("fnv_hash_short_host", |b| {
+        let hasher = FnvRouterHasher;
         b.iter(|| {
             let host = "api.com";
-            black_box(fnv_hash(host))
+            black_box(hasher.hash(host))
         })
     });
     
     c.bench_function("fnv_hash_long_host", |b| {
+        let hasher = FnvRouterHasher;
         b.iter(|| {
             let host = "very.long.subdomain.example.com";
-            black_box(fnv_hash(host))
+            black_box(hasher.hash(host))
         })
     });
     
@@ -53,7 +55,8 @@ fn routing_benchmark(c: &mut Criterion) {
         (10000, &large_table)
     ] {
         group.bench_with_input(BenchmarkId::new("http_route_lookup", size), &table, |b, table| {
-            let host_hash = fnv_hash(&format!("host{}.example.com", size / 2));
+            let hasher = FnvRouterHasher;
+            let host_hash = hasher.hash(&format!("host{}.example.com", size / 2));
             b.iter(|| {
                 black_box(table.route_http_request(host_hash, "/api/users"))
             })
@@ -73,14 +76,16 @@ fn routing_benchmark(c: &mut Criterion) {
     complex_table.add_http_route("api.com", "/api/v2", backend.clone());
     
     c.bench_function("path_matching_simple", |b| {
-        let host_hash = fnv_hash("api.com");
+        let hasher = FnvRouterHasher;
+        let host_hash = hasher.hash("api.com");
         b.iter(|| {
             black_box(complex_table.route_http_request(host_hash, "/"))
         })
     });
     
     c.bench_function("path_matching_complex", |b| {
-        let host_hash = fnv_hash("api.com");
+        let hasher = FnvRouterHasher;
+        let host_hash = hasher.hash("api.com");
         b.iter(|| {
             black_box(complex_table.route_http_request(host_hash, "/api/v1/users/123/profile"))
         })

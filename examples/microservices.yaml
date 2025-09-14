@@ -18,87 +18,45 @@ gateway:
     port: 27017
   workers:
   - id: 0
-    protocols:
-    - http1
-    - http2
+    protocol: HTTP
     buffer_size: 8KB
     buffer_count: 96
     tcp_nodelay: true
-    tcp_keepalive: false
-    tcp_keepalive_idle: 2h
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 9
   - id: 1
-    protocols:
-    - http1
-    - http2
+    protocol: HTTP
     buffer_size: 8KB
     buffer_count: 96
     tcp_nodelay: true
-    tcp_keepalive: false
-    tcp_keepalive_idle: 2h
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 9
   - id: 2
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 32KB
     buffer_count: 32
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 30m
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 3
   - id: 3
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 32KB
     buffer_count: 32
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 30m
-    tcp_keepalive_interval: 1m
-    tcp_keepalive_probes: 3
   - id: 4
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 16KB
     buffer_count: 48
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 15m
-    tcp_keepalive_interval: 30s
-    tcp_keepalive_probes: 3
   - id: 5
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 16KB
     buffer_count: 48
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 15m
-    tcp_keepalive_interval: 30s
-    tcp_keepalive_probes: 3
   - id: 6
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 64KB
     buffer_count: 24
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 20m
-    tcp_keepalive_interval: 45s
-    tcp_keepalive_probes: 3
   - id: 7
-    protocols:
-    - tcp
+    protocol: TCP
     buffer_size: 64KB
     buffer_count: 24
     tcp_nodelay: true
-    tcp_keepalive: true
-    tcp_keepalive_idle: 20m
-    tcp_keepalive_interval: 45s
-    tcp_keepalive_probes: 3
   worker_threads: 8
   api_port: 8081
   api_enabled: true
@@ -106,6 +64,12 @@ gateway:
   connection_pool_size: 128
   buffer_pool_size: 128MB
   network_interface: eth0
+backend_pool:
+  default_pool_size: 50
+  tcp_keepalive: true
+  tcp_keepalive_idle: 1h
+  tcp_keepalive_interval: 1m
+  tcp_keepalive_probes: 6
 http_routes:
 - parent_refs:
   - name: microservices-gateway

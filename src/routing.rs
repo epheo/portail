@@ -1,18 +1,15 @@
 use fnv::FnvHashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
+use tracing::{debug, warn};
 
 // Branch prediction hints for hot paths
 #[inline(always)]
-fn likely(b: bool) -> bool {
+pub fn likely(b: bool) -> bool {
     std::hint::black_box(b)
 }
 
-#[inline(always)]
-fn unlikely(b: bool) -> bool {
-    std::hint::black_box(b)
-}
 
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -23,6 +20,8 @@ pub struct RouteTable {
     pub tcp_routes: FnvHashMap<u16, BackendPool>,
     // Default backend accessed rarely (only when no specific HTTP route found)
     pub default_http_backend: Option<BackendPool>,
+    // Router hasher for host hashing (hot path optimization - placed after frequently accessed fields)
+    hasher: FnvRouterHasher,
 }
 
 impl RouteTable {
@@ -32,68 +31,90 @@ impl RouteTable {
             http_routes: FnvHashMap::with_capacity_and_hasher(128, Default::default()),
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             default_http_backend: None,
+            hasher: FnvRouterHasher::default(),
         }
     }
-
+    
+    /// Hash a host string using the configured hasher
+    /// Provides abstraction over the hashing implementation
     #[inline(always)]
-    pub fn route_http_request(&self, host_hash: u64, path: &str) -> Result<&Backend> {
+    pub fn hash_host(&self, host: &str) -> u64 {
+        self.hasher.hash(host)
+    }
+    
+    /// Find HTTP backend pool for host and path (pure routing, no backend selection)
+    #[inline(always)]
+    pub fn find_http_backend_pool(&self, host_hash: u64, path: &str) -> Result<&BackendPool> {
         // Fast path: Look up host entry with branch prediction hint
         if likely(self.http_routes.contains_key(&host_hash)) {
             let host_entry = unsafe { self.http_routes.get(&host_hash).unwrap_unchecked() };
             
             // Path matching: use radix tree lookup for common prefixes
-            let backend = self.find_best_path_match(&host_entry.path_routes, path)
-                .unwrap_or(&host_entry.default_backend);
+            if let Some(backend_pool) = self.find_best_path_match(&host_entry.path_routes, path) {
+                return Ok(backend_pool);
+            }
             
-            return backend.select_backend();
+            // NO FALLBACK: Path matching failed - expose the error
+            return Err(anyhow!("Path matching failed for '{}' - no route configured", path));
         }
         
-        // Fallback: Use global default backend
-        if unlikely(self.default_http_backend.is_some()) {
-            return self.default_http_backend.as_ref().unwrap().select_backend();
-        }
-        
-        Err(anyhow!("No route found for HTTP request"))
+        // NO GLOBAL FALLBACK: Host not found - expose the error  
+        Err(anyhow!("No route configured for host"))
     }
     
-    /// TCP routing by server listening port - O(1) lookup
+    /// Find TCP backend pool by server port (pure routing, no backend selection)
     #[inline(always)]
-    pub fn route_tcp_request(&self, server_port: u16) -> Result<&Backend> {
+    pub fn find_tcp_backend_pool(&self, server_port: u16) -> Result<&BackendPool> {
         // Look up TCP route by server listening port
         if let Some(backend_pool) = self.tcp_routes.get(&server_port) {
-            return backend_pool.select_backend();
+            return Ok(backend_pool);
         }
         
         Err(anyhow!("No TCP route configured for port {}", server_port))
     }
+
     
     /// Path matching using prefix tree concepts
     #[inline(always)]
-    fn find_best_path_match<'a>(&self, path_routes: &'a [PathRoute], path: &str) -> Option<&'a BackendPool> {
+    pub fn find_best_path_match<'a>(&self, path_routes: &'a [PathRoute], path: &str) -> Option<&'a BackendPool> {
         let path_bytes = path.as_bytes();
         let mut best_match: Option<(&PathRoute, usize)> = None;
+        
+        debug!("PATH_MATCHING: Looking for '{}' in {} available routes", path, path_routes.len());
         
         // Linear search with early termination and SIMD-style matching
         for route in path_routes {
             let prefix_bytes = route.prefix.as_bytes();
+            debug!("PATH_MATCHING: Checking route prefix '{}' against request path '{}'", route.prefix, path);
             
             // Fast length check
             if prefix_bytes.len() > path_bytes.len() {
+                debug!("PATH_MATCHING: Skipping '{}' - prefix too long ({} > {})", route.prefix, prefix_bytes.len(), path_bytes.len());
                 continue;
             }
             
             // Use byte comparison for prefix matching
             if self.fast_prefix_match(path_bytes, prefix_bytes) {
                 let match_len = prefix_bytes.len();
+                debug!("PATH_MATCHING: Found match '{}' with length {}", route.prefix, match_len);
                 
                 // Track the longest matching prefix
                 if best_match.map_or(true, |(_, len)| match_len > len) {
+                    debug!("PATH_MATCHING: New best match '{}' (length {})", route.prefix, match_len);
                     best_match = Some((route, match_len));
                 }
+            } else {
+                debug!("PATH_MATCHING: No match for prefix '{}'", route.prefix);
             }
         }
         
-        best_match.map(|(route, _)| &route.backend)
+        if let Some((best_route, match_len)) = best_match {
+            debug!("PATH_MATCHING: Selected route '{}' for path '{}' (match_len={})", best_route.prefix, path, match_len);
+            Some(&best_route.backend)
+        } else {
+            warn!("PATH_MATCHING: No route found for path '{}' in {} available routes", path, path_routes.len());
+            None
+        }
     }
     
     /// Prefix matching using manual loop unrolling
@@ -126,14 +147,13 @@ impl RouteTable {
     }
 
     pub fn add_http_route_with_pool(&mut self, host: &str, path_prefix: &str, backends: Vec<Backend>, strategy: LoadBalanceStrategy) {
-        let host_hash = fnv_hash(host);
+        let host_hash = self.hash_host(host);
         let backend_count = backends.len();
         
         let path_route = PathRoute {
             prefix: path_prefix.to_string(),
             backend: BackendPool {
                 backends,
-                round_robin_counter: AtomicU32::new(0),
                 strategy,
                 health_state: Arc::new(AtomicU64::new((1u64 << backend_count) - 1)), // All backends healthy
                 _padding: [0; 0],
@@ -148,7 +168,6 @@ impl RouteTable {
                     backends: vec![Backend::new("127.0.0.1".to_string(), 3001)
                         .expect("Default backend address should be valid")
                         .with_health_check("/health".to_string())],
-                    round_robin_counter: AtomicU32::new(0),
                     strategy: LoadBalanceStrategy::RoundRobin,
                     health_state: Arc::new(AtomicU64::new(1)),
                     _padding: [0; 0],
@@ -166,7 +185,6 @@ impl RouteTable {
         let backend_count = backends.len();
         let backend_pool = BackendPool {
             backends,
-            round_robin_counter: AtomicU32::new(0),
             strategy: LoadBalanceStrategy::RoundRobin,
             health_state: Arc::new(AtomicU64::new((1u64 << backend_count) - 1)), // All healthy
             _padding: [0; 0],
@@ -181,11 +199,7 @@ impl RouteTable {
         self.tcp_routes.keys().copied().collect()
     }
     
-    /// Check if a port has a TCP route configured
-    /// Used for immediate TCP detection without protocol detection
-    pub fn has_tcp_route(&self, port: u16) -> bool {
-        self.tcp_routes.contains_key(&port)
-    }
+    
 }
 
 #[derive(Debug, Clone)]
@@ -203,14 +217,12 @@ pub struct PathRoute {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(C, align(64))]
 pub struct BackendPool {
     // Hot data first: backends accessed on every request for load balancing
     pub backends: Vec<Backend>,
-    // Round robin counter accessed frequently for load balancing
-    pub round_robin_counter: AtomicU32,
-    // Strategy accessed during backend selection
+    // Strategy accessed during backend selection (load balancing handled at worker level)
     pub strategy: LoadBalanceStrategy,
     // Health state accessed less frequently (only during health checks)
     pub health_state: Arc<AtomicU64>,
@@ -218,31 +230,24 @@ pub struct BackendPool {
     pub _padding: [u8; 0], // align(64) handles alignment, minimal padding needed
 }
 
-impl Clone for BackendPool {
-    fn clone(&self) -> Self {
-        Self {
-            backends: self.backends.clone(),
-            round_robin_counter: AtomicU32::new(self.round_robin_counter.load(std::sync::atomic::Ordering::Relaxed)),
-            strategy: self.strategy.clone(),
-            health_state: self.health_state.clone(),
-            _padding: [0; 0],
-        }
-    }
-}
 
 impl BackendPool {
+    /// Check if backend pool has any available backends
     #[inline(always)]
-    pub fn select_backend(&self) -> Result<&Backend> {
-        match self.strategy {
-            LoadBalanceStrategy::RoundRobin => {
-                if self.backends.is_empty() {
-                    return Err(anyhow!("No backends available"));
-                }
-                
-                let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize % self.backends.len();
-                Ok(&self.backends[index])
-            }
-        }
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+    
+    /// Get backend count for load balancing calculations
+    #[inline(always)]
+    pub fn backend_count(&self) -> usize {
+        self.backends.len()
+    }
+    
+    /// Get backend by index for worker-local selection
+    #[inline(always)]
+    pub fn get_backend(&self, index: usize) -> Option<&Backend> {
+        self.backends.get(index)
     }
 }
 
@@ -256,6 +261,8 @@ pub enum LoadBalanceStrategy {
 pub struct Backend {
     // Hot data first: pre-computed socket address for zero-allocation connection establishment
     pub socket_addr: std::net::SocketAddr,
+    // File descriptor for active connection (if available)
+    pub fd: std::os::unix::io::RawFd,
     // Health check path is accessed less frequently
     pub health_check_path: Option<String>,
 }
@@ -280,6 +287,7 @@ impl Backend {
             
         Ok(Self {
             socket_addr,
+            fd: -1, // Invalid fd initially - will be set when connection is established
             health_check_path: None,
         })
     }
@@ -291,25 +299,40 @@ impl Backend {
     
 }
 
-/// FNV hash implementation for Rust layer host-based routing
-/// Note: eBPF also implements FNV hash for worker selection - both are needed
-/// - eBPF FNV: Address + protocol → worker selection (kernel space)
-/// - Rust FNV: Host header → route table lookup (user space)
-#[inline(always)]
-pub fn fnv_hash(data: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    
-    let bytes = data.as_bytes();
-    let mut hash = FNV_OFFSET_BASIS;
-    
-    // Simple tight loop - matches eBPF implementation pattern
-    for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+/// Router hashing abstraction for host-based routing
+/// Provides consistent hashing interface with potential for optimization or replacement
+pub trait RouterHasher {
+    /// Hash a string key for routing table lookups
+    /// Must provide consistent results for the same input
+    fn hash(&self, data: &str) -> u64;
+}
+
+/// FNV hash implementation for high-performance routing
+/// Optimized for short strings typical of HTTP Host headers
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FnvRouterHasher;
+
+impl RouterHasher for FnvRouterHasher {
+    /// FNV hash implementation for Rust layer host-based routing
+    /// Note: eBPF also implements FNV hash for worker selection - both are needed
+    /// - eBPF FNV: Address + protocol → worker selection (kernel space)  
+    /// - Rust FNV: Host header → route table lookup (user space)
+    #[inline(always)]
+    fn hash(&self, data: &str) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+        const FNV_PRIME: u64 = 1099511628211;
+        
+        let bytes = data.as_bytes();
+        let mut hash = FNV_OFFSET_BASIS;
+        
+        // Simple tight loop - matches eBPF implementation pattern
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        
+        hash
     }
-    
-    hash
 }
 
 

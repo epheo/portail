@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
-use uringress::parser::parse_http_headers_fast;
-use uringress::routing::{RouteTable, Backend, fnv_hash};
+use uringress::uring_worker::unified_http_parser::UnifiedHttpParser;
+use uringress::routing::{RouteTable, Backend, FnvRouterHasher, RouterHasher};
 
 /// CPU profiling tests for hot path analysis
 /// These tests are designed to be run with external profiling tools like flamegraph
@@ -21,9 +21,9 @@ fn test_cpu_profiling_parser_hot_path() {
     
     for _ in 0..iterations {
         for request in &requests {
-            let result = parse_http_headers_fast(request);
+            let result = UnifiedHttpParser::extract_routing_info(request);
             // Use black_box equivalent to prevent optimization
-            std::hint::black_box(result);
+            let _ = std::hint::black_box(result);
         }
     }
     
@@ -59,12 +59,13 @@ fn test_cpu_profiling_routing_hot_path() {
     let start = Instant::now();
     let iterations = 50_000;
     
+    let hasher = FnvRouterHasher;
     for _ in 0..iterations {
         for (i, host) in test_hosts.iter().enumerate() {
             let path = test_paths[i % test_paths.len()];
-            let host_hash = fnv_hash(host);
-            let result = table.route_http_request(host_hash, path);
-            std::hint::black_box(result);
+            let host_hash = hasher.hash(host);
+            let result = table.find_http_backend_pool(host_hash, path);
+            let _ = std::hint::black_box(result);
         }
     }
     
@@ -99,13 +100,15 @@ fn test_cpu_profiling_end_to_end_hot_path() {
     for _ in 0..iterations {
         for request in &requests {
             // Parse request
-            let (_, path, host, _) = parse_http_headers_fast(request.as_bytes()).unwrap();
+            let info = UnifiedHttpParser::extract_routing_info(request.as_bytes()).unwrap();
+            let (path, host) = (info.path, Some(info.host));
             
             // Route request
             if let Some(host) = host {
-                let host_hash = fnv_hash(host);
-                let result = table.route_http_request(host_hash, path);
-                std::hint::black_box(result);
+                let hasher = FnvRouterHasher;
+                let host_hash = hasher.hash(host);
+                let result = table.find_http_backend_pool(host_hash, path);
+                let _ = std::hint::black_box(result);
             }
         }
     }
@@ -137,9 +140,10 @@ fn test_cpu_profiling_fnv_hash_hot_path() {
     let start = Instant::now();
     let iterations = 1_000_000; // Very high iteration count for hash function
     
+    let hasher = FnvRouterHasher;
     for _ in 0..iterations {
         for hostname in &test_strings {
-            let hash = fnv_hash(hostname);
+            let hash = hasher.hash(hostname);
             std::hint::black_box(hash);
         }
     }
@@ -193,13 +197,12 @@ fn test_cpu_profiling_stress_test() {
         
         for request in &requests {
             // Full pipeline: parse + route + select backend
-            match parse_http_headers_fast(request.as_bytes()) {
-                Ok((_, path, host, _)) => {
-                    if let Some(host) = host {
-                        let host_hash = fnv_hash(host);
-                        let result = table.route_http_request(host_hash, path);
-                        std::hint::black_box(result);
-                    }
+            match UnifiedHttpParser::extract_routing_info(request.as_bytes()) {
+                Ok(info) => {
+                    let hasher = FnvRouterHasher;
+                    let host_hash = hasher.hash(info.host);
+                    let result = table.find_http_backend_pool(host_hash, info.path);
+                    let _ = std::hint::black_box(result);
                 }
                 Err(e) => {
                     std::hint::black_box(e);

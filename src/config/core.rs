@@ -1,21 +1,1000 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use std::path::Path;
+use std::time::Duration;
 use anyhow::{anyhow, Result};
 
-use super::types::*;
+/// Protocol types following Kubernetes Gateway API specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Protocol {
+    HTTP,
+    HTTPS,
+    TCP,
+    UDP,
+}
 
-impl PortailConfig {
+
+/// Individual worker configuration for protocol-specific optimization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// Worker ID (0-based index)
+    pub id: usize,
+    
+    /// Protocol this worker specializes in
+    pub protocol: Protocol,
+    
+    /// Buffer size for this worker (optimized per protocol)
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub buffer_size: usize,
+    
+    /// Number of buffers to allocate for this worker
+    #[serde(default = "default_buffer_count")]
+    pub buffer_count: u16,
+    
+    /// Enable TCP_NODELAY for immediate packet transmission
+    #[serde(default)]
+    pub tcp_nodelay: bool,
+}
+
+/// Gateway configuration following Kubernetes Gateway API specification
+/// Defines the infrastructure layer with listeners for different protocols and ports
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    #[serde(default = "default_gateway_name")]
+    pub name: String,
+    pub listeners: Vec<ListenerConfig>,
+    
+    /// Optional worker-specific configurations for protocol optimization
+    /// If not specified, falls back to worker_threads with default configurations
+    pub workers: Option<Vec<WorkerConfig>>,
+    
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    #[serde(default = "default_api_enabled")]
+    pub api_enabled: bool,
+    #[serde(default)]
+    pub io_uring_queue_depth: u32,
+    #[serde(default)]
+    pub connection_pool_size: usize,
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size", default = "default_buffer_pool_size")]
+    pub buffer_pool_size: usize,
+    #[serde(default = "default_network_interface")]
+    pub network_interface: Option<String>,
+}
+
+/// Listener configuration defining protocol and port bindings
+/// Follows Kubernetes Gateway API Listener specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerConfig {
+    pub name: String,
+    pub protocol: Protocol,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+/// TLS configuration for HTTPS/TLS listeners
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub certificate_refs: Vec<CertificateRef>,
+    #[serde(default)]
+    pub mode: TlsMode,
+}
+
+/// Reference to TLS certificate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// TLS mode configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum TlsMode {
+    Terminate,
+    Passthrough,
+}
+
+impl Default for TlsMode {
+    fn default() -> Self {
+        TlsMode::Terminate
+    }
+}
+
+// Default value functions
+fn default_gateway_name() -> String {
+    "uringress-gateway".to_string()
+}
+
+fn default_worker_threads() -> usize {
+    4
+}
+
+fn default_api_port() -> u16 {
+    8081
+}
+
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_buffer_pool_size() -> usize {
+    64 * 1024 * 1024 // 64MB
+}
+
+fn default_network_interface() -> Option<String> {
+    None // Auto-detect or use "eth0" as fallback in implementation
+}
+
+fn default_buffer_count() -> u16 {
+    256 // Increased for high concurrent load handling
+}
+
+fn default_tcp_keepalive_idle() -> Duration {
+    Duration::from_secs(7200) // 2 hours - RFC default
+}
+
+fn default_tcp_keepalive_interval() -> Duration {
+    Duration::from_secs(75) // 75 seconds between probes - RFC default
+}
+
+fn default_tcp_keepalive_probes() -> u32 {
+    9 // 9 probes before considering connection dead - RFC default
+}
+
+fn default_backend_pool_size() -> usize {
+    10 // Default 10 connections per backend for connection reuse
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            name: default_gateway_name(),
+            listeners: vec![
+                ListenerConfig {
+                    name: "http".to_string(),
+                    protocol: Protocol::HTTP,
+                    port: 8080,
+                    hostname: None,
+                    tls: None,
+                    address: None,
+                    interface: None,
+                },
+            ],
+            workers: None, // Use default worker configuration
+            worker_threads: default_worker_threads(),
+            api_port: default_api_port(),
+            api_enabled: default_api_enabled(),
+            io_uring_queue_depth: 256,
+            connection_pool_size: 64,
+            buffer_pool_size: default_buffer_pool_size(),
+            network_interface: default_network_interface(),
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Get effective worker configurations, generating defaults if none specified
+    pub fn get_worker_configs(&self) -> Vec<WorkerConfig> {
+        if let Some(ref workers) = self.workers {
+            workers.clone()
+        } else {
+            self.generate_default_worker_configs()
+        }
+    }
+    
+    /// Generate default worker configurations based on worker_threads
+    /// Creates protocol-specialized workers for optimal performance
+    fn generate_default_worker_configs(&self) -> Vec<WorkerConfig> {
+        let mut workers = Vec::with_capacity(self.worker_threads);
+        
+        // Strategy: Create balanced worker distribution
+        // - 50% HTTP workers (optimized for small buffers, low latency)
+        // - 50% TCP workers (optimized for large buffers, high throughput)
+        let http_workers = (self.worker_threads + 1) / 2; // Round up for HTTP
+        
+        // HTTP workers (small buffers for low latency)
+        for id in 0..http_workers {
+            workers.push(WorkerConfig {
+                id,
+                protocol: Protocol::HTTP,
+                buffer_size: 8192,  // 8KB for HTTP headers/small responses
+                buffer_count: default_buffer_count(),
+                tcp_nodelay: false, // HTTP can benefit from Nagle's algorithm
+            });
+        }
+        
+        // TCP workers (large buffers for bulk transfers like SCP)
+        for id in http_workers..self.worker_threads {
+            workers.push(WorkerConfig {
+                id,
+                protocol: Protocol::TCP,
+                buffer_size: 65536, // 64KB for bulk data transfers
+                buffer_count: 16,   // Fewer buffers due to larger size
+                tcp_nodelay: true,  // Immediate transmission for interactive protocols
+            });
+        }
+        
+        workers
+    }
+    
+    /// Validate worker configurations for consistency and correctness
+    pub fn validate_worker_configs(&self) -> Result<(), String> {
+        let worker_configs = self.get_worker_configs();
+        
+        if worker_configs.is_empty() {
+            return Err("At least one worker must be configured".to_string());
+        }
+        
+        // Check for unique and sequential worker IDs
+        let mut ids: Vec<usize> = worker_configs.iter().map(|w| w.id).collect();
+        ids.sort_unstable();
+        
+        for (expected, &actual) in ids.iter().enumerate() {
+            if expected != actual {
+                return Err(format!("Worker IDs must be sequential starting from 0. Expected {}, found {}", expected, actual));
+            }
+        }
+        
+        // Validate individual worker configurations
+        for worker in &worker_configs {
+            self.validate_single_worker_config(worker)?;
+        }
+        
+        // Ensure at least one worker supports each protocol if listeners require them
+        self.validate_protocol_coverage(&worker_configs)?;
+        
+        Ok(())
+    }
+    
+    /// Validate a single worker configuration
+    fn validate_single_worker_config(&self, worker: &WorkerConfig) -> Result<(), String> {
+        // Validate buffer size (minimum 1KB, maximum 1MB)
+        if worker.buffer_size < 1024 {
+            return Err(format!("Worker {}: buffer_size must be at least 1KB, got {}", worker.id, worker.buffer_size));
+        }
+        if worker.buffer_size > 1024 * 1024 {
+            return Err(format!("Worker {}: buffer_size must be at most 1MB, got {}", worker.id, worker.buffer_size));
+        }
+        
+        // Validate buffer count (minimum 1, maximum 1024)
+        if worker.buffer_count == 0 {
+            return Err(format!("Worker {}: buffer_count must be at least 1", worker.id));
+        }
+        if worker.buffer_count > 1024 {
+            return Err(format!("Worker {}: buffer_count must be at most 1024, got {}", worker.id, worker.buffer_count));
+        }
+        
+        // Protocol is always valid since it's a required field
+        
+        // TCP keep-alive validation moved to backend pool level
+        
+        Ok(())
+    }
+    
+    /// Validate that required protocols are covered by at least one worker
+    fn validate_protocol_coverage(&self, workers: &[WorkerConfig]) -> Result<(), String> {
+        // Check for HTTP coverage if we have HTTP listeners
+        let has_http_listeners = self.listeners.iter().any(|l| matches!(l.protocol, Protocol::HTTP | Protocol::HTTPS));
+        
+        if has_http_listeners {
+            let has_http_workers = workers.iter().any(|w| 
+                w.protocol == Protocol::HTTP || w.protocol == Protocol::HTTPS
+            );
+            
+            if !has_http_workers {
+                return Err("HTTP listeners configured but no workers support HTTP protocols".to_string());
+            }
+        }
+        
+        // Check for TCP coverage if we have TCP listeners
+        let has_tcp_listeners = self.listeners.iter().any(|l| l.protocol == Protocol::TCP);
+        
+        if has_tcp_listeners {
+            let has_tcp_workers = workers.iter().any(|w| w.protocol == Protocol::TCP);
+            
+            if !has_tcp_workers {
+                return Err("TCP listeners configured but no workers support TCP protocol".to_string());
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+/// Backend connection pool configuration
+/// Manages TCP keep-alive settings and pool sizing for backend connections
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendPoolConfig {
+    /// Default number of connections per backend
+    #[serde(default = "default_backend_pool_size")]
+    pub default_pool_size: usize,
+    
+    /// Enable TCP keep-alive for backend connections
+    #[serde(default)]
+    pub tcp_keepalive: bool,
+    
+    /// TCP keep-alive idle time before first probe
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration", default = "default_tcp_keepalive_idle")]
+    pub tcp_keepalive_idle: Duration,
+    
+    /// TCP keep-alive probe interval
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration", default = "default_tcp_keepalive_interval")]
+    pub tcp_keepalive_interval: Duration,
+    
+    /// TCP keep-alive probe count
+    #[serde(default = "default_tcp_keepalive_probes")]
+    pub tcp_keepalive_probes: u32,
+}
+
+impl Default for BackendPoolConfig {
+    fn default() -> Self {
+        Self {
+            default_pool_size: default_backend_pool_size(),
+            tcp_keepalive: false,
+            tcp_keepalive_idle: default_tcp_keepalive_idle(),
+            tcp_keepalive_interval: default_tcp_keepalive_interval(),
+            tcp_keepalive_probes: default_tcp_keepalive_probes(),
+        }
+    }
+}
+
+/// Root configuration structure for UringRess
+/// All parsing happens once at startup - zero runtime overhead
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UringRessConfig {
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+    
+    #[serde(default)]
+    pub backend_pool: BackendPoolConfig,
+    
+    #[serde(default)]
+    pub http_routes: Vec<HttpRouteConfig>,
+    
+    #[serde(default)]
+    pub tcp_routes: Vec<TcpRouteConfig>,
+    
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+    
+    #[serde(default)]
+    pub performance: PerformanceConfig,
+}
+
+/// Server configuration with ports and worker settings
+/// Replaces environment variable-based configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    pub http_port: u16,
+    pub tcp_ports: Vec<u16>,
+    pub api_port: u16,
+    pub api_enabled: bool,
+    pub worker_threads: usize,
+    pub io_uring_queue_depth: u32,
+    pub connection_pool_size: usize,
+    
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub buffer_pool_size: usize,
+}
+
+/// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
+/// Defines how HTTP traffic is routed based on hostnames and request matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteConfig {
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    pub rules: Vec<HttpRouteRule>,
+}
+
+/// Reference to a Gateway that this route attaches to
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// HTTP route rule with matches and backend references
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteRule {
+    #[serde(default)]
+    pub matches: Vec<HttpRouteMatch>,
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// HTTP route match conditions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<HttpPathMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Vec<HttpHeaderMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<Vec<HttpQueryParamMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// HTTP path matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPathMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpPathMatchType,
+    pub value: String,
+}
+
+/// HTTP path match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpPathMatchType {
+    Exact,
+    PathPrefix,
+    RegularExpression,
+}
+
+/// HTTP header matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpHeaderMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpHeaderMatchType,
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP header match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpHeaderMatchType {
+    Exact,
+    RegularExpression,
+}
+
+/// HTTP query parameter matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpQueryParamMatch {
+    #[serde(rename = "type")]
+    pub match_type: HttpQueryParamMatchType,
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP query parameter match types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HttpQueryParamMatchType {
+    Exact,
+    RegularExpression,
+}
+
+/// Backend reference with optional weight and filters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendRef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub port: u16,
+    #[serde(default = "default_backend_weight")]
+    pub weight: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+fn default_backend_weight() -> i32 {
+    1
+}
+
+// Helper implementations for common HTTP route patterns
+impl HttpRouteMatch {
+    pub fn path_prefix(path: &str) -> Self {
+        Self {
+            path: Some(HttpPathMatch {
+                match_type: HttpPathMatchType::PathPrefix,
+                value: path.to_string(),
+            }),
+            headers: None,
+            query_params: None,
+            method: None,
+        }
+    }
+
+}
+
+/// TCP route configuration following Kubernetes Gateway API TCPRoute specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpRouteConfig {
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
+    pub rules: Vec<TcpRouteRule>,
+}
+
+/// TCP route rule with backend references
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpRouteRule {
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// Backend configuration for both HTTP and TCP routes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    pub address: String,
+    pub port: u16,
+    pub health_check_path: Option<String>,
+}
+
+/// Load balancing strategy for backend selection
+/// 
+/// Currently supported strategies:
+/// - `RoundRobin`: Distributes requests evenly across backends in rotation
+/// - `LeastConnections`: **[NOT YET IMPLEMENTED]** Would select backend with fewest active connections
+///   
+/// **Note**: `LeastConnections` is accepted in configuration files for future compatibility,
+/// but currently falls back to `RoundRobin` behavior. This will be implemented in a future version
+/// once proper connection tracking infrastructure is added to the io_uring data plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Round-robin distribution across backends
+    RoundRobin,
+    /// **[PLANNED - NOT IMPLEMENTED]** Select backend with fewest active connections
+    /// Currently falls back to `RoundRobin` behavior
+    LeastConnections,
+}
+
+/// Observability configuration (logging, metrics, health checks)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
+}
+
+/// Logging configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub level: LogLevel,
+    
+    #[serde(default)]
+    pub format: LogFormat,
+    
+    #[serde(default)]
+    pub output: LogOutput,
+}
+
+/// Log level enumeration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+/// Log format enumeration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Json,
+    Pretty,
+    Compact,
+}
+
+/// Log output destination
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogOutput {
+    Stdout,
+    Stderr,
+    File(String),
+}
+
+/// Metrics configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub path: String,
+}
+
+/// Health check configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckConfig {
+    pub enabled: bool,
+    
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub interval: Duration,
+    
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub timeout: Duration,
+    
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+}
+
+/// Performance configuration - replaces RuntimeConfig entirely
+/// All values pre-computed at startup for zero runtime overhead
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[repr(C)] // Predictable memory layout for cache efficiency
+pub struct PerformanceConfig {
+    // Hot data first - accessed every request
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub backend_response_timeout: Duration,
+    
+    pub connection_pool_size: usize,
+    pub max_requests_per_connection: u32,
+    
+    // Buffer configuration
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub standard_buffer_size: usize,
+    
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub large_buffer_size: usize,
+    
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub header_buffer_size: usize,
+    
+    // Pre-computed Duration objects (zero runtime parsing)
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub connection_max_age: Duration,
+    
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub circuit_breaker_timeout: Duration,
+    
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub keep_alive_timeout: Duration,
+    
+    // Circuit breaker and retry configuration
+    pub circuit_breaker_failure_threshold: u32,
+    pub max_retries: u32,
+    
+    // Network optimization
+    pub tcp_nodelay: bool,
+    pub so_reuseport: bool,
+    
+    // CPU affinity (optional)
+    pub cpu_affinity: Option<Vec<usize>>,
+}
+
+// Default implementations with production-ready values
+// Based on current RuntimeConfig::from_env() defaults
+
+impl Default for UringRessConfig {
+    fn default() -> Self {
+        Self {
+            gateway: GatewayConfig::default(),
+            backend_pool: BackendPoolConfig::default(),
+            http_routes: Vec::new(),
+            tcp_routes: Vec::new(),
+            observability: ObservabilityConfig::default(),
+            performance: PerformanceConfig::default(),
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            http_port: 8080,
+            tcp_ports: vec![9090],
+            api_port: 8081,
+            api_enabled: true,
+            worker_threads: num_cpus::get().min(8), // Cap at 8 for performance
+            io_uring_queue_depth: 256,
+            connection_pool_size: 64,
+            buffer_pool_size: 64 * 1024 * 1024, // 64MB
+        }
+    }
+}
+
+impl Default for LoadBalanceStrategy {
+    fn default() -> Self {
+        LoadBalanceStrategy::RoundRobin
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            format: LogFormat::Pretty,
+            output: LogOutput::Stdout,
+        }
+    }
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Info
+    }
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        LogFormat::Pretty
+    }
+}
+
+impl Default for LogOutput {
+    fn default() -> Self {
+        LogOutput::Stdout
+    }
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 9091,
+            path: "/metrics".to_string(),
+        }
+    }
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(5),
+            failure_threshold: 3,
+            success_threshold: 2,
+        }
+    }
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            // Hot path values (matching RuntimeConfig::from_env defaults)
+            backend_response_timeout: Duration::from_secs(10),
+            connection_pool_size: 64,
+            max_requests_per_connection: 100,
+            
+            // Buffer configuration (matching RuntimeConfig defaults)
+            standard_buffer_size: 8192,   // 8KB
+            large_buffer_size: 16384,     // 16KB
+            header_buffer_size: 4096,     // 4KB
+            
+            // Pre-computed Duration objects
+            connection_max_age: Duration::from_secs(120),
+            circuit_breaker_timeout: Duration::from_secs(10),
+            keep_alive_timeout: Duration::from_secs(5),
+            
+            // Circuit breaker and retry
+            circuit_breaker_failure_threshold: 5,
+            max_retries: 2,
+            
+            // Network optimization
+            tcp_nodelay: true,
+            so_reuseport: true,
+            
+            // CPU affinity disabled by default
+            cpu_affinity: None,
+        }
+    }
+}
+
+// Custom deserializers for human-readable formats
+// All parsing happens once at startup
+
+/// Deserialize human-readable sizes like "64MB", "1GB", "512KB"
+fn deserialize_size<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    parse_size(&s).map_err(D::Error::custom)
+}
+
+/// Deserialize human-readable durations like "10s", "500ms", "1m"
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    parse_duration(&s).map_err(D::Error::custom)
+}
+
+/// Serialize Duration to human-readable format
+fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let s = format_duration(duration);
+    serializer.serialize_str(&s)
+}
+
+/// Serialize size to human-readable format
+fn serialize_size<S>(size: &usize, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let s = format_size(*size);
+    serializer.serialize_str(&s)
+}
+
+/// Parse human-readable size strings to bytes
+fn parse_size(s: &str) -> Result<usize> {
+    let s = s.trim().to_lowercase();
+    
+    if let Ok(bytes) = s.parse::<usize>() {
+        return Ok(bytes);
+    }
+    
+    let (number_part, suffix) = if s.ends_with("kb") {
+        (s.trim_end_matches("kb"), 1024)
+    } else if s.ends_with("mb") {
+        (s.trim_end_matches("mb"), 1024 * 1024)
+    } else if s.ends_with("gb") {
+        (s.trim_end_matches("gb"), 1024 * 1024 * 1024)
+    } else if s.ends_with("k") {
+        (s.trim_end_matches("k"), 1024)
+    } else if s.ends_with("m") {
+        (s.trim_end_matches("m"), 1024 * 1024)
+    } else if s.ends_with("g") {
+        (s.trim_end_matches("g"), 1024 * 1024 * 1024)
+    } else {
+        return Err(anyhow!("Invalid size format: {}. Expected format like '64MB', '1GB', '512KB'", s));
+    };
+    
+    let number: f64 = number_part.parse()
+        .map_err(|_| anyhow!("Invalid number in size: {}", s))?;
+    
+    if number < 0.0 {
+        return Err(anyhow!("Size cannot be negative: {}", s));
+    }
+    
+    Ok((number * suffix as f64) as usize)
+}
+
+/// Parse human-readable duration strings to Duration
+fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim().to_lowercase();
+    
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(Duration::from_secs(secs));
+    }
+    
+    let (number_part, suffix) = if s.ends_with("ns") {
+        (s.trim_end_matches("ns"), Duration::from_nanos(1))
+    } else if s.ends_with("us") || s.ends_with("μs") {
+        (s.trim_end_matches("us").trim_end_matches("μs"), Duration::from_micros(1))
+    } else if s.ends_with("ms") {
+        (s.trim_end_matches("ms"), Duration::from_millis(1))
+    } else if s.ends_with("s") {
+        (s.trim_end_matches("s"), Duration::from_secs(1))
+    } else if s.ends_with("m") {
+        (s.trim_end_matches("m"), Duration::from_secs(60))
+    } else if s.ends_with("h") {
+        (s.trim_end_matches("h"), Duration::from_secs(3600))
+    } else {
+        return Err(anyhow!("Invalid duration format: {}. Expected format like '10s', '500ms', '1m'", s));
+    };
+    
+    let number: f64 = number_part.parse()
+        .map_err(|_| anyhow!("Invalid number in duration: {}", s))?;
+    
+    if number < 0.0 {
+        return Err(anyhow!("Duration cannot be negative: {}", s));
+    }
+    
+    Ok(Duration::from_nanos((number * suffix.as_nanos() as f64) as u64))
+}
+
+/// Format Duration to human-readable string
+fn format_duration(duration: &Duration) -> String {
+    let total_secs = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    
+    if total_secs >= 3600 {
+        format!("{}h", total_secs / 3600)
+    } else if total_secs >= 60 {
+        format!("{}m", total_secs / 60)
+    } else if total_secs > 0 {
+        format!("{}s", total_secs)
+    } else if nanos >= 1_000_000 {
+        format!("{}ms", nanos / 1_000_000)
+    } else if nanos >= 1_000 {
+        format!("{}us", nanos / 1_000)
+    } else {
+        format!("{}ns", nanos)
+    }
+}
+
+/// Format size to human-readable string
+fn format_size(size: usize) -> String {
+    const GB: usize = 1024 * 1024 * 1024;
+    const MB: usize = 1024 * 1024;
+    const KB: usize = 1024;
+    
+    if size >= GB && size % GB == 0 {
+        format!("{}GB", size / GB)
+    } else if size >= MB && size % MB == 0 {
+        format!("{}MB", size / MB)
+    } else if size >= KB && size % KB == 0 {
+        format!("{}KB", size / KB)
+    } else {
+        size.to_string()
+    }
+}
+
+// Configuration loading and persistence
+impl UringRessConfig {
     /// Load configuration from file with auto-format detection
     /// Supports JSON (.json) and YAML (.yaml, .yml) formats
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-
+        
+        // Check if file exists
         if !path.exists() {
             return Err(anyhow!("Configuration file not found: {}", path.display()));
         }
-
+        
+        // Read file contents
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow!("Failed to read configuration file '{}': {}", path.display(), e))?;
-
+        
+        // Auto-detect format from file extension
         let config = match path.extension().and_then(|ext| ext.to_str()) {
             Some("json") => {
                 serde_json::from_str::<Self>(&content)
@@ -39,479 +1018,527 @@ impl PortailConfig {
                 ));
             }
         };
-
+        
+        // Validate the loaded configuration
         config.validate()
             .map_err(|e| anyhow!("Configuration validation failed for '{}': {}", path.display(), e))?;
-
+        
         Ok(config)
     }
 }
 
-impl PortailConfig {
+// Configuration validation
+impl UringRessConfig {
+    /// Validate the entire configuration for consistency and correctness
+    /// All validation happens once at startup
+    pub fn validate(&self) -> Result<()> {
+        self.gateway.validate()?;
+        
+        // Validate worker configurations
+        self.gateway.validate_worker_configs()
+            .map_err(|e| anyhow!("Worker configuration validation failed: {}", e))?;
+        
+        for (i, route) in self.http_routes.iter().enumerate() {
+            route.validate().map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
+        }
+        
+        for (i, route) in self.tcp_routes.iter().enumerate() {
+            route.validate().map_err(|e| anyhow!("TCP route {}: {}", i, e))?;
+        }
+        
+        self.observability.validate()?;
+        self.performance.validate()?;
+        
+        // Check for port conflicts
+        self.validate_port_conflicts()?;
+        
+        Ok(())
+    }
+    
+    /// Check for port conflicts between different services
+    fn validate_port_conflicts(&self) -> Result<()> {
+        let mut used_ports = std::collections::HashSet::new();
+        
+        // Check gateway listener ports
+        for listener in &self.gateway.listeners {
+            if !used_ports.insert(listener.port) {
+                return Err(anyhow!("Port conflict: Listener port {} already in use", listener.port));
+            }
+        }
+        
+        // Check API port
+        if self.gateway.api_enabled {
+            if !used_ports.insert(self.gateway.api_port) {
+                return Err(anyhow!("Port conflict: API port {} already in use", self.gateway.api_port));
+            }
+        }
+        
+        // Check metrics port
+        if self.observability.metrics.enabled {
+            if !used_ports.insert(self.observability.metrics.port) {
+                return Err(anyhow!("Port conflict: Metrics port {} already in use", self.observability.metrics.port));
+            }
+        }
+        
+        // TCP route ports are checked via parent_refs and gateway listeners
+        // No additional port validation needed since TCP routes must reference valid listeners
+        
+        Ok(())
+    }
+}
+
+impl HttpRouteConfig {
+    fn validate(&self) -> Result<()> {
+        // Validate parent refs
+        if self.parent_refs.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one parent_ref"));
+        }
+        
+        for parent_ref in &self.parent_refs {
+            parent_ref.validate()?;
+        }
+        
+        // Validate hostnames
+        if self.hostnames.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one hostname"));
+        }
+        
+        for hostname in &self.hostnames {
+            if hostname.is_empty() {
+                return Err(anyhow!("Hostname cannot be empty"));
+            }
+            if hostname.contains(':') {
+                return Err(anyhow!("Hostname must not contain port: {}", hostname));
+            }
+        }
+        
+        // Validate rules
+        if self.rules.is_empty() {
+            return Err(anyhow!("HTTP route must have at least one rule"));
+        }
+        
+        for (i, rule) in self.rules.iter().enumerate() {
+            rule.validate().map_err(|e| anyhow!("HTTP route rule {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl TcpRouteConfig {
+    fn validate(&self) -> Result<()> {
+        // Validate parent refs
+        if self.parent_refs.is_empty() {
+            return Err(anyhow!("TCP route must have at least one parent_ref"));
+        }
+        
+        for parent_ref in &self.parent_refs {
+            parent_ref.validate()?;
+        }
+        
+        // Validate rules
+        if self.rules.is_empty() {
+            return Err(anyhow!("TCP route must have at least one rule"));
+        }
+        
+        for (i, rule) in self.rules.iter().enumerate() {
+            rule.validate().map_err(|e| anyhow!("TCP route rule {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+
+impl GatewayConfig {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Gateway name cannot be empty"));
+        }
+        
+        if self.listeners.is_empty() {
+            return Err(anyhow!("Gateway must have at least one listener"));
+        }
+        
+        for (i, listener) in self.listeners.iter().enumerate() {
+            listener.validate().map_err(|e| anyhow!("Listener {}: {}", i, e))?;
+        }
+        
+        validate_port(self.api_port, "API port")?;
+        
+        if self.worker_threads == 0 {
+            return Err(anyhow!("Worker threads must be greater than 0"));
+        }
+        
+        Ok(())
+    }
+}
+
+impl ListenerConfig {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Listener name cannot be empty"));
+        }
+        
+        validate_port(self.port, "Listener port")?;
+        
+        // Validate interface name if specified
+        if let Some(ref interface) = self.interface {
+            if interface.is_empty() {
+                return Err(anyhow!("Interface name cannot be empty when specified"));
+            }
+            
+            // Basic interface name validation (Linux interface naming rules)
+            if interface.len() > 15 {
+                return Err(anyhow!("Interface name '{}' is too long (max 15 characters)", interface));
+            }
+            
+            // Interface names cannot contain certain characters
+            if interface.contains(' ') || interface.contains('/') || interface.contains(':') {
+                return Err(anyhow!("Interface name '{}' contains invalid characters", interface));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl ParentRef {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Parent ref name cannot be empty"));
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpRouteRule {
+    fn validate(&self) -> Result<()> {
+        if self.backend_refs.is_empty() {
+            return Err(anyhow!("HTTP route rule must have at least one backend_ref"));
+        }
+        
+        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+        }
+        
+        for (i, match_rule) in self.matches.iter().enumerate() {
+            match_rule.validate().map_err(|e| anyhow!("Match rule {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpRouteMatch {
+    fn validate(&self) -> Result<()> {
+        if let Some(path_match) = &self.path {
+            path_match.validate()?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpPathMatch {
+    fn validate(&self) -> Result<()> {
+        if !self.value.starts_with('/') {
+            return Err(anyhow!("Path match value must start with '/': {}", self.value));
+        }
+        
+        Ok(())
+    }
+}
+
+impl TcpRouteRule {
+    fn validate(&self) -> Result<()> {
+        if self.backend_refs.is_empty() {
+            return Err(anyhow!("TCP route rule must have at least one backend_ref"));
+        }
+        
+        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl BackendRef {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(anyhow!("Backend ref name cannot be empty"));
+        }
+        
+        validate_port(self.port, "Backend ref port")?;
+        
+        if self.weight <= 0 {
+            return Err(anyhow!("Backend ref weight must be greater than 0: {}", self.weight));
+        }
+        
+        Ok(())
+    }
+}
+
+impl ObservabilityConfig {
+    fn validate(&self) -> Result<()> {
+        self.metrics.validate()?;
+        self.health_check.validate()?;
+        Ok(())
+    }
+}
+
+impl MetricsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled {
+            validate_port(self.port, "Metrics port")?;
+            
+            if !self.path.starts_with('/') {
+                return Err(anyhow!("Metrics path must start with '/': {}", self.path));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl HealthCheckConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled {
+            if self.interval.as_secs() == 0 {
+                return Err(anyhow!("Health check interval must be greater than 0"));
+            }
+            
+            if self.timeout.as_secs() == 0 {
+                return Err(anyhow!("Health check timeout must be greater than 0"));
+            }
+            
+            if self.failure_threshold == 0 {
+                return Err(anyhow!("Health check failure threshold must be greater than 0"));
+            }
+            
+            if self.success_threshold == 0 {
+                return Err(anyhow!("Health check success threshold must be greater than 0"));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl PerformanceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.connection_pool_size == 0 {
+            return Err(anyhow!("Connection pool size must be greater than 0"));
+        }
+        
+        if self.max_requests_per_connection == 0 {
+            return Err(anyhow!("Max requests per connection must be greater than 0"));
+        }
+        
+        if self.standard_buffer_size == 0 {
+            return Err(anyhow!("Standard buffer size must be greater than 0"));
+        }
+        
+        if self.large_buffer_size == 0 {
+            return Err(anyhow!("Large buffer size must be greater than 0"));
+        }
+        
+        if self.header_buffer_size == 0 {
+            return Err(anyhow!("Header buffer size must be greater than 0"));
+        }
+        
+        if self.circuit_breaker_failure_threshold == 0 {
+            return Err(anyhow!("Circuit breaker failure threshold must be greater than 0"));
+        }
+        
+        Ok(())
+    }
+}
+
+
+/// Resolve service name to IP address
+/// For MVP: simple localhost resolution
+/// In production: would integrate with service discovery (DNS, Consul, K8s, etc.)
+fn resolve_service_address(service_name: &str) -> String {
+    // For development/testing, all services resolve to localhost
+    // This is appropriate for our examples where services run locally
+    match service_name {
+        // Allow some common service patterns
+        name if name.contains("localhost") => "127.0.0.1".to_string(),
+        name if name.contains("127.0.0.1") => "127.0.0.1".to_string(),
+        // All other services resolve to localhost for MVP
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+// Configuration to runtime structure conversion
+impl UringRessConfig {
     /// Convert configuration to RouteTable for runtime use
     /// All route processing happens once at startup - zero runtime overhead
     pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
-        use crate::routing;
-
-        let mut route_table = routing::RouteTable::new();
-
+        use crate::routing::{RouteTable, Backend};
+        
+        let mut route_table = RouteTable::new();
+        
         tracing::debug!("Converting {} HTTP routes to route table", self.http_routes.len());
-
+        
+        // Convert HTTP routes using new Gateway API structure
         for (route_idx, http_route) in self.http_routes.iter().enumerate() {
-            tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules",
+            tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules", 
                 route_idx, http_route.hostnames.len(), http_route.rules.len());
-
-            // Find all matching listeners for this route's parentRefs.
-            // A route may target a specific listener (sectionName) or all listeners (no sectionName).
-            let matched_listeners = find_listeners_for_route(&http_route.parent_refs, &self.gateway);
-
-            if matched_listeners.is_empty() {
-                // No matching listener found — route without gateway context.
-                // Add to a default scope with port 0 (for file-based configs without a gateway).
-                let effective_hostnames = if http_route.hostnames.is_empty() {
-                    vec!["*".to_string()]
-                } else {
-                    http_route.hostnames.clone()
-                };
-
-                for hostname in &effective_hostnames {
-                    for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
-                        for route_match in &rule.matches {
-                            let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
-                            route_table.add_http_route_for_listener(0, None, hostname, routing_rule);
+            // For each hostname in the route
+            for hostname in &http_route.hostnames {
+                tracing::debug!("  Processing hostname: {}", hostname);
+                // For each rule in the route
+                for (rule_idx, rule) in http_route.rules.iter().enumerate() {
+                    tracing::debug!("    Processing rule {}: {} matches, {} backend_refs", 
+                        rule_idx, rule.matches.len(), rule.backend_refs.len());
+                    // For each match in the rule
+                    for route_match in &rule.matches {
+                        // Extract path from match (default to "/" if no path match)
+                        let path = if let Some(path_match) = &route_match.path {
+                            &path_match.value
+                        } else {
+                            "/"
+                        };
+                        
+                        tracing::debug!("      Adding route: {} {} -> {} backends", 
+                            hostname, path, rule.backend_refs.len());
+                        
+                        // Convert backend references to Backend objects
+                        let mut backends = Vec::new();
+                        for backend_ref in &rule.backend_refs {
+                            // For MVP: resolve service names to localhost
+                            // In production, this would resolve via service discovery
+                            let backend_address = resolve_service_address(&backend_ref.name);
+                            let backend = Backend::new(
+                                backend_address.clone(),
+                                backend_ref.port
+                            )?;
+                            backends.push(backend);
+                            tracing::debug!("        Backend: {}:{} (service: {})", 
+                                backend_address, backend_ref.port, backend_ref.name);
                         }
-                    }
-                }
-                continue;
-            }
-
-            // For each matching listener, compute hostname intersection and add routes
-            for listener in &matched_listeners {
-                let effective_hostnames = if http_route.hostnames.is_empty() {
-                    // Route has no hostnames = match all.
-                    // Use listener hostname if set, otherwise catch-all "*".
-                    match &listener.hostname {
-                        Some(h) => vec![h.clone()],
-                        None => vec!["*".to_string()],
-                    }
-                } else {
-                    let hostnames = intersect_hostnames(listener, &http_route.hostnames);
-                    if hostnames.is_empty() {
-                        tracing::warn!("HTTP route {} has no hostnames matching listener '{}' scope, skipping",
-                            route_idx, listener.name);
-                        continue;
-                    }
-                    hostnames
-                };
-
-                for hostname in &effective_hostnames {
-                    tracing::debug!("  Processing hostname: {} for listener {}:{} ({:?})",
-                        hostname, listener.name, listener.port, listener.hostname);
-                    for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
-                            rule_idx, rule.matches.len(), rule.backend_refs.len());
-
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
-
-                        for route_match in &rule.matches {
-                            let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
-                            tracing::debug!("      Adding route: {} {} -> {} backends (listener {}:{:?})",
-                                hostname, routing_rule.path, backends.len(), listener.port, listener.hostname);
-                            route_table.add_http_route_for_listener(
-                                listener.port,
-                                listener.hostname.as_deref(),
+                        
+                        if backends.len() == 1 {
+                            // Single backend
+                            route_table.add_http_route(hostname, path, backends.into_iter().next().unwrap());
+                        } else {
+                            // Multiple backends with round-robin
+                            route_table.add_http_route_with_pool(
                                 hostname,
-                                routing_rule,
+                                path,
+                                backends,
+                                crate::routing::LoadBalanceStrategy::RoundRobin
                             );
                         }
                     }
                 }
             }
         }
-
-        self.convert_l4_routes(&mut route_table, &self.tcp_routes, Protocol::TCP)?;
-        self.convert_l4_routes(&mut route_table, &self.udp_routes, Protocol::UDP)?;
-
-        // Convert TLS routes (SNI-based)
-        for tls_route in &self.tls_routes {
-            for rule in &tls_route.rules {
-                let backends: Vec<routing::Backend> = rule.backend_refs.iter()
-                    .filter_map(|br| {
-                        routing::Backend::new(br.name.clone(), br.port)
-                            .map_err(|e| tracing::warn!("Skipping TLS backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
-                            .ok()
-                    })
-                    .collect();
-
-                for hostname in &tls_route.hostnames {
-                    route_table.add_tls_route(hostname, backends.clone());
+        
+        // Convert TCP routes using new Gateway API structure
+        for tcp_route in &self.tcp_routes {
+            // Find the listener port for this TCP route by examining parent refs
+            if let Some(parent_ref) = tcp_route.parent_refs.first() {
+                if let Some(section_name) = &parent_ref.section_name {
+                    // Find the listener with this section name
+                    if let Some(listener) = self.gateway.listeners.iter()
+                        .find(|l| l.name == *section_name && l.protocol == Protocol::TCP) {
+                        
+                        // Convert backend references to Backend objects
+                        for rule in &tcp_route.rules {
+                            let mut backends = Vec::new();
+                            for backend_ref in &rule.backend_refs {
+                                let backend = Backend::new(
+                                    format!("127.0.0.1"), // Placeholder - in real implementation would resolve service
+                                    backend_ref.port
+                                )?;
+                                backends.push(backend);
+                            }
+                            
+                            // Add TCP route using the listener port
+                            route_table.add_tcp_route(listener.port, backends);
+                        }
+                    }
                 }
             }
         }
-
-        tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
-            route_table.listener_scopes.values().map(|v| v.len()).sum::<usize>(), route_table.tcp_routes.len(), route_table.udp_routes.len());
-
+        
+        tracing::debug!("Route table conversion completed: {} HTTP routes, {} TCP routes", 
+            route_table.http_routes.len(), route_table.tcp_routes.len());
+        
         Ok(route_table)
     }
 }
 
-trait L4Route {
-    fn parent_refs(&self) -> &[ParentRef];
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]>;
-}
-
-impl L4Route for TcpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
-    }
-}
-
-impl L4Route for UdpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
-    }
-}
-
-impl PortailConfig {
-    fn convert_l4_routes<R: L4Route>(
-        &self,
-        route_table: &mut crate::routing::RouteTable,
-        routes: &[R],
-        protocol: Protocol,
-    ) -> Result<()> {
-        use crate::routing;
-
-        for route in routes {
-            if let Some(parent_ref) = route.parent_refs().first() {
-                if let Some(section_name) = &parent_ref.section_name {
-                    let protocol_matches = |l: &&ListenerConfig| match protocol {
-                        Protocol::TCP => matches!(l.protocol, Protocol::TCP | Protocol::TLS),
-                        _ => l.protocol == protocol,
-                    };
-                    if let Some(listener) = self.gateway.listeners.iter()
-                        .find(|l| l.name == *section_name && protocol_matches(l)) {
-
-                        for backend_refs in route.backend_refs_per_rule() {
-                            let backends: Vec<routing::Backend> = backend_refs.iter()
-                                .filter_map(|br| {
-                                    routing::Backend::new(br.name.clone(), br.port)
-                                        .map_err(|e| tracing::warn!("Skipping L4 backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
-                                        .ok()
-                                })
-                                .collect();
-
-                            match protocol {
-                                Protocol::TCP | Protocol::TLS | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
-                                Protocol::UDP => route_table.add_udp_route(listener.port, backends),
-                            }
-                        }
-                    }
-                }
-            }
+impl PerformanceConfig {
+    /// Convert PerformanceConfig and GatewayConfig to RuntimeConfig
+    /// All values are pre-computed at startup for zero runtime overhead
+    pub fn to_runtime_config(&self, gateway: &GatewayConfig) -> Result<crate::runtime_config::RuntimeConfig> {
+        use std::collections::HashMap;
+        
+        // Build listener map for zero-overhead port-based routing
+        let mut listeners = HashMap::new();
+        for listener in &gateway.listeners {
+            let protocol = match listener.protocol {
+                Protocol::HTTP => crate::runtime_config::Protocol::HTTP,
+                Protocol::HTTPS => crate::runtime_config::Protocol::HTTPS,
+                Protocol::TCP => crate::runtime_config::Protocol::TCP,
+                Protocol::UDP => crate::runtime_config::Protocol::UDP,
+            };
+            
+            // Parse the address if provided
+            let address = if let Some(ref addr_str) = listener.address {
+                Some(addr_str.parse().map_err(|e| anyhow::anyhow!("Invalid listener address {}: {}", addr_str, e))?)
+            } else {
+                None
+            };
+            
+            let listener_info = crate::runtime_config::ListenerInfo {
+                protocol,
+                address,
+                interface: listener.interface.clone(),
+            };
+            
+            listeners.insert(listener.port, listener_info);
         }
-        Ok(())
+        
+        Ok(crate::runtime_config::RuntimeConfig::new(
+            listeners,
+        ))
     }
 }
 
-/// Find all listeners that a route attaches to via its parentRefs.
-/// A route without sectionName attaches to all listeners.
-/// A route with sectionName attaches only to that specific listener.
-fn find_listeners_for_route<'a>(parent_refs: &[ParentRef], gateway: &'a GatewayConfig) -> Vec<&'a ListenerConfig> {
-    if parent_refs.is_empty() {
-        return Vec::new();
-    }
+// Utility functions
 
-    let mut matched = Vec::new();
-    for pr in parent_refs {
-        // Filter listeners by sectionName and/or port from the parentRef
-        let candidates: Vec<&ListenerConfig> = gateway.listeners.iter().filter(|l| {
-            // If sectionName is specified, listener name must match
-            if let Some(section) = &pr.section_name {
-                if l.name != *section {
-                    return false;
-                }
-            }
-            // If port is specified, listener port must match
-            if let Some(port) = pr.port {
-                if l.port != port as u16 {
-                    return false;
-                }
-            }
-            true
-        }).collect();
-
-        for listener in candidates {
-            if !matched.iter().any(|l: &&ListenerConfig| l.name == listener.name) {
-                matched.push(listener);
-            }
-        }
+/// Validate port number is in valid range (1-65535)
+fn validate_port(port: u16, name: &str) -> Result<()> {
+    if port == 0 {
+        return Err(anyhow!("{} must be between 1 and 65535", name));
     }
-    matched
+    Ok(())
 }
 
-/// Build backends and filters from a route rule. Extracts common logic from the route loop.
-fn build_rule_components(
-    rule: &HttpRouteRule,
-    _rule_idx: usize,
-    _hostname: &str,
-    endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
-) -> Result<(Vec<crate::routing::Backend>, Vec<crate::routing::HttpFilter>)> {
-    use crate::routing;
-
-    let mut backends = Vec::new();
-    for backend_ref in &rule.backend_refs {
-        let backend_filters = convert_filters(&backend_ref.filters)?;
-
-        // Check if this backend has endpoint overrides (headless service)
-        let override_key = (backend_ref.name.clone(), backend_ref.port);
-        if let Some(endpoints) = endpoint_overrides.get(&override_key) {
-            if !endpoints.is_empty() {
-                tracing::debug!("        Headless backend {}:{} -> {} pod endpoints",
-                    backend_ref.name, backend_ref.port, endpoints.len());
-                for (pod_ip, target_port) in endpoints {
-                    match routing::Backend::with_weight(
-                        pod_ip.clone(),
-                        *target_port,
-                        backend_ref.weight,
-                    ) {
-                        Ok(mut backend) => {
-                            backend.filters = backend_filters.clone();
-                            backends.push(backend);
-                        }
-                        Err(e) => {
-                            tracing::warn!("        Skipping headless endpoint {}:{} - {}", pod_ip, target_port, e);
-                        }
-                    }
-                }
-                continue;
-            }
-        }
-
-        // Standard DNS-based resolution
-        match routing::Backend::with_weight(
-            backend_ref.name.clone(),
-            backend_ref.port,
-            backend_ref.weight,
-        ) {
-            Ok(mut backend) => {
-                backend.filters = backend_filters;
-                backends.push(backend);
-                tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
-            }
-            Err(e) => {
-                tracing::warn!("        Skipping backend {}:{} - DNS resolution failed: {}", backend_ref.name, backend_ref.port, e);
-            }
-        }
-    }
-
-    let filters = convert_filters(&rule.filters)?;
-    Ok((backends, filters))
-}
-
-/// Build a routing rule from a route match, reused backends, and filters.
-fn build_routing_rule(
-    route_match: &crate::config::HttpRouteMatch,
-    filters: &[crate::routing::HttpFilter],
-    backends: &[crate::routing::Backend],
-    rule: &HttpRouteRule,
-) -> Result<crate::routing::HttpRouteRule> {
-    use crate::routing;
-
-    let (path, path_match_type, path_regex) = if let Some(path_match) = &route_match.path {
-        match path_match.match_type {
-            HttpPathMatchType::PathPrefix => (path_match.value.as_str(), routing::PathMatchType::Prefix, None),
-            HttpPathMatchType::Exact => (path_match.value.as_str(), routing::PathMatchType::Exact, None),
-            HttpPathMatchType::RegularExpression => {
-                let re = regex::Regex::new(&path_match.value)
-                    .map_err(|e| anyhow!("Invalid path regex '{}': {}", path_match.value, e))?;
-                (path_match.value.as_str(), routing::PathMatchType::RegularExpression, Some(re))
-            }
-        }
-    } else {
-        ("/", routing::PathMatchType::Prefix, None)
-    };
-
-    let header_matches: Vec<routing::HeaderMatch> = route_match.headers.iter().map(Into::into).collect();
-    let query_param_matches: Vec<routing::QueryParamMatch> = route_match.query_params.iter().map(Into::into).collect();
-
-    let mut routing_rule = routing::HttpRouteRule::new(
-        path_match_type,
-        path.to_string(),
-        header_matches,
-        query_param_matches,
-        filters.to_vec(),
-        backends.to_vec(),
-    ).with_method(route_match.method.clone());
-    routing_rule.path_regex = path_regex;
-    if let Some(ref timeouts) = rule.timeouts {
-        routing_rule.request_timeout = timeouts.request;
-        routing_rule.backend_request_timeout = timeouts.backend_request;
-    }
-    Ok(routing_rule)
-}
-
-/// Check if a route hostname is within the scope of a listener hostname.
-/// Rules:
-/// - Listener has no hostname: all route hostnames are valid
-/// - Listener "*.example.com" accepts "foo.example.com" and "*.example.com"
-/// - Listener "example.com" accepts only "example.com"
-/// - Route "*.example.com" is within listener "*.example.com"
-/// - Route "*.specific.com" intersects with listener "very.specific.com"
-fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
-    let lh = listener_hostname.to_ascii_lowercase();
-    let rh = route_hostname.to_ascii_lowercase();
-
-    if let Some(listener_parent) = lh.strip_prefix("*.") {
-        // Wildcard listener: route hostname must be under the same parent domain
-        if let Some(route_parent) = rh.strip_prefix("*.") {
-            // *.example.com listener, *.example.com route -> match
-            route_parent == listener_parent
-        } else {
-            // *.example.com listener, foo.example.com route -> match if parent matches
-            rh.ends_with(listener_parent) && rh.len() > listener_parent.len()
-                && rh.as_bytes()[rh.len() - listener_parent.len() - 1] == b'.'
-        }
-    } else {
-        // Exact listener hostname
-        if let Some(route_parent) = rh.strip_prefix("*.") {
-            // Exact listener "very.specific.com", wildcard route "*.specific.com"
-            // -> match if the listener hostname is under the route's wildcard scope
-            lh.ends_with(route_parent) && lh.len() > route_parent.len()
-                && lh.as_bytes()[lh.len() - route_parent.len() - 1] == b'.'
-        } else {
-            // Both exact -> must match exactly
-            rh == lh
-        }
-    }
-}
-
-/// Compute the intersection of listener hostname scope with route hostnames.
-/// Returns the set of effective hostnames that result from the intersection.
-/// Per Gateway API spec, the intersection is the more specific of the two:
-///   - listener "very.specific.com" ∩ route "*.specific.com" → "very.specific.com"
-///   - listener "*.example.com" ∩ route "foo.example.com" → "foo.example.com"
-///   - listener "*.example.com" ∩ route "*.example.com" → "*.example.com"
-fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) -> Vec<String> {
-    match &listener.hostname {
-        None => {
-            // No listener hostname -> all route hostnames are valid
-            route_hostnames.to_vec()
-        }
-        Some(listener_hostname) => {
-            let lh = listener_hostname.to_ascii_lowercase();
-            route_hostnames.iter()
-                .filter(|rh| hostname_matches(listener_hostname, rh))
-                .map(|rh| {
-                    let rh_lower = rh.to_ascii_lowercase();
-                    // Return the more specific of the two hostnames
-                    if rh_lower.starts_with("*.") && !lh.starts_with("*.") {
-                        // Route is wildcard, listener is exact → use listener (more specific)
-                        lh.clone()
-                    } else if lh.starts_with("*.") && !rh_lower.starts_with("*.") {
-                        // Listener is wildcard, route is exact → use route (more specific)
-                        rh_lower
-                    } else {
-                        // Both same type → use route hostname
-                        rh_lower
-                    }
-                })
-                .collect()
-        }
-    }
-}
-
-fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
-    config_filters.iter().map(crate::routing::HttpFilter::try_from).collect()
-}
-
-impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
-    type Error = anyhow::Error;
-
-    fn try_from(f: &HttpRouteFilter) -> Result<Self> {
-        Ok(match f {
-            HttpRouteFilter::RequestHeaderModifier { config } => {
-                Self::RequestHeaderModifier {
-                    add: std::sync::Arc::new(config.add.clone()),
-                    set: std::sync::Arc::new(config.set.clone()),
-                    remove: std::sync::Arc::new(config.remove.clone()),
-                }
-            }
-            HttpRouteFilter::ResponseHeaderModifier { config } => {
-                Self::ResponseHeaderModifier {
-                    add: std::sync::Arc::new(config.add.clone()),
-                    set: std::sync::Arc::new(config.set.clone()),
-                    remove: std::sync::Arc::new(config.remove.clone()),
-                }
-            }
-            HttpRouteFilter::RequestRedirect { config } => {
-                let path = config.path.as_ref().map(crate::routing::URLRewritePath::from);
-                Self::RequestRedirect {
-                    scheme: config.scheme.clone(),
-                    hostname: config.hostname.clone(),
-                    port: config.port,
-                    path,
-                    status_code: config.status_code,
-                }
-            }
-            HttpRouteFilter::URLRewrite { config } => {
-                Self::URLRewrite {
-                    hostname: config.hostname.clone(),
-                    path: config.path.as_ref().map(crate::routing::URLRewritePath::from),
-                }
-            }
-            HttpRouteFilter::RequestMirror { config } => {
-                let backend = crate::routing::Backend::with_weight(
-                    config.backend_ref.name.clone(), config.backend_ref.port, config.backend_ref.weight,
-                )?;
-                Self::RequestMirror { backend_addr: backend.socket_addr }
-            }
-        })
-    }
-}
-
-
-impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
-    fn from(p: &HttpURLRewritePath) -> Self {
-        match p {
-            HttpURLRewritePath::ReplaceFullPath { value } => Self::ReplaceFullPath(value.clone()),
-            HttpURLRewritePath::ReplacePrefixMatch { value } => Self::ReplacePrefixMatch(value.clone()),
-        }
-    }
-}
-
-fn build_value_matcher(value: &str, match_type: &super::types::StringMatchType) -> crate::routing::ValueMatcher {
-    match match_type {
-        super::types::StringMatchType::Exact => crate::routing::ValueMatcher::Exact(value.to_string()),
-        super::types::StringMatchType::RegularExpression => {
-            // Validation ensures regex is valid before we get here
-            let re = regex::Regex::new(value).expect("regex validated at config load time");
-            crate::routing::ValueMatcher::Regex(re)
-        }
-    }
-}
-
-impl From<&super::types::HttpHeaderMatch> for crate::routing::HeaderMatch {
-    fn from(hm: &super::types::HttpHeaderMatch) -> Self {
-        Self { name: hm.name.to_ascii_lowercase(), matcher: build_value_matcher(&hm.value, &hm.match_type) }
-    }
-}
-
-impl From<&super::types::HttpQueryParamMatch> for crate::routing::QueryParamMatch {
-    fn from(qm: &super::types::HttpQueryParamMatch) -> Self {
-        Self { name: qm.name.clone(), matcher: build_value_matcher(&qm.value, &qm.match_type) }
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::super::*;
-    use super::super::parsing::parse_duration;
-    use std::time::Duration;
-
+    use super::*;
+    
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_size("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("0.5MB").unwrap(), 512 * 1024);
+        
+        assert!(parse_size("invalid").is_err());
+        assert!(parse_size("-1MB").is_err());
+    }
+    
     #[test]
     fn test_parse_duration() {
         assert_eq!(parse_duration("5").unwrap(), Duration::from_secs(5));
@@ -519,19 +1546,23 @@ mod tests {
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-
+        
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("-5s").is_err());
     }
-
-
+    
+    
     #[test]
     fn test_default_config() {
-        let config = PortailConfig::default();
+        let config = UringRessConfig::default();
         assert!(config.validate().is_ok());
+        assert_eq!(config.gateway.api_port, 8081);
+        assert!(config.gateway.api_enabled);
+        assert_eq!(config.performance.connection_pool_size, 64);
+        // Gateway should have at least one listener
         assert!(!config.gateway.listeners.is_empty());
     }
-
+    
     #[test]
     fn test_json_deserialization() {
         let json = r#"{
@@ -549,15 +1580,41 @@ mod tests {
                         "port": 8080
                     }
                 ],
-                "workerThreads": 8
+                "worker_threads": 8,
+                "api_port": 8090,
+                "api_enabled": true,
+                "io_uring_queue_depth": 512,
+                "connection_pool_size": 128,
+                "buffer_pool_size": "128MB"
+            },
+            "performance": {
+                "backend_response_timeout": "30s",
+                "connection_pool_size": 128,
+                "max_requests_per_connection": 200,
+                "standard_buffer_size": "16KB",
+                "large_buffer_size": "32KB",
+                "header_buffer_size": "8KB",
+                "connection_max_age": "5m",
+                "circuit_breaker_timeout": "15s",
+                "keep_alive_timeout": "10s",
+                "circuit_breaker_failure_threshold": 10,
+                "max_retries": 3,
+                "tcp_nodelay": true,
+                "so_reuseport": true,
+                "cpu_affinity": [0, 1, 2, 3]
             }
         }"#;
-
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.gateway.listeners[0].port, 9000);
+        assert_eq!(config.gateway.buffer_pool_size, 128 * 1024 * 1024);
+        assert_eq!(config.performance.backend_response_timeout, Duration::from_secs(30));
+        assert_eq!(config.performance.standard_buffer_size, 16 * 1024);
+        assert_eq!(config.performance.connection_max_age, Duration::from_secs(300));
+        assert_eq!(config.performance.cpu_affinity, Some(vec![0, 1, 2, 3]));
     }
-
+    
     #[test]
     fn test_route_configuration() {
         let json = r#"{
@@ -571,18 +1628,24 @@ mod tests {
                     },
                     {
                         "name": "tcp-5432",
-                        "protocol": "TCP",
+                        "protocol": "TCP", 
                         "port": 5432
                     }
                 ],
-                "workerThreads": 8
+                "worker_threads": 8,
+                "api_port": 8081,
+                "api_enabled": true,
+                "io_uring_queue_depth": 256,
+                "connection_pool_size": 64,
+                "buffer_pool_size": "64MB"
             },
-            "httpRoutes": [
+            "http_routes": [
                 {
-                    "parentRefs": [
+                    "parent_refs": [
                         {
                             "name": "test-gateway",
-                            "sectionName": "http-8080"
+                            "section_name": "http-8080",
+                            "port": 8080
                         }
                     ],
                     "hostnames": ["api.example.com"],
@@ -596,34 +1659,38 @@ mod tests {
                                     }
                                 }
                             ],
-                            "backendRefs": [
+                            "backend_refs": [
                                 {
                                     "name": "api-service",
-                                    "port": 3000
+                                    "port": 3000,
+                                    "weight": 100
                                 }
                             ]
                         }
                     ]
                 }
             ],
-            "tcpRoutes": [
+            "tcp_routes": [
                 {
-                    "parentRefs": [
+                    "parent_refs": [
                         {
                             "name": "test-gateway",
-                            "sectionName": "tcp-5432"
+                            "section_name": "tcp-5432",
+                            "port": 5432
                         }
                     ],
                     "rules": [
                         {
-                            "backendRefs": [
+                            "backend_refs": [
                                 {
                                     "name": "db1-service",
-                                    "port": 5432
+                                    "port": 5432,
+                                    "weight": 50
                                 },
                                 {
                                     "name": "db2-service",
-                                    "port": 5432
+                                    "port": 5432,
+                                    "weight": 50
                                 }
                             ]
                         }
@@ -631,357 +1698,67 @@ mod tests {
                 }
             ]
         }"#;
-
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
-
+        
+        // Test Gateway API structure
         assert_eq!(config.gateway.name, "test-gateway");
         assert_eq!(config.gateway.listeners.len(), 2);
-
+        
+        // Test HTTP routes
         assert_eq!(config.http_routes.len(), 1);
         assert_eq!(config.http_routes[0].hostnames[0], "api.example.com");
         assert_eq!(config.http_routes[0].rules[0].matches[0].path.as_ref().unwrap().value, "/v1");
         assert_eq!(config.http_routes[0].rules[0].backend_refs[0].name, "api-service");
         assert_eq!(config.http_routes[0].rules[0].backend_refs[0].port, 3000);
-
+        
+        // Test TCP routes  
         assert_eq!(config.tcp_routes.len(), 1);
         assert_eq!(config.tcp_routes[0].rules[0].backend_refs.len(), 2);
         assert_eq!(config.tcp_routes[0].rules[0].backend_refs[0].name, "db1-service");
         assert_eq!(config.tcp_routes[0].rules[0].backend_refs[1].name, "db2-service");
     }
-
+    
     #[test]
     fn test_example_generation_functions() {
-        let minimal = PortailConfig::generate_minimal();
+        // Test that all example generation functions produce valid configurations
+        let minimal = UringRessConfig::generate_minimal();
         assert!(minimal.validate().is_ok());
         assert_eq!(minimal.http_routes.len(), 1);
         assert_eq!(minimal.tcp_routes.len(), 0);
-
-        let development = PortailConfig::generate_development();
+        
+        let development = UringRessConfig::generate_development();
         assert!(development.validate().is_ok());
-        assert_eq!(development.http_routes.len(), 8);
+        assert_eq!(development.http_routes.len(), 6); // Gateway API groups routes efficiently
         assert_eq!(development.tcp_routes.len(), 1);
+        
+        let production = UringRessConfig::generate_production();
+        assert!(production.validate().is_ok());
+        assert_eq!(production.http_routes.len(), 3); // Gateway API groups routes efficiently
+        assert_eq!(production.tcp_routes.len(), 2);
+        
+        let microservices = UringRessConfig::generate_microservices();
+        assert!(microservices.validate().is_ok());
+        assert_eq!(microservices.http_routes.len(), 2); // Gateway API groups microservices routes
+        assert_eq!(microservices.tcp_routes.len(), 4);
     }
-
+    
     #[test]
     fn test_serialization_roundtrip() {
-        let config = PortailConfig::generate_minimal();
-
+        let config = UringRessConfig::generate_minimal();
+        
+        // Test JSON roundtrip
         let json = config.to_json_pretty().unwrap();
-        let parsed_json: PortailConfig = serde_json::from_str(&json).unwrap();
+        let parsed_json: UringRessConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed_json.validate().is_ok());
-
+        
+        // Test YAML roundtrip
         let yaml = config.to_yaml_pretty().unwrap();
-        let parsed_yaml: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
+        let parsed_yaml: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed_yaml.validate().is_ok());
     }
-
-    #[test]
-    fn test_url_rewrite_json_deserialization() {
-        let json = r#"{
-            "gateway": {
-                "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
-            },
-            "httpRoutes": [{
-                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
-                "hostnames": ["example.com"],
-                "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
-                    "filters": [{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2"}}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
-                }]
-            }]
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.validate().is_ok());
-        assert!(matches!(
-            config.http_routes[0].rules[0].filters[0],
-            HttpRouteFilter::URLRewrite { ref config } if config.path.is_some()
-        ));
-    }
-
-    #[test]
-    fn test_url_rewrite_yaml_roundtrip() {
-        let config = PortailConfig::generate_development();
-        let yaml = config.to_yaml_pretty().unwrap();
-        let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(parsed.validate().is_ok());
-        assert_eq!(parsed.http_routes.len(), 8);
-    }
-
-    #[test]
-    fn test_request_mirror_json_deserialization() {
-        let json = r#"{
-            "gateway": {
-                "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
-            },
-            "httpRoutes": [{
-                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
-                "hostnames": ["example.com"],
-                "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
-                    "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "127.0.0.1", "port": 9999}}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
-                }]
-            }]
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.validate().is_ok());
-        assert!(matches!(
-            config.http_routes[0].rules[0].filters[0],
-            HttpRouteFilter::RequestMirror { .. }
-        ));
-    }
-
-    #[test]
-    fn test_url_rewrite_to_route_table() {
-        let json = r#"{
-            "gateway": {
-                "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
-            },
-            "httpRoutes": [{
-                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
-                "hostnames": ["example.com"],
-                "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
-                    "filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "new.example.com"}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
-                }]
-            }]
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "GET", "/v1/test", &[], "", 8080).unwrap();
-        assert_eq!(rule.filters.len(), 1);
-        assert!(matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com"));
-    }
-
-    #[test]
-    fn test_request_mirror_to_route_table() {
-        let json = r#"{
-            "gateway": {
-                "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
-            },
-            "httpRoutes": [{
-                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
-                "hostnames": ["example.com"],
-                "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
-                    "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "127.0.0.1", "port": 9999}}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
-                }]
-            }]
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "GET", "/", &[], "", 8080).unwrap();
-        assert_eq!(rule.filters.len(), 1);
-        if let crate::routing::HttpFilter::RequestMirror { backend_addr } = &rule.filters[0] {
-            assert_eq!(backend_addr.port(), 9999);
-        } else {
-            panic!("expected RequestMirror filter");
-        }
-    }
-
-    #[test]
-    fn test_https_listener_json_deserialization() {
-        let json = r#"{
-            "gateway": {
-                "name": "tls-gw",
-                "listeners": [
-                    {
-                        "name": "https",
-                        "protocol": "HTTPS",
-                        "port": 443,
-                        "tls": {
-                            "mode": "Terminate",
-                            "certificateRefs": [{"name": "my-cert"}]
-                        }
-                    }
-                ],
-                "workerThreads": 1
-            }
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.validate().is_ok());
-
-        let listener = &config.gateway.listeners[0];
-        assert!(matches!(listener.protocol, Protocol::HTTPS));
-        let tls = listener.tls.as_ref().unwrap();
-        assert!(matches!(tls.mode, TlsMode::Terminate));
-        assert_eq!(tls.certificate_refs[0].name, "my-cert");
-    }
-
-    #[test]
-    fn test_tls_passthrough_listener_json_deserialization() {
-        let json = r#"{
-            "gateway": {
-                "name": "tls-gw",
-                "listeners": [
-                    {
-                        "name": "tls-passthrough",
-                        "protocol": "TLS",
-                        "port": 8443,
-                        "tls": {
-                            "mode": "Passthrough"
-                        }
-                    }
-                ],
-                "workerThreads": 1
-            }
-        }"#;
-        let config: PortailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.validate().is_ok());
-
-        let listener = &config.gateway.listeners[0];
-        assert!(matches!(listener.protocol, Protocol::TLS));
-        let tls = listener.tls.as_ref().unwrap();
-        assert!(matches!(tls.mode, TlsMode::Passthrough));
-        assert!(tls.certificate_refs.is_empty());
-    }
-
-    #[test]
-    fn test_tls_config_yaml_roundtrip() {
-        let config = PortailConfig::generate_development();
-        let yaml = config.to_yaml_pretty().unwrap();
-        let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(parsed.validate().is_ok());
-
-        // Find the HTTPS listener
-        let https = parsed.gateway.listeners.iter()
-            .find(|l| matches!(l.protocol, Protocol::HTTPS))
-            .expect("development config should have HTTPS listener");
-        let tls = https.tls.as_ref().unwrap();
-        assert!(matches!(tls.mode, TlsMode::Terminate));
-        assert_eq!(tls.certificate_refs[0].name, "example-cert");
-    }
-
-    #[test]
-    fn test_tls_config_json_roundtrip() {
-        let config = PortailConfig::generate_development();
-        let json = config.to_json_pretty().unwrap();
-        let parsed: PortailConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.validate().is_ok());
-
-        let https = parsed.gateway.listeners.iter()
-            .find(|l| matches!(l.protocol, Protocol::HTTPS))
-            .expect("development config should have HTTPS listener");
-        assert_eq!(https.tls.as_ref().unwrap().certificate_refs[0].name, "example-cert");
-    }
-
-    #[test]
-    fn test_hostname_matches_wildcard_listener() {
-        assert!(super::hostname_matches("*.example.com", "foo.example.com"));
-        assert!(super::hostname_matches("*.example.com", "*.example.com"));
-        assert!(!super::hostname_matches("*.example.com", "example.com"));
-        assert!(!super::hostname_matches("*.example.com", "foo.other.com"));
-    }
-
-    #[test]
-    fn test_hostname_matches_exact_listener() {
-        assert!(super::hostname_matches("example.com", "example.com"));
-        assert!(!super::hostname_matches("example.com", "foo.example.com"));
-        assert!(!super::hostname_matches("example.com", "other.com"));
-    }
-
-    #[test]
-    fn test_intersect_hostnames_no_listener_hostname() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            hostname: None,
-            address: None,
-            interface: None,
-            tls: None,
-        };
-        let route_hostnames = vec!["a.com".to_string(), "b.com".to_string()];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
-        assert_eq!(result, route_hostnames);
-    }
-
-    #[test]
-    fn test_intersect_hostnames_wildcard_listener_filters() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            hostname: Some("*.example.com".to_string()),
-            address: None,
-            interface: None,
-            tls: None,
-        };
-        let route_hostnames = vec![
-            "foo.example.com".to_string(),
-            "bar.example.com".to_string(),
-            "other.org".to_string(),
-        ];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
-        assert_eq!(result, vec!["foo.example.com", "bar.example.com"]);
-    }
-
-    #[test]
-    fn test_intersect_hostnames_exact_listener_restricts() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            hostname: Some("api.example.com".to_string()),
-            address: None,
-            interface: None,
-            tls: None,
-        };
-        let route_hostnames = vec![
-            "api.example.com".to_string(),
-            "web.example.com".to_string(),
-        ];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
-        assert_eq!(result, vec!["api.example.com"]);
-    }
-
-    #[test]
-    fn test_external_name_endpoint_override_resolves() {
-        // Simulate what the controller does for ExternalName services:
-        // endpoint_overrides maps (svc_fqdn, port) → (externalName, port)
-        let json = r#"{
-            "gateway": {
-                "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
-            },
-            "httpRoutes": [{
-                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
-                "hostnames": ["proxy.example.com"],
-                "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
-                    "backendRefs": [{"name": "external-api.default.svc", "port": 443}]
-                }]
-            }]
-        }"#;
-        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.validate().is_ok());
-
-        // Insert ExternalName override: svc FQDN → external DNS name
-        config.endpoint_overrides.insert(
-            ("external-api.default.svc".to_string(), 443),
-            vec![("httpbin.org".to_string(), 443)],
-        );
-
-        // to_route_table should resolve "httpbin.org" via DNS
-        let rt = config.to_route_table();
-        assert!(rt.is_ok(), "ExternalName DNS resolution should succeed: {:?}", rt.err());
-        let rt = rt.unwrap();
-
-        let rule = rt.find_http_route("proxy.example.com", "GET", "/", &[], "", 8080).unwrap();
-        assert!(!rule.backends.is_empty(), "should have resolved ExternalName backend");
-        assert_eq!(rule.backends[0].socket_addr.port(), 443);
-    }
+    
+    
 }
+

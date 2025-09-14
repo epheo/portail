@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use uringress::parser::parse_http_headers_fast;
+use uringress::uring_worker::unified_http_parser::UnifiedHttpParser;
 use std::time::Duration;
 
 fn parsing_benchmark(c: &mut Criterion) {
@@ -15,45 +15,45 @@ fn parsing_benchmark(c: &mut Criterion) {
     // Fast parsing benchmarks - Target: <300ns for simple requests (single-pass optimization)
     c.bench_function("parse_headers_fast_simple", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(simple_request))
+            black_box(UnifiedHttpParser::extract_routing_info(simple_request))
         })
     });
     
     c.bench_function("parse_headers_fast_typical", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(typical_request))
+            black_box(UnifiedHttpParser::extract_routing_info(typical_request))
         })
     });
     
     c.bench_function("parse_headers_fast_complex", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(complex_request))
+            black_box(UnifiedHttpParser::extract_routing_info(complex_request))
         })
     });
     
     // Additional fast parsing benchmarks for different scenarios
     c.bench_function("parse_headers_fast_simple_repeated", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(simple_request))
+            black_box(UnifiedHttpParser::extract_routing_info(simple_request))
         })
     });
     
     c.bench_function("parse_headers_fast_typical_repeated", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(typical_request))
+            black_box(UnifiedHttpParser::extract_routing_info(typical_request))
         })
     });
     
     c.bench_function("parse_headers_fast_complex_repeated", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(complex_request))
+            black_box(UnifiedHttpParser::extract_routing_info(complex_request))
         })
     });
     
     // Error handling benchmarks
     c.bench_function("parse_malformed_request", |b| {
         b.iter(|| {
-            black_box(parse_http_headers_fast(malformed_request))
+            black_box(UnifiedHttpParser::extract_routing_info(malformed_request))
         })
     });
     
@@ -64,7 +64,7 @@ fn parsing_benchmark(c: &mut Criterion) {
         let large_request = generate_large_request(*size);
         group.bench_with_input(BenchmarkId::new("parse_headers_fast", size), &large_request, |b, req| {
             b.iter(|| {
-                black_box(parse_http_headers_fast(req))
+                black_box(UnifiedHttpParser::extract_routing_info(req))
             })
         });
     }
@@ -78,7 +78,7 @@ fn parsing_benchmark(c: &mut Criterion) {
         let request = format!("{} /api/test HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
         method_group.bench_with_input(BenchmarkId::new("parse_headers_fast", method), &request, |b, req| {
             b.iter(|| {
-                black_box(parse_http_headers_fast(req.as_bytes()))
+                black_box(UnifiedHttpParser::extract_routing_info(req.as_bytes()))
             })
         });
     }
@@ -98,7 +98,7 @@ fn parsing_benchmark(c: &mut Criterion) {
         let request = format!("GET /test HTTP/1.1\r\nHost: {}\r\n\r\n", host);
         host_group.bench_with_input(BenchmarkId::new("parse_headers_fast", i), &request, |b, req| {
             b.iter(|| {
-                black_box(parse_http_headers_fast(req.as_bytes()))
+                black_box(UnifiedHttpParser::extract_routing_info(req.as_bytes()))
             })
         });
     }
@@ -112,14 +112,14 @@ fn memory_parsing_benchmark(c: &mut Criterion) {
     c.bench_function("parse_headers_fast_allocation", |b| {
         b.iter(|| {
             // This measures the allocation overhead of parsing
-            black_box(parse_http_headers_fast(request))
+            black_box(UnifiedHttpParser::extract_routing_info(request))
         })
     });
     
     c.bench_function("parse_headers_fast_allocation_test", |b| {
         b.iter(|| {
             // This measures fast parsing allocation overhead in repeated calls
-            black_box(parse_http_headers_fast(request))
+            black_box(UnifiedHttpParser::extract_routing_info(request))
         })
     });
 }

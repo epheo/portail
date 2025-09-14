@@ -1,19 +1,21 @@
-use uringress::routing::{RouteTable, Backend, BackendPool, LoadBalanceStrategy, fnv_hash};
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use uringress::routing::{RouteTable, Backend, BackendPool, LoadBalanceStrategy, FnvRouterHasher, RouterHasher};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[test]
 fn test_fnv_hash_consistency() {
+    let hasher = FnvRouterHasher;
     let host = "example.com";
-    let hash1 = fnv_hash(host);
-    let hash2 = fnv_hash(host);
+    let hash1 = hasher.hash(host);
+    let hash2 = hasher.hash(host);
     assert_eq!(hash1, hash2);
 }
 
 #[test]
 fn test_fnv_hash_different_values() {
-    let hash1 = fnv_hash("example.com");
-    let hash2 = fnv_hash("different.com");
+    let hasher = FnvRouterHasher;
+    let hash1 = hasher.hash("example.com");
+    let hash2 = hasher.hash("different.com");
     assert_ne!(hash1, hash2);
 }
 
@@ -33,11 +35,13 @@ fn test_route_table_http_routing() {
     let backend = Backend::new("192.168.1.100".to_string(), 8080).unwrap();
     table.add_http_route("api.example.com", "/v1/users", backend);
     
-    let host_hash = fnv_hash("api.example.com");
-    let result = table.route_http_request(host_hash, "/v1/users/123");
+    let hasher = FnvRouterHasher;
+    let host_hash = hasher.hash("api.example.com");
+    let result = table.find_http_backend_pool(host_hash, "/v1/users/123");
     assert!(result.is_ok());
     
-    let backend_ref = result.unwrap();
+    let backend_pool = result.unwrap();
+    let backend_ref = backend_pool.get_backend(0).unwrap();
     assert_eq!(backend_ref.socket_addr.ip(), std::net::IpAddr::V4("192.168.1.100".parse().unwrap()));
     assert_eq!(backend_ref.socket_addr.port(), 8080);
 }
@@ -46,8 +50,9 @@ fn test_route_table_http_routing() {
 fn test_route_table_http_routing_no_match() {
     let table = RouteTable::new();
     
-    let host_hash = fnv_hash("nonexistent.com");
-    let result = table.route_http_request(host_hash, "/api/test");
+    let hasher = FnvRouterHasher;
+    let host_hash = hasher.hash("nonexistent.com");
+    let result = table.find_http_backend_pool(host_hash, "/api/test");
     assert!(result.is_err());
 }
 
@@ -61,10 +66,11 @@ fn test_route_table_tcp_routing() {
     ];
     table.add_tcp_route(5432, backends);
     
-    let result = table.route_tcp_request(5432);
+    let result = table.find_tcp_backend_pool(5432);
     assert!(result.is_ok());
     
-    let backend_ref = result.unwrap();
+    let backend_pool = result.unwrap();
+    let backend_ref = backend_pool.get_backend(0).unwrap();
     assert!(format!("{}", backend_ref.socket_addr.ip()).starts_with("192.168.1.1"));
     assert_eq!(backend_ref.socket_addr.port(), 5432);
 }
@@ -73,7 +79,7 @@ fn test_route_table_tcp_routing() {
 fn test_route_table_tcp_routing_no_match() {
     let table = RouteTable::new();
     
-    let result = table.route_tcp_request(9999);
+    let result = table.find_tcp_backend_pool(9999);
     assert!(result.is_err());
 }
 
@@ -88,16 +94,15 @@ fn test_backend_pool_round_robin() {
     let pool = BackendPool {
         backends,
         strategy: LoadBalanceStrategy::RoundRobin,
-        round_robin_counter: AtomicU32::new(0),
         health_state: Arc::new(AtomicU64::new(7)), // All 3 healthy
         _padding: [0; 0],
     };
     
-    // Test round robin selection
-    let b1 = pool.select_backend().unwrap();
-    let b2 = pool.select_backend().unwrap();
-    let b3 = pool.select_backend().unwrap();
-    let b4 = pool.select_backend().unwrap(); // Should wrap around
+    // Test manual backend selection by index
+    let b1 = pool.get_backend(0).unwrap();
+    let b2 = pool.get_backend(1).unwrap();
+    let b3 = pool.get_backend(2).unwrap();
+    let b4 = pool.get_backend(0).unwrap(); // Wrap around manually
     
     assert_eq!(format!("{}", b1.socket_addr.ip()), "127.0.0.1");
     assert_eq!(format!("{}", b2.socket_addr.ip()), "127.0.0.2");
@@ -110,13 +115,12 @@ fn test_backend_pool_empty() {
     let pool = BackendPool {
         backends: vec![],
         strategy: LoadBalanceStrategy::RoundRobin,
-        round_robin_counter: AtomicU32::new(0),
         health_state: Arc::new(AtomicU64::new(0)),
         _padding: [0; 0],
     };
     
-    let result = pool.select_backend();
-    assert!(result.is_err());
+    let result = pool.get_backend(0);
+    assert!(result.is_none());
 }
 
 #[test]
@@ -145,15 +149,20 @@ fn test_path_matching_longest_prefix_first() {
     table.add_http_route("api.com", "/api", backend1);
     table.add_http_route("api.com", "/api/v1", backend2);
     
-    let host_hash = fnv_hash("api.com");
+    let hasher = FnvRouterHasher;
+    let host_hash = hasher.hash("api.com");
     
     // Should match longer prefix first
-    let result = table.route_http_request(host_hash, "/api/v1/users");
+    let result = table.find_http_backend_pool(host_hash, "/api/v1/users");
     assert!(result.is_ok());
-    assert_eq!(format!("{}", result.unwrap().socket_addr.ip()), "127.0.0.2");
+    let backend_pool = result.unwrap();
+    let backend_ref = backend_pool.get_backend(0).unwrap();
+    assert_eq!(format!("{}", backend_ref.socket_addr.ip()), "127.0.0.2");
     
     // Should match shorter prefix for non-v1 paths
-    let result = table.route_http_request(host_hash, "/api/v2/users");
+    let result = table.find_http_backend_pool(host_hash, "/api/v2/users");
     assert!(result.is_ok());
-    assert_eq!(format!("{}", result.unwrap().socket_addr.ip()), "127.0.0.1");
+    let backend_pool = result.unwrap();
+    let backend_ref = backend_pool.get_backend(0).unwrap();
+    assert_eq!(format!("{}", backend_ref.socket_addr.ip()), "127.0.0.1");
 }

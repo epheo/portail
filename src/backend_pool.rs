@@ -1,66 +1,44 @@
-//! Per-worker connection pool for persistent TCP connections.
+//! TCP Keep-Alive Configuration for Backend Connections
 //!
-//! Each worker owns its own pool — no locks, no contention.
-//! Reuses idle backend connections across requests to amortize TCP handshake cost.
+//! This module provides configuration for TCP keep-alive settings used by
+//! thread-local backend connection pools in UringWorker instances.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::TcpStream;
-use anyhow::Result;
-use crate::logging::debug;
 
-pub struct BackendPool {
-    pools: HashMap<SocketAddr, Vec<TcpStream>>,
-    max_idle_per_backend: usize,
-    connect_timeout: Duration,
+/// TCP Keep-Alive configuration
+#[derive(Debug, Clone)]
+pub struct TcpKeepAliveConfig {
+    /// Enable TCP keep-alive
+    pub enabled: bool,
+    /// Time before sending first keep-alive probe
+    pub idle_time: Duration,
+    /// Interval between keep-alive probes
+    pub probe_interval: Duration,
+    /// Number of failed probes before considering connection dead
+    pub probe_count: u32,
 }
 
-impl BackendPool {
-    pub fn new(max_idle_per_backend: usize, connect_timeout: Duration) -> Self {
+impl Default for TcpKeepAliveConfig {
+    fn default() -> Self {
         Self {
-            pools: HashMap::new(),
-            max_idle_per_backend,
-            connect_timeout,
+            enabled: true,
+            idle_time: Duration::from_secs(600),    // 10 minutes
+            probe_interval: Duration::from_secs(60), // 1 minute
+            probe_count: 3,
         }
     }
+}
 
-    pub async fn acquire(&mut self, addr: SocketAddr) -> Result<TcpStream> {
-        // Try reuse an idle connection — pop and probe until we find a live one.
-        if let Some(conns) = self.pools.get_mut(&addr) {
-            while let Some(conn) = conns.pop() {
-                let mut probe = [0u8; 0];
-                match conn.try_read(&mut probe) {
-                    // Would block = connection is alive and idle
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        debug!("Pool hit: reusing connection to {}", addr);
-                        return Ok(conn);
-                    }
-                    // Zero bytes read or error = stale connection, try next
-                    _ => continue,
-                }
-            }
-        }
-
-        // No reusable connection — open a new one
-        debug!("Pool miss: connecting to {}", addr);
-        let conn = tokio::time::timeout(
-            self.connect_timeout,
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
-
-        conn.set_nodelay(true)?;
-        Ok(conn)
-    }
-
-    pub fn release(&mut self, addr: SocketAddr, conn: TcpStream) {
-        let conns = self.pools.entry(addr).or_default();
-        if conns.len() < self.max_idle_per_backend {
-            conns.push(conn);
-        }
-        // else: drop closes the fd
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_tcp_keepalive_config_default() {
+        let config = TcpKeepAliveConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.idle_time, Duration::from_secs(600));
+        assert_eq!(config.probe_interval, Duration::from_secs(60));
+        assert_eq!(config.probe_count, 3);
     }
 }
