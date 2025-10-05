@@ -1,6 +1,3 @@
-# Generated development configuration (YAML)
-# Use --output <file> to save to a file
-
 gateway:
   name: development-gateway
   listeners:
@@ -16,38 +13,22 @@ gateway:
     interface: lo
   workers:
   - id: 0
-    protocol: HTTP
-    buffer_size: 8KB
+    buffer_size: 16KB
     buffer_count: 256
-    tcp_nodelay: false
+    tcp_nodelay: true
   - id: 1
-    protocol: HTTP
-    buffer_size: 8KB
+    buffer_size: 16KB
     buffer_count: 256
-    tcp_nodelay: false
+    tcp_nodelay: true
   - id: 2
-    protocol: TCP
-    buffer_size: 64KB
-    buffer_count: 16
+    buffer_size: 16KB
+    buffer_count: 256
     tcp_nodelay: true
   - id: 3
-    protocol: TCP
-    buffer_size: 64KB
-    buffer_count: 16
+    buffer_size: 16KB
+    buffer_count: 256
     tcp_nodelay: true
   worker_threads: 4
-  api_port: 8081
-  api_enabled: true
-  io_uring_queue_depth: 256
-  connection_pool_size: 64
-  buffer_pool_size: 64MB
-  network_interface: eth0
-backend_pool:
-  default_pool_size: 10
-  tcp_keepalive: true
-  tcp_keepalive_idle: 10m
-  tcp_keepalive_interval: 1m
-  tcp_keepalive_probes: 5
 http_routes:
 - parent_refs:
   - name: development-gateway
@@ -60,9 +41,9 @@ http_routes:
         type: PathPrefix
         value: /
     backend_refs:
-    - name: frontend-service
+    - name: 127.0.0.1
       port: 3001
-      weight: 1
+
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -74,15 +55,15 @@ http_routes:
         type: PathPrefix
         value: /index.html
     backend_refs:
-    - name: frontend-service-1
+    - name: 127.0.0.1
       port: 3001
-      weight: 1
-    - name: frontend-service-2
+
+    - name: 127.0.0.1
       port: 3002
-      weight: 1
-    - name: frontend-service-3
+
+    - name: 127.0.0.1
       port: 3003
-      weight: 1
+
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -94,9 +75,9 @@ http_routes:
         type: PathPrefix
         value: /api.json
     backend_refs:
-    - name: api-service
+    - name: 127.0.0.1
       port: 3001
-      weight: 1
+
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -108,9 +89,9 @@ http_routes:
         type: PathPrefix
         value: /users.json
     backend_refs:
-    - name: users-service
+    - name: 127.0.0.1
       port: 3002
-      weight: 1
+
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -122,9 +103,9 @@ http_routes:
         type: PathPrefix
         value: /dataset.json
     backend_refs:
-    - name: dataset-service
+    - name: 127.0.0.1
       port: 3003
-      weight: 1
+
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -136,45 +117,22 @@ http_routes:
         type: PathPrefix
         value: /health
     backend_refs:
-    - name: api-service
+    - name: 127.0.0.1
       port: 3001
-      weight: 1
+
 tcp_routes:
 - parent_refs:
   - name: development-gateway
     section_name: tcp-ssh
   rules:
   - backend_refs:
-    - name: ssh-service
-      port: 22
-      weight: 1
+    - name: 127.0.0.1
+      port: 2242
+
 observability:
   logging:
     level: debug
-    format: compact
+    format: pretty
     output: stdout
-  metrics:
-    enabled: true
-    port: 9091
-    path: /metrics
-  health_check:
-    enabled: true
-    interval: 15s
-    timeout: 10s
-    failure_threshold: 5
-    success_threshold: 2
 performance:
-  backend_response_timeout: 30s
-  connection_pool_size: 64
-  max_requests_per_connection: 100
-  standard_buffer_size: 8KB
-  large_buffer_size: 16KB
-  header_buffer_size: 4KB
-  connection_max_age: 5m
-  circuit_breaker_timeout: 15s
   keep_alive_timeout: 10s
-  circuit_breaker_failure_threshold: 5
-  max_retries: 3
-  tcp_nodelay: true
-  so_reuseport: true
-  cpu_affinity: null

@@ -1,69 +1,56 @@
-# Generated minimal configuration (YAML)
-# Use --output <file> to save to a file
-
-gateway:
-  name: minimal-gateway
-  listeners:
-  - name: http
-    protocol: HTTP
-    port: 8080
-  workers: null
-  worker_threads: 2
-  api_port: 8081
-  api_enabled: true
-  io_uring_queue_depth: 128
-  connection_pool_size: 32
-  buffer_pool_size: 32MB
-  network_interface: eth0
-backend_pool:
-  default_pool_size: 5
-  tcp_keepalive: false
-  tcp_keepalive_idle: 2h
-  tcp_keepalive_interval: 1m
-  tcp_keepalive_probes: 9
-http_routes:
-- parent_refs:
-  - name: minimal-gateway
-    section_name: http
-  hostnames:
-  - localhost
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /api.json
-    backend_refs:
-    - name: api-service
-      port: 3001
-      weight: 1
-tcp_routes: []
-observability:
-  logging:
-    level: info
-    format: pretty
-    output: stdout
-  metrics:
-    enabled: false
-    port: 9091
-    path: /metrics
-  health_check:
-    enabled: true
-    interval: 30s
-    timeout: 5s
-    failure_threshold: 3
-    success_threshold: 2
-performance:
-  backend_response_timeout: 5s
-  connection_pool_size: 32
-  max_requests_per_connection: 50
-  standard_buffer_size: 4KB
-  large_buffer_size: 8KB
-  header_buffer_size: 2KB
-  connection_max_age: 1m
-  circuit_breaker_timeout: 5s
-  keep_alive_timeout: 5s
-  circuit_breaker_failure_threshold: 3
-  max_retries: 1
-  tcp_nodelay: true
-  so_reuseport: true
-  cpu_affinity: null
+{
+  "gateway": {
+    "name": "minimal-gateway",
+    "listeners": [
+      {
+        "name": "http",
+        "protocol": "HTTP",
+        "port": 8080
+      }
+    ],
+    "workers": null,
+    "worker_threads": 2
+  },
+  "http_routes": [
+    {
+      "parent_refs": [
+        {
+          "name": "minimal-gateway",
+          "section_name": "http"
+        }
+      ],
+      "hostnames": [
+        "localhost"
+      ],
+      "rules": [
+        {
+          "matches": [
+            {
+              "path": {
+                "type": "PathPrefix",
+                "value": "/api.json"
+              }
+            }
+          ],
+          "backend_refs": [
+            {
+              "name": "api-service",
+              "port": 3001
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tcp_routes": [],
+  "observability": {
+    "logging": {
+      "level": "info",
+      "format": "pretty",
+      "output": "stdout"
+    }
+  },
+  "performance": {
+    "keep_alive_timeout": "5s"
+  }
+}

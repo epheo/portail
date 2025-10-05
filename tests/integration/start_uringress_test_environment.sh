@@ -19,8 +19,7 @@ else
 fi
 
 # Use absolute paths for all binaries and directories
-# Use profiling binary for meaningful flamegraphs with debug symbols
-URINGRESS_BINARY="$PROJECT_ROOT/target/profiling/uringress"
+URINGRESS_BINARY="$PROJECT_ROOT/target/release/uringress"
 TEST_CONTENT_DIR="$SCRIPT_DIR/test-content"
 INTEGRATION_DIR="$SCRIPT_DIR"
 
@@ -86,17 +85,29 @@ check_dependencies() {
     
     # Check UringRess binary - build if needed
     if [[ ! -f ${URINGRESS_BINARY} ]]; then
-        print_status $YELLOW "UringRess profiling binary not found, building it..."
-        print_status $BLUE "Running: cargo build --profile profiling"
-        cd "$PROJECT_ROOT"
-        if cargo build --profile profiling; then
-            print_status $GREEN "✓ UringRess profiling binary built successfully"
+        if [[ "$URINGRESS_BINARY" == *"/profiling/"* ]]; then
+            local build_flag="--profile profiling"
         else
-            print_status $RED "✗ Failed to build UringRess profiling binary"
+            local build_flag="--release"
+        fi
+        print_status $YELLOW "UringRess binary not found, building it..."
+        print_status $BLUE "Running: cargo build $build_flag"
+        cd "$PROJECT_ROOT"
+        if cargo build $build_flag; then
+            print_status $GREEN "✓ UringRess binary built successfully"
+        else
+            print_status $RED "✗ Failed to build UringRess binary"
             exit 1
         fi
     else
-        print_status $GREEN "✓ UringRess profiling binary found"
+        print_status $GREEN "✓ UringRess binary found"
+    fi
+
+    # Set eBPF capabilities on the binary so it can run without sudo
+    if ! getcap "${URINGRESS_BINARY}" 2>/dev/null | grep -q "cap_bpf"; then
+        print_status $BLUE "Setting eBPF capabilities on binary (requires sudo)..."
+        sudo setcap cap_bpf,cap_net_admin+ep "${URINGRESS_BINARY}"
+        print_status $GREEN "✓ eBPF capabilities set"
     fi
     
     # Check other required tools
@@ -107,123 +118,6 @@ check_dependencies() {
     done
     
     print_status $GREEN "✓ Dependencies check completed"
-}
-
-# Function to setup test content
-setup_test_content() {
-    print_status $BLUE "Setting up test content directories..."
-    
-    # Create content directories
-    mkdir -p ${TEST_CONTENT_DIR}/{small,medium,large}
-    
-    # Small responses (< 1KB) - API-like responses
-    cat > ${TEST_CONTENT_DIR}/small/api.json <<EOF
-{
-  "status": "ok",
-  "service": "api",
-  "timestamp": "$(date -Iseconds)",
-  "data": {
-    "id": 1,
-    "name": "test-service",
-    "version": "1.0.0"
-  }
-}
-EOF
-    
-    cat > ${TEST_CONTENT_DIR}/small/health <<EOF
-{
-  "status": "healthy",
-  "uptime": "1h",
-  "version": "1.0.0",
-  "checks": {
-    "database": "ok",
-    "cache": "ok",
-    "memory": "ok"
-  }
-}
-EOF
-    
-    echo '<html><head><title>Backend 1 - Small</title></head><body><h1>Backend 1 (Port 3001)</h1><p>Small test page served through UringRess proxy</p><p style="color: blue;">This is served by KISS backend #1</p></body></html>' > ${TEST_CONTENT_DIR}/small/index.html
-    
-    # Medium responses (1-10KB) - Typical web pages/API responses
-    cat > ${TEST_CONTENT_DIR}/medium/users.json <<EOF
-{
-  "users": [
-$(for i in {1..50}; do echo "    {\"id\": $i, \"name\": \"user$i\", \"email\": \"user$i@example.com\", \"active\": $([ $((i % 2)) -eq 0 ] && echo true || echo false)}$([ $i -lt 50 ] && echo ',')"; done)
-  ],
-  "meta": {
-    "total": 50,
-    "page": 1,
-    "per_page": 50,
-    "has_more": false
-  }
-}
-EOF
-    
-    cat > ${TEST_CONTENT_DIR}/medium/page.html <<EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Backend 2 - Medium</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .content { max-width: 800px; margin: 0 auto; }
-        .data { background: #f5f5f5; padding: 20px; margin: 20px 0; }
-        .backend-info { background: #e8f5e8; border: 2px solid green; padding: 15px; margin: 20px 0; }
-    </style>
-</head>
-<body>
-    <div class="content">
-        <h1>Backend 2 - Medium Content Test Page</h1>
-        <div class="backend-info">
-            <h2>Backend Information</h2>
-            <p><strong>Backend:</strong> #2 (Port 3002)</p>
-            <p><strong>Content Type:</strong> Medium-sized responses</p>
-        </div>
-        <p>This page tests medium-sized responses through the UringRess proxy.</p>
-        <div class="data">
-$(for i in {1..20}; do echo "            <p>Sample data line $i with some content to increase page size.</p>"; done)
-        </div>
-    </div>
-</body>
-</html>
-EOF
-    
-    echo '<html><head><title>Backend 2 - Medium</title></head><body><h1>Backend 2 (Port 3002)</h1><p>Medium test page served through UringRess proxy</p><p style="color: green;">This is served by KISS backend #2</p></body></html>' > ${TEST_CONTENT_DIR}/medium/index.html
-    
-    # Large responses (100KB+) - File downloads, large datasets
-    cat > ${TEST_CONTENT_DIR}/large/dataset.json <<EOF
-{
-  "dataset": "large_test_data",
-  "description": "Large dataset for testing proxy performance with big responses",
-  "data": "$(head -c 80000 /dev/urandom | base64 -w 0)",
-  "size_bytes": 80000,
-  "generated_at": "$(date -Iseconds)"
-}
-EOF
-    
-    # Create a large text file
-    cat > ${TEST_CONTENT_DIR}/large/large-file.txt <<EOF
-Large File Content Test
-=======================
-
-This file contains a significant amount of text data to test how UringRess handles
-large response streaming and memory usage.
-
-$(for i in {1..1000}; do echo "Line $i: This is a test line with some content to make the file larger. Lorem ipsum dolor sit amet, consectetur adipiscing elit."; done)
-
-End of large file.
-EOF
-    
-    echo '<html><head><title>Backend 3 - Large</title></head><body><h1>Backend 3 (Port 3003)</h1><p>Large test page served through UringRess proxy</p><p style="color: red;">This is served by KISS backend #3</p></body></html>' > ${TEST_CONTENT_DIR}/large/index.html
-    
-    print_status $GREEN "✓ Test content created successfully"
-    
-    # Show content sizes
-    print_status $BLUE "Content sizes:"
-    du -sh ${TEST_CONTENT_DIR}/* | while read size dir; do
-        echo "  $(basename $dir): $size"
-    done
 }
 
 # Function to create tmux session with multiple panes
@@ -536,10 +430,12 @@ main() {
     
     case ${command} in
         "start")
+            if [[ "${2:-}" == "profile" ]]; then
+                URINGRESS_BINARY="$PROJECT_ROOT/target/profiling/uringress"
+            fi
             check_dependencies
-            setup_test_content
             create_tmux_session
-            
+
             print_status $GREEN ""
             print_status $GREEN "🚀 Test environment started successfully!"
             print_status $BLUE ""

@@ -1,148 +1,129 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use uringress::routing::{RouteTable, Backend, FnvRouterHasher, RouterHasher};
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use uringress::routing::{RouteTable, Backend, FnvRouterHasher};
 use std::time::Duration;
 
 fn routing_benchmark(c: &mut Criterion) {
-    // Create routing table with various scales for performance testing
     let mut small_table = RouteTable::new();
     let mut medium_table = RouteTable::new();
     let mut large_table = RouteTable::new();
-    
-    // Small table: 100 routes (typical microservice)
+
     for i in 0..100 {
         let host = format!("host{}.example.com", i);
-        let backend = Backend::new(format!("backend{}", i), 8080).unwrap();
-        small_table.add_http_route(&host, "/api", backend);
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        small_table.add_http_route(&host, "/api", vec![backend]);
     }
-    
-    // Medium table: 1,000 routes (medium service)
+
     for i in 0..1000 {
         let host = format!("host{}.example.com", i);
-        let backend = Backend::new(format!("backend{}", i), 8080).unwrap();
-        medium_table.add_http_route(&host, "/api", backend);
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        medium_table.add_http_route(&host, "/api", vec![backend]);
     }
-    
-    // Large table: 10,000 routes (large enterprise service)
+
     for i in 0..10000 {
         let host = format!("host{}.example.com", i);
-        let backend = Backend::new(format!("backend{}", i), 8080).unwrap();
-        large_table.add_http_route(&host, "/api", backend);
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        large_table.add_http_route(&host, "/api", vec![backend]);
     }
-    
-    // FNV Hash Performance - Target: <10ns (sub-microsecond)
+
     c.bench_function("fnv_hash_short_host", |b| {
-        let hasher = FnvRouterHasher;
         b.iter(|| {
             let host = "api.com";
-            black_box(hasher.hash(host))
+            std::hint::black_box(FnvRouterHasher::hash(host))
         })
     });
-    
+
     c.bench_function("fnv_hash_long_host", |b| {
-        let hasher = FnvRouterHasher;
         b.iter(|| {
             let host = "very.long.subdomain.example.com";
-            black_box(hasher.hash(host))
+            std::hint::black_box(FnvRouterHasher::hash(host))
         })
     });
-    
-    // Route Lookup Performance - Target: O(1) regardless of table size
+
     let mut group = c.benchmark_group("route_lookup_by_table_size");
-    
+
     for (size, table) in [
         (100, &small_table),
-        (1000, &medium_table), 
+        (1000, &medium_table),
         (10000, &large_table)
     ] {
+        let host = format!("host{}.example.com", size / 2);
         group.bench_with_input(BenchmarkId::new("http_route_lookup", size), &table, |b, table| {
-            let hasher = FnvRouterHasher;
-            let host_hash = hasher.hash(&format!("host{}.example.com", size / 2));
             b.iter(|| {
-                black_box(table.route_http_request(host_hash, "/api/users"))
+                std::hint::black_box(table.find_http_backends(&host, "/api/users"))
             })
         });
     }
     group.finish();
-    
-    // Path Matching Performance - Multiple path prefixes
+
     let mut complex_table = RouteTable::new();
-    let backend = Backend::new("backend".to_string(), 8080).unwrap();
-    
-    // Add routes with different path complexities
-    complex_table.add_http_route("api.com", "/", backend.clone());
-    complex_table.add_http_route("api.com", "/api", backend.clone());
-    complex_table.add_http_route("api.com", "/api/v1", backend.clone());
-    complex_table.add_http_route("api.com", "/api/v1/users", backend.clone());
-    complex_table.add_http_route("api.com", "/api/v2", backend.clone());
-    
+    let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+
+    complex_table.add_http_route("api.com", "/", vec![backend.clone()]);
+    complex_table.add_http_route("api.com", "/api", vec![backend.clone()]);
+    complex_table.add_http_route("api.com", "/api/v1", vec![backend.clone()]);
+    complex_table.add_http_route("api.com", "/api/v1/users", vec![backend.clone()]);
+    complex_table.add_http_route("api.com", "/api/v2", vec![backend.clone()]);
+
     c.bench_function("path_matching_simple", |b| {
-        let hasher = FnvRouterHasher;
-        let host_hash = hasher.hash("api.com");
         b.iter(|| {
-            black_box(complex_table.route_http_request(host_hash, "/"))
+            std::hint::black_box(complex_table.find_http_backends("api.com", "/"))
         })
     });
-    
+
     c.bench_function("path_matching_complex", |b| {
-        let hasher = FnvRouterHasher;
-        let host_hash = hasher.hash("api.com");
         b.iter(|| {
-            black_box(complex_table.route_http_request(host_hash, "/api/v1/users/123/profile"))
+            std::hint::black_box(complex_table.find_http_backends("api.com", "/api/v1/users/123/profile"))
         })
     });
-    
-    // TCP Route Lookup Performance
+
     let mut tcp_table = RouteTable::new();
     for port in 8000..9000 {
-        let backends = vec![Backend::new(format!("backend{}", port), port).unwrap()];
+        let backends = vec![Backend::new("127.0.0.1".to_string(), port).unwrap()];
         tcp_table.add_tcp_route(port, backends);
     }
-    
+
     c.bench_function("tcp_route_lookup", |b| {
         b.iter(|| {
-            black_box(tcp_table.route_tcp_request(8500))
+            std::hint::black_box(tcp_table.find_tcp_backends(8500))
         })
     });
-    
-    // Backend Selection Performance
-    let backends = (0..100).map(|i| Backend::new(format!("backend{}", i), 8080).unwrap()).collect();
+
+    let backends = (0..100).map(|_| Backend::new("127.0.0.1".to_string(), 8080).unwrap()).collect();
     tcp_table.add_tcp_route(9999, backends);
-    
+
     c.bench_function("backend_selection_round_robin", |b| {
         b.iter(|| {
-            black_box(tcp_table.route_tcp_request(9999))
+            std::hint::black_box(tcp_table.find_tcp_backends(9999))
         })
     });
 }
 
 fn memory_benchmark(c: &mut Criterion) {
-    // Memory allocation benchmarks
     c.bench_function("route_table_creation", |b| {
         b.iter(|| {
-            black_box(RouteTable::new())
+            std::hint::black_box(RouteTable::new())
         })
     });
-    
+
     c.bench_function("backend_creation", |b| {
         b.iter(|| {
-            black_box(Backend::new("test.com".to_string(), 8080).unwrap())
+            std::hint::black_box(Backend::new("127.0.0.1".to_string(), 8080).unwrap())
         })
     });
-    
+
     c.bench_function("add_http_route", |b| {
         b.iter_batched(
             || RouteTable::new(),
             |mut table| {
-                let backend = Backend::new("test.com".to_string(), 8080).unwrap();
-                table.add_http_route("host.com", "/api", backend);
-                black_box(table)
+                let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+                table.add_http_route("host.com", "/api", vec![backend]);
+                std::hint::black_box(table)
             },
             criterion::BatchSize::SmallInput
         )
     });
 }
 
-// Configure benchmarks for MVP performance targets
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))

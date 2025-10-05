@@ -34,27 +34,15 @@ run_worker() {
     local error_count=0
     
     for ((i=1; i<=requests; i++)); do
-        # Randomly select endpoint
         local endpoint=${TEST_ENDPOINTS[$((RANDOM % ${#TEST_ENDPOINTS[@]}))]}
         local url="${PROXY_URL}/${endpoint}"
-        
-        # Make request with timeout
-        if curl -s --max-time 5 -w "%{http_code}" "$url" > /tmp/worker_${worker_id}_response_${i} 2>/dev/null; then
-            local status_code=$(tail -c 3 /tmp/worker_${worker_id}_response_${i})
-            if [[ "$status_code" == "200" ]]; then
-                success_count=$((success_count + 1))
-            else
-                error_count=$((error_count + 1))
-            fi
+
+        local status_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$url" 2>/dev/null)
+        if [[ "$status_code" == "200" ]]; then
+            success_count=$((success_count + 1))
         else
             error_count=$((error_count + 1))
         fi
-        
-        # Clean up response file
-        rm -f /tmp/worker_${worker_id}_response_${i}
-        
-        # Small delay to avoid overwhelming
-        sleep 0.01
     done
     
     local end_time=$(date +%s.%N)
@@ -141,30 +129,3 @@ else
     echo -e "${RED}✗ LOW THROUGHPUT: <500 RPS achieved${NC}"
 fi
 
-# Generate structured test summary
-echo ""
-echo -e "${BLUE}=== TEST SUMMARY ===${NC}"
-echo "STRUCTURED_OUTPUT_BEGIN"
-echo "TEST_NAME=concurrent_connections"
-echo "TEST_TIMESTAMP=$(date)"
-echo "TEST_STATUS=COMPLETED"
-echo ""
-echo "[METRICS]"
-echo "CONCURRENT_WORKERS=$CONCURRENT_WORKERS"
-echo "REQUESTS_PER_WORKER=$REQUESTS_PER_WORKER"
-echo "TOTAL_REQUESTS=$total_requests"
-echo "SUCCESSFUL_REQUESTS=$total_success"
-echo "ERROR_REQUESTS=$total_errors"
-echo "SUCCESS_RATE=$success_rate"
-echo "DURATION_SECONDS=$total_duration"
-echo "OVERALL_RPS=$overall_rps"
-echo ""
-echo "[NOTES]"
-echo "Real network I/O through UringRess proxy to KISS backends"
-echo "Multiple concurrent workers test load balancing"
-echo "Random endpoint selection simulates realistic traffic"
-echo "STRUCTURED_OUTPUT_END"
-
-echo ""
-echo "Note: This test measures real network I/O performance through UringRess proxy"
-echo "to KISS backends, providing realistic performance characteristics."

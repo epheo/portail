@@ -203,21 +203,21 @@ pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::i
     Ok(response)
 }
 
-/// Handle to a running Portail subprocess. Kills on drop.
-pub struct PortailProcess {
+/// Handle to a running UringRess subprocess. Kills on drop.
+pub struct UringRessProcess {
     child: Child,
     _config_file: tempfile::NamedTempFile,
     pub proxy_addr: SocketAddr,
 }
 
-impl PortailProcess {
-    /// Build a test config and spawn Portail.
+impl UringRessProcess {
+    /// Build a test config and spawn UringRess.
     /// `routes` maps (hostname, path_prefix) → backend SocketAddr.
     pub fn spawn(routes: &[(&str, &str, SocketAddr)], proxy_port: u16) -> Self {
         Self::spawn_with_tcp(routes, proxy_port, &[])
     }
 
-    /// Build a test config with both HTTP and TCP routes, then spawn Portail.
+    /// Build a test config with both HTTP and TCP routes, then spawn UringRess.
     /// `tcp_routes` maps (listener_name, proxy_port) → backend SocketAddr.
     pub fn spawn_with_tcp(
         routes: &[(&str, &str, SocketAddr)],
@@ -260,11 +260,11 @@ impl PortailProcess {
                             let _ = err.read_to_string(&mut stderr);
                         }
                         panic!(
-                            "Portail exited with {} before accepting connections.\nstderr: {}",
+                            "UringRess exited with {} before accepting connections.\nstderr: {}",
                             status, stderr
                         );
                     }
-                    panic!("Portail did not start accepting connections on {} within 5s", wait_addr);
+                    panic!("UringRess did not start accepting connections on {} within 5s", wait_addr);
                 }
                 if TcpStream::connect_timeout(wait_addr, Duration::from_millis(100)).is_ok() {
                     break;
@@ -279,46 +279,9 @@ impl PortailProcess {
             proxy_addr,
         }
     }
-
-    /// Spawn with filtered routes (hostname, path, backend, filters_json).
-    pub fn spawn_with_filters(
-        routes: &[(&str, &str, SocketAddr, &str)],
-        proxy_port: u16,
-    ) -> Self {
-        let config = build_test_config_with_filters(routes, proxy_port);
-        let config_file = tempfile::Builder::new()
-            .suffix(".json")
-            .tempfile()
-            .expect("create temp config");
-        std::fs::write(config_file.path(), config).expect("write temp config");
-
-        let binary = cargo_bin_path();
-        let child = Command::new(&binary)
-            .arg("--config")
-            .arg(config_file.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e));
-
-        let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("Portail did not start accepting connections within 5s");
-            }
-            if TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        Self { child, _config_file: config_file, proxy_addr }
-    }
 }
 
-impl Drop for PortailProcess {
+impl Drop for UringRessProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -461,7 +424,7 @@ fn build_test_config_with_tcp(
         backend_refs.push(format!(
             r#"{{
                 "matches": [{{"path": {{"type": "PathPrefix", "value": "{}"}}}}],
-                "backendRefs": [{{"name": "{}", "port": {}}}]
+                "backend_refs": [{{"name": "{}", "port": {}}}]
             }}"#,
             path,
             backend_addr.ip(),
@@ -481,8 +444,8 @@ fn build_test_config_with_tcp(
         ));
         tcp_route_entries.push(format!(
             r#"{{
-      "parentRefs": [{{"name": "test-gateway", "sectionName": "{}"}}],
-      "rules": [{{"backendRefs": [{{"name": "{}", "port": {}}}]}}]
+      "parent_refs": [{{"name": "test-gateway", "section_name": "{}"}}],
+      "rules": [{{"backend_refs": [{{"name": "{}", "port": {}}}]}}]
     }}"#,
             name, backend_addr.ip(), backend_addr.port()
         ));
@@ -502,7 +465,7 @@ fn build_test_config_with_tcp(
     } else {
         format!(
             r#"[{{
-      "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],
+      "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
       "hostnames": [{}],
       "rules": [{}]
     }}]"#,
@@ -516,14 +479,16 @@ fn build_test_config_with_tcp(
   "gateway": {{
     "name": "test-gateway",
     "listeners": [{}],
-    "workerThreads": 1
+    "worker_threads": 1
   }},
-  "httpRoutes": {},
-  "tcpRoutes": [{}],
+  "http_routes": {},
+  "tcp_routes": [{}],
   "observability": {{
     "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
   }},
-  "performance": {{}}
+  "performance": {{
+    "keep_alive_timeout": "5s"
+  }}
 }}"#,
         listeners,
         http_routes_section,
@@ -531,168 +496,19 @@ fn build_test_config_with_tcp(
     )
 }
 
-/// Backend that records the raw request bytes received, for verifying rewrites and header modifications.
-pub struct InspectingBackend {
-    pub addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-    received: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-}
-
-impl InspectingBackend {
-    pub fn spawn(response_body: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind inspecting backend");
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        let body = response_body.to_string();
-        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let received_clone = received.clone();
-
-        listener.set_nonblocking(true).unwrap();
-
-        let handle = thread::spawn(move || {
-            while !shutdown_clone.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let body = body.clone();
-                        let shutdown = shutdown_clone.clone();
-                        let received = received_clone.clone();
-                        thread::spawn(move || {
-                            handle_inspecting_connection(stream, &body, &shutdown, &received);
-                        });
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self { addr, shutdown, handle: Some(handle), received }
-    }
-
-    pub fn received_requests(&self) -> Vec<Vec<u8>> {
-        self.received.lock().unwrap().clone()
-    }
-}
-
-fn handle_inspecting_connection(
-    mut stream: TcpStream,
-    body: &str,
-    shutdown: &AtomicBool,
-    received: &std::sync::Mutex<Vec<Vec<u8>>>,
-) {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-
-    let mut buf = [0u8; 8192];
-    loop {
-        if shutdown.load(Ordering::Relaxed) { return; }
-
-        let n = match stream.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(_) => return,
-        };
-
-        let request = &buf[..n];
-        if !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            continue;
-        }
-
-        received.lock().unwrap().push(request.to_vec());
-
-        let keep_alive = request_is_keepalive(request);
-
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
-            body.len(),
-            if keep_alive { "keep-alive" } else { "close" },
-            body
-        );
-
-        if stream.write_all(response.as_bytes()).is_err() { return; }
-        if !keep_alive { return; }
-    }
-}
-
-impl Drop for InspectingBackend {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = TcpStream::connect(self.addr);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// Build a test config with filters support on HTTP routes.
-pub fn build_test_config_with_filters(
-    routes: &[(&str, &str, SocketAddr, &str)], // (hostname, path, backend, filters_json)
-    proxy_port: u16,
-) -> String {
-    let mut backend_refs = Vec::new();
-    let mut hostnames: Vec<String> = Vec::new();
-
-    for (hostname, path, backend_addr, filters_json) in routes {
-        if !hostnames.contains(&hostname.to_string()) {
-            hostnames.push(hostname.to_string());
-        }
-        let filters_part = if filters_json.is_empty() {
-            String::new()
-        } else {
-            format!(r#""filters": [{}],"#, filters_json)
-        };
-        backend_refs.push(format!(
-            r#"{{
-                "matches": [{{"path": {{"type": "PathPrefix", "value": "{}"}}}}],
-                {}
-                "backendRefs": [{{"name": "{}", "port": {}}}]
-            }}"#,
-            path, filters_part, backend_addr.ip(), backend_addr.port()
-        ));
-    }
-
-    let hostnames_json: Vec<String> = hostnames.iter().map(|h| format!("\"{}\"", h)).collect();
-
-    format!(
-        r#"{{
-  "gateway": {{
-    "name": "test-gateway",
-    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
-    "workerThreads": 1
-  }},
-  "httpRoutes": [{{
-    "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],
-    "hostnames": [{}],
-    "rules": [{}]
-  }}],
-  "observability": {{
-    "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
-  }},
-  "performance": {{}}
-}}"#,
-        proxy_port,
-        hostnames_json.join(", "),
-        backend_refs.join(", ")
-    )
-}
-
 fn cargo_bin_path() -> PathBuf {
     // Look for the binary in target/release or target/debug
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release_bin = project_root.join("target/release/portail");
+    let release_bin = project_root.join("target/release/uringress");
     if release_bin.exists() {
         return release_bin;
     }
-    let debug_bin = project_root.join("target/debug/portail");
+    let debug_bin = project_root.join("target/debug/uringress");
     if debug_bin.exists() {
         return debug_bin;
     }
     panic!(
-        "Portail binary not found. Build with `cargo build --release` first.\n\
+        "UringRess binary not found. Build with `cargo build --release` first.\n\
          Looked in: {:?} and {:?}",
         release_bin, debug_bin
     );

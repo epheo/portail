@@ -1,10 +1,10 @@
-use uringress::uring_worker::unified_http_parser::{UnifiedHttpParser, ConnectionType};
+use uringress::http_parser::{extract_routing_info, ConnectionType};
 
 #[test]
 fn test_parse_http_headers_fast() {
     let request = b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/7.68.0\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api/v1/users");
     assert_eq!(result.host, "example.com");
 }
@@ -12,8 +12,8 @@ fn test_parse_http_headers_fast() {
 #[test]
 fn test_parse_http_headers_fast_post() {
     let request = b"POST /api/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api/data");
     assert_eq!(result.host, "api.example.com");
 }
@@ -21,8 +21,8 @@ fn test_parse_http_headers_fast_post() {
 #[test]
 fn test_parse_http_headers_fast_no_host() {
     let request = b"GET /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api");
     assert_eq!(result.host, "localhost"); // Default fallback when no Host header
 }
@@ -30,8 +30,8 @@ fn test_parse_http_headers_fast_no_host() {
 #[test]
 fn test_parse_http_headers_fast_complex_path() {
     let request = b"GET /api/v1/users/123?filter=active&sort=name HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api/v1/users/123?filter=active&sort=name");
     assert_eq!(result.host, "api.example.com");
 }
@@ -39,8 +39,8 @@ fn test_parse_http_headers_fast_complex_path() {
 #[test]
 fn test_parse_http_headers_fast_root_path() {
     let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/");
     assert_eq!(result.host, "example.com");
 }
@@ -48,8 +48,8 @@ fn test_parse_http_headers_fast_root_path() {
 #[test]
 fn test_parse_http_headers_fast_host_with_port() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api");
     assert_eq!(result.host, "example.com"); // Normalized - port removed for Gateway API compliance
 }
@@ -57,8 +57,8 @@ fn test_parse_http_headers_fast_host_with_port() {
 #[test]
 fn test_parse_http_headers_fast_case_insensitive_host() {
     let request = b"GET /api HTTP/1.1\r\nHOST: example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api");
     assert_eq!(result.host, "example.com");
 }
@@ -66,8 +66,8 @@ fn test_parse_http_headers_fast_case_insensitive_host() {
 #[test]
 fn test_parse_http_headers_fast_multiple_headers() {
     let request = b"GET /api HTTP/1.1\r\nUser-Agent: test\r\nHost: example.com\r\nAccept: application/json\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api");
     assert_eq!(result.host, "example.com");
 }
@@ -75,8 +75,8 @@ fn test_parse_http_headers_fast_multiple_headers() {
 #[test]
 fn test_parse_http_headers_fast_whitespace_in_headers() {
     let request = b"GET /api HTTP/1.1\r\nHost:    example.com   \r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api");
     assert_eq!(result.host, "example.com");
 }
@@ -84,24 +84,19 @@ fn test_parse_http_headers_fast_whitespace_in_headers() {
 #[test]
 fn test_parse_http_headers_fast_different_methods() {
     let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
-    
-    for _method in &methods {
-        let request = format!("{} /test HTTP/1.1\r\nHost: example.com\r\n\r\n", _method);
-        let result = UnifiedHttpParser::extract_routing_info(request.as_bytes()).unwrap();
+
+    for method in &methods {
+        let request = format!("{} /test HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
+        let result = extract_routing_info(request.as_bytes()).unwrap();
         assert_eq!(result.path, "/test");
         assert_eq!(result.host, "example.com");
     }
 }
 
-// Note: UnifiedHttpParser is lenient and provides defaults for malformed requests
-// These error cases are now handled gracefully rather than returning errors
-
-#[test]  
+#[test]
 fn test_parse_http_headers_fast_empty_request() {
     let request = b"";
-    let result = UnifiedHttpParser::extract_routing_info(request);
-    // UnifiedHttpParser handles empty requests gracefully with defaults
-    // Empty request gets default path "/" and host "localhost"
+    let result = extract_routing_info(request);
     match result {
         Ok(info) => {
             assert_eq!(info.path, "/");
@@ -115,18 +110,17 @@ fn test_parse_http_headers_fast_empty_request() {
 
 #[test]
 fn test_parse_http_headers_fast_minimal_valid_request() {
-    // Test the minimum viable request that UnifiedHttpParser accepts
     let request = b"GET / HTTP/1.1\r\n\r\n";
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/");
-    assert_eq!(result.host, "localhost"); // Default fallback
+    assert_eq!(result.host, "localhost");
 }
 
 #[test]
 fn test_connection_close_header() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::Close);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -134,10 +128,9 @@ fn test_connection_close_header() {
 
 #[test]
 fn test_connection_close_with_trailing_whitespace() {
-    // Test the actual ApacheBench scenario - Connection: close with trailing space
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close \r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::Close);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -146,8 +139,8 @@ fn test_connection_close_with_trailing_whitespace() {
 #[test]
 fn test_connection_keep_alive_header() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::KeepAlive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -155,10 +148,9 @@ fn test_connection_keep_alive_header() {
 
 #[test]
 fn test_connection_default_behavior() {
-    // No Connection header - should default to KeepAlive for HTTP/1.1
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::KeepAlive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -166,10 +158,9 @@ fn test_connection_default_behavior() {
 
 #[test]
 fn test_http10_default_close_behavior() {
-    // HTTP/1.0 with no Connection header should default to close
     let request = b"GET /api HTTP/1.0\r\nHost: example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::Close);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -177,10 +168,9 @@ fn test_http10_default_close_behavior() {
 
 #[test]
 fn test_http11_default_keepalive_behavior() {
-    // HTTP/1.1 with no Connection header should default to keep-alive
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::KeepAlive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
@@ -188,11 +178,10 @@ fn test_http11_default_keepalive_behavior() {
 
 #[test]
 fn test_apachebench_scenario() {
-    // Exact ApacheBench request format - HTTP/1.0 with no Connection header
     let request = b"GET /index.html HTTP/1.0\r\nHost: localhost:8080\r\nUser-Agent: ApacheBench/2.3\r\nAccept: */*\r\n\r\n";
-    
-    let result = UnifiedHttpParser::extract_routing_info(request).unwrap();
+
+    let result = extract_routing_info(request).unwrap();
     assert_eq!(result.connection_type, ConnectionType::Close);
-    assert_eq!(result.host, "localhost"); // Port should be stripped
+    assert_eq!(result.host, "localhost");
     assert_eq!(result.path, "/index.html");
 }

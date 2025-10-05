@@ -1,16 +1,16 @@
 //! Centralized logging module
 //!
-//! error!, warn!, and info! are always active.
-//! debug!/trace! become no-ops in release builds.
+//! error! and warn! are always active. debug!/trace!/info! become no-ops
+//! in release builds.
 
 use anyhow::Result;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-pub use tracing::{error, warn, info};
+pub use tracing::{error, warn};
 
 #[cfg(debug_assertions)]
-pub use tracing::debug;
+pub use tracing::{debug, info};
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
 pub use tracing::trace;
@@ -23,12 +23,20 @@ macro_rules! logging_debug {
 
 #[cfg(not(debug_assertions))]
 #[macro_export]
+macro_rules! logging_info {
+    ($($arg:tt)*) => {()};
+}
+
+#[cfg(not(debug_assertions))]
+#[macro_export]
 macro_rules! logging_trace {
     ($($arg:tt)*) => {()};
 }
 
 #[cfg(not(debug_assertions))]
 pub use logging_debug as debug;
+#[cfg(not(debug_assertions))]
+pub use logging_info as info;
 #[cfg(not(debug_assertions))]
 #[allow(unused_imports)]
 pub use logging_trace as trace;
@@ -120,11 +128,7 @@ pub fn init_logging(verbose_level: u8, config: Option<&crate::config::LoggingCon
         }
 
         match logging_config.format {
-            LogFormat::Json => {
-                let s = fmt().with_env_filter(filter).with_target(true).json();
-                init_subscriber!(s, &logging_config.output);
-            }
-            LogFormat::Compact => {
+            LogFormat::Json | LogFormat::Compact => {
                 let mut s = fmt().with_env_filter(filter).with_target(true).compact();
                 if show_details {
                     s = s.with_file(true).with_line_number(true);

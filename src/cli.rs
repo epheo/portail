@@ -25,12 +25,6 @@ pub struct Args {
     #[arg(conflicts_with_all = ["validate_only"])]
     pub check_config: bool,
 
-    /// Override API server port
-    #[arg(long, value_name = "PORT")]
-    #[arg(help = "Override API server port (1-65535)")]
-    #[arg(value_parser = clap::value_parser!(u16))]
-    pub api_port: Option<u16>,
-
     /// Override number of worker threads
     #[arg(short, long, value_name = "COUNT")]
     #[arg(help = "Override number of worker threads (1-256)")]
@@ -43,11 +37,6 @@ pub struct Args {
     #[arg(action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// Disable API server
-    #[arg(long)]
-    #[arg(help = "Disable the REST API server (proxy-only mode)")]
-    pub no_api: bool,
-
     /// Show example configuration file locations
     #[arg(long)]
     #[arg(help = "Display paths to example configuration files and exit")]
@@ -55,8 +44,8 @@ pub struct Args {
 
     /// Generate example configuration file
     #[arg(long, value_name = "TYPE")]
-    #[arg(help = "Generate example configuration file (minimal, development, production, microservices)")]
-    #[arg(value_parser = ["minimal", "development", "production", "microservices"])]
+    #[arg(help = "Generate example configuration file (minimal, development)")]
+    #[arg(value_parser = ["minimal", "development"])]
     pub generate_config: Option<String>,
 
     /// Output file for generated configuration
@@ -65,18 +54,9 @@ pub struct Args {
     #[arg(requires = "generate_config")]
     pub output: Option<PathBuf>,
 
-    /// Enable CPU profiling for specified duration (e.g., "30s", "1m")
-    #[arg(long, value_name = "DURATION")]
-    #[arg(help = "Enable CPU profiling and generate flamegraph for specified duration")]
-    pub profile_cpu: Option<String>,
 }
 
 impl Args {
-    /// Parse command-line arguments
-    pub fn parse_args() -> Self {
-        Args::parse()
-    }
-
     /// Validate argument combinations and requirements
     pub fn validate(&self) -> Result<(), String> {
         // Validate config file extension if provided
@@ -102,13 +82,6 @@ impl Args {
         // Validate that check-config and validate-only require config file
         if (self.check_config || self.validate_only) && self.config.is_none() {
             return Err("--check-config and --validate-only require --config to be specified".to_string());
-        }
-
-        // Validate port ranges
-        if let Some(port) = self.api_port {
-            if port == 0 {
-                return Err("API port must be between 1 and 65535".to_string());
-            }
         }
 
         // Validate worker count
@@ -148,14 +121,12 @@ mod tests {
             config: Some(PathBuf::from("config.json")),
             validate_only: false,
             check_config: false,
-            api_port: None,
+
             workers: None,
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert!(args.validate().is_ok());
 
@@ -163,14 +134,12 @@ mod tests {
             config: Some(PathBuf::from("config.yaml")),
             validate_only: false,
             check_config: false,
-            api_port: None,
+
             workers: None,
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert!(args.validate().is_ok());
 
@@ -178,14 +147,12 @@ mod tests {
             config: Some(PathBuf::from("config.txt")),
             validate_only: false,
             check_config: false,
-            api_port: None,
+
             workers: None,
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert!(args.validate().is_err());
     }
@@ -196,14 +163,12 @@ mod tests {
             config: None,
             validate_only: true,
             check_config: false,
-            api_port: None,
+
             workers: None,
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert!(args.validate().is_err());
 
@@ -211,33 +176,28 @@ mod tests {
             config: None,
             validate_only: false,
             check_config: true,
-            api_port: None,
+
             workers: None,
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert!(args.validate().is_err());
     }
 
     #[test]
-    fn test_worker_count_precedence() {
-        // CLI arg takes precedence
+    fn test_worker_count_parsing() {
         let args = Args {
             config: None,
             validate_only: false,
             check_config: false,
-            api_port: None,
+
             workers: Some(8),
             verbose: 0,
-            no_api: false,
             example_config: false,
             generate_config: None,
             output: None,
-            profile_cpu: None,
         };
         assert_eq!(args.workers.unwrap(), 8);
     }

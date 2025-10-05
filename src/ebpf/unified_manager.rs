@@ -1,15 +1,15 @@
-/// Simplified eBPF Manager for UringRess
-/// Manages SO_REUSEPORT program only - now using Rust eBPF implementation
-/// Single codepath: eBPF functionality is required, no fallback behavior
+//! Simplified eBPF Manager for UringRess
+//! Manages SO_REUSEPORT program only - now using Rust eBPF implementation
+//! Single codepath: eBPF functionality is required, no fallback behavior
 
 use anyhow::{anyhow, Result};
 use aya::{
-    maps::ReusePortSockArray,
+    maps::{HashMap as EbpfHashMap, ReusePortSockArray},
     programs::SkReuseport,
     Ebpf,
 };
 use std::os::unix::io::{RawFd, AsRawFd, BorrowedFd};
-use tracing::{info, debug, warn};
+use crate::logging::{info, debug, warn};
 
 /// Simple wrapper for RawFd that implements AsRawFd for ReusePortSockArray::set()
 /// This allows us to pass raw file descriptors to the socket array map
@@ -20,6 +20,16 @@ impl AsRawFd for SocketFdWrapper {
         self.0
     }
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct PortWorkerConfig {
+    base_index: u32,
+    worker_count: u32,
+}
+
+// SAFETY: #[repr(C)] with only u32 fields, no padding
+unsafe impl aya::Pod for PortWorkerConfig {}
 
 /// Simplified eBPF manager for SO_REUSEPORT program only
 /// Required component - no optional wrapping or fallback behavior
@@ -73,9 +83,7 @@ impl UnifiedEbpfManager {
         Ok(Self { bpf })
     }
     
-    // Program loading now happens during initialization in new()
-    
-    /// Attach SO_REUSEPORT program to specific socket following upstream patterns
+    /// Attach SO_REUSEPORT program to specific socket
     /// Called during socket setup in uring_worker.rs  
     pub fn attach_reuseport_program(&mut self, socket_fd: RawFd) -> Result<()> {
         debug!("Attaching SO_REUSEPORT program to socket fd: {}", socket_fd);
@@ -97,113 +105,66 @@ impl UnifiedEbpfManager {
         Ok(())
     }
     
-    // Stub methods for control plane compatibility during transition
-    // These will be properly implemented once basic eBPF loading works
-    
-    pub fn update_route_table(&mut self, routes: &crate::routing::RouteTable) -> Result<()> {
-        let http_count = routes.http_routes.len();
-        let tcp_count = routes.tcp_routes.len();
-        debug!("Route table update: {} HTTP, {} TCP routes (stub implementation)", http_count, tcp_count);
+    /// Populate socket array and port→worker config maps for eBPF program.
+    /// Groups sockets by port with contiguous array indices so each SO_REUSEPORT
+    /// group maps to a distinct slice of the socket array.
+    pub fn populate_socket_maps(
+        &mut self,
+        worker_fds: &[(usize, u16, RawFd)],
+    ) -> Result<()> {
+        use std::collections::BTreeMap;
+
+        // Group by port, collecting (worker_id, fd) pairs
+        let mut by_port: BTreeMap<u16, Vec<(usize, RawFd)>> = BTreeMap::new();
+        for &(worker_id, port, fd) in worker_fds {
+            by_port.entry(port).or_default().push((worker_id, fd));
+        }
+        // Sort each port's workers by worker_id for deterministic ordering
+        for workers in by_port.values_mut() {
+            workers.sort_by_key(|&(wid, _)| wid);
+        }
+
+        // Populate socket array (first borrow of self.bpf)
+        let mut current_index: u32 = 0;
+        let mut port_configs: Vec<(u16, PortWorkerConfig)> = Vec::new();
+        {
+            let mut worker_socket_array: ReusePortSockArray<_> = ReusePortSockArray::try_from(
+                self.bpf.map_mut("worker_socket_array")
+                    .ok_or_else(|| anyhow!("worker_socket_array map not found"))?
+            ).map_err(|e| anyhow!("Failed to convert worker_socket_array: {}", e))?;
+
+            for (&port, workers) in &by_port {
+                let base_index = current_index;
+                let worker_count = workers.len() as u32;
+
+                for &(worker_id, fd) in workers {
+                    worker_socket_array.set(current_index, &SocketFdWrapper(fd), 0)
+                        .map_err(|e| anyhow!("Failed to set socket array index {} (worker {} port {}): {}",
+                                              current_index, worker_id, port, e))?;
+                    debug!("Socket array[{}]: worker {} port {} fd={}", current_index, worker_id, port, fd);
+                    current_index += 1;
+                }
+
+                port_configs.push((port, PortWorkerConfig { base_index, worker_count }));
+                debug!("Port {}: base_index={}, worker_count={}", port, base_index, worker_count);
+            }
+        }
+
+        // Populate port config HashMap (second borrow of self.bpf)
+        {
+            let mut port_config_map: EbpfHashMap<_, u16, PortWorkerConfig> = EbpfHashMap::try_from(
+                self.bpf.map_mut("port_worker_config")
+                    .ok_or_else(|| anyhow!("port_worker_config map not found"))?
+            ).map_err(|e| anyhow!("Failed to convert port_worker_config: {}", e))?;
+
+            for (port, config) in &port_configs {
+                port_config_map.insert(port, config, 0)
+                    .map_err(|e| anyhow!("Failed to insert port_worker_config for port {}: {}", port, e))?;
+            }
+        }
+
+        info!("Socket maps populated: {} ports, {} total entries", by_port.len(), current_index);
         Ok(())
     }
-    
-    
-    
-    
-    
-    /// Update socket array map with worker socket file descriptors using worker-ID-based indexing
-    /// This ensures worker N's socket is placed at index N in the socket array for correct selection
-    pub fn update_worker_socket_array_by_worker_id(&mut self, worker_socket_map: &std::collections::BTreeMap<u32, RawFd>) -> Result<()> {
-        info!("🔧 SOCKET_ARRAY_DEBUG: Starting worker-ID-based socket array population");
-        
-        // Log the worker-to-socket mapping
-        for (&worker_id, &socket_fd) in worker_socket_map {
-            info!("🔧 SOCKET_ARRAY_DEBUG: Worker {} -> socket_fd={}", worker_id, socket_fd);
-        }
-        
-        // Get worker_socket_array using correct aya-rs ReusePortSockArray pattern
-        info!("🔧 SOCKET_ARRAY_DEBUG: Attempting to get worker_socket_array map");
-        let mut worker_socket_array: ReusePortSockArray<_> = ReusePortSockArray::try_from(
-            self.bpf.map_mut("worker_socket_array")
-                .ok_or_else(|| {
-                    warn!("❌ SOCKET_ARRAY_DEBUG: worker_socket_array map not found!");
-                    anyhow!("worker_socket_array not found")
-                })?
-        ).map_err(|e| {
-            warn!("❌ SOCKET_ARRAY_DEBUG: Failed to convert worker_socket_array: {}", e);
-            anyhow!("Failed to convert worker_socket_array: {}", e)
-        })?;
-        
-        info!("✅ SOCKET_ARRAY_DEBUG: Successfully obtained ReusePortSockArray map");
-        
-        // Populate socket array using worker IDs as indices
-        let mut successful_insertions: u32 = 0;
-        for (&worker_id, &socket_fd) in worker_socket_map {
-            info!("🔧 SOCKET_ARRAY_DEBUG: Processing Worker {} socket_fd={}", worker_id, socket_fd);
-            
-            if socket_fd <= 0 {
-                warn!("❌ SOCKET_ARRAY_DEBUG: Invalid socket FD {} for worker {}, skipping", socket_fd, worker_id);
-                continue;
-            }
-            
-            if worker_id >= 8 {
-                warn!("❌ SOCKET_ARRAY_DEBUG: Worker ID {} exceeds socket array size (8), skipping", worker_id);
-                continue;
-            }
-            
-            info!("✅ SOCKET_ARRAY_DEBUG: Socket FD {} is valid, creating wrapper", socket_fd);
-            
-            // Create AsRawFd wrapper for the raw file descriptor
-            let socket_wrapper = SocketFdWrapper(socket_fd);
-            
-            info!("🔧 SOCKET_ARRAY_DEBUG: Calling socket_array.set({}, socket_fd={}, flags=0)", worker_id, socket_fd);
-            
-            // Use worker ID directly as the index in the socket array
-            match worker_socket_array.set(worker_id, &socket_wrapper, 0) {
-                Ok(()) => {
-                    info!("✅ SOCKET_ARRAY_DEBUG: Successfully added Worker {} socket fd={} at index={}", 
-                          worker_id, socket_fd, worker_id);
-                    successful_insertions += 1;
-                }
-                Err(e) => {
-                    warn!("❌ SOCKET_ARRAY_DEBUG: Failed to add Worker {} socket {} at index {}: {}", 
-                          worker_id, socket_fd, worker_id, e);
-                    return Err(anyhow!("Failed to add Worker {} socket {} at index {}: {}", 
-                                      worker_id, socket_fd, worker_id, e));
-                }
-            }
-        }
-        
-        info!("🎉 SOCKET_ARRAY_DEBUG: Worker-ID-based socket array population completed!");
-        info!("🎉 SOCKET_ARRAY_DEBUG: - Total workers: {}", worker_socket_map.len());
-        info!("🎉 SOCKET_ARRAY_DEBUG: - Successful insertions: {}", successful_insertions);
-        
-        // Log final mapping for verification
-        for (&worker_id, &socket_fd) in worker_socket_map {
-            info!("🎉 SOCKET_ARRAY_DEBUG: Index {} = Worker {} socket_fd={}", 
-                  worker_id, worker_id, socket_fd);
-        }
-        
-        if successful_insertions == 0 {
-            warn!("❌ SOCKET_ARRAY_DEBUG: WARNING - No sockets were successfully inserted into the array!");
-        }
-        
-        Ok(())
-    }
-    
-    
-    
-    
-    
 }
 
-impl Drop for UnifiedEbpfManager {
-    fn drop(&mut self) {
-        info!("Shutting down UnifiedEbpfManager");
-        
-        // Note: In aya 0.13, XDP programs are detached automatically when dropped
-        // SO_REUSEPORT programs are automatically detached when sockets close
-        
-        info!("UnifiedEbpfManager shutdown complete");
-    }
-}

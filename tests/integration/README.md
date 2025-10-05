@@ -183,7 +183,6 @@ The reporting system follows a zero-impact measurement philosophy:
 1. **Post-Test Analysis**: Parses completed test outputs, never adds runtime overhead
 2. **Existing Tool Integration**: Works with curl, ab, wrk outputs without modification
 3. **Optional Reporting**: Tests run normally; reporting is a separate step
-4. **Structured Output**: Minimal structured blocks added to test outputs
 
 ## Test Types
 
@@ -413,9 +412,8 @@ curl -v http://localhost:3001/health  # Direct backend
 
 ### Test Content Management
 
-Test content is automatically generated but can be customized:
+Test content is committed under `test-content/`:
 
-- **Small content**: Modify `setup_test_content()` in main script
 - **Custom endpoints**: Add files to `test-content/{size}/` directories
 - **New content types**: Extend KISS backend configuration
 
@@ -435,18 +433,6 @@ Integration tests can be automated in CI:
     tests/integration/start_uringress_test_environment.sh stop
 ```
 
-## Architecture Context
-
-These integration tests validate the UringRess MVP architecture described in `MVP_ARCHITECTURE.md`:
-
-- **SO_REUSEPORT**: Multiple workers sharing port 8080
-- **io_uring**: Zero-copy I/O operations
-- **FNV Hashing**: O(1) route lookup performance
-- **Circuit Breakers**: Backend failure detection
-- **Connection Pooling**: Backend connection management
-
-The realistic testing approach ensures that theoretical performance targets translate to actual production performance.
-
 ## Contributing
 
 When adding new integration tests:
@@ -457,32 +443,6 @@ When adding new integration tests:
 4. **Document thoroughly**: Update this README with test descriptions
 5. **Test both execution contexts**: Project root and integration directory
 
-## Profiling Tools
-
-### CPU Profiling (Flamegraphs)
-
-```bash
-# Setup profiling environment
-./profiling/setup_cpu_profiling.sh
-
-# Generate flamegraphs for hot path analysis
-./profiling/run_flamegraph_analysis.sh
-```
-
-Flamegraphs will be saved to `reports/cpu/flamegraph_*_TIMESTAMP.svg`
-
-### Memory Profiling
-
-```bash
-# Analyze memory allocation patterns
-./profiling/run_memory_analysis.sh
-```
-
-Memory reports will be saved to `reports/memory/memory_*_TIMESTAMP.log`
-
 ## Related Documentation
 
-- [`MVP_ARCHITECTURE.md`](../../MVP_ARCHITECTURE.md): UringRess architecture overview
-- [`TESTING.md`](../../TESTING.md): Complete testing strategy
-- [`tests/test_performance.rs`](../test_performance.rs): Synthetic performance tests
 - [KISS Project](https://github.com/epheo/kiss): Backend static file server

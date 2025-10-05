@@ -3,43 +3,27 @@ name = "uringress"
 version = "0.1.0"
 edition = "2021"
 authors = ["UringRess Contributors"]
-description = "Ultra-High-Performance Kubernetes Gateway API Controller built for io_uring"
+description = "Ultra-High-Performance Kubernetes Gateway API Controller"
 license = "Apache-2.0"
 repository = "https://github.com/your-org/uringress"
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs"] }
-io-uring = "0.7.10"
-# io_uring_buf_ring = "0.2.1"
-io_uring_buf_ring = { path = "../io_uring_buf_ring" }
-# Using kernel-provided buffer ring management for native zero-copy operations
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+dashmap = "6"
 socket2 = { version = "0.6.0", features = ["all"] }
 libc = "0.2"
 fnv = "1.0"
-memchr = "2.6"
-bytes = "1.7"
-http = "1.1"
+arc-swap = "1"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-prometheus = "0.14"
-hyper = { version = "1.4", features = ["client", "http1", "http2"] }
-hyper-util = "0.1"
 
 # Configuration and CLI dependencies
 serde_yaml = "0.9"
 clap = { version = "4.0", features = ["derive"] }
-tokio-util = "0.7"
-
-# Kubernetes dependencies
-kube = { version = "1.1", features = ["client", "runtime", "derive"] }
-k8s-openapi = { version = "0.25", features = ["v1_30"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-num_cpus = "1.16"
-chrono = { version = "0.4", features = ["serde"] }
-pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"] }
-
 # eBPF dependencies - pure Rust eBPF implementation
 aya = { path = "../aya/aya" }
 
@@ -52,10 +36,7 @@ aya-ebpf-macros = { path = "../aya/aya-ebpf-macros" }
 
 [dev-dependencies]
 criterion = "0.7"
-rand = "0.9"
-# Profiling dependencies
-flamegraph = "0.6"
-dhat = "0.3"
+tempfile = "3"
 
 [[bench]]
 name = "routing_bench"
@@ -85,7 +66,7 @@ lto = false  # Disable LTO for better symbol visibility
 [profile.bench]
 debug = true
 
-# Profiling-optimized release build  
+# Profiling-optimized release build
 [profile.profiling]
 inherits = "release"
 debug = 2          # Full debug info

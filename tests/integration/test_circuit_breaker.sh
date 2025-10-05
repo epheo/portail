@@ -4,6 +4,7 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_URL="http://localhost:8080"
 BACKEND_PORTS=(3001 3002 3003)
 BACKEND_CONTENT_TYPES=("small" "medium" "large")
@@ -91,14 +92,7 @@ start_backend() {
         return
     fi
     
-    # Detect if running from project root or integration directory
-    if [[ -d "./tests/integration/test-content" ]]; then
-        # Running from project root
-        local content_dir="./tests/integration/test-content/$content_type"
-    else
-        # Running from integration directory
-        local content_dir="./test-content/$content_type"
-    fi
+    local content_dir="$SCRIPT_DIR/test-content/$content_type"
     
     kiss --port "$port" --static-dir "$content_dir" > /dev/null 2>&1 &
     local pid=$!
@@ -222,34 +216,3 @@ done
 
 echo ""
 echo -e "${GREEN}=== Circuit Breaker Test Complete ===${NC}"
-
-# Generate structured test summary
-echo ""
-echo -e "${BLUE}=== TEST SUMMARY ===${NC}"
-echo "STRUCTURED_OUTPUT_BEGIN"
-echo "TEST_NAME=circuit_breaker"
-echo "TEST_TIMESTAMP=$(date)"
-echo "TEST_STATUS=COMPLETED"
-echo ""
-echo "[METRICS]"
-echo "BACKEND_COUNT=${#BACKEND_PORTS[@]}"
-echo "TEST_PHASES=7"
-echo "FINAL_PROXY_STATUS=responding"
-echo "FINAL_BACKENDS_STATUS=all_responding"
-echo ""
-echo "[NOTES]"
-echo "Circuit breaker behavior validation with real backend failures"
-echo "Tests automatic failure detection and recovery"
-echo "Validates response codes and timing during failures"
-echo "Performance testing after recovery"
-echo "STRUCTURED_OUTPUT_END"
-
-echo ""
-echo "Key observations to look for:"
-echo "  1. Failed requests should return 502/504 status codes"
-echo "  2. Response times should be fast for circuit breaker responses"
-echo "  3. Recovery should happen automatically when backends restart"
-echo "  4. Performance should return to normal after recovery"
-echo ""
-echo "Note: This test validates real circuit breaker behavior with actual"
-echo "backend failures and recoveries, not synthetic test conditions."

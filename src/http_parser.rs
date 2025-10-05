@@ -4,25 +4,6 @@
 use anyhow::Result;
 use crate::logging::debug;
 
-/// Find the end of HTTP headers (\r\n\r\n boundary).
-/// Returns the position just past the double CRLF.
-/// Uses memchr SIMD-accelerated search for \r, then checks the following 3 bytes.
-pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
-    let mut start = 0;
-    while let Some(pos) = memchr::memchr(b'\r', &data[start..]) {
-        let abs = start + pos;
-        if abs + 3 < data.len()
-            && data[abs + 1] == b'\n'
-            && data[abs + 2] == b'\r'
-            && data[abs + 3] == b'\n'
-        {
-            return Some(abs + 4);
-        }
-        start = abs + 1;
-    }
-    None
-}
-
 /// HTTP Connection header preference
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionType {
@@ -47,13 +28,9 @@ pub enum HttpVersion {
 /// Contains all fields needed for routing decisions and execution
 #[derive(Debug, Clone)]
 pub struct HttpRequestInfo<'a> {
-    pub method: &'a str,
     pub host: &'a str,
     pub path: &'a str,
-    pub query_string: &'a str,
     pub connection_type: ConnectionType,
-    /// Raw header bytes for lazy header matching (zero-copy)
-    pub header_data: &'a [u8],
 }
 
 /// Extract complete HTTP routing information with zero-copy parsing
@@ -66,7 +43,6 @@ pub fn extract_routing_info(
 
         // Single-pass state machine parser
         let mut pos = 0;
-        let mut method: Option<&str> = None;
         let mut path: Option<&str> = None;
         let mut host: Option<&str> = None;
         let mut raw_connection_type = ConnectionType::Default;
@@ -81,12 +57,10 @@ pub fn extract_routing_info(
         }
 
         if line_end > pos {
-            let first_line = match std::str::from_utf8(&request_data[pos..line_end]) {
-                Ok(s) => s,
-                Err(_) => return Err(anyhow::anyhow!("Non-UTF8 data in HTTP request line")),
-            };
+            // SAFETY: HTTP request line is ASCII by RFC 7230 - skip UTF-8 validation
+            let first_line = unsafe { std::str::from_utf8_unchecked(&request_data[pos..line_end]) };
             let mut parts = first_line.split_whitespace();
-            method = parts.next();
+            parts.next(); // Skip method
             path = parts.next();
 
             if line_end >= 8 && &request_data[line_end-8..line_end] == b"HTTP/1.0" {
@@ -100,8 +74,6 @@ pub fn extract_routing_info(
         pos = line_end;
         if pos < request_data.len() && request_data[pos] == b'\r' { pos += 1; }
         if pos < request_data.len() && request_data[pos] == b'\n' { pos += 1; }
-
-        let header_start = pos;
 
         // Parse headers in single pass
         while pos < request_data.len() {
@@ -140,7 +112,8 @@ pub fn extract_routing_info(
                         .position(|&b| b == b':')
                         .map_or(value_end, |pos| value_start + pos);
 
-                    host = std::str::from_utf8(&line[value_start..normalized_end]).ok();
+                    // SAFETY: Host header is ASCII by RFC 7230
+                    host = Some(unsafe { std::str::from_utf8_unchecked(&line[value_start..normalized_end]) });
 
                 } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
                     let mut value_start = 11;
@@ -154,12 +127,12 @@ pub fn extract_routing_info(
                         value_end -= 1;
                     }
 
-                    if let Ok(value) = std::str::from_utf8(&line[value_start..value_end]) {
-                        if value.eq_ignore_ascii_case("close") {
-                            raw_connection_type = ConnectionType::Close;
-                        } else if value.eq_ignore_ascii_case("keep-alive") {
-                            raw_connection_type = ConnectionType::KeepAlive;
-                        }
+                    // SAFETY: Connection header is ASCII by RFC 7230
+                    let value = unsafe { std::str::from_utf8_unchecked(&line[value_start..value_end]) };
+                    if value.eq_ignore_ascii_case("close") {
+                        raw_connection_type = ConnectionType::Close;
+                    } else if value.eq_ignore_ascii_case("keep-alive") {
+                        raw_connection_type = ConnectionType::KeepAlive;
                     }
 
                 }
@@ -183,31 +156,9 @@ pub fn extract_routing_info(
             }
         };
 
-        // header_data covers everything from header_start to current pos (end of headers)
-        let header_data = &request_data[header_start..pos];
-
-        let raw_path = path.unwrap_or("/");
-        let (clean_path, query_string) = match raw_path.find('?') {
-            Some(pos) => (&raw_path[..pos], &raw_path[pos + 1..]),
-            None => (raw_path, ""),
-        };
-
-        // Per RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header.
-        // HTTP/1.0 clients may omit it, so use empty string for routing to handle.
-        let resolved_host = match host {
-            Some(h) => h,
-            None if http_version == HttpVersion::Http11 => {
-                return Err(anyhow::anyhow!("Missing required Host header in HTTP/1.1 request"));
-            }
-            None => "",
-        };
-
         Ok(HttpRequestInfo {
-            method: method.unwrap_or("GET"),
-            host: resolved_host,
-            path: clean_path,
-            query_string,
+            host: host.unwrap_or("localhost"),
+            path: path.unwrap_or("/"),
             connection_type,
-            header_data,
         })
 }

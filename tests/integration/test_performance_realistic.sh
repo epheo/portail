@@ -16,11 +16,6 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${BLUE}=== UringRess Realistic Performance Test ===${NC}"
-echo "This test measures real-world performance characteristics:"
-echo "  - Actual network I/O through UringRess proxy"
-echo "  - Real HTTP request/response cycles"
-echo "  - Genuine backend response processing"
-echo "  - True memory allocation and cleanup"
 echo ""
 
 # Function to check dependencies
@@ -93,10 +88,8 @@ test_latency() {
     if [[ ${#times[@]} -gt 0 ]]; then
         local avg_time=$(printf '%s\n' "${times[@]}" | awk '{sum+=$1} END {print sum/NR}')
         echo "${avg_time}s average (${#times[@]}/20 successful)"
-        SUMMARY_LATENCY_AVG="$avg_time"
     else
         echo -e "${RED}Failed${NC}"
-        SUMMARY_LATENCY_AVG="0.005"  # Default 5ms for failed tests
     fi
     
     # Test medium content
@@ -154,18 +147,8 @@ test_throughput_ab() {
         
         if [[ $ab_exit_code -eq 0 ]]; then
             echo "$ab_output" | grep -E "(Requests per second|Time per request|Failed requests|Transfer rate)" | sed 's/^/  /'
-            # Capture RPS for summary (take the 50 concurrent test as most representative)
-            if [[ $concurrency -eq 50 ]]; then
-                local rps=$(echo "$ab_output" | grep "Requests per second" | awk '{print $4}' | cut -d'.' -f1)
-                if [[ -n "$rps" ]]; then
-                    SUMMARY_THROUGHPUT_RPS="$rps"
-                fi
-            fi
         else
             echo -e "  ${RED}Test failed${NC}"
-            if [[ $concurrency -eq 50 ]]; then
-                SUMMARY_THROUGHPUT_RPS="1000"  # Default for failed tests
-            fi
         fi
         echo ""
     done
@@ -345,7 +328,6 @@ test_proxy_overhead() {
         local overhead=$(echo "scale=6; $proxy_avg - $backend_avg" | bc -l)
         local overhead_percent=$(echo "scale=2; ($overhead / $backend_avg) * 100" | bc -l)
         echo "Proxy overhead: ${overhead}s (${overhead_percent}%)"
-        SUMMARY_PROXY_OVERHEAD="$overhead"
         
         # Evaluation
         local overhead_ms=$(echo "$overhead * 1000" | bc -l)
@@ -358,40 +340,8 @@ test_proxy_overhead() {
         else
             echo -e "${RED}✗ HIGH: >10ms proxy overhead${NC}"
         fi
-    else
-        SUMMARY_PROXY_OVERHEAD="0.002"  # Default 2ms for failed tests
     fi
     echo ""
-}
-
-# Global variables to store results for summary
-SUMMARY_LATENCY_AVG=""
-SUMMARY_THROUGHPUT_RPS=""
-SUMMARY_SUCCESS_RATE=""
-SUMMARY_PROXY_OVERHEAD=""
-SUMMARY_MEMORY_PEAK=""
-
-# Function to generate structured test summary
-generate_test_summary() {
-    echo ""
-    echo -e "${BLUE}=== TEST SUMMARY ===${NC}"
-    echo "STRUCTURED_OUTPUT_BEGIN"
-    echo "TEST_NAME=realistic_performance"
-    echo "TEST_TIMESTAMP=$(date)"
-    echo "TEST_STATUS=COMPLETED"
-    echo ""
-    echo "[METRICS]"
-    echo "LATENCY_AVG_SECONDS=${SUMMARY_LATENCY_AVG:-0.001}"
-    echo "THROUGHPUT_RPS=${SUMMARY_THROUGHPUT_RPS:-5000}"
-    echo "SUCCESS_RATE=${SUMMARY_SUCCESS_RATE:-95}"
-    echo "PROXY_OVERHEAD_SECONDS=${SUMMARY_PROXY_OVERHEAD:-0.002}"
-    echo "MEMORY_PEAK_KB=${SUMMARY_MEMORY_PEAK:-0}"
-    echo ""
-    echo "[NOTES]"
-    echo "Real network I/O through UringRess proxy to KISS backends"
-    echo "External measurement tools (curl, ab, wrk) used"
-    echo "Results may be lower than synthetic microbenchmarks"
-    echo "STRUCTURED_OUTPUT_END"
 }
 
 # Main test execution
@@ -407,21 +357,6 @@ main() {
     test_proxy_overhead
     
     echo -e "${GREEN}=== Realistic Performance Test Complete ===${NC}"
-    echo ""
-    echo "Key findings:"
-    echo "  1. Latency measurements show real proxy overhead"
-    echo "  2. Throughput tests demonstrate actual network capacity"
-    echo "  3. Memory usage indicates resource efficiency"
-    echo "  4. Mixed workload simulates production traffic patterns"
-    echo ""
-    echo "This test provides realistic performance characteristics using:"
-    echo "  - Real network I/O through UringRess proxy"
-    echo "  - Actual KISS backend responses"
-    echo "  - True memory allocation and cleanup"
-    echo "  - Genuine HTTP request/response processing"
-    
-    # Generate structured summary for report parsing
-    generate_test_summary
 }
 
 main "$@"

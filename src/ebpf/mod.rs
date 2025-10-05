@@ -1,52 +1,33 @@
-/// eBPF module for UringRess SO_REUSEPORT worker selection
-/// Implements address-aware worker dispatch at socket level
-/// 
-/// Simplified Architecture:
-/// - SO_REUSEPORT Program: Address-aware worker selection
-/// - Maps: Worker capabilities and routing configuration
-/// - Single Codepath: eBPF functionality is required, no fallbacks
+//! eBPF module for UringRess SO_REUSEPORT worker selection
+//! Implements address-aware worker dispatch at socket level
+//!
+//! Simplified Architecture:
+//! - SO_REUSEPORT Program: Address-aware worker selection
+//! - Maps: Worker capabilities and routing configuration
+//! - Single Codepath: eBPF functionality is required, no fallbacks
 
 pub mod unified_manager;
-pub mod address_dispatcher;
 
 pub use unified_manager::UnifiedEbpfManager;
-pub use address_dispatcher::AddressDispatcher;
 
 use anyhow::{anyhow, Result};
-use tracing::info;
-
-/// Validate eBPF system requirements - public interface for early startup validation  
-/// Single codepath architecture: either all requirements pass or system fails
-pub fn validate_system_requirements() -> Result<()> {
-    validate_ebpf_requirements()
-}
-
-/// Initialize simplified eBPF subsystem - SO_REUSEPORT program only
-/// Returns error if eBPF requirements not met - no fallback behavior
-pub fn initialize_ebpf_system() -> Result<UnifiedEbpfManager> {
-    info!("Initializing simplified eBPF system - SO_REUSEPORT program only");
-    
-    // Requirements already validated in main.rs startup
-    // Create simplified eBPF manager - required component, no Option<>
-    let manager = UnifiedEbpfManager::new()?;
-    
-    info!("eBPF system initialized successfully");
-    Ok(manager)
-}
+use crate::logging::info;
 
 /// Validate eBPF system requirements - fail fast if not met
-/// Single codepath architecture: either all requirements pass or system fails
-fn validate_ebpf_requirements() -> Result<()> {
-    // Validate kernel version (Linux 5.10+ required for io_uring + eBPF)
+/// Single codepath: either all requirements pass or system fails
+pub fn validate_system_requirements() -> Result<()> {
     validate_kernel_version()?;
-    
-    // Validate capabilities (CAP_BPF, CAP_NET_ADMIN required)
     validate_capabilities()?;
-    
-    // Rust eBPF programs are embedded at compile time - no file validation needed
-    
-    info!("eBPF requirements validation passed - single codepath architecture ready");
+    info!("eBPF requirements validation passed");
     Ok(())
+}
+
+/// Initialize eBPF subsystem - SO_REUSEPORT program only
+pub fn initialize_ebpf_system() -> Result<UnifiedEbpfManager> {
+    info!("Initializing eBPF system - SO_REUSEPORT program only");
+    let manager = UnifiedEbpfManager::new()?;
+    info!("eBPF system initialized successfully");
+    Ok(manager)
 }
 
 /// Validate kernel version meets minimum requirements
@@ -93,30 +74,20 @@ fn validate_kernel_version() -> Result<()> {
     ))
 }
 
-/// Validate process has required capabilities
 fn validate_capabilities() -> Result<()> {
-    use std::process::Command;
-    
-    // Check if running as root (uid 0) - simplest capability check
-    let uid_output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|e| anyhow!("Cannot check user ID: {}", e))?;
-    
-    if !uid_output.status.success() {
-        return Err(anyhow!("Cannot determine user privileges"));
-    }
-    
-    let uid_str = String::from_utf8_lossy(&uid_output.stdout);
-    let uid = uid_str.trim().parse::<u32>()
-        .map_err(|e| anyhow!("Cannot parse user ID '{}': {}", uid_str.trim(), e))?;
-    
+    // SAFETY: getuid() is always safe and cannot fail
+    let uid = unsafe { libc::getuid() };
+
     if uid == 0 {
         info!("Running as root - all eBPF capabilities available");
         return Ok(());
     }
-    
-    // For non-root, provide clear guidance
+
+    if has_required_capabilities() {
+        info!("Required capabilities (CAP_BPF, CAP_NET_ADMIN) detected via setcap");
+        return Ok(());
+    }
+
     Err(anyhow!(
         "UringRess requires CAP_BPF and CAP_NET_ADMIN capabilities for eBPF operations. \
         \nCurrent user ID: {} (non-root) \
@@ -129,5 +100,25 @@ fn validate_capabilities() -> Result<()> {
     ))
 }
 
-// No longer needed - Rust eBPF programs are embedded at compile time
+/// Check effective capabilities from /proc/self/status (no external deps)
+fn has_required_capabilities() -> bool {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:\t") {
+            let cap_eff = match u64::from_str_radix(hex.trim(), 16) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let cap_net_admin = 1u64 << 12;
+            let cap_bpf = 1u64 << 39;
+            return (cap_eff & cap_net_admin != 0) && (cap_eff & cap_bpf != 0);
+        }
+    }
+
+    false
+}
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::parsing::{deserialize_duration, serialize_duration, deserialize_duration_opt, serialize_duration_opt};
+use super::parsing::{deserialize_size, serialize_size, deserialize_duration, serialize_duration};
 
 /// Protocol types following Kubernetes Gateway API specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -10,20 +10,42 @@ use super::parsing::{deserialize_duration, serialize_duration, deserialize_durat
 pub enum Protocol {
     HTTP,
     HTTPS,
-    TLS,
     TCP,
     UDP,
+}
+
+/// Individual worker configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// Worker ID (0-based index)
+    pub id: usize,
+
+    /// Buffer size for this worker's buffer ring
+    #[serde(deserialize_with = "deserialize_size", serialize_with = "serialize_size")]
+    pub buffer_size: usize,
+
+    /// Number of buffers to allocate for this worker
+    #[serde(default = "default_buffer_count")]
+    pub buffer_count: u16,
+
+    /// Enable TCP_NODELAY for immediate packet transmission
+    #[serde(default)]
+    pub tcp_nodelay: bool,
 }
 
 /// Gateway configuration following Kubernetes Gateway API specification
 /// Defines the infrastructure layer with listeners for different protocols and ports
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     #[serde(default = "default_gateway_name")]
     pub name: String,
     pub listeners: Vec<ListenerConfig>,
+
+    /// Optional worker-specific configurations
+    /// If not specified, generates defaults from worker_threads
+    pub workers: Option<Vec<WorkerConfig>>,
 
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
@@ -43,47 +65,21 @@ pub struct ListenerConfig {
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TlsConfig {
-    pub mode: TlsMode,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub certificate_refs: Vec<CertificateRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TlsMode {
-    Terminate,
-    Passthrough,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CertificateRef {
-    pub name: String,
-    /// The listener hostname associated with this cert (for SNI routing).
-    /// e.g. "*.desku.be", "example.org", etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(skip)]
-    pub cert_pem: Option<Vec<u8>>,
-    #[serde(skip)]
-    pub key_pem: Option<Vec<u8>>,
 }
 
 // Default value functions
 fn default_gateway_name() -> String {
-    "portail-gateway".to_string()
+    "uringress-gateway".to_string()
 }
 
 fn default_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    4
 }
+
+pub(crate) fn default_buffer_count() -> u16 {
+    256 // Increased for high concurrent load handling
+}
+
 
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -97,20 +93,76 @@ impl Default for GatewayConfig {
                     hostname: None,
                     address: None,
                     interface: None,
-                    tls: None,
                 },
             ],
+            workers: None,
             worker_threads: default_worker_threads(),
         }
     }
 }
 
-/// Root configuration structure for Portail
+impl GatewayConfig {
+    /// Get effective worker configurations, generating defaults if none specified
+    pub fn get_worker_configs(&self) -> Vec<WorkerConfig> {
+        if let Some(ref workers) = self.workers {
+            workers.clone()
+        } else {
+            self.generate_default_worker_configs()
+        }
+    }
+
+    fn generate_default_worker_configs(&self) -> Vec<WorkerConfig> {
+        (0..self.worker_threads)
+            .map(|id| WorkerConfig {
+                id,
+                buffer_size: 16384, // 16KB — balanced for both HTTP and TCP
+                buffer_count: default_buffer_count(),
+                tcp_nodelay: true,
+            })
+            .collect()
+    }
+
+    /// Validate worker configurations for consistency and correctness
+    pub fn validate_worker_configs(&self) -> Result<(), String> {
+        let worker_configs = self.get_worker_configs();
+
+        if worker_configs.is_empty() {
+            return Err("At least one worker must be configured".to_string());
+        }
+
+        let mut ids: Vec<usize> = worker_configs.iter().map(|w| w.id).collect();
+        ids.sort_unstable();
+
+        for (expected, &actual) in ids.iter().enumerate() {
+            if expected != actual {
+                return Err(format!("Worker IDs must be sequential starting from 0. Expected {}, found {}", expected, actual));
+            }
+        }
+
+        for worker in &worker_configs {
+            if worker.buffer_size < 1024 {
+                return Err(format!("Worker {}: buffer_size must be at least 1KB, got {}", worker.id, worker.buffer_size));
+            }
+            if worker.buffer_size > 1024 * 1024 {
+                return Err(format!("Worker {}: buffer_size must be at most 1MB, got {}", worker.id, worker.buffer_size));
+            }
+            if worker.buffer_count == 0 {
+                return Err(format!("Worker {}: buffer_count must be at least 1", worker.id));
+            }
+            if worker.buffer_count > 1024 {
+                return Err(format!("Worker {}: buffer_count must be at most 1024, got {}", worker.id, worker.buffer_count));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Root configuration structure for UringRess
 /// All parsing happens once at startup - zero runtime overhead
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct PortailConfig {
+pub struct UringRessConfig {
     #[serde(default)]
     pub gateway: GatewayConfig,
 
@@ -121,9 +173,6 @@ pub struct PortailConfig {
     pub tcp_routes: Vec<TcpRouteConfig>,
 
     #[serde(default)]
-    pub tls_routes: Vec<TlsRouteConfig>,
-
-    #[serde(default)]
     pub udp_routes: Vec<UdpRouteConfig>,
 
     #[serde(default)]
@@ -131,17 +180,11 @@ pub struct PortailConfig {
 
     #[serde(default)]
     pub performance: PerformanceConfig,
-
-    /// Pod IP + targetPort overrides for headless services (not serialized).
-    /// Map: (backend_fqdn, service_port) → Vec<(pod_ip, target_port)>
-    #[serde(skip)]
-    pub endpoint_overrides: std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
 /// Defines how HTTP traffic is routed based on hostnames and request matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct HttpRouteConfig {
     #[serde(default)]
@@ -153,60 +196,28 @@ pub struct HttpRouteConfig {
 
 /// Reference to a Gateway that this route attaches to
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ParentRef {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<i32>,
 }
 
 /// HTTP route rule with matches and backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HttpRouteRule {
     #[serde(default)]
     pub matches: Vec<HttpRouteMatch>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub filters: Vec<HttpRouteFilter>,
     pub backend_refs: Vec<BackendRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeouts: Option<HttpRouteTimeouts>,
-}
-
-/// Per-rule timeout configuration following Gateway API HTTPRouteTimeouts
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HttpRouteTimeouts {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
-    pub request: Option<Duration>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
-    pub backend_request: Option<Duration>,
 }
 
 /// HTTP route match conditions
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HttpRouteMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<HttpPathMatch>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub headers: Vec<HttpHeaderMatch>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub query_params: Vec<HttpQueryParamMatch>,
-}
-
-/// HTTP query parameter match condition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpQueryParamMatch {
-    pub name: String,
-    pub value: String,
-    #[serde(default, rename = "type")]
-    pub match_type: StringMatchType,
 }
 
 /// HTTP path matching
@@ -219,179 +230,33 @@ pub struct HttpPathMatch {
 }
 
 /// HTTP path match types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum HttpPathMatchType {
     PathPrefix,
-    Exact,
-    RegularExpression,
 }
-
-/// String match type for headers and query parameters
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
-pub enum StringMatchType {
-    #[default]
-    Exact,
-    RegularExpression,
-}
-
-/// HTTP header match condition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpHeaderMatch {
-    pub name: String,
-    pub value: String,
-    #[serde(default, rename = "type")]
-    pub match_type: StringMatchType,
-}
-
-/// Header modification config shared by request/response header modifiers
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeaderModifierConfig {
-    #[serde(default)]
-    pub add: Vec<HttpHeader>,
-    #[serde(default)]
-    pub set: Vec<HttpHeader>,
-    #[serde(default)]
-    pub remove: Vec<String>,
-}
-
-/// RequestRedirect config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestRedirectConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheme: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<HttpURLRewritePath>,
-    #[serde(default = "default_redirect_status")]
-    pub status_code: u16,
-}
-
-/// URLRewrite config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct URLRewriteConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<HttpURLRewritePath>,
-}
-
-/// RequestMirror config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestMirrorConfig {
-    pub backend_ref: BackendRef,
-}
-
-/// HTTP route filter (Gateway API spec)
-///
-/// Wire format nests each filter's config under a camelCase key matching the type:
-/// ```yaml
-/// - type: RequestHeaderModifier
-///   requestHeaderModifier:
-///     add: [...]
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum HttpRouteFilter {
-    RequestHeaderModifier {
-        #[serde(rename = "requestHeaderModifier")]
-        config: HeaderModifierConfig,
-    },
-    ResponseHeaderModifier {
-        #[serde(rename = "responseHeaderModifier")]
-        config: HeaderModifierConfig,
-    },
-    RequestRedirect {
-        #[serde(rename = "requestRedirect")]
-        config: RequestRedirectConfig,
-    },
-    URLRewrite {
-        #[serde(rename = "urlRewrite")]
-        config: URLRewriteConfig,
-    },
-    RequestMirror {
-        #[serde(rename = "requestMirror")]
-        config: RequestMirrorConfig,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum HttpURLRewritePath {
-    ReplaceFullPath {
-        #[serde(rename = "replaceFullPath")]
-        value: String,
-    },
-    ReplacePrefixMatch {
-        #[serde(rename = "replacePrefixMatch")]
-        value: String,
-    },
-}
-
-fn default_redirect_status() -> u16 {
-    302
-}
-
-/// Re-export from routing — single HttpHeader type used by both config and routing
-pub use crate::routing::HttpHeader;
 
 /// Backend reference for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendRef {
     pub name: String,
     pub port: u16,
-    #[serde(default = "default_backend_weight", skip_serializing_if = "is_default_weight")]
-    pub weight: u32,
-    /// Original group from the gateway-api backendRef (empty string = core API group)
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub group: String,
-    /// Original kind from the gateway-api backendRef (default "Service")
-    #[serde(default = "default_backend_kind", skip_serializing_if = "is_default_kind")]
-    pub kind: String,
-    /// Per-backend filters (e.g. BackendRequestHeaderModifier)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub filters: Vec<HttpRouteFilter>,
-}
-
-fn default_backend_kind() -> String {
-    "Service".to_string()
-}
-
-fn is_default_kind(k: &String) -> bool {
-    k == "Service"
-}
-
-fn default_backend_weight() -> u32 {
-    1
-}
-
-fn is_default_weight(w: &u32) -> bool {
-    *w == 1
 }
 
 impl HttpRouteMatch {
     pub fn path_prefix(path: &str) -> Self {
         Self {
-            method: None,
             path: Some(HttpPathMatch {
                 match_type: HttpPathMatchType::PathPrefix,
                 value: path.to_string(),
             }),
-            headers: vec![],
-            query_params: vec![],
         }
     }
 }
 
 /// TCP route configuration following Kubernetes Gateway API TCPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct TcpRouteConfig {
     #[serde(default)]
@@ -401,7 +266,6 @@ pub struct TcpRouteConfig {
 
 /// TCP route rule with backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct TcpRouteRule {
     pub backend_refs: Vec<BackendRef>,
@@ -409,7 +273,6 @@ pub struct TcpRouteRule {
 
 /// UDP route configuration following Kubernetes Gateway API UDPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UdpRouteConfig {
     #[serde(default)]
@@ -419,30 +282,8 @@ pub struct UdpRouteConfig {
 
 /// UDP route rule with backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UdpRouteRule {
-    pub backend_refs: Vec<BackendRef>,
-}
-
-/// TLS route configuration following Kubernetes Gateway API TLSRoute specification
-/// Routes TLS connections based on SNI hostname
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct TlsRouteConfig {
-    #[serde(default)]
-    pub parent_refs: Vec<ParentRef>,
-    #[serde(default)]
-    pub hostnames: Vec<String>,
-    pub rules: Vec<TlsRouteRule>,
-}
-
-/// TLS route rule with backend references
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct TlsRouteRule {
     pub backend_refs: Vec<BackendRef>,
 }
 
@@ -503,9 +344,11 @@ pub enum LogOutput {
 /// Performance configuration
 /// All values pre-computed at startup for zero runtime overhead
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    pub keep_alive_timeout: Duration,
+
     #[serde(default = "default_backend_timeout", deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub backend_timeout: Duration,
 
@@ -524,6 +367,7 @@ fn default_udp_session_timeout() -> Duration {
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
+            keep_alive_timeout: Duration::from_secs(5),
             backend_timeout: default_backend_timeout(),
             udp_session_timeout: default_udp_session_timeout(),
         }

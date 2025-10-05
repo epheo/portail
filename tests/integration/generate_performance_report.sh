@@ -123,80 +123,62 @@ run_integration_tests() {
 # Function to parse test outputs and extract metrics
 parse_test_results() {
     echo "Parsing test results..."
-    
-    # Parse realistic performance test results from structured output
+
+    # Parse realistic performance test output
     if [[ -f /tmp/realistic_test_output.log ]]; then
-        # Extract from STRUCTURED_OUTPUT section
-        local structured_section=$(sed -n '/STRUCTURED_OUTPUT_BEGIN/,/STRUCTURED_OUTPUT_END/p' /tmp/realistic_test_output.log)
-        
-        if [[ -n "$structured_section" ]]; then
-            # Extract latency
-            local latency_seconds=$(echo "$structured_section" | grep "LATENCY_AVG_SECONDS=" | cut -d'=' -f2)
-            if [[ -n "$latency_seconds" ]]; then
-                local latency_us=$(seconds_to_microseconds "$latency_seconds")
-                store_metric "latency_avg_us" "$latency_us"
-            fi
-            
-            # Extract throughput
-            local throughput_rps=$(echo "$structured_section" | grep "THROUGHPUT_RPS=" | cut -d'=' -f2)
-            if [[ -n "$throughput_rps" ]]; then
-                store_metric "throughput_rps" "$throughput_rps"
-            fi
-            
-            # Extract proxy overhead
-            local overhead_seconds=$(echo "$structured_section" | grep "PROXY_OVERHEAD_SECONDS=" | cut -d'=' -f2)
-            if [[ -n "$overhead_seconds" ]]; then
-                local overhead_ms=$(seconds_to_milliseconds "$overhead_seconds")
-                store_metric "proxy_overhead_ms" "$overhead_ms"
-            fi
-            
-            # Extract success rate (default from realistic test)
-            local success_rate=$(echo "$structured_section" | grep "SUCCESS_RATE=" | cut -d'=' -f2)
-            if [[ -n "$success_rate" ]]; then
-                store_metric "success_rate" "$success_rate"
-            fi
+        # Latency: "Small content (api.json): 0.000312s average (20/20 successful)"
+        local latency_seconds=$(grep "Small content (api.json):" /tmp/realistic_test_output.log | grep -oP '[0-9]+\.[0-9]+(?=s average)' | head -1)
+        if [[ -n "$latency_seconds" ]]; then
+            local latency_us=$(seconds_to_microseconds "$latency_seconds")
+            store_metric "latency_avg_us" "$latency_us"
+        fi
+
+        # Throughput from ab: "Requests per second:    32507.12 [#/sec]"
+        local throughput_rps=$(grep "Requests per second:" /tmp/realistic_test_output.log | tail -1 | awk '{print $4}' | cut -d'.' -f1)
+        if [[ -n "$throughput_rps" ]]; then
+            store_metric "throughput_rps" "$throughput_rps"
+        fi
+
+        # Proxy overhead: "Proxy overhead: 0.000300s (75%)"
+        local overhead_seconds=$(grep "Proxy overhead:" /tmp/realistic_test_output.log | grep -oP '[0-9]+\.[0-9]+(?=s )' | head -1)
+        if [[ -n "$overhead_seconds" ]]; then
+            local overhead_ms=$(seconds_to_milliseconds "$overhead_seconds")
+            store_metric "proxy_overhead_ms" "$overhead_ms"
         fi
     fi
-    
-    # Parse concurrent test results from structured output  
+
+    # Parse concurrent test output
     if [[ -f /tmp/concurrent_test_output.log ]]; then
-        local structured_section=$(sed -n '/STRUCTURED_OUTPUT_BEGIN/,/STRUCTURED_OUTPUT_END/p' /tmp/concurrent_test_output.log)
-        
-        if [[ -n "$structured_section" ]]; then
-            # Extract success rate (override if better)
-            local success_rate=$(echo "$structured_section" | grep "SUCCESS_RATE=" | cut -d'=' -f2)
-            if [[ -n "$success_rate" ]]; then
-                store_metric "success_rate" "$success_rate"
-            fi
-            
-            # Extract concurrent throughput (may be different from single-connection)
-            local concurrent_rps=$(echo "$structured_section" | grep "OVERALL_RPS=" | cut -d'=' -f2 | cut -d'.' -f1)
-            if [[ -n "$concurrent_rps" ]]; then
-                # Use higher of single or concurrent RPS
-                local current_rps=$(get_metric "throughput_rps")
-                if (( $(echo "$concurrent_rps" | awk '{print ($1 > 0)}') )); then
-                    if (( $(echo "$concurrent_rps" | awk -v curr="$current_rps" '{print ($1 > curr)}') )); then
-                        store_metric "throughput_rps" "$concurrent_rps"
-                    fi
-                fi
+        # "Success rate: 100.00%"
+        local success_rate=$(grep "^Success rate:" /tmp/concurrent_test_output.log | grep -oP '[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$success_rate" ]]; then
+            store_metric "success_rate" "$success_rate"
+        fi
+
+        # "Overall RPS: 1051.25"
+        local concurrent_rps=$(grep "^Overall RPS:" /tmp/concurrent_test_output.log | awk '{print $3}' | cut -d'.' -f1)
+        if [[ -n "$concurrent_rps" ]]; then
+            local current_rps=$(get_metric "throughput_rps")
+            if (( $(echo "$concurrent_rps" | awk -v curr="$current_rps" '{print ($1 > curr)}') )); then
+                store_metric "throughput_rps" "$concurrent_rps"
             fi
         fi
     fi
-    
-    # Set default values if not found
+
+    # Defaults for metrics that couldn't be parsed
     if [[ $(get_metric "latency_avg_us") == "0" ]]; then
-        store_metric "latency_avg_us" "1000"  # Default 1ms
+        store_metric "latency_avg_us" "1000"
     fi
     if [[ $(get_metric "throughput_rps") == "0" ]]; then
-        store_metric "throughput_rps" "5000"   # Default 5K RPS
+        store_metric "throughput_rps" "5000"
     fi
     if [[ $(get_metric "success_rate") == "0" ]]; then
-        store_metric "success_rate" "95"       # Default 95%
+        store_metric "success_rate" "95"
     fi
     if [[ $(get_metric "proxy_overhead_ms") == "0" ]]; then
-        store_metric "proxy_overhead_ms" "2"   # Default 2ms
+        store_metric "proxy_overhead_ms" "2"
     fi
-    
+
     store_metric "test_timestamp" "$(date)"
 }
 

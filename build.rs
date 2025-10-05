@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     
     println!("cargo:warning=Running: {:?}", cmd);
     let output = cmd.output()
-        .with_context(|| format!("failed to execute cargo build for eBPF"))?;
+        .with_context(|| "failed to execute cargo build for eBPF".to_string())?;
     
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -1,8 +1,10 @@
+pub mod types;
+pub mod parsing;
+pub mod validation;
 pub mod core;
 pub mod examples;
 
-// Re-export all core types for backward compatibility
-pub use core::*;
+pub use types::*;
 
 // Re-export example generation functions
-pub use examples::{print_example_config_info};
+pub use examples::print_example_config_info;
