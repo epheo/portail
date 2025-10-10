@@ -7,12 +7,26 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use crate::logging::{debug, error};
 use crate::http_parser::{ConnectionType, extract_routing_info};
-use crate::routing::RouteTable;
+use crate::routing::{self, RouteTable, HttpFilter, BackendSelector};
+
+#[derive(Debug, Clone)]
+pub struct HeaderModifications {
+    pub add: Vec<routing::HttpHeader>,
+    pub set: Vec<routing::HttpHeader>,
+    pub remove: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub enum ProcessingDecision {
     HttpForward {
         backend_addr: SocketAddr,
+        keepalive: bool,
+        request_header_mods: Option<HeaderModifications>,
+        response_header_mods: Option<HeaderModifications>,
+    },
+    HttpRedirect {
+        status_code: u16,
+        location: String,
         keepalive: bool,
     },
     TcpForward {
@@ -26,32 +40,6 @@ pub enum ProcessingDecision {
         close_connection: bool,
     },
     CloseConnection,
-}
-
-/// Round-robin backend selector
-#[derive(Debug)]
-pub struct BackendSelector {
-    route_counters: fnv::FnvHashMap<u64, u32>,
-}
-
-impl BackendSelector {
-    pub fn new() -> Self {
-        Self {
-            route_counters: fnv::FnvHashMap::default(),
-        }
-    }
-
-    pub fn select_backend(&mut self, route_hash: u64, backend_count: usize) -> usize {
-        let counter = self.route_counters.entry(route_hash).or_insert(0);
-        let count = *counter as usize;
-        *counter = counter.wrapping_add(1);
-
-        if backend_count.is_power_of_two() {
-            count & (backend_count - 1)
-        } else {
-            count % backend_count
-        }
-    }
 }
 
 pub fn analyze_request(
@@ -101,33 +89,93 @@ fn analyze_http_request(
     request_data: &[u8],
 ) -> Result<ProcessingDecision> {
     let request_info = extract_routing_info(request_data)?;
+    let keepalive = request_info.connection_type != ConnectionType::Close;
 
-    let backend_list = match routes.find_http_backends(request_info.host, request_info.path) {
-        Ok(list) => list,
+    let rule = match routes.find_http_route(request_info.host, request_info.path, request_info.header_data) {
+        Ok(rule) => rule,
         Err(_) => {
             return Ok(ProcessingDecision::SendHttpError {
                 error_code: 404,
-                close_connection: request_info.connection_type == ConnectionType::Close,
+                close_connection: !keepalive,
             });
         }
     };
 
-    if backend_list.is_empty() {
+    // Check for redirect filter first
+    for filter in &rule.filters {
+        if let HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } = filter {
+            let location = build_redirect_location(
+                scheme.as_deref(),
+                hostname.as_deref().unwrap_or(request_info.host),
+                *port,
+                path.as_deref().unwrap_or(request_info.path),
+                request_info.host,
+            );
+            return Ok(ProcessingDecision::HttpRedirect {
+                status_code: *status_code,
+                location,
+                keepalive,
+            });
+        }
+    }
+
+    if rule.backends.is_empty() {
         return Ok(ProcessingDecision::SendHttpError {
             error_code: 503,
-            close_connection: request_info.connection_type == ConnectionType::Close,
+            close_connection: !keepalive,
         });
     }
 
     let host_hash = RouteTable::hash_host(request_info.host);
     let route_hash = compute_route_hash(host_hash, request_info.path);
-    let backend_index = backend_selector.select_backend(route_hash, backend_list.len());
-    let selected_backend = &backend_list[backend_index];
+    let backend_index = backend_selector.select_weighted_backend(route_hash, &rule.backends);
+    let selected_backend = &rule.backends[backend_index];
+
+    // Collect header modification filters
+    let mut request_header_mods: Option<HeaderModifications> = None;
+    let mut response_header_mods: Option<HeaderModifications> = None;
+
+    for filter in &rule.filters {
+        match filter {
+            HttpFilter::RequestHeaderModifier { add, set, remove } => {
+                request_header_mods = Some(HeaderModifications {
+                    add: add.clone(),
+                    set: set.clone(),
+                    remove: remove.clone(),
+                });
+            }
+            HttpFilter::ResponseHeaderModifier { add, set, remove } => {
+                response_header_mods = Some(HeaderModifications {
+                    add: add.clone(),
+                    set: set.clone(),
+                    remove: remove.clone(),
+                });
+            }
+            HttpFilter::RequestRedirect { .. } => {} // already handled above
+        }
+    }
 
     Ok(ProcessingDecision::HttpForward {
         backend_addr: selected_backend.socket_addr,
-        keepalive: request_info.connection_type != ConnectionType::Close,
+        keepalive,
+        request_header_mods,
+        response_header_mods,
     })
+}
+
+fn build_redirect_location(
+    scheme: Option<&str>,
+    hostname: &str,
+    port: Option<u16>,
+    path: &str,
+    original_host: &str,
+) -> String {
+    let scheme = scheme.unwrap_or("http");
+    let host = if hostname == original_host { original_host } else { hostname };
+    match port {
+        Some(p) => format!("{}://{}:{}{}", scheme, host, p, path),
+        None => format!("{}://{}{}", scheme, host, path),
+    }
 }
 
 pub fn analyze_udp_request(

@@ -28,9 +28,12 @@ pub enum HttpVersion {
 /// Contains all fields needed for routing decisions and execution
 #[derive(Debug, Clone)]
 pub struct HttpRequestInfo<'a> {
+    pub method: &'a str,
     pub host: &'a str,
     pub path: &'a str,
     pub connection_type: ConnectionType,
+    /// Raw header bytes for lazy header matching (zero-copy)
+    pub header_data: &'a [u8],
 }
 
 /// Extract complete HTTP routing information with zero-copy parsing
@@ -43,6 +46,7 @@ pub fn extract_routing_info(
 
         // Single-pass state machine parser
         let mut pos = 0;
+        let mut method: Option<&str> = None;
         let mut path: Option<&str> = None;
         let mut host: Option<&str> = None;
         let mut raw_connection_type = ConnectionType::Default;
@@ -60,7 +64,7 @@ pub fn extract_routing_info(
             // SAFETY: HTTP request line is ASCII by RFC 7230 - skip UTF-8 validation
             let first_line = unsafe { std::str::from_utf8_unchecked(&request_data[pos..line_end]) };
             let mut parts = first_line.split_whitespace();
-            parts.next(); // Skip method
+            method = parts.next();
             path = parts.next();
 
             if line_end >= 8 && &request_data[line_end-8..line_end] == b"HTTP/1.0" {
@@ -74,6 +78,8 @@ pub fn extract_routing_info(
         pos = line_end;
         if pos < request_data.len() && request_data[pos] == b'\r' { pos += 1; }
         if pos < request_data.len() && request_data[pos] == b'\n' { pos += 1; }
+
+        let header_start = pos;
 
         // Parse headers in single pass
         while pos < request_data.len() {
@@ -156,9 +162,14 @@ pub fn extract_routing_info(
             }
         };
 
+        // header_data covers everything from header_start to current pos (end of headers)
+        let header_data = &request_data[header_start..pos];
+
         Ok(HttpRequestInfo {
+            method: method.unwrap_or("GET"),
             host: host.unwrap_or("localhost"),
             path: path.unwrap_or("/"),
             connection_type,
+            header_data,
         })
 }

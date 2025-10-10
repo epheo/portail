@@ -62,6 +62,10 @@ impl HttpRouteConfig {
             if hostname.contains(':') {
                 return Err(anyhow!("Hostname must not contain port: {}", hostname));
             }
+            // Wildcard hostnames must be "*.domain" format
+            if hostname.starts_with('*') && !hostname.starts_with("*.") {
+                return Err(anyhow!("Wildcard hostname must use '*.domain' format: {}", hostname));
+            }
         }
 
         if self.rules.is_empty() {
@@ -159,8 +163,10 @@ impl ParentRef {
 
 impl HttpRouteRule {
     fn validate(&self) -> Result<()> {
-        if self.backend_refs.is_empty() {
-            return Err(anyhow!("HTTP route rule must have at least one backend_ref"));
+        // backend_refs can be empty when a redirect filter is present
+        let has_redirect = self.filters.iter().any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
+        if self.backend_refs.is_empty() && !has_redirect {
+            return Err(anyhow!("HTTP route rule must have at least one backend_ref (or a RequestRedirect filter)"));
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
@@ -171,6 +177,10 @@ impl HttpRouteRule {
             match_rule.validate().map_err(|e| anyhow!("Match rule {}: {}", i, e))?;
         }
 
+        for (i, filter) in self.filters.iter().enumerate() {
+            validate_filter(filter).map_err(|e| anyhow!("Filter {}: {}", i, e))?;
+        }
+
         Ok(())
     }
 }
@@ -179,6 +189,11 @@ impl HttpRouteMatch {
     fn validate(&self) -> Result<()> {
         if let Some(path_match) = &self.path {
             path_match.validate()?;
+        }
+
+        for (i, header_match) in self.headers.iter().enumerate() {
+            validate_header_match(header_match)
+                .map_err(|e| anyhow!("Header match {}: {}", i, e))?;
         }
 
         Ok(())
@@ -253,6 +268,10 @@ impl BackendRef {
 
         validate_port(self.port, "Backend ref port")?;
 
+        if self.weight > 1_000_000 {
+            return Err(anyhow!("Backend weight must be 0-1000000, got {}", self.weight));
+        }
+
         Ok(())
     }
 }
@@ -261,6 +280,38 @@ impl BackendRef {
 fn validate_port(port: u16, name: &str) -> Result<()> {
     if port == 0 {
         return Err(anyhow!("{} must be between 1 and 65535", name));
+    }
+    Ok(())
+}
+
+fn validate_header_match(hm: &HttpHeaderMatch) -> Result<()> {
+    if hm.name.is_empty() {
+        return Err(anyhow!("Header match name cannot be empty"));
+    }
+    // RFC 7230: header field names are tokens (visible ASCII, no delimiters)
+    if !hm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
+        return Err(anyhow!("Header match name '{}' contains invalid characters", hm.name));
+    }
+    Ok(())
+}
+
+fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
+    match filter {
+        HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
+            if scheme.is_none() && hostname.is_none() && port.is_none() && path.is_none() {
+                return Err(anyhow!("RequestRedirect must set at least one of: scheme, hostname, port, path"));
+            }
+            match status_code {
+                301 | 302 | 303 | 307 | 308 => {}
+                _ => return Err(anyhow!("RequestRedirect status_code must be 301, 302, 303, 307, or 308, got {}", status_code)),
+            }
+            if let Some(p) = path {
+                if !p.starts_with('/') {
+                    return Err(anyhow!("RequestRedirect path must start with '/', got '{}'", p));
+                }
+            }
+        }
+        HttpRouteFilter::RequestHeaderModifier { .. } | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
     }
     Ok(())
 }

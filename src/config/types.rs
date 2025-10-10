@@ -205,19 +205,21 @@ pub struct ParentRef {
 
 /// HTTP route rule with matches and backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HttpRouteRule {
     #[serde(default)]
     pub matches: Vec<HttpRouteMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<HttpRouteFilter>,
     pub backend_refs: Vec<BackendRef>,
 }
 
 /// HTTP route match conditions
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HttpRouteMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<HttpPathMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpHeaderMatch>,
 }
 
 /// HTTP path matching
@@ -230,18 +232,80 @@ pub struct HttpPathMatch {
 }
 
 /// HTTP path match types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum HttpPathMatchType {
     PathPrefix,
+    Exact,
+}
+
+/// HTTP header match condition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHeaderMatch {
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP route filter (Gateway API spec)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum HttpRouteFilter {
+    RequestHeaderModifier {
+        #[serde(default)]
+        add: Vec<HttpHeader>,
+        #[serde(default)]
+        set: Vec<HttpHeader>,
+        #[serde(default)]
+        remove: Vec<String>,
+    },
+    ResponseHeaderModifier {
+        #[serde(default)]
+        add: Vec<HttpHeader>,
+        #[serde(default)]
+        set: Vec<HttpHeader>,
+        #[serde(default)]
+        remove: Vec<String>,
+    },
+    RequestRedirect {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scheme: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default = "default_redirect_status")]
+        status_code: u16,
+    },
+}
+
+fn default_redirect_status() -> u16 {
+    302
+}
+
+/// HTTP header name/value pair for filter operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
 }
 
 /// Backend reference for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BackendRef {
     pub name: String,
     pub port: u16,
+    #[serde(default = "default_backend_weight", skip_serializing_if = "is_default_weight")]
+    pub weight: u32,
+}
+
+fn default_backend_weight() -> u32 {
+    1
+}
+
+fn is_default_weight(w: &u32) -> bool {
+    *w == 1
 }
 
 impl HttpRouteMatch {
@@ -251,6 +315,7 @@ impl HttpRouteMatch {
                 match_type: HttpPathMatchType::PathPrefix,
                 value: path.to_string(),
             }),
+            headers: vec![],
         }
     }
 }

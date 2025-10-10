@@ -1,4 +1,4 @@
-use uringress::routing::{RouteTable, Backend, FnvRouterHasher};
+use uringress::routing::{RouteTable, Backend, HttpRouteRule, PathMatchType, FnvRouterHasher};
 
 #[test]
 fn test_fnv_hash_consistency() {
@@ -27,13 +27,19 @@ fn test_route_table_http_routing() {
     let mut table = RouteTable::new();
 
     let backend = Backend::new("192.168.1.100".to_string(), 8080).unwrap();
-    table.add_http_route("api.example.com", "/v1/users", vec![backend]);
+    table.add_http_route("api.example.com", HttpRouteRule {
+        path_match_type: PathMatchType::Prefix,
+        path: "/v1/users".to_string(),
+        header_matches: vec![],
+        filters: vec![],
+        backends: vec![backend],
+    });
 
-    let result = table.find_http_backends("api.example.com", "/v1/users/123");
+    let result = table.find_http_route("api.example.com", "/v1/users/123", &[]);
     assert!(result.is_ok());
 
-    let backends = result.unwrap();
-    let backend_ref = &backends[0];
+    let rule = result.unwrap();
+    let backend_ref = &rule.backends[0];
     assert_eq!(backend_ref.socket_addr.ip(), std::net::IpAddr::V4("192.168.1.100".parse().unwrap()));
     assert_eq!(backend_ref.socket_addr.port(), 8080);
 }
@@ -42,7 +48,7 @@ fn test_route_table_http_routing() {
 fn test_route_table_http_routing_no_match() {
     let table = RouteTable::new();
 
-    let result = table.find_http_backends("nonexistent.com", "/api/test");
+    let result = table.find_http_route("nonexistent.com", "/api/test", &[]);
     assert!(result.is_err());
 }
 
@@ -88,20 +94,32 @@ fn test_path_matching_longest_prefix_first() {
     let backend1 = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
     let backend2 = Backend::new("127.0.0.2".to_string(), 8080).unwrap();
 
-    table.add_http_route("api.com", "/api", vec![backend1]);
-    table.add_http_route("api.com", "/api/v1", vec![backend2]);
+    table.add_http_route("api.com", HttpRouteRule {
+        path_match_type: PathMatchType::Prefix,
+        path: "/api".to_string(),
+        header_matches: vec![],
+        filters: vec![],
+        backends: vec![backend1],
+    });
+    table.add_http_route("api.com", HttpRouteRule {
+        path_match_type: PathMatchType::Prefix,
+        path: "/api/v1".to_string(),
+        header_matches: vec![],
+        filters: vec![],
+        backends: vec![backend2],
+    });
 
     // Should match longer prefix first
-    let result = table.find_http_backends("api.com", "/api/v1/users");
+    let result = table.find_http_route("api.com", "/api/v1/users", &[]);
     assert!(result.is_ok());
-    let backends = result.unwrap();
-    let backend_ref = &backends[0];
+    let rule = result.unwrap();
+    let backend_ref = &rule.backends[0];
     assert_eq!(format!("{}", backend_ref.socket_addr.ip()), "127.0.0.2");
 
     // Should match shorter prefix for non-v1 paths
-    let result = table.find_http_backends("api.com", "/api/v2/users");
+    let result = table.find_http_route("api.com", "/api/v2/users", &[]);
     assert!(result.is_ok());
-    let backends = result.unwrap();
-    let backend_ref = &backends[0];
+    let rule = result.unwrap();
+    let backend_ref = &rule.backends[0];
     assert_eq!(format!("{}", backend_ref.socket_addr.ip()), "127.0.0.1");
 }

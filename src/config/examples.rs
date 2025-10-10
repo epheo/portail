@@ -29,10 +29,12 @@ impl UringRessConfig {
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/api.json")],
                         backend_refs: vec![BackendRef {
                             name: "api-service".to_string(),
                             port: 3001,
+                            weight: 1,
                         }],
                     }],
                 }
@@ -94,10 +96,12 @@ impl UringRessConfig {
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/")],
                         backend_refs: vec![BackendRef {
                             name: "frontend-service".to_string(),
                             port: 3001,
+                            weight: 1,
                         }],
                     }],
                 },
@@ -108,11 +112,12 @@ impl UringRessConfig {
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/index.html")],
                         backend_refs: vec![
-                            BackendRef { name: "frontend-service-1".to_string(), port: 3001 },
-                            BackendRef { name: "frontend-service-2".to_string(), port: 3002 },
-                            BackendRef { name: "frontend-service-3".to_string(), port: 3003 },
+                            BackendRef { name: "frontend-service-1".to_string(), port: 3001, weight: 1 },
+                            BackendRef { name: "frontend-service-2".to_string(), port: 3002, weight: 1 },
+                            BackendRef { name: "frontend-service-3".to_string(), port: 3003, weight: 1 },
                         ],
                     }],
                 },
@@ -120,32 +125,36 @@ impl UringRessConfig {
                     parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/api.json")],
-                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001 }],
+                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
                     }],
                 },
                 HttpRouteConfig {
                     parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/users.json")],
-                        backend_refs: vec![BackendRef { name: "users-service".to_string(), port: 3002 }],
+                        backend_refs: vec![BackendRef { name: "users-service".to_string(), port: 3002, weight: 1 }],
                     }],
                 },
                 HttpRouteConfig {
                     parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/dataset.json")],
-                        backend_refs: vec![BackendRef { name: "dataset-service".to_string(), port: 3003 }],
+                        backend_refs: vec![BackendRef { name: "dataset-service".to_string(), port: 3003, weight: 1 }],
                     }],
                 },
                 HttpRouteConfig {
                     parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
+                        filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/health")],
-                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001 }],
+                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
                     }],
                 },
             ],
@@ -159,6 +168,7 @@ impl UringRessConfig {
                         backend_refs: vec![BackendRef {
                             name: "ssh-service".to_string(),
                             port: 22,
+                            weight: 1,
                         }],
                     }],
                 }

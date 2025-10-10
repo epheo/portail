@@ -20,8 +20,8 @@ use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::logging::{warn, info, debug};
-use crate::request_processor::{self, BackendSelector, ProcessingDecision};
-use crate::routing::RouteTable;
+use crate::request_processor::{self, HeaderModifications, ProcessingDecision};
+use crate::routing::{BackendSelector, RouteTable};
 
 /// Run an accept loop on a single listener, spawning a task per connection.
 pub async fn run_worker(
@@ -88,8 +88,20 @@ async fn handle_connection(
         ProcessingDecision::TcpForward { backend_addr } => {
             handle_tcp_connection(client, backend_addr, &buf[..n]).await
         }
-        ProcessingDecision::HttpForward { backend_addr, keepalive } => {
-            handle_http_connection(client, &mut buf, n, backend_addr, keepalive, server_port, routes, pool, &mut selector).await
+        ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods } => {
+            handle_http_connection(
+                client, &mut buf, n, backend_addr, keepalive,
+                request_header_mods, response_header_mods,
+                server_port, routes, pool, &mut selector,
+            ).await
+        }
+        ProcessingDecision::HttpRedirect { status_code, location, keepalive } => {
+            send_redirect_response(&mut client, status_code, &location).await?;
+            if keepalive {
+                handle_keepalive_after_response(client, &mut buf, server_port, routes, pool, &mut selector).await
+            } else {
+                Ok(())
+            }
         }
         ProcessingDecision::SendHttpError { error_code, .. } => {
             send_error_response(&mut client, error_code).await
@@ -98,12 +110,15 @@ async fn handle_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_http_connection(
     mut client: TcpStream,
     buf: &mut Vec<u8>,
     initial_bytes: usize,
     initial_backend_addr: SocketAddr,
     initial_keepalive: bool,
+    initial_req_mods: Option<HeaderModifications>,
+    initial_resp_mods: Option<HeaderModifications>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: Arc<BackendPool>,
@@ -112,13 +127,21 @@ async fn handle_http_connection(
     let mut backend_addr = initial_backend_addr;
     let mut keepalive = initial_keepalive;
     let mut request_bytes = initial_bytes;
+    let mut req_mods = initial_req_mods;
+    let mut resp_mods = initial_resp_mods;
 
     loop {
         let mut backend = pool.acquire(backend_addr).await?;
 
-        backend.write_all(&buf[..request_bytes]).await?;
+        // Apply request header modifications if present
+        if let Some(ref mods) = req_mods {
+            let modified = apply_request_header_mods(&buf[..request_bytes], mods);
+            backend.write_all(&modified).await?;
+        } else {
+            backend.write_all(&buf[..request_bytes]).await?;
+        }
 
-        let response_complete = forward_http_response(&mut backend, &mut client, buf).await?;
+        let response_complete = forward_http_response(&mut backend, &mut client, buf, resp_mods.as_ref()).await?;
 
         if response_complete && keepalive {
             pool.release(backend_addr, backend);
@@ -141,9 +164,21 @@ async fn handle_http_connection(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka } => {
+            ProcessingDecision::HttpForward {
+                backend_addr: addr, keepalive: ka,
+                request_header_mods, response_header_mods,
+            } => {
                 backend_addr = addr;
                 keepalive = ka;
+                req_mods = request_header_mods;
+                resp_mods = response_header_mods;
+            }
+            ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
+                send_redirect_response(&mut client, status_code, &location).await?;
+                if !ka {
+                    return Ok(());
+                }
+                continue;
             }
             ProcessingDecision::SendHttpError { error_code, close_connection } => {
                 send_error_response(&mut client, error_code).await?;
@@ -159,12 +194,60 @@ async fn handle_http_connection(
     }
 }
 
+/// After sending a redirect on a keepalive connection, continue reading requests.
+async fn handle_keepalive_after_response(
+    mut client: TcpStream,
+    buf: &mut Vec<u8>,
+    server_port: u16,
+    routes: Arc<ArcSwap<RouteTable>>,
+    pool: Arc<BackendPool>,
+    selector: &mut BackendSelector,
+) -> Result<()> {
+    loop {
+        let n = client.read(buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        let decision = {
+            let route_table = routes.load();
+            request_processor::analyze_request(&route_table, selector, &buf[..n], server_port)?
+        };
+
+        match decision {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods } => {
+                return handle_http_connection(
+                    client, buf, n, backend_addr, keepalive,
+                    request_header_mods, response_header_mods,
+                    server_port, routes, pool, selector,
+                ).await;
+            }
+            ProcessingDecision::HttpRedirect { status_code, location, keepalive } => {
+                send_redirect_response(&mut client, status_code, &location).await?;
+                if !keepalive {
+                    return Ok(());
+                }
+                continue;
+            }
+            ProcessingDecision::SendHttpError { error_code, close_connection } => {
+                send_error_response(&mut client, error_code).await?;
+                if close_connection {
+                    return Ok(());
+                }
+                continue;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 /// Forward the backend's HTTP response to the client.
 /// Returns true if the response was fully received (backend connection reusable).
 async fn forward_http_response(
     backend: &mut TcpStream,
     client: &mut TcpStream,
     buf: &mut [u8],
+    response_mods: Option<&HeaderModifications>,
 ) -> Result<bool> {
     let mut headers_parsed = false;
     let mut content_length: Option<usize> = None;
@@ -178,15 +261,25 @@ async fn forward_http_response(
             return Ok(false);
         }
 
-        client.write_all(&buf[..n]).await?;
-
         if !headers_parsed {
             header_buf.extend_from_slice(&buf[..n]);
 
             if let Some(header_end) = find_header_end(&header_buf) {
                 headers_parsed = true;
-                let headers = &header_buf[..header_end];
 
+                // Apply response header modifications if present
+                if let Some(mods) = response_mods {
+                    let modified_headers = apply_response_header_mods(&header_buf[..header_end], mods);
+                    client.write_all(&modified_headers).await?;
+                    // Write body portion that came with headers
+                    if header_buf.len() > header_end {
+                        client.write_all(&header_buf[header_end..]).await?;
+                    }
+                } else {
+                    client.write_all(&header_buf).await?;
+                }
+
+                let headers = &header_buf[..header_end];
                 content_length = parse_content_length(headers);
                 chunked = is_chunked_transfer(headers);
 
@@ -204,9 +297,18 @@ async fn forward_http_response(
                 if is_no_body_status(headers) {
                     return Ok(true);
                 }
+            } else {
+                // Headers not complete yet, don't write anything until we have them
+                // (only relevant when response_mods are active)
+                if response_mods.is_none() {
+                    // No modifications needed, stream through immediately
+                    // But we already extended header_buf, so nothing to do here—
+                    // the full buffer will be written once headers are complete
+                }
             }
         } else {
             body_bytes_forwarded += n;
+            client.write_all(&buf[..n]).await?;
 
             if let Some(cl) = content_length {
                 if body_bytes_forwarded >= cl {
@@ -395,6 +497,26 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+async fn send_redirect_response(client: &mut TcpStream, status_code: u16, location: &str) -> Result<()> {
+    let status_text = match status_code {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Found",
+    };
+
+    let body = format!("{} {}", status_code, status_text);
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: {}\r\n\r\n{}",
+        status_code, status_text, location, body.len(), body
+    );
+
+    client.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
 async fn send_error_response(client: &mut TcpStream, error_code: u16) -> Result<()> {
     let (status_text, body) = match error_code {
         400 => ("Bad Request", "400 Bad Request"),
@@ -412,6 +534,132 @@ async fn send_error_response(client: &mut TcpStream, error_code: u16) -> Result<
 
     client.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+// --- Header modification ---
+
+/// Apply request header modifications: copies request line, modifies headers, appends body.
+/// Only called when filters are active — the common case remains zero-copy.
+fn apply_request_header_mods(original: &[u8], mods: &HeaderModifications) -> Vec<u8> {
+    let header_end = find_header_end(original).unwrap_or(original.len());
+
+    // Split into header region and body
+    let header_region = &original[..header_end];
+    let body = &original[header_end..];
+
+    let header_str = match std::str::from_utf8(header_region) {
+        Ok(s) => s,
+        Err(_) => return original.to_vec(),
+    };
+
+    let lines: Vec<&str> = header_str.lines().collect();
+    if lines.is_empty() {
+        return original.to_vec();
+    }
+
+    // First line is request line
+    let request_line = lines[0];
+    let header_lines = &lines[1..];
+
+    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + mods.add.len() + mods.set.len());
+
+    // Process existing headers: remove or set
+    for line in header_lines {
+        if line.is_empty() {
+            continue;
+        }
+        let colon_pos = match line.find(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = &line[..colon_pos];
+
+        // Skip removed headers
+        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+
+        // Replace with set value if matching
+        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
+            result_headers.push(format!("{}: {}", set_header.name, set_header.value));
+            continue;
+        }
+
+        result_headers.push(line.to_string());
+    }
+
+    // Add new headers
+    for h in &mods.add {
+        result_headers.push(format!("{}: {}", h.name, h.value));
+    }
+
+    let mut out = Vec::with_capacity(original.len() + 256);
+    out.extend_from_slice(request_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for h in &result_headers {
+        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+
+    out
+}
+
+/// Apply response header modifications to buffered response headers.
+/// Returns the modified header region (including trailing \r\n\r\n).
+fn apply_response_header_mods(headers: &[u8], mods: &HeaderModifications) -> Vec<u8> {
+    let header_str = match std::str::from_utf8(headers) {
+        Ok(s) => s,
+        Err(_) => return headers.to_vec(),
+    };
+
+    let lines: Vec<&str> = header_str.lines().collect();
+    if lines.is_empty() {
+        return headers.to_vec();
+    }
+
+    let status_line = lines[0];
+    let header_lines = &lines[1..];
+
+    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + mods.add.len() + mods.set.len());
+
+    for line in header_lines {
+        if line.is_empty() {
+            continue;
+        }
+        let colon_pos = match line.find(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = &line[..colon_pos];
+
+        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+
+        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
+            result_headers.push(format!("{}: {}", set_header.name, set_header.value));
+            continue;
+        }
+
+        result_headers.push(line.to_string());
+    }
+
+    for h in &mods.add {
+        result_headers.push(format!("{}: {}", h.name, h.value));
+    }
+
+    let mut out = Vec::with_capacity(headers.len() + 256);
+    out.extend_from_slice(status_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for h in &result_headers {
+        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+
+    out
 }
 
 // --- HTTP response parsing helpers ---

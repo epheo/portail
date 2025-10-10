@@ -51,9 +51,9 @@ impl UringRessConfig {
     /// Convert configuration to RouteTable for runtime use
     /// All route processing happens once at startup - zero runtime overhead
     pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
-        use crate::routing::{RouteTable, Backend};
+        use crate::routing;
 
-        let mut route_table = RouteTable::new();
+        let mut route_table = routing::RouteTable::new();
 
         tracing::debug!("Converting {} HTTP routes to route table", self.http_routes.len());
 
@@ -65,27 +65,50 @@ impl UringRessConfig {
                 for (rule_idx, rule) in http_route.rules.iter().enumerate() {
                     tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
                         rule_idx, rule.matches.len(), rule.backend_refs.len());
+
+                    let mut backends = Vec::new();
+                    for backend_ref in &rule.backend_refs {
+                        let backend = routing::Backend::with_weight(
+                            backend_ref.name.clone(),
+                            backend_ref.port,
+                            backend_ref.weight,
+                        )?;
+                        backends.push(backend);
+                        tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
+                    }
+
+                    let filters = convert_filters(&rule.filters);
+
                     for route_match in &rule.matches {
-                        let path = if let Some(path_match) = &route_match.path {
-                            &path_match.value
+                        let (path, path_match_type) = if let Some(path_match) = &route_match.path {
+                            let pmt = match path_match.match_type {
+                                HttpPathMatchType::PathPrefix => routing::PathMatchType::Prefix,
+                                HttpPathMatchType::Exact => routing::PathMatchType::Exact,
+                            };
+                            (path_match.value.as_str(), pmt)
                         } else {
-                            "/"
+                            ("/", routing::PathMatchType::Prefix)
                         };
 
+                        let header_matches: Vec<routing::HeaderMatch> = route_match
+                            .headers
+                            .iter()
+                            .map(|hm| routing::HeaderMatch {
+                                name: hm.name.to_ascii_lowercase(),
+                                value: hm.value.clone(),
+                            })
+                            .collect();
+
                         tracing::debug!("      Adding route: {} {} -> {} backends",
-                            hostname, path, rule.backend_refs.len());
+                            hostname, path, backends.len());
 
-                        let mut backends = Vec::new();
-                        for backend_ref in &rule.backend_refs {
-                            let backend = Backend::new(
-                                backend_ref.name.clone(),
-                                backend_ref.port
-                            )?;
-                            backends.push(backend);
-                            tracing::debug!("        Backend: {}:{}", backend_ref.name, backend_ref.port);
-                        }
-
-                        route_table.add_http_route(hostname, path, backends);
+                        route_table.add_http_route(hostname, routing::HttpRouteRule {
+                            path_match_type,
+                            path: path.to_string(),
+                            header_matches,
+                            filters: filters.clone(),
+                            backends: backends.clone(),
+                        });
                     }
                 }
             }
@@ -100,7 +123,7 @@ impl UringRessConfig {
                         for rule in &tcp_route.rules {
                             let mut backends = Vec::new();
                             for backend_ref in &rule.backend_refs {
-                                let backend = Backend::new(
+                                let backend = routing::Backend::new(
                                     backend_ref.name.clone(),
                                     backend_ref.port
                                 )?;
@@ -123,7 +146,7 @@ impl UringRessConfig {
                         for rule in &udp_route.rules {
                             let mut backends = Vec::new();
                             for backend_ref in &rule.backend_refs {
-                                let backend = Backend::new(
+                                let backend = routing::Backend::new(
                                     backend_ref.name.clone(),
                                     backend_ref.port
                                 )?;
@@ -142,6 +165,37 @@ impl UringRessConfig {
 
         Ok(route_table)
     }
+}
+
+fn convert_filters(config_filters: &[HttpRouteFilter]) -> Vec<crate::routing::HttpFilter> {
+    config_filters
+        .iter()
+        .map(|f| match f {
+            HttpRouteFilter::RequestHeaderModifier { add, set, remove } => {
+                crate::routing::HttpFilter::RequestHeaderModifier {
+                    add: add.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    set: set.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    remove: remove.clone(),
+                }
+            }
+            HttpRouteFilter::ResponseHeaderModifier { add, set, remove } => {
+                crate::routing::HttpFilter::ResponseHeaderModifier {
+                    add: add.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    set: set.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    remove: remove.clone(),
+                }
+            }
+            HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
+                crate::routing::HttpFilter::RequestRedirect {
+                    scheme: scheme.clone(),
+                    hostname: hostname.clone(),
+                    port: *port,
+                    path: path.clone(),
+                    status_code: *status_code,
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

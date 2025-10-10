@@ -1,4 +1,4 @@
-//! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
+//! UDP per-listener recv_from loop with per-session connected backend sockets.
 //! Sessions are identified by source address and expire after a configurable timeout.
 
 use std::net::SocketAddr;
@@ -11,7 +11,6 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::health::HealthRegistry;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
@@ -30,21 +29,16 @@ pub async fn run_udp_worker(
     routes: Arc<ArcSwap<RouteTable>>,
     session_timeout: Duration,
     shutdown: CancellationToken,
-    health: Arc<HealthRegistry>,
 ) {
     info!("UDP worker {} listening on port {}", worker_id, server_port);
 
     let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
-    let selector = BackendSelector::new();
+    let mut selector = BackendSelector::new();
     let mut buf = vec![0u8; 65536];
-
-    // Use a monotonic epoch for last_active tracking (shared between main loop and reaper)
-    let epoch = Instant::now();
 
     // Reaper task: periodically remove expired sessions
     let reaper_sessions = sessions.clone();
     let reaper_shutdown = shutdown.clone();
-    let reaper_epoch = epoch;
     let _reaper = tokio::spawn(async move {
         let mut interval = tokio::time::interval(session_timeout / 2);
         loop {
@@ -52,7 +46,7 @@ pub async fn run_udp_worker(
                 biased;
                 _ = reaper_shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let now = reaper_epoch.elapsed().as_secs();
+                    let now = Instant::now().elapsed().as_secs();
                     let timeout_secs = session_timeout.as_secs();
                     reaper_sessions.retain(|_addr, session: &mut UdpSession| {
                         let last = session.last_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -68,6 +62,8 @@ pub async fn run_udp_worker(
         }
     });
 
+    // Use a monotonic epoch for last_active tracking
+    let epoch = Instant::now();
 
     loop {
         tokio::select! {
@@ -84,8 +80,8 @@ pub async fn run_udp_worker(
                         // Update last_active or create new session
                         if let Some(session) = sessions.get(&client_addr) {
                             session.last_active.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(e) = session.backend_socket.send(&buf[..n]).await {
-                                debug!("UDP send to backend failed for {}: {}", client_addr, e);
+                            if let Err(_e) = session.backend_socket.send(&buf[..n]).await {
+                                debug!("UDP send to backend failed for {}: {}", client_addr, _e);
                                 drop(session);
                                 sessions.remove(&client_addr);
                             }
@@ -95,7 +91,7 @@ pub async fn run_udp_worker(
                         // New session — route lookup
                         let decision = {
                             let route_table = routes.load();
-                            match request_processor::analyze_udp_request(&route_table, &selector, server_port, &health) {
+                            match request_processor::analyze_udp_request(&route_table, &mut selector, server_port) {
                                 Ok(d) => d,
                                 Err(e) => {
                                     warn!("UDP routing error for port {}: {}", server_port, e);
@@ -139,13 +135,19 @@ pub async fn run_udp_worker(
                         let task_timeout = session_timeout;
                         let backend_task = tokio::spawn(async move {
                             let mut reply_buf = vec![0u8; 65536];
-                            while let Ok(Ok(n)) = tokio::time::timeout(task_timeout, backend_rx.recv(&mut reply_buf)).await {
-                                task_last_active.store(
-                                    epoch.elapsed().as_secs(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                if listener_socket.send_to(&reply_buf[..n], client_addr).await.is_err() {
-                                    break;
+                            loop {
+                                match tokio::time::timeout(task_timeout, backend_rx.recv(&mut reply_buf)).await {
+                                    Ok(Ok(n)) => {
+                                        task_last_active.store(
+                                            epoch.elapsed().as_secs(),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if let Err(_e) = listener_socket.send_to(&reply_buf[..n], client_addr).await {
+                                            break;
+                                        }
+                                    }
+                                    // Timeout or error — session expired
+                                    _ => break,
                                 }
                             }
                         });
