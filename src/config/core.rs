@@ -77,7 +77,7 @@ impl UringRessConfig {
                         tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
                     }
 
-                    let filters = convert_filters(&rule.filters);
+                    let filters = convert_filters(&rule.filters)?;
 
                     for route_match in &rule.matches {
                         let (path, path_match_type) = if let Some(path_match) = &route_match.path {
@@ -167,32 +167,53 @@ impl UringRessConfig {
     }
 }
 
-fn convert_filters(config_filters: &[HttpRouteFilter]) -> Vec<crate::routing::HttpFilter> {
+fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
+    use crate::routing::{self, URLRewritePath};
+
     config_filters
         .iter()
         .map(|f| match f {
             HttpRouteFilter::RequestHeaderModifier { add, set, remove } => {
-                crate::routing::HttpFilter::RequestHeaderModifier {
-                    add: add.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    set: set.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                Ok(routing::HttpFilter::RequestHeaderModifier {
+                    add: add.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    set: set.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
                     remove: remove.clone(),
-                }
+                })
             }
             HttpRouteFilter::ResponseHeaderModifier { add, set, remove } => {
-                crate::routing::HttpFilter::ResponseHeaderModifier {
-                    add: add.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    set: set.iter().map(|h| crate::routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                Ok(routing::HttpFilter::ResponseHeaderModifier {
+                    add: add.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
+                    set: set.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
                     remove: remove.clone(),
-                }
+                })
             }
             HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
-                crate::routing::HttpFilter::RequestRedirect {
+                Ok(routing::HttpFilter::RequestRedirect {
                     scheme: scheme.clone(),
                     hostname: hostname.clone(),
                     port: *port,
                     path: path.clone(),
                     status_code: *status_code,
-                }
+                })
+            }
+            HttpRouteFilter::URLRewrite { hostname, path } => {
+                Ok(routing::HttpFilter::URLRewrite {
+                    hostname: hostname.clone(),
+                    path: path.as_ref().map(|p| match p {
+                        HttpURLRewritePath::ReplaceFullPath { value } => URLRewritePath::ReplaceFullPath(value.clone()),
+                        HttpURLRewritePath::ReplacePrefixMatch { value } => URLRewritePath::ReplacePrefixMatch(value.clone()),
+                    }),
+                })
+            }
+            HttpRouteFilter::RequestMirror { backend_ref } => {
+                let backend = routing::Backend::with_weight(
+                    backend_ref.name.clone(),
+                    backend_ref.port,
+                    backend_ref.weight,
+                )?;
+                Ok(routing::HttpFilter::RequestMirror {
+                    backend_addr: backend.socket_addr,
+                })
             }
         })
         .collect()
@@ -367,7 +388,7 @@ mod tests {
 
         let development = UringRessConfig::generate_development();
         assert!(development.validate().is_ok());
-        assert_eq!(development.http_routes.len(), 6);
+        assert_eq!(development.http_routes.len(), 8);
         assert_eq!(development.tcp_routes.len(), 1);
     }
 
@@ -382,5 +403,121 @@ mod tests {
         let yaml = config.to_yaml_pretty().unwrap();
         let parsed_yaml: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed_yaml.validate().is_ok());
+    }
+
+    #[test]
+    fn test_url_rewrite_json_deserialization() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
+                "worker_threads": 1
+            },
+            "http_routes": [{
+                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
+                    "filters": [{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/v2"}}],
+                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(matches!(
+            config.http_routes[0].rules[0].filters[0],
+            HttpRouteFilter::URLRewrite { ref path, .. } if path.is_some()
+        ));
+    }
+
+    #[test]
+    fn test_url_rewrite_yaml_roundtrip() {
+        let config = UringRessConfig::generate_development();
+        let yaml = config.to_yaml_pretty().unwrap();
+        let parsed: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.validate().is_ok());
+        // The development config includes URLRewrite and RequestMirror routes
+        assert_eq!(parsed.http_routes.len(), 8);
+    }
+
+    #[test]
+    fn test_request_mirror_json_deserialization() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
+                "worker_threads": 1
+            },
+            "http_routes": [{
+                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "filters": [{"type": "RequestMirror", "backend_ref": {"name": "127.0.0.1", "port": 9999}}],
+                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(matches!(
+            config.http_routes[0].rules[0].filters[0],
+            HttpRouteFilter::RequestMirror { .. }
+        ));
+    }
+
+    #[test]
+    fn test_url_rewrite_to_route_table() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
+                "worker_threads": 1
+            },
+            "http_routes": [{
+                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
+                    "filters": [{"type": "URLRewrite", "hostname": "new.example.com"}],
+                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let rule = rt.find_http_route("example.com", "/v1/test", &[]).unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        assert!(matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com"));
+    }
+
+    #[test]
+    fn test_request_mirror_to_route_table() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
+                "worker_threads": 1
+            },
+            "http_routes": [{
+                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "filters": [{"type": "RequestMirror", "backend_ref": {"name": "127.0.0.1", "port": 9999}}],
+                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let rule = rt.find_http_route("example.com", "/", &[]).unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        if let crate::routing::HttpFilter::RequestMirror { backend_addr } = &rule.filters[0] {
+            assert_eq!(backend_addr.port(), 9999);
+        } else {
+            panic!("expected RequestMirror filter");
+        }
     }
 }

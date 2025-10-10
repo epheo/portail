@@ -157,6 +157,29 @@ impl UringRessConfig {
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
                     }],
                 },
+                HttpRouteConfig {
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        filters: vec![HttpRouteFilter::URLRewrite {
+                            hostname: None,
+                            path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                        }],
+                        matches: vec![HttpRouteMatch::path_prefix("/v1")],
+                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                    }],
+                },
+                HttpRouteConfig {
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    hostnames: vec!["localhost".to_string()],
+                    rules: vec![HttpRouteRule {
+                        filters: vec![HttpRouteFilter::RequestMirror {
+                            backend_ref: BackendRef { name: "127.0.0.1".to_string(), port: 9999, weight: 1 },
+                        }],
+                        matches: vec![HttpRouteMatch::path_prefix("/mirrored")],
+                        backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                    }],
+                },
             ],
             tcp_routes: vec![
                 TcpRouteConfig {

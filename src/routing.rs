@@ -207,6 +207,19 @@ pub enum HttpFilter {
         path: Option<String>,
         status_code: u16,
     },
+    URLRewrite {
+        hostname: Option<String>,
+        path: Option<URLRewritePath>,
+    },
+    RequestMirror {
+        backend_addr: std::net::SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum URLRewritePath {
+    ReplaceFullPath(String),
+    ReplacePrefixMatch(String),
 }
 
 #[derive(Debug, Clone)]

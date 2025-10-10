@@ -279,6 +279,43 @@ impl UringRessProcess {
             proxy_addr,
         }
     }
+
+    /// Spawn with filtered routes (hostname, path, backend, filters_json).
+    pub fn spawn_with_filters(
+        routes: &[(&str, &str, SocketAddr, &str)],
+        proxy_port: u16,
+    ) -> Self {
+        let config = build_test_config_with_filters(routes, proxy_port);
+        let config_file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("create temp config");
+        std::fs::write(config_file.path(), config).expect("write temp config");
+
+        let binary = cargo_bin_path();
+        let child = Command::new(&binary)
+            .arg("--config")
+            .arg(config_file.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e));
+
+        let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("UringRess did not start accepting connections within 5s");
+            }
+            if TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Self { child, _config_file: config_file, proxy_addr }
+    }
 }
 
 impl Drop for UringRessProcess {
@@ -493,6 +530,157 @@ fn build_test_config_with_tcp(
         listeners,
         http_routes_section,
         tcp_route_entries.join(", ")
+    )
+}
+
+/// Backend that records the raw request bytes received, for verifying rewrites and header modifications.
+pub struct InspectingBackend {
+    pub addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    received: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl InspectingBackend {
+    pub fn spawn(response_body: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind inspecting backend");
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let body = response_body.to_string();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = thread::spawn(move || {
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let body = body.clone();
+                        let shutdown = shutdown_clone.clone();
+                        let received = received_clone.clone();
+                        thread::spawn(move || {
+                            handle_inspecting_connection(stream, &body, &shutdown, &received);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { addr, shutdown, handle: Some(handle), received }
+    }
+
+    pub fn received_requests(&self) -> Vec<Vec<u8>> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+fn handle_inspecting_connection(
+    mut stream: TcpStream,
+    body: &str,
+    shutdown: &AtomicBool,
+    received: &std::sync::Mutex<Vec<Vec<u8>>>,
+) {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut buf = [0u8; 8192];
+    loop {
+        if shutdown.load(Ordering::Relaxed) { return; }
+
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+
+        let request = &buf[..n];
+        if !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            continue;
+        }
+
+        received.lock().unwrap().push(request.to_vec());
+
+        let keep_alive = request_is_keepalive(request);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
+            body.len(),
+            if keep_alive { "keep-alive" } else { "close" },
+            body
+        );
+
+        if stream.write_all(response.as_bytes()).is_err() { return; }
+        if !keep_alive { return; }
+    }
+}
+
+impl Drop for InspectingBackend {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Build a test config with filters support on HTTP routes.
+pub fn build_test_config_with_filters(
+    routes: &[(&str, &str, SocketAddr, &str)], // (hostname, path, backend, filters_json)
+    proxy_port: u16,
+) -> String {
+    let mut backend_refs = Vec::new();
+    let mut hostnames: Vec<String> = Vec::new();
+
+    for (hostname, path, backend_addr, filters_json) in routes {
+        if !hostnames.contains(&hostname.to_string()) {
+            hostnames.push(hostname.to_string());
+        }
+        let filters_part = if filters_json.is_empty() {
+            String::new()
+        } else {
+            format!(r#""filters": [{}],"#, filters_json)
+        };
+        backend_refs.push(format!(
+            r#"{{
+                "matches": [{{"path": {{"type": "PathPrefix", "value": "{}"}}}}],
+                {}
+                "backend_refs": [{{"name": "{}", "port": {}}}]
+            }}"#,
+            path, filters_part, backend_addr.ip(), backend_addr.port()
+        ));
+    }
+
+    let hostnames_json: Vec<String> = hostnames.iter().map(|h| format!("\"{}\"", h)).collect();
+
+    format!(
+        r#"{{
+  "gateway": {{
+    "name": "test-gateway",
+    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
+    "worker_threads": 1
+  }},
+  "http_routes": [{{
+    "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
+    "hostnames": [{}],
+    "rules": [{}]
+  }}],
+  "observability": {{
+    "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
+  }},
+  "performance": {{
+    "keep_alive_timeout": "5s"
+  }}
+}}"#,
+        proxy_port,
+        hostnames_json.join(", "),
+        backend_refs.join(", ")
     )
 }
 

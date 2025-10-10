@@ -41,9 +41,8 @@ http_routes:
         type: PathPrefix
         value: /
     backend_refs:
-    - name: 127.0.0.1
+    - name: frontend-service
       port: 3001
-
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -55,15 +54,12 @@ http_routes:
         type: PathPrefix
         value: /index.html
     backend_refs:
-    - name: 127.0.0.1
+    - name: frontend-service-1
       port: 3001
-
-    - name: 127.0.0.1
+    - name: frontend-service-2
       port: 3002
-
-    - name: 127.0.0.1
+    - name: frontend-service-3
       port: 3003
-
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -75,9 +71,8 @@ http_routes:
         type: PathPrefix
         value: /api.json
     backend_refs:
-    - name: 127.0.0.1
+    - name: api-service
       port: 3001
-
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -89,9 +84,8 @@ http_routes:
         type: PathPrefix
         value: /users.json
     backend_refs:
-    - name: 127.0.0.1
+    - name: users-service
       port: 3002
-
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -103,9 +97,8 @@ http_routes:
         type: PathPrefix
         value: /dataset.json
     backend_refs:
-    - name: 127.0.0.1
+    - name: dataset-service
       port: 3003
-
 - parent_refs:
   - name: development-gateway
     section_name: http
@@ -117,18 +110,53 @@ http_routes:
         type: PathPrefix
         value: /health
     backend_refs:
-    - name: 127.0.0.1
+    - name: api-service
       port: 3001
-
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    filters:
+    - type: URLRewrite
+      path:
+        type: ReplacePrefixMatch
+        value: /v2
+    backend_refs:
+    - name: api-service
+      port: 3001
+- parent_refs:
+  - name: development-gateway
+    section_name: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /mirrored
+    filters:
+    - type: RequestMirror
+      backend_ref:
+        name: 127.0.0.1
+        port: 9999
+    backend_refs:
+    - name: api-service
+      port: 3001
 tcp_routes:
 - parent_refs:
   - name: development-gateway
     section_name: tcp-ssh
   rules:
   - backend_refs:
-    - name: 127.0.0.1
+    - name: ssh-service
       port: 2242
-
+udp_routes: []
 observability:
   logging:
     level: debug
@@ -136,3 +164,5 @@ observability:
     output: stdout
 performance:
   keep_alive_timeout: 10s
+  backend_timeout: 30s
+  udp_session_timeout: 30s

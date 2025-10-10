@@ -278,6 +278,22 @@ pub enum HttpRouteFilter {
         #[serde(default = "default_redirect_status")]
         status_code: u16,
     },
+    URLRewrite {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<HttpURLRewritePath>,
+    },
+    RequestMirror {
+        backend_ref: BackendRef,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum HttpURLRewritePath {
+    ReplaceFullPath { value: String },
+    ReplacePrefixMatch { value: String },
 }
 
 fn default_redirect_status() -> u16 {

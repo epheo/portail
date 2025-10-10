@@ -20,7 +20,7 @@ use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::logging::{warn, info, debug};
-use crate::request_processor::{self, HeaderModifications, ProcessingDecision};
+use crate::request_processor::{self, HeaderModifications, ProcessingDecision, URLRewrite, RewrittenPath};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -88,10 +88,11 @@ async fn handle_connection(
         ProcessingDecision::TcpForward { backend_addr } => {
             handle_tcp_connection(client, backend_addr, &buf[..n]).await
         }
-        ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods } => {
+        ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods, url_rewrite, mirror_addrs } => {
             handle_http_connection(
                 client, &mut buf, n, backend_addr, keepalive,
                 request_header_mods, response_header_mods,
+                url_rewrite, mirror_addrs,
                 server_port, routes, pool, &mut selector,
             ).await
         }
@@ -119,6 +120,8 @@ async fn handle_http_connection(
     initial_keepalive: bool,
     initial_req_mods: Option<HeaderModifications>,
     initial_resp_mods: Option<HeaderModifications>,
+    initial_url_rewrite: Option<URLRewrite>,
+    initial_mirror_addrs: Vec<SocketAddr>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: Arc<BackendPool>,
@@ -129,15 +132,19 @@ async fn handle_http_connection(
     let mut request_bytes = initial_bytes;
     let mut req_mods = initial_req_mods;
     let mut resp_mods = initial_resp_mods;
+    let mut rewrite = initial_url_rewrite;
+    let mut mirrors = initial_mirror_addrs;
 
     loop {
         let mut backend = pool.acquire(backend_addr).await?;
 
-        // Apply request header modifications if present
-        if let Some(ref mods) = req_mods {
-            let modified = apply_request_header_mods(&buf[..request_bytes], mods);
+        let has_modifications = req_mods.is_some() || rewrite.is_some();
+        if has_modifications {
+            let modified = apply_request_modifications(&buf[..request_bytes], req_mods.as_ref(), rewrite.as_ref());
+            dispatch_mirrors(&mirrors, &modified);
             backend.write_all(&modified).await?;
         } else {
+            dispatch_mirrors(&mirrors, &buf[..request_bytes]);
             backend.write_all(&buf[..request_bytes]).await?;
         }
 
@@ -167,11 +174,14 @@ async fn handle_http_connection(
             ProcessingDecision::HttpForward {
                 backend_addr: addr, keepalive: ka,
                 request_header_mods, response_header_mods,
+                url_rewrite, mirror_addrs,
             } => {
                 backend_addr = addr;
                 keepalive = ka;
                 req_mods = request_header_mods;
                 resp_mods = response_header_mods;
+                rewrite = url_rewrite;
+                mirrors = mirror_addrs;
             }
             ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
                 send_redirect_response(&mut client, status_code, &location).await?;
@@ -215,10 +225,11 @@ async fn handle_keepalive_after_response(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods } => {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods, url_rewrite, mirror_addrs } => {
                 return handle_http_connection(
                     client, buf, n, backend_addr, keepalive,
                     request_header_mods, response_header_mods,
+                    url_rewrite, mirror_addrs,
                     server_port, routes, pool, selector,
                 ).await;
             }
@@ -536,14 +547,39 @@ async fn send_error_response(client: &mut TcpStream, error_code: u16) -> Result<
     Ok(())
 }
 
-// --- Header modification ---
+// --- Request modification ---
 
-/// Apply request header modifications: copies request line, modifies headers, appends body.
-/// Only called when filters are active — the common case remains zero-copy.
-fn apply_request_header_mods(original: &[u8], mods: &HeaderModifications) -> Vec<u8> {
+/// Fire-and-forget mirror dispatch. Response is discarded per Gateway API spec.
+fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
+    for &addr in mirror_addrs {
+        let data = data.to_vec();
+        tokio::spawn(async move {
+            if let Ok(mut conn) = TcpStream::connect(addr).await {
+                let _ = conn.write_all(&data).await;
+            }
+        });
+    }
+}
+
+/// Rewrite the path in an HTTP request line.
+/// "GET /old HTTP/1.1" → "GET /new HTTP/1.1"
+fn rewrite_request_line_path(request_line: &str, new_path: &str) -> String {
+    // Request line format: METHOD SP PATH SP VERSION
+    let mut parts = request_line.splitn(3, ' ');
+    let method = parts.next().unwrap_or("GET");
+    let _old_path = parts.next().unwrap_or("/");
+    let version = parts.next().unwrap_or("HTTP/1.1");
+    format!("{} {} {}", method, new_path, version)
+}
+
+/// Apply request modifications: header mods and/or URL rewrite.
+/// Only called when modifications exist — the common case remains zero-copy.
+fn apply_request_modifications(
+    original: &[u8],
+    header_mods: Option<&HeaderModifications>,
+    url_rewrite: Option<&URLRewrite>,
+) -> Vec<u8> {
     let header_end = find_header_end(original).unwrap_or(original.len());
-
-    // Split into header region and body
     let header_region = &original[..header_end];
     let body = &original[header_end..];
 
@@ -557,13 +593,28 @@ fn apply_request_header_mods(original: &[u8], mods: &HeaderModifications) -> Vec
         return original.to_vec();
     }
 
-    // First line is request line
-    let request_line = lines[0];
+    // Rewrite request line path if needed
+    let request_line = if let Some(rewrite) = url_rewrite {
+        if let Some(ref rewritten) = rewrite.path {
+            let new_path = match rewritten {
+                RewrittenPath::Full(p) => p.as_str(),
+                RewrittenPath::PrefixReplaced(p) => p.as_str(),
+            };
+            rewrite_request_line_path(lines[0], new_path)
+        } else {
+            lines[0].to_string()
+        }
+    } else {
+        lines[0].to_string()
+    };
+
     let header_lines = &lines[1..];
+    let extra_cap = header_mods.map_or(0, |m| m.add.len() + m.set.len());
+    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + extra_cap);
 
-    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + mods.add.len() + mods.set.len());
+    // Rewrite hostname replaces the Host header
+    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
 
-    // Process existing headers: remove or set
     for line in header_lines {
         if line.is_empty() {
             continue;
@@ -574,23 +625,29 @@ fn apply_request_header_mods(original: &[u8], mods: &HeaderModifications) -> Vec
         };
         let name = &line[..colon_pos];
 
-        // Skip removed headers
-        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        // Replace Host header if hostname rewrite is active
+        if rewrite_hostname.is_some() && name.eq_ignore_ascii_case("host") {
+            result_headers.push(format!("Host: {}", rewrite_hostname.unwrap()));
             continue;
         }
 
-        // Replace with set value if matching
-        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
-            result_headers.push(format!("{}: {}", set_header.name, set_header.value));
-            continue;
+        if let Some(mods) = header_mods {
+            if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
+                result_headers.push(format!("{}: {}", set_header.name, set_header.value));
+                continue;
+            }
         }
 
         result_headers.push(line.to_string());
     }
 
-    // Add new headers
-    for h in &mods.add {
-        result_headers.push(format!("{}: {}", h.name, h.value));
+    if let Some(mods) = header_mods {
+        for h in &mods.add {
+            result_headers.push(format!("{}: {}", h.name, h.value));
+        }
     }
 
     let mut out = Vec::with_capacity(original.len() + 256);
@@ -707,4 +764,117 @@ fn is_no_body_status(headers: &[u8]) -> bool {
 
 fn ends_with_chunked_terminator(data: &[u8]) -> bool {
     data.ends_with(b"0\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_processor::{URLRewrite, RewrittenPath, HeaderModifications};
+    use crate::routing::HttpHeader;
+
+    #[test]
+    fn test_rewrite_request_line_path() {
+        let result = rewrite_request_line_path("GET /old HTTP/1.1", "/new");
+        assert_eq!(result, "GET /new HTTP/1.1");
+    }
+
+    #[test]
+    fn test_apply_modifications_path_rewrite() {
+        let request = b"GET /old/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let rewrite = URLRewrite {
+            hostname: None,
+            path: Some(RewrittenPath::Full("/new/path".to_string())),
+        };
+        let result = apply_request_modifications(request, None, Some(&rewrite));
+        let result_str = std::str::from_utf8(&result).unwrap();
+
+        assert!(result_str.starts_with("GET /new/path HTTP/1.1\r\n"));
+        assert!(result_str.contains("Host: example.com"));
+    }
+
+    #[test]
+    fn test_apply_modifications_host_rewrite() {
+        let request = b"GET / HTTP/1.1\r\nHost: original.example.com\r\n\r\n";
+        let rewrite = URLRewrite {
+            hostname: Some("rewritten.example.com".to_string()),
+            path: None,
+        };
+        let result = apply_request_modifications(request, None, Some(&rewrite));
+        let result_str = std::str::from_utf8(&result).unwrap();
+
+        assert!(result_str.contains("Host: rewritten.example.com"));
+        assert!(!result_str.contains("original.example.com"));
+    }
+
+    #[test]
+    fn test_apply_modifications_combined() {
+        let request = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
+        let rewrite = URLRewrite {
+            hostname: Some("new.com".to_string()),
+            path: Some(RewrittenPath::Full("/new".to_string())),
+        };
+        let mods = HeaderModifications {
+            add: vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }],
+            set: vec![],
+            remove: vec!["User-Agent".to_string()],
+        };
+        let result = apply_request_modifications(request, Some(&mods), Some(&rewrite));
+        let result_str = std::str::from_utf8(&result).unwrap();
+
+        assert!(result_str.starts_with("GET /new HTTP/1.1\r\n"));
+        assert!(result_str.contains("Host: new.com"));
+        assert!(result_str.contains("X-Added: yes"));
+        assert!(!result_str.contains("User-Agent"));
+    }
+
+    #[test]
+    fn test_apply_modifications_no_mods_passthrough() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = apply_request_modifications(request, None, None);
+        // Should produce equivalent output (headers may be reformatted but content same)
+        let result_str = std::str::from_utf8(&result).unwrap();
+        assert!(result_str.starts_with("GET / HTTP/1.1\r\n"));
+        assert!(result_str.contains("Host: example.com"));
+    }
+
+    #[test]
+    fn test_apply_response_header_mods_add() {
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let mods = HeaderModifications {
+            add: vec![HttpHeader { name: "X-Custom".to_string(), value: "added".to_string() }],
+            set: vec![],
+            remove: vec![],
+        };
+        let result = apply_response_header_mods(headers, &mods);
+        let result_str = std::str::from_utf8(&result).unwrap();
+        assert!(result_str.contains("X-Custom: added"));
+    }
+
+    #[test]
+    fn test_apply_response_header_mods_remove() {
+        let headers = b"HTTP/1.1 200 OK\r\nX-Internal: secret\r\nContent-Length: 5\r\n\r\n";
+        let mods = HeaderModifications {
+            add: vec![],
+            set: vec![],
+            remove: vec!["X-Internal".to_string()],
+        };
+        let result = apply_response_header_mods(headers, &mods);
+        let result_str = std::str::from_utf8(&result).unwrap();
+        assert!(!result_str.contains("X-Internal"));
+        assert!(result_str.contains("Content-Length: 5"));
+    }
+
+    #[test]
+    fn test_apply_response_header_mods_set() {
+        let headers = b"HTTP/1.1 200 OK\r\nServer: old-server\r\n\r\n";
+        let mods = HeaderModifications {
+            add: vec![],
+            set: vec![HttpHeader { name: "Server".to_string(), value: "uringress".to_string() }],
+            remove: vec![],
+        };
+        let result = apply_response_header_mods(headers, &mods);
+        let result_str = std::str::from_utf8(&result).unwrap();
+        assert!(result_str.contains("Server: uringress"));
+        assert!(!result_str.contains("old-server"));
+    }
 }

@@ -12,13 +12,14 @@
 
 mod helpers;
 
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 
 use helpers::{
     extract_body, extract_status, http_request, http_request_keepalive, http_request_timeout,
-    tcp_roundtrip, TcpEchoBackend, TestBackend, UringRessProcess,
+    tcp_roundtrip, TcpEchoBackend, TestBackend, InspectingBackend, UringRessProcess,
 };
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
@@ -433,4 +434,323 @@ fn test_tcp_proxy_eof_propagation() {
     let response2 = tcp_roundtrip(tcp_addr, b"after-eof", Duration::from_secs(5))
         .expect("new connection after EOF should work");
     assert_eq!(response2, b"after-eof");
+}
+
+// === Filter Integration Tests ===
+
+fn extract_header_value<'a>(response: &'a [u8], name: &str) -> Option<&'a str> {
+    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let headers_str = std::str::from_utf8(&response[..header_end]).ok()?;
+    for line in headers_str.lines().skip(1) {
+        if let Some(colon) = line.find(':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                return Some(line[colon + 1..].trim());
+            }
+        }
+    }
+    None
+}
+
+fn extract_request_path(raw_request: &[u8]) -> Option<String> {
+    let first_line_end = raw_request.iter().position(|&b| b == b'\r')?;
+    let first_line = std::str::from_utf8(&raw_request[..first_line_end]).ok()?;
+    let path = first_line.split_whitespace().nth(1)?;
+    Some(path.to_string())
+}
+
+fn extract_request_header_value(raw_request: &[u8], name: &str) -> Option<String> {
+    let req_str = std::str::from_utf8(raw_request).ok()?;
+    for line in req_str.lines().skip(1) {
+        if let Some(colon) = line.find(':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                return Some(line[colon + 1..].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore]
+fn test_url_rewrite_full_path_e2e() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(20);
+    let filter = r#"{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/new"}}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", backend.addr, filter)],
+        port,
+    );
+
+    let request = b"GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    thread::sleep(Duration::from_millis(100));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty(), "backend should have received a request");
+    let path = extract_request_path(&requests[0]).unwrap();
+    assert_eq!(path, "/new", "backend should receive rewritten path");
+}
+
+#[test]
+#[ignore]
+fn test_url_rewrite_prefix_replace_e2e() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(21);
+    let filter = r#"{"type": "URLRewrite", "path": {"type": "ReplacePrefixMatch", "value": "/v2"}}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/v1", backend.addr, filter)],
+        port,
+    );
+
+    let request = b"GET /v1/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    thread::sleep(Duration::from_millis(100));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty());
+    let path = extract_request_path(&requests[0]).unwrap();
+    assert_eq!(path, "/v2/users", "prefix /v1 should be replaced with /v2");
+}
+
+#[test]
+#[ignore]
+fn test_url_rewrite_hostname_e2e() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(22);
+    let filter = r#"{"type": "URLRewrite", "hostname": "rewritten.example.com"}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", backend.addr, filter)],
+        port,
+    );
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    thread::sleep(Duration::from_millis(100));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty());
+    let host = extract_request_header_value(&requests[0], "Host").unwrap();
+    assert_eq!(host, "rewritten.example.com");
+}
+
+#[test]
+#[ignore]
+fn test_request_header_modifier_e2e() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(23);
+    let filter = r#"{"type": "RequestHeaderModifier", "add": [{"name": "X-Added", "value": "yes"}], "remove": ["User-Agent"]}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", backend.addr, filter)],
+        port,
+    );
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: test\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    thread::sleep(Duration::from_millis(100));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty());
+    let req_str = String::from_utf8_lossy(&requests[0]);
+    assert!(req_str.contains("X-Added: yes"), "X-Added header should be present");
+    assert!(!req_str.to_lowercase().contains("user-agent"), "User-Agent should be removed");
+}
+
+#[test]
+#[ignore]
+fn test_response_header_modifier_e2e() {
+    // Use a TestBackend that adds X-Internal header in its response
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let backend_addr = listener.local_addr().unwrap();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    listener.set_nonblocking(true).unwrap();
+    let _handle = thread::spawn(move || {
+        while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let resp = "HTTP/1.1 200 OK\r\nX-Internal: secret\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let port = proxy_port(24);
+    let filter = r#"{"type": "ResponseHeaderModifier", "remove": ["X-Internal"]}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", backend_addr, filter)],
+        port,
+    );
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    let resp_str = String::from_utf8_lossy(&response);
+    assert!(!resp_str.contains("X-Internal"), "X-Internal should be removed from response");
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+#[ignore]
+fn test_request_redirect_e2e() {
+    let port = proxy_port(25);
+    let filter = r#"{"type": "RequestRedirect", "hostname": "other.com", "status_code": 301}"#;
+    // Redirect rules don't need backend_refs, but our helper always adds one.
+    // The proxy should return redirect before contacting any backend.
+    let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", dead_addr, filter)],
+        port,
+    );
+
+    let request = b"GET /page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get redirect");
+    assert_eq!(extract_status(&response), Some(301));
+
+    let location = extract_header_value(&response, "Location");
+    assert!(location.is_some(), "redirect should have Location header");
+    assert!(location.unwrap().contains("other.com"), "Location should contain new hostname");
+}
+
+#[test]
+#[ignore]
+fn test_request_mirror_e2e() {
+    let primary = InspectingBackend::spawn("primary-ok");
+    let mirror = InspectingBackend::spawn("mirror-ok");
+    let port = proxy_port(26);
+
+    let filter = format!(
+        r#"{{"type": "RequestMirror", "backend_ref": {{"name": "{}", "port": {}}}}}"#,
+        mirror.addr.ip(), mirror.addr.port()
+    );
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", primary.addr, &filter)],
+        port,
+    );
+
+    let request = b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+    assert_eq!(std::str::from_utf8(extract_body(&response)).unwrap().trim(), "primary-ok");
+
+    // Give mirror time to receive the fire-and-forget request
+    thread::sleep(Duration::from_millis(500));
+    let mirror_requests = mirror.received_requests();
+    assert!(!mirror_requests.is_empty(), "mirror backend should have received the request");
+}
+
+#[test]
+#[ignore]
+fn test_filter_combination_rewrite_plus_header_mod() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(27);
+    let filters = r#"{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/new"}}, {"type": "RequestHeaderModifier", "add": [{"name": "X-Rewritten", "value": "true"}]}"#;
+    let proxy = UringRessProcess::spawn_with_filters(
+        &[("localhost", "/", backend.addr, filters)],
+        port,
+    );
+
+    let request = b"GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request).expect("should get response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    thread::sleep(Duration::from_millis(100));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty());
+    let path = extract_request_path(&requests[0]).unwrap();
+    assert_eq!(path, "/new");
+    let req_str = String::from_utf8_lossy(&requests[0]);
+    assert!(req_str.contains("X-Rewritten: true"));
+}
+
+#[test]
+#[ignore]
+fn test_exact_vs_prefix_path_e2e() {
+    let backend_exact = InspectingBackend::spawn("exact");
+    let backend_prefix = InspectingBackend::spawn("prefix");
+    let port = proxy_port(28);
+
+    // Use two separate routes: exact /foo and prefix /foo
+    // We need a custom config for this since both go to different backends
+    let config = format!(
+        r#"{{
+  "gateway": {{
+    "name": "test-gateway",
+    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
+    "worker_threads": 1
+  }},
+  "http_routes": [{{
+    "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
+    "hostnames": ["localhost"],
+    "rules": [
+      {{
+        "matches": [{{"path": {{"type": "Exact", "value": "/foo"}}}}],
+        "backend_refs": [{{"name": "{}", "port": {}}}]
+      }},
+      {{
+        "matches": [{{"path": {{"type": "PathPrefix", "value": "/foo"}}}}],
+        "backend_refs": [{{"name": "{}", "port": {}}}]
+      }}
+    ]
+  }}],
+  "observability": {{"logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}}},
+  "performance": {{"keep_alive_timeout": "5s"}}
+}}"#,
+        port,
+        backend_exact.addr.ip(), backend_exact.addr.port(),
+        backend_prefix.addr.ip(), backend_prefix.addr.port()
+    );
+
+    let config_file = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .expect("create temp config");
+    std::fs::write(config_file.path(), config).expect("write temp config");
+
+    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/uringress");
+    let debug_binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/uringress");
+    let bin = if binary.exists() { binary } else { debug_binary };
+
+    let mut child = std::process::Command::new(&bin)
+        .arg("--config")
+        .arg(config_file.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", bin, e));
+
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline { panic!("timeout waiting for proxy"); }
+        if std::net::TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // GET /foo → exact match → backend_exact
+    let req = b"GET /foo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let resp = http_request(proxy_addr, req).expect("exact request");
+    assert_eq!(std::str::from_utf8(extract_body(&resp)).unwrap().trim(), "exact");
+
+    // GET /foo/bar → prefix match → backend_prefix
+    let req = b"GET /foo/bar HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let resp = http_request(proxy_addr, req).expect("prefix request");
+    assert_eq!(std::str::from_utf8(extract_body(&resp)).unwrap().trim(), "prefix");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
