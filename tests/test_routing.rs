@@ -1,22 +1,7 @@
 use uringress::routing::{
     RouteTable, Backend, HttpRouteRule, HttpFilter, HttpHeader, URLRewritePath,
-    PathMatchType, HeaderMatch, BackendSelector, FnvRouterHasher,
+    PathMatchType, HeaderMatch, BackendSelector,
 };
-
-#[test]
-fn test_fnv_hash_consistency() {
-    let host = "example.com";
-    let hash1 = FnvRouterHasher::hash(host);
-    let hash2 = FnvRouterHasher::hash(host);
-    assert_eq!(hash1, hash2);
-}
-
-#[test]
-fn test_fnv_hash_different_values() {
-    let hash1 = FnvRouterHasher::hash("example.com");
-    let hash2 = FnvRouterHasher::hash("different.com");
-    assert_ne!(hash1, hash2);
-}
 
 #[test]
 fn test_route_table_creation() {
@@ -30,13 +15,10 @@ fn test_route_table_http_routing() {
     let mut table = RouteTable::new();
 
     let backend = Backend::new("192.168.1.100".to_string(), 8080).unwrap();
-    table.add_http_route("api.example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/v1/users".to_string(),
-        header_matches: vec![],
-        filters: vec![],
-        backends: vec![backend],
-    });
+    table.add_http_route("api.example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/v1/users".to_string(), vec![], vec![],
+        vec![backend],
+    ));
 
     let result = table.find_http_route("api.example.com", "/v1/users/123", &[]);
     assert!(result.is_ok());
@@ -93,24 +75,17 @@ fn test_backend_creation() {
 fn test_path_matching_longest_prefix_first() {
     let mut table = RouteTable::new();
 
-    // Add routes in reverse order to test sorting
     let backend1 = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
     let backend2 = Backend::new("127.0.0.2".to_string(), 8080).unwrap();
 
-    table.add_http_route("api.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/api".to_string(),
-        header_matches: vec![],
-        filters: vec![],
-        backends: vec![backend1],
-    });
-    table.add_http_route("api.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/api/v1".to_string(),
-        header_matches: vec![],
-        filters: vec![],
-        backends: vec![backend2],
-    });
+    table.add_http_route("api.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/api".to_string(), vec![], vec![],
+        vec![backend1],
+    ));
+    table.add_http_route("api.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/api/v1".to_string(), vec![], vec![],
+        vec![backend2],
+    ));
 
     // Should match longer prefix first
     let result = table.find_http_route("api.com", "/api/v1/users", &[]);
@@ -134,13 +109,7 @@ fn backend(port: u16) -> Backend {
 }
 
 fn rule(path_type: PathMatchType, path: &str, port: u16) -> HttpRouteRule {
-    HttpRouteRule {
-        path_match_type: path_type,
-        path: path.to_string(),
-        header_matches: vec![],
-        filters: vec![],
-        backends: vec![backend(port)],
-    }
+    HttpRouteRule::new(path_type, path.to_string(), vec![], vec![], vec![backend(port)])
 }
 
 // Path matching
@@ -239,8 +208,6 @@ fn test_case_insensitive_host() {
 
 #[test]
 fn test_host_with_port_stripped() {
-    // The http_parser strips port from Host header before routing,
-    // so we test that the route table matches without port
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8001));
 
@@ -253,13 +220,12 @@ fn test_host_with_port_stripped() {
 #[test]
 fn test_single_header_match() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
-        filters: vec![],
-        backends: vec![backend(8001)],
-    });
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(),
+        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![],
+        vec![backend(8001)],
+    ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"X-Env: canary\r\n";
@@ -270,24 +236,23 @@ fn test_single_header_match() {
 #[test]
 fn test_multiple_headers_and_logic() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(),
+        vec![
             HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() },
             HeaderMatch { name: "x-region".to_string(), value: "us-east".to_string() },
         ],
-        filters: vec![],
-        backends: vec![backend(8001)],
-    });
+        vec![],
+        vec![backend(8001)],
+    ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
-    // Both headers present → match
+    // Both headers present -> match
     let headers = b"X-Env: canary\r\nX-Region: us-east\r\n";
     let r = rt.find_http_route("example.com", "/", headers).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
-    // Only one header → fallback
+    // Only one header -> fallback
     let headers = b"X-Env: canary\r\n";
     let r = rt.find_http_route("example.com", "/", headers).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
@@ -296,16 +261,14 @@ fn test_multiple_headers_and_logic() {
 #[test]
 fn test_header_match_case_insensitive() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
-        filters: vec![],
-        backends: vec![backend(8001)],
-    });
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(),
+        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![],
+        vec![backend(8001)],
+    ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
-    // Header name case doesn't matter
     let headers = b"x-env: canary\r\n";
     let r = rt.find_http_route("example.com", "/", headers).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
@@ -314,16 +277,14 @@ fn test_header_match_case_insensitive() {
 #[test]
 fn test_header_match_fallback_to_no_header_rule() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
-        filters: vec![],
-        backends: vec![backend(8001)],
-    });
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(),
+        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![],
+        vec![backend(8001)],
+    ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
-    // No matching headers → falls through to default rule
     let headers = b"X-Env: production\r\n";
     let r = rt.find_http_route("example.com", "/", headers).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
@@ -333,15 +294,20 @@ fn test_header_match_fallback_to_no_header_rule() {
 
 #[test]
 fn test_weighted_round_robin_distribution() {
-    let backends = vec![
-        Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
-        Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
-    ];
+    let mut rt = RouteTable::new();
+    rt.add_http_route("test.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+        vec![
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+        ],
+    ));
+    let rule = rt.find_http_route("test.com", "/", &[]).unwrap();
 
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..400 {
-        let idx = selector.select_weighted_backend(42, &backends);
+        let idx = selector.select_weighted_backend(42, rule);
         counts[idx] += 1;
     }
     assert_eq!(counts[0], 300);
@@ -350,15 +316,20 @@ fn test_weighted_round_robin_distribution() {
 
 #[test]
 fn test_equal_weights() {
-    let backends = vec![
-        Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
-        Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
-    ];
+    let mut rt = RouteTable::new();
+    rt.add_http_route("test.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+        vec![
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+        ],
+    ));
+    let rule = rt.find_http_route("test.com", "/", &[]).unwrap();
 
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..100 {
-        let idx = selector.select_weighted_backend(42, &backends);
+        let idx = selector.select_weighted_backend(42, rule);
         counts[idx] += 1;
     }
     assert_eq!(counts[0], 50);
@@ -367,14 +338,19 @@ fn test_equal_weights() {
 
 #[test]
 fn test_zero_weight_backend_never_selected() {
-    let backends = vec![
-        Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
-        Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0 },
-    ];
+    let mut rt = RouteTable::new();
+    rt.add_http_route("test.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+        vec![
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0 },
+        ],
+    ));
+    let rule = rt.find_http_route("test.com", "/", &[]).unwrap();
 
     let mut selector = BackendSelector::new();
     for _ in 0..100 {
-        let idx = selector.select_weighted_backend(42, &backends);
+        let idx = selector.select_weighted_backend(42, rule);
         assert_eq!(idx, 0, "zero-weight backend should never be selected");
     }
 }
@@ -384,36 +360,33 @@ fn test_zero_weight_backend_never_selected() {
 #[test]
 fn test_route_carries_filters() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![],
-        filters: vec![HttpFilter::RequestHeaderModifier {
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![],
+        vec![HttpFilter::RequestHeaderModifier {
             add: vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }],
             set: vec![],
             remove: vec![],
         }],
-        backends: vec![backend(8001)],
-    });
+        vec![backend(8001)],
+    ));
 
     let r = rt.find_http_route("example.com", "/", &[]).unwrap();
     assert_eq!(r.filters.len(), 1);
+    assert!(r.has_filters);
     assert!(matches!(&r.filters[0], HttpFilter::RequestHeaderModifier { .. }));
 }
 
 #[test]
 fn test_url_rewrite_on_route_rule() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/v1".to_string(),
-        header_matches: vec![],
-        filters: vec![HttpFilter::URLRewrite {
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/v1".to_string(), vec![],
+        vec![HttpFilter::URLRewrite {
             hostname: None,
             path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
         }],
-        backends: vec![backend(8001)],
-    });
+        vec![backend(8001)],
+    ));
 
     let r = rt.find_http_route("example.com", "/v1/users", &[]).unwrap();
     assert_eq!(r.filters.len(), 1);
@@ -423,17 +396,41 @@ fn test_url_rewrite_on_route_rule() {
 #[test]
 fn test_request_mirror_on_route_rule() {
     let mut rt = RouteTable::new();
-    rt.add_http_route("example.com", HttpRouteRule {
-        path_match_type: PathMatchType::Prefix,
-        path: "/".to_string(),
-        header_matches: vec![],
-        filters: vec![HttpFilter::RequestMirror {
+    rt.add_http_route("example.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![],
+        vec![HttpFilter::RequestMirror {
             backend_addr: "127.0.0.1:9999".parse().unwrap(),
         }],
-        backends: vec![backend(8001)],
-    });
+        vec![backend(8001)],
+    ));
 
     let r = rt.find_http_route("example.com", "/", &[]).unwrap();
     assert_eq!(r.filters.len(), 1);
     assert!(matches!(&r.filters[0], HttpFilter::RequestMirror { .. }));
+}
+
+// Pre-computed fields
+
+#[test]
+fn test_has_filters_precomputed() {
+    let mut rt = RouteTable::new();
+    rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8001));
+
+    let r = rt.find_http_route("example.com", "/", &[]).unwrap();
+    assert!(!r.has_filters);
+}
+
+#[test]
+fn test_cumulative_weights_precomputed() {
+    let mut rt = RouteTable::new();
+    rt.add_http_route("test.com", HttpRouteRule::new(
+        PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+        vec![
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+        ],
+    ));
+    let r = rt.find_http_route("test.com", "/", &[]).unwrap();
+    assert_eq!(r.total_weight, 4);
+    assert_eq!(r.cumulative_weights, vec![3, 4]);
 }

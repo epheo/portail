@@ -7,12 +7,12 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use crate::logging::{debug, error};
 use crate::http_parser::{ConnectionType, extract_routing_info};
-use crate::routing::{self, RouteTable, HttpFilter, URLRewritePath, BackendSelector};
+use crate::routing::{RouteTable, HttpFilter, URLRewritePath, BackendSelector, HttpHeader};
 
 #[derive(Debug, Clone)]
 pub struct HeaderModifications {
-    pub add: Vec<routing::HttpHeader>,
-    pub set: Vec<routing::HttpHeader>,
+    pub add: Vec<HttpHeader>,
+    pub set: Vec<HttpHeader>,
     pub remove: Vec<String>,
 }
 
@@ -28,15 +28,23 @@ pub enum RewrittenPath {
     PrefixReplaced(String),
 }
 
+/// Filter data only allocated when a route actually has filters.
+#[derive(Debug, Clone)]
+pub struct HttpFilterData {
+    pub request_header_mods: Option<HeaderModifications>,
+    pub response_header_mods: Option<HeaderModifications>,
+    pub url_rewrite: Option<URLRewrite>,
+    pub mirror_addrs: Vec<SocketAddr>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProcessingDecision {
+    /// Boxed filter data keeps the enum small (~40 bytes vs ~256).
+    /// None on the fast path (no filters) avoids the heap allocation entirely.
     HttpForward {
         backend_addr: SocketAddr,
         keepalive: bool,
-        request_header_mods: Option<HeaderModifications>,
-        response_header_mods: Option<HeaderModifications>,
-        url_rewrite: Option<URLRewrite>,
-        mirror_addrs: Vec<SocketAddr>,
+        filters: Option<Box<HttpFilterData>>,
     },
     HttpRedirect {
         status_code: u16,
@@ -87,9 +95,10 @@ fn is_http_request(data: &[u8]) -> bool {
 }
 
 #[inline(always)]
-fn compute_route_hash(host_hash: u64, path: &str) -> u64 {
+fn compute_route_hash(path: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = host_hash;
+    let mut hash = FNV_OFFSET_BASIS;
     for &byte in path.as_bytes() {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -115,24 +124,6 @@ fn analyze_http_request(
         }
     };
 
-    // Check for redirect filter first
-    for filter in &rule.filters {
-        if let HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } = filter {
-            let location = build_redirect_location(
-                scheme.as_deref(),
-                hostname.as_deref().unwrap_or(request_info.host),
-                *port,
-                path.as_deref().unwrap_or(request_info.path),
-                request_info.host,
-            );
-            return Ok(ProcessingDecision::HttpRedirect {
-                status_code: *status_code,
-                location,
-                keepalive,
-            });
-        }
-    }
-
     if rule.backends.is_empty() {
         return Ok(ProcessingDecision::SendHttpError {
             error_code: 503,
@@ -140,11 +131,20 @@ fn analyze_http_request(
         });
     }
 
-    let host_hash = RouteTable::hash_host(request_info.host);
-    let route_hash = compute_route_hash(host_hash, request_info.path);
-    let backend_index = backend_selector.select_weighted_backend(route_hash, &rule.backends);
+    let route_hash = compute_route_hash(request_info.path);
+    let backend_index = backend_selector.select_weighted_backend(route_hash, rule);
     let selected_backend = &rule.backends[backend_index];
 
+    // Fast path: no filters — no Box allocation, enum stays 40 bytes
+    if !rule.has_filters {
+        return Ok(ProcessingDecision::HttpForward {
+            backend_addr: selected_backend.socket_addr,
+            keepalive,
+            filters: None,
+        });
+    }
+
+    // Slow path: process filters, box the result
     let mut request_header_mods: Option<HeaderModifications> = None;
     let mut response_header_mods: Option<HeaderModifications> = None;
     let mut url_rewrite: Option<URLRewrite> = None;
@@ -152,6 +152,20 @@ fn analyze_http_request(
 
     for filter in &rule.filters {
         match filter {
+            HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
+                let location = build_redirect_location(
+                    scheme.as_deref(),
+                    hostname.as_deref().unwrap_or(request_info.host),
+                    *port,
+                    path.as_deref().unwrap_or(request_info.path),
+                    request_info.host,
+                );
+                return Ok(ProcessingDecision::HttpRedirect {
+                    status_code: *status_code,
+                    location,
+                    keepalive,
+                });
+            }
             HttpFilter::RequestHeaderModifier { add, set, remove } => {
                 request_header_mods = Some(HeaderModifications {
                     add: add.clone(),
@@ -188,17 +202,18 @@ fn analyze_http_request(
             HttpFilter::RequestMirror { backend_addr } => {
                 mirror_addrs.push(*backend_addr);
             }
-            HttpFilter::RequestRedirect { .. } => {}
         }
     }
 
     Ok(ProcessingDecision::HttpForward {
         backend_addr: selected_backend.socket_addr,
         keepalive,
-        request_header_mods,
-        response_header_mods,
-        url_rewrite,
-        mirror_addrs,
+        filters: Some(Box::new(HttpFilterData {
+            request_header_mods,
+            response_header_mods,
+            url_rewrite,
+            mirror_addrs,
+        })),
     })
 }
 
@@ -290,13 +305,13 @@ mod tests {
         filters: Vec<HttpFilter>,
     ) -> RouteTable {
         let mut rt = RouteTable::new();
-        rt.add_http_route(host, HttpRouteRule {
-            path_match_type: path_type,
-            path: path.to_string(),
-            header_matches: vec![],
+        rt.add_http_route(host, HttpRouteRule::new(
+            path_type,
+            path.to_string(),
+            vec![],
             filters,
-            backends: vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1 }],
-        });
+            vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1 }],
+        ));
         rt
     }
 
@@ -317,8 +332,9 @@ mod tests {
         let req = make_request("GET", "/old", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, .. } = decision {
-            let rewrite = url_rewrite.unwrap();
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            let rewrite = fd.url_rewrite.unwrap();
             assert!(matches!(rewrite.path, Some(RewrittenPath::Full(ref p)) if p == "/new"));
         } else {
             panic!("expected HttpForward");
@@ -338,8 +354,9 @@ mod tests {
         let req = make_request("GET", "/v1/users", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, .. } = decision {
-            let rewrite = url_rewrite.unwrap();
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            let rewrite = fd.url_rewrite.unwrap();
             assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2/users"));
         } else {
             panic!("expected HttpForward");
@@ -359,8 +376,9 @@ mod tests {
         let req = make_request("GET", "/v1", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, .. } = decision {
-            let rewrite = url_rewrite.unwrap();
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            let rewrite = fd.url_rewrite.unwrap();
             assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2"));
         } else {
             panic!("expected HttpForward");
@@ -380,8 +398,9 @@ mod tests {
         let req = make_request("GET", "/users", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, .. } = decision {
-            let rewrite = url_rewrite.unwrap();
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            let rewrite = fd.url_rewrite.unwrap();
             assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/api/users"),
                 "expected /api/users, got {:?}", rewrite.path);
         } else {
@@ -402,8 +421,9 @@ mod tests {
         let req = make_request("GET", "/", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, .. } = decision {
-            let rewrite = url_rewrite.unwrap();
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            let rewrite = fd.url_rewrite.unwrap();
             assert_eq!(rewrite.hostname.as_deref(), Some("new.example.com"));
             assert!(rewrite.path.is_none());
         } else {
@@ -431,9 +451,10 @@ mod tests {
         let req = make_request("GET", "/v1/test", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, request_header_mods, .. } = decision {
-            assert!(url_rewrite.is_some());
-            assert!(request_header_mods.is_some());
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            assert!(fd.url_rewrite.is_some());
+            assert!(fd.request_header_mods.is_some());
         } else {
             panic!("expected HttpForward");
         }
@@ -451,9 +472,10 @@ mod tests {
         let req = make_request("GET", "/", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { mirror_addrs, .. } = decision {
-            assert_eq!(mirror_addrs.len(), 1);
-            assert_eq!(mirror_addrs[0], "127.0.0.1:9999".parse().unwrap());
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            assert_eq!(fd.mirror_addrs.len(), 1);
+            assert_eq!(fd.mirror_addrs[0], "127.0.0.1:9999".parse().unwrap());
         } else {
             panic!("expected HttpForward");
         }
@@ -472,8 +494,9 @@ mod tests {
         let req = make_request("GET", "/", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { mirror_addrs, .. } = decision {
-            assert_eq!(mirror_addrs.len(), 2);
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            let fd = filters.unwrap();
+            assert_eq!(fd.mirror_addrs.len(), 2);
         } else {
             panic!("expected HttpForward");
         }
@@ -482,19 +505,17 @@ mod tests {
     #[test]
     fn test_redirect_takes_priority_over_backends() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/".to_string(),
-            header_matches: vec![],
-            filters: vec![HttpFilter::RequestRedirect {
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![],
+            vec![HttpFilter::RequestRedirect {
                 scheme: Some("https".to_string()),
                 hostname: None,
                 port: None,
                 path: None,
                 status_code: 301,
             }],
-            backends: vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
-        });
+            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
+        ));
         let mut sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
@@ -509,11 +530,8 @@ mod tests {
         let req = make_request("GET", "/", "example.com");
         let decision = analyze_request(&rt, &mut sel, &req, 8080).unwrap();
 
-        if let ProcessingDecision::HttpForward { url_rewrite, mirror_addrs, request_header_mods, response_header_mods, .. } = decision {
-            assert!(url_rewrite.is_none());
-            assert!(mirror_addrs.is_empty());
-            assert!(request_header_mods.is_none());
-            assert!(response_header_mods.is_none());
+        if let ProcessingDecision::HttpForward { filters, .. } = decision {
+            assert!(filters.is_none());
         } else {
             panic!("expected HttpForward");
         }

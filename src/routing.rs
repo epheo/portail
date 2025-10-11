@@ -19,11 +19,6 @@ impl RouteTable {
         }
     }
 
-    #[inline(always)]
-    pub fn hash_host(host: &str) -> u64 {
-        FnvRouterHasher::hash(host)
-    }
-
     /// Find an HTTP route rule for host, path, and headers.
     /// Tries exact host first, then wildcard. Within a host entry, exact path
     /// beats prefix, then longest prefix wins. Header matches are AND-combined.
@@ -112,7 +107,16 @@ impl RouteTable {
         None
     }
 
-    pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
+    pub fn add_http_route(&mut self, host: &str, mut rule: HttpRouteRule) {
+        // Pre-compute metadata to avoid per-request work
+        rule.has_filters = !rule.filters.is_empty();
+        let mut cumulative = 0u64;
+        rule.cumulative_weights = rule.backends.iter().map(|b| {
+            cumulative += b.weight as u64;
+            cumulative
+        }).collect();
+        rule.total_weight = cumulative;
+
         let host_lower = host.to_ascii_lowercase();
 
         // Wildcard hosts (*.example.com) are stored by their parent domain
@@ -179,6 +183,34 @@ pub struct HttpRouteRule {
     pub header_matches: Vec<HeaderMatch>,
     pub filters: Vec<HttpFilter>,
     pub backends: Vec<Backend>,
+    /// Pre-computed at add_http_route time to skip filter iteration on hot path
+    pub has_filters: bool,
+    /// Pre-computed sum of backend weights for O(1) access
+    pub total_weight: u64,
+    /// Pre-computed prefix sums for O(log n) binary search in select_weighted_backend
+    pub cumulative_weights: Vec<u64>,
+}
+
+impl HttpRouteRule {
+    pub fn new(
+        path_match_type: PathMatchType,
+        path: String,
+        header_matches: Vec<HeaderMatch>,
+        filters: Vec<HttpFilter>,
+        backends: Vec<Backend>,
+    ) -> Self {
+        Self {
+            path_match_type,
+            path,
+            header_matches,
+            filters,
+            backends,
+            // Populated by add_http_route
+            has_filters: false,
+            total_weight: 0,
+            cumulative_weights: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -304,33 +336,6 @@ pub fn find_header_value<'a>(header_data: &'a [u8], name: &str) -> Option<&'a st
     None
 }
 
-/// FNV hash for host-based routing lookups.
-/// eBPF also uses FNV for worker selection — both are needed:
-/// - eBPF FNV: Address + protocol -> worker selection (kernel space)
-/// - Rust FNV: Host header -> route table lookup (user space)
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FnvRouterHasher;
-
-impl FnvRouterHasher {
-    /// Case-insensitive FNV hash — folds ASCII uppercase to lowercase per RFC 7230 §2.7.3
-    #[inline(always)]
-    pub fn hash(data: &str) -> u64 {
-        const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-        const FNV_PRIME: u64 = 1099511628211;
-
-        let bytes = data.as_bytes();
-        let mut hash = FNV_OFFSET_BASIS;
-
-        for &byte in bytes {
-            let normalized = byte.to_ascii_lowercase();
-            hash ^= normalized as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-
-        hash
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,20 +343,14 @@ mod tests {
     #[test]
     fn test_exact_path_matching() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Exact,
-            path: "/foo".to_string(),
-            header_matches: vec![],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
-        });
-        rt.add_http_route("example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/foo".to_string(),
-            header_matches: vec![],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 }],
-        });
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Exact, "/foo".to_string(), vec![], vec![],
+            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
+        ));
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/foo".to_string(), vec![], vec![],
+            vec![Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 }],
+        ));
 
         // Exact match wins
         let rule = rt.find_http_route("example.com", "/foo", &[]).unwrap();
@@ -365,20 +364,14 @@ mod tests {
     #[test]
     fn test_wildcard_host_matching() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("*.example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/".to_string(),
-            header_matches: vec![],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:9001".parse().unwrap(), weight: 1 }],
-        });
-        rt.add_http_route("specific.example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/".to_string(),
-            header_matches: vec![],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:9002".parse().unwrap(), weight: 1 }],
-        });
+        rt.add_http_route("*.example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+            vec![Backend { socket_addr: "127.0.0.1:9001".parse().unwrap(), weight: 1 }],
+        ));
+        rt.add_http_route("specific.example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+            vec![Backend { socket_addr: "127.0.0.1:9002".parse().unwrap(), weight: 1 }],
+        ));
 
         // Exact host takes priority
         let rule = rt.find_http_route("specific.example.com", "/", &[]).unwrap();
@@ -395,23 +388,16 @@ mod tests {
     #[test]
     fn test_header_matching() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/".to_string(),
-            header_matches: vec![HeaderMatch {
-                name: "x-env".to_string(),
-                value: "canary".to_string(),
-            }],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:7001".parse().unwrap(), weight: 1 }],
-        });
-        rt.add_http_route("example.com", HttpRouteRule {
-            path_match_type: PathMatchType::Prefix,
-            path: "/".to_string(),
-            header_matches: vec![],
-            filters: vec![],
-            backends: vec![Backend { socket_addr: "127.0.0.1:7002".parse().unwrap(), weight: 1 }],
-        });
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(),
+            vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+            vec![],
+            vec![Backend { socket_addr: "127.0.0.1:7001".parse().unwrap(), weight: 1 }],
+        ));
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+            vec![Backend { socket_addr: "127.0.0.1:7002".parse().unwrap(), weight: 1 }],
+        ));
 
         let headers = b"X-Env: canary\r\nAccept: */*\r\n";
 
@@ -435,15 +421,20 @@ mod tests {
 
     #[test]
     fn test_weighted_backend() {
-        let b1 = Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 };
-        let b2 = Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 };
-        let backends = vec![b1, b2];
+        let mut rt = RouteTable::new();
+        rt.add_http_route("test.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+            vec![
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+            ],
+        ));
+        let rule = rt.find_http_route("test.com", "/", &[]).unwrap();
 
         let mut selector = BackendSelector::new();
         let mut counts = [0u32; 2];
-        // total weight = 4, cycle through enough to see distribution
         for _ in 0..400 {
-            let idx = selector.select_weighted_backend(42, &backends);
+            let idx = selector.select_weighted_backend(42, rule);
             counts[idx] += 1;
         }
         // b1 (weight 3) should get ~75%, b2 (weight 1) should get ~25%
@@ -465,28 +456,26 @@ impl BackendSelector {
         }
     }
 
-    /// Select backend using weighted round-robin.
-    /// Each call increments a counter; the counter modulo total weight
-    /// determines which backend is selected based on cumulative weight ranges.
-    pub fn select_weighted_backend(&mut self, route_hash: u64, backends: &[Backend]) -> usize {
-        let total_weight: u64 = backends.iter().map(|b| b.weight as u64).sum();
-        if total_weight == 0 {
+    /// Select backend using weighted round-robin with pre-computed weights.
+    /// Uses O(log n) binary search on pre-computed cumulative_weights.
+    #[inline(always)]
+    pub fn select_weighted_backend(
+        &mut self,
+        route_hash: u64,
+        rule: &HttpRouteRule,
+    ) -> usize {
+        if rule.backends.len() <= 1 {
+            return 0;
+        }
+        if rule.total_weight == 0 {
             return 0;
         }
 
         let counter = self.route_counters.entry(route_hash).or_insert(0);
-        let slot = *counter % total_weight;
+        let slot = *counter % rule.total_weight;
         *counter = counter.wrapping_add(1);
 
-        let mut cumulative = 0u64;
-        for (i, backend) in backends.iter().enumerate() {
-            cumulative += backend.weight as u64;
-            if slot < cumulative {
-                return i;
-            }
-        }
-
-        backends.len() - 1
+        rule.cumulative_weights.partition_point(|&cw| cw <= slot)
     }
 
     /// Simple round-robin (for equal-weight backends or non-HTTP routes)

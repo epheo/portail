@@ -20,7 +20,7 @@ use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::logging::{warn, info, debug};
-use crate::request_processor::{self, HeaderModifications, ProcessingDecision, URLRewrite, RewrittenPath};
+use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision, URLRewrite, RewrittenPath};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -88,11 +88,9 @@ async fn handle_connection(
         ProcessingDecision::TcpForward { backend_addr } => {
             handle_tcp_connection(client, backend_addr, &buf[..n]).await
         }
-        ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods, url_rewrite, mirror_addrs } => {
+        ProcessingDecision::HttpForward { backend_addr, keepalive, filters } => {
             handle_http_connection(
-                client, &mut buf, n, backend_addr, keepalive,
-                request_header_mods, response_header_mods,
-                url_rewrite, mirror_addrs,
+                client, &mut buf, n, backend_addr, keepalive, filters,
                 server_port, routes, pool, &mut selector,
             ).await
         }
@@ -111,17 +109,13 @@ async fn handle_connection(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_http_connection(
     mut client: TcpStream,
     buf: &mut Vec<u8>,
     initial_bytes: usize,
     initial_backend_addr: SocketAddr,
     initial_keepalive: bool,
-    initial_req_mods: Option<HeaderModifications>,
-    initial_resp_mods: Option<HeaderModifications>,
-    initial_url_rewrite: Option<URLRewrite>,
-    initial_mirror_addrs: Vec<SocketAddr>,
+    initial_filters: Option<Box<HttpFilterData>>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: Arc<BackendPool>,
@@ -130,25 +124,31 @@ async fn handle_http_connection(
     let mut backend_addr = initial_backend_addr;
     let mut keepalive = initial_keepalive;
     let mut request_bytes = initial_bytes;
-    let mut req_mods = initial_req_mods;
-    let mut resp_mods = initial_resp_mods;
-    let mut rewrite = initial_url_rewrite;
-    let mut mirrors = initial_mirror_addrs;
+    let mut filter_data = initial_filters;
 
     loop {
         let mut backend = pool.acquire(backend_addr).await?;
 
-        let has_modifications = req_mods.is_some() || rewrite.is_some();
-        if has_modifications {
-            let modified = apply_request_modifications(&buf[..request_bytes], req_mods.as_ref(), rewrite.as_ref());
-            dispatch_mirrors(&mirrors, &modified);
-            backend.write_all(&modified).await?;
+        if let Some(ref fd) = filter_data {
+            let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
+            if has_mods {
+                let modified = apply_request_modifications(
+                    &buf[..request_bytes],
+                    fd.request_header_mods.as_ref(),
+                    fd.url_rewrite.as_ref(),
+                );
+                if !fd.mirror_addrs.is_empty() { dispatch_mirrors(&fd.mirror_addrs, &modified); }
+                backend.write_all(&modified).await?;
+            } else {
+                if !fd.mirror_addrs.is_empty() { dispatch_mirrors(&fd.mirror_addrs, &buf[..request_bytes]); }
+                backend.write_all(&buf[..request_bytes]).await?;
+            }
         } else {
-            dispatch_mirrors(&mirrors, &buf[..request_bytes]);
             backend.write_all(&buf[..request_bytes]).await?;
         }
 
-        let response_complete = forward_http_response(&mut backend, &mut client, buf, resp_mods.as_ref()).await?;
+        let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
+        let response_complete = forward_http_response(&mut backend, &mut client, buf, resp_mods).await?;
 
         if response_complete && keepalive {
             pool.release(backend_addr, backend);
@@ -158,30 +158,21 @@ async fn handle_http_connection(
             return Ok(());
         }
 
-        // Wait for next request on this client connection (keepalive)
         request_bytes = client.read(buf).await?;
         if request_bytes == 0 {
             return Ok(());
         }
 
-        // Re-analyze for next request (host/path may differ)
         let decision = {
             let route_table = routes.load();
             request_processor::analyze_request(&route_table, selector, &buf[..request_bytes], server_port)?
         };
 
         match decision {
-            ProcessingDecision::HttpForward {
-                backend_addr: addr, keepalive: ka,
-                request_header_mods, response_header_mods,
-                url_rewrite, mirror_addrs,
-            } => {
+            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters } => {
                 backend_addr = addr;
                 keepalive = ka;
-                req_mods = request_header_mods;
-                resp_mods = response_header_mods;
-                rewrite = url_rewrite;
-                mirrors = mirror_addrs;
+                filter_data = filters;
             }
             ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
                 send_redirect_response(&mut client, status_code, &location).await?;
@@ -225,11 +216,9 @@ async fn handle_keepalive_after_response(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr, keepalive, request_header_mods, response_header_mods, url_rewrite, mirror_addrs } => {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, filters } => {
                 return handle_http_connection(
-                    client, buf, n, backend_addr, keepalive,
-                    request_header_mods, response_header_mods,
-                    url_rewrite, mirror_addrs,
+                    client, buf, n, backend_addr, keepalive, filters,
                     server_port, routes, pool, selector,
                 ).await;
             }
@@ -260,6 +249,79 @@ async fn forward_http_response(
     buf: &mut [u8],
     response_mods: Option<&HeaderModifications>,
 ) -> Result<bool> {
+    if response_mods.is_some() {
+        forward_http_response_with_mods(backend, client, buf, response_mods.unwrap()).await
+    } else {
+        forward_http_response_passthrough(backend, client, buf).await
+    }
+}
+
+/// Fast path: stream response bytes to client immediately, track headers
+/// only for completion detection (connection reuse). Zero buffering delay.
+async fn forward_http_response_passthrough(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+    buf: &mut [u8],
+) -> Result<bool> {
+    let mut headers_parsed = false;
+    let mut content_length: Option<usize> = None;
+    let mut body_bytes_forwarded: usize = 0;
+    let mut chunked = false;
+    let mut header_buf = Vec::new();
+
+    loop {
+        let n = backend.read(buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        // Write to client immediately — don't wait for header parsing
+        client.write_all(&buf[..n]).await?;
+
+        if !headers_parsed {
+            header_buf.extend_from_slice(&buf[..n]);
+
+            if let Some(header_end) = find_header_end(&header_buf) {
+                headers_parsed = true;
+                let headers = &header_buf[..header_end];
+                content_length = parse_content_length(headers);
+                chunked = is_chunked_transfer(headers);
+                body_bytes_forwarded = header_buf.len() - header_end;
+
+                if let Some(cl) = content_length {
+                    if body_bytes_forwarded >= cl {
+                        return Ok(true);
+                    }
+                }
+                if chunked && ends_with_chunked_terminator(&header_buf[header_end..]) {
+                    return Ok(true);
+                }
+                if is_no_body_status(headers) {
+                    return Ok(true);
+                }
+            }
+        } else {
+            body_bytes_forwarded += n;
+
+            if let Some(cl) = content_length {
+                if body_bytes_forwarded >= cl {
+                    return Ok(true);
+                }
+            }
+            if chunked && buf[..n].ends_with(b"0\r\n\r\n") {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+/// Slow path: buffer headers to apply modifications before forwarding.
+async fn forward_http_response_with_mods(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+    buf: &mut [u8],
+    mods: &HeaderModifications,
+) -> Result<bool> {
     let mut headers_parsed = false;
     let mut content_length: Option<usize> = None;
     let mut body_bytes_forwarded: usize = 0;
@@ -278,24 +340,16 @@ async fn forward_http_response(
             if let Some(header_end) = find_header_end(&header_buf) {
                 headers_parsed = true;
 
-                // Apply response header modifications if present
-                if let Some(mods) = response_mods {
-                    let modified_headers = apply_response_header_mods(&header_buf[..header_end], mods);
-                    client.write_all(&modified_headers).await?;
-                    // Write body portion that came with headers
-                    if header_buf.len() > header_end {
-                        client.write_all(&header_buf[header_end..]).await?;
-                    }
-                } else {
-                    client.write_all(&header_buf).await?;
+                let modified_headers = apply_response_header_mods(&header_buf[..header_end], mods);
+                client.write_all(&modified_headers).await?;
+                if header_buf.len() > header_end {
+                    client.write_all(&header_buf[header_end..]).await?;
                 }
 
                 let headers = &header_buf[..header_end];
                 content_length = parse_content_length(headers);
                 chunked = is_chunked_transfer(headers);
-
-                let body_in_this_chunk = header_buf.len() - header_end;
-                body_bytes_forwarded = body_in_this_chunk;
+                body_bytes_forwarded = header_buf.len() - header_end;
 
                 if let Some(cl) = content_length {
                     if body_bytes_forwarded >= cl {
@@ -307,14 +361,6 @@ async fn forward_http_response(
                 }
                 if is_no_body_status(headers) {
                     return Ok(true);
-                }
-            } else {
-                // Headers not complete yet, don't write anything until we have them
-                // (only relevant when response_mods are active)
-                if response_mods.is_none() {
-                    // No modifications needed, stream through immediately
-                    // But we already extended header_buf, so nothing to do here—
-                    // the full buffer will be written once headers are complete
                 }
             }
         } else {
@@ -561,19 +607,8 @@ fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
     }
 }
 
-/// Rewrite the path in an HTTP request line.
-/// "GET /old HTTP/1.1" → "GET /new HTTP/1.1"
-fn rewrite_request_line_path(request_line: &str, new_path: &str) -> String {
-    // Request line format: METHOD SP PATH SP VERSION
-    let mut parts = request_line.splitn(3, ' ');
-    let method = parts.next().unwrap_or("GET");
-    let _old_path = parts.next().unwrap_or("/");
-    let version = parts.next().unwrap_or("HTTP/1.1");
-    format!("{} {} {}", method, new_path, version)
-}
-
 /// Apply request modifications: header mods and/or URL rewrite.
-/// Only called when modifications exist — the common case remains zero-copy.
+/// Operates on raw bytes — no intermediate String allocations.
 fn apply_request_modifications(
     original: &[u8],
     header_mods: Option<&HeaderModifications>,
@@ -583,83 +618,107 @@ fn apply_request_modifications(
     let header_region = &original[..header_end];
     let body = &original[header_end..];
 
-    let header_str = match std::str::from_utf8(header_region) {
-        Ok(s) => s,
-        Err(_) => return original.to_vec(),
-    };
-
-    let lines: Vec<&str> = header_str.lines().collect();
-    if lines.is_empty() {
-        return original.to_vec();
-    }
-
-    // Rewrite request line path if needed
-    let request_line = if let Some(rewrite) = url_rewrite {
-        if let Some(ref rewritten) = rewrite.path {
-            let new_path = match rewritten {
-                RewrittenPath::Full(p) => p.as_str(),
-                RewrittenPath::PrefixReplaced(p) => p.as_str(),
-            };
-            rewrite_request_line_path(lines[0], new_path)
-        } else {
-            lines[0].to_string()
-        }
-    } else {
-        lines[0].to_string()
-    };
-
-    let header_lines = &lines[1..];
-    let extra_cap = header_mods.map_or(0, |m| m.add.len() + m.set.len());
-    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + extra_cap);
-
-    // Rewrite hostname replaces the Host header
+    let mut out = Vec::with_capacity(original.len() + 256);
     let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
 
-    for line in header_lines {
+    // Process line by line on raw bytes
+    let mut pos = 0;
+    let mut first_line = true;
+    while pos < header_region.len() {
+        let line_start = pos;
+        // Find \r\n boundary
+        while pos < header_region.len() && header_region[pos] != b'\r' && header_region[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &header_region[line_start..pos];
+
+        // Skip past CRLF
+        if pos < header_region.len() && header_region[pos] == b'\r' { pos += 1; }
+        if pos < header_region.len() && header_region[pos] == b'\n' { pos += 1; }
+
         if line.is_empty() {
             continue;
         }
-        let colon_pos = match line.find(':') {
+
+        if first_line {
+            first_line = false;
+            // Request line: rewrite path if needed
+            if let Some(rewrite) = url_rewrite {
+                if let Some(ref rewritten) = rewrite.path {
+                    let new_path = match rewritten {
+                        RewrittenPath::Full(p) => p.as_bytes(),
+                        RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
+                    };
+                    // Find METHOD and VERSION by locating the two spaces
+                    if let Some(sp1) = line.iter().position(|&b| b == b' ') {
+                        if let Some(sp2) = line[sp1 + 1..].iter().position(|&b| b == b' ') {
+                            out.extend_from_slice(&line[..sp1 + 1]);
+                            out.extend_from_slice(new_path);
+                            out.extend_from_slice(&line[sp1 + 1 + sp2..]);
+                            out.extend_from_slice(b"\r\n");
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            continue;
+        }
+
+        // Header line: find colon to extract name
+        let colon_pos = match line.iter().position(|&b| b == b':') {
             Some(p) => p,
-            None => continue,
+            None => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
         };
         let name = &line[..colon_pos];
 
         // Replace Host header if hostname rewrite is active
-        if rewrite_hostname.is_some() && name.eq_ignore_ascii_case("host") {
-            result_headers.push(format!("Host: {}", rewrite_hostname.unwrap()));
-            continue;
+        if let Some(new_host) = rewrite_hostname {
+            if name.eq_ignore_ascii_case(b"host") {
+                out.extend_from_slice(b"Host: ");
+                out.extend_from_slice(new_host.as_bytes());
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
         }
 
         if let Some(mods) = header_mods {
-            if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            // SAFETY: header names are ASCII per RFC 7230
+            let name_str = unsafe { std::str::from_utf8_unchecked(name) };
+
+            if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
                 continue;
             }
-            if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
-                result_headers.push(format!("{}: {}", set_header.name, set_header.value));
+            if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name_str)) {
+                out.extend_from_slice(set_header.name.as_bytes());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(set_header.value.as_bytes());
+                out.extend_from_slice(b"\r\n");
                 continue;
             }
         }
 
-        result_headers.push(line.to_string());
-    }
-
-    if let Some(mods) = header_mods {
-        for h in &mods.add {
-            result_headers.push(format!("{}: {}", h.name, h.value));
-        }
-    }
-
-    let mut out = Vec::with_capacity(original.len() + 256);
-    out.extend_from_slice(request_line.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    for h in &result_headers {
-        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(line);
         out.extend_from_slice(b"\r\n");
     }
+
+    // Add headers
+    if let Some(mods) = header_mods {
+        for h in &mods.add {
+            out.extend_from_slice(h.name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(h.value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
-
     out
 }
 
@@ -771,12 +830,6 @@ mod tests {
     use super::*;
     use crate::request_processor::{URLRewrite, RewrittenPath, HeaderModifications};
     use crate::routing::HttpHeader;
-
-    #[test]
-    fn test_rewrite_request_line_path() {
-        let result = rewrite_request_line_path("GET /old HTTP/1.1", "/new");
-        assert_eq!(result, "GET /new HTTP/1.1");
-    }
 
     #[test]
     fn test_apply_modifications_path_rewrite() {

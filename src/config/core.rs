@@ -102,13 +102,13 @@ impl UringRessConfig {
                         tracing::debug!("      Adding route: {} {} -> {} backends",
                             hostname, path, backends.len());
 
-                        route_table.add_http_route(hostname, routing::HttpRouteRule {
+                        route_table.add_http_route(hostname, routing::HttpRouteRule::new(
                             path_match_type,
-                            path: path.to_string(),
+                            path.to_string(),
                             header_matches,
-                            filters: filters.clone(),
-                            backends: backends.clone(),
-                        });
+                            filters.clone(),
+                            backends.clone(),
+                        ));
                     }
                 }
             }
