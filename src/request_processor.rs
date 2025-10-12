@@ -114,7 +114,7 @@ fn analyze_http_request(
     let request_info = extract_routing_info(request_data)?;
     let keepalive = request_info.connection_type != ConnectionType::Close;
 
-    let rule = match routes.find_http_route(request_info.host, request_info.path, request_info.header_data) {
+    let rule = match routes.find_http_route(request_info.host, request_info.method, request_info.path, request_info.header_data, request_info.query_string) {
         Ok(rule) => rule,
         Err(_) => {
             return Ok(ProcessingDecision::SendHttpError {
@@ -308,6 +308,7 @@ mod tests {
         rt.add_http_route(host, HttpRouteRule::new(
             path_type,
             path.to_string(),
+            vec![],
             vec![],
             filters,
             vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1 }],
@@ -506,7 +507,7 @@ mod tests {
     fn test_redirect_takes_priority_over_backends() {
         let mut rt = RouteTable::new();
         rt.add_http_route("example.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/".to_string(), vec![],
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
             vec![HttpFilter::RequestRedirect {
                 scheme: Some("https".to_string()),
                 hostname: None,

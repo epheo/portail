@@ -19,15 +19,17 @@ impl RouteTable {
         }
     }
 
-    /// Find an HTTP route rule for host, path, and headers.
+    /// Find an HTTP route rule for host, method, path, headers, and query string.
     /// Tries exact host first, then wildcard. Within a host entry, exact path
-    /// beats prefix, then longest prefix wins. Header matches are AND-combined.
+    /// beats prefix, then longest prefix wins. All match conditions are AND-combined.
     #[inline(always)]
     pub fn find_http_route<'a>(
         &'a self,
         host: &str,
+        method: &str,
         path: &str,
         header_data: &[u8],
+        query_string: &str,
     ) -> Result<&'a HttpRouteRule> {
         let mut buf = [0u8; 256];
         let host_bytes = host.as_bytes();
@@ -38,7 +40,7 @@ impl RouteTable {
 
         // Try exact host first
         if let Some(host_entry) = self.http_routes.get(key) {
-            if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, path, header_data) {
+            if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
                 return Ok(rule);
             }
         }
@@ -47,7 +49,7 @@ impl RouteTable {
         if let Some(dot_pos) = key.find('.') {
             let parent = &key[dot_pos + 1..];
             if let Some(host_entry) = self.wildcard_http_routes.get(parent) {
-                if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, path, header_data) {
+                if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
                     return Ok(rule);
                 }
             }
@@ -64,16 +66,26 @@ impl RouteTable {
         Err(anyhow!("No TCP route found for port {}", server_port))
     }
 
-    /// Match rules: exact path first, then longest prefix. Header matches are AND-combined.
+    /// Match rules: method first (fastest reject), then exact path before longest prefix,
+    /// then headers, then query params. All conditions are AND-combined.
     #[inline(always)]
     fn find_best_rule_match<'a>(
         rules: &'a [HttpRouteRule],
+        method: &str,
         path: &str,
         header_data: &[u8],
+        query_string: &str,
     ) -> Option<&'a HttpRouteRule> {
         let path_bytes = path.as_bytes();
 
         for rule in rules {
+            // Method match — single comparison, rejects early
+            if let Some(ref required) = rule.method_match {
+                if !required.eq_ignore_ascii_case(method) {
+                    continue;
+                }
+            }
+
             let path_matches = match rule.path_match_type {
                 PathMatchType::Exact => path_bytes == rule.path.as_bytes(),
                 PathMatchType::Prefix => {
@@ -88,7 +100,6 @@ impl RouteTable {
                 continue;
             }
 
-            // Check header matches (AND logic) — skip if no header_data provided and matches exist
             if !rule.header_matches.is_empty() {
                 if header_data.is_empty() {
                     continue;
@@ -96,6 +107,16 @@ impl RouteTable {
                 let all_match = rule.header_matches.iter().all(|hm| {
                     find_header_value(header_data, &hm.name)
                         .map_or(false, |v| v == hm.value)
+                });
+                if !all_match {
+                    continue;
+                }
+            }
+
+            // Query param matches — only parsed when rule requires them
+            if !rule.query_param_matches.is_empty() {
+                let all_match = rule.query_param_matches.iter().all(|qm| {
+                    query_string_contains_param(query_string, &qm.name, &qm.value)
                 });
                 if !all_match {
                     continue;
@@ -178,9 +199,11 @@ pub enum PathMatchType {
 
 #[derive(Debug, Clone)]
 pub struct HttpRouteRule {
+    pub method_match: Option<String>,
     pub path_match_type: PathMatchType,
     pub path: String,
     pub header_matches: Vec<HeaderMatch>,
+    pub query_param_matches: Vec<QueryParamMatch>,
     pub filters: Vec<HttpFilter>,
     pub backends: Vec<Backend>,
     /// Pre-computed at add_http_route time to skip filter iteration on hot path
@@ -196,26 +219,39 @@ impl HttpRouteRule {
         path_match_type: PathMatchType,
         path: String,
         header_matches: Vec<HeaderMatch>,
+        query_param_matches: Vec<QueryParamMatch>,
         filters: Vec<HttpFilter>,
         backends: Vec<Backend>,
     ) -> Self {
         Self {
+            method_match: None,
             path_match_type,
             path,
             header_matches,
+            query_param_matches,
             filters,
             backends,
-            // Populated by add_http_route
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],
         }
+    }
+
+    pub fn with_method(mut self, method: Option<String>) -> Self {
+        self.method_match = method;
+        self
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct HeaderMatch {
     /// Lowercase header name
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryParamMatch {
     pub name: String,
     pub value: String,
 }
@@ -336,53 +372,61 @@ pub fn find_header_value<'a>(header_data: &'a [u8], name: &str) -> Option<&'a st
     None
 }
 
+/// Zero-allocation query parameter lookup.
+/// Iterates `&`-separated pairs looking for exact `name=value` match.
+#[inline]
+pub fn query_string_contains_param(query: &str, name: &str, value: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    for pair in query.split('&') {
+        if let Some(eq_pos) = pair.find('=') {
+            if &pair[..eq_pos] == name && &pair[eq_pos + 1..] == value {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn backend(port: u16) -> Backend {
+        Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1 }
+    }
+
+    fn rule(path_type: PathMatchType, path: &str, backends: Vec<Backend>) -> HttpRouteRule {
+        HttpRouteRule::new(path_type, path.to_string(), vec![], vec![], vec![], backends)
+    }
+
     #[test]
     fn test_exact_path_matching() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("example.com", HttpRouteRule::new(
-            PathMatchType::Exact, "/foo".to_string(), vec![], vec![],
-            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
-        ));
-        rt.add_http_route("example.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/foo".to_string(), vec![], vec![],
-            vec![Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 }],
-        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Exact, "/foo", vec![backend(8001)]));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo", vec![backend(8002)]));
 
-        // Exact match wins
-        let rule = rt.find_http_route("example.com", "/foo", &[]).unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+        let r = rt.find_http_route("example.com", "GET", "/foo", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
 
-        // Prefix still works for sub-paths
-        let rule = rt.find_http_route("example.com", "/foo/bar", &[]).unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+        let r = rt.find_http_route("example.com", "GET", "/foo/bar", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
     }
 
     #[test]
     fn test_wildcard_host_matching() {
         let mut rt = RouteTable::new();
-        rt.add_http_route("*.example.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
-            vec![Backend { socket_addr: "127.0.0.1:9001".parse().unwrap(), weight: 1 }],
-        ));
-        rt.add_http_route("specific.example.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
-            vec![Backend { socket_addr: "127.0.0.1:9002".parse().unwrap(), weight: 1 }],
-        ));
+        rt.add_http_route("*.example.com", rule(PathMatchType::Prefix, "/", vec![backend(9001)]));
+        rt.add_http_route("specific.example.com", rule(PathMatchType::Prefix, "/", vec![backend(9002)]));
 
-        // Exact host takes priority
-        let rule = rt.find_http_route("specific.example.com", "/", &[]).unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:9002".parse().unwrap());
+        let r = rt.find_http_route("specific.example.com", "GET", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:9002".parse().unwrap());
 
-        // Wildcard catches others
-        let rule = rt.find_http_route("other.example.com", "/", &[]).unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:9001".parse().unwrap());
+        let r = rt.find_http_route("other.example.com", "GET", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:9001".parse().unwrap());
 
-        // Non-matching returns error
-        assert!(rt.find_http_route("example.org", "/", &[]).is_err());
+        assert!(rt.find_http_route("example.org", "GET", "/", &[], "").is_err());
     }
 
     #[test]
@@ -391,23 +435,17 @@ mod tests {
         rt.add_http_route("example.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(),
             vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
-            vec![],
-            vec![Backend { socket_addr: "127.0.0.1:7001".parse().unwrap(), weight: 1 }],
+            vec![], vec![],
+            vec![backend(7001)],
         ));
-        rt.add_http_route("example.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
-            vec![Backend { socket_addr: "127.0.0.1:7002".parse().unwrap(), weight: 1 }],
-        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(7002)]));
 
         let headers = b"X-Env: canary\r\nAccept: */*\r\n";
+        let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:7001".parse().unwrap());
 
-        // With matching header -> canary backend
-        let rule = rt.find_http_route("example.com", "/", headers).unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:7001".parse().unwrap());
-
-        // Without matching header -> fallback
-        let rule = rt.find_http_route("example.com", "/", b"Accept: */*\r\n").unwrap();
-        assert_eq!(rule.backends[0].socket_addr, "127.0.0.1:7002".parse().unwrap());
+        let r = rt.find_http_route("example.com", "GET", "/", b"Accept: */*\r\n", "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:7002".parse().unwrap());
     }
 
     #[test]
@@ -423,23 +461,127 @@ mod tests {
     fn test_weighted_backend() {
         let mut rt = RouteTable::new();
         rt.add_http_route("test.com", HttpRouteRule::new(
-            PathMatchType::Prefix, "/".to_string(), vec![], vec![],
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
                 Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
                 Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
             ],
         ));
-        let rule = rt.find_http_route("test.com", "/", &[]).unwrap();
+        let r = rt.find_http_route("test.com", "GET", "/", &[], "").unwrap();
 
         let mut selector = BackendSelector::new();
         let mut counts = [0u32; 2];
         for _ in 0..400 {
-            let idx = selector.select_weighted_backend(42, rule);
+            let idx = selector.select_weighted_backend(42, r);
             counts[idx] += 1;
         }
-        // b1 (weight 3) should get ~75%, b2 (weight 1) should get ~25%
         assert_eq!(counts[0], 300);
         assert_eq!(counts[1], 100);
+    }
+
+    #[test]
+    fn test_method_matching() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com",
+            rule(PathMatchType::Prefix, "/", vec![backend(8001)]).with_method(Some("POST".to_string())));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        // POST matches the method-constrained rule
+        let r = rt.find_http_route("example.com", "POST", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // GET skips the method-constrained rule, hits fallback
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+
+        // Case-insensitive
+        let r = rt.find_http_route("example.com", "post", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+    }
+
+    #[test]
+    fn test_query_param_matching() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![],
+            vec![QueryParamMatch { name: "version".to_string(), value: "2".to_string() }],
+            vec![], vec![backend(8001)],
+        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        // Matching query param
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "version=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // Missing query param -> fallback
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+
+        // Wrong value -> fallback
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "version=1").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+
+        // Multiple params, one matches
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "foo=bar&version=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+    }
+
+    #[test]
+    fn test_multiple_query_params_and_logic() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![],
+            vec![
+                QueryParamMatch { name: "a".to_string(), value: "1".to_string() },
+                QueryParamMatch { name: "b".to_string(), value: "2".to_string() },
+            ],
+            vec![], vec![backend(8001)],
+        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        // Both params present
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "a=1&b=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // Only one param -> fallback
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "a=1").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+    }
+
+    #[test]
+    fn test_combined_method_path_header_query() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/api".to_string(),
+            vec![HeaderMatch { name: "x-env".to_string(), value: "prod".to_string() }],
+            vec![QueryParamMatch { name: "v".to_string(), value: "2".to_string() }],
+            vec![],
+            vec![backend(8001)],
+        ).with_method(Some("POST".to_string())));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        let headers = b"X-Env: prod\r\n";
+
+        // All match
+        let r = rt.find_http_route("example.com", "POST", "/api/users", headers, "v=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // Wrong method -> fallback
+        let r = rt.find_http_route("example.com", "GET", "/api/users", headers, "v=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+
+        // Wrong query -> fallback
+        let r = rt.find_http_route("example.com", "POST", "/api/users", headers, "v=1").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+    }
+
+    #[test]
+    fn test_query_string_contains_param() {
+        assert!(query_string_contains_param("a=1&b=2", "a", "1"));
+        assert!(query_string_contains_param("a=1&b=2", "b", "2"));
+        assert!(!query_string_contains_param("a=1&b=2", "c", "3"));
+        assert!(!query_string_contains_param("", "a", "1"));
+        assert!(!query_string_contains_param("a=1", "a", "2"));
     }
 }
 

@@ -217,9 +217,20 @@ pub struct HttpRouteRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRouteMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<HttpPathMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HttpHeaderMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_params: Vec<HttpQueryParamMatch>,
+}
+
+/// HTTP query parameter match condition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpQueryParamMatch {
+    pub name: String,
+    pub value: String,
 }
 
 /// HTTP path matching
@@ -327,11 +338,13 @@ fn is_default_weight(w: &u32) -> bool {
 impl HttpRouteMatch {
     pub fn path_prefix(path: &str) -> Self {
         Self {
+            method: None,
             path: Some(HttpPathMatch {
                 match_type: HttpPathMatchType::PathPrefix,
                 value: path.to_string(),
             }),
             headers: vec![],
+            query_params: vec![],
         }
     }
 }

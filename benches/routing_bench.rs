@@ -1,6 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use uringress::routing::{RouteTable, Backend, FnvRouterHasher};
+use uringress::routing::{RouteTable, Backend, HttpRouteRule, PathMatchType};
 use std::time::Duration;
+
+fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
+    HttpRouteRule::new(PathMatchType::Prefix, path.to_string(), vec![], vec![], vec![], vec![backend])
+}
 
 fn routing_benchmark(c: &mut Criterion) {
     let mut small_table = RouteTable::new();
@@ -10,34 +14,20 @@ fn routing_benchmark(c: &mut Criterion) {
     for i in 0..100 {
         let host = format!("host{}.example.com", i);
         let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
-        small_table.add_http_route(&host, "/api", vec![backend]);
+        small_table.add_http_route(&host, make_rule("/api", backend));
     }
 
     for i in 0..1000 {
         let host = format!("host{}.example.com", i);
         let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
-        medium_table.add_http_route(&host, "/api", vec![backend]);
+        medium_table.add_http_route(&host, make_rule("/api", backend));
     }
 
     for i in 0..10000 {
         let host = format!("host{}.example.com", i);
         let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
-        large_table.add_http_route(&host, "/api", vec![backend]);
+        large_table.add_http_route(&host, make_rule("/api", backend));
     }
-
-    c.bench_function("fnv_hash_short_host", |b| {
-        b.iter(|| {
-            let host = "api.com";
-            std::hint::black_box(FnvRouterHasher::hash(host))
-        })
-    });
-
-    c.bench_function("fnv_hash_long_host", |b| {
-        b.iter(|| {
-            let host = "very.long.subdomain.example.com";
-            std::hint::black_box(FnvRouterHasher::hash(host))
-        })
-    });
 
     let mut group = c.benchmark_group("route_lookup_by_table_size");
 
@@ -49,30 +39,28 @@ fn routing_benchmark(c: &mut Criterion) {
         let host = format!("host{}.example.com", size / 2);
         group.bench_with_input(BenchmarkId::new("http_route_lookup", size), &table, |b, table| {
             b.iter(|| {
-                std::hint::black_box(table.find_http_backends(&host, "/api/users"))
+                std::hint::black_box(table.find_http_route(&host, "GET", "/api/users", &[], ""))
             })
         });
     }
     group.finish();
 
     let mut complex_table = RouteTable::new();
-    let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
 
-    complex_table.add_http_route("api.com", "/", vec![backend.clone()]);
-    complex_table.add_http_route("api.com", "/api", vec![backend.clone()]);
-    complex_table.add_http_route("api.com", "/api/v1", vec![backend.clone()]);
-    complex_table.add_http_route("api.com", "/api/v1/users", vec![backend.clone()]);
-    complex_table.add_http_route("api.com", "/api/v2", vec![backend.clone()]);
+    for path in ["/", "/api", "/api/v1", "/api/v1/users", "/api/v2"] {
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        complex_table.add_http_route("api.com", make_rule(path, backend));
+    }
 
     c.bench_function("path_matching_simple", |b| {
         b.iter(|| {
-            std::hint::black_box(complex_table.find_http_backends("api.com", "/"))
+            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/", &[], ""))
         })
     });
 
     c.bench_function("path_matching_complex", |b| {
         b.iter(|| {
-            std::hint::black_box(complex_table.find_http_backends("api.com", "/api/v1/users/123/profile"))
+            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/api/v1/users/123/profile", &[], ""))
         })
     });
 
@@ -116,7 +104,7 @@ fn memory_benchmark(c: &mut Criterion) {
             || RouteTable::new(),
             |mut table| {
                 let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
-                table.add_http_route("host.com", "/api", vec![backend]);
+                table.add_http_route("host.com", make_rule("/api", backend));
                 std::hint::black_box(table)
             },
             criterion::BatchSize::SmallInput

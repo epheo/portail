@@ -191,8 +191,18 @@ impl HttpRouteRule {
     }
 }
 
+const VALID_HTTP_METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE",
+];
+
 impl HttpRouteMatch {
     fn validate(&self) -> Result<()> {
+        if let Some(ref method) = self.method {
+            if !VALID_HTTP_METHODS.iter().any(|m| m.eq_ignore_ascii_case(method)) {
+                return Err(anyhow!("Invalid HTTP method '{}'. Must be one of: {}", method, VALID_HTTP_METHODS.join(", ")));
+            }
+        }
+
         if let Some(path_match) = &self.path {
             path_match.validate()?;
         }
@@ -200,6 +210,11 @@ impl HttpRouteMatch {
         for (i, header_match) in self.headers.iter().enumerate() {
             validate_header_match(header_match)
                 .map_err(|e| anyhow!("Header match {}: {}", i, e))?;
+        }
+
+        for (i, qp) in self.query_params.iter().enumerate() {
+            validate_query_param_match(qp)
+                .map_err(|e| anyhow!("Query param match {}: {}", i, e))?;
         }
 
         Ok(())
@@ -297,6 +312,16 @@ fn validate_header_match(hm: &HttpHeaderMatch) -> Result<()> {
     // RFC 7230: header field names are tokens (visible ASCII, no delimiters)
     if !hm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
         return Err(anyhow!("Header match name '{}' contains invalid characters", hm.name));
+    }
+    Ok(())
+}
+
+fn validate_query_param_match(qp: &HttpQueryParamMatch) -> Result<()> {
+    if qp.name.is_empty() {
+        return Err(anyhow!("Query param name cannot be empty"));
+    }
+    if qp.name.contains('&') || qp.name.contains('=') {
+        return Err(anyhow!("Query param name '{}' must not contain '&' or '='", qp.name));
     }
     Ok(())
 }

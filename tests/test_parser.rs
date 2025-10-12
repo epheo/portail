@@ -32,8 +32,27 @@ fn test_parse_http_headers_fast_complex_path() {
     let request = b"GET /api/v1/users/123?filter=active&sort=name HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.path, "/api/v1/users/123?filter=active&sort=name");
+    assert_eq!(result.path, "/api/v1/users/123");
+    assert_eq!(result.query_string, "filter=active&sort=name");
     assert_eq!(result.host, "api.example.com");
+}
+
+#[test]
+fn test_parse_path_without_query_string() {
+    let request = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    let result = extract_routing_info(request).unwrap();
+    assert_eq!(result.path, "/api/users");
+    assert_eq!(result.query_string, "");
+}
+
+#[test]
+fn test_parse_path_with_empty_query_string() {
+    let request = b"GET /api/users? HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    let result = extract_routing_info(request).unwrap();
+    assert_eq!(result.path, "/api/users");
+    assert_eq!(result.query_string, "");
 }
 
 #[test]

@@ -99,6 +99,15 @@ impl UringRessConfig {
                             })
                             .collect();
 
+                        let query_param_matches: Vec<routing::QueryParamMatch> = route_match
+                            .query_params
+                            .iter()
+                            .map(|qm| routing::QueryParamMatch {
+                                name: qm.name.clone(),
+                                value: qm.value.clone(),
+                            })
+                            .collect();
+
                         tracing::debug!("      Adding route: {} {} -> {} backends",
                             hostname, path, backends.len());
 
@@ -106,9 +115,10 @@ impl UringRessConfig {
                             path_match_type,
                             path.to_string(),
                             header_matches,
+                            query_param_matches,
                             filters.clone(),
                             backends.clone(),
-                        ));
+                        ).with_method(route_match.method.clone()));
                     }
                 }
             }
@@ -487,7 +497,7 @@ mod tests {
         }"#;
         let config: UringRessConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "/v1/test", &[]).unwrap();
+        let rule = rt.find_http_route("example.com", "GET", "/v1/test", &[], "").unwrap();
         assert_eq!(rule.filters.len(), 1);
         assert!(matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com"));
     }
@@ -512,7 +522,7 @@ mod tests {
         }"#;
         let config: UringRessConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "/", &[]).unwrap();
+        let rule = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
         assert_eq!(rule.filters.len(), 1);
         if let crate::routing::HttpFilter::RequestMirror { backend_addr } = &rule.filters[0] {
             assert_eq!(backend_addr.port(), 9999);

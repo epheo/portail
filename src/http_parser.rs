@@ -31,6 +31,7 @@ pub struct HttpRequestInfo<'a> {
     pub method: &'a str,
     pub host: &'a str,
     pub path: &'a str,
+    pub query_string: &'a str,
     pub connection_type: ConnectionType,
     /// Raw header bytes for lazy header matching (zero-copy)
     pub header_data: &'a [u8],
@@ -165,10 +166,17 @@ pub fn extract_routing_info(
         // header_data covers everything from header_start to current pos (end of headers)
         let header_data = &request_data[header_start..pos];
 
+        let raw_path = path.unwrap_or("/");
+        let (clean_path, query_string) = match raw_path.find('?') {
+            Some(pos) => (&raw_path[..pos], &raw_path[pos + 1..]),
+            None => (raw_path, ""),
+        };
+
         Ok(HttpRequestInfo {
             method: method.unwrap_or("GET"),
             host: host.unwrap_or("localhost"),
-            path: path.unwrap_or("/"),
+            path: clean_path,
+            query_string,
             connection_type,
             header_data,
         })
