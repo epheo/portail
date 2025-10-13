@@ -237,29 +237,11 @@ pub fn analyze_udp_request(
     backend_selector: &mut BackendSelector,
     server_port: u16,
 ) -> Result<ProcessingDecision> {
-    let backend_list = match routes.find_udp_backends(server_port) {
-        Ok(list) => list,
-        Err(_) => {
-            error!("UDP routing failed for port {}: no route configured", server_port);
-            return Ok(ProcessingDecision::CloseConnection);
-        }
-    };
-
-    if backend_list.is_empty() {
-        error!("UDP routing failed for port {}: no backends available", server_port);
-        return Ok(ProcessingDecision::CloseConnection);
-    }
-
-    let route_hash = server_port as u64;
-    let backend_index = backend_selector.select_backend(route_hash, backend_list.len());
-    let selected_backend = &backend_list[backend_index];
-
-    debug!("UDP route found: port {} -> backend {}",
-           server_port, selected_backend.socket_addr);
-
-    Ok(ProcessingDecision::UdpForward {
-        backend_addr: selected_backend.socket_addr,
-    })
+    analyze_l4_request(
+        backend_selector, server_port, "UDP",
+        |port| routes.find_udp_backends(port),
+        |addr| ProcessingDecision::UdpForward { backend_addr: addr },
+    )
 }
 
 fn analyze_tcp_request(
@@ -267,16 +249,30 @@ fn analyze_tcp_request(
     backend_selector: &mut BackendSelector,
     server_port: u16,
 ) -> Result<ProcessingDecision> {
-    let backend_list = match routes.find_tcp_backends(server_port) {
+    analyze_l4_request(
+        backend_selector, server_port, "TCP",
+        |port| routes.find_tcp_backends(port),
+        |addr| ProcessingDecision::TcpForward { backend_addr: addr },
+    )
+}
+
+fn analyze_l4_request<'a>(
+    backend_selector: &mut BackendSelector,
+    server_port: u16,
+    proto: &str,
+    lookup: impl FnOnce(u16) -> Result<&'a Vec<crate::routing::Backend>>,
+    make_decision: impl FnOnce(SocketAddr) -> ProcessingDecision,
+) -> Result<ProcessingDecision> {
+    let backend_list = match lookup(server_port) {
         Ok(list) => list,
         Err(_) => {
-            error!("TCP routing failed for port {}: no route configured", server_port);
+            error!("{} routing failed for port {}: no route configured", proto, server_port);
             return Ok(ProcessingDecision::CloseConnection);
         }
     };
 
     if backend_list.is_empty() {
-        error!("TCP routing failed for port {}: no backends available", server_port);
+        error!("{} routing failed for port {}: no backends available", proto, server_port);
         return Ok(ProcessingDecision::CloseConnection);
     }
 
@@ -284,12 +280,10 @@ fn analyze_tcp_request(
     let backend_index = backend_selector.select_backend(route_hash, backend_list.len());
     let selected_backend = &backend_list[backend_index];
 
-    debug!("TCP route found: port {} -> backend {}",
-           server_port, selected_backend.socket_addr);
+    debug!("{} route found: port {} -> backend {}",
+           proto, server_port, selected_backend.socket_addr);
 
-    Ok(ProcessingDecision::TcpForward {
-        backend_addr: selected_backend.socket_addr,
-    })
+    Ok(make_decision(selected_backend.socket_addr))
 }
 
 #[cfg(test)]

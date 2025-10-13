@@ -106,7 +106,7 @@ impl RouteTable {
                 }
                 let all_match = rule.header_matches.iter().all(|hm| {
                     find_header_value(header_data, &hm.name)
-                        .map_or(false, |v| v == hm.value)
+                        .is_some_and(|v| v == hm.value)
                 });
                 if !all_match {
                     continue;
@@ -586,16 +586,14 @@ mod tests {
 }
 
 /// Weighted round-robin backend selector
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BackendSelector {
     route_counters: FnvHashMap<u64, u64>,
 }
 
 impl BackendSelector {
     pub fn new() -> Self {
-        Self {
-            route_counters: FnvHashMap::default(),
-        }
+        Self::default()
     }
 
     /// Select backend using weighted round-robin with pre-computed weights.

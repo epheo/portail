@@ -10,6 +10,8 @@ mod http_parser;
 mod request_processor;
 mod backend_pool;
 mod worker;
+mod udp_worker;
+mod http_filters;
 mod data_plane;
 mod ebpf;
 

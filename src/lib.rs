@@ -6,5 +6,7 @@ pub mod http_parser;
 pub mod request_processor;
 pub mod backend_pool;
 pub mod worker;
+pub mod udp_worker;
+pub mod http_filters;
 pub mod data_plane;
 pub mod ebpf;

@@ -18,6 +18,7 @@ use crate::config::{PerformanceConfig, Protocol};
 use crate::logging::info;
 use crate::routing::RouteTable;
 use crate::worker;
+use crate::udp_worker;
 
 struct TcpListenerEntry {
     worker_id: usize,
@@ -138,7 +139,7 @@ impl DataPlane {
             let session_timeout = self.udp_session_timeout;
 
             let handle = tokio::spawn(async move {
-                worker::run_udp_worker(worker_id, socket, port, routes, session_timeout, shutdown).await;
+                udp_worker::run_udp_worker(worker_id, socket, port, routes, session_timeout, shutdown).await;
             });
 
             self.task_handles.push(handle);
