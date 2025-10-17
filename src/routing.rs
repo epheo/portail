@@ -1,4 +1,5 @@
 use fnv::FnvHashMap;
+use serde::{Serialize, Deserialize};
 use anyhow::{anyhow, Result};
 
 #[derive(Debug, Clone)]
@@ -290,7 +291,7 @@ pub enum URLRewritePath {
     ReplacePrefixMatch(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpHeader {
     pub name: String,
     pub value: String,

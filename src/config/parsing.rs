@@ -2,15 +2,6 @@ use serde::{Deserialize, Deserializer, Serializer, de::Error as DeError};
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 
-/// Deserialize human-readable sizes like "64MB", "1GB", "512KB"
-pub(crate) fn deserialize_size<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    parse_size(&s).map_err(D::Error::custom)
-}
-
 /// Deserialize human-readable durations like "10s", "500ms", "1m"
 pub(crate) fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
@@ -27,49 +18,6 @@ where
 {
     let s = format_duration(duration);
     serializer.serialize_str(&s)
-}
-
-/// Serialize size to human-readable format
-pub(crate) fn serialize_size<S>(size: &usize, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let s = format_size(*size);
-    serializer.serialize_str(&s)
-}
-
-/// Parse human-readable size strings to bytes
-pub(crate) fn parse_size(s: &str) -> Result<usize> {
-    let s = s.trim().to_lowercase();
-
-    if let Ok(bytes) = s.parse::<usize>() {
-        return Ok(bytes);
-    }
-
-    let (number_part, suffix) = if s.ends_with("kb") {
-        (s.trim_end_matches("kb"), 1024)
-    } else if s.ends_with("mb") {
-        (s.trim_end_matches("mb"), 1024 * 1024)
-    } else if s.ends_with("gb") {
-        (s.trim_end_matches("gb"), 1024 * 1024 * 1024)
-    } else if s.ends_with("k") {
-        (s.trim_end_matches("k"), 1024)
-    } else if s.ends_with("m") {
-        (s.trim_end_matches("m"), 1024 * 1024)
-    } else if s.ends_with("g") {
-        (s.trim_end_matches("g"), 1024 * 1024 * 1024)
-    } else {
-        return Err(anyhow!("Invalid size format: {}. Expected format like '64MB', '1GB', '512KB'", s));
-    };
-
-    let number: f64 = number_part.parse()
-        .map_err(|_| anyhow!("Invalid number in size: {}", s))?;
-
-    if number < 0.0 {
-        return Err(anyhow!("Size cannot be negative: {}", s));
-    }
-
-    Ok((number * suffix as f64) as usize)
 }
 
 /// Parse human-readable duration strings to Duration
@@ -123,22 +71,5 @@ pub(crate) fn format_duration(duration: &Duration) -> String {
         format!("{}us", nanos / 1_000)
     } else {
         format!("{}ns", nanos)
-    }
-}
-
-/// Format size to human-readable string
-pub(crate) fn format_size(size: usize) -> String {
-    const GB: usize = 1024 * 1024 * 1024;
-    const MB: usize = 1024 * 1024;
-    const KB: usize = 1024;
-
-    if size >= GB && size % GB == 0 {
-        format!("{}GB", size / GB)
-    } else if size >= MB && size % MB == 0 {
-        format!("{}MB", size / MB)
-    } else if size >= KB && size % KB == 0 {
-        format!("{}KB", size / KB)
-    } else {
-        size.to_string()
     }
 }

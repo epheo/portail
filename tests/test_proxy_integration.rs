@@ -708,7 +708,7 @@ fn test_exact_vs_prefix_path_e2e() {
     ]
   }}],
   "observability": {{"logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}}},
-  "performance": {{"keep_alive_timeout": "5s"}}
+  "performance": {{}}
 }}"#,
         port,
         backend_exact.addr.ip(), backend_exact.addr.port(),

@@ -8,9 +8,6 @@ impl UringRessConfig {
     pub fn validate(&self) -> Result<()> {
         self.gateway.validate()?;
 
-        self.gateway.validate_worker_configs()
-            .map_err(|e| anyhow!("Worker configuration validation failed: {}", e))?;
-
         for (i, route) in self.http_routes.iter().enumerate() {
             route.validate().map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
         }

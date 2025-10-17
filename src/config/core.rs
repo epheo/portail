@@ -90,23 +90,8 @@ impl UringRessConfig {
                             ("/", routing::PathMatchType::Prefix)
                         };
 
-                        let header_matches: Vec<routing::HeaderMatch> = route_match
-                            .headers
-                            .iter()
-                            .map(|hm| routing::HeaderMatch {
-                                name: hm.name.to_ascii_lowercase(),
-                                value: hm.value.clone(),
-                            })
-                            .collect();
-
-                        let query_param_matches: Vec<routing::QueryParamMatch> = route_match
-                            .query_params
-                            .iter()
-                            .map(|qm| routing::QueryParamMatch {
-                                name: qm.name.clone(),
-                                value: qm.value.clone(),
-                            })
-                            .collect();
+                        let header_matches: Vec<routing::HeaderMatch> = route_match.headers.iter().map(Into::into).collect();
+                        let query_param_matches: Vec<routing::QueryParamMatch> = route_match.query_params.iter().map(Into::into).collect();
 
                         tracing::debug!("      Adding route: {} {} -> {} backends",
                             hostname, path, backends.len());
@@ -124,51 +109,8 @@ impl UringRessConfig {
             }
         }
 
-        for tcp_route in &self.tcp_routes {
-            if let Some(parent_ref) = tcp_route.parent_refs.first() {
-                if let Some(section_name) = &parent_ref.section_name {
-                    if let Some(listener) = self.gateway.listeners.iter()
-                        .find(|l| l.name == *section_name && l.protocol == Protocol::TCP) {
-
-                        for rule in &tcp_route.rules {
-                            let mut backends = Vec::new();
-                            for backend_ref in &rule.backend_refs {
-                                let backend = routing::Backend::new(
-                                    backend_ref.name.clone(),
-                                    backend_ref.port
-                                )?;
-                                backends.push(backend);
-                            }
-
-                            route_table.add_tcp_route(listener.port, backends);
-                        }
-                    }
-                }
-            }
-        }
-
-        for udp_route in &self.udp_routes {
-            if let Some(parent_ref) = udp_route.parent_refs.first() {
-                if let Some(section_name) = &parent_ref.section_name {
-                    if let Some(listener) = self.gateway.listeners.iter()
-                        .find(|l| l.name == *section_name && l.protocol == Protocol::UDP) {
-
-                        for rule in &udp_route.rules {
-                            let mut backends = Vec::new();
-                            for backend_ref in &rule.backend_refs {
-                                let backend = routing::Backend::new(
-                                    backend_ref.name.clone(),
-                                    backend_ref.port
-                                )?;
-                                backends.push(backend);
-                            }
-
-                            route_table.add_udp_route(listener.port, backends);
-                        }
-                    }
-                }
-            }
-        }
+        self.convert_l4_routes(&mut route_table, &self.tcp_routes, Protocol::TCP)?;
+        self.convert_l4_routes(&mut route_table, &self.udp_routes, Protocol::UDP)?;
 
         tracing::debug!("Route table conversion completed: {} HTTP routes, {} TCP routes, {} UDP routes",
             route_table.http_routes.len(), route_table.tcp_routes.len(), route_table.udp_routes.len());
@@ -177,75 +119,121 @@ impl UringRessConfig {
     }
 }
 
-fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
-    use crate::routing::{self, URLRewritePath};
+trait L4Route {
+    fn parent_refs(&self) -> &[ParentRef];
+    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]>;
+}
 
-    config_filters
-        .iter()
-        .map(|f| match f {
+impl L4Route for TcpRouteConfig {
+    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
+    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
+        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
+    }
+}
+
+impl L4Route for UdpRouteConfig {
+    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
+    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
+        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
+    }
+}
+
+impl UringRessConfig {
+    fn convert_l4_routes<R: L4Route>(
+        &self,
+        route_table: &mut crate::routing::RouteTable,
+        routes: &[R],
+        protocol: Protocol,
+    ) -> Result<()> {
+        use crate::routing;
+
+        for route in routes {
+            if let Some(parent_ref) = route.parent_refs().first() {
+                if let Some(section_name) = &parent_ref.section_name {
+                    if let Some(listener) = self.gateway.listeners.iter()
+                        .find(|l| l.name == *section_name && l.protocol == protocol) {
+
+                        for backend_refs in route.backend_refs_per_rule() {
+                            let backends: Vec<routing::Backend> = backend_refs.iter()
+                                .map(|br| routing::Backend::new(br.name.clone(), br.port))
+                                .collect::<Result<_>>()?;
+
+                            match protocol {
+                                Protocol::TCP | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
+                                Protocol::UDP => route_table.add_udp_route(listener.port, backends),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
+    config_filters.iter().map(crate::routing::HttpFilter::try_from).collect()
+}
+
+impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
+    type Error = anyhow::Error;
+
+    fn try_from(f: &HttpRouteFilter) -> Result<Self> {
+        Ok(match f {
             HttpRouteFilter::RequestHeaderModifier { add, set, remove } => {
-                Ok(routing::HttpFilter::RequestHeaderModifier {
-                    add: add.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    set: set.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    remove: remove.clone(),
-                })
+                Self::RequestHeaderModifier { add: add.clone(), set: set.clone(), remove: remove.clone() }
             }
             HttpRouteFilter::ResponseHeaderModifier { add, set, remove } => {
-                Ok(routing::HttpFilter::ResponseHeaderModifier {
-                    add: add.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    set: set.iter().map(|h| routing::HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect(),
-                    remove: remove.clone(),
-                })
+                Self::ResponseHeaderModifier { add: add.clone(), set: set.clone(), remove: remove.clone() }
             }
             HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
-                Ok(routing::HttpFilter::RequestRedirect {
-                    scheme: scheme.clone(),
-                    hostname: hostname.clone(),
-                    port: *port,
-                    path: path.clone(),
-                    status_code: *status_code,
-                })
+                Self::RequestRedirect {
+                    scheme: scheme.clone(), hostname: hostname.clone(),
+                    port: *port, path: path.clone(), status_code: *status_code,
+                }
             }
             HttpRouteFilter::URLRewrite { hostname, path } => {
-                Ok(routing::HttpFilter::URLRewrite {
+                Self::URLRewrite {
                     hostname: hostname.clone(),
-                    path: path.as_ref().map(|p| match p {
-                        HttpURLRewritePath::ReplaceFullPath { value } => URLRewritePath::ReplaceFullPath(value.clone()),
-                        HttpURLRewritePath::ReplacePrefixMatch { value } => URLRewritePath::ReplacePrefixMatch(value.clone()),
-                    }),
-                })
+                    path: path.as_ref().map(crate::routing::URLRewritePath::from),
+                }
             }
             HttpRouteFilter::RequestMirror { backend_ref } => {
-                let backend = routing::Backend::with_weight(
-                    backend_ref.name.clone(),
-                    backend_ref.port,
-                    backend_ref.weight,
+                let backend = crate::routing::Backend::with_weight(
+                    backend_ref.name.clone(), backend_ref.port, backend_ref.weight,
                 )?;
-                Ok(routing::HttpFilter::RequestMirror {
-                    backend_addr: backend.socket_addr,
-                })
+                Self::RequestMirror { backend_addr: backend.socket_addr }
             }
         })
-        .collect()
+    }
+}
+
+impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
+    fn from(p: &HttpURLRewritePath) -> Self {
+        match p {
+            HttpURLRewritePath::ReplaceFullPath { value } => Self::ReplaceFullPath(value.clone()),
+            HttpURLRewritePath::ReplacePrefixMatch { value } => Self::ReplacePrefixMatch(value.clone()),
+        }
+    }
+}
+
+impl From<&super::types::HttpHeaderMatch> for crate::routing::HeaderMatch {
+    fn from(hm: &super::types::HttpHeaderMatch) -> Self {
+        Self { name: hm.name.to_ascii_lowercase(), value: hm.value.clone() }
+    }
+}
+
+impl From<&super::types::HttpQueryParamMatch> for crate::routing::QueryParamMatch {
+    fn from(qm: &super::types::HttpQueryParamMatch) -> Self {
+        Self { name: qm.name.clone(), value: qm.value.clone() }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::super::parsing::{parse_size, parse_duration};
+    use super::super::parsing::parse_duration;
     use std::time::Duration;
-
-    #[test]
-    fn test_parse_size() {
-        assert_eq!(parse_size("1024").unwrap(), 1024);
-        assert_eq!(parse_size("1KB").unwrap(), 1024);
-        assert_eq!(parse_size("1mb").unwrap(), 1024 * 1024);
-        assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("0.5MB").unwrap(), 512 * 1024);
-
-        assert!(parse_size("invalid").is_err());
-        assert!(parse_size("-1MB").is_err());
-    }
 
     #[test]
     fn test_parse_duration() {
@@ -285,16 +273,12 @@ mod tests {
                     }
                 ],
                 "worker_threads": 8
-            },
-            "performance": {
-                "keep_alive_timeout": "10s"
             }
         }"#;
 
         let config: UringRessConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.gateway.listeners[0].port, 9000);
-        assert_eq!(config.performance.keep_alive_timeout, Duration::from_secs(10));
     }
 
     #[test]

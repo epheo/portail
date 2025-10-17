@@ -3,6 +3,7 @@
 //! Analyzes incoming data and produces routing decisions.
 //! Works on byte slices — no I/O runtime dependency.
 
+use std::hash::Hasher;
 use anyhow::Result;
 use std::net::SocketAddr;
 use crate::logging::{debug, error};
@@ -96,14 +97,9 @@ fn is_http_request(data: &[u8]) -> bool {
 
 #[inline(always)]
 fn compute_route_hash(path: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in path.as_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(path.as_bytes());
+    hasher.finish()
 }
 
 fn analyze_http_request(
@@ -158,7 +154,6 @@ fn analyze_http_request(
                     hostname.as_deref().unwrap_or(request_info.host),
                     *port,
                     path.as_deref().unwrap_or(request_info.path),
-                    request_info.host,
                 );
                 return Ok(ProcessingDecision::HttpRedirect {
                     status_code: *status_code,
@@ -222,13 +217,11 @@ fn build_redirect_location(
     hostname: &str,
     port: Option<u16>,
     path: &str,
-    original_host: &str,
 ) -> String {
     let scheme = scheme.unwrap_or("http");
-    let host = if hostname == original_host { original_host } else { hostname };
     match port {
-        Some(p) => format!("{}://{}:{}{}", scheme, host, p, path),
-        None => format!("{}://{}{}", scheme, host, path),
+        Some(p) => format!("{}://{}:{}{}", scheme, hostname, p, path),
+        None => format!("{}://{}{}", scheme, hostname, path),
     }
 }
 

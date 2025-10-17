@@ -523,9 +523,7 @@ fn build_test_config_with_tcp(
   "observability": {{
     "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
   }},
-  "performance": {{
-    "keep_alive_timeout": "5s"
-  }}
+  "performance": {{}}
 }}"#,
         listeners,
         http_routes_section,
@@ -674,9 +672,7 @@ pub fn build_test_config_with_filters(
   "observability": {{
     "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
   }},
-  "performance": {{
-    "keep_alive_timeout": "5s"
-  }}
+  "performance": {{}}
 }}"#,
         proxy_port,
         hostnames_json.join(", "),

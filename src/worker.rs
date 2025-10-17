@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
-use crate::http_filters::{find_header_end, apply_request_modifications, apply_response_header_mods, dispatch_mirrors};
+use crate::http_filters::{apply_request_modifications, apply_response_header_mods, dispatch_mirrors};
+use crate::http_parser::find_header_end;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
@@ -339,26 +340,12 @@ async fn send_error_response(client: &mut TcpStream, error_code: u16) -> Result<
 
 // --- HTTP response parsing helpers ---
 
-fn find_response_header_value<'a>(headers: &'a [u8], name: &str) -> Option<&'a str> {
-    let headers_str = std::str::from_utf8(headers).ok()?;
-    let name_colon_len = name.len() + 1; // "Name:"
-    for line in headers_str.lines() {
-        if line.len() > name_colon_len
-            && line.as_bytes()[name.len()] == b':'
-            && line[..name.len()].eq_ignore_ascii_case(name)
-        {
-            return Some(line[name_colon_len..].trim());
-        }
-    }
-    None
-}
-
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    find_response_header_value(headers, "content-length")?.parse().ok()
+    crate::routing::find_header_value(headers, "content-length")?.parse().ok()
 }
 
 fn is_chunked_transfer(headers: &[u8]) -> bool {
-    find_response_header_value(headers, "transfer-encoding")
+    crate::routing::find_header_value(headers, "transfer-encoding")
         .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
 }
 

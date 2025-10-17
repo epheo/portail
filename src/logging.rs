@@ -128,7 +128,11 @@ pub fn init_logging(verbose_level: u8, config: Option<&crate::config::LoggingCon
         }
 
         match logging_config.format {
-            LogFormat::Json | LogFormat::Compact => {
+            LogFormat::Json => {
+                let s = fmt().with_env_filter(filter).with_target(true).json();
+                init_subscriber!(s, &logging_config.output);
+            }
+            LogFormat::Compact => {
                 let mut s = fmt().with_env_filter(filter).with_target(true).compact();
                 if show_details {
                     s = s.with_file(true).with_line_number(true);

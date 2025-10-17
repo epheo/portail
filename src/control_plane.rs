@@ -8,8 +8,8 @@ use crate::routing::RouteTable;
 use crate::config::UringRessConfig;
 use crate::ebpf::{initialize_ebpf_system, UnifiedEbpfManager};
 
-/// Control Plane running on dedicated Tokio runtime
-/// Handles configuration management, eBPF coordination, and routing
+/// Control Plane — shares the main Tokio runtime.
+/// Handles configuration management, eBPF coordination, and routing.
 pub struct ControlPlane {
     pub ebpf_manager: UnifiedEbpfManager,
     config: UringRessConfig,
@@ -28,27 +28,21 @@ impl ControlPlane {
         })
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&self) -> Result<()> {
         info!("Starting Control Plane");
-        self.setup_configured_routes(&self.config.clone())?;
+        let route_table = self.config.to_route_table()
+            .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
+        self.update_routes(route_table)?;
+        info!("Routes loaded: {} HTTP routes, {} TCP routes",
+              self.config.http_routes.len(), self.config.tcp_routes.len());
         info!("Control Plane started successfully");
         Ok(())
     }
-    
-    /// Wait for shutdown signal
+
     pub async fn wait_for_shutdown(&self) -> Result<()> {
         info!("Control Plane waiting for shutdown signal");
         signal::ctrl_c().await?;
         info!("Control Plane received shutdown signal");
-        Ok(())
-    }
-    
-    fn setup_configured_routes(&mut self, config: &UringRessConfig) -> Result<()> {
-        let route_table = config.to_route_table()
-            .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
-        self.update_routes(route_table)?;
-        info!("Routes loaded: {} HTTP routes, {} TCP routes",
-              config.http_routes.len(), config.tcp_routes.len());
         Ok(())
     }
     

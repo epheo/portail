@@ -24,14 +24,14 @@ struct TcpListenerEntry {
     worker_id: usize,
     port: u16,
     raw_fd: RawFd,
-    listener: Option<TcpListener>,
+    listener: TcpListener,
 }
 
 struct UdpListenerEntry {
     worker_id: usize,
     port: u16,
     raw_fd: RawFd,
-    socket: Option<UdpSocket>,
+    socket: UdpSocket,
 }
 
 pub struct DataPlane {
@@ -71,7 +71,7 @@ impl DataPlane {
                             worker_id,
                             port: *port,
                             raw_fd,
-                            listener: Some(tokio_listener),
+                            listener: tokio_listener,
                         });
 
                         info!("Worker {} TCP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
@@ -85,7 +85,7 @@ impl DataPlane {
                             worker_id,
                             port: *port,
                             raw_fd,
-                            socket: Some(tokio_socket),
+                            socket: tokio_socket,
                         });
 
                         info!("Worker {} UDP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
@@ -115,38 +115,35 @@ impl DataPlane {
 
     /// Start async worker tasks — call after eBPF programs are attached.
     pub fn start(&mut self, routes: Arc<ArcSwap<RouteTable>>) {
-        for entry in &mut self.tcp_listeners {
-            let listener = entry.listener.take().expect("listener already started");
+        let tcp_count = self.tcp_listeners.len();
+        let udp_count = self.udp_listeners.len();
+
+        for entry in self.tcp_listeners.drain(..) {
             let routes = routes.clone();
             let pool = self.pool.clone();
             let shutdown = self.shutdown.clone();
-            let worker_id = entry.worker_id;
-            let port = entry.port;
 
             let handle = tokio::spawn(async move {
-                worker::run_worker(worker_id, listener, port, routes, pool, shutdown).await;
+                worker::run_worker(entry.worker_id, entry.listener, entry.port, routes, pool, shutdown).await;
             });
 
             self.task_handles.push(handle);
         }
 
-        for entry in &mut self.udp_listeners {
-            let socket = Arc::new(entry.socket.take().expect("socket already started"));
+        for entry in self.udp_listeners.drain(..) {
+            let socket = Arc::new(entry.socket);
             let routes = routes.clone();
             let shutdown = self.shutdown.clone();
-            let worker_id = entry.worker_id;
-            let port = entry.port;
             let session_timeout = self.udp_session_timeout;
 
             let handle = tokio::spawn(async move {
-                udp_worker::run_udp_worker(worker_id, socket, port, routes, session_timeout, shutdown).await;
+                udp_worker::run_udp_worker(entry.worker_id, socket, entry.port, routes, session_timeout, shutdown).await;
             });
 
             self.task_handles.push(handle);
         }
 
-        info!("Data plane started: {} TCP + {} UDP worker tasks",
-            self.tcp_listeners.len(), self.udp_listeners.len());
+        info!("Data plane started: {} TCP + {} UDP worker tasks", tcp_count, udp_count);
     }
 
     /// Signal shutdown and wait for all workers to finish.

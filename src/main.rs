@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         .map(|l| (l.port, l.protocol.clone()))
         .collect();
     let performance_config = uringress_config.performance.clone();
-    let worker_count = uringress_config.gateway.get_worker_configs().len();
+    let worker_count = uringress_config.gateway.worker_threads;
 
     info!("Configuration loaded: {} listeners, {} HTTP routes, {} TCP routes, {} UDP routes",
           uringress_config.gateway.listeners.len(),

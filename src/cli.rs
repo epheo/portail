@@ -25,12 +25,6 @@ pub struct Args {
     #[arg(conflicts_with_all = ["validate_only"])]
     pub check_config: bool,
 
-    /// Override number of worker threads
-    #[arg(short, long, value_name = "COUNT")]
-    #[arg(help = "Override number of worker threads (1-256)")]
-    #[arg(value_parser = clap::value_parser!(usize))]
-    pub workers: Option<usize>,
-
     /// Enable verbose logging
     #[arg(short, long)]
     #[arg(help = "Enable verbose logging output")]
@@ -84,13 +78,6 @@ impl Args {
             return Err("--check-config and --validate-only require --config to be specified".to_string());
         }
 
-        // Validate worker count
-        if let Some(workers) = self.workers {
-            if workers == 0 || workers > 256 {
-                return Err("Worker count must be between 1 and 256".to_string());
-            }
-        }
-
         Ok(())
     }
 
@@ -122,7 +109,7 @@ mod tests {
             validate_only: false,
             check_config: false,
 
-            workers: None,
+
             verbose: 0,
             example_config: false,
             generate_config: None,
@@ -135,7 +122,7 @@ mod tests {
             validate_only: false,
             check_config: false,
 
-            workers: None,
+
             verbose: 0,
             example_config: false,
             generate_config: None,
@@ -148,7 +135,7 @@ mod tests {
             validate_only: false,
             check_config: false,
 
-            workers: None,
+
             verbose: 0,
             example_config: false,
             generate_config: None,
@@ -164,7 +151,7 @@ mod tests {
             validate_only: true,
             check_config: false,
 
-            workers: None,
+
             verbose: 0,
             example_config: false,
             generate_config: None,
@@ -177,7 +164,7 @@ mod tests {
             validate_only: false,
             check_config: true,
 
-            workers: None,
+
             verbose: 0,
             example_config: false,
             generate_config: None,
@@ -186,19 +173,4 @@ mod tests {
         assert!(args.validate().is_err());
     }
 
-    #[test]
-    fn test_worker_count_parsing() {
-        let args = Args {
-            config: None,
-            validate_only: false,
-            check_config: false,
-
-            workers: Some(8),
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-        };
-        assert_eq!(args.workers.unwrap(), 8);
-    }
 }

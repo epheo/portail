@@ -18,7 +18,6 @@ impl UringRessConfig {
                         interface: None,
                     },
                 ],
-                workers: None,
                 worker_threads: 2,
             },
             http_routes: vec![
@@ -49,7 +48,6 @@ impl UringRessConfig {
                 },
             },
             performance: PerformanceConfig {
-                keep_alive_timeout: Duration::from_secs(5),
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
             },
@@ -80,12 +78,6 @@ impl UringRessConfig {
                         interface: Some("lo".to_string()),
                     },
                 ],
-                workers: Some(vec![
-                    WorkerConfig { id: 0, buffer_size: 16384, buffer_count: 256, tcp_nodelay: true },
-                    WorkerConfig { id: 1, buffer_size: 16384, buffer_count: 256, tcp_nodelay: true },
-                    WorkerConfig { id: 2, buffer_size: 16384, buffer_count: 256, tcp_nodelay: true },
-                    WorkerConfig { id: 3, buffer_size: 16384, buffer_count: 256, tcp_nodelay: true },
-                ]),
                 worker_threads: 4,
             },
             http_routes: vec![
@@ -205,7 +197,6 @@ impl UringRessConfig {
                 },
             },
             performance: PerformanceConfig {
-                keep_alive_timeout: Duration::from_secs(10),
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
             },

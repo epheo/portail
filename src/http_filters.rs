@@ -7,13 +7,8 @@ use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use crate::http_parser::find_header_end;
 use crate::request_processor::{HeaderModifications, URLRewrite, RewrittenPath};
-
-pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|pos| pos + 4)
-}
 
 /// Fire-and-forget mirror dispatch. Response is discarded per Gateway API spec.
 pub(crate) fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {

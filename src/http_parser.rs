@@ -4,6 +4,14 @@
 use anyhow::Result;
 use crate::logging::debug;
 
+/// Find the end of HTTP headers (\r\n\r\n boundary).
+/// Returns the position just past the double CRLF.
+pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
 /// HTTP Connection header preference
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionType {
