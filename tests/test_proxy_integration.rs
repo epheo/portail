@@ -475,7 +475,7 @@ fn extract_request_header_value(raw_request: &[u8], name: &str) -> Option<String
 fn test_url_rewrite_full_path_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(20);
-    let filter = r#"{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/new"}}"#;
+    let filter = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/new"}}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
@@ -497,7 +497,7 @@ fn test_url_rewrite_full_path_e2e() {
 fn test_url_rewrite_prefix_replace_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(21);
-    let filter = r#"{"type": "URLRewrite", "path": {"type": "ReplacePrefixMatch", "value": "/v2"}}"#;
+    let filter = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/v1", backend.addr, filter)],
         port,
@@ -519,7 +519,7 @@ fn test_url_rewrite_prefix_replace_e2e() {
 fn test_url_rewrite_hostname_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(22);
-    let filter = r#"{"type": "URLRewrite", "hostname": "rewritten.example.com"}"#;
+    let filter = r#"{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.example.com"}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
@@ -541,7 +541,7 @@ fn test_url_rewrite_hostname_e2e() {
 fn test_request_header_modifier_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(23);
-    let filter = r#"{"type": "RequestHeaderModifier", "add": [{"name": "X-Added", "value": "yes"}], "remove": ["User-Agent"]}"#;
+    let filter = r#"{"type": "RequestHeaderModifier", "requestHeaderModifier": {"add": [{"name": "X-Added", "value": "yes"}], "remove": ["User-Agent"]}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
@@ -588,7 +588,7 @@ fn test_response_header_modifier_e2e() {
     });
 
     let port = proxy_port(24);
-    let filter = r#"{"type": "ResponseHeaderModifier", "remove": ["X-Internal"]}"#;
+    let filter = r#"{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["X-Internal"]}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/", backend_addr, filter)],
         port,
@@ -608,7 +608,7 @@ fn test_response_header_modifier_e2e() {
 #[ignore]
 fn test_request_redirect_e2e() {
     let port = proxy_port(25);
-    let filter = r#"{"type": "RequestRedirect", "hostname": "other.com", "status_code": 301}"#;
+    let filter = r#"{"type": "RequestRedirect", "requestRedirect": {"hostname": "other.com", "statusCode": 301}}"#;
     // Redirect rules don't need backend_refs, but our helper always adds one.
     // The proxy should return redirect before contacting any backend.
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -634,7 +634,7 @@ fn test_request_mirror_e2e() {
     let port = proxy_port(26);
 
     let filter = format!(
-        r#"{{"type": "RequestMirror", "backend_ref": {{"name": "{}", "port": {}}}}}"#,
+        r#"{{"type": "RequestMirror", "requestMirror": {{"backendRef": {{"name": "{}", "port": {}}}}}}}"#,
         mirror.addr.ip(), mirror.addr.port()
     );
     let proxy = UringRessProcess::spawn_with_filters(
@@ -658,7 +658,7 @@ fn test_request_mirror_e2e() {
 fn test_filter_combination_rewrite_plus_header_mod() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(27);
-    let filters = r#"{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/new"}}, {"type": "RequestHeaderModifier", "add": [{"name": "X-Rewritten", "value": "true"}]}"#;
+    let filters = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/new"}}}, {"type": "RequestHeaderModifier", "requestHeaderModifier": {"add": [{"name": "X-Rewritten", "value": "true"}]}}"#;
     let proxy = UringRessProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filters)],
         port,
@@ -691,19 +691,19 @@ fn test_exact_vs_prefix_path_e2e() {
   "gateway": {{
     "name": "test-gateway",
     "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
-    "worker_threads": 1
+    "workerThreads": 1
   }},
-  "http_routes": [{{
-    "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
+  "httpRoutes": [{{
+    "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],
     "hostnames": ["localhost"],
     "rules": [
       {{
         "matches": [{{"path": {{"type": "Exact", "value": "/foo"}}}}],
-        "backend_refs": [{{"name": "{}", "port": {}}}]
+        "backendRefs": [{{"name": "{}", "port": {}}}]
       }},
       {{
         "matches": [{{"path": {{"type": "PathPrefix", "value": "/foo"}}}}],
-        "backend_refs": [{{"name": "{}", "port": {}}}]
+        "backendRefs": [{{"name": "{}", "port": {}}}]
       }}
     ]
   }}],

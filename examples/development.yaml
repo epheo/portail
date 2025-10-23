@@ -11,11 +11,11 @@ gateway:
     port: 2222
     address: 127.0.0.1
     interface: lo
-  worker_threads: 4
-http_routes:
-- parent_refs:
+  workerThreads: 4
+httpRoutes:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -23,12 +23,12 @@ http_routes:
     - path:
         type: PathPrefix
         value: /
-    backend_refs:
+    backendRefs:
     - name: frontend-service
       port: 3001
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -36,16 +36,16 @@ http_routes:
     - path:
         type: PathPrefix
         value: /index.html
-    backend_refs:
+    backendRefs:
     - name: frontend-service-1
       port: 3001
     - name: frontend-service-2
       port: 3002
     - name: frontend-service-3
       port: 3003
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -53,12 +53,12 @@ http_routes:
     - path:
         type: PathPrefix
         value: /api.json
-    backend_refs:
+    backendRefs:
     - name: api-service
       port: 3001
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -66,12 +66,12 @@ http_routes:
     - path:
         type: PathPrefix
         value: /users.json
-    backend_refs:
+    backendRefs:
     - name: users-service
       port: 3002
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -79,12 +79,12 @@ http_routes:
     - path:
         type: PathPrefix
         value: /dataset.json
-    backend_refs:
+    backendRefs:
     - name: dataset-service
       port: 3003
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -92,12 +92,12 @@ http_routes:
     - path:
         type: PathPrefix
         value: /health
-    backend_refs:
+    backendRefs:
     - name: api-service
       port: 3001
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -107,15 +107,16 @@ http_routes:
         value: /v1
     filters:
     - type: URLRewrite
-      path:
-        type: ReplacePrefixMatch
-        value: /v2
-    backend_refs:
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v2
+    backendRefs:
     - name: api-service
       port: 3001
-- parent_refs:
+- parentRefs:
   - name: development-gateway
-    section_name: http
+    sectionName: http
   hostnames:
   - localhost
   rules:
@@ -125,26 +126,27 @@ http_routes:
         value: /mirrored
     filters:
     - type: RequestMirror
-      backend_ref:
-        name: 127.0.0.1
-        port: 9999
-    backend_refs:
+      requestMirror:
+        backendRef:
+          name: 127.0.0.1
+          port: 9999
+    backendRefs:
     - name: api-service
       port: 3001
-tcp_routes:
-- parent_refs:
+tcpRoutes:
+- parentRefs:
   - name: development-gateway
-    section_name: tcp-ssh
+    sectionName: tcp-ssh
   rules:
-  - backend_refs:
+  - backendRefs:
     - name: ssh-service
       port: 2242
-udp_routes: []
+udpRoutes: []
 observability:
   logging:
     level: debug
     format: pretty
     output: stdout
 performance:
-  backend_timeout: 30s
-  udp_session_timeout: 30s
+  backendTimeout: 30s
+  udpSessionTimeout: 30s

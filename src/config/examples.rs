@@ -154,8 +154,10 @@ impl UringRessConfig {
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![HttpRouteFilter::URLRewrite {
-                            hostname: None,
-                            path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                            config: URLRewriteConfig {
+                                hostname: None,
+                                path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                            },
                         }],
                         matches: vec![HttpRouteMatch::path_prefix("/v1")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
@@ -166,7 +168,9 @@ impl UringRessConfig {
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![HttpRouteFilter::RequestMirror {
-                            backend_ref: BackendRef { name: "127.0.0.1".to_string(), port: 9999, weight: 1 },
+                            config: RequestMirrorConfig {
+                                backend_ref: BackendRef { name: "127.0.0.1".to_string(), port: 9999, weight: 1 },
+                            },
                         }],
                         matches: vec![HttpRouteMatch::path_prefix("/mirrored")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],

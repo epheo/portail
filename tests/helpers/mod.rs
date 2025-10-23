@@ -461,7 +461,7 @@ fn build_test_config_with_tcp(
         backend_refs.push(format!(
             r#"{{
                 "matches": [{{"path": {{"type": "PathPrefix", "value": "{}"}}}}],
-                "backend_refs": [{{"name": "{}", "port": {}}}]
+                "backendRefs": [{{"name": "{}", "port": {}}}]
             }}"#,
             path,
             backend_addr.ip(),
@@ -481,8 +481,8 @@ fn build_test_config_with_tcp(
         ));
         tcp_route_entries.push(format!(
             r#"{{
-      "parent_refs": [{{"name": "test-gateway", "section_name": "{}"}}],
-      "rules": [{{"backend_refs": [{{"name": "{}", "port": {}}}]}}]
+      "parentRefs": [{{"name": "test-gateway", "sectionName": "{}"}}],
+      "rules": [{{"backendRefs": [{{"name": "{}", "port": {}}}]}}]
     }}"#,
             name, backend_addr.ip(), backend_addr.port()
         ));
@@ -502,7 +502,7 @@ fn build_test_config_with_tcp(
     } else {
         format!(
             r#"[{{
-      "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
+      "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],
       "hostnames": [{}],
       "rules": [{}]
     }}]"#,
@@ -516,10 +516,10 @@ fn build_test_config_with_tcp(
   "gateway": {{
     "name": "test-gateway",
     "listeners": [{}],
-    "worker_threads": 1
+    "workerThreads": 1
   }},
-  "http_routes": {},
-  "tcp_routes": [{}],
+  "httpRoutes": {},
+  "tcpRoutes": [{}],
   "observability": {{
     "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
   }},
@@ -649,7 +649,7 @@ pub fn build_test_config_with_filters(
             r#"{{
                 "matches": [{{"path": {{"type": "PathPrefix", "value": "{}"}}}}],
                 {}
-                "backend_refs": [{{"name": "{}", "port": {}}}]
+                "backendRefs": [{{"name": "{}", "port": {}}}]
             }}"#,
             path, filters_part, backend_addr.ip(), backend_addr.port()
         ));
@@ -662,10 +662,10 @@ pub fn build_test_config_with_filters(
   "gateway": {{
     "name": "test-gateway",
     "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
-    "worker_threads": 1
+    "workerThreads": 1
   }},
-  "http_routes": [{{
-    "parent_refs": [{{"name": "test-gateway", "section_name": "http"}}],
+  "httpRoutes": [{{
+    "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],
     "hostnames": [{}],
     "rules": [{}]
   }}],

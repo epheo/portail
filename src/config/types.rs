@@ -17,6 +17,7 @@ pub enum Protocol {
 /// Gateway configuration following Kubernetes Gateway API specification
 /// Defines the infrastructure layer with listeners for different protocols and ports
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     #[serde(default = "default_gateway_name")]
@@ -74,6 +75,7 @@ impl Default for GatewayConfig {
 /// Root configuration structure for UringRess
 /// All parsing happens once at startup - zero runtime overhead
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UringRessConfig {
     #[serde(default)]
@@ -98,6 +100,7 @@ pub struct UringRessConfig {
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
 /// Defines how HTTP traffic is routed based on hostnames and request matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct HttpRouteConfig {
     #[serde(default)]
@@ -109,6 +112,7 @@ pub struct HttpRouteConfig {
 
 /// Reference to a Gateway that this route attaches to
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ParentRef {
     pub name: String,
@@ -118,6 +122,7 @@ pub struct ParentRef {
 
 /// HTTP route rule with matches and backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HttpRouteRule {
     #[serde(default)]
     pub matches: Vec<HttpRouteMatch>,
@@ -128,6 +133,7 @@ pub struct HttpRouteRule {
 
 /// HTTP route match conditions
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HttpRouteMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -170,54 +176,93 @@ pub struct HttpHeaderMatch {
     pub value: String,
 }
 
+/// Header modification config shared by request/response header modifiers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderModifierConfig {
+    #[serde(default)]
+    pub add: Vec<HttpHeader>,
+    #[serde(default)]
+    pub set: Vec<HttpHeader>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// RequestRedirect config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRedirectConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<HttpURLRewritePath>,
+    #[serde(default = "default_redirect_status")]
+    pub status_code: u16,
+}
+
+/// URLRewrite config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct URLRewriteConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<HttpURLRewritePath>,
+}
+
+/// RequestMirror config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestMirrorConfig {
+    pub backend_ref: BackendRef,
+}
+
 /// HTTP route filter (Gateway API spec)
+///
+/// Wire format nests each filter's config under a camelCase key matching the type:
+/// ```yaml
+/// - type: RequestHeaderModifier
+///   requestHeaderModifier:
+///     add: [...]
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HttpRouteFilter {
     RequestHeaderModifier {
-        #[serde(default)]
-        add: Vec<HttpHeader>,
-        #[serde(default)]
-        set: Vec<HttpHeader>,
-        #[serde(default)]
-        remove: Vec<String>,
+        #[serde(rename = "requestHeaderModifier")]
+        config: HeaderModifierConfig,
     },
     ResponseHeaderModifier {
-        #[serde(default)]
-        add: Vec<HttpHeader>,
-        #[serde(default)]
-        set: Vec<HttpHeader>,
-        #[serde(default)]
-        remove: Vec<String>,
+        #[serde(rename = "responseHeaderModifier")]
+        config: HeaderModifierConfig,
     },
     RequestRedirect {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        scheme: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hostname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
-        #[serde(default = "default_redirect_status")]
-        status_code: u16,
+        #[serde(rename = "requestRedirect")]
+        config: RequestRedirectConfig,
     },
     URLRewrite {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hostname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        path: Option<HttpURLRewritePath>,
+        #[serde(rename = "urlRewrite")]
+        config: URLRewriteConfig,
     },
     RequestMirror {
-        backend_ref: BackendRef,
+        #[serde(rename = "requestMirror")]
+        config: RequestMirrorConfig,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HttpURLRewritePath {
-    ReplaceFullPath { value: String },
-    ReplacePrefixMatch { value: String },
+    ReplaceFullPath {
+        #[serde(rename = "replaceFullPath")]
+        value: String,
+    },
+    ReplacePrefixMatch {
+        #[serde(rename = "replacePrefixMatch")]
+        value: String,
+    },
 }
 
 fn default_redirect_status() -> u16 {
@@ -260,6 +305,7 @@ impl HttpRouteMatch {
 
 /// TCP route configuration following Kubernetes Gateway API TCPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct TcpRouteConfig {
     #[serde(default)]
@@ -269,6 +315,7 @@ pub struct TcpRouteConfig {
 
 /// TCP route rule with backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct TcpRouteRule {
     pub backend_refs: Vec<BackendRef>,
@@ -276,6 +323,7 @@ pub struct TcpRouteRule {
 
 /// UDP route configuration following Kubernetes Gateway API UDPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UdpRouteConfig {
     #[serde(default)]
@@ -285,6 +333,7 @@ pub struct UdpRouteConfig {
 
 /// UDP route rule with backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UdpRouteRule {
     pub backend_refs: Vec<BackendRef>,
@@ -347,6 +396,7 @@ pub enum LogOutput {
 /// Performance configuration
 /// All values pre-computed at startup for zero runtime overhead
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
     #[serde(default = "default_backend_timeout", deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]

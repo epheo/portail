@@ -323,39 +323,42 @@ fn validate_query_param_match(qp: &HttpQueryParamMatch) -> Result<()> {
     Ok(())
 }
 
+fn validate_rewrite_path(p: &HttpURLRewritePath) -> Result<()> {
+    let value = match p {
+        HttpURLRewritePath::ReplaceFullPath { value } => value,
+        HttpURLRewritePath::ReplacePrefixMatch { value } => value,
+    };
+    if !value.starts_with('/') {
+        return Err(anyhow!("path value must start with '/'"));
+    }
+    Ok(())
+}
+
 fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
     match filter {
-        HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
-            if scheme.is_none() && hostname.is_none() && port.is_none() && path.is_none() {
+        HttpRouteFilter::RequestRedirect { config } => {
+            if config.scheme.is_none() && config.hostname.is_none() && config.port.is_none() && config.path.is_none() {
                 return Err(anyhow!("RequestRedirect must set at least one of: scheme, hostname, port, path"));
             }
-            match status_code {
+            match config.status_code {
                 301 | 302 | 303 | 307 | 308 => {}
-                _ => return Err(anyhow!("RequestRedirect status_code must be 301, 302, 303, 307, or 308, got {}", status_code)),
+                _ => return Err(anyhow!("RequestRedirect status_code must be 301, 302, 303, 307, or 308, got {}", config.status_code)),
             }
-            if let Some(p) = path {
-                if !p.starts_with('/') {
-                    return Err(anyhow!("RequestRedirect path must start with '/', got '{}'", p));
-                }
+            if let Some(ref p) = config.path {
+                validate_rewrite_path(p).map_err(|e| anyhow!("RequestRedirect {}", e))?;
             }
         }
         HttpRouteFilter::RequestHeaderModifier { .. } | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
-        HttpRouteFilter::URLRewrite { hostname, path } => {
-            if hostname.is_none() && path.is_none() {
+        HttpRouteFilter::URLRewrite { config } => {
+            if config.hostname.is_none() && config.path.is_none() {
                 return Err(anyhow!("URLRewrite must set at least one of: hostname, path"));
             }
-            if let Some(ref p) = path {
-                let value = match p {
-                    HttpURLRewritePath::ReplaceFullPath { value } => value,
-                    HttpURLRewritePath::ReplacePrefixMatch { value } => value,
-                };
-                if !value.starts_with('/') {
-                    return Err(anyhow!("URLRewrite path value must start with '/'"));
-                }
+            if let Some(ref p) = config.path {
+                validate_rewrite_path(p).map_err(|e| anyhow!("URLRewrite {}", e))?;
             }
         }
-        HttpRouteFilter::RequestMirror { backend_ref } => {
-            backend_ref.validate()?;
+        HttpRouteFilter::RequestMirror { config } => {
+            config.backend_ref.validate()?;
         }
     }
     Ok(())
@@ -380,7 +383,7 @@ mod tests {
     #[test]
     fn test_url_rewrite_requires_at_least_one_field() {
         let rule = make_rule(
-            vec![HttpRouteFilter::URLRewrite { hostname: None, path: None }],
+            vec![HttpRouteFilter::URLRewrite { config: URLRewriteConfig { hostname: None, path: None } }],
             vec![default_backend()],
         );
         assert!(rule.validate().is_err());
@@ -390,8 +393,10 @@ mod tests {
     fn test_url_rewrite_path_must_start_with_slash() {
         let rule = make_rule(
             vec![HttpRouteFilter::URLRewrite {
-                hostname: None,
-                path: Some(HttpURLRewritePath::ReplaceFullPath { value: "foo".to_string() }),
+                config: URLRewriteConfig {
+                    hostname: None,
+                    path: Some(HttpURLRewritePath::ReplaceFullPath { value: "foo".to_string() }),
+                },
             }],
             vec![default_backend()],
         );
@@ -403,15 +408,19 @@ mod tests {
         let rule = make_rule(
             vec![
                 HttpRouteFilter::URLRewrite {
-                    hostname: Some("new.com".to_string()),
-                    path: None,
+                    config: URLRewriteConfig {
+                        hostname: Some("new.com".to_string()),
+                        path: None,
+                    },
                 },
                 HttpRouteFilter::RequestRedirect {
-                    scheme: Some("https".to_string()),
-                    hostname: None,
-                    port: None,
-                    path: None,
-                    status_code: 301,
+                    config: RequestRedirectConfig {
+                        scheme: Some("https".to_string()),
+                        hostname: None,
+                        port: None,
+                        path: None,
+                        status_code: 301,
+                    },
                 },
             ],
             vec![default_backend()],
@@ -423,7 +432,9 @@ mod tests {
     fn test_request_mirror_empty_backend_name() {
         let rule = make_rule(
             vec![HttpRouteFilter::RequestMirror {
-                backend_ref: BackendRef { name: "".to_string(), port: 8080, weight: 1 },
+                config: RequestMirrorConfig {
+                    backend_ref: BackendRef { name: "".to_string(), port: 8080, weight: 1 },
+                },
             }],
             vec![default_backend()],
         );
@@ -434,8 +445,10 @@ mod tests {
     fn test_url_rewrite_valid_full_path() {
         let rule = make_rule(
             vec![HttpRouteFilter::URLRewrite {
-                hostname: None,
-                path: Some(HttpURLRewritePath::ReplaceFullPath { value: "/new".to_string() }),
+                config: URLRewriteConfig {
+                    hostname: None,
+                    path: Some(HttpURLRewritePath::ReplaceFullPath { value: "/new".to_string() }),
+                },
             }],
             vec![default_backend()],
         );
@@ -446,8 +459,10 @@ mod tests {
     fn test_url_rewrite_valid_prefix_match() {
         let rule = make_rule(
             vec![HttpRouteFilter::URLRewrite {
-                hostname: None,
-                path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                config: URLRewriteConfig {
+                    hostname: None,
+                    path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                },
             }],
             vec![default_backend()],
         );
@@ -458,11 +473,13 @@ mod tests {
     fn test_redirect_without_backends_ok() {
         let rule = make_rule(
             vec![HttpRouteFilter::RequestRedirect {
-                scheme: Some("https".to_string()),
-                hostname: None,
-                port: None,
-                path: None,
-                status_code: 301,
+                config: RequestRedirectConfig {
+                    scheme: Some("https".to_string()),
+                    hostname: None,
+                    port: None,
+                    path: None,
+                    status_code: 301,
+                },
             }],
             vec![], // no backends
         );
@@ -473,8 +490,10 @@ mod tests {
     fn test_rewrite_requires_backends() {
         let rule = make_rule(
             vec![HttpRouteFilter::URLRewrite {
-                hostname: Some("new.com".to_string()),
-                path: None,
+                config: URLRewriteConfig {
+                    hostname: Some("new.com".to_string()),
+                    path: None,
+                },
             }],
             vec![], // no backends — rewrite needs a backend to forward to
         );

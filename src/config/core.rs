@@ -180,31 +180,47 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
 
     fn try_from(f: &HttpRouteFilter) -> Result<Self> {
         Ok(match f {
-            HttpRouteFilter::RequestHeaderModifier { add, set, remove } => {
-                Self::RequestHeaderModifier { add: add.clone(), set: set.clone(), remove: remove.clone() }
+            HttpRouteFilter::RequestHeaderModifier { config } => {
+                Self::RequestHeaderModifier {
+                    add: config.add.clone(), set: config.set.clone(), remove: config.remove.clone(),
+                }
             }
-            HttpRouteFilter::ResponseHeaderModifier { add, set, remove } => {
-                Self::ResponseHeaderModifier { add: add.clone(), set: set.clone(), remove: remove.clone() }
+            HttpRouteFilter::ResponseHeaderModifier { config } => {
+                Self::ResponseHeaderModifier {
+                    add: config.add.clone(), set: config.set.clone(), remove: config.remove.clone(),
+                }
             }
-            HttpRouteFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
+            HttpRouteFilter::RequestRedirect { config } => {
+                let path = config.path.as_ref().map(rewrite_path_to_string);
                 Self::RequestRedirect {
-                    scheme: scheme.clone(), hostname: hostname.clone(),
-                    port: *port, path: path.clone(), status_code: *status_code,
+                    scheme: config.scheme.clone(),
+                    hostname: config.hostname.clone(),
+                    port: config.port,
+                    path,
+                    status_code: config.status_code,
                 }
             }
-            HttpRouteFilter::URLRewrite { hostname, path } => {
+            HttpRouteFilter::URLRewrite { config } => {
                 Self::URLRewrite {
-                    hostname: hostname.clone(),
-                    path: path.as_ref().map(crate::routing::URLRewritePath::from),
+                    hostname: config.hostname.clone(),
+                    path: config.path.as_ref().map(crate::routing::URLRewritePath::from),
                 }
             }
-            HttpRouteFilter::RequestMirror { backend_ref } => {
+            HttpRouteFilter::RequestMirror { config } => {
                 let backend = crate::routing::Backend::with_weight(
-                    backend_ref.name.clone(), backend_ref.port, backend_ref.weight,
+                    config.backend_ref.name.clone(), config.backend_ref.port, config.backend_ref.weight,
                 )?;
                 Self::RequestMirror { backend_addr: backend.socket_addr }
             }
         })
+    }
+}
+
+/// Extract the path string from an HttpURLRewritePath for redirect Location header
+fn rewrite_path_to_string(p: &HttpURLRewritePath) -> String {
+    match p {
+        HttpURLRewritePath::ReplaceFullPath { value } => value.clone(),
+        HttpURLRewritePath::ReplacePrefixMatch { value } => value.clone(),
     }
 }
 
@@ -272,7 +288,7 @@ mod tests {
                         "port": 8080
                     }
                 ],
-                "worker_threads": 8
+                "workerThreads": 8
             }
         }"#;
 
@@ -298,14 +314,14 @@ mod tests {
                         "port": 5432
                     }
                 ],
-                "worker_threads": 8
+                "workerThreads": 8
             },
-            "http_routes": [
+            "httpRoutes": [
                 {
-                    "parent_refs": [
+                    "parentRefs": [
                         {
                             "name": "test-gateway",
-                            "section_name": "http-8080"
+                            "sectionName": "http-8080"
                         }
                     ],
                     "hostnames": ["api.example.com"],
@@ -319,7 +335,7 @@ mod tests {
                                     }
                                 }
                             ],
-                            "backend_refs": [
+                            "backendRefs": [
                                 {
                                     "name": "api-service",
                                     "port": 3000
@@ -329,17 +345,17 @@ mod tests {
                     ]
                 }
             ],
-            "tcp_routes": [
+            "tcpRoutes": [
                 {
-                    "parent_refs": [
+                    "parentRefs": [
                         {
                             "name": "test-gateway",
-                            "section_name": "tcp-5432"
+                            "sectionName": "tcp-5432"
                         }
                     ],
                     "rules": [
                         {
-                            "backend_refs": [
+                            "backendRefs": [
                                 {
                                     "name": "db1-service",
                                     "port": 5432
@@ -405,15 +421,15 @@ mod tests {
             "gateway": {
                 "name": "test-gw",
                 "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "worker_threads": 1
+                "workerThreads": 1
             },
-            "http_routes": [{
-                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
                 "hostnames": ["example.com"],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
-                    "filters": [{"type": "URLRewrite", "path": {"type": "ReplaceFullPath", "value": "/v2"}}],
-                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2"}}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
                 }]
             }]
         }"#;
@@ -421,7 +437,7 @@ mod tests {
         assert!(config.validate().is_ok());
         assert!(matches!(
             config.http_routes[0].rules[0].filters[0],
-            HttpRouteFilter::URLRewrite { ref path, .. } if path.is_some()
+            HttpRouteFilter::URLRewrite { ref config } if config.path.is_some()
         ));
     }
 
@@ -431,7 +447,6 @@ mod tests {
         let yaml = config.to_yaml_pretty().unwrap();
         let parsed: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.validate().is_ok());
-        // The development config includes URLRewrite and RequestMirror routes
         assert_eq!(parsed.http_routes.len(), 8);
     }
 
@@ -441,15 +456,15 @@ mod tests {
             "gateway": {
                 "name": "test-gw",
                 "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "worker_threads": 1
+                "workerThreads": 1
             },
-            "http_routes": [{
-                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
                 "hostnames": ["example.com"],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
-                    "filters": [{"type": "RequestMirror", "backend_ref": {"name": "127.0.0.1", "port": 9999}}],
-                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                    "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "127.0.0.1", "port": 9999}}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
                 }]
             }]
         }"#;
@@ -467,15 +482,15 @@ mod tests {
             "gateway": {
                 "name": "test-gw",
                 "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "worker_threads": 1
+                "workerThreads": 1
             },
-            "http_routes": [{
-                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
                 "hostnames": ["example.com"],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/v1"}}],
-                    "filters": [{"type": "URLRewrite", "hostname": "new.example.com"}],
-                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "new.example.com"}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
                 }]
             }]
         }"#;
@@ -492,15 +507,15 @@ mod tests {
             "gateway": {
                 "name": "test-gw",
                 "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "worker_threads": 1
+                "workerThreads": 1
             },
-            "http_routes": [{
-                "parent_refs": [{"name": "test-gw", "section_name": "http"}],
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
                 "hostnames": ["example.com"],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
-                    "filters": [{"type": "RequestMirror", "backend_ref": {"name": "127.0.0.1", "port": 9999}}],
-                    "backend_refs": [{"name": "127.0.0.1", "port": 8001}]
+                    "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "127.0.0.1", "port": 9999}}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
                 }]
             }]
         }"#;
