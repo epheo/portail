@@ -1,13 +1,14 @@
 //! Tokio async TCP worker — one task per accepted connection.
 //!
 //! HTTP request/response proxying with keepalive and backend connection pooling,
-//! and raw TCP bidirectional forwarding via copy_bidirectional.
+//! raw TCP bidirectional forwarding, TLS termination, and TLS passthrough.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
@@ -17,6 +18,7 @@ use crate::http_parser::find_header_end;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
+use crate::tls::{self, Connection};
 
 struct ConnectionState {
     server_port: u16,
@@ -33,6 +35,8 @@ pub async fn run_worker(
     routes: Arc<ArcSwap<RouteTable>>,
     pool: Arc<BackendPool>,
     shutdown: CancellationToken,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_passthrough: bool,
 ) {
     info!("Worker {} accepting on port {}", worker_id, server_port);
 
@@ -45,18 +49,51 @@ pub async fn run_worker(
             }
             result = listener.accept() => {
                 match result {
-                    Ok((client, peer)) => {
-                        let state = ConnectionState {
-                            server_port,
-                            routes: routes.clone(),
-                            pool: pool.clone(),
-                            selector: BackendSelector::new(),
-                        };
-                        tokio::spawn(async move {
-                            if let Err(_e) = handle_connection(client, peer, state).await {
-                                debug!("Connection from {} closed: {}", peer, _e);
-                            }
-                        });
+                    Ok((tcp_stream, peer)) => {
+                        let routes = routes.clone();
+                        let pool = pool.clone();
+                        let acceptor = tls_acceptor.clone();
+
+                        if tls_passthrough {
+                            tokio::spawn(async move {
+                                if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes).await {
+                                    debug!("TLS passthrough from {} closed: {}", peer, _e);
+                                }
+                            });
+                        } else if let Some(acceptor) = acceptor {
+                            tokio::spawn(async move {
+                                match acceptor.accept(tcp_stream).await {
+                                    Ok(tls_stream) => {
+                                        let conn = Connection::Tls { inner: tls_stream };
+                                        let state = ConnectionState {
+                                            server_port,
+                                            routes,
+                                            pool,
+                                            selector: BackendSelector::new(),
+                                        };
+                                        if let Err(_e) = handle_connection(conn, peer, state).await {
+                                            debug!("TLS connection from {} closed: {}", peer, _e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("TLS handshake failed from {}: {}", peer, e);
+                                    }
+                                }
+                            });
+                        } else {
+                            let state = ConnectionState {
+                                server_port,
+                                routes,
+                                pool,
+                                selector: BackendSelector::new(),
+                            };
+                            tokio::spawn(async move {
+                                let conn = Connection::Plain { inner: tcp_stream };
+                                if let Err(_e) = handle_connection(conn, peer, state).await {
+                                    debug!("Connection from {} closed: {}", peer, _e);
+                                }
+                            });
+                        }
                     }
                     Err(e) => {
                         warn!("Worker {} accept error: {}", worker_id, e);
@@ -68,7 +105,7 @@ pub async fn run_worker(
 }
 
 async fn handle_connection(
-    mut client: TcpStream,
+    mut client: Connection,
     _peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
@@ -126,7 +163,7 @@ async fn handle_connection(
 /// Handle HTTP forward requests in a keepalive loop.
 /// Returns true if the connection should continue (keepalive), false to close.
 async fn handle_http_forward(
-    client: &mut TcpStream,
+    client: &mut Connection,
     buf: &mut [u8],
     initial_bytes: usize,
     initial_backend_addr: SocketAddr,
@@ -216,7 +253,7 @@ async fn handle_http_forward(
 /// With mods: buffers until headers complete, applies modifications, then writes.
 async fn forward_http_response(
     backend: &mut TcpStream,
-    client: &mut TcpStream,
+    client: &mut Connection,
     buf: &mut [u8],
     response_mods: Option<&HeaderModifications>,
 ) -> Result<bool> {
@@ -285,8 +322,35 @@ async fn forward_http_response(
     }
 }
 
-async fn handle_tcp_connection(
+/// L4 TLS passthrough: peek ClientHello for SNI, then forward raw TCP to backend.
+async fn handle_tls_passthrough(
     mut client: TcpStream,
+    server_port: u16,
+    routes: Arc<ArcSwap<RouteTable>>,
+) -> Result<()> {
+    let mut peek_buf = vec![0u8; 16384];
+    let n = client.peek(&mut peek_buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let sni = tls::extract_sni(&peek_buf[..n]);
+    let hostname = sni.as_deref().unwrap_or("");
+
+    let route_table = routes.load();
+    let backend_addr = route_table.resolve_tls_passthrough(hostname, server_port)
+        .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
+
+    let mut backend = TcpStream::connect(backend_addr).await?;
+    backend.set_nodelay(true)?;
+    client.set_nodelay(true)?;
+
+    tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    Ok(())
+}
+
+async fn handle_tcp_connection(
+    mut client: Connection,
     backend_addr: SocketAddr,
     initial_data: &[u8],
 ) -> Result<()> {
@@ -299,7 +363,7 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-async fn send_redirect_response(client: &mut TcpStream, status_code: u16, location: &str) -> Result<()> {
+async fn send_redirect_response(client: &mut Connection, status_code: u16, location: &str) -> Result<()> {
     let status_text = match status_code {
         301 => "Moved Permanently",
         302 => "Found",
@@ -319,7 +383,7 @@ async fn send_redirect_response(client: &mut TcpStream, status_code: u16, locati
     Ok(())
 }
 
-async fn send_error_response(client: &mut TcpStream, error_code: u16) -> Result<()> {
+async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
     let (status_text, body) = match error_code {
         400 => ("Bad Request", "400 Bad Request"),
         404 => ("Not Found", "404 Not Found"),

@@ -482,3 +482,36 @@ fn test_method_plus_query_plus_header_integration() {
     let r = rt.find_http_route("example.com", "GET", "/api", headers, "debug=true").unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
+
+// TLS passthrough routing integration tests
+
+#[test]
+fn test_tls_passthrough_routing() {
+    let mut rt = RouteTable::new();
+    rt.add_tcp_route(8443, vec![backend(9001)]);
+
+    let addr = rt.resolve_tls_passthrough("secure.example.com", 8443);
+    assert!(addr.is_some());
+    assert_eq!(addr.unwrap().port(), 9001);
+}
+
+#[test]
+fn test_tls_passthrough_no_route_for_port() {
+    let mut rt = RouteTable::new();
+    rt.add_tcp_route(8443, vec![backend(9001)]);
+
+    // Different port has no route
+    assert!(rt.resolve_tls_passthrough("example.com", 9999).is_none());
+}
+
+#[test]
+fn test_tls_passthrough_coexists_with_tcp() {
+    let mut rt = RouteTable::new();
+    rt.add_tcp_route(8443, vec![backend(9001)]);
+    rt.add_tcp_route(2222, vec![backend(22)]);
+
+    // TLS passthrough uses TCP routes
+    assert_eq!(rt.resolve_tls_passthrough("example.com", 8443).unwrap().port(), 9001);
+    // Regular TCP route still works
+    assert!(rt.find_tcp_backends(2222).is_ok());
+}

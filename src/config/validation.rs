@@ -144,6 +144,37 @@ impl ListenerConfig {
             }
         }
 
+        // TLS config validation per protocol
+        match self.protocol {
+            Protocol::HTTPS => {
+                let tls_cfg = self.tls.as_ref()
+                    .ok_or_else(|| anyhow!("HTTPS listener requires tls config"))?;
+                if tls_cfg.mode != TlsMode::Terminate {
+                    return Err(anyhow!("HTTPS listener requires tls mode Terminate"));
+                }
+                if tls_cfg.certificate_refs.is_empty() {
+                    return Err(anyhow!("HTTPS listener requires at least one certificateRef"));
+                }
+                for (i, cert_ref) in tls_cfg.certificate_refs.iter().enumerate() {
+                    if cert_ref.name.is_empty() {
+                        return Err(anyhow!("certificateRef {} name cannot be empty", i));
+                    }
+                }
+            }
+            Protocol::TLS => {
+                let tls_cfg = self.tls.as_ref()
+                    .ok_or_else(|| anyhow!("TLS listener requires tls config"))?;
+                if tls_cfg.mode != TlsMode::Passthrough {
+                    return Err(anyhow!("TLS listener requires tls mode Passthrough"));
+                }
+            }
+            Protocol::HTTP | Protocol::TCP | Protocol::UDP => {
+                if self.tls.is_some() {
+                    return Err(anyhow!("{:?} listener must not have tls config", self.protocol));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -498,5 +529,104 @@ mod tests {
             vec![], // no backends — rewrite needs a backend to forward to
         );
         assert!(rule.validate().is_err());
+    }
+
+    // --- TLS validation tests ---
+
+    fn make_listener(protocol: Protocol, tls: Option<TlsConfig>) -> ListenerConfig {
+        ListenerConfig {
+            name: "test".to_string(),
+            protocol,
+            port: 443,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls,
+        }
+    }
+
+    #[test]
+    fn test_https_requires_tls_config() {
+        let listener = make_listener(Protocol::HTTPS, None);
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_https_requires_terminate_mode() {
+        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
+            mode: TlsMode::Passthrough,
+            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+        }));
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_https_requires_certificate_refs() {
+        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
+            mode: TlsMode::Terminate,
+            certificate_refs: vec![],
+        }));
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_https_valid_tls_config() {
+        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
+            mode: TlsMode::Terminate,
+            certificate_refs: vec![CertificateRef { name: "my-cert".to_string() }],
+        }));
+        assert!(listener.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_requires_passthrough_mode() {
+        let listener = make_listener(Protocol::TLS, Some(TlsConfig {
+            mode: TlsMode::Terminate,
+            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+        }));
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_passthrough_valid() {
+        let listener = make_listener(Protocol::TLS, Some(TlsConfig {
+            mode: TlsMode::Passthrough,
+            certificate_refs: vec![],
+        }));
+        assert!(listener.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_requires_tls_config() {
+        let listener = make_listener(Protocol::TLS, None);
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_http_rejects_tls_config() {
+        let listener = make_listener(Protocol::HTTP, Some(TlsConfig {
+            mode: TlsMode::Terminate,
+            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+        }));
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_tcp_rejects_tls_config() {
+        let mut listener = make_listener(Protocol::TCP, Some(TlsConfig {
+            mode: TlsMode::Passthrough,
+            certificate_refs: vec![],
+        }));
+        listener.port = 2222;
+        assert!(listener.validate().is_err());
+    }
+
+    #[test]
+    fn test_https_empty_cert_name_rejected() {
+        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
+            mode: TlsMode::Terminate,
+            certificate_refs: vec![CertificateRef { name: "".to_string() }],
+        }));
+        assert!(listener.validate().is_err());
     }
 }

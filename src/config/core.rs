@@ -150,8 +150,12 @@ impl UringRessConfig {
         for route in routes {
             if let Some(parent_ref) = route.parent_refs().first() {
                 if let Some(section_name) = &parent_ref.section_name {
+                    let protocol_matches = |l: &&ListenerConfig| match protocol {
+                        Protocol::TCP => matches!(l.protocol, Protocol::TCP | Protocol::TLS),
+                        _ => l.protocol == protocol,
+                    };
                     if let Some(listener) = self.gateway.listeners.iter()
-                        .find(|l| l.name == *section_name && l.protocol == protocol) {
+                        .find(|l| l.name == *section_name && protocol_matches(l)) {
 
                         for backend_refs in route.backend_refs_per_rule() {
                             let backends: Vec<routing::Backend> = backend_refs.iter()
@@ -159,7 +163,7 @@ impl UringRessConfig {
                                 .collect::<Result<_>>()?;
 
                             match protocol {
-                                Protocol::TCP | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
+                                Protocol::TCP | Protocol::TLS | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
                                 Protocol::UDP => route_table.add_udp_route(listener.port, backends),
                             }
                         }
@@ -528,5 +532,91 @@ mod tests {
         } else {
             panic!("expected RequestMirror filter");
         }
+    }
+
+    #[test]
+    fn test_https_listener_json_deserialization() {
+        let json = r#"{
+            "gateway": {
+                "name": "tls-gw",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "protocol": "HTTPS",
+                        "port": 443,
+                        "tls": {
+                            "mode": "Terminate",
+                            "certificateRefs": [{"name": "my-cert"}]
+                        }
+                    }
+                ],
+                "workerThreads": 1
+            }
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        assert!(config.validate().is_ok());
+
+        let listener = &config.gateway.listeners[0];
+        assert!(matches!(listener.protocol, Protocol::HTTPS));
+        let tls = listener.tls.as_ref().unwrap();
+        assert!(matches!(tls.mode, TlsMode::Terminate));
+        assert_eq!(tls.certificate_refs[0].name, "my-cert");
+    }
+
+    #[test]
+    fn test_tls_passthrough_listener_json_deserialization() {
+        let json = r#"{
+            "gateway": {
+                "name": "tls-gw",
+                "listeners": [
+                    {
+                        "name": "tls-passthrough",
+                        "protocol": "TLS",
+                        "port": 8443,
+                        "tls": {
+                            "mode": "Passthrough"
+                        }
+                    }
+                ],
+                "workerThreads": 1
+            }
+        }"#;
+        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        assert!(config.validate().is_ok());
+
+        let listener = &config.gateway.listeners[0];
+        assert!(matches!(listener.protocol, Protocol::TLS));
+        let tls = listener.tls.as_ref().unwrap();
+        assert!(matches!(tls.mode, TlsMode::Passthrough));
+        assert!(tls.certificate_refs.is_empty());
+    }
+
+    #[test]
+    fn test_tls_config_yaml_roundtrip() {
+        let config = UringRessConfig::generate_development();
+        let yaml = config.to_yaml_pretty().unwrap();
+        let parsed: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.validate().is_ok());
+
+        // Find the HTTPS listener
+        let https = parsed.gateway.listeners.iter()
+            .find(|l| matches!(l.protocol, Protocol::HTTPS))
+            .expect("development config should have HTTPS listener");
+        let tls = https.tls.as_ref().unwrap();
+        assert!(matches!(tls.mode, TlsMode::Terminate));
+        assert_eq!(tls.certificate_refs[0].name, "example-cert");
+    }
+
+    #[test]
+    fn test_tls_config_json_roundtrip() {
+        let config = UringRessConfig::generate_development();
+        let json = config.to_json_pretty().unwrap();
+        let parsed: UringRessConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.validate().is_ok());
+
+        let https = parsed.gateway.listeners.iter()
+            .find(|l| matches!(l.protocol, Protocol::HTTPS))
+            .expect("development config should have HTTPS listener");
+        assert_eq!(https.tls.as_ref().unwrap().certificate_refs[0].name, "example-cert");
     }
 }

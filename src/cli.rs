@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(requires = "generate_config")]
     pub output: Option<PathBuf>,
 
+    /// Directory containing TLS certificate files ({name}.crt / {name}.key)
+    #[arg(long, value_name = "DIR")]
+    #[arg(help = "Directory for TLS certificate files (default: /etc/uringress/certs)")]
+    pub cert_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -114,6 +118,7 @@ mod tests {
             example_config: false,
             generate_config: None,
             output: None,
+            cert_dir: None,
         };
         assert!(args.validate().is_ok());
 
@@ -121,12 +126,11 @@ mod tests {
             config: Some(PathBuf::from("config.yaml")),
             validate_only: false,
             check_config: false,
-
-
             verbose: 0,
             example_config: false,
             generate_config: None,
             output: None,
+            cert_dir: None,
         };
         assert!(args.validate().is_ok());
 
@@ -134,12 +138,11 @@ mod tests {
             config: Some(PathBuf::from("config.txt")),
             validate_only: false,
             check_config: false,
-
-
             verbose: 0,
             example_config: false,
             generate_config: None,
             output: None,
+            cert_dir: None,
         };
         assert!(args.validate().is_err());
     }
@@ -150,12 +153,11 @@ mod tests {
             config: None,
             validate_only: true,
             check_config: false,
-
-
             verbose: 0,
             example_config: false,
             generate_config: None,
             output: None,
+            cert_dir: None,
         };
         assert!(args.validate().is_err());
 
@@ -163,12 +165,11 @@ mod tests {
             config: None,
             validate_only: false,
             check_config: true,
-
-
             verbose: 0,
             example_config: false,
             generate_config: None,
             output: None,
+            cert_dir: None,
         };
         assert!(args.validate().is_err());
     }

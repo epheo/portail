@@ -12,6 +12,7 @@ mod backend_pool;
 mod worker;
 mod udp_worker;
 mod http_filters;
+mod tls;
 mod data_plane;
 mod ebpf;
 
@@ -55,11 +56,10 @@ async fn main() -> Result<()> {
 
     logging::init_logging(args.verbose, Some(&uringress_config.observability.logging));
 
-    let listener_protocols: Vec<(u16, config::Protocol)> = uringress_config.gateway.listeners.iter()
-        .map(|l| (l.port, l.protocol.clone()))
-        .collect();
     let performance_config = uringress_config.performance.clone();
     let worker_count = uringress_config.gateway.worker_threads;
+    let listeners = uringress_config.gateway.listeners.clone();
+    let cert_dir = args.cert_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("certs"));
 
     info!("Configuration loaded: {} listeners, {} HTTP routes, {} TCP routes, {} UDP routes",
           uringress_config.gateway.listeners.len(),
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
 
     let routes = control_plane.get_routes();
 
-    let mut data_plane = DataPlane::new(worker_count, &listener_protocols, &performance_config)?;
+    let mut data_plane = DataPlane::new(worker_count, &listeners, &performance_config, &cert_dir)?;
 
     // Attach eBPF before starting workers
     let listener_fds = data_plane.get_listener_fds();
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
 
     data_plane.start(routes);
 
-    info!("UringRess ready: {} workers × {} listeners", worker_count, listener_protocols.len());
+    info!("UringRess ready: {} workers × {} listeners", worker_count, listeners.len());
 
     // Wait for shutdown signal
     control_plane.wait_for_shutdown().await?;

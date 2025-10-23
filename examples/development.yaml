@@ -6,6 +6,15 @@ gateway:
     port: 8080
     address: 127.0.0.1
     interface: lo
+  - name: https
+    protocol: HTTPS
+    port: 8443
+    address: 127.0.0.1
+    interface: lo
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: example-cert
   - name: tcp-ssh
     protocol: TCP
     port: 2222

@@ -179,6 +179,15 @@ impl RouteTable {
     pub fn add_udp_route(&mut self, port: u16, backends: Vec<Backend>) {
         self.udp_routes.insert(port, backends);
     }
+
+    /// Resolve a TLS passthrough connection to a backend address.
+    /// Uses TCP routes for the listener port — SNI is logged but routing
+    /// is port-based (matching Gateway API TCPRoute on TLS listeners).
+    pub fn resolve_tls_passthrough(&self, _sni: &str, server_port: u16) -> Option<std::net::SocketAddr> {
+        self.tcp_routes.get(&server_port)
+            .and_then(|backends| backends.first())
+            .map(|b| b.socket_addr)
+    }
 }
 
 impl Default for RouteTable {
@@ -583,6 +592,21 @@ mod tests {
         assert!(!query_string_contains_param("a=1&b=2", "c", "3"));
         assert!(!query_string_contains_param("", "a", "1"));
         assert!(!query_string_contains_param("a=1", "a", "2"));
+    }
+
+    #[test]
+    fn test_resolve_tls_passthrough_found() {
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(8443, vec![backend(9001)]);
+
+        let addr = rt.resolve_tls_passthrough("example.com", 8443);
+        assert_eq!(addr, Some("127.0.0.1:9001".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_tls_passthrough_no_route() {
+        let rt = RouteTable::new();
+        assert!(rt.resolve_tls_passthrough("example.com", 8443).is_none());
     }
 }
 

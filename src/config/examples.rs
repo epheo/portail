@@ -16,6 +16,7 @@ impl UringRessConfig {
                         hostname: None,
                         address: None,
                         interface: None,
+                        tls: None,
                     },
                 ],
                 worker_threads: 2,
@@ -68,6 +69,21 @@ impl UringRessConfig {
                         hostname: None,
                         address: Some("127.0.0.1".to_string()),
                         interface: Some("lo".to_string()),
+                        tls: None,
+                    },
+                    ListenerConfig {
+                        name: "https".to_string(),
+                        protocol: Protocol::HTTPS,
+                        port: 8443,
+                        hostname: None,
+                        address: Some("127.0.0.1".to_string()),
+                        interface: Some("lo".to_string()),
+                        tls: Some(TlsConfig {
+                            mode: TlsMode::Terminate,
+                            certificate_refs: vec![CertificateRef {
+                                name: "example-cert".to_string(),
+                            }],
+                        }),
                     },
                     ListenerConfig {
                         name: "tcp-ssh".to_string(),
@@ -76,6 +92,7 @@ impl UringRessConfig {
                         hostname: None,
                         address: Some("127.0.0.1".to_string()),
                         interface: Some("lo".to_string()),
+                        tls: None,
                     },
                 ],
                 worker_threads: 4,

@@ -10,6 +10,7 @@ use super::parsing::{deserialize_duration, serialize_duration};
 pub enum Protocol {
     HTTP,
     HTTPS,
+    TLS,
     TCP,
     UDP,
 }
@@ -42,6 +43,27 @@ pub struct ListenerConfig {
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    pub mode: TlsMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificate_refs: Vec<CertificateRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TlsMode {
+    Terminate,
+    Passthrough,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateRef {
+    pub name: String,
 }
 
 // Default value functions
@@ -65,6 +87,7 @@ impl Default for GatewayConfig {
                     hostname: None,
                     address: None,
                     interface: None,
+                    tls: None,
                 },
             ],
             worker_threads: default_worker_threads(),

@@ -5,18 +5,21 @@
 //! uses the same dest-port offset in the transport header).
 
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
-use crate::config::{PerformanceConfig, Protocol};
+use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::logging::info;
 use crate::routing::RouteTable;
+use crate::tls;
 use crate::worker;
 use crate::udp_worker;
 
@@ -25,6 +28,8 @@ struct TcpListenerEntry {
     port: u16,
     raw_fd: RawFd,
     listener: TcpListener,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_passthrough: bool,
 }
 
 struct UdpListenerEntry {
@@ -44,12 +49,13 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Create listeners for all (worker, port, protocol) combinations.
+    /// Create listeners for all (worker, listener) combinations.
     /// Sockets are created with SO_REUSEPORT so multiple workers can share the same port.
     pub fn new(
         worker_count: usize,
-        listener_protocols: &[(u16, Protocol)],
+        listeners: &[ListenerConfig],
         performance_config: &PerformanceConfig,
+        cert_dir: &PathBuf,
     ) -> Result<Self> {
         let pool = Arc::new(BackendPool::new(
             64,
@@ -59,31 +65,56 @@ impl DataPlane {
         let mut tcp_listeners = Vec::new();
         let mut udp_listeners = Vec::new();
 
+        // Pre-build TLS acceptors (shared across workers for the same listener)
+        let mut tls_acceptors: Vec<Option<Arc<TlsAcceptor>>> = Vec::with_capacity(listeners.len());
+        let mut tls_passthrough_flags: Vec<bool> = Vec::with_capacity(listeners.len());
+
+        for listener_cfg in listeners {
+            match (&listener_cfg.protocol, &listener_cfg.tls) {
+                (Protocol::HTTPS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
+                    let acceptor = tls::build_tls_acceptor(&tls_cfg.certificate_refs, cert_dir)?;
+                    tls_acceptors.push(Some(Arc::new(acceptor)));
+                    tls_passthrough_flags.push(false);
+                }
+                (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
+                    tls_acceptors.push(None);
+                    tls_passthrough_flags.push(true);
+                }
+                _ => {
+                    tls_acceptors.push(None);
+                    tls_passthrough_flags.push(false);
+                }
+            }
+        }
+
         for worker_id in 0..worker_count {
-            for (port, protocol) in listener_protocols {
-                match protocol {
-                    Protocol::HTTP | Protocol::HTTPS | Protocol::TCP => {
-                        let std_listener = create_reuseport_tcp_listener(*port)?;
+            for (i, listener_cfg) in listeners.iter().enumerate() {
+                let port = listener_cfg.port;
+                match listener_cfg.protocol {
+                    Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
+                        let std_listener = create_reuseport_tcp_listener(port)?;
                         let raw_fd = std_listener.as_raw_fd();
                         let tokio_listener = TcpListener::from_std(std_listener)?;
 
                         tcp_listeners.push(TcpListenerEntry {
                             worker_id,
-                            port: *port,
+                            port,
                             raw_fd,
                             listener: tokio_listener,
+                            tls_acceptor: tls_acceptors[i].clone(),
+                            tls_passthrough: tls_passthrough_flags[i],
                         });
 
                         info!("Worker {} TCP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
                     }
                     Protocol::UDP => {
-                        let std_socket = create_reuseport_udp_socket(*port)?;
+                        let std_socket = create_reuseport_udp_socket(port)?;
                         let raw_fd = std_socket.as_raw_fd();
                         let tokio_socket = UdpSocket::from_std(std_socket)?;
 
                         udp_listeners.push(UdpListenerEntry {
                             worker_id,
-                            port: *port,
+                            port,
                             raw_fd,
                             socket: tokio_socket,
                         });
@@ -124,7 +155,16 @@ impl DataPlane {
             let shutdown = self.shutdown.clone();
 
             let handle = tokio::spawn(async move {
-                worker::run_worker(entry.worker_id, entry.listener, entry.port, routes, pool, shutdown).await;
+                worker::run_worker(
+                    entry.worker_id,
+                    entry.listener,
+                    entry.port,
+                    routes,
+                    pool,
+                    shutdown,
+                    entry.tls_acceptor,
+                    entry.tls_passthrough,
+                ).await;
             });
 
             self.task_handles.push(handle);
