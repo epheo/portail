@@ -36,10 +36,12 @@ impl UringRessConfig {
                             port: 3001,
                             weight: 1,
                         }],
+                        timeouts: None,
                     }],
                 }
             ],
             tcp_routes: vec![],
+            tls_routes: vec![],
             udp_routes: vec![],
             observability: ObservabilityConfig {
                 logging: LoggingConfig {
@@ -112,6 +114,7 @@ impl UringRessConfig {
                             port: 3001,
                             weight: 1,
                         }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -128,6 +131,7 @@ impl UringRessConfig {
                             BackendRef { name: "frontend-service-2".to_string(), port: 3002, weight: 1 },
                             BackendRef { name: "frontend-service-3".to_string(), port: 3003, weight: 1 },
                         ],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -137,6 +141,7 @@ impl UringRessConfig {
                         filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/api.json")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -146,6 +151,7 @@ impl UringRessConfig {
                         filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/users.json")],
                         backend_refs: vec![BackendRef { name: "users-service".to_string(), port: 3002, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -155,6 +161,7 @@ impl UringRessConfig {
                         filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/dataset.json")],
                         backend_refs: vec![BackendRef { name: "dataset-service".to_string(), port: 3003, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -164,6 +171,7 @@ impl UringRessConfig {
                         filters: vec![],
                         matches: vec![HttpRouteMatch::path_prefix("/health")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -178,6 +186,7 @@ impl UringRessConfig {
                         }],
                         matches: vec![HttpRouteMatch::path_prefix("/v1")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
                 HttpRouteConfig {
@@ -191,9 +200,11 @@ impl UringRessConfig {
                         }],
                         matches: vec![HttpRouteMatch::path_prefix("/mirrored")],
                         backend_refs: vec![BackendRef { name: "api-service".to_string(), port: 3001, weight: 1 }],
+                        timeouts: None,
                     }],
                 },
             ],
+            tls_routes: vec![],
             tcp_routes: vec![
                 TcpRouteConfig {
                     parent_refs: vec![ParentRef {

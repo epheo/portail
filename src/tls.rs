@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
@@ -7,6 +8,8 @@ use std::task::{Context, Poll};
 use anyhow::{anyhow, Result};
 use pin_project_lite::pin_project;
 use rustls::ServerConfig;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
@@ -72,18 +75,41 @@ impl Connection {
     }
 }
 
-/// Load PEM cert+key from disk and build a TLS acceptor.
-///
-/// In standalone mode, `name` from CertificateRef resolves to:
-///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
-pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
-    if cert_refs.is_empty() {
-        return Err(anyhow!("TLS Terminate mode requires at least one certificateRef"));
+/// SNI-based certificate resolver.
+/// Selects the appropriate certificate based on the ClientHello server_name.
+#[derive(Debug)]
+struct SniCertResolver {
+    /// Exact hostname -> certified key
+    certs: HashMap<String, Arc<CertifiedKey>>,
+    /// Wildcard: parent domain -> certified key (e.g. "example.com" matches "*.example.com")
+    wildcard_certs: HashMap<String, Arc<CertifiedKey>>,
+    /// Default certificate (first loaded)
+    default: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let sni = client_hello.server_name()?;
+        let sni_lower = sni.to_ascii_lowercase();
+
+        // Exact match
+        if let Some(key) = self.certs.get(&sni_lower) {
+            return Some(key.clone());
+        }
+
+        // Wildcard: strip first label
+        if let Some(dot_pos) = sni_lower.find('.') {
+            let parent = &sni_lower[dot_pos + 1..];
+            if let Some(key) = self.wildcard_certs.get(parent) {
+                return Some(key.clone());
+            }
+        }
+
+        Some(self.default.clone())
     }
+}
 
-    // Use the first certificate ref (multi-cert / SNI-based selection is future work)
-    let cert_ref = &cert_refs[0];
-
+fn load_cert_and_key(cert_ref: &CertificateRef, cert_dir: &Path) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
     let cert_path = cert_dir.join(format!("{}.crt", cert_ref.name));
     let key_path = cert_dir.join(format!("{}.key", cert_ref.name));
 
@@ -104,10 +130,67 @@ pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Resu
         .map_err(|e| anyhow!("Failed to parse private key PEM: {}", e))?
         .ok_or_else(|| anyhow!("No private key found in '{}'", key_path.display()))?;
 
+    Ok((certs, key))
+}
+
+fn build_certified_key(certs: Vec<rustls::pki_types::CertificateDer<'static>>, key: rustls::pki_types::PrivateKeyDer<'static>) -> Result<CertifiedKey> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let signing_key = provider.key_provider.load_private_key(key)
+        .map_err(|e| anyhow!("Failed to load private key: {}", e))?;
+    Ok(CertifiedKey::new(certs, signing_key))
+}
+
+/// Load PEM cert+key from disk and build a TLS acceptor.
+/// Supports multiple certificates with SNI-based selection.
+///
+/// In standalone mode, `name` from CertificateRef resolves to:
+///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
+pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
+    if cert_refs.is_empty() {
+        return Err(anyhow!("TLS Terminate mode requires at least one certificateRef"));
+    }
+
+    if cert_refs.len() == 1 {
+        // Single cert fast path — no resolver overhead
+        let (certs, key) = load_cert_and_key(&cert_refs[0], cert_dir)?;
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow!("TLS config error: {}", e))?;
+        return Ok(TlsAcceptor::from(Arc::new(config)));
+    }
+
+    // Multiple certs — use SNI resolver
+    let mut certs_map = HashMap::new();
+    let mut wildcard_map = HashMap::new();
+    let mut default_key = None;
+
+    for cert_ref in cert_refs {
+        let (certs, key) = load_cert_and_key(cert_ref, cert_dir)?;
+        let certified_key = Arc::new(build_certified_key(certs, key)?);
+        if default_key.is_none() {
+            default_key = Some(certified_key.clone());
+        }
+
+        let name_lower = cert_ref.name.to_ascii_lowercase();
+        if let Some(stripped) = name_lower.strip_prefix("*.") {
+            wildcard_map.insert(stripped.to_string(), certified_key);
+        } else {
+            certs_map.insert(name_lower, certified_key);
+        }
+    }
+
+    let resolver = SniCertResolver {
+        certs: certs_map,
+        wildcard_certs: wildcard_map,
+        default: default_key.unwrap(),
+    };
+
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow!("TLS config error: {}", e))?;
+        .with_cert_resolver(Arc::new(resolver));
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
@@ -311,6 +394,43 @@ mod tests {
     fn test_extract_sni_not_handshake_type() {
         // Application data (0x17) instead of handshake (0x16)
         assert_eq!(extract_sni(&[0x17, 0x03, 0x01, 0x00, 0x05, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn test_build_tls_acceptor_multiple_certs() {
+        use std::io::Write;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Generate two self-signed certs
+        for name in &["cert-a", "cert-b"] {
+            let key_path = dir_path.join(format!("{}.key", name));
+            let cert_path = dir_path.join(format!("{}.crt", name));
+            let status = Command::new("openssl")
+                .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                       "-nodes", "-keyout"])
+                .arg(&key_path)
+                .args(["-out"])
+                .arg(&cert_path)
+                .args(["-days", "1", "-subj", &format!("/CN={}", name)])
+                .output();
+            match status {
+                Ok(output) if output.status.success() => {}
+                _ => {
+                    // openssl not available, skip test
+                    return;
+                }
+            }
+        }
+
+        let cert_refs = vec![
+            CertificateRef { name: "cert-a".to_string() },
+            CertificateRef { name: "cert-b".to_string() },
+        ];
+        let result = build_tls_acceptor(&cert_refs, dir_path);
+        assert!(result.is_ok(), "multi-cert TLS acceptor should succeed: {:?}", result.err());
     }
 
     #[test]

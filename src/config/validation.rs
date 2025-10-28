@@ -16,6 +16,10 @@ impl UringRessConfig {
             route.validate().map_err(|e| anyhow!("TCP route {}: {}", i, e))?;
         }
 
+        for (i, route) in self.tls_routes.iter().enumerate() {
+            route.validate().map_err(|e| anyhow!("TLS route {}: {}", i, e))?;
+        }
+
         for (i, route) in self.udp_routes.iter().enumerate() {
             route.validate().map_err(|e| anyhow!("UDP route {}: {}", i, e))?;
         }
@@ -251,8 +255,60 @@ impl HttpRouteMatch {
 
 impl HttpPathMatch {
     fn validate(&self) -> Result<()> {
-        if !self.value.starts_with('/') {
+        if self.match_type == HttpPathMatchType::RegularExpression {
+            regex::Regex::new(&self.value)
+                .map_err(|e| anyhow!("Invalid path regex '{}': {}", self.value, e))?;
+        } else if !self.value.starts_with('/') {
             return Err(anyhow!("Path match value must start with '/': {}", self.value));
+        }
+
+        Ok(())
+    }
+}
+
+impl TlsRouteConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.parent_refs.is_empty() {
+            return Err(anyhow!("TLS route must have at least one parent_ref"));
+        }
+
+        for parent_ref in &self.parent_refs {
+            parent_ref.validate()?;
+        }
+
+        if self.hostnames.is_empty() {
+            return Err(anyhow!("TLS route must have at least one hostname for SNI matching"));
+        }
+
+        for hostname in &self.hostnames {
+            if hostname.is_empty() {
+                return Err(anyhow!("TLS route hostname cannot be empty"));
+            }
+            if hostname.starts_with('*') && !hostname.starts_with("*.") {
+                return Err(anyhow!("Wildcard hostname must use '*.domain' format: {}", hostname));
+            }
+        }
+
+        if self.rules.is_empty() {
+            return Err(anyhow!("TLS route must have at least one rule"));
+        }
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            rule.validate().map_err(|e| anyhow!("TLS route rule {}: {}", i, e))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl TlsRouteRule {
+    fn validate(&self) -> Result<()> {
+        if self.backend_refs.is_empty() {
+            return Err(anyhow!("TLS route rule must have at least one backend_ref"));
+        }
+
+        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
         }
 
         Ok(())
@@ -341,6 +397,10 @@ fn validate_header_match(hm: &HttpHeaderMatch) -> Result<()> {
     if !hm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
         return Err(anyhow!("Header match name '{}' contains invalid characters", hm.name));
     }
+    if hm.match_type == StringMatchType::RegularExpression {
+        regex::Regex::new(&hm.value)
+            .map_err(|e| anyhow!("Invalid header match regex '{}': {}", hm.value, e))?;
+    }
     Ok(())
 }
 
@@ -350,6 +410,10 @@ fn validate_query_param_match(qp: &HttpQueryParamMatch) -> Result<()> {
     }
     if qp.name.contains('&') || qp.name.contains('=') {
         return Err(anyhow!("Query param name '{}' must not contain '&' or '='", qp.name));
+    }
+    if qp.match_type == StringMatchType::RegularExpression {
+        regex::Regex::new(&qp.value)
+            .map_err(|e| anyhow!("Invalid query param match regex '{}': {}", qp.value, e))?;
     }
     Ok(())
 }
@@ -404,6 +468,7 @@ mod tests {
             matches: vec![HttpRouteMatch::path_prefix("/")],
             filters,
             backend_refs,
+            timeouts: None,
         }
     }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::parsing::{deserialize_duration, serialize_duration};
+use super::parsing::{deserialize_duration, serialize_duration, deserialize_duration_opt, serialize_duration_opt};
 
 /// Protocol types following Kubernetes Gateway API specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +111,9 @@ pub struct UringRessConfig {
     pub tcp_routes: Vec<TcpRouteConfig>,
 
     #[serde(default)]
+    pub tls_routes: Vec<TlsRouteConfig>,
+
+    #[serde(default)]
     pub udp_routes: Vec<UdpRouteConfig>,
 
     #[serde(default)]
@@ -152,6 +155,18 @@ pub struct HttpRouteRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<HttpRouteFilter>,
     pub backend_refs: Vec<BackendRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<HttpRouteTimeouts>,
+}
+
+/// Per-rule timeout configuration following Gateway API HTTPRouteTimeouts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRouteTimeouts {
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
+    pub request: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
+    pub backend_request: Option<Duration>,
 }
 
 /// HTTP route match conditions
@@ -173,6 +188,8 @@ pub struct HttpRouteMatch {
 pub struct HttpQueryParamMatch {
     pub name: String,
     pub value: String,
+    #[serde(default, rename = "type")]
+    pub match_type: StringMatchType,
 }
 
 /// HTTP path matching
@@ -190,6 +207,16 @@ pub struct HttpPathMatch {
 pub enum HttpPathMatchType {
     PathPrefix,
     Exact,
+    RegularExpression,
+}
+
+/// String match type for headers and query parameters
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub enum StringMatchType {
+    #[default]
+    Exact,
+    RegularExpression,
 }
 
 /// HTTP header match condition
@@ -197,6 +224,8 @@ pub enum HttpPathMatchType {
 pub struct HttpHeaderMatch {
     pub name: String,
     pub value: String,
+    #[serde(default, rename = "type")]
+    pub match_type: StringMatchType,
 }
 
 /// Header modification config shared by request/response header modifiers
@@ -359,6 +388,27 @@ pub struct UdpRouteConfig {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct UdpRouteRule {
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// TLS route configuration following Kubernetes Gateway API TLSRoute specification
+/// Routes TLS connections based on SNI hostname
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TlsRouteConfig {
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    pub rules: Vec<TlsRouteRule>,
+}
+
+/// TLS route rule with backend references
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TlsRouteRule {
     pub backend_refs: Vec<BackendRef>,
 }
 

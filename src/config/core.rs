@@ -60,7 +60,22 @@ impl UringRessConfig {
         for (route_idx, http_route) in self.http_routes.iter().enumerate() {
             tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules",
                 route_idx, http_route.hostnames.len(), http_route.rules.len());
-            for hostname in &http_route.hostnames {
+
+            // Compute effective hostnames by intersecting with listener scope
+            let effective_hostnames = match find_listener_for_route(&http_route.parent_refs, &self.gateway) {
+                Some(listener) => {
+                    let hostnames = intersect_hostnames(listener, &http_route.hostnames);
+                    if hostnames.is_empty() {
+                        tracing::warn!("HTTP route {} has no hostnames matching listener '{}' scope, skipping",
+                            route_idx, listener.name);
+                        continue;
+                    }
+                    hostnames
+                }
+                None => http_route.hostnames.clone(),
+            };
+
+            for hostname in &effective_hostnames {
                 tracing::debug!("  Processing hostname: {}", hostname);
                 for (rule_idx, rule) in http_route.rules.iter().enumerate() {
                     tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
@@ -80,14 +95,18 @@ impl UringRessConfig {
                     let filters = convert_filters(&rule.filters)?;
 
                     for route_match in &rule.matches {
-                        let (path, path_match_type) = if let Some(path_match) = &route_match.path {
-                            let pmt = match path_match.match_type {
-                                HttpPathMatchType::PathPrefix => routing::PathMatchType::Prefix,
-                                HttpPathMatchType::Exact => routing::PathMatchType::Exact,
-                            };
-                            (path_match.value.as_str(), pmt)
+                        let (path, path_match_type, path_regex) = if let Some(path_match) = &route_match.path {
+                            match path_match.match_type {
+                                HttpPathMatchType::PathPrefix => (path_match.value.as_str(), routing::PathMatchType::Prefix, None),
+                                HttpPathMatchType::Exact => (path_match.value.as_str(), routing::PathMatchType::Exact, None),
+                                HttpPathMatchType::RegularExpression => {
+                                    let re = regex::Regex::new(&path_match.value)
+                                        .map_err(|e| anyhow!("Invalid path regex '{}': {}", path_match.value, e))?;
+                                    (path_match.value.as_str(), routing::PathMatchType::RegularExpression, Some(re))
+                                }
+                            }
                         } else {
-                            ("/", routing::PathMatchType::Prefix)
+                            ("/", routing::PathMatchType::Prefix, None)
                         };
 
                         let header_matches: Vec<routing::HeaderMatch> = route_match.headers.iter().map(Into::into).collect();
@@ -96,14 +115,20 @@ impl UringRessConfig {
                         tracing::debug!("      Adding route: {} {} -> {} backends",
                             hostname, path, backends.len());
 
-                        route_table.add_http_route(hostname, routing::HttpRouteRule::new(
+                        let mut routing_rule = routing::HttpRouteRule::new(
                             path_match_type,
                             path.to_string(),
                             header_matches,
                             query_param_matches,
                             filters.clone(),
                             backends.clone(),
-                        ).with_method(route_match.method.clone()));
+                        ).with_method(route_match.method.clone());
+                        routing_rule.path_regex = path_regex;
+                        if let Some(ref timeouts) = rule.timeouts {
+                            routing_rule.request_timeout = timeouts.request;
+                            routing_rule.backend_request_timeout = timeouts.backend_request;
+                        }
+                        route_table.add_http_route(hostname, routing_rule);
                     }
                 }
             }
@@ -111,6 +136,19 @@ impl UringRessConfig {
 
         self.convert_l4_routes(&mut route_table, &self.tcp_routes, Protocol::TCP)?;
         self.convert_l4_routes(&mut route_table, &self.udp_routes, Protocol::UDP)?;
+
+        // Convert TLS routes (SNI-based)
+        for tls_route in &self.tls_routes {
+            for rule in &tls_route.rules {
+                let backends: Vec<routing::Backend> = rule.backend_refs.iter()
+                    .map(|br| routing::Backend::new(br.name.clone(), br.port))
+                    .collect::<Result<_>>()?;
+
+                for hostname in &tls_route.hostnames {
+                    route_table.add_tls_route(hostname, backends.clone());
+                }
+            }
+        }
 
         tracing::debug!("Route table conversion completed: {} HTTP routes, {} TCP routes, {} UDP routes",
             route_table.http_routes.len(), route_table.tcp_routes.len(), route_table.udp_routes.len());
@@ -172,6 +210,58 @@ impl UringRessConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Find the listener that a route attaches to via parentRef.sectionName
+fn find_listener_for_route<'a>(parent_refs: &[ParentRef], gateway: &'a GatewayConfig) -> Option<&'a ListenerConfig> {
+    parent_refs.first().and_then(|pr| {
+        pr.section_name.as_ref().and_then(|section| {
+            gateway.listeners.iter().find(|l| l.name == *section)
+        })
+    })
+}
+
+/// Check if a route hostname is within the scope of a listener hostname.
+/// Rules:
+/// - Listener has no hostname: all route hostnames are valid
+/// - Listener "*.example.com" accepts "foo.example.com" and "*.example.com"
+/// - Listener "example.com" accepts only "example.com"
+/// - Route "*.example.com" is within listener "*.example.com"
+fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
+    let lh = listener_hostname.to_ascii_lowercase();
+    let rh = route_hostname.to_ascii_lowercase();
+
+    if let Some(listener_parent) = lh.strip_prefix("*.") {
+        // Wildcard listener: route hostname must be under the same parent domain
+        if let Some(route_parent) = rh.strip_prefix("*.") {
+            // *.example.com listener, *.example.com route -> match
+            route_parent == listener_parent
+        } else {
+            // *.example.com listener, foo.example.com route -> match if parent matches
+            rh.ends_with(listener_parent) && rh.len() > listener_parent.len()
+                && rh.as_bytes()[rh.len() - listener_parent.len() - 1] == b'.'
+        }
+    } else {
+        // Exact listener: route hostname must match exactly (or route can be more specific wildcard)
+        rh == lh
+    }
+}
+
+/// Compute the intersection of listener hostname scope with route hostnames.
+/// Returns the set of route hostnames that are valid within the listener's scope.
+fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) -> Vec<String> {
+    match &listener.hostname {
+        None => {
+            // No listener hostname -> all route hostnames are valid
+            route_hostnames.to_vec()
+        }
+        Some(listener_hostname) => {
+            route_hostnames.iter()
+                .filter(|rh| hostname_matches(listener_hostname, rh))
+                .cloned()
+                .collect()
+        }
     }
 }
 
@@ -237,15 +327,26 @@ impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
     }
 }
 
+fn build_value_matcher(value: &str, match_type: &super::types::StringMatchType) -> crate::routing::ValueMatcher {
+    match match_type {
+        super::types::StringMatchType::Exact => crate::routing::ValueMatcher::Exact(value.to_string()),
+        super::types::StringMatchType::RegularExpression => {
+            // Validation ensures regex is valid before we get here
+            let re = regex::Regex::new(value).expect("regex validated at config load time");
+            crate::routing::ValueMatcher::Regex(re)
+        }
+    }
+}
+
 impl From<&super::types::HttpHeaderMatch> for crate::routing::HeaderMatch {
     fn from(hm: &super::types::HttpHeaderMatch) -> Self {
-        Self { name: hm.name.to_ascii_lowercase(), value: hm.value.clone() }
+        Self { name: hm.name.to_ascii_lowercase(), matcher: build_value_matcher(&hm.value, &hm.match_type) }
     }
 }
 
 impl From<&super::types::HttpQueryParamMatch> for crate::routing::QueryParamMatch {
     fn from(qm: &super::types::HttpQueryParamMatch) -> Self {
-        Self { name: qm.name.clone(), value: qm.value.clone() }
+        Self { name: qm.name.clone(), matcher: build_value_matcher(&qm.value, &qm.match_type) }
     }
 }
 
@@ -618,5 +719,75 @@ mod tests {
             .find(|l| matches!(l.protocol, Protocol::HTTPS))
             .expect("development config should have HTTPS listener");
         assert_eq!(https.tls.as_ref().unwrap().certificate_refs[0].name, "example-cert");
+    }
+
+    #[test]
+    fn test_hostname_matches_wildcard_listener() {
+        assert!(super::hostname_matches("*.example.com", "foo.example.com"));
+        assert!(super::hostname_matches("*.example.com", "*.example.com"));
+        assert!(!super::hostname_matches("*.example.com", "example.com"));
+        assert!(!super::hostname_matches("*.example.com", "foo.other.com"));
+    }
+
+    #[test]
+    fn test_hostname_matches_exact_listener() {
+        assert!(super::hostname_matches("example.com", "example.com"));
+        assert!(!super::hostname_matches("example.com", "foo.example.com"));
+        assert!(!super::hostname_matches("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_intersect_hostnames_no_listener_hostname() {
+        let listener = ListenerConfig {
+            name: "http".to_string(),
+            protocol: Protocol::HTTP,
+            port: 8080,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: None,
+        };
+        let route_hostnames = vec!["a.com".to_string(), "b.com".to_string()];
+        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        assert_eq!(result, route_hostnames);
+    }
+
+    #[test]
+    fn test_intersect_hostnames_wildcard_listener_filters() {
+        let listener = ListenerConfig {
+            name: "http".to_string(),
+            protocol: Protocol::HTTP,
+            port: 8080,
+            hostname: Some("*.example.com".to_string()),
+            address: None,
+            interface: None,
+            tls: None,
+        };
+        let route_hostnames = vec![
+            "foo.example.com".to_string(),
+            "bar.example.com".to_string(),
+            "other.org".to_string(),
+        ];
+        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        assert_eq!(result, vec!["foo.example.com", "bar.example.com"]);
+    }
+
+    #[test]
+    fn test_intersect_hostnames_exact_listener_restricts() {
+        let listener = ListenerConfig {
+            name: "http".to_string(),
+            protocol: Protocol::HTTP,
+            port: 8080,
+            hostname: Some("api.example.com".to_string()),
+            address: None,
+            interface: None,
+            tls: None,
+        };
+        let route_hostnames = vec![
+            "api.example.com".to_string(),
+            "web.example.com".to_string(),
+        ];
+        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        assert_eq!(result, vec!["api.example.com"]);
     }
 }

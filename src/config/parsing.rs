@@ -20,6 +20,29 @@ where
     serializer.serialize_str(&s)
 }
 
+/// Deserialize optional human-readable duration
+pub(crate) fn deserialize_duration_opt<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => parse_duration(&s).map(Some).map_err(D::Error::custom),
+        None => Ok(None),
+    }
+}
+
+/// Serialize optional Duration to human-readable format
+pub(crate) fn serialize_duration_opt<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match duration {
+        Some(d) => serializer.serialize_some(&format_duration(d)),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Parse human-readable duration strings to Duration
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim().to_lowercase();

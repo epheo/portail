@@ -1,3 +1,4 @@
+use std::time::Duration;
 use fnv::FnvHashMap;
 use serde::{Serialize, Deserialize};
 use anyhow::{anyhow, Result};
@@ -8,6 +9,8 @@ pub struct RouteTable {
     pub wildcard_http_routes: FnvHashMap<String, HostEntry>,
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
+    pub tls_routes: FnvHashMap<String, Vec<Backend>>,
+    pub wildcard_tls_routes: FnvHashMap<String, Vec<Backend>>,
 }
 
 impl RouteTable {
@@ -17,6 +20,8 @@ impl RouteTable {
             wildcard_http_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
+            tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
+            wildcard_tls_routes: FnvHashMap::with_capacity_and_hasher(8, Default::default()),
         }
     }
 
@@ -89,11 +94,18 @@ impl RouteTable {
 
             let path_matches = match rule.path_match_type {
                 PathMatchType::Exact => path_bytes == rule.path.as_bytes(),
+                PathMatchType::RegularExpression => {
+                    rule.path_regex.as_ref().is_some_and(|re| re.is_match(path))
+                }
                 PathMatchType::Prefix => {
                     let prefix_bytes = rule.path.as_bytes();
-                    path_bytes.len() >= prefix_bytes.len()
-                        && (prefix_bytes.is_empty()
-                            || path_bytes[..prefix_bytes.len()] == *prefix_bytes)
+                    let prefix_len = prefix_bytes.len();
+                    prefix_bytes.is_empty()
+                        || (path_bytes.len() >= prefix_len
+                            && path_bytes[..prefix_len] == *prefix_bytes
+                            && (path_bytes.len() == prefix_len
+                                || path_bytes[prefix_len] == b'/'
+                                || prefix_bytes[prefix_len - 1] == b'/'))
                 }
             };
 
@@ -107,7 +119,7 @@ impl RouteTable {
                 }
                 let all_match = rule.header_matches.iter().all(|hm| {
                     find_header_value(header_data, &hm.name)
-                        .is_some_and(|v| v == hm.value)
+                        .is_some_and(|v| hm.matcher.is_match(v))
                 });
                 if !all_match {
                     continue;
@@ -117,7 +129,8 @@ impl RouteTable {
             // Query param matches — only parsed when rule requires them
             if !rule.query_param_matches.is_empty() {
                 let all_match = rule.query_param_matches.iter().all(|qm| {
-                    query_string_contains_param(query_string, &qm.name, &qm.value)
+                    find_query_param_value(query_string, &qm.name)
+                        .is_some_and(|v| qm.matcher.is_match(v))
                 });
                 if !all_match {
                     continue;
@@ -154,13 +167,14 @@ impl RouteTable {
 
         host_entry.rules.push(rule);
 
-        // Sort: exact paths first, then prefix by length desc
+        // Sort: exact > regex > prefix, then by path length desc
         host_entry.rules.sort_by(|a, b| {
-            match (&a.path_match_type, &b.path_match_type) {
-                (PathMatchType::Exact, PathMatchType::Prefix) => std::cmp::Ordering::Less,
-                (PathMatchType::Prefix, PathMatchType::Exact) => std::cmp::Ordering::Greater,
-                _ => b.path.len().cmp(&a.path.len()),
+            fn rank(t: &PathMatchType) -> u8 {
+                match t { PathMatchType::Exact => 0, PathMatchType::RegularExpression => 1, PathMatchType::Prefix => 2 }
             }
+            let r = rank(&a.path_match_type).cmp(&rank(&b.path_match_type));
+            if r != std::cmp::Ordering::Equal { return r; }
+            b.path.len().cmp(&a.path.len())
         });
     }
 
@@ -180,10 +194,35 @@ impl RouteTable {
         self.udp_routes.insert(port, backends);
     }
 
+    pub fn add_tls_route(&mut self, hostname: &str, backends: Vec<Backend>) {
+        let host_lower = hostname.to_ascii_lowercase();
+        if let Some(stripped) = host_lower.strip_prefix("*.") {
+            self.wildcard_tls_routes.insert(stripped.to_string(), backends);
+        } else {
+            self.tls_routes.insert(host_lower, backends);
+        }
+    }
+
     /// Resolve a TLS passthrough connection to a backend address.
-    /// Uses TCP routes for the listener port — SNI is logged but routing
-    /// is port-based (matching Gateway API TCPRoute on TLS listeners).
-    pub fn resolve_tls_passthrough(&self, _sni: &str, server_port: u16) -> Option<std::net::SocketAddr> {
+    /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
+    /// back to port-based TCP routes.
+    pub fn resolve_tls_passthrough(&self, sni: &str, server_port: u16) -> Option<std::net::SocketAddr> {
+        let sni_lower = sni.to_ascii_lowercase();
+
+        // Exact SNI match
+        if let Some(backends) = self.tls_routes.get(&sni_lower) {
+            return backends.first().map(|b| b.socket_addr);
+        }
+
+        // Wildcard SNI match: "foo.example.com" -> check "example.com"
+        if let Some(dot_pos) = sni_lower.find('.') {
+            let parent = &sni_lower[dot_pos + 1..];
+            if let Some(backends) = self.wildcard_tls_routes.get(parent) {
+                return backends.first().map(|b| b.socket_addr);
+            }
+        }
+
+        // Fall back to port-based TCP routes
         self.tcp_routes.get(&server_port)
             .and_then(|backends| backends.first())
             .map(|b| b.socket_addr)
@@ -205,6 +244,7 @@ pub struct HostEntry {
 pub enum PathMatchType {
     Prefix,
     Exact,
+    RegularExpression,
 }
 
 #[derive(Debug, Clone)]
@@ -212,10 +252,13 @@ pub struct HttpRouteRule {
     pub method_match: Option<String>,
     pub path_match_type: PathMatchType,
     pub path: String,
+    pub path_regex: Option<regex::Regex>,
     pub header_matches: Vec<HeaderMatch>,
     pub query_param_matches: Vec<QueryParamMatch>,
     pub filters: Vec<HttpFilter>,
     pub backends: Vec<Backend>,
+    pub request_timeout: Option<Duration>,
+    pub backend_request_timeout: Option<Duration>,
     /// Pre-computed at add_http_route time to skip filter iteration on hot path
     pub has_filters: bool,
     /// Pre-computed sum of backend weights for O(1) access
@@ -237,10 +280,13 @@ impl HttpRouteRule {
             method_match: None,
             path_match_type,
             path,
+            path_regex: None,
             header_matches,
             query_param_matches,
             filters,
             backends,
+            request_timeout: None,
+            backend_request_timeout: None,
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],
@@ -254,16 +300,32 @@ impl HttpRouteRule {
 }
 
 #[derive(Debug, Clone)]
+pub enum ValueMatcher {
+    Exact(String),
+    Regex(regex::Regex),
+}
+
+impl ValueMatcher {
+    #[inline]
+    pub fn is_match(&self, value: &str) -> bool {
+        match self {
+            ValueMatcher::Exact(expected) => value == expected,
+            ValueMatcher::Regex(re) => re.is_match(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct HeaderMatch {
     /// Lowercase header name
     pub name: String,
-    pub value: String,
+    pub matcher: ValueMatcher,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueryParamMatch {
     pub name: String,
-    pub value: String,
+    pub matcher: ValueMatcher,
 }
 
 #[derive(Debug, Clone)]
@@ -382,21 +444,28 @@ pub fn find_header_value<'a>(header_data: &'a [u8], name: &str) -> Option<&'a st
     None
 }
 
+/// Zero-allocation query parameter value lookup.
+/// Returns the value for the first matching `name=value` pair.
+#[inline]
+pub fn find_query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    if query.is_empty() {
+        return None;
+    }
+    for pair in query.split('&') {
+        if let Some(eq_pos) = pair.find('=') {
+            if &pair[..eq_pos] == name {
+                return Some(&pair[eq_pos + 1..]);
+            }
+        }
+    }
+    None
+}
+
 /// Zero-allocation query parameter lookup.
 /// Iterates `&`-separated pairs looking for exact `name=value` match.
 #[inline]
 pub fn query_string_contains_param(query: &str, name: &str, value: &str) -> bool {
-    if query.is_empty() {
-        return false;
-    }
-    for pair in query.split('&') {
-        if let Some(eq_pos) = pair.find('=') {
-            if &pair[..eq_pos] == name && &pair[eq_pos + 1..] == value {
-                return true;
-            }
-        }
-    }
-    false
+    find_query_param_value(query, name).is_some_and(|v| v == value)
 }
 
 #[cfg(test)]
@@ -444,7 +513,7 @@ mod tests {
         let mut rt = RouteTable::new();
         rt.add_http_route("example.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(),
-            vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+            vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("canary".to_string()) }],
             vec![], vec![],
             vec![backend(7001)],
         ));
@@ -465,6 +534,40 @@ mod tests {
         assert_eq!(find_header_value(headers, "x-custom"), Some("hello"));
         assert_eq!(find_header_value(headers, "content-type"), Some("text/plain"));
         assert_eq!(find_header_value(headers, "missing"), None);
+    }
+
+    #[test]
+    fn test_prefix_boundary_no_false_extension() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo", vec![backend(8001)]));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        // /foo/bar matches prefix /foo (boundary at /)
+        let r = rt.find_http_route("example.com", "GET", "/foo/bar", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // /foobar must NOT match prefix /foo — falls through to /
+        let r = rt.find_http_route("example.com", "GET", "/foobar", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+
+        // /foo exactly matches prefix /foo
+        let r = rt.find_http_route("example.com", "GET", "/foo", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+    }
+
+    #[test]
+    fn test_prefix_boundary_trailing_slash() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo/", vec![backend(8001)]));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        // /foo/bar matches prefix /foo/ (prefix ends with /)
+        let r = rt.find_http_route("example.com", "GET", "/foo/bar", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // /foo/ matches prefix /foo/
+        let r = rt.find_http_route("example.com", "GET", "/foo/", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
     }
 
     #[test]
@@ -514,7 +617,7 @@ mod tests {
         let mut rt = RouteTable::new();
         rt.add_http_route("example.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![],
-            vec![QueryParamMatch { name: "version".to_string(), value: "2".to_string() }],
+            vec![QueryParamMatch { name: "version".to_string(), matcher: ValueMatcher::Exact("2".to_string()) }],
             vec![], vec![backend(8001)],
         ));
         rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
@@ -542,8 +645,8 @@ mod tests {
         rt.add_http_route("example.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![],
             vec![
-                QueryParamMatch { name: "a".to_string(), value: "1".to_string() },
-                QueryParamMatch { name: "b".to_string(), value: "2".to_string() },
+                QueryParamMatch { name: "a".to_string(), matcher: ValueMatcher::Exact("1".to_string()) },
+                QueryParamMatch { name: "b".to_string(), matcher: ValueMatcher::Exact("2".to_string()) },
             ],
             vec![], vec![backend(8001)],
         ));
@@ -563,8 +666,8 @@ mod tests {
         let mut rt = RouteTable::new();
         rt.add_http_route("example.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/api".to_string(),
-            vec![HeaderMatch { name: "x-env".to_string(), value: "prod".to_string() }],
-            vec![QueryParamMatch { name: "v".to_string(), value: "2".to_string() }],
+            vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("prod".to_string()) }],
+            vec![QueryParamMatch { name: "v".to_string(), matcher: ValueMatcher::Exact("2".to_string()) }],
             vec![],
             vec![backend(8001)],
         ).with_method(Some("POST".to_string())));
@@ -595,6 +698,79 @@ mod tests {
     }
 
     #[test]
+    fn test_regex_header_matching() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(),
+            vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Regex(regex::Regex::new("^(canary|staging)$").unwrap()) }],
+            vec![], vec![],
+            vec![backend(7001)],
+        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(7002)]));
+
+        let headers = b"X-Env: canary\r\n";
+        let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:7001".parse().unwrap());
+
+        let headers = b"X-Env: staging\r\n";
+        let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:7001".parse().unwrap());
+
+        let headers = b"X-Env: production\r\n";
+        let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:7002".parse().unwrap());
+    }
+
+    #[test]
+    fn test_regex_query_param_matching() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![],
+            vec![QueryParamMatch { name: "version".to_string(), matcher: ValueMatcher::Regex(regex::Regex::new(r"^\d+$").unwrap()) }],
+            vec![], vec![backend(8001)],
+        ));
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "version=2").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        let r = rt.find_http_route("example.com", "GET", "/", &[], "version=abc").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+    }
+
+    #[test]
+    fn test_regex_path_matching() {
+        let mut rt = RouteTable::new();
+        let mut regex_rule = rule(PathMatchType::RegularExpression, r"^/api/v\d+/users$", vec![backend(8001)]);
+        regex_rule.path_regex = Some(regex::Regex::new(r"^/api/v\d+/users$").unwrap());
+        rt.add_http_route("example.com", regex_rule);
+        rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", vec![backend(8002)]));
+
+        let r = rt.find_http_route("example.com", "GET", "/api/v1/users", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        let r = rt.find_http_route("example.com", "GET", "/api/v2/users", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8001".parse().unwrap());
+
+        // No match — falls to prefix
+        let r = rt.find_http_route("example.com", "GET", "/api/v1/posts", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+    }
+
+    #[test]
+    fn test_exact_beats_regex_precedence() {
+        let mut rt = RouteTable::new();
+        let mut regex_rule = rule(PathMatchType::RegularExpression, r"^/foo.*", vec![backend(8001)]);
+        regex_rule.path_regex = Some(regex::Regex::new(r"^/foo.*").unwrap());
+        rt.add_http_route("example.com", regex_rule);
+        rt.add_http_route("example.com", rule(PathMatchType::Exact, "/foo", vec![backend(8002)]));
+
+        // Exact match wins over regex
+        let r = rt.find_http_route("example.com", "GET", "/foo", &[], "").unwrap();
+        assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
+    }
+
+    #[test]
     fn test_resolve_tls_passthrough_found() {
         let mut rt = RouteTable::new();
         rt.add_tcp_route(8443, vec![backend(9001)]);
@@ -607,6 +783,37 @@ mod tests {
     fn test_resolve_tls_passthrough_no_route() {
         let rt = RouteTable::new();
         assert!(rt.resolve_tls_passthrough("example.com", 8443).is_none());
+    }
+
+    #[test]
+    fn test_tls_route_sni_exact_match() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route("secure.example.com", vec![backend(9001)]);
+        rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
+
+        let addr = rt.resolve_tls_passthrough("secure.example.com", 8443);
+        assert_eq!(addr, Some("127.0.0.1:9001".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_tls_route_sni_wildcard_match() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route("*.example.com", vec![backend(9002)]);
+        rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
+
+        let addr = rt.resolve_tls_passthrough("foo.example.com", 8443);
+        assert_eq!(addr, Some("127.0.0.1:9002".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_tls_route_sni_fallback_to_tcp() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route("secure.example.com", vec![backend(9001)]);
+        rt.add_tcp_route(8443, vec![backend(9999)]);
+
+        // No SNI match -> falls back to TCP port route
+        let addr = rt.resolve_tls_passthrough("other.example.org", 8443);
+        assert_eq!(addr, Some("127.0.0.1:9999".parse().unwrap()));
     }
 }
 

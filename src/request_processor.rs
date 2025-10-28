@@ -46,6 +46,7 @@ pub enum ProcessingDecision {
         backend_addr: SocketAddr,
         keepalive: bool,
         filters: Option<Box<HttpFilterData>>,
+        backend_timeout: Option<std::time::Duration>,
     },
     HttpRedirect {
         status_code: u16,
@@ -137,6 +138,7 @@ fn analyze_http_request(
             backend_addr: selected_backend.socket_addr,
             keepalive,
             filters: None,
+            backend_timeout: rule.backend_request_timeout,
         });
     }
 
@@ -209,6 +211,7 @@ fn analyze_http_request(
             url_rewrite,
             mirror_addrs,
         })),
+        backend_timeout: rule.backend_request_timeout,
     })
 }
 

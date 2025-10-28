@@ -128,9 +128,9 @@ async fn handle_connection(
             ProcessingDecision::TcpForward { backend_addr } => {
                 return handle_tcp_connection(client, backend_addr, &buf[..n]).await;
             }
-            ProcessingDecision::HttpForward { backend_addr, keepalive, filters } => {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout } => {
                 let ka = handle_http_forward(
-                    &mut client, &mut buf, n, backend_addr, keepalive, filters, &mut state,
+                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, &mut state,
                 ).await?;
                 if !ka {
                     return Ok(());
@@ -169,15 +169,24 @@ async fn handle_http_forward(
     initial_backend_addr: SocketAddr,
     initial_keepalive: bool,
     initial_filters: Option<Box<HttpFilterData>>,
+    initial_backend_timeout: Option<std::time::Duration>,
     state: &mut ConnectionState,
 ) -> Result<bool> {
     let mut backend_addr = initial_backend_addr;
     let mut keepalive = initial_keepalive;
     let mut request_bytes = initial_bytes;
     let mut filter_data = initial_filters;
+    let mut per_rule_timeout = initial_backend_timeout;
 
     loop {
-        let mut backend = state.pool.acquire(backend_addr).await?;
+        let timeout_dur = per_rule_timeout.unwrap_or(std::time::Duration::from_secs(30));
+        let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                send_error_response(client, 504).await?;
+                return Ok(false);
+            }
+        };
 
         if let Some(ref fd) = filter_data {
             let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
@@ -198,7 +207,16 @@ async fn handle_http_forward(
         }
 
         let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
-        let response_complete = forward_http_response(&mut backend, client, buf, resp_mods).await?;
+        let response_complete = match tokio::time::timeout(
+            timeout_dur,
+            forward_http_response(&mut backend, client, buf, resp_mods),
+        ).await {
+            Ok(result) => result?,
+            Err(_) => {
+                send_error_response(client, 504).await?;
+                return Ok(false);
+            }
+        };
 
         if response_complete && keepalive {
             state.pool.release(backend_addr, backend);
@@ -219,10 +237,11 @@ async fn handle_http_forward(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters } => {
+            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt } => {
                 backend_addr = addr;
                 keepalive = ka;
                 filter_data = filters;
+                per_rule_timeout = bt;
             }
             ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
                 send_redirect_response(client, status_code, &location).await?;

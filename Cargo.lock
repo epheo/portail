@@ -1709,6 +1709,7 @@ dependencies = [
  "fnv",
  "libc",
  "pin-project-lite",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "rustversion",

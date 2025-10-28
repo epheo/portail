@@ -1,6 +1,6 @@
 use uringress::routing::{
     RouteTable, Backend, HttpRouteRule, HttpFilter, HttpHeader, URLRewritePath,
-    PathMatchType, HeaderMatch, QueryParamMatch, BackendSelector,
+    PathMatchType, HeaderMatch, QueryParamMatch, BackendSelector, ValueMatcher,
 };
 
 #[test]
@@ -219,7 +219,7 @@ fn test_single_header_match() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(),
-        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("canary".to_string()) }],
         vec![], vec![],
         vec![backend(8001)],
     ));
@@ -236,8 +236,8 @@ fn test_multiple_headers_and_logic() {
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(),
         vec![
-            HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() },
-            HeaderMatch { name: "x-region".to_string(), value: "us-east".to_string() },
+            HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("canary".to_string()) },
+            HeaderMatch { name: "x-region".to_string(), matcher: ValueMatcher::Exact("us-east".to_string()) },
         ],
         vec![], vec![],
         vec![backend(8001)],
@@ -258,7 +258,7 @@ fn test_header_match_case_insensitive() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(),
-        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("canary".to_string()) }],
         vec![], vec![],
         vec![backend(8001)],
     ));
@@ -274,7 +274,7 @@ fn test_header_match_fallback_to_no_header_rule() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(),
-        vec![HeaderMatch { name: "x-env".to_string(), value: "canary".to_string() }],
+        vec![HeaderMatch { name: "x-env".to_string(), matcher: ValueMatcher::Exact("canary".to_string()) }],
         vec![], vec![],
         vec![backend(8001)],
     ));
@@ -451,7 +451,7 @@ fn test_query_param_match_integration() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/search".to_string(), vec![],
-        vec![QueryParamMatch { name: "format".to_string(), value: "json".to_string() }],
+        vec![QueryParamMatch { name: "format".to_string(), matcher: ValueMatcher::Exact("json".to_string()) }],
         vec![], vec![backend(8001)],
     ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/search", 8002));
@@ -468,8 +468,8 @@ fn test_method_plus_query_plus_header_integration() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/api".to_string(),
-        vec![HeaderMatch { name: "x-version".to_string(), value: "2".to_string() }],
-        vec![QueryParamMatch { name: "debug".to_string(), value: "true".to_string() }],
+        vec![HeaderMatch { name: "x-version".to_string(), matcher: ValueMatcher::Exact("2".to_string()) }],
+        vec![QueryParamMatch { name: "debug".to_string(), matcher: ValueMatcher::Exact("true".to_string()) }],
         vec![], vec![backend(8001)],
     ).with_method(Some("POST".to_string())));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
