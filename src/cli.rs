@@ -52,6 +52,16 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     #[arg(help = "Directory for TLS certificate files (default: /etc/uringress/certs)")]
     pub cert_dir: Option<PathBuf>,
+
+    /// Run as Kubernetes Gateway API controller
+    #[arg(long)]
+    #[arg(help = "Watch Kubernetes Gateway API resources instead of loading a config file")]
+    pub kubernetes: bool,
+
+    /// Controller name for GatewayClass matching
+    #[arg(long, default_value = "uringress.io/gateway-controller")]
+    #[arg(help = "Controller name to match against GatewayClass spec.controllerName")]
+    pub controller_name: String,
 }
 
 impl Args {
@@ -80,6 +90,10 @@ impl Args {
         // Validate that check-config and validate-only require config file
         if (self.check_config || self.validate_only) && self.config.is_none() {
             return Err("--check-config and --validate-only require --config to be specified".to_string());
+        }
+
+        if self.kubernetes && self.config.is_some() {
+            return Err("--kubernetes and --config are mutually exclusive".to_string());
         }
 
         Ok(())
@@ -119,6 +133,8 @@ mod tests {
             generate_config: None,
             output: None,
             cert_dir: None,
+            kubernetes: false,
+            controller_name: "uringress.io/gateway-controller".to_string(),
         };
         assert!(args.validate().is_ok());
 
@@ -131,6 +147,8 @@ mod tests {
             generate_config: None,
             output: None,
             cert_dir: None,
+            kubernetes: false,
+            controller_name: "uringress.io/gateway-controller".to_string(),
         };
         assert!(args.validate().is_ok());
 
@@ -143,6 +161,8 @@ mod tests {
             generate_config: None,
             output: None,
             cert_dir: None,
+            kubernetes: false,
+            controller_name: "uringress.io/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
     }
@@ -158,6 +178,8 @@ mod tests {
             generate_config: None,
             output: None,
             cert_dir: None,
+            kubernetes: false,
+            controller_name: "uringress.io/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
 
@@ -170,6 +192,25 @@ mod tests {
             generate_config: None,
             output: None,
             cert_dir: None,
+            kubernetes: false,
+            controller_name: "uringress.io/gateway-controller".to_string(),
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_kubernetes_and_config_mutually_exclusive() {
+        let args = Args {
+            config: Some(PathBuf::from("config.yaml")),
+            validate_only: false,
+            check_config: false,
+            verbose: 0,
+            example_config: false,
+            generate_config: None,
+            output: None,
+            cert_dir: None,
+            kubernetes: true,
+            controller_name: "uringress.io/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
     }

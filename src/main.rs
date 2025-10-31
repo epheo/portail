@@ -15,12 +15,14 @@ mod http_filters;
 mod tls;
 mod data_plane;
 mod ebpf;
+mod kubernetes;
 
 use control_plane::ControlPlane;
 use data_plane::DataPlane;
 use cli::Args;
 use clap::Parser;
 use config::UringRessConfig;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,6 +83,20 @@ async fn main() -> Result<()> {
 
     let routes = control_plane.get_routes();
 
+    // In Kubernetes mode, spawn the Gateway API controller
+    let shutdown_token = CancellationToken::new();
+    if args.kubernetes {
+        let k8s_routes = routes.clone();
+        let controller_name = args.controller_name.clone();
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = kubernetes::controller::run_controller(k8s_routes, controller_name, token).await {
+                error!("Kubernetes controller failed: {}", e);
+            }
+        });
+        info!("Kubernetes Gateway API controller started");
+    }
+
     let mut data_plane = DataPlane::new(worker_count, &listeners, &performance_config, &cert_dir)?;
 
     // Attach eBPF before starting workers
@@ -95,6 +111,7 @@ async fn main() -> Result<()> {
 
     // Wait for shutdown signal
     control_plane.wait_for_shutdown().await?;
+    shutdown_token.cancel();
 
     info!("Shutting down UringRess");
     data_plane.shutdown().await;
