@@ -152,6 +152,9 @@ pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Resu
         return Err(anyhow!("TLS Terminate mode requires at least one certificateRef"));
     }
 
+    // Ensure a process-level CryptoProvider is available
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     if cert_refs.len() == 1 {
         // Single cert fast path — no resolver overhead
         let (certs, key) = load_cert_and_key(&cert_refs[0], cert_dir)?;
@@ -398,7 +401,6 @@ mod tests {
 
     #[test]
     fn test_build_tls_acceptor_multiple_certs() {
-        use std::io::Write;
         use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();

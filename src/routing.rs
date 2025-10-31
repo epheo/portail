@@ -461,16 +461,13 @@ pub fn find_query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str>
     None
 }
 
-/// Zero-allocation query parameter lookup.
-/// Iterates `&`-separated pairs looking for exact `name=value` match.
-#[inline]
-pub fn query_string_contains_param(query: &str, name: &str, value: &str) -> bool {
-    find_query_param_value(query, name).is_some_and(|v| v == value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_string_contains_param(query: &str, name: &str, value: &str) -> bool {
+        find_query_param_value(query, name).is_some_and(|v| v == value)
+    }
 
     fn backend(port: u16) -> Backend {
         Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1 }

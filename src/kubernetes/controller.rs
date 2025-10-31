@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 use futures::StreamExt;
@@ -8,6 +9,7 @@ use kube::runtime::Controller;
 use kube::runtime::reflector::ObjectRef;
 use kube::Client;
 use kube::ResourceExt;
+use k8s_openapi::api::core::v1::Namespace;
 use tokio_util::sync::CancellationToken;
 
 use gateway_api::gatewayclasses::GatewayClass;
@@ -183,6 +185,8 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
+    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by uringress").await;
+
     // Fetch all routes across all namespaces
     let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
     let tcp_routes_api: Api<TCPRoute> = Api::all(ctx.client.clone());
@@ -213,15 +217,33 @@ async fn reconcile(
         .map(|list| list.items)
         .unwrap_or_default();
 
+    // Pre-fetch namespace labels for allowedRoutes selector matching
+    let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
+    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ns_api
+        .list(&ListParams::default())
+        .await
+        .map(|list| {
+            list.items
+                .into_iter()
+                .filter_map(|ns| {
+                    let name = ns.metadata.name?;
+                    let labels = ns.metadata.labels.unwrap_or_default();
+                    Some((name, labels))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Build config from K8s resources
-    let config = match reconcile_to_config(
+    let result = match reconcile_to_config(
         &gateway,
         &http_routes,
         &tcp_routes,
         &tls_routes,
         &udp_routes,
+        &namespace_labels,
     ) {
-        Ok(c) => c,
+        Ok(r) => r,
         Err(e) => {
             error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
             status::update_gateway_status(
@@ -229,14 +251,35 @@ async fn reconcile(
                 &gateway,
                 false,
                 &format!("Reconciliation failed: {}", e),
+                &HashMap::new(),
             )
             .await;
             return Ok(Action::await_change());
         }
     };
 
-    // Convert to route table
-    match config.to_route_table() {
+    let config = &result.config;
+
+    // Compute per-listener attached route counts from accepted routes
+    let mut listener_route_counts: HashMap<String, i32> = HashMap::new();
+    for listener in &gateway.spec.listeners {
+        listener_route_counts.insert(listener.name.clone(), 0);
+    }
+    for ra in &result.route_status {
+        if ra.accepted {
+            if let Some(ref section) = ra.section_name {
+                *listener_route_counts.entry(section.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Convert to route table (spawn_blocking: to_route_table does sync DNS resolution)
+    let config_clone = config.clone();
+    let route_table = tokio::task::spawn_blocking(move || config_clone.to_route_table())
+        .await
+        .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
+
+    match route_table {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
             info!(
@@ -248,7 +291,14 @@ async fn reconcile(
                 config.tls_routes.len(),
                 config.udp_routes.len(),
             );
-            status::update_gateway_status(&ctx.client, &gateway, true, "Programmed").await;
+            status::update_gateway_status(
+                &ctx.client,
+                &gateway,
+                true,
+                "Programmed",
+                &listener_route_counts,
+            )
+            .await;
         }
         Err(e) => {
             error!(
@@ -260,8 +310,76 @@ async fn reconcile(
                 &gateway,
                 false,
                 &format!("Route table conversion failed: {}", e),
+                &listener_route_counts,
             )
             .await;
+        }
+    }
+
+    // Update per-route status
+    for ra in &result.route_status {
+        match ra.kind {
+            "HTTPRoute" => {
+                status::update_route_status::<HTTPRoute>(
+                    &ctx.client,
+                    &ra.name,
+                    &ra.namespace,
+                    &ctx.controller_name,
+                    &gw_name,
+                    &gw_ns,
+                    ra.section_name.as_deref(),
+                    ra.accepted,
+                    &ra.message,
+                    ra.generation,
+                )
+                .await;
+            }
+            "TCPRoute" => {
+                status::update_route_status::<TCPRoute>(
+                    &ctx.client,
+                    &ra.name,
+                    &ra.namespace,
+                    &ctx.controller_name,
+                    &gw_name,
+                    &gw_ns,
+                    ra.section_name.as_deref(),
+                    ra.accepted,
+                    &ra.message,
+                    ra.generation,
+                )
+                .await;
+            }
+            "TLSRoute" => {
+                status::update_route_status::<TLSRoute>(
+                    &ctx.client,
+                    &ra.name,
+                    &ra.namespace,
+                    &ctx.controller_name,
+                    &gw_name,
+                    &gw_ns,
+                    ra.section_name.as_deref(),
+                    ra.accepted,
+                    &ra.message,
+                    ra.generation,
+                )
+                .await;
+            }
+            "UDPRoute" => {
+                status::update_route_status::<UDPRoute>(
+                    &ctx.client,
+                    &ra.name,
+                    &ra.namespace,
+                    &ctx.controller_name,
+                    &gw_name,
+                    &gw_ns,
+                    ra.section_name.as_deref(),
+                    ra.accepted,
+                    &ra.message,
+                    ra.generation,
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 

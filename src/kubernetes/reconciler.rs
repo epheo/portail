@@ -1,12 +1,131 @@
+use std::collections::{BTreeMap, HashMap};
 use anyhow::{anyhow, Result};
 
-use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
+use gateway_api::gateways::{
+    Gateway, GatewayListeners, GatewayListenersTlsMode,
+    GatewayListenersAllowedRoutesNamespacesFrom,
+};
 use gateway_api::httproutes::*;
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
 
 use crate::config::*;
+
+pub struct ReconcileResult {
+    pub config: UringRessConfig,
+    pub route_status: Vec<RouteAcceptance>,
+}
+
+pub struct RouteAcceptance {
+    pub name: String,
+    pub namespace: String,
+    pub kind: &'static str,
+    pub accepted: bool,
+    pub message: String,
+    pub generation: Option<i64>,
+    pub section_name: Option<String>,
+}
+
+/// Check if a route in `route_ns` is allowed by the listener's allowedRoutes policy.
+fn is_route_allowed_by_listener(
+    listener: &GatewayListeners,
+    gateway_ns: &str,
+    route_ns: &str,
+    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+) -> bool {
+    let allowed = match &listener.allowed_routes {
+        None => return route_ns == gateway_ns,
+        Some(ar) => ar,
+    };
+    let namespaces = match &allowed.namespaces {
+        None => return route_ns == gateway_ns,
+        Some(ns) => ns,
+    };
+    match &namespaces.from {
+        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => {
+            route_ns == gateway_ns
+        }
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
+            let labels = match namespace_labels.get(route_ns) {
+                Some(l) => l,
+                None => return false,
+            };
+            let selector = match &namespaces.selector {
+                Some(s) => s,
+                None => return true,
+            };
+            // matchLabels: every key=value must be present
+            if let Some(match_labels) = &selector.match_labels {
+                for (k, v) in match_labels {
+                    if labels.get(k) != Some(v) {
+                        return false;
+                    }
+                }
+            }
+            // matchExpressions: each expression must match
+            if let Some(exprs) = &selector.match_expressions {
+                for expr in exprs {
+                    let has = labels.get(&expr.key);
+                    let vals = expr.values.as_deref().unwrap_or_default();
+                    match expr.operator.as_str() {
+                        "In" => {
+                            if !has.map_or(false, |v| vals.contains(v)) {
+                                return false;
+                            }
+                        }
+                        "NotIn" => {
+                            if has.map_or(false, |v| vals.contains(v)) {
+                                return false;
+                            }
+                        }
+                        "Exists" => {
+                            if has.is_none() {
+                                return false;
+                            }
+                        }
+                        "DoesNotExist" => {
+                            if has.is_some() {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Check if a route targets a specific listener by sectionName, and if so, whether
+/// the listener's namespace policy allows the route.
+fn route_allowed_for_listener<T: ParentRefAccess>(
+    parent_refs: &Option<Vec<T>>,
+    gateway_name: &str,
+    listener: &GatewayListeners,
+    gateway_ns: &str,
+    route_ns: &str,
+    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+) -> bool {
+    let refs = match parent_refs.as_ref() {
+        Some(r) => r,
+        None => return false,
+    };
+    refs.iter().any(|pr| {
+        if pr.ref_name() != gateway_name {
+            return false;
+        }
+        // If sectionName is specified, it must match this listener
+        if let Some(section) = pr.ref_section_name() {
+            if section != listener.name {
+                return false;
+            }
+        }
+        is_route_allowed_by_listener(listener, gateway_ns, route_ns, namespace_labels)
+    })
+}
 
 /// Convert Kubernetes Gateway API resources into a UringRessConfig.
 /// This reuses all existing validation, conversion, hostname intersection,
@@ -17,41 +136,177 @@ pub fn reconcile_to_config(
     tcp_routes: &[TCPRoute],
     tls_routes: &[TLSRoute],
     udp_routes: &[UDPRoute],
-) -> Result<UringRessConfig> {
+    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+) -> Result<ReconcileResult> {
     let gateway_config = convert_gateway(gateway)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
+    let gateway_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
 
-    let http_route_configs: Vec<HttpRouteConfig> = http_routes
-        .iter()
-        .filter(|r| route_targets_gateway(&r.spec.parent_refs, gateway_name))
-        .filter_map(|r| convert_http_route(r, gateway_name).ok())
-        .collect();
+    let mut route_status = Vec::new();
 
-    let tcp_route_configs: Vec<TcpRouteConfig> = tcp_routes
-        .iter()
-        .filter(|r| route_targets_gateway(&r.spec.parent_refs, gateway_name))
-        .filter_map(|r| convert_tcp_route(r, gateway_name).ok())
-        .collect();
+    let http_route_configs = collect_routes(
+        http_routes,
+        gateway_name,
+        gateway_ns,
+        &gateway.spec.listeners,
+        namespace_labels,
+        "HTTPRoute",
+        |r| &r.spec.parent_refs,
+        |r| route_namespace(&r.metadata),
+        |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
+        |r| convert_http_route(r, gateway_name),
+        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        &mut route_status,
+    );
 
-    let tls_route_configs: Vec<TlsRouteConfig> = tls_routes
-        .iter()
-        .filter(|r| route_targets_gateway(&r.spec.parent_refs, gateway_name))
-        .filter_map(|r| convert_tls_route(r, gateway_name).ok())
-        .collect();
+    let tcp_route_configs = collect_routes(
+        tcp_routes,
+        gateway_name,
+        gateway_ns,
+        &gateway.spec.listeners,
+        namespace_labels,
+        "TCPRoute",
+        |r| &r.spec.parent_refs,
+        |r| route_namespace(&r.metadata),
+        |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
+        |r| convert_tcp_route(r, gateway_name),
+        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        &mut route_status,
+    );
 
-    let udp_route_configs: Vec<UdpRouteConfig> = udp_routes
-        .iter()
-        .filter(|r| route_targets_gateway(&r.spec.parent_refs, gateway_name))
-        .filter_map(|r| convert_udp_route(r, gateway_name).ok())
-        .collect();
+    let tls_route_configs = collect_routes(
+        tls_routes,
+        gateway_name,
+        gateway_ns,
+        &gateway.spec.listeners,
+        namespace_labels,
+        "TLSRoute",
+        |r| &r.spec.parent_refs,
+        |r| route_namespace(&r.metadata),
+        |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
+        |r| convert_tls_route(r, gateway_name),
+        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        &mut route_status,
+    );
 
-    Ok(UringRessConfig {
-        gateway: gateway_config,
-        http_routes: http_route_configs,
-        tcp_routes: tcp_route_configs,
-        tls_routes: tls_route_configs,
-        udp_routes: udp_route_configs,
-        ..Default::default()
+    let udp_route_configs = collect_routes(
+        udp_routes,
+        gateway_name,
+        gateway_ns,
+        &gateway.spec.listeners,
+        namespace_labels,
+        "UDPRoute",
+        |r| &r.spec.parent_refs,
+        |r| route_namespace(&r.metadata),
+        |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
+        |r| convert_udp_route(r, gateway_name),
+        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        &mut route_status,
+    );
+
+    Ok(ReconcileResult {
+        config: UringRessConfig {
+            gateway: gateway_config,
+            http_routes: http_route_configs,
+            tcp_routes: tcp_route_configs,
+            tls_routes: tls_route_configs,
+            udp_routes: udp_route_configs,
+            ..Default::default()
+        },
+        route_status,
+    })
+}
+
+/// Generic route collection with namespace scoping and acceptance tracking.
+fn collect_routes<R, P, C>(
+    routes: &[R],
+    gateway_name: &str,
+    gateway_ns: &str,
+    listeners: &[GatewayListeners],
+    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+    kind: &'static str,
+    get_parent_refs: impl Fn(&R) -> &Option<Vec<P>>,
+    get_namespace: impl Fn(&R) -> &str,
+    get_identity: impl Fn(&R) -> (&str, Option<i64>),
+    convert: impl Fn(&R) -> Result<C>,
+    get_section_name: impl Fn(&R) -> Option<String>,
+    route_status: &mut Vec<RouteAcceptance>,
+) -> Vec<C>
+where
+    P: ParentRefAccess,
+{
+    let mut configs = Vec::new();
+    for route in routes {
+        if !route_targets_gateway(get_parent_refs(route), gateway_name) {
+            continue;
+        }
+
+        let route_ns = get_namespace(route);
+        let (name, generation) = get_identity(route);
+        let section_name = get_section_name(route);
+
+        // Check namespace scoping against at least one listener
+        let ns_allowed = listeners.iter().any(|l| {
+            route_allowed_for_listener(
+                get_parent_refs(route),
+                gateway_name,
+                l,
+                gateway_ns,
+                route_ns,
+                namespace_labels,
+            )
+        });
+
+        if !ns_allowed {
+            route_status.push(RouteAcceptance {
+                name: name.to_string(),
+                namespace: route_ns.to_string(),
+                kind,
+                accepted: false,
+                message: format!("Route namespace '{}' not allowed by listener policy", route_ns),
+                generation,
+                section_name,
+            });
+            continue;
+        }
+
+        match convert(route) {
+            Ok(config) => {
+                route_status.push(RouteAcceptance {
+                    name: name.to_string(),
+                    namespace: route_ns.to_string(),
+                    kind,
+                    accepted: true,
+                    message: "Accepted".to_string(),
+                    generation,
+                    section_name,
+                });
+                configs.push(config);
+            }
+            Err(e) => {
+                route_status.push(RouteAcceptance {
+                    name: name.to_string(),
+                    namespace: route_ns.to_string(),
+                    kind,
+                    accepted: false,
+                    message: format!("Conversion failed: {}", e),
+                    generation,
+                    section_name,
+                });
+            }
+        }
+    }
+    configs
+}
+
+fn first_section_name_for_gateway<T: ParentRefAccess>(
+    parent_refs: &Option<Vec<T>>,
+    gateway_name: &str,
+) -> Option<String> {
+    parent_refs.as_ref().and_then(|refs| {
+        refs.iter()
+            .find(|pr| pr.ref_name() == gateway_name)
+            .and_then(|pr| pr.ref_section_name().map(String::from))
     })
 }
 
@@ -553,6 +808,12 @@ mod tests {
     use gateway_api::gateways::*;
     use kube::core::ObjectMeta;
 
+    fn default_ns_labels() -> HashMap<String, BTreeMap<String, String>> {
+        let mut m = HashMap::new();
+        m.insert("default".to_string(), BTreeMap::new());
+        m
+    }
+
     fn test_gateway() -> Gateway {
         Gateway {
             metadata: ObjectMeta {
@@ -615,25 +876,27 @@ mod tests {
     fn test_reconcile_basic() {
         let gw = test_gateway();
         let route = test_http_route();
+        let ns_labels = default_ns_labels();
 
-        let config =
-            reconcile_to_config(&gw, &[route], &[], &[], &[]).unwrap();
+        let result =
+            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels).unwrap();
 
-        assert_eq!(config.gateway.name, "test-gw");
-        assert_eq!(config.gateway.listeners.len(), 1);
-        assert_eq!(config.gateway.listeners[0].port, 8080);
-        assert_eq!(config.http_routes.len(), 1);
-        assert_eq!(config.http_routes[0].hostnames, vec!["api.example.com"]);
-        assert_eq!(config.http_routes[0].rules[0].backend_refs[0].name, "api-svc.default.svc");
-        assert_eq!(config.http_routes[0].rules[0].backend_refs[0].port, 3000);
+        assert_eq!(result.config.gateway.name, "test-gw");
+        assert_eq!(result.config.gateway.listeners.len(), 1);
+        assert_eq!(result.config.gateway.listeners[0].port, 8080);
+        assert_eq!(result.config.http_routes.len(), 1);
+        assert_eq!(result.config.http_routes[0].hostnames, vec!["api.example.com"]);
+        assert_eq!(result.config.http_routes[0].rules[0].backend_refs[0].name, "api-svc.default.svc");
+        assert_eq!(result.config.http_routes[0].rules[0].backend_refs[0].port, 3000);
+        assert!(result.route_status.iter().all(|r| r.accepted));
     }
 
     #[test]
     fn test_reconcile_filters_routes_by_gateway() {
         let gw = test_gateway();
         let matching_route = test_http_route();
+        let ns_labels = default_ns_labels();
 
-        // Route targeting a different gateway
         let other_route = HTTPRoute {
             metadata: ObjectMeta {
                 name: Some("other-route".to_string()),
@@ -658,38 +921,38 @@ mod tests {
             status: None,
         };
 
-        let config = reconcile_to_config(
+        let result = reconcile_to_config(
             &gw,
             &[matching_route, other_route],
             &[],
             &[],
             &[],
+            &ns_labels,
         )
         .unwrap();
 
-        assert_eq!(config.http_routes.len(), 1);
-        assert_eq!(config.http_routes[0].hostnames, vec!["api.example.com"]);
+        assert_eq!(result.config.http_routes.len(), 1);
+        assert_eq!(result.config.http_routes[0].hostnames, vec!["api.example.com"]);
     }
 
     #[test]
     fn test_reconcile_produces_valid_config() {
         let gw = test_gateway();
         let route = test_http_route();
+        let ns_labels = default_ns_labels();
 
-        let config =
-            reconcile_to_config(&gw, &[route], &[], &[], &[]).unwrap();
+        let result =
+            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels).unwrap();
 
-        // Verify the config structure is correct
-        assert_eq!(config.gateway.listeners[0].protocol, Protocol::HTTP);
-        assert_eq!(config.http_routes[0].rules.len(), 1);
-        let rule = &config.http_routes[0].rules[0];
+        assert_eq!(result.config.gateway.listeners[0].protocol, Protocol::HTTP);
+        assert_eq!(result.config.http_routes[0].rules.len(), 1);
+        let rule = &result.config.http_routes[0].rules[0];
         assert_eq!(rule.matches.len(), 1);
         assert_eq!(
             rule.matches[0].path.as_ref().unwrap().match_type,
             HttpPathMatchType::PathPrefix
         );
         assert_eq!(rule.matches[0].path.as_ref().unwrap().value, "/v1");
-        // Backend uses DNS name format for in-cluster resolution
         assert_eq!(rule.backend_refs[0].name, "api-svc.default.svc");
     }
 
@@ -703,5 +966,82 @@ mod tests {
             backend_dns_name("my-svc", None, "default"),
             "my-svc.default.svc"
         );
+    }
+
+    #[test]
+    fn test_namespace_scoping_same() {
+        // Default (no allowedRoutes) => Same namespace only
+        let mut gw = test_gateway();
+        gw.metadata.namespace = Some("default".to_string());
+
+        // Route in different namespace should be rejected
+        let mut route = test_http_route();
+        route.metadata.namespace = Some("other-ns".to_string());
+
+        let mut ns_labels = default_ns_labels();
+        ns_labels.insert("other-ns".to_string(), BTreeMap::new());
+
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels).unwrap();
+        assert_eq!(result.config.http_routes.len(), 0);
+        assert!(!result.route_status[0].accepted);
+    }
+
+    #[test]
+    fn test_namespace_scoping_all() {
+        use gateway_api::gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces};
+
+        let mut gw = test_gateway();
+        gw.spec.listeners[0].allowed_routes = Some(GatewayListenersAllowedRoutes {
+            namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                from: Some(GatewayListenersAllowedRoutesNamespacesFrom::All),
+                selector: None,
+            }),
+            kinds: None,
+        });
+
+        let mut route = test_http_route();
+        route.metadata.namespace = Some("other-ns".to_string());
+
+        let mut ns_labels = default_ns_labels();
+        ns_labels.insert("other-ns".to_string(), BTreeMap::new());
+
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels).unwrap();
+        assert_eq!(result.config.http_routes.len(), 1);
+        assert!(result.route_status[0].accepted);
+    }
+
+    #[test]
+    fn test_namespace_scoping_selector() {
+        use gateway_api::gateways::*;
+
+        let mut gw = test_gateway();
+        gw.spec.listeners[0].allowed_routes = Some(GatewayListenersAllowedRoutes {
+            namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                from: Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector),
+                selector: Some(GatewayListenersAllowedRoutesNamespacesSelector {
+                    match_labels: Some(BTreeMap::from([("env".to_string(), "prod".to_string())])),
+                    match_expressions: None,
+                }),
+            }),
+            kinds: None,
+        });
+
+        let mut route = test_http_route();
+        route.metadata.namespace = Some("prod-ns".to_string());
+
+        // Namespace with matching label
+        let mut ns_labels = default_ns_labels();
+        ns_labels.insert(
+            "prod-ns".to_string(),
+            BTreeMap::from([("env".to_string(), "prod".to_string())]),
+        );
+
+        let result = reconcile_to_config(&gw, &[route.clone()], &[], &[], &[], &ns_labels).unwrap();
+        assert_eq!(result.config.http_routes.len(), 1);
+
+        // Namespace without matching label
+        ns_labels.insert("prod-ns".to_string(), BTreeMap::from([("env".to_string(), "staging".to_string())]));
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels).unwrap();
+        assert_eq!(result.config.http_routes.len(), 0);
     }
 }

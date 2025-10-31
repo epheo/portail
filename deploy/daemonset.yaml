@@ -1,37 +1,45 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: portail
-  namespace: portail-system
+  name: uringress
+  namespace: uringress-system
   labels:
-    app: portail
+    app: uringress
 spec:
   selector:
     matchLabels:
-      app: portail
+      app: uringress
   template:
     metadata:
       labels:
-        app: portail
+        app: uringress
     spec:
-      serviceAccountName: portail-controller
+      serviceAccountName: uringress-controller
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-      - name: portail
-        image: quay.io/epheo/portail:latest
-        imagePullPolicy: Always
-        args: ["--kubernetes"]
-        securityContext:
-          capabilities:
-            add:
-              - NET_BIND_SERVICE
-        env:
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.hostIP
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
+        - name: uringress
+          image: uringress:latest
+          args: ["--kubernetes"]
+          securityContext:
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - NET_BIND_SERVICE
+                - SYS_ADMIN
+          volumeMounts:
+            - name: bpf
+              mountPath: /sys/fs/bpf
+            - name: tls-certs
+              mountPath: /etc/uringress/certs
+              readOnly: true
+      volumes:
+        - name: bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: tls-certs
+          secret:
+            secretName: uringress-tls
+            optional: true

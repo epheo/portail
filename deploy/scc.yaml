@@ -1,13 +1,16 @@
 apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
-  name: portail
+  name: uringress
 allowHostNetwork: true
 allowHostPorts: true
 allowPrivilegedContainer: false
-allowHostDirVolumePlugin: false
+allowHostDirVolumePlugin: true
 allowedCapabilities:
+  - BPF
+  - NET_ADMIN
   - NET_BIND_SERVICE
+  - SYS_ADMIN
 runAsUser:
   type: RunAsAny
 seLinuxContext:
@@ -17,7 +20,8 @@ fsGroup:
 supplementalGroups:
   type: RunAsAny
 volumes:
+  - hostPath
   - secret
   - configMap
 users:
-  - system:serviceaccount:portail-system:portail-controller
+  - system:serviceaccount:uringress-system:uringress-controller
