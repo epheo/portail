@@ -1,4 +1,4 @@
-/// eBPF integration tests for UringRess
+/// eBPF integration tests for Portail
 /// Validates eBPF system initialization (requires privileged environment)
 
 use anyhow::Result;
@@ -6,7 +6,7 @@ use anyhow::Result;
 #[cfg(test)]
 mod ebpf_tests {
     use super::*;
-    use uringress::ebpf::initialize_ebpf_system;
+    use portail::ebpf::initialize_ebpf_system;
 
     #[test]
     fn test_ebpf_system_initialization() -> Result<()> {

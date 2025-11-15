@@ -1,12 +1,12 @@
 use clap::{ArgAction, Parser};
 use std::path::PathBuf;
 
-/// Command-line interface for UringRess Gateway Controller
+/// Command-line interface for Portail Gateway Controller
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-#[command(name = "uringress")]
+#[command(name = "portail")]
 #[command(about = "High-Performance Kubernetes Gateway API Controller")]
-#[command(long_about = "UringRess is a high-performance Kubernetes Gateway API Controller built exclusively for io_uring-enabled Linux environments. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.")]
+#[command(long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.")]
 pub struct Args {
     /// Configuration file path (JSON or YAML format)
     #[arg(short, long, value_name = "FILE")]
@@ -50,7 +50,7 @@ pub struct Args {
 
     /// Directory containing TLS certificate files ({name}.crt / {name}.key)
     #[arg(long, value_name = "DIR")]
-    #[arg(help = "Directory for TLS certificate files (default: /etc/uringress/certs)")]
+    #[arg(help = "Directory for TLS certificate files (default: /etc/portail/certs)")]
     pub cert_dir: Option<PathBuf>,
 
     /// Run as Kubernetes Gateway API controller
@@ -59,7 +59,7 @@ pub struct Args {
     pub kubernetes: bool,
 
     /// Controller name for GatewayClass matching
-    #[arg(long, default_value = "uringress.io/gateway-controller")]
+    #[arg(long, default_value = "portail.epheo.eu/gateway-controller")]
     #[arg(help = "Controller name to match against GatewayClass spec.controllerName")]
     pub controller_name: String,
 }
@@ -134,7 +134,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: false,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_ok());
 
@@ -148,7 +148,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: false,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_ok());
 
@@ -162,7 +162,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: false,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
     }
@@ -179,7 +179,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: false,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
 
@@ -193,7 +193,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: false,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
     }
@@ -210,7 +210,7 @@ mod tests {
             output: None,
             cert_dir: None,
             kubernetes: true,
-            controller_name: "uringress.io/gateway-controller".to_string(),
+            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
         };
         assert!(args.validate().is_err());
     }

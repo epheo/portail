@@ -68,7 +68,7 @@ pub struct CertificateRef {
 
 // Default value functions
 fn default_gateway_name() -> String {
-    "uringress-gateway".to_string()
+    "portail-gateway".to_string()
 }
 
 fn default_worker_threads() -> usize {
@@ -95,12 +95,12 @@ impl Default for GatewayConfig {
     }
 }
 
-/// Root configuration structure for UringRess
+/// Root configuration structure for Portail
 /// All parsing happens once at startup - zero runtime overhead
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct UringRessConfig {
+pub struct PortailConfig {
     #[serde(default)]
     pub gateway: GatewayConfig,
 

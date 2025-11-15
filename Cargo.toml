@@ -1,11 +1,11 @@
 [package]
-name = "uringress"
+name = "portail"
 version = "0.1.0"
 edition = "2021"
-authors = ["UringRess Contributors"]
-description = "Ultra-High-Performance Kubernetes Gateway API Controller"
+authors = ["Portail Contributors"]
+description = "Kubernetes Gateway API Controller"
 license = "Apache-2.0"
-repository = "https://github.com/your-org/uringress"
+repository = "https://github.com/epheo/portail"
 
 [dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util"] }

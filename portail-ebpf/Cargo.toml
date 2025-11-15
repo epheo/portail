@@ -1,0 +1,23 @@
+[package]
+name = "portail-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = { path = "../../aya/ebpf/aya-ebpf" }
+aya-ebpf-macros = { path = "../../aya/aya-ebpf-macros" }
+ebpf-panic = { path = "../../aya/ebpf-panic" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = true
+
+[[bin]]
+name = "sk_reuseport"
+path = "src/main.rs"
+
+[features]
+default = []

@@ -185,7 +185,7 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by uringress").await;
+    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
 
     // Fetch all routes across all namespaces
     let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());

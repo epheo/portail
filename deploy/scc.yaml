@@ -1,7 +1,7 @@
 apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
-  name: uringress
+  name: portail
 allowHostNetwork: true
 allowHostPorts: true
 allowPrivilegedContainer: false
@@ -24,4 +24,4 @@ volumes:
   - secret
   - configMap
 users:
-  - system:serviceaccount:uringress-system:uringress-controller
+  - system:serviceaccount:portail-system:portail-controller

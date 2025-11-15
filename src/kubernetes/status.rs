@@ -44,7 +44,7 @@ pub async fn update_gateway_status(
             type_: "Accepted".to_string(),
             status: "True".to_string(),
             reason: "Accepted".to_string(),
-            message: "Gateway accepted by uringress controller".to_string(),
+            message: "Gateway accepted by portail controller".to_string(),
             last_transition_time: now.clone(),
             observed_generation: generation,
         },
@@ -98,7 +98,7 @@ pub async fn update_gateway_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("uringress"), &Patch::Merge(status))
+        .patch_status(&name, &PatchParams::apply("portail"), &Patch::Merge(status))
         .await
     {
         Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
@@ -134,7 +134,7 @@ pub async fn update_gateway_class_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("uringress"), &Patch::Merge(status))
+        .patch_status(&name, &PatchParams::apply("portail"), &Patch::Merge(status))
         .await
     {
         Ok(_) => debug!("Updated GatewayClass {} status", name),
@@ -206,7 +206,7 @@ where
     });
 
     match api
-        .patch_status(route_name, &PatchParams::apply("uringress"), &Patch::Merge(status))
+        .patch_status(route_name, &PatchParams::apply("portail"), &Patch::Merge(status))
         .await
     {
         Ok(_) => debug!("Updated {} {}/{} status", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name),

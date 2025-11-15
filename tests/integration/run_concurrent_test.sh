@@ -1,5 +1,5 @@
 #!/bin/bash
-# Concurrent connection test for UringRess
+# Concurrent connection test for Portail
 # Tests how well the proxy handles multiple simultaneous connections
 
 set -e
@@ -17,7 +17,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== UringRess Concurrent Connection Test ===${NC}"
+echo -e "${BLUE}=== Portail Concurrent Connection Test ===${NC}"
 echo "Configuration:"
 echo "  Workers: $CONCURRENT_WORKERS"
 echo "  Requests per worker: $REQUESTS_PER_WORKER"
@@ -55,16 +55,16 @@ run_worker() {
     echo "$success_count" > /tmp/worker_${worker_id}_result
 }
 
-# Check if UringRess is responding
-echo "Checking UringRess availability..."
+# Check if Portail is responding
+echo "Checking Portail availability..."
 if ! curl -s --max-time 3 "${PROXY_URL}/health" > /dev/null; then
-    echo -e "${RED}ERROR: UringRess not responding at ${PROXY_URL}${NC}"
+    echo -e "${RED}ERROR: Portail not responding at ${PROXY_URL}${NC}"
     echo "Make sure the test environment is running:"
-    echo "  From project root: tests/integration/start_uringress_test_environment.sh start"
-    echo "  From integration dir: ./start_uringress_test_environment.sh start"
+    echo "  From project root: tests/integration/start_portail_test_environment.sh start"
+    echo "  From integration dir: ./start_portail_test_environment.sh start"
     exit 1
 fi
-echo -e "${GREEN}✓ UringRess is responding${NC}"
+echo -e "${GREEN}✓ Portail is responding${NC}"
 echo ""
 
 # Start concurrent workers

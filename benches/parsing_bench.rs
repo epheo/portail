@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use uringress::http_parser::extract_routing_info;
+use portail::http_parser::extract_routing_info;
 use std::time::Duration;
 
 fn parsing_benchmark(c: &mut Criterion) {

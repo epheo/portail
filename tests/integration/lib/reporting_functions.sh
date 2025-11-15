@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared reporting utilities for UringRess integration tests
+# Shared reporting utilities for Portail integration tests
 # Provides consistent performance evaluation and report formatting
 
 # Colors for output formatting
@@ -16,7 +16,7 @@ export TARGET_SUCCESS_RATE=95
 export TARGET_PROXY_OVERHEAD_MS=1
 
 # Report data storage (global associative arrays simulation using files)
-export REPORT_DATA_DIR="/tmp/uringress_report_$$"
+export REPORT_DATA_DIR="/tmp/portail_report_$$"
 
 # Initialize report data storage
 init_report_storage() {
@@ -336,7 +336,7 @@ save_performance_data() {
     local overhead_ms=$(get_metric "proxy_overhead_ms")
     
     cat > "$output_file" <<EOF
-# UringRess Performance Test Results
+# Portail Performance Test Results
 # Generated: $timestamp
 
 [SUMMARY]
@@ -362,7 +362,7 @@ print_test_footer() {
     echo ""
     echo -e "${BLUE}==================== TEST NOTES ====================${NC}"
     echo ""
-    echo "• This report analyzes real network I/O performance through UringRess proxy"
+    echo "• This report analyzes real network I/O performance through Portail proxy"
     echo "• Measurements use external tools (curl, ab, wrk) to avoid impacting results"
     echo "• Performance targets based on CLAUDE.md architecture goals"
     echo "• Integration test results may be lower than synthetic microbenchmarks"

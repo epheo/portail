@@ -1,6 +1,6 @@
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
-  name: uringress
+  name: portail
 spec:
-  controllerName: uringress.io/gateway-controller
+  controllerName: portail.epheo.eu/gateway-controller

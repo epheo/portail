@@ -5,19 +5,19 @@ use crate::logging::{info, debug, warn};
 use tokio::signal;
 
 use crate::routing::RouteTable;
-use crate::config::UringRessConfig;
+use crate::config::PortailConfig;
 use crate::ebpf::{initialize_ebpf_system, UnifiedEbpfManager};
 
 /// Control Plane — shares the main Tokio runtime.
 /// Handles configuration management, eBPF coordination, and routing.
 pub struct ControlPlane {
     pub ebpf_manager: UnifiedEbpfManager,
-    config: UringRessConfig,
+    config: PortailConfig,
     current_routes: Arc<ArcSwap<RouteTable>>,
 }
 
 impl ControlPlane {
-    pub fn new(config: UringRessConfig) -> Result<Self> {
+    pub fn new(config: PortailConfig) -> Result<Self> {
         let ebpf_manager = initialize_ebpf_system()?;
         let current_routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
@@ -101,8 +101,8 @@ impl ControlPlane {
                 \nTroubleshooting: \
                 \n  1. Check kernel eBPF support: sudo dmesg | grep -i bpf \
                 \n  2. Verify eBPF programs compiled: ls -la target/ebpf/ \
-                \n  3. Check capabilities: sudo setcap cap_net_admin,cap_bpf+ep target/debug/uringress \
-                \n  4. Run with privileges: sudo ./target/debug/uringress",
+                \n  3. Check capabilities: sudo setcap cap_net_admin,cap_bpf+ep target/debug/portail \
+                \n  4. Run with privileges: sudo ./target/debug/portail",
                 attached_count, worker_fds.len(), failed_count
             ))
         }

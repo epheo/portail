@@ -2,7 +2,7 @@ use super::types::*;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 
-impl UringRessConfig {
+impl PortailConfig {
     /// Generate a minimal configuration example
     pub fn generate_minimal() -> Self {
         Self {

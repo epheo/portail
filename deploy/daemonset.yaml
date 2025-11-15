@@ -1,25 +1,25 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: uringress
-  namespace: uringress-system
+  name: portail
+  namespace: portail-system
   labels:
-    app: uringress
+    app: portail
 spec:
   selector:
     matchLabels:
-      app: uringress
+      app: portail
   template:
     metadata:
       labels:
-        app: uringress
+        app: portail
     spec:
-      serviceAccountName: uringress-controller
+      serviceAccountName: portail-controller
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-        - name: uringress
-          image: uringress:latest
+        - name: portail
+          image: portail:latest
           args: ["--kubernetes"]
           securityContext:
             capabilities:
@@ -32,7 +32,7 @@ spec:
             - name: bpf
               mountPath: /sys/fs/bpf
             - name: tls-certs
-              mountPath: /etc/uringress/certs
+              mountPath: /etc/portail/certs
               readOnly: true
       volumes:
         - name: bpf
@@ -41,5 +41,5 @@ spec:
             type: DirectoryOrCreate
         - name: tls-certs
           secret:
-            secretName: uringress-tls
+            secretName: portail-tls
             optional: true

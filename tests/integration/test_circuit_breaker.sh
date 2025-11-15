@@ -1,5 +1,5 @@
 #!/bin/bash
-# Circuit breaker test for UringRess
+# Circuit breaker test for Portail
 # Tests backend failure detection and recovery
 
 set -e
@@ -16,7 +16,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== UringRess Circuit Breaker Test ===${NC}"
+echo -e "${BLUE}=== Portail Circuit Breaker Test ===${NC}"
 echo ""
 
 # Function to check service health
@@ -109,7 +109,7 @@ start_backend() {
 
 # Initial health check
 echo -e "${BLUE}=== Initial Health Check ===${NC}"
-check_service "$PROXY_URL/health" "UringRess proxy"
+check_service "$PROXY_URL/health" "Portail proxy"
 
 for i in "${!BACKEND_PORTS[@]}"; do
     check_service "http://localhost:${BACKEND_PORTS[$i]}/health" "KISS backend ${BACKEND_PORTS[$i]} (${BACKEND_CONTENT_TYPES[$i]})"
@@ -208,7 +208,7 @@ echo ""
 
 # Final health check
 echo -e "${BLUE}=== Final Health Check ===${NC}"
-check_service "$PROXY_URL/health" "UringRess proxy"
+check_service "$PROXY_URL/health" "Portail proxy"
 
 for i in "${!BACKEND_PORTS[@]}"; do
     check_service "http://localhost:${BACKEND_PORTS[$i]}/health" "KISS backend ${BACKEND_PORTS[$i]} (${BACKEND_CONTENT_TYPES[$i]})"

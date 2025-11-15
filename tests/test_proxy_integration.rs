@@ -1,11 +1,11 @@
-/// End-to-end proxy integration tests for UringRess.
+/// End-to-end proxy integration tests for Portail.
 ///
-/// These tests spawn a real UringRess process and backend TCP servers,
+/// These tests spawn a real Portail process and backend TCP servers,
 /// send actual HTTP traffic through the proxy, and verify responses.
 ///
 /// Requirements:
-/// - UringRess binary must be built (`cargo build --release`)
-/// - Linux with io_uring + eBPF support
+/// - Portail binary must be built (`cargo build --release`)
+/// - Linux with eBPF support
 /// - CAP_BPF + CAP_NET_ADMIN capabilities (typically root)
 ///
 /// Run with: cargo test --release --test test_proxy_integration
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use helpers::{
     extract_body, extract_status, http_request, http_request_keepalive, http_request_timeout,
-    tcp_roundtrip, TcpEchoBackend, TestBackend, InspectingBackend, UringRessProcess,
+    tcp_roundtrip, TcpEchoBackend, TestBackend, InspectingBackend, PortailProcess,
 };
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
@@ -32,7 +32,7 @@ fn proxy_port(offset: u16) -> u16 {
 fn test_http_proxy_roundtrip() {
     let backend = TestBackend::spawn("hello from backend");
     let port = proxy_port(1);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", backend.addr)],
         port,
     );
@@ -58,7 +58,7 @@ fn test_http_proxy_roundtrip() {
 fn test_http_keepalive_reuse() {
     let backend = TestBackend::spawn("keepalive-response");
     let port = proxy_port(2);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", backend.addr)],
         port,
     );
@@ -86,7 +86,7 @@ fn test_http_keepalive_reuse() {
 fn test_http_connection_close() {
     let backend = TestBackend::spawn("close-response");
     let port = proxy_port(3);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", backend.addr)],
         port,
     );
@@ -111,7 +111,7 @@ fn test_multiple_backends() {
     let port = proxy_port(4);
 
     // Two different path prefixes → two different backends
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[
             ("localhost", "/a", backend_a.addr),
             ("localhost", "/b", backend_b.addr),
@@ -140,7 +140,7 @@ fn test_backend_unreachable() {
     // Point to a port where nothing is listening
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let port = proxy_port(5);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", dead_addr)],
         port,
     );
@@ -172,7 +172,7 @@ fn test_backend_unreachable() {
 fn test_concurrent_requests() {
     let backend = TestBackend::spawn("concurrent-ok");
     let port = proxy_port(6);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", backend.addr)],
         port,
     );
@@ -246,7 +246,7 @@ fn test_large_response_forwarding() {
     let size = 128 * 1024; // 128KB
     let backend = TestBackend::spawn_large(size);
     let port = proxy_port(7);
-    let proxy = UringRessProcess::spawn(
+    let proxy = PortailProcess::spawn(
         &[("localhost", "/", backend.addr)],
         port,
     );
@@ -278,7 +278,7 @@ fn test_tcp_works_during_http_load() {
     let http_port = proxy_port(16);
     let tcp_port = proxy_port(17);
 
-    let proxy = UringRessProcess::spawn_with_tcp(
+    let proxy = PortailProcess::spawn_with_tcp(
         &[("localhost", "/", http_backend.addr)],
         http_port,
         &[("tcp-mixed", tcp_port, echo.addr)],
@@ -340,7 +340,7 @@ fn test_tcp_proxy_echo_roundtrip() {
     let http_port = proxy_port(10);
     let tcp_port = proxy_port(11);
 
-    let _proxy = UringRessProcess::spawn_with_tcp(
+    let _proxy = PortailProcess::spawn_with_tcp(
         &[],
         http_port,
         &[("tcp-echo", tcp_port, echo.addr)],
@@ -366,7 +366,7 @@ fn test_tcp_proxy_binary_data() {
     let http_port = proxy_port(12);
     let tcp_port = proxy_port(13);
 
-    let _proxy = UringRessProcess::spawn_with_tcp(
+    let _proxy = PortailProcess::spawn_with_tcp(
         &[],
         http_port,
         &[("tcp-bin", tcp_port, echo.addr)],
@@ -398,7 +398,7 @@ fn test_tcp_proxy_eof_propagation() {
     let http_port = proxy_port(14);
     let tcp_port = proxy_port(15);
 
-    let _proxy = UringRessProcess::spawn_with_tcp(
+    let _proxy = PortailProcess::spawn_with_tcp(
         &[],
         http_port,
         &[("tcp-eof", tcp_port, echo.addr)],
@@ -476,7 +476,7 @@ fn test_url_rewrite_full_path_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(20);
     let filter = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/new"}}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
     );
@@ -498,7 +498,7 @@ fn test_url_rewrite_prefix_replace_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(21);
     let filter = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/v1", backend.addr, filter)],
         port,
     );
@@ -520,7 +520,7 @@ fn test_url_rewrite_hostname_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(22);
     let filter = r#"{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.example.com"}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
     );
@@ -542,7 +542,7 @@ fn test_request_header_modifier_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(23);
     let filter = r#"{"type": "RequestHeaderModifier", "requestHeaderModifier": {"add": [{"name": "X-Added", "value": "yes"}], "remove": ["User-Agent"]}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filter)],
         port,
     );
@@ -589,7 +589,7 @@ fn test_response_header_modifier_e2e() {
 
     let port = proxy_port(24);
     let filter = r#"{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["X-Internal"]}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", backend_addr, filter)],
         port,
     );
@@ -612,7 +612,7 @@ fn test_request_redirect_e2e() {
     // Redirect rules don't need backend_refs, but our helper always adds one.
     // The proxy should return redirect before contacting any backend.
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", dead_addr, filter)],
         port,
     );
@@ -637,7 +637,7 @@ fn test_request_mirror_e2e() {
         r#"{{"type": "RequestMirror", "requestMirror": {{"backendRef": {{"name": "{}", "port": {}}}}}}}"#,
         mirror.addr.ip(), mirror.addr.port()
     );
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", primary.addr, &filter)],
         port,
     );
@@ -659,7 +659,7 @@ fn test_filter_combination_rewrite_plus_header_mod() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(27);
     let filters = r#"{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/new"}}}, {"type": "RequestHeaderModifier", "requestHeaderModifier": {"add": [{"name": "X-Rewritten", "value": "true"}]}}"#;
-    let proxy = UringRessProcess::spawn_with_filters(
+    let proxy = PortailProcess::spawn_with_filters(
         &[("localhost", "/", backend.addr, filters)],
         port,
     );
@@ -721,8 +721,8 @@ fn test_exact_vs_prefix_path_e2e() {
         .expect("create temp config");
     std::fs::write(config_file.path(), config).expect("write temp config");
 
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/uringress");
-    let debug_binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/uringress");
+    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/portail");
+    let debug_binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/portail");
     let bin = if binary.exists() { binary } else { debug_binary };
 
     let mut child = std::process::Command::new(&bin)

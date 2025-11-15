@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use uringress::http_parser::extract_routing_info;
-use uringress::routing::{RouteTable, Backend, HttpRouteRule, PathMatchType};
+use portail::http_parser::extract_routing_info;
+use portail::routing::{RouteTable, Backend, HttpRouteRule, PathMatchType};
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {

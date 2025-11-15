@@ -1,5 +1,5 @@
 #!/bin/bash
-# UringRess Performance Report Generator
+# Portail Performance Report Generator
 # Aggregates data from integration tests and produces comprehensive performance reports
 
 set -e
@@ -20,7 +20,7 @@ DATA_FILE="${REPORT_OUTPUT_DIR}/performance_data_${TIMESTAMP}.conf"
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Generate comprehensive performance reports from UringRess integration tests"
+    echo "Generate comprehensive performance reports from Portail integration tests"
     echo ""
     echo "Options:"
     echo "  -r, --run-tests     Run all integration tests before generating report"
@@ -77,12 +77,12 @@ mkdir -p "$REPORT_OUTPUT_DIR"
 # Initialize reporting system
 init_report_storage
 
-echo -e "${BLUE}UringRess Performance Report Generator${NC}"
+echo -e "${BLUE}Portail Performance Report Generator${NC}"
 echo "======================================"
 echo ""
 
-# Function to check if UringRess is running
-check_uringress_running() {
+# Function to check if Portail is running
+check_portail_running() {
     if curl -s --max-time 3 "http://localhost:8080/health" > /dev/null 2>&1; then
         return 0
     else
@@ -95,13 +95,13 @@ run_integration_tests() {
     echo -e "${BLUE}Running integration tests...${NC}"
     
     # Check if test environment is running
-    if ! check_uringress_running; then
-        echo -e "${YELLOW}UringRess not running, starting test environment...${NC}"
-        cd "$SCRIPT_DIR" && ./start_uringress_test_environment.sh start
+    if ! check_portail_running; then
+        echo -e "${YELLOW}Portail not running, starting test environment...${NC}"
+        cd "$SCRIPT_DIR" && ./start_portail_test_environment.sh start
         sleep 5
         
-        if ! check_uringress_running; then
-            echo -e "${RED}Failed to start UringRess test environment${NC}"
+        if ! check_portail_running; then
+            echo -e "${RED}Failed to start Portail test environment${NC}"
             exit 1
         fi
     fi
@@ -193,7 +193,7 @@ generate_complete_report() {
     exec 3>&1
     exec 1> >(tee /tmp/report_output.tmp)
     
-    print_test_metadata "UringRess Integration Tests" "$(get_metric 'test_timestamp')" ""
+    print_test_metadata "Portail Integration Tests" "$(get_metric 'test_timestamp')" ""
     
     # Generate grades for executive summary
     local latency_us=$(get_metric "latency_avg_us")

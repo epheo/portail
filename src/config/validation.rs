@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 
 use super::types::*;
 
-impl UringRessConfig {
+impl PortailConfig {
     /// Validate the entire configuration for consistency and correctness
     /// All validation happens once at startup
     pub fn validate(&self) -> Result<()> {

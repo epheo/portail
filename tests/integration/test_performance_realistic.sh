@@ -1,5 +1,5 @@
 #!/bin/bash
-# Realistic performance test for UringRess
+# Realistic performance test for Portail
 # Measures actual end-to-end performance with real backends
 
 set -e
@@ -15,7 +15,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== UringRess Realistic Performance Test ===${NC}"
+echo -e "${BLUE}=== Portail Realistic Performance Test ===${NC}"
 echo ""
 
 # Function to check dependencies
@@ -35,19 +35,19 @@ check_dependencies() {
     fi
 }
 
-# Function to check UringRess availability
-check_uringress() {
-    echo "Checking UringRess availability..."
+# Function to check Portail availability
+check_portail() {
+    echo "Checking Portail availability..."
     
     if ! curl -s --max-time 3 "$PROXY_URL/health" > /dev/null; then
-        echo -e "${RED}ERROR: UringRess not responding at $PROXY_URL${NC}"
+        echo -e "${RED}ERROR: Portail not responding at $PROXY_URL${NC}"
         echo "Start the test environment:"
-        echo "  From project root: tests/integration/start_uringress_test_environment.sh start"
-        echo "  From integration dir: ./start_uringress_test_environment.sh start"
+        echo "  From project root: tests/integration/start_portail_test_environment.sh start"
+        echo "  From integration dir: ./start_portail_test_environment.sh start"
         exit 1
     fi
     
-    echo -e "${GREEN}✓ UringRess is responding${NC}"
+    echo -e "${GREEN}✓ Portail is responding${NC}"
     echo ""
 }
 
@@ -231,16 +231,16 @@ EOF
 # Function to test memory usage
 test_memory_usage() {
     echo -e "${BLUE}=== Memory Usage Test ===${NC}"
-    echo "Monitoring UringRess memory usage during load..."
+    echo "Monitoring Portail memory usage during load..."
     
-    local uringress_pid=$(pgrep -f "target/release/uringress" 2>/dev/null || pgrep -f "/uringress --config" 2>/dev/null || echo "")
-    if [[ -z "$uringress_pid" ]]; then
-        echo -e "${RED}UringRess process not found${NC}"
+    local portail_pid=$(pgrep -f "target/release/portail" 2>/dev/null || pgrep -f "/portail --config" 2>/dev/null || echo "")
+    if [[ -z "$portail_pid" ]]; then
+        echo -e "${RED}Portail process not found${NC}"
         return
     fi
     
     # Get initial memory usage
-    local initial_memory=$(ps -p "$uringress_pid" -o rss= 2>/dev/null || echo "0")
+    local initial_memory=$(ps -p "$portail_pid" -o rss= 2>/dev/null || echo "0")
     echo "Initial memory usage: ${initial_memory} KB"
     
     # Run load test while monitoring memory
@@ -250,7 +250,7 @@ test_memory_usage() {
         # Start memory monitoring in background
         (
             for i in {1..30}; do
-                local current_memory=$(ps -p "$uringress_pid" -o rss= 2>/dev/null || echo "0")
+                local current_memory=$(ps -p "$portail_pid" -o rss= 2>/dev/null || echo "0")
                 echo "$i $current_memory" >> /tmp/memory_usage.log
                 sleep 1
             done
@@ -347,7 +347,7 @@ test_proxy_overhead() {
 # Main test execution
 main() {
     check_dependencies
-    check_uringress
+    check_portail
     run_warmup
     test_latency
     test_throughput_ab

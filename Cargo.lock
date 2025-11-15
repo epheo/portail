@@ -1795,6 +1795,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "portail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "aya",
+ "aya-build",
+ "aya-ebpf",
+ "aya-ebpf-macros",
+ "clap",
+ "criterion",
+ "dashmap",
+ "fnv",
+ "futures",
+ "gateway-api",
+ "k8s-openapi",
+ "kube",
+ "libc",
+ "pin-project-lite",
+ "regex",
+ "rustls",
+ "rustls-pemfile",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2687,42 +2723,6 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "uringress"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "aya",
- "aya-build",
- "aya-ebpf",
- "aya-ebpf-macros",
- "clap",
- "criterion",
- "dashmap",
- "fnv",
- "futures",
- "gateway-api",
- "k8s-openapi",
- "kube",
- "libc",
- "pin-project-lite",
- "regex",
- "rustls",
- "rustls-pemfile",
- "rustversion",
- "serde",
- "serde_json",
- "serde_yaml",
- "socket2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "url"

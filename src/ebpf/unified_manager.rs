@@ -1,4 +1,4 @@
-//! Simplified eBPF Manager for UringRess
+//! Simplified eBPF Manager for Portail
 //! Manages SO_REUSEPORT program only - now using Rust eBPF implementation
 //! Single codepath: eBPF functionality is required, no fallback behavior
 

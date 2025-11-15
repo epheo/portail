@@ -9,7 +9,7 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("CARGO_MANIFEST_DIR not set"))?;
     let out_dir = env::var("OUT_DIR")
         .map_err(|_| anyhow!("OUT_DIR not set"))?;
-    let ebpf_dir = PathBuf::from(&manifest_dir).join("uringress-ebpf");
+    let ebpf_dir = PathBuf::from(&manifest_dir).join("portail-ebpf");
     
     // Add dependency tracking
     println!("cargo:rerun-if-changed={}", ebpf_dir.join("src").display());

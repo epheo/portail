@@ -1,4 +1,4 @@
-use uringress::routing::{
+use portail::routing::{
     RouteTable, Backend, HttpRouteRule, HttpFilter, HttpHeader, URLRewritePath,
     PathMatchType, HeaderMatch, QueryParamMatch, BackendSelector, ValueMatcher,
 };

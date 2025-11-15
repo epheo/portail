@@ -4,6 +4,6 @@ COPY . .
 RUN cargo build --release
 
 FROM scratch
-COPY --from=builder /build/target/release/uringress /uringress
-ENTRYPOINT ["/uringress"]
+COPY --from=builder /build/target/release/portail /portail
+ENTRYPOINT ["/portail"]
 CMD ["--kubernetes"]

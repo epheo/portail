@@ -1,16 +1,17 @@
-# UringRess
+# portail
 
-This project is a way for me to learn about io_uring and eBPF.
+**portail** is a Kubernetes API Gateway using Tokio runtime.
 
-For now, this is just a TCP/HTTP loadbalancer that you can configure with a yaml file.
+This project was originaly a way for me to learn about io_uring and eBPF.
+But in front of the complexity, I took a step back and removed the io_uring
+implementation that was getting out of hands and used Tokio instead.
 
-In the future this should be a Kubernetes Gateway API Controller, hopefully offering decent performances.
+It is a single person project, obviously **not production ready** in any way.
+Many parts have been written by Claude Code LLM.
 
-Protocol detection and worker selection is performed by the eBPF program,
-the io_uring workers are then handling the traffic.
-Each worker is usually configured with a speciality (http, tcp etc)
+You have been warned.
 
-For now packets go from kernel to user space and back to kernel, this could be optimized with AF_XDP and bypassing kernel network stack, but I'll try to deal with the current (already too high) complexity before introducing more.
+That being said, performances are decent and I'm using it for my Microshift homelab.
 
 ## License
 

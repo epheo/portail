@@ -21,7 +21,7 @@ use control_plane::ControlPlane;
 use data_plane::DataPlane;
 use cli::Args;
 use clap::Parser;
-use config::UringRessConfig;
+use config::PortailConfig;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -42,32 +42,32 @@ async fn main() -> Result<()> {
     // Validate eBPF requirements — fail fast
     if let Err(e) = ebpf::validate_system_requirements() {
         eprintln!("eBPF system requirements not met: {}", e);
-        eprintln!("UringRess uses single codepath architecture with no fallback behavior.");
+        eprintln!("Portail uses single codepath architecture with no fallback behavior.");
         std::process::exit(1);
     }
 
-    let uringress_config = if let Some(config_path) = &args.config {
-        UringRessConfig::load_from_file(config_path)
+    let portail_config = if let Some(config_path) = &args.config {
+        PortailConfig::load_from_file(config_path)
             .map_err(|e| {
                 eprintln!("Failed to load configuration file: {}", e);
                 std::process::exit(1);
             }).unwrap()
     } else {
-        UringRessConfig::default()
+        PortailConfig::default()
     };
 
-    logging::init_logging(args.verbose, Some(&uringress_config.observability.logging));
+    logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
-    let performance_config = uringress_config.performance.clone();
-    let worker_count = uringress_config.gateway.worker_threads;
-    let listeners = uringress_config.gateway.listeners.clone();
+    let performance_config = portail_config.performance.clone();
+    let worker_count = portail_config.gateway.worker_threads;
+    let listeners = portail_config.gateway.listeners.clone();
     let cert_dir = args.cert_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("certs"));
 
     info!("Configuration loaded: {} listeners, {} HTTP routes, {} TCP routes, {} UDP routes",
-          uringress_config.gateway.listeners.len(),
-          uringress_config.http_routes.len(),
-          uringress_config.tcp_routes.len(),
-          uringress_config.udp_routes.len());
+          portail_config.gateway.listeners.len(),
+          portail_config.http_routes.len(),
+          portail_config.tcp_routes.len(),
+          portail_config.udp_routes.len());
 
     if args.is_validation_mode() {
         return handle_validation_mode(&args);
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     }
 
     // Single Tokio runtime for both control and data planes
-    let mut control_plane = ControlPlane::new(uringress_config)?;
+    let mut control_plane = ControlPlane::new(portail_config)?;
     control_plane.start().await?;
 
     let routes = control_plane.get_routes();
@@ -107,16 +107,16 @@ async fn main() -> Result<()> {
 
     data_plane.start(routes);
 
-    info!("UringRess ready: {} workers × {} listeners", worker_count, listeners.len());
+    info!("Portail ready: {} workers × {} listeners", worker_count, listeners.len());
 
     // Wait for shutdown signal
     control_plane.wait_for_shutdown().await?;
     shutdown_token.cancel();
 
-    info!("Shutting down UringRess");
+    info!("Shutting down Portail");
     data_plane.shutdown().await;
 
-    info!("UringRess shutdown complete");
+    info!("Portail shutdown complete");
     Ok(())
 }
 
@@ -127,7 +127,7 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
     if args.validate_only {
         info!("Validating configuration file: {:?}", config_path);
 
-        match UringRessConfig::load_from_file(config_path) {
+        match PortailConfig::load_from_file(config_path) {
             Ok(config) => {
                 info!("Configuration file parsed successfully");
 
@@ -156,7 +156,7 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
     } else if args.check_config {
         info!("Checking configuration file: {:?}", config_path);
 
-        match UringRessConfig::load_from_file(config_path) {
+        match PortailConfig::load_from_file(config_path) {
             Ok(config) => {
                 println!("Parsed configuration:");
                 println!("---");
@@ -210,8 +210,8 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
     info!("Generating {} configuration", config_type);
 
     let config = match config_type.as_str() {
-        "minimal" => UringRessConfig::generate_minimal(),
-        "development" => UringRessConfig::generate_development(),
+        "minimal" => PortailConfig::generate_minimal(),
+        "development" => PortailConfig::generate_development(),
         _ => {
             error!("Invalid configuration type: {}", config_type);
             std::process::exit(1);

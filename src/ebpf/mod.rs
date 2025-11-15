@@ -1,4 +1,4 @@
-//! eBPF module for UringRess SO_REUSEPORT worker selection
+//! eBPF module for Portail SO_REUSEPORT worker selection
 //! Implements address-aware worker dispatch at socket level
 //!
 //! Simplified Architecture:
@@ -56,7 +56,7 @@ fn validate_kernel_version() -> Result<()> {
                     } else {
                         return Err(anyhow!(
                             "Kernel version {} does not meet requirements. \
-                            \nRequired: Linux 5.10+ for io_uring and eBPF integration \
+                            \nRequired: Linux 5.10+ for eBPF support \
                             \nCurrent: Linux {} \
                             \nSingle codepath architecture requires modern kernel features.", 
                             version, version
@@ -69,7 +69,7 @@ fn validate_kernel_version() -> Result<()> {
     
     Err(anyhow!(
         "Cannot parse kernel version from: {} \
-        \nRequired: Linux 5.10+ for io_uring and eBPF support", 
+        \nRequired: Linux 5.10+ for eBPF support",
         version_info.chars().take(100).collect::<String>()
     ))
 }
@@ -89,11 +89,11 @@ fn validate_capabilities() -> Result<()> {
     }
 
     Err(anyhow!(
-        "UringRess requires CAP_BPF and CAP_NET_ADMIN capabilities for eBPF operations. \
+        "Portail requires CAP_BPF and CAP_NET_ADMIN capabilities for eBPF operations. \
         \nCurrent user ID: {} (non-root) \
         \nSolutions: \
-        \n  1. Run as root: sudo uringress \
-        \n  2. Set capabilities: sudo setcap cap_bpf,cap_net_admin+ep uringress \
+        \n  1. Run as root: sudo portail \
+        \n  2. Set capabilities: sudo setcap cap_bpf,cap_net_admin+ep portail \
         \n  3. Add user to appropriate groups with eBPF access \
         \nSingle codepath architecture requires full eBPF privileges.",
         uid

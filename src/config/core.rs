@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 
 use super::types::*;
 
-impl UringRessConfig {
+impl PortailConfig {
     /// Load configuration from file with auto-format detection
     /// Supports JSON (.json) and YAML (.yaml, .yml) formats
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -47,7 +47,7 @@ impl UringRessConfig {
     }
 }
 
-impl UringRessConfig {
+impl PortailConfig {
     /// Convert configuration to RouteTable for runtime use
     /// All route processing happens once at startup - zero runtime overhead
     pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
@@ -176,7 +176,7 @@ impl L4Route for UdpRouteConfig {
     }
 }
 
-impl UringRessConfig {
+impl PortailConfig {
     fn convert_l4_routes<R: L4Route>(
         &self,
         route_table: &mut crate::routing::RouteTable,
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = UringRessConfig::default();
+        let config = PortailConfig::default();
         assert!(config.validate().is_ok());
         assert!(!config.gateway.listeners.is_empty());
     }
@@ -397,7 +397,7 @@ mod tests {
             }
         }"#;
 
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.gateway.listeners[0].port, 9000);
     }
@@ -476,7 +476,7 @@ mod tests {
             ]
         }"#;
 
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
 
         assert_eq!(config.gateway.name, "test-gateway");
@@ -496,12 +496,12 @@ mod tests {
 
     #[test]
     fn test_example_generation_functions() {
-        let minimal = UringRessConfig::generate_minimal();
+        let minimal = PortailConfig::generate_minimal();
         assert!(minimal.validate().is_ok());
         assert_eq!(minimal.http_routes.len(), 1);
         assert_eq!(minimal.tcp_routes.len(), 0);
 
-        let development = UringRessConfig::generate_development();
+        let development = PortailConfig::generate_development();
         assert!(development.validate().is_ok());
         assert_eq!(development.http_routes.len(), 8);
         assert_eq!(development.tcp_routes.len(), 1);
@@ -509,14 +509,14 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let config = UringRessConfig::generate_minimal();
+        let config = PortailConfig::generate_minimal();
 
         let json = config.to_json_pretty().unwrap();
-        let parsed_json: UringRessConfig = serde_json::from_str(&json).unwrap();
+        let parsed_json: PortailConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed_json.validate().is_ok());
 
         let yaml = config.to_yaml_pretty().unwrap();
-        let parsed_yaml: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
+        let parsed_yaml: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed_yaml.validate().is_ok());
     }
 
@@ -538,7 +538,7 @@ mod tests {
                 }]
             }]
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         assert!(matches!(
             config.http_routes[0].rules[0].filters[0],
@@ -548,9 +548,9 @@ mod tests {
 
     #[test]
     fn test_url_rewrite_yaml_roundtrip() {
-        let config = UringRessConfig::generate_development();
+        let config = PortailConfig::generate_development();
         let yaml = config.to_yaml_pretty().unwrap();
-        let parsed: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
+        let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.validate().is_ok());
         assert_eq!(parsed.http_routes.len(), 8);
     }
@@ -573,7 +573,7 @@ mod tests {
                 }]
             }]
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
         assert!(matches!(
             config.http_routes[0].rules[0].filters[0],
@@ -599,7 +599,7 @@ mod tests {
                 }]
             }]
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
         let rule = rt.find_http_route("example.com", "GET", "/v1/test", &[], "").unwrap();
         assert_eq!(rule.filters.len(), 1);
@@ -624,7 +624,7 @@ mod tests {
                 }]
             }]
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
         let rule = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
         assert_eq!(rule.filters.len(), 1);
@@ -654,7 +654,7 @@ mod tests {
                 "workerThreads": 1
             }
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
 
         let listener = &config.gateway.listeners[0];
@@ -682,7 +682,7 @@ mod tests {
                 "workerThreads": 1
             }
         }"#;
-        let config: UringRessConfig = serde_json::from_str(json).unwrap();
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
 
         let listener = &config.gateway.listeners[0];
@@ -694,9 +694,9 @@ mod tests {
 
     #[test]
     fn test_tls_config_yaml_roundtrip() {
-        let config = UringRessConfig::generate_development();
+        let config = PortailConfig::generate_development();
         let yaml = config.to_yaml_pretty().unwrap();
-        let parsed: UringRessConfig = serde_yaml::from_str(&yaml).unwrap();
+        let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.validate().is_ok());
 
         // Find the HTTPS listener
@@ -710,9 +710,9 @@ mod tests {
 
     #[test]
     fn test_tls_config_json_roundtrip() {
-        let config = UringRessConfig::generate_development();
+        let config = PortailConfig::generate_development();
         let json = config.to_json_pretty().unwrap();
-        let parsed: UringRessConfig = serde_json::from_str(&json).unwrap();
+        let parsed: PortailConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.validate().is_ok());
 
         let https = parsed.gateway.listeners.iter()

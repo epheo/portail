@@ -203,21 +203,21 @@ pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::i
     Ok(response)
 }
 
-/// Handle to a running UringRess subprocess. Kills on drop.
-pub struct UringRessProcess {
+/// Handle to a running Portail subprocess. Kills on drop.
+pub struct PortailProcess {
     child: Child,
     _config_file: tempfile::NamedTempFile,
     pub proxy_addr: SocketAddr,
 }
 
-impl UringRessProcess {
-    /// Build a test config and spawn UringRess.
+impl PortailProcess {
+    /// Build a test config and spawn Portail.
     /// `routes` maps (hostname, path_prefix) → backend SocketAddr.
     pub fn spawn(routes: &[(&str, &str, SocketAddr)], proxy_port: u16) -> Self {
         Self::spawn_with_tcp(routes, proxy_port, &[])
     }
 
-    /// Build a test config with both HTTP and TCP routes, then spawn UringRess.
+    /// Build a test config with both HTTP and TCP routes, then spawn Portail.
     /// `tcp_routes` maps (listener_name, proxy_port) → backend SocketAddr.
     pub fn spawn_with_tcp(
         routes: &[(&str, &str, SocketAddr)],
@@ -260,11 +260,11 @@ impl UringRessProcess {
                             let _ = err.read_to_string(&mut stderr);
                         }
                         panic!(
-                            "UringRess exited with {} before accepting connections.\nstderr: {}",
+                            "Portail exited with {} before accepting connections.\nstderr: {}",
                             status, stderr
                         );
                     }
-                    panic!("UringRess did not start accepting connections on {} within 5s", wait_addr);
+                    panic!("Portail did not start accepting connections on {} within 5s", wait_addr);
                 }
                 if TcpStream::connect_timeout(wait_addr, Duration::from_millis(100)).is_ok() {
                     break;
@@ -306,7 +306,7 @@ impl UringRessProcess {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if std::time::Instant::now() > deadline {
-                panic!("UringRess did not start accepting connections within 5s");
+                panic!("Portail did not start accepting connections within 5s");
             }
             if TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() {
                 break;
@@ -318,7 +318,7 @@ impl UringRessProcess {
     }
 }
 
-impl Drop for UringRessProcess {
+impl Drop for PortailProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -683,16 +683,16 @@ pub fn build_test_config_with_filters(
 fn cargo_bin_path() -> PathBuf {
     // Look for the binary in target/release or target/debug
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release_bin = project_root.join("target/release/uringress");
+    let release_bin = project_root.join("target/release/portail");
     if release_bin.exists() {
         return release_bin;
     }
-    let debug_bin = project_root.join("target/debug/uringress");
+    let debug_bin = project_root.join("target/debug/portail");
     if debug_bin.exists() {
         return debug_bin;
     }
     panic!(
-        "UringRess binary not found. Build with `cargo build --release` first.\n\
+        "Portail binary not found. Build with `cargo build --release` first.\n\
          Looked in: {:?} and {:?}",
         release_bin, debug_bin
     );

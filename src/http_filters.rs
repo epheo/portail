@@ -289,12 +289,12 @@ mod tests {
         let headers = b"HTTP/1.1 200 OK\r\nServer: old-server\r\n\r\n";
         let mods = HeaderModifications {
             add: vec![],
-            set: vec![HttpHeader { name: "Server".to_string(), value: "uringress".to_string() }],
+            set: vec![HttpHeader { name: "Server".to_string(), value: "portail".to_string() }],
             remove: vec![],
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();
-        assert!(result_str.contains("Server: uringress"));
+        assert!(result_str.contains("Server: portail"));
         assert!(!result_str.contains("old-server"));
     }
 }

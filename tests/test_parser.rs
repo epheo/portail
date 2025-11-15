@@ -1,4 +1,4 @@
-use uringress::http_parser::{extract_routing_info, ConnectionType};
+use portail::http_parser::{extract_routing_info, ConnectionType};
 
 #[test]
 fn test_parse_http_headers_fast() {

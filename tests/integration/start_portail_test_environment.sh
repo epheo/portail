@@ -1,11 +1,11 @@
 #!/bin/bash
-# UringRess tmux Test Environment
+# Portail tmux Test Environment
 # Realistic performance testing using KISS backends
 
 set -e
 
-SESSION_NAME="uringress-test"
-TMUX_CONF="/tmp/uringress-test.conf"
+SESSION_NAME="portail-test"
+TMUX_CONF="/tmp/portail-test.conf"
 KISS_BINARY="kiss"
 
 # Detect script location and set absolute paths
@@ -19,7 +19,7 @@ else
 fi
 
 # Use absolute paths for all binaries and directories
-URINGRESS_BINARY="$PROJECT_ROOT/target/release/uringress"
+PORTAIL_BINARY="$PROJECT_ROOT/target/release/portail"
 TEST_CONTENT_DIR="$SCRIPT_DIR/test-content"
 INTEGRATION_DIR="$SCRIPT_DIR"
 
@@ -83,30 +83,30 @@ check_dependencies() {
         exit 1
     fi
     
-    # Check UringRess binary - build if needed
-    if [[ ! -f ${URINGRESS_BINARY} ]]; then
-        if [[ "$URINGRESS_BINARY" == *"/profiling/"* ]]; then
+    # Check Portail binary - build if needed
+    if [[ ! -f ${PORTAIL_BINARY} ]]; then
+        if [[ "$PORTAIL_BINARY" == *"/profiling/"* ]]; then
             local build_flag="--profile profiling"
         else
             local build_flag="--release"
         fi
-        print_status $YELLOW "UringRess binary not found, building it..."
+        print_status $YELLOW "Portail binary not found, building it..."
         print_status $BLUE "Running: cargo build $build_flag"
         cd "$PROJECT_ROOT"
         if cargo build $build_flag; then
-            print_status $GREEN "✓ UringRess binary built successfully"
+            print_status $GREEN "✓ Portail binary built successfully"
         else
-            print_status $RED "✗ Failed to build UringRess binary"
+            print_status $RED "✗ Failed to build Portail binary"
             exit 1
         fi
     else
-        print_status $GREEN "✓ UringRess binary found"
+        print_status $GREEN "✓ Portail binary found"
     fi
 
     # Set eBPF capabilities on the binary so it can run without sudo
-    if ! getcap "${URINGRESS_BINARY}" 2>/dev/null | grep -q "cap_bpf"; then
+    if ! getcap "${PORTAIL_BINARY}" 2>/dev/null | grep -q "cap_bpf"; then
         print_status $BLUE "Setting eBPF capabilities on binary (requires sudo)..."
-        sudo setcap cap_bpf,cap_net_admin+ep "${URINGRESS_BINARY}"
+        sudo setcap cap_bpf,cap_net_admin+ep "${PORTAIL_BINARY}"
         print_status $GREEN "✓ eBPF capabilities set"
     fi
     
@@ -144,8 +144,8 @@ create_tmux_session() {
     # Setup monitoring commands
     tmux send-keys -t ${SESSION_NAME}:monitor.0 "echo 'System Monitor' && htop" Enter
     tmux send-keys -t ${SESSION_NAME}:monitor.1 "echo 'Network Connections' && watch -n1 'ss -tlnp | grep -E \"(8080|300[123])\"'" Enter
-    tmux send-keys -t ${SESSION_NAME}:monitor.2 "echo 'Process Monitor' && watch -n1 'ps aux | grep -E \"(uringress|kiss)\" | head -10'" Enter
-    tmux send-keys -t ${SESSION_NAME}:monitor.3 "echo 'UringRess Logs' && echo 'Waiting for UringRess to start...' && sleep 2 && tail -f /tmp/uringress-test.log 2>/dev/null || echo 'Log file not yet created'" Enter
+    tmux send-keys -t ${SESSION_NAME}:monitor.2 "echo 'Process Monitor' && watch -n1 'ps aux | grep -E \"(portail|kiss)\" | head -10'" Enter
+    tmux send-keys -t ${SESSION_NAME}:monitor.3 "echo 'Portail Logs' && echo 'Waiting for Portail to start...' && sleep 2 && tail -f /tmp/portail-test.log 2>/dev/null || echo 'Log file not yet created'" Enter
     
     # Create KISS backends window
     tmux new-window -t ${SESSION_NAME} -n "kiss-backends"
@@ -157,8 +157,8 @@ create_tmux_session() {
     tmux send-keys -t ${SESSION_NAME}:kiss-backends.1 "echo 'KISS Backend 2 - Medium Content (Port 3002)' && echo 'Starting...' && ${KISS_BINARY} --port 3002 --static-dir ${TEST_CONTENT_DIR}/medium" Enter  
     tmux send-keys -t ${SESSION_NAME}:kiss-backends.2 "echo 'KISS Backend 3 - Large Content (Port 3003)' && echo 'Starting...' && ${KISS_BINARY} --port 3003 --static-dir ${TEST_CONTENT_DIR}/large" Enter
     
-    # Create UringRess window
-    tmux new-window -t ${SESSION_NAME} -n "uringress"
+    # Create Portail window
+    tmux new-window -t ${SESSION_NAME} -n "portail"
     
     # Wait for KISS backends to start
     print_status $BLUE "Waiting for KISS backends to start..."
@@ -179,8 +179,8 @@ create_tmux_session() {
         print_status $YELLOW "Some backends are not ready, but continuing..."
     fi
     
-    # Start UringRess
-    print_status $BLUE "Starting UringRess..."
+    # Start Portail
+    print_status $BLUE "Starting Portail..."
     
     # Check if profiling is requested
     local profile_args=""
@@ -190,7 +190,7 @@ create_tmux_session() {
         print_status $BLUE "Profiling enabled for duration: $profile_duration"
     fi
     
-    tmux send-keys -t ${SESSION_NAME}:uringress "echo 'UringRess Proxy Server' && echo 'Starting with configuration from development.yaml...' && cd '$PROJECT_ROOT' && '$URINGRESS_BINARY' --config '$PROJECT_ROOT/examples/development.yaml' $profile_args 2>&1 | tee /tmp/uringress-test.log" Enter
+    tmux send-keys -t ${SESSION_NAME}:portail "echo 'Portail Proxy Server' && echo 'Starting with configuration from development.yaml...' && cd '$PROJECT_ROOT' && '$PORTAIL_BINARY' --config '$PROJECT_ROOT/examples/development.yaml' $profile_args 2>&1 | tee /tmp/portail-test.log" Enter
     
     # Create testing window
     tmux new-window -t ${SESSION_NAME} -n "testing"
@@ -206,7 +206,7 @@ create_tmux_session() {
     tmux send-keys -t ${SESSION_NAME}:testing.0 "echo ''" Enter
     
     tmux send-keys -t ${SESSION_NAME}:testing.1 "echo 'Automated Testing Pane'" Enter
-    tmux send-keys -t ${SESSION_NAME}:testing.1 "echo 'Run: tests/integration/start_uringress_test_environment.sh test'" Enter
+    tmux send-keys -t ${SESSION_NAME}:testing.1 "echo 'Run: tests/integration/start_portail_test_environment.sh test'" Enter
     tmux send-keys -t ${SESSION_NAME}:testing.1 "echo ''" Enter
     
     # Select the monitoring window by default
@@ -217,7 +217,7 @@ create_tmux_session() {
     print_status $BLUE "Session layout:"
     print_status $BLUE "  - Window 0 (monitor): System monitoring (htop, network, processes, logs)"
     print_status $BLUE "  - Window 1 (kiss-backends): Three KISS backend services"
-    print_status $BLUE "  - Window 2 (uringress): UringRess proxy service"  
+    print_status $BLUE "  - Window 2 (portail): Portail proxy service"  
     print_status $BLUE "  - Window 3 (testing): Manual and automated testing"
     print_status $BLUE ""
     print_status $GREEN "To attach: tmux attach-session -t ${SESSION_NAME}"
@@ -238,19 +238,19 @@ run_automated_tests() {
         exit 1
     fi
     
-    # Wait for UringRess to start
-    print_status $BLUE "Waiting for UringRess to be ready..."
+    # Wait for Portail to start
+    print_status $BLUE "Waiting for Portail to be ready..."
     local retries=0
     while ! curl -s --connect-timeout 2 http://localhost:8080/health > /dev/null 2>&1; do
         sleep 2
         retries=$((retries + 1))
         if [[ $retries -gt 15 ]]; then
-            print_status $RED "ERROR: UringRess not responding after 30 seconds"
+            print_status $RED "ERROR: Portail not responding after 30 seconds"
             return 1
         fi
     done
     
-    print_status $GREEN "✓ UringRess is ready"
+    print_status $GREEN "✓ Portail is ready"
     
     # Clear testing pane and start tests
     tmux send-keys -t ${session_target} "clear" Enter
@@ -297,7 +297,7 @@ run_automated_tests() {
 
 # Function to show status
 show_status() {
-    print_status $BLUE "=== UringRess Test Environment Status ==="
+    print_status $BLUE "=== Portail Test Environment Status ==="
     
     # tmux session
     print_status $BLUE "\\n--- tmux Session ---"
@@ -312,10 +312,10 @@ show_status() {
     
     # Processes
     print_status $BLUE "\\n--- Processes ---"
-    if pgrep -f "uringress" > /dev/null; then
-        print_status $GREEN "✓ UringRess is running (PID: $(pgrep -f "uringress"))"
+    if pgrep -f "portail" > /dev/null; then
+        print_status $GREEN "✓ Portail is running (PID: $(pgrep -f "portail"))"
     else
-        print_status $RED "✗ UringRess not running"
+        print_status $RED "✗ Portail not running"
     fi
     
     for port in 3001 3002 3003; do
@@ -329,7 +329,7 @@ show_status() {
     # Network ports
     print_status $BLUE "\\n--- Network Ports ---"
     if ss -tlnp | grep -q ":8080"; then
-        print_status $GREEN "✓ UringRess listening on port 8080"
+        print_status $GREEN "✓ Portail listening on port 8080"
     else
         print_status $RED "✗ Nothing listening on port 8080"
     fi
@@ -345,9 +345,9 @@ show_status() {
     # Service health
     print_status $BLUE "\\n--- Service Health ---"
     if curl -s --connect-timeout 2 http://localhost:8080/health > /dev/null 2>&1; then
-        print_status $GREEN "✓ UringRess health check OK"
+        print_status $GREEN "✓ Portail health check OK"
     else
-        print_status $RED "✗ UringRess health check failed"
+        print_status $RED "✗ Portail health check failed"
     fi
     
     for port in 3001 3002 3003; do
@@ -371,11 +371,11 @@ stop_environment() {
     
     # Kill processes
     pkill -f "kiss --port" 2>/dev/null || true
-    pkill -f "uringress" 2>/dev/null || true
+    pkill -f "portail" 2>/dev/null || true
     print_status $GREEN "✓ Processes stopped"
     
     # Clean up files
-    rm -f /tmp/uringress-test.log ${TMUX_CONF}
+    rm -f /tmp/portail-test.log ${TMUX_CONF}
     print_status $GREEN "✓ Temporary files cleaned"
     
     print_status $GREEN "✓ Environment stopped successfully"
@@ -384,7 +384,7 @@ stop_environment() {
 # Function to show usage
 show_usage() {
     cat <<EOF
-${BLUE}UringRess tmux Test Environment${NC}
+${BLUE}Portail tmux Test Environment${NC}
 
 ${GREEN}Usage:${NC} $0 [command] [options]
 
@@ -395,7 +395,7 @@ ${GREEN}Commands:${NC}
     ${YELLOW}stop${NC}                     - Stop all services and kill tmux session
     ${YELLOW}status${NC}                   - Show status of all services
     ${YELLOW}test${NC}                     - Run automated tests (session must be running)
-    ${YELLOW}logs${NC}                     - Show UringRess logs
+    ${YELLOW}logs${NC}                     - Show Portail logs
 
 ${GREEN}Examples:${NC}
     $0 start                 # Start everything
@@ -415,7 +415,7 @@ ${GREEN}tmux Navigation:${NC}
 ${GREEN}Windows:${NC}
     0. monitor        # System monitoring
     1. kiss-backends  # KISS backend services
-    2. uringress      # UringRess proxy
+    2. portail      # Portail proxy
     3. testing        # Manual and automated testing
 
 ${GREEN}Integration Directory:${NC}
@@ -431,7 +431,7 @@ main() {
     case ${command} in
         "start")
             if [[ "${2:-}" == "profile" ]]; then
-                URINGRESS_BINARY="$PROJECT_ROOT/target/profiling/uringress"
+                PORTAIL_BINARY="$PROJECT_ROOT/target/profiling/portail"
             fi
             check_dependencies
             create_tmux_session
@@ -469,10 +469,10 @@ main() {
             ;;
             
         "logs")
-            if [[ -f /tmp/uringress-test.log ]]; then
-                tail -f /tmp/uringress-test.log
+            if [[ -f /tmp/portail-test.log ]]; then
+                tail -f /tmp/portail-test.log
             else
-                print_status $RED "Log file not found. Is UringRess running?"
+                print_status $RED "Log file not found. Is Portail running?"
                 exit 1
             fi
             ;;
