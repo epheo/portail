@@ -17,6 +17,7 @@ use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
+use crate::health::HealthRegistry;
 use crate::logging::info;
 use crate::routing::RouteTable;
 use crate::tls;
@@ -44,6 +45,7 @@ pub struct DataPlane {
     udp_listeners: Vec<UdpListenerEntry>,
     task_handles: Vec<JoinHandle<()>>,
     pool: Arc<BackendPool>,
+    health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
 }
@@ -61,6 +63,7 @@ impl DataPlane {
             64,
             performance_config.backend_timeout,
         ));
+        let health = Arc::new(HealthRegistry::new());
 
         let mut tcp_listeners = Vec::new();
         let mut udp_listeners = Vec::new();
@@ -130,6 +133,7 @@ impl DataPlane {
             udp_listeners,
             task_handles: Vec::new(),
             pool,
+            health,
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
         })
@@ -152,6 +156,7 @@ impl DataPlane {
         for entry in self.tcp_listeners.drain(..) {
             let routes = routes.clone();
             let pool = self.pool.clone();
+            let health = self.health.clone();
             let shutdown = self.shutdown.clone();
 
             let handle = tokio::spawn(async move {
@@ -164,6 +169,7 @@ impl DataPlane {
                     shutdown,
                     entry.tls_acceptor,
                     entry.tls_passthrough,
+                    health,
                 ).await;
             });
 
@@ -173,11 +179,12 @@ impl DataPlane {
         for entry in self.udp_listeners.drain(..) {
             let socket = Arc::new(entry.socket);
             let routes = routes.clone();
+            let health = self.health.clone();
             let shutdown = self.shutdown.clone();
             let session_timeout = self.udp_session_timeout;
 
             let handle = tokio::spawn(async move {
-                udp_worker::run_udp_worker(entry.worker_id, socket, entry.port, routes, session_timeout, shutdown).await;
+                udp_worker::run_udp_worker(entry.worker_id, socket, entry.port, routes, session_timeout, shutdown, health).await;
             });
 
             self.task_handles.push(handle);

@@ -5,6 +5,7 @@ pub mod control_plane;
 pub mod http_parser;
 pub mod request_processor;
 pub mod backend_pool;
+pub mod health;
 pub mod worker;
 pub mod udp_worker;
 pub mod http_filters;

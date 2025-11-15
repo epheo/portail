@@ -847,6 +847,82 @@ impl BackendSelector {
         rule.cumulative_weights.partition_point(|&cw| cw <= slot)
     }
 
+    /// Health-aware weighted backend selection.
+    ///
+    /// Returns `None` when all backends are unhealthy (caller should send 503).
+    ///
+    /// Three-branch logic:
+    /// - **All healthy** → fast path: reuse pre-computed `cumulative_weights` (zero overhead)
+    /// - **Some unhealthy** → slow path: filter + linear walk with manual weight sum
+    /// - **All unhealthy** → `None`
+    ///
+    /// The slow path is O(n) on backend count which is acceptable because
+    /// n is typically 2–5 and this path is only taken during partial failures.
+    pub fn select_healthy_weighted_backend(
+        &mut self,
+        route_hash: u64,
+        rule: &HttpRouteRule,
+        health: &crate::health::HealthRegistry,
+    ) -> Option<usize> {
+        let backends = &rule.backends;
+
+        if backends.is_empty() {
+            return None;
+        }
+
+        if backends.len() == 1 {
+            // Single backend: always return it so the worker can attempt a
+            // connection and record the failure — there is no alternative anyway.
+            return Some(0);
+        }
+
+        // One linear pass: count healthy backends and sum their weights.
+        let mut healthy_weight: u64 = 0;
+        let mut healthy_count: usize = 0;
+        for b in backends {
+            if health.is_healthy(&b.socket_addr) {
+                healthy_weight += b.weight as u64;
+                healthy_count += 1;
+            }
+        }
+
+        if healthy_count == 0 {
+            return None;
+        }
+
+        let counter = self.route_counters.entry(route_hash).or_insert(0);
+
+        if healthy_count == backends.len() {
+            // Fast path — all healthy, use pre-computed cumulative_weights.
+            if rule.total_weight == 0 {
+                return Some(0);
+            }
+            let slot = *counter % rule.total_weight;
+            *counter = counter.wrapping_add(1);
+            return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
+        }
+
+        // Slow path — some backends are unhealthy; recompute distribution over
+        // the healthy subset only.
+        let slot = *counter % healthy_weight;
+        *counter = counter.wrapping_add(1);
+
+        let mut cumulative: u64 = 0;
+        for (i, b) in backends.iter().enumerate() {
+            if !health.is_healthy(&b.socket_addr) {
+                continue;
+            }
+            cumulative += b.weight as u64;
+            if cumulative > slot {
+                return Some(i);
+            }
+        }
+
+        // Unreachable given healthy_weight > 0, but fall back to first healthy
+        // backend rather than panic.
+        backends.iter().position(|b| health.is_healthy(&b.socket_addr))
+    }
+
     /// Simple round-robin (for equal-weight backends or non-HTTP routes)
     pub fn select_backend(&mut self, route_hash: u64, backend_count: usize) -> usize {
         let counter = self.route_counters.entry(route_hash).or_insert(0);

@@ -13,6 +13,10 @@ You have been warned.
 
 That being said, performances are decent and I'm using it for my Microshift homelab.
 
+## Setting up dev env
+
+I use Dev Container
+
 ## License
 
 Apache-2.0

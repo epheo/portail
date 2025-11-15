@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::health::HealthRegistry;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
@@ -29,6 +30,7 @@ pub async fn run_udp_worker(
     routes: Arc<ArcSwap<RouteTable>>,
     session_timeout: Duration,
     shutdown: CancellationToken,
+    health: Arc<HealthRegistry>,
 ) {
     info!("UDP worker {} listening on port {}", worker_id, server_port);
 
@@ -91,7 +93,7 @@ pub async fn run_udp_worker(
                         // New session — route lookup
                         let decision = {
                             let route_table = routes.load();
-                            match request_processor::analyze_udp_request(&route_table, &mut selector, server_port) {
+                            match request_processor::analyze_udp_request(&route_table, &mut selector, server_port, &health) {
                                 Ok(d) => d,
                                 Err(e) => {
                                     warn!("UDP routing error for port {}: {}", server_port, e);

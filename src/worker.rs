@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
+use crate::health::HealthRegistry;
 use crate::http_filters::{apply_request_modifications, apply_response_header_mods, dispatch_mirrors};
 use crate::http_parser::find_header_end;
 use crate::logging::{warn, info, debug};
@@ -25,6 +26,7 @@ struct ConnectionState {
     routes: Arc<ArcSwap<RouteTable>>,
     pool: Arc<BackendPool>,
     selector: BackendSelector,
+    health: Arc<HealthRegistry>,
 }
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -37,6 +39,7 @@ pub async fn run_worker(
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_passthrough: bool,
+    health: Arc<HealthRegistry>,
 ) {
     info!("Worker {} accepting on port {}", worker_id, server_port);
 
@@ -53,10 +56,11 @@ pub async fn run_worker(
                         let routes = routes.clone();
                         let pool = pool.clone();
                         let acceptor = tls_acceptor.clone();
+                        let health = health.clone();
 
                         if tls_passthrough {
                             tokio::spawn(async move {
-                                if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes).await {
+                                if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes, health).await {
                                     debug!("TLS passthrough from {} closed: {}", peer, _e);
                                 }
                             });
@@ -70,6 +74,7 @@ pub async fn run_worker(
                                             routes,
                                             pool,
                                             selector: BackendSelector::new(),
+                                            health,
                                         };
                                         if let Err(_e) = handle_connection(conn, peer, state).await {
                                             debug!("TLS connection from {} closed: {}", peer, _e);
@@ -86,6 +91,7 @@ pub async fn run_worker(
                                 routes,
                                 pool,
                                 selector: BackendSelector::new(),
+                                health,
                             };
                             tokio::spawn(async move {
                                 let conn = Connection::Plain { inner: tcp_stream };
@@ -121,12 +127,12 @@ async fn handle_connection(
     loop {
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..n], state.server_port)?
+            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..n], state.server_port, &state.health)?
         };
 
         match decision {
             ProcessingDecision::TcpForward { backend_addr } => {
-                return handle_tcp_connection(client, backend_addr, &buf[..n]).await;
+                return handle_tcp_connection(client, backend_addr, &buf[..n], Arc::clone(&state.health)).await;
             }
             ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout } => {
                 let ka = handle_http_forward(
@@ -181,8 +187,23 @@ async fn handle_http_forward(
     loop {
         let timeout_dur = per_rule_timeout.unwrap_or(std::time::Duration::from_secs(30));
         let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr)).await {
-            Ok(result) => result?,
+            Ok(Ok(stream)) => {
+                state.health.record_success(backend_addr);
+                stream
+            }
+            Ok(Err(e)) => {
+                warn!("Backend {} connect failed: {}", backend_addr, e);
+                if state.health.record_failure(backend_addr) {
+                    HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+                }
+                send_error_response(client, 502).await?;
+                return Ok(false);
+            }
             Err(_) => {
+                warn!("Backend {} connect timeout", backend_addr);
+                if state.health.record_failure(backend_addr) {
+                    HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+                }
                 send_error_response(client, 504).await?;
                 return Ok(false);
             }
@@ -233,7 +254,7 @@ async fn handle_http_forward(
 
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..request_bytes], state.server_port)?
+            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..request_bytes], state.server_port, &state.health)?
         };
 
         match decision {
@@ -346,6 +367,7 @@ async fn handle_tls_passthrough(
     mut client: TcpStream,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
+    health: Arc<HealthRegistry>,
 ) -> Result<()> {
     let mut peek_buf = vec![0u8; 16384];
     let n = client.peek(&mut peek_buf).await?;
@@ -360,11 +382,21 @@ async fn handle_tls_passthrough(
     let backend_addr = route_table.resolve_tls_passthrough(hostname, server_port)
         .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
 
-    let mut backend = TcpStream::connect(backend_addr).await?;
-    backend.set_nodelay(true)?;
-    client.set_nodelay(true)?;
+    match TcpStream::connect(backend_addr).await {
+        Ok(mut backend) => {
+            health.record_success(backend_addr);
+            backend.set_nodelay(true)?;
+            client.set_nodelay(true)?;
+            tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+        }
+        Err(e) => {
+            if health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(health, backend_addr);
+            }
+            return Err(anyhow::anyhow!("TLS passthrough connect to {} failed: {}", backend_addr, e));
+        }
+    }
 
-    tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
     Ok(())
 }
 
@@ -372,13 +404,22 @@ async fn handle_tcp_connection(
     mut client: Connection,
     backend_addr: SocketAddr,
     initial_data: &[u8],
+    health: Arc<HealthRegistry>,
 ) -> Result<()> {
-    let mut backend = TcpStream::connect(backend_addr).await?;
-    backend.set_nodelay(true)?;
-
-    backend.write_all(initial_data).await?;
-
-    tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    match TcpStream::connect(backend_addr).await {
+        Ok(mut backend) => {
+            health.record_success(backend_addr);
+            backend.set_nodelay(true)?;
+            backend.write_all(initial_data).await?;
+            tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+        }
+        Err(e) => {
+            if health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(health, backend_addr);
+            }
+            return Err(anyhow::anyhow!("TCP connect to {} failed: {}", backend_addr, e));
+        }
+    }
     Ok(())
 }
 

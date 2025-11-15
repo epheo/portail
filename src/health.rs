@@ -66,23 +66,11 @@ pub struct HealthRegistry {
     backends: DashMap<SocketAddr, BackendHealth>,
 }
 
-impl Default for HealthRegistry {
-    fn default() -> Self {
+impl HealthRegistry {
+    pub fn new() -> Self {
         Self {
             backends: DashMap::new(),
         }
-    }
-}
-
-impl HealthRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Remove all tracked backend health state.
-    /// Called on config reload to prevent stale entries from blocking new backends.
-    pub fn clear(&self) {
-        self.backends.clear();
     }
 
     /// Returns `true` if the backend is considered healthy.
@@ -96,13 +84,8 @@ impl HealthRegistry {
     }
 
     /// Called on successful `pool.acquire()` to reset failure state.
-    /// No-op (zero allocation, no DashMap access) if no backends have ever failed.
+    /// No-op (zero allocation) if the backend has never failed.
     pub fn record_success(&self, addr: SocketAddr) {
-        // Fast path: if no backend has ever failed, skip the DashMap lookup entirely.
-        // DashMap::is_empty() is lock-free and O(1).
-        if self.backends.is_empty() {
-            return;
-        }
         if let Some(entry) = self.backends.get(&addr) {
             if entry.consecutive_failures.load(Ordering::Relaxed) > 0
                 || entry.status.load(Ordering::Acquire) != STATUS_HEALTHY

@@ -9,6 +9,7 @@ mod control_plane;
 mod http_parser;
 mod request_processor;
 mod backend_pool;
+mod health;
 mod worker;
 mod udp_worker;
 mod http_filters;
