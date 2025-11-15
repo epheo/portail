@@ -61,9 +61,13 @@ pub enum TlsMode {
     Passthrough,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CertificateRef {
     pub name: String,
+    #[serde(skip)]
+    pub cert_pem: Option<Vec<u8>>,
+    #[serde(skip)]
+    pub key_pem: Option<Vec<u8>>,
 }
 
 // Default value functions

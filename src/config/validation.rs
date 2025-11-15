@@ -620,7 +620,7 @@ mod tests {
     fn test_https_requires_terminate_mode() {
         let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
             mode: TlsMode::Passthrough,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
         }));
         assert!(listener.validate().is_err());
     }
@@ -638,7 +638,7 @@ mod tests {
     fn test_https_valid_tls_config() {
         let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
             mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "my-cert".to_string() }],
+            certificate_refs: vec![CertificateRef { name: "my-cert".to_string(), ..Default::default() }],
         }));
         assert!(listener.validate().is_ok());
     }
@@ -647,7 +647,7 @@ mod tests {
     fn test_tls_requires_passthrough_mode() {
         let listener = make_listener(Protocol::TLS, Some(TlsConfig {
             mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
         }));
         assert!(listener.validate().is_err());
     }
@@ -671,7 +671,7 @@ mod tests {
     fn test_http_rejects_tls_config() {
         let listener = make_listener(Protocol::HTTP, Some(TlsConfig {
             mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string() }],
+            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
         }));
         assert!(listener.validate().is_err());
     }
@@ -690,7 +690,7 @@ mod tests {
     fn test_https_empty_cert_name_rejected() {
         let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
             mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "".to_string() }],
+            certificate_refs: vec![CertificateRef { name: "".to_string(), ..Default::default() }],
         }));
         assert!(listener.validate().is_err());
     }

@@ -142,6 +142,7 @@ pub async fn update_gateway_class_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_route_status<K>(
     client: &Client,
     route_name: &str,
@@ -152,6 +153,8 @@ pub async fn update_route_status<K>(
     section_name: Option<&str>,
     accepted: bool,
     message: &str,
+    refs_resolved: bool,
+    refs_message: &str,
     generation: Option<i64>,
 )
 where
@@ -193,9 +196,9 @@ where
                         },
                         {
                             "type": "ResolvedRefs",
-                            "status": if accepted { "True" } else { "False" },
-                            "reason": if accepted { "ResolvedRefs" } else { "BackendNotFound" },
-                            "message": if accepted { "All references resolved" } else { message },
+                            "status": if refs_resolved { "True" } else { "False" },
+                            "reason": if refs_resolved { "ResolvedRefs" } else { "BackendNotFound" },
+                            "message": refs_message,
                             "lastTransitionTime": now,
                             "observedGeneration": generation,
                         },

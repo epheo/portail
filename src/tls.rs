@@ -109,7 +109,28 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
+fn parse_pem_cert_and_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("Failed to parse certificate PEM: {}", e))?;
+
+    if certs.is_empty() {
+        return Err(anyhow!("No certificates found in PEM data"));
+    }
+
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|e| anyhow!("Failed to parse private key PEM: {}", e))?
+        .ok_or_else(|| anyhow!("No private key found in PEM data"))?;
+
+    Ok((certs, key))
+}
+
 fn load_cert_and_key(cert_ref: &CertificateRef, cert_dir: &Path) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    // Prefer in-memory PEM bytes (from K8s Secrets) over filesystem
+    if let (Some(cert_pem), Some(key_pem)) = (&cert_ref.cert_pem, &cert_ref.key_pem) {
+        return parse_pem_cert_and_key(cert_pem, key_pem);
+    }
+
     let cert_path = cert_dir.join(format!("{}.crt", cert_ref.name));
     let key_path = cert_dir.join(format!("{}.key", cert_ref.name));
 
@@ -118,19 +139,7 @@ fn load_cert_and_key(cert_ref: &CertificateRef, cert_dir: &Path) -> Result<(Vec<
     let key_pem = std::fs::read(&key_path)
         .map_err(|e| anyhow!("Failed to read key '{}': {}", key_path.display(), e))?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| anyhow!("Failed to parse certificate PEM: {}", e))?;
-
-    if certs.is_empty() {
-        return Err(anyhow!("No certificates found in '{}'", cert_path.display()));
-    }
-
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| anyhow!("No private key found in '{}'", key_path.display()))?;
-
-    Ok((certs, key))
+    parse_pem_cert_and_key(&cert_pem, &key_pem)
 }
 
 fn build_certified_key(certs: Vec<rustls::pki_types::CertificateDer<'static>>, key: rustls::pki_types::PrivateKeyDer<'static>) -> Result<CertifiedKey> {
@@ -428,8 +437,8 @@ mod tests {
         }
 
         let cert_refs = vec![
-            CertificateRef { name: "cert-a".to_string() },
-            CertificateRef { name: "cert-b".to_string() },
+            CertificateRef { name: "cert-a".to_string(), ..Default::default() },
+            CertificateRef { name: "cert-b".to_string(), ..Default::default() },
         ];
         let result = build_tls_acceptor(&cert_refs, dir_path);
         assert!(result.is_ok(), "multi-cert TLS acceptor should succeed: {:?}", result.err());
@@ -443,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_acceptor_missing_cert_file() {
-        let refs = vec![CertificateRef { name: "nonexistent".to_string() }];
+        let refs = vec![CertificateRef { name: "nonexistent".to_string(), ..Default::default() }];
         let result = build_tls_acceptor(&refs, std::path::Path::new("/tmp"));
         assert!(result.is_err());
     }

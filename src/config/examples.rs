@@ -84,6 +84,7 @@ impl PortailConfig {
                             mode: TlsMode::Terminate,
                             certificate_refs: vec![CertificateRef {
                                 name: "example-cert".to_string(),
+                                ..Default::default()
                             }],
                         }),
                     },
