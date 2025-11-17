@@ -26,20 +26,29 @@ impl BackendPool {
     }
 
     pub async fn acquire(&self, addr: SocketAddr) -> Result<TcpStream> {
-        // Try reuse an idle connection
-        if let Some(mut conns) = self.pools.get_mut(&addr) {
-            while let Some(conn) = conns.pop() {
-                // Verify the connection is still alive (peek for EOF)
-                let mut probe = [0u8; 0];
-                match conn.try_read(&mut probe) {
-                    // Would block = connection is alive and idle
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        debug!("Pool hit: reusing connection to {}", addr);
-                        return Ok(conn);
-                    }
-                    // Zero bytes read or error = stale connection, try next
-                    _ => continue,
+        // Try reuse an idle connection — pop one at a time to minimize shard lock hold time.
+        // The lock is released between iterations so other workers can acquire/release concurrently.
+        loop {
+            let conn = {
+                let mut guard = match self.pools.get_mut(&addr) {
+                    Some(g) => g,
+                    None => break,
+                };
+                match guard.pop() {
+                    Some(c) => c,
+                    None => break,
                 }
+            };
+            // Guard is dropped — liveness check happens outside the critical section
+            let mut probe = [0u8; 0];
+            match conn.try_read(&mut probe) {
+                // Would block = connection is alive and idle
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    debug!("Pool hit: reusing connection to {}", addr);
+                    return Ok(conn);
+                }
+                // Zero bytes read or error = stale connection, try next
+                _ => continue,
             }
         }
 

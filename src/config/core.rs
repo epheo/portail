@@ -276,12 +276,16 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
         Ok(match f {
             HttpRouteFilter::RequestHeaderModifier { config } => {
                 Self::RequestHeaderModifier {
-                    add: config.add.clone(), set: config.set.clone(), remove: config.remove.clone(),
+                    add: std::sync::Arc::new(config.add.clone()),
+                    set: std::sync::Arc::new(config.set.clone()),
+                    remove: std::sync::Arc::new(config.remove.clone()),
                 }
             }
             HttpRouteFilter::ResponseHeaderModifier { config } => {
                 Self::ResponseHeaderModifier {
-                    add: config.add.clone(), set: config.set.clone(), remove: config.remove.clone(),
+                    add: std::sync::Arc::new(config.add.clone()),
+                    set: std::sync::Arc::new(config.set.clone()),
+                    remove: std::sync::Arc::new(config.remove.clone()),
                 }
             }
             HttpRouteFilter::RequestRedirect { config } => {

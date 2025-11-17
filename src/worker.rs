@@ -301,7 +301,7 @@ async fn forward_http_response(
     let mut content_length: Option<usize> = None;
     let mut body_bytes_forwarded: usize = 0;
     let mut chunked = false;
-    let mut header_buf = Vec::new();
+    let mut header_buf = Vec::with_capacity(1024);
     // Rolling tail buffer for detecting chunked terminator across read boundaries.
     // Tracks the last 5 bytes (len of b"0\r\n\r\n") seen so far in the body.
     let mut chunked_tail = [0u8; 5];
@@ -455,21 +455,23 @@ async fn send_redirect_response(client: &mut Connection, status_code: u16, locat
 }
 
 async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
-    let (status_text, body) = match error_code {
-        400 => ("Bad Request", "400 Bad Request"),
-        404 => ("Not Found", "404 Not Found"),
-        502 => ("Bad Gateway", "502 Bad Gateway"),
-        503 => ("Service Unavailable", "503 Service Unavailable"),
-        504 => ("Gateway Timeout", "504 Gateway Timeout"),
-        _ => ("Internal Server Error", "500 Internal Server Error"),
+    static RESP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\nConnection: close\r\n\r\n400 Bad Request";
+    static RESP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
+    static RESP_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
+    static RESP_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable";
+    static RESP_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n504 Gateway Timeout";
+    static RESP_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 25\r\nConnection: close\r\n\r\n500 Internal Server Error";
+
+    let response = match error_code {
+        400 => RESP_400,
+        404 => RESP_404,
+        502 => RESP_502,
+        503 => RESP_503,
+        504 => RESP_504,
+        _ => RESP_500,
     };
 
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        error_code, status_text, body.len(), body
-    );
-
-    client.write_all(response.as_bytes()).await?;
+    client.write_all(response).await?;
     Ok(())
 }
 

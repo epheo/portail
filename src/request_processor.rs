@@ -4,6 +4,7 @@
 //! Works on byte slices — no I/O runtime dependency.
 
 use std::hash::Hasher;
+use std::sync::Arc;
 use anyhow::Result;
 use std::net::SocketAddr;
 use crate::logging::{debug, error};
@@ -13,9 +14,9 @@ use crate::routing::{RouteTable, HttpFilter, URLRewritePath, BackendSelector, Ht
 
 #[derive(Debug, Clone)]
 pub struct HeaderModifications {
-    pub add: Vec<HttpHeader>,
-    pub set: Vec<HttpHeader>,
-    pub remove: Vec<String>,
+    pub add: Arc<Vec<HttpHeader>>,
+    pub set: Arc<Vec<HttpHeader>>,
+    pub remove: Arc<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,16 +177,16 @@ fn analyze_http_request(
             }
             HttpFilter::RequestHeaderModifier { add, set, remove } => {
                 request_header_mods = Some(HeaderModifications {
-                    add: add.clone(),
-                    set: set.clone(),
-                    remove: remove.clone(),
+                    add: Arc::clone(add),
+                    set: Arc::clone(set),
+                    remove: Arc::clone(remove),
                 });
             }
             HttpFilter::ResponseHeaderModifier { add, set, remove } => {
                 response_header_mods = Some(HeaderModifications {
-                    add: add.clone(),
-                    set: set.clone(),
-                    remove: remove.clone(),
+                    add: Arc::clone(add),
+                    set: Arc::clone(set),
+                    remove: Arc::clone(remove),
                 });
             }
             HttpFilter::URLRewrite { hostname, path } => {
@@ -469,9 +470,9 @@ mod tests {
                     path: Some(URLRewritePath::ReplaceFullPath("/new".to_string())),
                 },
                 HttpFilter::RequestHeaderModifier {
-                    add: vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }],
-                    set: vec![],
-                    remove: vec![],
+                    add: Arc::new(vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }]),
+                    set: Arc::new(vec![]),
+                    remove: Arc::new(vec![]),
                 },
             ],
         );

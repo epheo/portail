@@ -124,7 +124,7 @@ pub(crate) fn apply_request_modifications(
 
     // Add headers
     if let Some(mods) = header_mods {
-        for h in &mods.add {
+        for h in mods.add.iter() {
             out.extend_from_slice(h.name.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value.as_bytes());
@@ -139,57 +139,75 @@ pub(crate) fn apply_request_modifications(
 
 /// Apply response header modifications to buffered response headers.
 /// Returns the modified header region (including trailing \r\n\r\n).
+/// Operates on raw bytes — no intermediate String allocations.
 pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModifications) -> Vec<u8> {
-    let header_str = match std::str::from_utf8(headers) {
-        Ok(s) => s,
-        Err(_) => return headers.to_vec(),
-    };
+    let mut out = Vec::with_capacity(headers.len() + 256);
+    let mut pos = 0;
+    let mut first_line = true;
 
-    let lines: Vec<&str> = header_str.lines().collect();
-    if lines.is_empty() {
-        return headers.to_vec();
-    }
+    while pos < headers.len() {
+        let line_start = pos;
+        // Find end of line
+        while pos < headers.len() && headers[pos] != b'\r' && headers[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &headers[line_start..pos];
 
-    let status_line = lines[0];
-    let header_lines = &lines[1..];
+        // Skip past CRLF
+        if pos < headers.len() && headers[pos] == b'\r' { pos += 1; }
+        if pos < headers.len() && headers[pos] == b'\n' { pos += 1; }
 
-    let mut result_headers: Vec<String> = Vec::with_capacity(header_lines.len() + mods.add.len() + mods.set.len());
-
-    for line in header_lines {
         if line.is_empty() {
             continue;
         }
-        let colon_pos = match line.find(':') {
+
+        if first_line {
+            // Status line: pass through unchanged
+            first_line = false;
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            continue;
+        }
+
+        // Header line: find colon to extract name
+        let colon_pos = match line.iter().position(|&b| b == b':') {
             Some(p) => p,
-            None => continue,
+            None => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
         };
         let name = &line[..colon_pos];
 
-        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        // SAFETY: header names are ASCII per RFC 7230
+        let name_str = unsafe { std::str::from_utf8_unchecked(name) };
+
+        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
             continue;
         }
 
-        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
-            result_headers.push(format!("{}: {}", set_header.name, set_header.value));
+        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name_str)) {
+            out.extend_from_slice(set_header.name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(set_header.value.as_bytes());
+            out.extend_from_slice(b"\r\n");
             continue;
         }
 
-        result_headers.push(line.to_string());
-    }
-
-    for h in &mods.add {
-        result_headers.push(format!("{}: {}", h.name, h.value));
-    }
-
-    let mut out = Vec::with_capacity(headers.len() + 256);
-    out.extend_from_slice(status_line.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    for h in &result_headers {
-        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(line);
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"\r\n");
 
+    // Add headers
+    for h in mods.add.iter() {
+        out.extend_from_slice(h.name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(h.value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(b"\r\n");
     out
 }
 
@@ -235,9 +253,9 @@ mod tests {
             path: Some(RewrittenPath::Full("/new".to_string())),
         };
         let mods = HeaderModifications {
-            add: vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }],
-            set: vec![],
-            remove: vec!["User-Agent".to_string()],
+            add: std::sync::Arc::new(vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }]),
+            set: std::sync::Arc::new(vec![]),
+            remove: std::sync::Arc::new(vec!["User-Agent".to_string()]),
         };
         let result = apply_request_modifications(request, Some(&mods), Some(&rewrite));
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -261,9 +279,9 @@ mod tests {
     fn test_apply_response_header_mods_add() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         let mods = HeaderModifications {
-            add: vec![HttpHeader { name: "X-Custom".to_string(), value: "added".to_string() }],
-            set: vec![],
-            remove: vec![],
+            add: std::sync::Arc::new(vec![HttpHeader { name: "X-Custom".to_string(), value: "added".to_string() }]),
+            set: std::sync::Arc::new(vec![]),
+            remove: std::sync::Arc::new(vec![]),
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -274,9 +292,9 @@ mod tests {
     fn test_apply_response_header_mods_remove() {
         let headers = b"HTTP/1.1 200 OK\r\nX-Internal: secret\r\nContent-Length: 5\r\n\r\n";
         let mods = HeaderModifications {
-            add: vec![],
-            set: vec![],
-            remove: vec!["X-Internal".to_string()],
+            add: std::sync::Arc::new(vec![]),
+            set: std::sync::Arc::new(vec![]),
+            remove: std::sync::Arc::new(vec!["X-Internal".to_string()]),
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -288,9 +306,9 @@ mod tests {
     fn test_apply_response_header_mods_set() {
         let headers = b"HTTP/1.1 200 OK\r\nServer: old-server\r\n\r\n";
         let mods = HeaderModifications {
-            add: vec![],
-            set: vec![HttpHeader { name: "Server".to_string(), value: "portail".to_string() }],
-            remove: vec![],
+            add: std::sync::Arc::new(vec![]),
+            set: std::sync::Arc::new(vec![HttpHeader { name: "Server".to_string(), value: "portail".to_string() }]),
+            remove: std::sync::Arc::new(vec![]),
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();

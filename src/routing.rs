@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 use fnv::FnvHashMap;
 use serde::{Serialize, Deserialize};
@@ -37,13 +38,33 @@ impl RouteTable {
         header_data: &[u8],
         query_string: &str,
     ) -> Result<&'a HttpRouteRule> {
-        let mut buf = [0u8; 256];
+        // Fast path: if host is already lowercase, avoid the copy entirely (99%+ of real traffic)
         let host_bytes = host.as_bytes();
+        let needs_lowercase = host_bytes.iter().any(|b| b.is_ascii_uppercase());
+
+        if !needs_lowercase {
+            // Fast path: use host directly, no copy
+            return self.lookup_http_route(host, method, path, header_data, query_string);
+        }
+
+        // Slow path: copy into stack buffer and lowercase
         let len = host_bytes.len().min(256);
+        let mut buf = [0u8; 256];
         buf[..len].copy_from_slice(&host_bytes[..len]);
         buf[..len].make_ascii_lowercase();
-        let key = std::str::from_utf8(&buf[..len]).unwrap_or(host);
+        // SAFETY: input was valid UTF-8 str, lowercasing ASCII preserves validity
+        let key = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+        self.lookup_http_route(key, method, path, header_data, query_string)
+    }
 
+    fn lookup_http_route<'a>(
+        &'a self,
+        key: &str,
+        method: &str,
+        path: &str,
+        header_data: &[u8],
+        query_string: &str,
+    ) -> Result<&'a HttpRouteRule> {
         // Try exact host first
         if let Some(host_entry) = self.http_routes.get(key) {
             if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
@@ -61,7 +82,7 @@ impl RouteTable {
             }
         }
 
-        Err(anyhow!("No HTTP route found for host={} path={}", host, path))
+        Err(anyhow!("No HTTP route found for host={} path={}", key, path))
     }
 
     #[inline(always)]
@@ -331,14 +352,14 @@ pub struct QueryParamMatch {
 #[derive(Debug, Clone)]
 pub enum HttpFilter {
     RequestHeaderModifier {
-        add: Vec<HttpHeader>,
-        set: Vec<HttpHeader>,
-        remove: Vec<String>,
+        add: Arc<Vec<HttpHeader>>,
+        set: Arc<Vec<HttpHeader>>,
+        remove: Arc<Vec<String>>,
     },
     ResponseHeaderModifier {
-        add: Vec<HttpHeader>,
-        set: Vec<HttpHeader>,
-        remove: Vec<String>,
+        add: Arc<Vec<HttpHeader>>,
+        set: Arc<Vec<HttpHeader>>,
+        remove: Arc<Vec<String>>,
     },
     RequestRedirect {
         scheme: Option<String>,

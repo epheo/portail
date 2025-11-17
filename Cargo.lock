@@ -1813,6 +1813,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "memchr",
  "pin-project-lite",
  "regex",
  "rustls",

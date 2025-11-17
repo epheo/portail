@@ -84,8 +84,13 @@ impl HealthRegistry {
     }
 
     /// Called on successful `pool.acquire()` to reset failure state.
-    /// No-op (zero allocation) if the backend has never failed.
+    /// No-op (zero allocation, no DashMap access) if no backends have ever failed.
     pub fn record_success(&self, addr: SocketAddr) {
+        // Fast path: if no backend has ever failed, skip the DashMap lookup entirely.
+        // DashMap::is_empty() is lock-free and O(1).
+        if self.backends.is_empty() {
+            return;
+        }
         if let Some(entry) = self.backends.get(&addr) {
             if entry.consecutive_failures.load(Ordering::Relaxed) > 0
                 || entry.status.load(Ordering::Acquire) != STATUS_HEALTHY

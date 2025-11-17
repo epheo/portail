@@ -6,10 +6,21 @@ use crate::logging::debug;
 
 /// Find the end of HTTP headers (\r\n\r\n boundary).
 /// Returns the position just past the double CRLF.
+/// Uses memchr SIMD-accelerated search for \r, then checks the following 3 bytes.
 pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|pos| pos + 4)
+    let mut start = 0;
+    while let Some(pos) = memchr::memchr(b'\r', &data[start..]) {
+        let abs = start + pos;
+        if abs + 3 < data.len()
+            && data[abs + 1] == b'\n'
+            && data[abs + 2] == b'\r'
+            && data[abs + 3] == b'\n'
+        {
+            return Some(abs + 4);
+        }
+        start = abs + 1;
+    }
+    None
 }
 
 /// HTTP Connection header preference

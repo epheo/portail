@@ -2,6 +2,7 @@ use portail::routing::{
     RouteTable, Backend, HttpRouteRule, HttpFilter, HttpHeader, URLRewritePath,
     PathMatchType, HeaderMatch, QueryParamMatch, BackendSelector, ValueMatcher,
 };
+use std::sync::Arc;
 
 #[test]
 fn test_route_table_creation() {
@@ -358,9 +359,9 @@ fn test_route_carries_filters() {
     rt.add_http_route("example.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(), vec![], vec![],
         vec![HttpFilter::RequestHeaderModifier {
-            add: vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }],
-            set: vec![],
-            remove: vec![],
+            add: Arc::new(vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }]),
+            set: Arc::new(vec![]),
+            remove: Arc::new(vec![]),
         }],
         vec![backend(8001)],
     ));
