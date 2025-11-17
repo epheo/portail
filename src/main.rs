@@ -17,6 +17,7 @@ mod tls;
 mod data_plane;
 mod ebpf;
 mod kubernetes;
+mod config_watcher;
 
 use control_plane::ControlPlane;
 use data_plane::DataPlane;
@@ -106,9 +107,20 @@ async fn main() -> Result<()> {
     control_plane.attach_worker_reuseport_programs(&listener_fds)?;
     info!("eBPF programs attached — starting worker tasks");
 
-    data_plane.start(routes);
+    data_plane.start(routes.clone());
 
     info!("Portail ready: {} workers × {} listeners", worker_count, listeners.len());
+
+    // In standalone mode, watch the config file for SIGHUP-triggered reloads
+    if !args.kubernetes {
+        if let Some(config_path) = args.config.clone() {
+            let reload_routes = routes;
+            let reload_shutdown = shutdown_token.clone();
+            tokio::spawn(async move {
+                config_watcher::watch_config(config_path, reload_routes, reload_shutdown).await;
+            });
+        }
+    }
 
     // Wait for shutdown signal
     control_plane.wait_for_shutdown().await?;

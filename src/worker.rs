@@ -302,6 +302,10 @@ async fn forward_http_response(
     let mut body_bytes_forwarded: usize = 0;
     let mut chunked = false;
     let mut header_buf = Vec::new();
+    // Rolling tail buffer for detecting chunked terminator across read boundaries.
+    // Tracks the last 5 bytes (len of b"0\r\n\r\n") seen so far in the body.
+    let mut chunked_tail = [0u8; 5];
+    let mut chunked_tail_len: usize = 0;
 
     loop {
         let n = backend.read(buf).await?;
@@ -339,8 +343,12 @@ async fn forward_http_response(
                         return Ok(true);
                     }
                 }
-                if chunked && ends_with_chunked_terminator(&header_buf[header_end..]) {
-                    return Ok(true);
+                if chunked {
+                    let body_so_far = &header_buf[header_end..];
+                    append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, body_so_far);
+                    if is_chunked_terminator(&chunked_tail, chunked_tail_len) {
+                        return Ok(true);
+                    }
                 }
                 if is_no_body_status(headers) {
                     return Ok(true);
@@ -355,8 +363,11 @@ async fn forward_http_response(
                     return Ok(true);
                 }
             }
-            if chunked && buf[..n].ends_with(b"0\r\n\r\n") {
-                return Ok(true);
+            if chunked {
+                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
+                if is_chunked_terminator(&chunked_tail, chunked_tail_len) {
+                    return Ok(true);
+                }
             }
         }
     }
@@ -479,6 +490,87 @@ fn is_no_body_status(headers: &[u8]) -> bool {
     status == b"204" || status == b"304" || status[0] == b'1'
 }
 
-fn ends_with_chunked_terminator(data: &[u8]) -> bool {
-    data.ends_with(b"0\r\n\r\n")
+/// Append new data to the rolling 5-byte tail buffer used for chunked terminator detection.
+#[inline]
+fn append_chunked_tail(tail: &mut [u8; 5], tail_len: &mut usize, data: &[u8]) {
+    if data.len() >= 5 {
+        // Fast path: new data is large enough to fill the entire tail
+        tail.copy_from_slice(&data[data.len() - 5..]);
+        *tail_len = 5;
+    } else if !data.is_empty() {
+        // Shift existing tail left and append new bytes
+        let keep = 5usize.saturating_sub(data.len()).min(*tail_len);
+        if keep > 0 {
+            tail.copy_within((*tail_len - keep)..*tail_len, 0);
+        }
+        let start = keep;
+        tail[start..start + data.len()].copy_from_slice(data);
+        *tail_len = keep + data.len();
+    }
+}
+
+/// Check if the tail buffer contains the chunked terminator `0\r\n\r\n`.
+#[inline]
+fn is_chunked_terminator(tail: &[u8; 5], tail_len: usize) -> bool {
+    tail_len == 5 && tail == b"0\r\n\r\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunked_terminator_single_read() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        append_chunked_tail(&mut tail, &mut len, b"some body data0\r\n\r\n");
+        assert!(is_chunked_terminator(&tail, len));
+    }
+
+    #[test]
+    fn test_chunked_terminator_split_across_two_reads() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        // First read ends with "0\r\n"
+        append_chunked_tail(&mut tail, &mut len, b"chunk data0\r\n");
+        assert!(!is_chunked_terminator(&tail, len));
+        // Second read starts with "\r\n"
+        append_chunked_tail(&mut tail, &mut len, b"\r\n");
+        assert!(is_chunked_terminator(&tail, len));
+    }
+
+    #[test]
+    fn test_chunked_terminator_split_byte_by_byte() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        for byte in b"0\r\n\r\n" {
+            append_chunked_tail(&mut tail, &mut len, std::slice::from_ref(byte));
+        }
+        assert!(is_chunked_terminator(&tail, len));
+    }
+
+    #[test]
+    fn test_chunked_terminator_false_positive_resistance() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        // Contains the bytes but not at the end
+        append_chunked_tail(&mut tail, &mut len, b"0\r\n\r\nmore data");
+        assert!(!is_chunked_terminator(&tail, len));
+    }
+
+    #[test]
+    fn test_chunked_terminator_not_enough_data() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        append_chunked_tail(&mut tail, &mut len, b"\r\n");
+        assert!(!is_chunked_terminator(&tail, len));
+    }
+
+    #[test]
+    fn test_chunked_terminator_exact_five_bytes() {
+        let mut tail = [0u8; 5];
+        let mut len = 0;
+        append_chunked_tail(&mut tail, &mut len, b"0\r\n\r\n");
+        assert!(is_chunked_terminator(&tail, len));
+    }
 }

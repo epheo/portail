@@ -148,6 +148,11 @@ impl ListenerConfig {
             }
         }
 
+        if let Some(ref addr) = self.address {
+            addr.parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow!("Invalid bind address '{}': must be a valid IPv4 or IPv6 address", addr))?;
+        }
+
         // TLS config validation per protocol
         match self.protocol {
             Protocol::HTTPS => {

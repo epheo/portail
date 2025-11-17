@@ -38,9 +38,13 @@ pub async fn run_udp_worker(
     let mut selector = BackendSelector::new();
     let mut buf = vec![0u8; 65536];
 
+    // Use a monotonic epoch for last_active tracking (shared between main loop and reaper)
+    let epoch = Instant::now();
+
     // Reaper task: periodically remove expired sessions
     let reaper_sessions = sessions.clone();
     let reaper_shutdown = shutdown.clone();
+    let reaper_epoch = epoch;
     let _reaper = tokio::spawn(async move {
         let mut interval = tokio::time::interval(session_timeout / 2);
         loop {
@@ -48,7 +52,7 @@ pub async fn run_udp_worker(
                 biased;
                 _ = reaper_shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let now = Instant::now().elapsed().as_secs();
+                    let now = reaper_epoch.elapsed().as_secs();
                     let timeout_secs = session_timeout.as_secs();
                     reaper_sessions.retain(|_addr, session: &mut UdpSession| {
                         let last = session.last_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -64,8 +68,6 @@ pub async fn run_udp_worker(
         }
     });
 
-    // Use a monotonic epoch for last_active tracking
-    let epoch = Instant::now();
 
     loop {
         tokio::select! {

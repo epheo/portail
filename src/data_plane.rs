@@ -95,7 +95,11 @@ impl DataPlane {
                 let port = listener_cfg.port;
                 match listener_cfg.protocol {
                     Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
-                        let std_listener = create_reuseport_tcp_listener(port)?;
+                        let std_listener = create_reuseport_tcp_listener(
+                            port,
+                            listener_cfg.address.as_deref(),
+                            listener_cfg.interface.as_deref(),
+                        )?;
                         let raw_fd = std_listener.as_raw_fd();
                         let tokio_listener = TcpListener::from_std(std_listener)?;
 
@@ -111,7 +115,11 @@ impl DataPlane {
                         info!("Worker {} TCP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
                     }
                     Protocol::UDP => {
-                        let std_socket = create_reuseport_udp_socket(port)?;
+                        let std_socket = create_reuseport_udp_socket(
+                            port,
+                            listener_cfg.address.as_deref(),
+                            listener_cfg.interface.as_deref(),
+                        )?;
                         let raw_fd = std_socket.as_raw_fd();
                         let tokio_socket = UdpSocket::from_std(std_socket)?;
 
@@ -206,28 +214,50 @@ impl DataPlane {
     }
 }
 
-fn create_reuseport_tcp_listener(port: u16) -> Result<std::net::TcpListener> {
+fn create_reuseport_tcp_listener(
+    port: u16,
+    bind_addr: Option<&str>,
+    interface: Option<&str>,
+) -> Result<std::net::TcpListener> {
     use socket2::{Socket, Domain, Type, Protocol};
 
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse()
+        .map_err(|e| anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e))?;
+    let domain = if ip.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    if let Some(iface) = interface {
+        socket.bind_device(Some(iface.as_bytes()))?;
+    }
+
+    let addr = std::net::SocketAddr::new(ip, port);
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
 
     Ok(socket.into())
 }
 
-fn create_reuseport_udp_socket(port: u16) -> Result<std::net::UdpSocket> {
+fn create_reuseport_udp_socket(
+    port: u16,
+    bind_addr: Option<&str>,
+    interface: Option<&str>,
+) -> Result<std::net::UdpSocket> {
     use socket2::{Socket, Domain, Type, Protocol};
 
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse()
+        .map_err(|e| anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e))?;
+    let domain = if ip.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    if let Some(iface) = interface {
+        socket.bind_device(Some(iface.as_bytes()))?;
+    }
+
+    let addr = std::net::SocketAddr::new(ip, port);
     socket.bind(&addr.into())?;
 
     Ok(socket.into())
