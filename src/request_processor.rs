@@ -88,15 +88,21 @@ pub fn analyze_request(
 
 #[inline(always)]
 fn is_http_request(data: &[u8]) -> bool {
-    if data.len() < 3 { return false; }
+    if data.len() < 4 { return false; }
 
-    data.starts_with(b"GET ") ||
-    data.starts_with(b"POST ") ||
-    data.starts_with(b"PUT ") ||
-    data.starts_with(b"DELETE ") ||
-    data.starts_with(b"HEAD ") ||
-    data.starts_with(b"OPTIONS ") ||
-    data.starts_with(b"PATCH ")
+    // Compare first 4 bytes as a u32 — all standard HTTP methods
+    // are uniquely identified by their first 4 bytes (including space for 3-letter methods).
+    let tag = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+    matches!(
+        tag,
+        u32::from_ne_bytes(*b"GET ") |
+        u32::from_ne_bytes(*b"POST") |
+        u32::from_ne_bytes(*b"PUT ") |
+        u32::from_ne_bytes(*b"DELE") |  // DELETE
+        u32::from_ne_bytes(*b"HEAD") |
+        u32::from_ne_bytes(*b"OPTI") |  // OPTIONS
+        u32::from_ne_bytes(*b"PATC")    // PATCH
+    )
 }
 
 #[inline(always)]
@@ -195,11 +201,11 @@ fn analyze_http_request(
                     URLRewritePath::ReplacePrefixMatch(value) => {
                         let suffix = &request_info.path[rule.path.len()..];
                         let needs_slash = !value.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-                        let result = if needs_slash {
-                            format!("{}/{}", value, suffix)
-                        } else {
-                            format!("{}{}", value, suffix)
-                        };
+                        let cap = value.len() + suffix.len() + if needs_slash { 1 } else { 0 };
+                        let mut result = String::with_capacity(cap);
+                        result.push_str(value);
+                        if needs_slash { result.push('/'); }
+                        result.push_str(suffix);
                         RewrittenPath::PrefixReplaced(result)
                     }
                 });

@@ -380,7 +380,7 @@ async fn handle_tls_passthrough(
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
 ) -> Result<()> {
-    let mut peek_buf = vec![0u8; 16384];
+    let mut peek_buf = [0u8; 16384];
     let n = client.peek(&mut peek_buf).await?;
     if n == 0 {
         return Ok(());
@@ -435,6 +435,8 @@ async fn handle_tcp_connection(
 }
 
 async fn send_redirect_response(client: &mut Connection, status_code: u16, location: &str) -> Result<()> {
+    use std::io::Write;
+
     let status_text = match status_code {
         301 => "Moved Permanently",
         302 => "Found",
@@ -444,13 +446,19 @@ async fn send_redirect_response(client: &mut Connection, status_code: u16, locat
         _ => "Found",
     };
 
-    let body = format!("{} {}", status_code, status_text);
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: {}\r\n\r\n{}",
-        status_code, status_text, location, body.len(), body
+    // Pre-compute body once, then build the entire response in one write! call
+    // into a stack-estimated Vec. Avoids two separate format! heap allocations.
+    let mut resp = Vec::with_capacity(128 + location.len());
+    let _ = write!(
+        resp,
+        "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: {}\r\n\r\n{} {}",
+        status_code, status_text, location,
+        // body length: digits of status_code (always 3) + 1 space + status_text length
+        3 + 1 + status_text.len(),
+        status_code, status_text,
     );
 
-    client.write_all(response.as_bytes()).await?;
+    client.write_all(&resp).await?;
     Ok(())
 }
 
