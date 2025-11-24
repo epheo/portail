@@ -149,7 +149,7 @@ tcpRoutes:
   rules:
   - backendRefs:
     - name: ssh-service
-      port: 2242
+      port: 22
 udpRoutes: []
 observability:
   logging:

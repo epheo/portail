@@ -101,10 +101,16 @@ pub(crate) fn apply_request_modifications(
                 continue;
             }
         }
-
         if let Some(mods) = header_mods {
-            // SAFETY: header names are ASCII per RFC 7230
-            let name_str = unsafe { std::str::from_utf8_unchecked(name) };
+            let name_str = match std::str::from_utf8(name) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Non-UTF8 header name: pass through unmodified
+                    out.extend_from_slice(line);
+                    out.extend_from_slice(b"\r\n");
+                    continue;
+                }
+            };
 
             if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
                 continue;
@@ -180,8 +186,14 @@ pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModificati
         };
         let name = &line[..colon_pos];
 
-        // SAFETY: header names are ASCII per RFC 7230
-        let name_str = unsafe { std::str::from_utf8_unchecked(name) };
+        let name_str = match std::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
+        };
 
         if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
             continue;

@@ -81,8 +81,10 @@ pub fn extract_routing_info(
         }
 
         if line_end > pos {
-            // SAFETY: HTTP request line is ASCII by RFC 7230 - skip UTF-8 validation
-            let first_line = unsafe { std::str::from_utf8_unchecked(&request_data[pos..line_end]) };
+            let first_line = match std::str::from_utf8(&request_data[pos..line_end]) {
+                Ok(s) => s,
+                Err(_) => return Err(anyhow::anyhow!("Non-UTF8 data in HTTP request line")),
+            };
             let mut parts = first_line.split_whitespace();
             method = parts.next();
             path = parts.next();
@@ -138,8 +140,7 @@ pub fn extract_routing_info(
                         .position(|&b| b == b':')
                         .map_or(value_end, |pos| value_start + pos);
 
-                    // SAFETY: Host header is ASCII by RFC 7230
-                    host = Some(unsafe { std::str::from_utf8_unchecked(&line[value_start..normalized_end]) });
+                    host = std::str::from_utf8(&line[value_start..normalized_end]).ok();
 
                 } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
                     let mut value_start = 11;
@@ -153,12 +154,12 @@ pub fn extract_routing_info(
                         value_end -= 1;
                     }
 
-                    // SAFETY: Connection header is ASCII by RFC 7230
-                    let value = unsafe { std::str::from_utf8_unchecked(&line[value_start..value_end]) };
-                    if value.eq_ignore_ascii_case("close") {
-                        raw_connection_type = ConnectionType::Close;
-                    } else if value.eq_ignore_ascii_case("keep-alive") {
-                        raw_connection_type = ConnectionType::KeepAlive;
+                    if let Ok(value) = std::str::from_utf8(&line[value_start..value_end]) {
+                        if value.eq_ignore_ascii_case("close") {
+                            raw_connection_type = ConnectionType::Close;
+                        } else if value.eq_ignore_ascii_case("keep-alive") {
+                            raw_connection_type = ConnectionType::KeepAlive;
+                        }
                     }
 
                 }

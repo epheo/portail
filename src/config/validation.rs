@@ -30,11 +30,18 @@ impl PortailConfig {
     }
 
     fn validate_port_conflicts(&self) -> Result<()> {
+        // Track (port, is_udp) — TCP and UDP can legally share the same port number
+        // since they use different socket families. HTTP/HTTPS/TLS/TCP all bind TCP sockets.
         let mut used_ports = std::collections::HashSet::new();
 
         for listener in &self.gateway.listeners {
-            if !used_ports.insert(listener.port) {
-                return Err(anyhow!("Port conflict: Listener port {} already in use", listener.port));
+            let is_udp = matches!(listener.protocol, Protocol::UDP);
+            if !used_ports.insert((listener.port, is_udp)) {
+                let proto_family = if is_udp { "UDP" } else { "TCP" };
+                return Err(anyhow!(
+                    "Port conflict: {} port {} is already in use by another listener",
+                    proto_family, listener.port
+                ));
             }
         }
 

@@ -52,8 +52,8 @@ impl RouteTable {
         let mut buf = [0u8; 256];
         buf[..len].copy_from_slice(&host_bytes[..len]);
         buf[..len].make_ascii_lowercase();
-        // SAFETY: input was valid UTF-8 str, lowercasing ASCII preserves validity
-        let key = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+        // Lowercasing ASCII in valid UTF-8 always produces valid UTF-8
+        let key = std::str::from_utf8(&buf[..len]).unwrap_or(host);
         self.lookup_http_route(key, method, path, header_data, query_string)
     }
 
@@ -448,8 +448,7 @@ pub fn find_header_value<'a>(header_data: &'a [u8], name: &str) -> Option<&'a st
             while end > start && (line[end - 1] == b' ' || line[end - 1] == b'\t') {
                 end -= 1;
             }
-            // SAFETY: HTTP headers are ASCII per RFC 7230
-            return Some(unsafe { std::str::from_utf8_unchecked(&line[start..end]) });
+            return std::str::from_utf8(&line[start..end]).ok();
         }
 
         // Advance past CRLF

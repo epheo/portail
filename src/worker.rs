@@ -22,6 +22,40 @@ use crate::request_processor::{self, HeaderModifications, HttpFilterData, Proces
 use crate::routing::{BackendSelector, RouteTable};
 use crate::tls::{self, Connection};
 
+/// Quick check if data starts with a known HTTP method.
+/// Used to decide whether to accumulate headers or pass through for raw TCP.
+#[inline]
+fn looks_like_http(data: &[u8]) -> bool {
+    data.starts_with(b"GET ")
+        || data.starts_with(b"POST ")
+        || data.starts_with(b"PUT ")
+        || data.starts_with(b"DELETE ")
+        || data.starts_with(b"HEAD ")
+        || data.starts_with(b"OPTIONS ")
+        || data.starts_with(b"PATCH ")
+        || data.starts_with(b"CONNECT ")
+        || data.starts_with(b"TRACE ")
+}
+
+/// Continue reading from `client` into `buf` starting at offset `already_read`
+/// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
+async fn read_remaining_headers(client: &mut Connection, buf: &mut [u8], already_read: usize) -> Result<usize> {
+    let mut total = already_read;
+    loop {
+        let n = client.read(&mut buf[total..]).await?;
+        if n == 0 {
+            return Ok(total); // Client closed mid-headers — use what we have
+        }
+        total += n;
+        if find_header_end(&buf[..total]).is_some() {
+            return Ok(total);
+        }
+        if total >= buf.len() {
+            return Err(anyhow::anyhow!("Request headers exceed buffer size"));
+        }
+    }
+}
+
 struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -129,6 +163,18 @@ async fn handle_connection(
         return Ok(());
     }
 
+    // If data looks like HTTP but headers aren't complete, accumulate more reads.
+    // TCP/binary data (no \r\n\r\n expected) passes through immediately.
+    if looks_like_http(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
+        match read_remaining_headers(&mut client, &mut buf, n).await {
+            Ok(total) => n = total,
+            Err(e) => {
+                let _ = send_error_response(&mut client, 431).await;
+                return Err(e);
+            }
+        }
+    }
+
     loop {
         let decision = {
             let route_table = state.routes.load();
@@ -165,6 +211,15 @@ async fn handle_connection(
         }
 
         n = client.read(&mut buf).await?;
+        if n > 0 && find_header_end(&buf[..n]).is_none() {
+            match read_remaining_headers(&mut client, &mut buf, n).await {
+                Ok(total) => n = total,
+                Err(e) => {
+                    let _ = send_error_response(&mut client, 431).await;
+                    return Err(e);
+                }
+            }
+        }
         if n == 0 {
             return Ok(());
         }
@@ -250,6 +305,15 @@ async fn handle_http_forward(
         }
 
         request_bytes = client.read(buf).await?;
+        if request_bytes > 0 && find_header_end(&buf[..request_bytes]).is_none() {
+            match read_remaining_headers(client, buf, request_bytes).await {
+                Ok(total) => request_bytes = total,
+                Err(e) => {
+                    let _ = send_error_response(client, 431).await;
+                    return Err(e);
+                }
+            }
+        }
         if request_bytes == 0 {
             return Ok(false);
         }
@@ -384,7 +448,11 @@ async fn handle_tls_passthrough(
     health: Arc<HealthRegistry>,
 ) -> Result<()> {
     let mut peek_buf = [0u8; 16384];
-    let n = client.peek(&mut peek_buf).await?;
+    let n = match tokio::time::timeout(Duration::from_secs(5), client.peek(&mut peek_buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("TLS passthrough: client sent no data within 5s")),
+    };
     if n == 0 {
         return Ok(());
     }
