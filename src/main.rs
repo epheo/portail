@@ -26,8 +26,7 @@ use clap::Parser;
 use config::PortailConfig;
 use tokio_util::sync::CancellationToken;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Err(error) = args.validate() {
@@ -35,10 +34,28 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Config generation needs no eBPF
+    // Config generation needs no eBPF — use a minimal single-threaded runtime
     if args.is_generation_mode() {
         logging::init_logging(args.verbose, None);
         return handle_generation_mode(&args);
+    }
+
+    // Validate and example modes also use minimal runtime
+    if args.is_validation_mode() || args.example_config {
+        let portail_config = if let Some(config_path) = &args.config {
+            PortailConfig::load_from_file(config_path)
+                .map_err(|e| {
+                    eprintln!("Failed to load configuration file: {}", e);
+                    std::process::exit(1);
+                }).unwrap()
+        } else {
+            PortailConfig::default()
+        };
+        logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
+        if args.is_validation_mode() {
+            return handle_validation_mode(&args);
+        }
+        return handle_example_config_mode(&args);
     }
 
     // Validate eBPF requirements — fail fast
@@ -60,8 +77,22 @@ async fn main() -> Result<()> {
 
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
-    let performance_config = portail_config.performance.clone();
     let worker_count = portail_config.gateway.worker_threads;
+
+    // Build Tokio runtime with thread count matching the configured worker count
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
+
+    info!("Tokio runtime started with {} threads", worker_count);
+
+    rt.block_on(async_main(args, portail_config, worker_count))
+}
+
+async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usize) -> Result<()> {
+    let performance_config = portail_config.performance.clone();
     let listeners = portail_config.gateway.listeners.clone();
     let cert_dir = args.cert_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("certs"));
 
@@ -70,14 +101,6 @@ async fn main() -> Result<()> {
           portail_config.http_routes.len(),
           portail_config.tcp_routes.len(),
           portail_config.udp_routes.len());
-
-    if args.is_validation_mode() {
-        return handle_validation_mode(&args);
-    }
-
-    if args.example_config {
-        return handle_example_config_mode(&args);
-    }
 
     // Single Tokio runtime for both control and data planes
     let mut control_plane = ControlPlane::new(portail_config)?;

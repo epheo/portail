@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,9 +25,11 @@ use crate::tls::{self, Connection};
 struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    pool: Arc<BackendPool>,
+    pool: BackendPool,
     selector: BackendSelector,
     health: Arc<HealthRegistry>,
+    /// Reused across keepalive responses to avoid per-response heap allocation.
+    header_buf: Vec<u8>,
 }
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -35,7 +38,8 @@ pub async fn run_worker(
     listener: TcpListener,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    pool: Arc<BackendPool>,
+    max_idle_per_backend: usize,
+    connect_timeout: Duration,
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_passthrough: bool,
@@ -54,7 +58,6 @@ pub async fn run_worker(
                 match result {
                     Ok((tcp_stream, peer)) => {
                         let routes = routes.clone();
-                        let pool = pool.clone();
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();
 
@@ -72,9 +75,10 @@ pub async fn run_worker(
                                         let state = ConnectionState {
                                             server_port,
                                             routes,
-                                            pool,
+                                            pool: BackendPool::new(max_idle_per_backend, connect_timeout),
                                             selector: BackendSelector::new(),
                                             health,
+                                            header_buf: Vec::with_capacity(1024),
                                         };
                                         if let Err(_e) = handle_connection(conn, peer, state).await {
                                             debug!("TLS connection from {} closed: {}", peer, _e);
@@ -89,9 +93,10 @@ pub async fn run_worker(
                             let state = ConnectionState {
                                 server_port,
                                 routes,
-                                pool,
+                                pool: BackendPool::new(max_idle_per_backend, connect_timeout),
                                 selector: BackendSelector::new(),
                                 health,
+                                header_buf: Vec::with_capacity(1024),
                             };
                             tokio::spawn(async move {
                                 let conn = Connection::Plain { inner: tcp_stream };
@@ -187,10 +192,7 @@ async fn handle_http_forward(
     loop {
         let timeout_dur = per_rule_timeout.unwrap_or(std::time::Duration::from_secs(30));
         let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr)).await {
-            Ok(Ok(stream)) => {
-                state.health.record_success(backend_addr);
-                stream
-            }
+            Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 warn!("Backend {} connect failed: {}", backend_addr, e);
                 if state.health.record_failure(backend_addr) {
@@ -230,7 +232,7 @@ async fn handle_http_forward(
         let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
         let response_complete = match tokio::time::timeout(
             timeout_dur,
-            forward_http_response(&mut backend, client, buf, resp_mods),
+            forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
         ).await {
             Ok(result) => result?,
             Err(_) => {
@@ -296,12 +298,13 @@ async fn forward_http_response(
     client: &mut Connection,
     buf: &mut [u8],
     response_mods: Option<&HeaderModifications>,
+    header_buf: &mut Vec<u8>,
 ) -> Result<bool> {
     let mut headers_parsed = false;
     let mut content_length: Option<usize> = None;
     let mut body_bytes_forwarded: usize = 0;
     let mut chunked = false;
-    let mut header_buf = Vec::with_capacity(1024);
+    header_buf.clear();
     // Rolling tail buffer for detecting chunked terminator across read boundaries.
     // Tracks the last 5 bytes (len of b"0\r\n\r\n") seen so far in the body.
     let mut chunked_tail = [0u8; 5];

@@ -6,7 +6,7 @@ set -e
 
 SESSION_NAME="portail-test"
 TMUX_CONF="/tmp/portail-test.conf"
-KISS_BINARY="kiss"
+KISS_BINARY="$HOME/.local/bin/kiss"
 
 # Detect script location and set absolute paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -152,9 +152,14 @@ create_tmux_session() {
     tmux split-window -h -t ${SESSION_NAME}:kiss-backends
     tmux split-window -v -t ${SESSION_NAME}:kiss-backends.0
     
-    # Start KISS backends in separate panes
+    # Wait for shells in new panes to initialize before sending commands
+    sleep 1
+    
+    # Start KISS backends in separate panes (staggered to avoid races)
     tmux send-keys -t ${SESSION_NAME}:kiss-backends.0 "echo 'KISS Backend 1 - Small Content (Port 3001)' && echo 'Starting...' && ${KISS_BINARY} --port 3001 --static-dir ${TEST_CONTENT_DIR}/small" Enter
-    tmux send-keys -t ${SESSION_NAME}:kiss-backends.1 "echo 'KISS Backend 2 - Medium Content (Port 3002)' && echo 'Starting...' && ${KISS_BINARY} --port 3002 --static-dir ${TEST_CONTENT_DIR}/medium" Enter  
+    sleep 0.5
+    tmux send-keys -t ${SESSION_NAME}:kiss-backends.1 "echo 'KISS Backend 2 - Medium Content (Port 3002)' && echo 'Starting...' && ${KISS_BINARY} --port 3002 --static-dir ${TEST_CONTENT_DIR}/medium" Enter
+    sleep 0.5
     tmux send-keys -t ${SESSION_NAME}:kiss-backends.2 "echo 'KISS Backend 3 - Large Content (Port 3003)' && echo 'Starting...' && ${KISS_BINARY} --port 3003 --static-dir ${TEST_CONTENT_DIR}/large" Enter
     
     # Create Portail window

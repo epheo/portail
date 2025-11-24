@@ -1,17 +1,17 @@
-//! Per-backend-address connection pool for persistent TCP connections.
+//! Per-worker connection pool for persistent TCP connections.
 //!
+//! Each worker owns its own pool — no locks, no contention.
 //! Reuses idle backend connections across requests to amortize TCP handshake cost.
-//! Shared across all workers via Arc.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
-use dashmap::DashMap;
 use tokio::net::TcpStream;
 use anyhow::Result;
 use crate::logging::debug;
 
 pub struct BackendPool {
-    pools: DashMap<SocketAddr, Vec<TcpStream>>,
+    pools: HashMap<SocketAddr, Vec<TcpStream>>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
 }
@@ -19,36 +19,26 @@ pub struct BackendPool {
 impl BackendPool {
     pub fn new(max_idle_per_backend: usize, connect_timeout: Duration) -> Self {
         Self {
-            pools: DashMap::new(),
+            pools: HashMap::new(),
             max_idle_per_backend,
             connect_timeout,
         }
     }
 
-    pub async fn acquire(&self, addr: SocketAddr) -> Result<TcpStream> {
-        // Try reuse an idle connection — pop one at a time to minimize shard lock hold time.
-        // The lock is released between iterations so other workers can acquire/release concurrently.
-        loop {
-            let conn = {
-                let mut guard = match self.pools.get_mut(&addr) {
-                    Some(g) => g,
-                    None => break,
-                };
-                match guard.pop() {
-                    Some(c) => c,
-                    None => break,
+    pub async fn acquire(&mut self, addr: SocketAddr) -> Result<TcpStream> {
+        // Try reuse an idle connection — pop and probe until we find a live one.
+        if let Some(conns) = self.pools.get_mut(&addr) {
+            while let Some(conn) = conns.pop() {
+                let mut probe = [0u8; 0];
+                match conn.try_read(&mut probe) {
+                    // Would block = connection is alive and idle
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        debug!("Pool hit: reusing connection to {}", addr);
+                        return Ok(conn);
+                    }
+                    // Zero bytes read or error = stale connection, try next
+                    _ => continue,
                 }
-            };
-            // Guard is dropped — liveness check happens outside the critical section
-            let mut probe = [0u8; 0];
-            match conn.try_read(&mut probe) {
-                // Would block = connection is alive and idle
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    debug!("Pool hit: reusing connection to {}", addr);
-                    return Ok(conn);
-                }
-                // Zero bytes read or error = stale connection, try next
-                _ => continue,
             }
         }
 
@@ -66,8 +56,8 @@ impl BackendPool {
         Ok(conn)
     }
 
-    pub fn release(&self, addr: SocketAddr, conn: TcpStream) {
-        let mut conns = self.pools.entry(addr).or_default();
+    pub fn release(&mut self, addr: SocketAddr, conn: TcpStream) {
+        let conns = self.pools.entry(addr).or_default();
         if conns.len() < self.max_idle_per_backend {
             conns.push(conn);
         }

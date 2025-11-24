@@ -90,19 +90,18 @@ pub fn analyze_request(
 fn is_http_request(data: &[u8]) -> bool {
     if data.len() < 4 { return false; }
 
+    const GET:  u32 = u32::from_ne_bytes(*b"GET ");
+    const POST: u32 = u32::from_ne_bytes(*b"POST");
+    const PUT:  u32 = u32::from_ne_bytes(*b"PUT ");
+    const DELE: u32 = u32::from_ne_bytes(*b"DELE"); // DELETE
+    const HEAD: u32 = u32::from_ne_bytes(*b"HEAD");
+    const OPTI: u32 = u32::from_ne_bytes(*b"OPTI"); // OPTIONS
+    const PATC: u32 = u32::from_ne_bytes(*b"PATC"); // PATCH
+
     // Compare first 4 bytes as a u32 — all standard HTTP methods
     // are uniquely identified by their first 4 bytes (including space for 3-letter methods).
     let tag = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-    matches!(
-        tag,
-        u32::from_ne_bytes(*b"GET ") |
-        u32::from_ne_bytes(*b"POST") |
-        u32::from_ne_bytes(*b"PUT ") |
-        u32::from_ne_bytes(*b"DELE") |  // DELETE
-        u32::from_ne_bytes(*b"HEAD") |
-        u32::from_ne_bytes(*b"OPTI") |  // OPTIONS
-        u32::from_ne_bytes(*b"PATC")    // PATCH
-    )
+    matches!(tag, GET | POST | PUT | DELE | HEAD | OPTI | PATC)
 }
 
 #[inline(always)]

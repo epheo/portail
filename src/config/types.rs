@@ -76,7 +76,9 @@ fn default_gateway_name() -> String {
 }
 
 fn default_worker_threads() -> usize {
-    4
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 impl Default for GatewayConfig {

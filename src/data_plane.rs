@@ -15,7 +15,6 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
-use crate::backend_pool::BackendPool;
 use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
 use crate::logging::info;
@@ -44,7 +43,8 @@ pub struct DataPlane {
     tcp_listeners: Vec<TcpListenerEntry>,
     udp_listeners: Vec<UdpListenerEntry>,
     task_handles: Vec<JoinHandle<()>>,
-    pool: Arc<BackendPool>,
+    max_idle_per_backend: usize,
+    connect_timeout: Duration,
     health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
@@ -59,10 +59,6 @@ impl DataPlane {
         performance_config: &PerformanceConfig,
         cert_dir: &PathBuf,
     ) -> Result<Self> {
-        let pool = Arc::new(BackendPool::new(
-            64,
-            performance_config.backend_timeout,
-        ));
         let health = Arc::new(HealthRegistry::new());
 
         let mut tcp_listeners = Vec::new();
@@ -140,7 +136,8 @@ impl DataPlane {
             tcp_listeners,
             udp_listeners,
             task_handles: Vec::new(),
-            pool,
+            max_idle_per_backend: 64,
+            connect_timeout: performance_config.backend_timeout,
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
@@ -163,9 +160,10 @@ impl DataPlane {
 
         for entry in self.tcp_listeners.drain(..) {
             let routes = routes.clone();
-            let pool = self.pool.clone();
             let health = self.health.clone();
             let shutdown = self.shutdown.clone();
+            let max_idle = self.max_idle_per_backend;
+            let connect_timeout = self.connect_timeout;
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
@@ -173,7 +171,8 @@ impl DataPlane {
                     entry.listener,
                     entry.port,
                     routes,
-                    pool,
+                    max_idle,
+                    connect_timeout,
                     shutdown,
                     entry.tls_acceptor,
                     entry.tls_passthrough,
