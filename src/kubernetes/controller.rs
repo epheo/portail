@@ -330,7 +330,7 @@ async fn reconcile(
         })
         .unwrap_or_default();
 
-    // Build config from K8s resources
+    // Build config for the triggered Gateway
     let result = match reconcile_to_config(
         &gateway,
         &http_routes,
@@ -353,9 +353,43 @@ async fn reconcile(
                 &HashMap::new(),
             )
             .await;
-            return Ok(Action::await_change());
+            return Ok(Action::requeue(std::time::Duration::from_secs(30)));
         }
     };
+
+    // Merge routes from OTHER managed Gateways so we don't clobber them
+    let mut merged_config = result.config.clone();
+    let gateways_api: Api<Gateway> = Api::all(ctx.client.clone());
+    let all_gateways = gateways_api.list(&ListParams::default()).await.map(|l| l.items).unwrap_or_default();
+    for other_gw in &all_gateways {
+        let other_name = other_gw.metadata.name.as_deref().unwrap_or("");
+        let other_ns = other_gw.metadata.namespace.as_deref().unwrap_or("default");
+        if other_name == gw_name && other_ns == gw_ns {
+            continue; // Skip the gateway we just reconciled
+        }
+        if other_gw.spec.gateway_class_name != *gateway_class_name {
+            continue; // Different controller
+        }
+        // Reconcile the other gateway and merge its routes
+        if let Ok(other_result) = reconcile_to_config(
+            other_gw,
+            &http_routes,
+            &tcp_routes,
+            &tls_routes,
+            &udp_routes,
+            &namespace_labels,
+            &reference_grants,
+            &known_services,
+            &cert_data,
+        ) {
+            // Merge listeners from other gateways
+            merged_config.gateway.listeners.extend(other_result.config.gateway.listeners);
+            merged_config.http_routes.extend(other_result.config.http_routes);
+            merged_config.tcp_routes.extend(other_result.config.tcp_routes);
+            merged_config.tls_routes.extend(other_result.config.tls_routes);
+            merged_config.udp_routes.extend(other_result.config.udp_routes);
+        }
+    }
 
     let config = &result.config;
 
@@ -373,7 +407,7 @@ async fn reconcile(
     }
 
     // Convert to route table (spawn_blocking: to_route_table does sync DNS resolution)
-    let config_clone = config.clone();
+    let config_clone = merged_config.clone();
     let route_table = tokio::task::spawn_blocking(move || config_clone.to_route_table())
         .await
         .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
@@ -385,10 +419,10 @@ async fn reconcile(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
                 gw_ns,
                 gw_name,
-                config.http_routes.len(),
-                config.tcp_routes.len(),
-                config.tls_routes.len(),
-                config.udp_routes.len(),
+                merged_config.http_routes.len(),
+                merged_config.tcp_routes.len(),
+                merged_config.tls_routes.len(),
+                merged_config.udp_routes.len(),
             );
             status::update_gateway_status(
                 &ctx.client,
@@ -490,7 +524,7 @@ async fn reconcile(
         }
     }
 
-    Ok(Action::await_change())
+    Ok(Action::requeue(std::time::Duration::from_secs(300)))
 }
 
 fn error_policy(

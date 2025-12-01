@@ -98,7 +98,7 @@ pub async fn update_gateway_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("portail"), &Patch::Merge(status))
+        .patch_status(&name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
         .await
     {
         Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
@@ -134,7 +134,7 @@ pub async fn update_gateway_class_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("portail"), &Patch::Merge(status))
+        .patch_status(&name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
         .await
     {
         Ok(_) => debug!("Updated GatewayClass {} status", name),
@@ -209,7 +209,7 @@ where
     });
 
     match api
-        .patch_status(route_name, &PatchParams::apply("portail"), &Patch::Merge(status))
+        .patch_status(route_name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
         .await
     {
         Ok(_) => debug!("Updated {} {}/{} status", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name),

@@ -35,8 +35,34 @@ fn is_route_allowed_by_listener(
     listener: &GatewayListeners,
     gateway_ns: &str,
     route_ns: &str,
+    route_kind: &str,
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
 ) -> bool {
+    // Check protocol ↔ route kind enforcement
+    let protocol_allows = match listener.protocol.as_str() {
+        "HTTP" | "HTTPS" => route_kind == "HTTPRoute",
+        "TLS" => route_kind == "TLSRoute",
+        "TCP" => route_kind == "TCPRoute",
+        "UDP" => route_kind == "UDPRoute",
+        _ => true, // Unknown protocol, allow anything
+    };
+    if !protocol_allows {
+        return false;
+    }
+
+    // Check allowedRoutes.kinds if specified
+    if let Some(ref allowed) = listener.allowed_routes {
+        if let Some(ref kinds) = allowed.kinds {
+            if !kinds.is_empty() {
+                let kind_allowed = kinds.iter().any(|k| {
+                    k.kind == route_kind
+                });
+                if !kind_allowed {
+                    return false;
+                }
+            }
+        }
+    }
     let allowed = match &listener.allowed_routes {
         None => return route_ns == gateway_ns,
         Some(ar) => ar,
@@ -110,6 +136,7 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
     listener: &GatewayListeners,
     gateway_ns: &str,
     route_ns: &str,
+    route_kind: &str,
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
 ) -> bool {
     let refs = match parent_refs.as_ref() {
@@ -126,7 +153,7 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
                 return false;
             }
         }
-        is_route_allowed_by_listener(listener, gateway_ns, route_ns, namespace_labels)
+        is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespace_labels)
     })
 }
 
@@ -274,6 +301,7 @@ where
                 l,
                 gateway_ns,
                 route_ns,
+                kind,
                 namespace_labels,
             )
         });
