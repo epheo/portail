@@ -128,8 +128,71 @@ fn is_route_allowed_by_listener(
     }
 }
 
+/// Check if a parentRef matches this gateway (name + group + kind + namespace).
+fn parent_ref_matches_gateway<T: ParentRefAccess>(pr: &T, gateway_name: &str, gateway_ns: &str) -> bool {
+    if pr.ref_name() != gateway_name {
+        return false;
+    }
+    // group must be "gateway.networking.k8s.io" or unset
+    if let Some(group) = pr.ref_group() {
+        if group != "gateway.networking.k8s.io" {
+            return false;
+        }
+    }
+    // kind must be "Gateway" or unset
+    if let Some(kind) = pr.ref_kind() {
+        if kind != "Gateway" {
+            return false;
+        }
+    }
+    // namespace must match the gateway's namespace (or be unset = route's own ns)
+    if let Some(ns) = pr.ref_namespace() {
+        if ns != gateway_ns {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check if a listener hostname and route hostnames have at least one overlap.
+/// Per Gateway API spec:
+/// - No listener hostname → all routes match
+/// - No route hostnames → matches any listener
+/// - Wildcard: listener `*.example.com` matches route `foo.example.com`
+fn hostnames_intersect(listener_hostname: Option<&str>, route_hostnames: &[String]) -> bool {
+    let listener_hn = match listener_hostname {
+        None => return true, // No listener hostname restriction
+        Some(h) => h,
+    };
+    if route_hostnames.is_empty() {
+        return true; // No route hostname restriction
+    }
+    route_hostnames.iter().any(|route_hn| {
+        hostname_matches(listener_hn, route_hn) || hostname_matches(route_hn, listener_hn)
+    })
+}
+
+/// Check if `pattern` matches `candidate`.
+/// Supports wildcard prefixes: `*.example.com` matches `foo.example.com`.
+fn hostname_matches(pattern: &str, candidate: &str) -> bool {
+    if pattern == candidate {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // candidate must be in a subdomain of suffix
+        if let Some(cand_rest) = candidate.strip_suffix(suffix) {
+            // cand_rest must end with '.' and have at least one char before it
+            // e.g. "foo." for "foo.example.com" matching "*.example.com"
+            return cand_rest.ends_with('.') && cand_rest.len() > 1;
+        }
+        // Also match exact suffix (*.example.com matches example.com per spec is actually NOT a match)
+        // Per spec, *.example.com does NOT match example.com itself, only subdomains
+    }
+    false
+}
+
 /// Check if a route targets a specific listener by sectionName, and if so, whether
-/// the listener's namespace policy allows the route.
+/// the listener's namespace/hostname/kind policy allows the route.
 fn route_allowed_for_listener<T: ParentRefAccess>(
     parent_refs: &Option<Vec<T>>,
     gateway_name: &str,
@@ -137,6 +200,7 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
     gateway_ns: &str,
     route_ns: &str,
     route_kind: &str,
+    route_hostnames: &[String],
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
 ) -> bool {
     let refs = match parent_refs.as_ref() {
@@ -144,7 +208,7 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
         None => return false,
     };
     refs.iter().any(|pr| {
-        if pr.ref_name() != gateway_name {
+        if !parent_ref_matches_gateway(pr, gateway_name, gateway_ns) {
             return false;
         }
         // If sectionName is specified, it must match this listener
@@ -152,6 +216,10 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
             if section != listener.name {
                 return false;
             }
+        }
+        // Check hostname intersection (only for HTTP/HTTPS/TLS listeners)
+        if !hostnames_intersect(listener.hostname.as_deref(), route_hostnames) {
+            return false;
         }
         is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespace_labels)
     })
@@ -190,7 +258,8 @@ pub fn reconcile_to_config(
         |r| route_namespace(&r.metadata),
         |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
         |r| convert_http_route(r, gateway_name),
-        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
+        |r| r.spec.hostnames.clone().unwrap_or_default(),
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
         &mut route_status,
     );
@@ -208,7 +277,8 @@ pub fn reconcile_to_config(
         |r| route_namespace(&r.metadata),
         |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
         |r| convert_tcp_route(r, gateway_name),
-        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
+        |_r| vec![],  // TCPRoute has no hostname matching
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
         &mut route_status,
     );
@@ -226,7 +296,8 @@ pub fn reconcile_to_config(
         |r| route_namespace(&r.metadata),
         |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
         |r| convert_tls_route(r, gateway_name),
-        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
+        |r| r.spec.hostnames.clone(),
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
         &mut route_status,
     );
@@ -244,7 +315,8 @@ pub fn reconcile_to_config(
         |r| route_namespace(&r.metadata),
         |r| (r.metadata.name.as_deref().unwrap_or("unknown"), r.metadata.generation),
         |r| convert_udp_route(r, gateway_name),
-        |r| first_section_name_for_gateway(&r.spec.parent_refs, gateway_name),
+        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
+        |_r| vec![],  // UDPRoute has no hostname matching
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
         &mut route_status,
     );
@@ -276,7 +348,8 @@ fn collect_routes<R, P, C>(
     get_namespace: impl Fn(&R) -> &str,
     get_identity: impl Fn(&R) -> (&str, Option<i64>),
     convert: impl Fn(&R) -> Result<C>,
-    get_section_name: impl Fn(&R) -> Option<String>,
+    get_parent_section_names: impl Fn(&R) -> Vec<Option<String>>,
+    get_hostnames: impl Fn(&R) -> Vec<String>,
     get_backend_refs: impl Fn(&C) -> Vec<(&str, u16)>,
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<C>
@@ -285,16 +358,17 @@ where
 {
     let mut configs = Vec::new();
     for route in routes {
-        if !route_targets_gateway(get_parent_refs(route), gateway_name) {
+        if !route_targets_gateway(get_parent_refs(route), gateway_name, gateway_ns) {
             continue;
         }
 
         let route_ns = get_namespace(route);
         let (name, generation) = get_identity(route);
-        let section_name = get_section_name(route);
+        let section_names = get_parent_section_names(route);
 
-        // Check namespace scoping against at least one listener
-        let ns_allowed = listeners.iter().any(|l| {
+        // Check namespace + hostname scoping against at least one listener
+        let route_hostnames = get_hostnames(route);
+        let allowed = listeners.iter().any(|l| {
             route_allowed_for_listener(
                 get_parent_refs(route),
                 gateway_name,
@@ -302,22 +376,25 @@ where
                 gateway_ns,
                 route_ns,
                 kind,
+                &route_hostnames,
                 namespace_labels,
             )
         });
 
-        if !ns_allowed {
-            route_status.push(RouteAcceptance {
-                name: name.to_string(),
-                namespace: route_ns.to_string(),
-                kind,
-                accepted: false,
-                message: format!("Route namespace '{}' not allowed by listener policy", route_ns),
-                refs_resolved: true,
-                refs_message: "All references resolved".to_string(),
-                generation,
-                section_name,
-            });
+        if !allowed {
+            for section_name in &section_names {
+                route_status.push(RouteAcceptance {
+                    name: name.to_string(),
+                    namespace: route_ns.to_string(),
+                    kind,
+                    accepted: false,
+                    message: format!("Route not allowed by any listener policy (namespace/hostname/kind)"),
+                    refs_resolved: true,
+                    refs_message: "All references resolved".to_string(),
+                    generation,
+                    section_name: section_name.clone(),
+                });
+            }
             continue;
         }
 
@@ -359,46 +436,54 @@ where
                     refs_messages.join("; ")
                 };
 
-                route_status.push(RouteAcceptance {
-                    name: name.to_string(),
-                    namespace: route_ns.to_string(),
-                    kind,
-                    accepted: true,
-                    message: "Accepted".to_string(),
-                    refs_resolved,
-                    refs_message,
-                    generation,
-                    section_name,
-                });
+                for section_name in &section_names {
+                    route_status.push(RouteAcceptance {
+                        name: name.to_string(),
+                        namespace: route_ns.to_string(),
+                        kind,
+                        accepted: true,
+                        message: "Accepted".to_string(),
+                        refs_resolved,
+                        refs_message: refs_message.clone(),
+                        generation,
+                        section_name: section_name.clone(),
+                    });
+                }
                 configs.push(config);
             }
             Err(e) => {
-                route_status.push(RouteAcceptance {
-                    name: name.to_string(),
-                    namespace: route_ns.to_string(),
-                    kind,
-                    accepted: false,
-                    message: format!("Conversion failed: {}", e),
-                    refs_resolved: false,
-                    refs_message: format!("Conversion failed: {}", e),
-                    generation,
-                    section_name,
-                });
+                for section_name in &section_names {
+                    route_status.push(RouteAcceptance {
+                        name: name.to_string(),
+                        namespace: route_ns.to_string(),
+                        kind,
+                        accepted: false,
+                        message: format!("Conversion failed: {}", e),
+                        refs_resolved: false,
+                        refs_message: format!("Conversion failed: {}", e),
+                        generation,
+                        section_name: section_name.clone(),
+                    });
+                }
             }
         }
     }
     configs
 }
 
-fn first_section_name_for_gateway<T: ParentRefAccess>(
+fn all_section_names_for_gateway<T: ParentRefAccess>(
     parent_refs: &Option<Vec<T>>,
     gateway_name: &str,
-) -> Option<String> {
-    parent_refs.as_ref().and_then(|refs| {
-        refs.iter()
-            .find(|pr| pr.ref_name() == gateway_name)
-            .and_then(|pr| pr.ref_section_name().map(String::from))
-    })
+    gateway_ns: &str,
+) -> Vec<Option<String>> {
+    parent_refs.as_ref()
+        .map(|refs| {
+            refs.iter()
+                .filter(|pr| parent_ref_matches_gateway(*pr, gateway_name, gateway_ns))
+                .map(|pr| pr.ref_section_name().map(String::from))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![None])
 }
 
 fn convert_gateway(gw: &Gateway, cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>) -> Result<GatewayConfig> {
@@ -467,11 +552,11 @@ fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &HashMap<(Stri
     })
 }
 
-/// Check if any parentRef in the route targets the given gateway name.
-fn route_targets_gateway<T: ParentRefAccess>(parent_refs: &Option<Vec<T>>, gateway_name: &str) -> bool {
+/// Check if any parentRef in the route targets the given gateway.
+fn route_targets_gateway<T: ParentRefAccess>(parent_refs: &Option<Vec<T>>, gateway_name: &str, gateway_ns: &str) -> bool {
     parent_refs
         .as_ref()
-        .map(|refs| refs.iter().any(|pr| pr.ref_name() == gateway_name))
+        .map(|refs| refs.iter().any(|pr| parent_ref_matches_gateway(pr, gateway_name, gateway_ns)))
         .unwrap_or(false)
 }
 
@@ -479,26 +564,41 @@ fn route_targets_gateway<T: ParentRefAccess>(parent_refs: &Option<Vec<T>>, gatew
 trait ParentRefAccess {
     fn ref_name(&self) -> &str;
     fn ref_section_name(&self) -> Option<&str>;
+    fn ref_group(&self) -> Option<&str>;
+    fn ref_kind(&self) -> Option<&str>;
+    fn ref_namespace(&self) -> Option<&str>;
 }
 
 impl ParentRefAccess for HTTPRouteParentRefs {
     fn ref_name(&self) -> &str { &self.name }
     fn ref_section_name(&self) -> Option<&str> { self.section_name.as_deref() }
+    fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
+    fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
+    fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
 }
 
 impl ParentRefAccess for TCPRouteParentRefs {
     fn ref_name(&self) -> &str { &self.name }
     fn ref_section_name(&self) -> Option<&str> { self.section_name.as_deref() }
+    fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
+    fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
+    fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
 }
 
 impl ParentRefAccess for TLSRouteParentRefs {
     fn ref_name(&self) -> &str { &self.name }
     fn ref_section_name(&self) -> Option<&str> { self.section_name.as_deref() }
+    fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
+    fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
+    fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
 }
 
 impl ParentRefAccess for UDPRouteParentRefs {
     fn ref_name(&self) -> &str { &self.name }
     fn ref_section_name(&self) -> Option<&str> { self.section_name.as_deref() }
+    fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
+    fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
+    fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
 }
 
 fn extract_parent_refs<T: ParentRefAccess>(

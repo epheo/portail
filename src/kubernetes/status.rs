@@ -116,17 +116,14 @@ pub async fn update_gateway_status(
         })
         .collect();
 
-    // Build status.addresses from listener ports
-    let mut addresses: Vec<serde_json::Value> = Vec::new();
-    let mut seen_ports = std::collections::HashSet::new();
-    for listener in &gateway.spec.listeners {
-        if seen_ports.insert(listener.port) {
-            addresses.push(serde_json::json!({
-                "type": "IPAddress",
-                "value": "0.0.0.0",
-            }));
-        }
-    }
+    // Build status.addresses — use NODE_IP or POD_IP from Downward API if available
+    let gateway_ip = std::env::var("NODE_IP")
+        .or_else(|_| std::env::var("POD_IP"))
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addresses = vec![serde_json::json!({
+        "type": "IPAddress",
+        "value": gateway_ip,
+    })];
 
     let status = serde_json::json!({
         "status": {
@@ -194,6 +191,7 @@ pub async fn update_route_status<K>(
     message: &str,
     refs_resolved: bool,
     refs_message: &str,
+    programmed: bool,
     generation: Option<i64>,
 )
 where
@@ -238,6 +236,14 @@ where
                             "status": if refs_resolved { "True" } else { "False" },
                             "reason": if refs_resolved { "ResolvedRefs" } else { "BackendNotFound" },
                             "message": refs_message,
+                            "lastTransitionTime": now,
+                            "observedGeneration": generation,
+                        },
+                        {
+                            "type": "Programmed",
+                            "status": if programmed { "True" } else { "False" },
+                            "reason": if programmed { "Programmed" } else { "Invalid" },
+                            "message": if programmed { "Route programmed into data plane" } else { "Route not yet programmed" },
                             "lastTransitionTime": now,
                             "observedGeneration": generation,
                         },

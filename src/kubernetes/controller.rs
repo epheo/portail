@@ -229,6 +229,26 @@ async fn reconcile(
 
     status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
 
+    // Explicitly reject other GatewayClasses with the same controllerName
+    if let Ok(all_gcs) = gc_api.list(&ListParams::default()).await {
+        for other_gc in &all_gcs.items {
+            if other_gc.spec.controller_name == ctx.controller_name
+                && other_gc.name_any() != gc.name_any()
+            {
+                status::update_gateway_class_status(
+                    &ctx.client,
+                    other_gc,
+                    false,
+                    &format!(
+                        "Another GatewayClass '{}' is already accepted by this controller",
+                        gc.name_any()
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
     // Fetch all routes across all namespaces
     let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
     let tcp_routes_api: Api<TCPRoute> = Api::all(ctx.client.clone());
@@ -276,6 +296,14 @@ async fn reconcile(
         })
         .unwrap_or_default();
 
+    // Fetch ReferenceGrants for cross-namespace authorization (needed for cert refs too)
+    let grants_api: Api<ReferenceGrant> = Api::all(ctx.client.clone());
+    let reference_grants = grants_api
+        .list(&ListParams::default())
+        .await
+        .map(|list| list.items)
+        .unwrap_or_default();
+
     // Fetch TLS certificate data from Kubernetes Secrets
     let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
     for listener in &gateway.spec.listeners {
@@ -283,6 +311,34 @@ async fn reconcile(
             if let Some(cert_refs) = &tls.certificate_refs {
                 for cert_ref in cert_refs {
                     let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&gw_ns);
+
+                    // Cross-namespace cert ref requires a ReferenceGrant
+                    if secret_ns != gw_ns {
+                        let grant_allows = reference_grants.iter().any(|grant| {
+                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
+                            if grant_ns != secret_ns {
+                                return false;
+                            }
+                            let from_ok = grant.spec.from.iter().any(|f| {
+                                f.group == "gateway.networking.k8s.io"
+                                    && f.kind == "Gateway"
+                                    && f.namespace == gw_ns
+                            });
+                            let to_ok = grant.spec.to.iter().any(|t| {
+                                t.group == "" && t.kind == "Secret"
+                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
+                            });
+                            from_ok && to_ok
+                        });
+                        if !grant_allows {
+                            warn!(
+                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                                secret_ns, cert_ref.name
+                            );
+                            continue;
+                        }
+                    }
+
                     let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), secret_ns);
                     match secret_api.get(&cert_ref.name).await {
                         Ok(secret) => {
@@ -304,14 +360,6 @@ async fn reconcile(
             }
         }
     }
-
-    // Fetch ReferenceGrants for cross-namespace authorization
-    let grants_api: Api<ReferenceGrant> = Api::all(ctx.client.clone());
-    let reference_grants = grants_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
 
     // Fetch Services for backend existence validation
     let services_api: Api<Service> = Api::all(ctx.client.clone());
@@ -412,7 +460,7 @@ async fn reconcile(
         .await
         .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
 
-    match route_table {
+    let route_table_ok = match route_table {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
             info!(
@@ -432,6 +480,7 @@ async fn reconcile(
                 &listener_route_counts,
             )
             .await;
+            true
         }
         Err(e) => {
             error!(
@@ -446,11 +495,14 @@ async fn reconcile(
                 &listener_route_counts,
             )
             .await;
+            false
         }
-    }
+    };
 
     // Update per-route status
+    let programmed = route_table_ok;
     for ra in &result.route_status {
+        let route_programmed = ra.accepted && programmed;
         match ra.kind {
             "HTTPRoute" => {
                 status::update_route_status::<HTTPRoute>(
@@ -465,6 +517,7 @@ async fn reconcile(
                     &ra.message,
                     ra.refs_resolved,
                     &ra.refs_message,
+                    route_programmed,
                     ra.generation,
                 )
                 .await;
@@ -482,6 +535,7 @@ async fn reconcile(
                     &ra.message,
                     ra.refs_resolved,
                     &ra.refs_message,
+                    route_programmed,
                     ra.generation,
                 )
                 .await;
@@ -499,6 +553,7 @@ async fn reconcile(
                     &ra.message,
                     ra.refs_resolved,
                     &ra.refs_message,
+                    route_programmed,
                     ra.generation,
                 )
                 .await;
@@ -516,6 +571,7 @@ async fn reconcile(
                     &ra.message,
                     ra.refs_resolved,
                     &ra.refs_message,
+                    route_programmed,
                     ra.generation,
                 )
                 .await;
