@@ -58,12 +58,26 @@ pub async fn update_gateway_status(
         },
     ];
 
+    // Detect listener conflicts: same port, different protocols
+    let mut port_protocols: HashMap<i32, String> = HashMap::new();
+    let mut conflicted_ports: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for l in &gateway.spec.listeners {
+        match port_protocols.get(&l.port) {
+            Some(existing_proto) if *existing_proto != l.protocol => {
+                conflicted_ports.insert(l.port);
+            }
+            None => { port_protocols.insert(l.port, l.protocol.clone()); }
+            _ => {}
+        }
+    }
+
     let listeners: Vec<serde_json::Value> = gateway
         .spec
         .listeners
         .iter()
         .map(|l| {
             let attached = listener_route_counts.get(&l.name).copied().unwrap_or(0);
+            let is_conflicted = conflicted_ports.contains(&l.port);
             serde_json::json!({
                 "name": l.name,
                 "attachedRoutes": attached,
@@ -71,17 +85,29 @@ pub async fn update_gateway_status(
                 "conditions": [
                     {
                         "type": "Accepted",
-                        "status": "True",
-                        "reason": "Accepted",
-                        "message": "Listener accepted",
+                        "status": if is_conflicted { "False" } else { "True" },
+                        "reason": if is_conflicted { "PortConflict" } else { "Accepted" },
+                        "message": if is_conflicted { "Listener port conflicts with another listener using a different protocol" } else { "Listener accepted" },
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
                     {
                         "type": "Programmed",
-                        "status": if programmed { "True" } else { "False" },
-                        "reason": if programmed { "Programmed" } else { "Invalid" },
-                        "message": message,
+                        "status": if programmed && !is_conflicted { "True" } else { "False" },
+                        "reason": if programmed && !is_conflicted { "Programmed" } else { "Invalid" },
+                        "message": if is_conflicted { "Listener not programmed due to port conflict" } else { message },
+                        "lastTransitionTime": now,
+                        "observedGeneration": generation,
+                    },
+                    {
+                        "type": "Conflicted",
+                        "status": if is_conflicted { "True" } else { "False" },
+                        "reason": if is_conflicted { "ProtocolConflict" } else { "NoConflicts" },
+                        "message": if is_conflicted {
+                            "Listener port shared with another listener using different protocol"
+                        } else {
+                            "No conflicts detected"
+                        },
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
@@ -90,10 +116,23 @@ pub async fn update_gateway_status(
         })
         .collect();
 
+    // Build status.addresses from listener ports
+    let mut addresses: Vec<serde_json::Value> = Vec::new();
+    let mut seen_ports = std::collections::HashSet::new();
+    for listener in &gateway.spec.listeners {
+        if seen_ports.insert(listener.port) {
+            addresses.push(serde_json::json!({
+                "type": "IPAddress",
+                "value": "0.0.0.0",
+            }));
+        }
+    }
+
     let status = serde_json::json!({
         "status": {
             "conditions": conditions,
             "listeners": listeners,
+            "addresses": addresses,
         }
     });
 

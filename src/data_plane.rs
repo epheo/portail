@@ -3,10 +3,14 @@
 //! Each worker is a Tokio task sharing the runtime's thread pool. eBPF programs
 //! attach to listener sockets the same way for both TCP and UDP (SO_REUSEPORT
 //! uses the same dest-port offset in the transport header).
+//!
+//! On shutdown, the data plane stops accepting new connections and waits up to
+//! `DRAIN_TIMEOUT` for in-flight connections to finish.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, UdpSocket};
@@ -17,7 +21,7 @@ use anyhow::Result;
 
 use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
-use crate::logging::info;
+use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 use crate::tls;
 use crate::worker;
@@ -48,7 +52,11 @@ pub struct DataPlane {
     health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
+    active_connections: Arc<AtomicUsize>,
 }
+
+/// Maximum time to wait for in-flight connections on shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DataPlane {
     /// Create listeners for all (worker, listener) combinations.
@@ -141,6 +149,7 @@ impl DataPlane {
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -200,16 +209,42 @@ impl DataPlane {
         info!("Data plane started: {} TCP + {} UDP worker tasks", tcp_count, udp_count);
     }
 
-    /// Signal shutdown and wait for all workers to finish.
+    /// Signal shutdown and wait for in-flight connections to drain (up to 30s).
     pub async fn shutdown(self) {
-        info!("Data plane shutting down");
+        info!("Data plane shutting down — draining in-flight connections");
         self.shutdown.cancel();
+
+        // Wait for active connections to drain, with timeout
+        let active = self.active_connections.clone();
+        let drain_result = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            loop {
+                let count = active.load(Ordering::Acquire);
+                if count == 0 {
+                    break;
+                }
+                info!("Waiting for {} in-flight connection(s) to drain", count);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }).await;
+
+        match drain_result {
+            Ok(()) => info!("All connections drained"),
+            Err(_) => {
+                let remaining = active.load(Ordering::Acquire);
+                warn!("Drain timeout after {:?}: {} connections still active", DRAIN_TIMEOUT, remaining);
+            }
+        }
 
         for handle in self.task_handles {
             let _ = handle.await;
         }
 
         info!("Data plane shutdown complete");
+    }
+
+    /// Get a reference to the shared health registry.
+    pub fn health(&self) -> &Arc<HealthRegistry> {
+        &self.health
     }
 }
 

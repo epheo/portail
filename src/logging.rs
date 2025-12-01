@@ -1,16 +1,16 @@
 //! Centralized logging module
 //!
-//! error! and warn! are always active. debug!/trace!/info! become no-ops
-//! in release builds.
+//! error!, warn!, and info! are always active.
+//! debug!/trace! become no-ops in release builds.
 
 use anyhow::Result;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-pub use tracing::{error, warn};
+pub use tracing::{error, warn, info};
 
 #[cfg(debug_assertions)]
-pub use tracing::{debug, info};
+pub use tracing::debug;
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
 pub use tracing::trace;
@@ -23,20 +23,12 @@ macro_rules! logging_debug {
 
 #[cfg(not(debug_assertions))]
 #[macro_export]
-macro_rules! logging_info {
-    ($($arg:tt)*) => {()};
-}
-
-#[cfg(not(debug_assertions))]
-#[macro_export]
 macro_rules! logging_trace {
     ($($arg:tt)*) => {()};
 }
 
 #[cfg(not(debug_assertions))]
 pub use logging_debug as debug;
-#[cfg(not(debug_assertions))]
-pub use logging_info as info;
 #[cfg(not(debug_assertions))]
 #[allow(unused_imports)]
 pub use logging_trace as trace;

@@ -73,6 +73,12 @@ impl HealthRegistry {
         }
     }
 
+    /// Remove all tracked backend health state.
+    /// Called on config reload to prevent stale entries from blocking new backends.
+    pub fn clear(&self) {
+        self.backends.clear();
+    }
+
     /// Returns `true` if the backend is considered healthy.
     /// Backends that have never failed are implicitly healthy (lazy registration).
     #[inline]

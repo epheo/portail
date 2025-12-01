@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use anyhow::Result;
 
 use crate::config::PortailConfig;
+use crate::health::HealthRegistry;
 use crate::logging::{info, warn, error};
 use crate::routing::RouteTable;
 
@@ -23,6 +24,7 @@ use crate::routing::RouteTable;
 pub async fn watch_config(
     config_path: PathBuf,
     routes: Arc<ArcSwap<RouteTable>>,
+    health: Arc<HealthRegistry>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     info!("Config watcher started — send SIGHUP to reload routes from {:?}", config_path);
@@ -45,7 +47,10 @@ pub async fn watch_config(
             _ = sighup.recv() => {
                 info!("SIGHUP received — reloading configuration from {:?}", config_path);
                 match reload_routes(&config_path, &routes) {
-                    Ok(()) => info!("Route configuration reloaded successfully"),
+                    Ok(()) => {
+                        health.clear();
+                        info!("Route configuration reloaded successfully");
+                    }
                     Err(e) => error!("Config reload failed (keeping existing routes): {}", e),
                 }
             }

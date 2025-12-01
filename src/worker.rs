@@ -133,9 +133,15 @@ pub async fn run_worker(
                                 header_buf: Vec::with_capacity(1024),
                             };
                             tokio::spawn(async move {
+                                let start = std::time::Instant::now();
                                 let conn = Connection::Plain { inner: tcp_stream };
-                                if let Err(_e) = handle_connection(conn, peer, state).await {
-                                    debug!("Connection from {} closed: {}", peer, _e);
+                                let result = handle_connection(conn, peer, state).await;
+                                let elapsed = start.elapsed();
+                                match result {
+                                    Ok(()) => info!("{} port={} duration={:?}", peer, server_port, elapsed),
+                                    Err(_e) => {
+                                        debug!("Connection from {} closed: {}", peer, _e);
+                                    }
                                 }
                             });
                         }
@@ -151,9 +157,10 @@ pub async fn run_worker(
 
 async fn handle_connection(
     mut client: Connection,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
+    let conn_start = std::time::Instant::now();
     client.set_nodelay(true)?;
 
     let mut buf = vec![0u8; 65536];
@@ -185,10 +192,21 @@ async fn handle_connection(
             ProcessingDecision::TcpForward { backend_addr } => {
                 return handle_tcp_connection(client, backend_addr, &buf[..n], Arc::clone(&state.health)).await;
             }
-            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout } => {
-                let ka = handle_http_forward(
+            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout } => {
+                let forward_fut = handle_http_forward(
                     &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, &mut state,
-                ).await?;
+                );
+                let ka = if let Some(req_timeout) = request_timeout {
+                    match tokio::time::timeout(req_timeout, forward_fut).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            let _ = send_error_response(&mut client, 504).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    forward_fut.await?
+                };
                 if !ka {
                     return Ok(());
                 }
@@ -324,7 +342,7 @@ async fn handle_http_forward(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt } => {
+            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _ } => {
                 backend_addr = addr;
                 keepalive = ka;
                 filter_data = filters;

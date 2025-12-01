@@ -77,22 +77,35 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_nanos((number * suffix.as_nanos() as f64) as u64))
 }
 
-/// Format Duration to human-readable string
+/// Format Duration to human-readable string, preserving sub-unit remainders.
+/// e.g. 90s → "1m30s", 3661s → "1h1m1s"
 pub(crate) fn format_duration(duration: &Duration) -> String {
     let total_secs = duration.as_secs();
     let nanos = duration.subsec_nanos();
 
-    if total_secs >= 3600 {
-        format!("{}h", total_secs / 3600)
-    } else if total_secs >= 60 {
-        format!("{}m", total_secs / 60)
-    } else if total_secs > 0 {
-        format!("{}s", total_secs)
-    } else if nanos >= 1_000_000 {
-        format!("{}ms", nanos / 1_000_000)
-    } else if nanos >= 1_000 {
-        format!("{}us", nanos / 1_000)
-    } else {
-        format!("{}ns", nanos)
+    if total_secs == 0 {
+        if nanos >= 1_000_000 {
+            return format!("{}ms", nanos / 1_000_000);
+        } else if nanos >= 1_000 {
+            return format!("{}us", nanos / 1_000);
+        } else {
+            return format!("{}ns", nanos);
+        }
     }
+
+    let mut result = String::new();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        result.push_str(&format!("{}h", hours));
+    }
+    if minutes > 0 {
+        result.push_str(&format!("{}m", minutes));
+    }
+    if secs > 0 || result.is_empty() {
+        result.push_str(&format!("{}s", secs));
+    }
+    result
 }

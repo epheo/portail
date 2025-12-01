@@ -138,9 +138,10 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
     if !args.kubernetes {
         if let Some(config_path) = args.config.clone() {
             let reload_routes = routes;
+            let reload_health = data_plane.health().clone();
             let reload_shutdown = shutdown_token.clone();
             tokio::spawn(async move {
-                config_watcher::watch_config(config_path, reload_routes, reload_shutdown).await;
+                config_watcher::watch_config(config_path, reload_routes, reload_health, reload_shutdown).await;
             });
         }
     }

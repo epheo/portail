@@ -25,20 +25,20 @@ use crate::logging::{info, warn, error, debug};
 
 /// Sync-safe Stream wrapper over an mpsc receiver.
 /// Required because `reconcile_all_on` needs `Send + Sync`.
-struct ReconcileStream(tokio::sync::mpsc::Receiver<()>);
+struct ReconcileStream(std::sync::Mutex<tokio::sync::mpsc::Receiver<()>>);
 
 impl futures::Stream for ReconcileStream {
     type Item = ();
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        match self.0.lock() {
+            Ok(mut rx) => rx.poll_recv(cx),
+            Err(_) => std::task::Poll::Ready(None),
+        }
     }
 }
-
-// Safety: Receiver is Send, and we only access it through Pin<&mut Self>
-unsafe impl Sync for ReconcileStream {}
 
 use super::reconciler::reconcile_to_config;
 use super::status;
@@ -114,7 +114,7 @@ pub async fn run_controller(
         });
     }
 
-    let reconcile_stream = ReconcileStream(reconcile_rx);
+    let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
 
     let controller = Controller::new(gateways.clone(), watcher::Config::default())
         .watches(http_routes, watcher::Config::default(), |route| {
@@ -391,7 +391,7 @@ async fn reconcile(
         }
     }
 
-    let config = &result.config;
+    let _config = &result.config;
 
     // Compute per-listener attached route counts from accepted routes
     let mut listener_route_counts: HashMap<String, i32> = HashMap::new();
