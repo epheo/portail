@@ -100,6 +100,14 @@ pub async fn update_gateway_status(
                         "observedGeneration": generation,
                     },
                     {
+                        "type": "ResolvedRefs",
+                        "status": "True",
+                        "reason": "ResolvedRefs",
+                        "message": "All references resolved",
+                        "lastTransitionTime": now,
+                        "observedGeneration": generation,
+                    },
+                    {
                         "type": "Conflicted",
                         "status": if is_conflicted { "True" } else { "False" },
                         "reason": if is_conflicted { "ProtocolConflict" } else { "NoConflicts" },
@@ -126,6 +134,12 @@ pub async fn update_gateway_status(
     })];
 
     let status = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "Gateway",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+        },
         "status": {
             "conditions": conditions,
             "listeners": listeners,
@@ -163,9 +177,33 @@ pub async fn update_gateway_class_status(
         observed_generation: generation,
     }];
 
+    // Declare supported features so the conformance suite can auto-detect them
+    let supported_features = vec![
+        serde_json::json!({"name": "Gateway"}),
+        serde_json::json!({"name": "GatewayPort8080"}),
+        serde_json::json!({"name": "HTTPRoute"}),
+        serde_json::json!({"name": "HTTPRouteDestinationPortMatching"}),
+        serde_json::json!({"name": "HTTPRouteHostRewrite"}),
+        serde_json::json!({"name": "HTTPRouteMethodMatching"}),
+        serde_json::json!({"name": "HTTPRoutePathRedirect"}),
+        serde_json::json!({"name": "HTTPRoutePathRewrite"}),
+        serde_json::json!({"name": "HTTPRoutePortRedirect"}),
+        serde_json::json!({"name": "HTTPRouteQueryParamMatching"}),
+        serde_json::json!({"name": "HTTPRouteRequestHeaderModification"}),
+        serde_json::json!({"name": "HTTPRouteResponseHeaderModification"}),
+        serde_json::json!({"name": "HTTPRouteSchemeRedirect"}),
+        serde_json::json!({"name": "ReferenceGrant"}),
+    ];
+
     let status = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayClass",
+        "metadata": {
+            "name": name,
+        },
         "status": {
             "conditions": conditions,
+            "supportedFeatures": supported_features,
         }
     });
 
@@ -216,7 +254,17 @@ where
         parent_ref["sectionName"] = serde_json::json!(section);
     }
 
+    // Derive apiVersion and kind from the concrete K type
+    let api_version = <K as kube::Resource>::api_version(&Default::default()).to_string();
+    let kind = <K as kube::Resource>::kind(&Default::default()).to_string();
+
     let status = serde_json::json!({
+        "apiVersion": api_version,
+        "kind": kind,
+        "metadata": {
+            "name": route_name,
+            "namespace": route_namespace,
+        },
         "status": {
             "parents": [
                 {

@@ -67,10 +67,51 @@ impl From<kube::Error> for ReconcileError {
     }
 }
 
+#[derive(Clone)]
 struct ControllerCtx {
     client: Client,
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
+}
+
+/// Reconcile a GatewayClass: accept ours, reject others with same controllerName
+async fn reconcile_gateway_class(
+    gc: Arc<GatewayClass>,
+    ctx: Arc<ControllerCtx>,
+) -> Result<Action, ReconcileError> {
+    let gc_name = gc.name_any();
+    debug!("Reconciling GatewayClass {}", gc_name);
+
+    if gc.spec.controller_name != ctx.controller_name {
+        debug!("GatewayClass {} has controller '{}', not ours", gc_name, gc.spec.controller_name);
+        return Ok(Action::await_change());
+    }
+
+    // Accept this GatewayClass
+    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
+
+    // Reject other GatewayClasses with same controllerName
+    let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+    if let Ok(all_gcs) = gc_api.list(&ListParams::default()).await {
+        for other_gc in &all_gcs.items {
+            if other_gc.spec.controller_name == ctx.controller_name
+                && other_gc.name_any() != gc_name
+            {
+                status::update_gateway_class_status(
+                    &ctx.client,
+                    other_gc,
+                    false,
+                    &format!(
+                        "Another GatewayClass '{}' is already accepted by this controller",
+                        gc_name
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    Ok(Action::await_change())
 }
 
 pub async fn run_controller(
@@ -81,6 +122,7 @@ pub async fn run_controller(
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
 
+    let gateway_classes: Api<GatewayClass> = Api::all(client.clone());
     let gateways: Api<Gateway> = Api::all(client.clone());
     let http_routes: Api<HTTPRoute> = Api::all(client.clone());
     let tcp_routes: Api<TCPRoute> = Api::all(client.clone());
@@ -116,18 +158,37 @@ pub async fn run_controller(
 
     let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
 
+    // Spawn GatewayClass controller so we accept GatewayClasses proactively
+    let gc_ctx = ctx.clone();
+    let gc_api = gateway_classes.clone();
+    tokio::spawn(async move {
+        let gc_controller = Controller::new(gc_api, watcher::Config::default())
+            .shutdown_on_signal()
+            .run(reconcile_gateway_class, error_policy_gc, gc_ctx);
+        gc_controller.for_each(|result| async move {
+            match result {
+                Ok(_) => {}
+                Err(e) => warn!("GatewayClass reconciliation error: {}", e),
+            }
+        }).await;
+    });
+
     let controller = Controller::new(gateways.clone(), watcher::Config::default())
         .watches(http_routes, watcher::Config::default(), |route| {
-            map_route_to_gateways(&route.spec.parent_refs)
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            map_route_to_gateways(&route.spec.parent_refs, route_ns)
         })
         .watches(tcp_routes, watcher::Config::default(), |route| {
-            map_route_to_gateways(&route.spec.parent_refs)
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            map_route_to_gateways(&route.spec.parent_refs, route_ns)
         })
         .watches(tls_routes, watcher::Config::default(), |route| {
-            map_route_to_gateways(&route.spec.parent_refs)
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            map_route_to_gateways(&route.spec.parent_refs, route_ns)
         })
         .watches(udp_routes, watcher::Config::default(), |route| {
-            map_route_to_gateways(&route.spec.parent_refs)
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            map_route_to_gateways(&route.spec.parent_refs, route_ns)
         })
         .reconcile_all_on(reconcile_stream)
         .shutdown_on_signal()
@@ -155,6 +216,7 @@ pub async fn run_controller(
 /// Map a route's parentRefs to Gateway ObjectRefs to trigger reconciliation.
 fn map_route_to_gateways<T: ParentRefLike>(
     parent_refs: &Option<Vec<T>>,
+    route_namespace: &str,
 ) -> Vec<ObjectRef<Gateway>> {
     parent_refs
         .as_ref()
@@ -162,7 +224,7 @@ fn map_route_to_gateways<T: ParentRefLike>(
             refs.iter()
                 .filter(|pr| pr.kind().map_or(true, |k| k == "Gateway"))
                 .map(|pr| {
-                    let ns = pr.namespace().unwrap_or("default");
+                    let ns = pr.namespace().unwrap_or(route_namespace);
                     ObjectRef::new(pr.name()).within(ns)
                 })
                 .collect()
@@ -448,8 +510,16 @@ async fn reconcile(
     }
     for ra in &result.route_status {
         if ra.accepted {
-            if let Some(ref section) = ra.section_name {
-                *listener_route_counts.entry(section.clone()).or_insert(0) += 1;
+            match &ra.section_name {
+                Some(section) => {
+                    *listener_route_counts.entry(section.clone()).or_insert(0) += 1;
+                }
+                None => {
+                    // No sectionName means the route attaches to ALL listeners
+                    for count in listener_route_counts.values_mut() {
+                        *count += 1;
+                    }
+                }
             }
         }
     }
@@ -589,5 +659,14 @@ fn error_policy(
     _ctx: Arc<ControllerCtx>,
 ) -> Action {
     warn!("Controller reconciliation error, requeueing");
+    Action::requeue(std::time::Duration::from_secs(5))
+}
+
+fn error_policy_gc(
+    _obj: Arc<GatewayClass>,
+    _error: &ReconcileError,
+    _ctx: Arc<ControllerCtx>,
+) -> Action {
+    warn!("GatewayClass reconciliation error, requeueing");
     Action::requeue(std::time::Duration::from_secs(5))
 }

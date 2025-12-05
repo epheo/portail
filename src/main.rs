@@ -27,6 +27,9 @@ use config::PortailConfig;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<()> {
+    // Install rustls CryptoProvider early — needed by kube client in K8s mode
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args = Args::parse();
 
     if let Err(error) = args.validate() {

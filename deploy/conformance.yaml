@@ -1,0 +1,90 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portail-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portail
+  namespace: portail-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portail-controller
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gatewayclasses", "gateways", "httproutes", "grpcroutes", "tcproutes", "tlsroutes", "udproutes", "referencegrants"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "grpcroutes/status", "tcproutes/status", "tlsroutes/status", "udproutes/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: [""]
+  resources: ["services", "secrets", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portail-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: portail-controller
+subjects:
+- kind: ServiceAccount
+  name: portail
+  namespace: portail-system
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: portail
+spec:
+  controllerName: portail.epheo.eu/gateway-controller
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: portail
+  namespace: portail-system
+spec:
+  selector:
+    matchLabels:
+      app: portail
+  template:
+    metadata:
+      labels:
+        app: portail
+    spec:
+      serviceAccountName: portail
+      imagePullSecrets:
+      - name: registry-creds
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: portail
+        image: registry.desku.be/portail:conformance
+        imagePullPolicy: Always
+        args: ["--kubernetes"]
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "SYS_ADMIN", "NET_RAW", "NET_BIND_SERVICE"]
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"

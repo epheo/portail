@@ -1,12 +1,11 @@
-FROM rust:latest AS builder
-WORKDIR /build
-COPY . .
-RUN cargo build --release
+# Build portail in your dev environment first:
+#   cargo build --release
+#
+# Then build the container image:
+#   podman build -t registry.desku.be/portail:conformance -f Containerfile .
 
-FROM alpine:latest
-RUN apk add --no-cache libgcc && \
-    adduser -D -u 1000 portail
-COPY --from=builder /build/target/release/portail /usr/local/bin/portail
-USER portail
+FROM registry.fedoraproject.org/fedora-minimal:43
+RUN microdnf install -y libgcc && microdnf clean all
+COPY target/release/portail /usr/local/bin/portail
 ENTRYPOINT ["/usr/local/bin/portail"]
 CMD ["--kubernetes"]
