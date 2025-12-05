@@ -388,7 +388,7 @@ pub enum HttpFilter {
         scheme: Option<String>,
         hostname: Option<String>,
         port: Option<u16>,
-        path: Option<String>,
+        path: Option<URLRewritePath>,
         status_code: u16,
     },
     URLRewrite {

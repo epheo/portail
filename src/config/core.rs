@@ -100,13 +100,19 @@ impl PortailConfig {
 
                     let mut backends = Vec::new();
                     for backend_ref in &rule.backend_refs {
-                        let backend = routing::Backend::with_weight(
+                        match routing::Backend::with_weight(
                             backend_ref.name.clone(),
                             backend_ref.port,
                             backend_ref.weight,
-                        )?;
-                        backends.push(backend);
-                        tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
+                        ) {
+                            Ok(backend) => {
+                                backends.push(backend);
+                                tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
+                            }
+                            Err(e) => {
+                                tracing::warn!("        Skipping backend {}:{} - DNS resolution failed: {}", backend_ref.name, backend_ref.port, e);
+                            }
+                        }
                     }
 
                     let filters = convert_filters(&rule.filters)?;
@@ -158,8 +164,12 @@ impl PortailConfig {
         for tls_route in &self.tls_routes {
             for rule in &tls_route.rules {
                 let backends: Vec<routing::Backend> = rule.backend_refs.iter()
-                    .map(|br| routing::Backend::new(br.name.clone(), br.port))
-                    .collect::<Result<_>>()?;
+                    .filter_map(|br| {
+                        routing::Backend::new(br.name.clone(), br.port)
+                            .map_err(|e| tracing::warn!("Skipping TLS backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
+                            .ok()
+                    })
+                    .collect();
 
                 for hostname in &tls_route.hostnames {
                     route_table.add_tls_route(hostname, backends.clone());
@@ -214,8 +224,12 @@ impl PortailConfig {
 
                         for backend_refs in route.backend_refs_per_rule() {
                             let backends: Vec<routing::Backend> = backend_refs.iter()
-                                .map(|br| routing::Backend::new(br.name.clone(), br.port))
-                                .collect::<Result<_>>()?;
+                                .filter_map(|br| {
+                                    routing::Backend::new(br.name.clone(), br.port)
+                                        .map_err(|e| tracing::warn!("Skipping L4 backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
+                                        .ok()
+                                })
+                                .collect();
 
                             match protocol {
                                 Protocol::TCP | Protocol::TLS | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
@@ -306,7 +320,7 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                 }
             }
             HttpRouteFilter::RequestRedirect { config } => {
-                let path = config.path.as_ref().map(rewrite_path_to_string);
+                let path = config.path.as_ref().map(crate::routing::URLRewritePath::from);
                 Self::RequestRedirect {
                     scheme: config.scheme.clone(),
                     hostname: config.hostname.clone(),

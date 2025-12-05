@@ -25,12 +25,52 @@ fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
     }
 }
 
+/// Per-listener validation status computed during reconciliation.
+#[derive(Clone, Debug)]
+pub struct ListenerStatus {
+    pub accepted: bool,
+    pub accepted_reason: String,
+    pub accepted_message: String,
+    pub programmed: bool,
+    pub programmed_reason: String,
+    pub programmed_message: String,
+    pub resolved_refs: bool,
+    pub resolved_refs_reason: String,
+    pub resolved_refs_message: String,
+    pub conflicted: bool,
+    pub conflicted_reason: String,
+    pub conflicted_message: String,
+    /// The supportedKinds list for this listener (computed from allowedRoutes.kinds)
+    pub supported_kinds: Vec<serde_json::Value>,
+}
+
+impl Default for ListenerStatus {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            accepted_reason: "Accepted".into(),
+            accepted_message: "Listener accepted".into(),
+            programmed: true,
+            programmed_reason: "Programmed".into(),
+            programmed_message: "Programmed".into(),
+            resolved_refs: true,
+            resolved_refs_reason: "ResolvedRefs".into(),
+            resolved_refs_message: "All references resolved".into(),
+            conflicted: false,
+            conflicted_reason: "NoConflicts".into(),
+            conflicted_message: "No conflicts detected".into(),
+            supported_kinds: vec![],
+        }
+    }
+}
+
 pub async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
     programmed: bool,
     message: &str,
     listener_route_counts: &HashMap<String, i32>,
+    listener_statuses: &HashMap<String, ListenerStatus>,
 ) {
     let name = gateway.name_any();
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -58,64 +98,53 @@ pub async fn update_gateway_status(
         },
     ];
 
-    // Detect listener conflicts: same port, different protocols
-    let mut port_protocols: HashMap<i32, String> = HashMap::new();
-    let mut conflicted_ports: std::collections::HashSet<i32> = std::collections::HashSet::new();
-    for l in &gateway.spec.listeners {
-        match port_protocols.get(&l.port) {
-            Some(existing_proto) if *existing_proto != l.protocol => {
-                conflicted_ports.insert(l.port);
-            }
-            None => { port_protocols.insert(l.port, l.protocol.clone()); }
-            _ => {}
-        }
-    }
-
     let listeners: Vec<serde_json::Value> = gateway
         .spec
         .listeners
         .iter()
         .map(|l| {
             let attached = listener_route_counts.get(&l.name).copied().unwrap_or(0);
-            let is_conflicted = conflicted_ports.contains(&l.port);
+            let ls = listener_statuses.get(&l.name).cloned().unwrap_or_default();
+
             serde_json::json!({
                 "name": l.name,
                 "attachedRoutes": attached,
-                "supportedKinds": supported_kinds_for_protocol(&l.protocol),
+                "supportedKinds": if ls.supported_kinds.is_empty() && ls.resolved_refs {
+                    // Default: use protocol-based kinds if not overridden
+                    supported_kinds_for_protocol(&l.protocol)
+                } else {
+                    ls.supported_kinds.clone()
+                },
                 "conditions": [
                     {
                         "type": "Accepted",
-                        "status": if is_conflicted { "False" } else { "True" },
-                        "reason": if is_conflicted { "PortConflict" } else { "Accepted" },
-                        "message": if is_conflicted { "Listener port conflicts with another listener using a different protocol" } else { "Listener accepted" },
+                        "status": if ls.accepted { "True" } else { "False" },
+                        "reason": ls.accepted_reason,
+                        "message": ls.accepted_message,
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
                     {
                         "type": "Programmed",
-                        "status": if programmed && !is_conflicted { "True" } else { "False" },
-                        "reason": if programmed && !is_conflicted { "Programmed" } else { "Invalid" },
-                        "message": if is_conflicted { "Listener not programmed due to port conflict" } else { message },
+                        "status": if ls.programmed { "True" } else { "False" },
+                        "reason": ls.programmed_reason,
+                        "message": ls.programmed_message,
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
                     {
                         "type": "ResolvedRefs",
-                        "status": "True",
-                        "reason": "ResolvedRefs",
-                        "message": "All references resolved",
+                        "status": if ls.resolved_refs { "True" } else { "False" },
+                        "reason": ls.resolved_refs_reason,
+                        "message": ls.resolved_refs_message,
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
                     {
                         "type": "Conflicted",
-                        "status": if is_conflicted { "True" } else { "False" },
-                        "reason": if is_conflicted { "ProtocolConflict" } else { "NoConflicts" },
-                        "message": if is_conflicted {
-                            "Listener port shared with another listener using different protocol"
-                        } else {
-                            "No conflicts detected"
-                        },
+                        "status": if ls.conflicted { "True" } else { "False" },
+                        "reason": ls.conflicted_reason,
+                        "message": ls.conflicted_message,
                         "lastTransitionTime": now,
                         "observedGeneration": generation,
                     },
@@ -226,8 +255,10 @@ pub async fn update_route_status<K>(
     gateway_namespace: &str,
     section_name: Option<&str>,
     accepted: bool,
+    accepted_reason: &str,
     message: &str,
     refs_resolved: bool,
+    refs_reason: &str,
     refs_message: &str,
     programmed: bool,
     generation: Option<i64>,
@@ -274,7 +305,7 @@ where
                         {
                             "type": "Accepted",
                             "status": if accepted { "True" } else { "False" },
-                            "reason": if accepted { "Accepted" } else { "NotAllowedByListeners" },
+                            "reason": accepted_reason,
                             "message": message,
                             "lastTransitionTime": now,
                             "observedGeneration": generation,
@@ -282,7 +313,7 @@ where
                         {
                             "type": "ResolvedRefs",
                             "status": if refs_resolved { "True" } else { "False" },
-                            "reason": if refs_resolved { "ResolvedRefs" } else { "BackendNotFound" },
+                            "reason": refs_reason,
                             "message": refs_message,
                             "lastTransitionTime": now,
                             "observedGeneration": generation,

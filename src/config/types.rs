@@ -337,6 +337,20 @@ pub struct BackendRef {
     pub port: u16,
     #[serde(default = "default_backend_weight", skip_serializing_if = "is_default_weight")]
     pub weight: u32,
+    /// Original group from the gateway-api backendRef (empty string = core API group)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Original kind from the gateway-api backendRef (default "Service")
+    #[serde(default = "default_backend_kind", skip_serializing_if = "is_default_kind")]
+    pub kind: String,
+}
+
+fn default_backend_kind() -> String {
+    "Service".to_string()
+}
+
+fn is_default_kind(k: &String) -> bool {
+    k == "Service"
 }
 
 fn default_backend_weight() -> u32 {

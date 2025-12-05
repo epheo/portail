@@ -23,8 +23,10 @@ pub struct RouteAcceptance {
     pub namespace: String,
     pub kind: &'static str,
     pub accepted: bool,
+    pub accepted_reason: String,
     pub message: String,
     pub refs_resolved: bool,
+    pub refs_reason: String,
     pub refs_message: String,
     pub generation: Option<i64>,
     pub section_name: Option<String>,
@@ -217,6 +219,12 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
                 return false;
             }
         }
+        // If port is specified, it must match this listener's port
+        if let Some(port) = pr.ref_port() {
+            if port != listener.port as i32 {
+                return false;
+            }
+        }
         // Check hostname intersection (only for HTTP/HTTPS/TLS listeners)
         if !hostnames_intersect(listener.hostname.as_deref(), route_hostnames) {
             return false;
@@ -260,7 +268,7 @@ pub fn reconcile_to_config(
         |r| convert_http_route(r, gateway_name),
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |r| r.spec.hostnames.clone().unwrap_or_default(),
-        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
+        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
         &mut route_status,
     );
 
@@ -279,7 +287,7 @@ pub fn reconcile_to_config(
         |r| convert_tcp_route(r, gateway_name),
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |_r| vec![],  // TCPRoute has no hostname matching
-        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
+        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
         &mut route_status,
     );
 
@@ -298,7 +306,7 @@ pub fn reconcile_to_config(
         |r| convert_tls_route(r, gateway_name),
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |r| r.spec.hostnames.clone(),
-        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
+        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
         &mut route_status,
     );
 
@@ -317,7 +325,7 @@ pub fn reconcile_to_config(
         |r| convert_udp_route(r, gateway_name),
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |_r| vec![],  // UDPRoute has no hostname matching
-        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port))).collect(),
+        |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
         &mut route_status,
     );
 
@@ -350,7 +358,7 @@ fn collect_routes<R, P, C>(
     convert: impl Fn(&R) -> Result<C>,
     get_parent_section_names: impl Fn(&R) -> Vec<Option<String>>,
     get_hostnames: impl Fn(&R) -> Vec<String>,
-    get_backend_refs: impl Fn(&C) -> Vec<(&str, u16)>,
+    get_backend_refs: impl Fn(&C) -> Vec<(&str, u16, &str, &str)>,
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<C>
 where
@@ -388,8 +396,10 @@ where
                     namespace: route_ns.to_string(),
                     kind,
                     accepted: false,
-                    message: format!("Route not allowed by any listener policy (namespace/hostname/kind)"),
+                    accepted_reason: "NotAllowedByListeners".to_string(),
+                    message: "Route not allowed by any listener policy (namespace/hostname/kind)".to_string(),
                     refs_resolved: true,
+                    refs_reason: "ResolvedRefs".to_string(),
                     refs_message: "All references resolved".to_string(),
                     generation,
                     section_name: section_name.clone(),
@@ -402,9 +412,20 @@ where
             Ok(config) => {
                 let mut refs_resolved = true;
                 let mut refs_messages = Vec::new();
+                let mut refs_reason = "ResolvedRefs".to_string();
 
-                // Validate backend refs: check cross-namespace grants and service existence
-                for (backend_name, _port) in get_backend_refs(&config) {
+                // Validate backend refs: check group/kind, cross-namespace grants, and service existence
+                for (backend_name, _port, group, ref_kind) in get_backend_refs(&config) {
+                    // Check group/kind — must be core ("") group and "Service" kind (or defaults)
+                    if (group != "" && group != "core") || (ref_kind != "Service" && ref_kind != "") {
+                        refs_resolved = false;
+                        refs_reason = "InvalidKind".to_string();
+                        refs_messages.push(format!(
+                            "Unsupported backend ref group/kind: {}/{}", group, ref_kind
+                        ));
+                        continue;
+                    }
+
                     // backend_name is "{svc}.{ns}.svc"
                     if let Some((svc_name, svc_ns)) = parse_backend_dns_name(backend_name) {
                         // Cross-namespace check
@@ -414,6 +435,7 @@ where
                             "", "Service", &svc_ns, &svc_name,
                         ) {
                             refs_resolved = false;
+                            refs_reason = "RefNotPermitted".to_string();
                             refs_messages.push(format!(
                                 "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
                                 svc_name, svc_ns
@@ -423,6 +445,7 @@ where
                         // Service existence check
                         if !known_services.contains(&(svc_name.clone(), svc_ns.clone())) {
                             refs_resolved = false;
+                            refs_reason = "BackendNotFound".to_string();
                             refs_messages.push(format!(
                                 "Backend service {}.{} not found", svc_name, svc_ns
                             ));
@@ -442,8 +465,10 @@ where
                         namespace: route_ns.to_string(),
                         kind,
                         accepted: true,
+                        accepted_reason: "Accepted".to_string(),
                         message: "Accepted".to_string(),
                         refs_resolved,
+                        refs_reason: refs_reason.clone(),
                         refs_message: refs_message.clone(),
                         generation,
                         section_name: section_name.clone(),
@@ -458,8 +483,10 @@ where
                         namespace: route_ns.to_string(),
                         kind,
                         accepted: false,
+                        accepted_reason: "InvalidRoute".to_string(),
                         message: format!("Conversion failed: {}", e),
                         refs_resolved: false,
+                        refs_reason: "InvalidKind".to_string(),
                         refs_message: format!("Conversion failed: {}", e),
                         generation,
                         section_name: section_name.clone(),
@@ -567,6 +594,7 @@ trait ParentRefAccess {
     fn ref_group(&self) -> Option<&str>;
     fn ref_kind(&self) -> Option<&str>;
     fn ref_namespace(&self) -> Option<&str>;
+    fn ref_port(&self) -> Option<i32>;
 }
 
 impl ParentRefAccess for HTTPRouteParentRefs {
@@ -575,6 +603,7 @@ impl ParentRefAccess for HTTPRouteParentRefs {
     fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
     fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
     fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
+    fn ref_port(&self) -> Option<i32> { self.port }
 }
 
 impl ParentRefAccess for TCPRouteParentRefs {
@@ -583,6 +612,7 @@ impl ParentRefAccess for TCPRouteParentRefs {
     fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
     fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
     fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
+    fn ref_port(&self) -> Option<i32> { self.port }
 }
 
 impl ParentRefAccess for TLSRouteParentRefs {
@@ -591,6 +621,7 @@ impl ParentRefAccess for TLSRouteParentRefs {
     fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
     fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
     fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
+    fn ref_port(&self) -> Option<i32> { self.port }
 }
 
 impl ParentRefAccess for UDPRouteParentRefs {
@@ -599,6 +630,7 @@ impl ParentRefAccess for UDPRouteParentRefs {
     fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
     fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
     fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
+    fn ref_port(&self) -> Option<i32> { self.port }
 }
 
 fn extract_parent_refs<T: ParentRefAccess>(
@@ -939,6 +971,8 @@ fn convert_mirror_config(
             name: backend_dns_name(&rm.backend_ref.name, rm.backend_ref.namespace.as_deref(), ns),
             port: rm.backend_ref.port.unwrap_or(80) as u16,
             weight: 1,
+            group: rm.backend_ref.group.clone().unwrap_or_default(),
+            kind: rm.backend_ref.kind.clone().unwrap_or_else(|| "Service".to_string()),
         },
     }
 }
@@ -948,6 +982,8 @@ fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> Backend
         name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
         port: br.port.unwrap_or(80) as u16,
         weight: br.weight.unwrap_or(1) as u32,
+        group: br.group.clone().unwrap_or_default(),
+        kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
     }
 }
 
@@ -979,6 +1015,8 @@ fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<TcpRouteCon
                     name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
                     port: br.port.unwrap_or(80) as u16,
                     weight: br.weight.unwrap_or(1) as u32,
+                    group: br.group.clone().unwrap_or_default(),
+                    kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
                 })
                 .collect();
             TcpRouteRule { backend_refs }
@@ -1008,6 +1046,8 @@ fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<TlsRouteCon
                     name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
                     port: br.port.unwrap_or(443) as u16,
                     weight: br.weight.unwrap_or(1) as u32,
+                    group: br.group.clone().unwrap_or_default(),
+                    kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
                 })
                 .collect();
             TlsRouteRule { backend_refs }
@@ -1037,6 +1077,8 @@ fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteCon
                     name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
                     port: br.port.unwrap_or(80) as u16,
                     weight: br.weight.unwrap_or(1) as u32,
+                    group: br.group.clone().unwrap_or_default(),
+                    kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
                 })
                 .collect();
             UdpRouteRule { backend_refs }

@@ -443,7 +443,15 @@ async fn reconcile(
                                 let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
                                 let key_pem = data.get("tls.key").map(|b| b.0.clone());
                                 if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
-                                    cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
+                                    // Validate PEM format — must contain valid certificate/key markers
+                                    let cert_str = String::from_utf8_lossy(&cert);
+                                    let key_str = String::from_utf8_lossy(&key);
+                                    if cert_str.contains("BEGIN CERTIFICATE") && 
+                                       (key_str.contains("BEGIN PRIVATE KEY") || key_str.contains("BEGIN RSA PRIVATE KEY") || key_str.contains("BEGIN EC PRIVATE KEY")) {
+                                        cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
+                                    } else {
+                                        warn!("Secret {}/{} has malformed PEM data", secret_ns, cert_ref.name);
+                                    }
                                 } else {
                                     warn!("Secret {}/{} missing tls.crt or tls.key", secret_ns, cert_ref.name);
                                 }
@@ -475,6 +483,131 @@ async fn reconcile(
         })
         .unwrap_or_default();
 
+    // --- Per-listener validation: compute ListenerStatus for each listener ---
+    let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
+
+    // Detect protocol conflicts: same port, different protocols
+    let mut port_protocols: HashMap<i32, String> = HashMap::new();
+    let mut conflicted_ports: HashSet<i32> = HashSet::new();
+    for l in &gateway.spec.listeners {
+        match port_protocols.get(&l.port) {
+            Some(existing_proto) if *existing_proto != l.protocol => {
+                conflicted_ports.insert(l.port);
+            }
+            None => { port_protocols.insert(l.port, l.protocol.clone()); }
+            _ => {}
+        }
+    }
+
+    for listener in &gateway.spec.listeners {
+        let mut ls = status::ListenerStatus::default();
+
+        // Check protocol conflict
+        if conflicted_ports.contains(&listener.port) {
+            ls.accepted = false;
+            ls.accepted_reason = "ProtocolConflict".into();
+            ls.accepted_message = "Listener port conflicts with another listener using a different protocol".into();
+            ls.programmed = false;
+            ls.programmed_reason = "Invalid".into();
+            ls.programmed_message = "Listener not programmed due to port conflict".into();
+            ls.conflicted = true;
+            ls.conflicted_reason = "ProtocolConflict".into();
+            ls.conflicted_message = "Listener port shared with another listener using different protocol".into();
+        }
+
+        // Validate TLS certificateRefs for HTTPS/TLS listeners
+        if let Some(tls) = &listener.tls {
+            if let Some(cert_refs) = &tls.certificate_refs {
+                for cert_ref in cert_refs {
+                    // Check group/kind — must be core ("") group and "Secret" kind
+                    let group = cert_ref.group.as_deref().unwrap_or("");
+                    let kind_str = cert_ref.kind.as_deref().unwrap_or("Secret");
+                    if group != "" || kind_str != "Secret" {
+                        ls.resolved_refs = false;
+                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
+                        ls.resolved_refs_message = format!(
+                            "Unsupported certificateRef group/kind: {}/{}", group, kind_str
+                        );
+                        continue;
+                    }
+
+                    let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&gw_ns);
+
+                    // Cross-namespace cert ref requires ReferenceGrant
+                    if secret_ns != gw_ns {
+                        let grant_allows = reference_grants.iter().any(|grant| {
+                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
+                            if grant_ns != secret_ns { return false; }
+                            let from_ok = grant.spec.from.iter().any(|f| {
+                                f.group == "gateway.networking.k8s.io"
+                                    && f.kind == "Gateway"
+                                    && f.namespace == gw_ns
+                            });
+                            let to_ok = grant.spec.to.iter().any(|t| {
+                                t.group == "" && t.kind == "Secret"
+                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
+                            });
+                            from_ok && to_ok
+                        });
+                        if !grant_allows {
+                            ls.resolved_refs = false;
+                            ls.resolved_refs_reason = "RefNotPermitted".into();
+                            ls.resolved_refs_message = format!(
+                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                                secret_ns, cert_ref.name
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Check Secret existence and format
+                    if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
+                        ls.resolved_refs = false;
+                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
+                        ls.resolved_refs_message = format!(
+                            "Secret {}/{} not found or missing tls.crt/tls.key",
+                            secret_ns, cert_ref.name
+                        );
+                    }
+                }
+            }
+        } else if matches!(listener.protocol.as_str(), "HTTPS" | "TLS") {
+            // HTTPS/TLS listener without TLS config
+            ls.resolved_refs = false;
+            ls.resolved_refs_reason = "InvalidCertificateRef".into();
+            ls.resolved_refs_message = "HTTPS/TLS listener requires TLS configuration".into();
+        }
+
+        // Check allowedRoutes.kinds validity and compute supportedKinds
+        if let Some(allowed_routes) = &listener.allowed_routes {
+            if let Some(kinds) = &allowed_routes.kinds {
+                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute", "GRPCRoute"];
+                let mut supported = Vec::new();
+                let mut has_invalid = false;
+                for k in kinds {
+                    let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+                    let kind_str = &k.kind;
+                    if group == "gateway.networking.k8s.io" && valid_kinds.contains(&kind_str.as_str()) {
+                        supported.push(serde_json::json!({
+                            "group": "gateway.networking.k8s.io",
+                            "kind": kind_str,
+                        }));
+                    } else {
+                        has_invalid = true;
+                    }
+                }
+                ls.supported_kinds = supported;
+                if has_invalid {
+                    ls.resolved_refs = false;
+                    ls.resolved_refs_reason = "InvalidRouteKinds".into();
+                    ls.resolved_refs_message = "One or more route kinds in allowedRoutes are not supported".into();
+                }
+            }
+        }
+
+        listener_statuses.insert(listener.name.clone(), ls);
+    }
+
     // Build config for the triggered Gateway
     let result = match reconcile_to_config(
         &gateway,
@@ -496,6 +629,7 @@ async fn reconcile(
                 false,
                 &format!("Reconciliation failed: {}", e),
                 &HashMap::new(),
+                &listener_statuses,
             )
             .await;
             return Ok(Action::requeue(std::time::Duration::from_secs(30)));
@@ -583,6 +717,7 @@ async fn reconcile(
                 true,
                 "Programmed",
                 &listener_route_counts,
+                &listener_statuses,
             )
             .await;
             true
@@ -598,6 +733,7 @@ async fn reconcile(
                 false,
                 &format!("Route table conversion failed: {}", e),
                 &listener_route_counts,
+                &listener_statuses,
             )
             .await;
             false
@@ -619,8 +755,10 @@ async fn reconcile(
                     &gw_ns,
                     ra.section_name.as_deref(),
                     ra.accepted,
+                    &ra.accepted_reason,
                     &ra.message,
                     ra.refs_resolved,
+                    &ra.refs_reason,
                     &ra.refs_message,
                     route_programmed,
                     ra.generation,
@@ -637,8 +775,10 @@ async fn reconcile(
                     &gw_ns,
                     ra.section_name.as_deref(),
                     ra.accepted,
+                    &ra.accepted_reason,
                     &ra.message,
                     ra.refs_resolved,
+                    &ra.refs_reason,
                     &ra.refs_message,
                     route_programmed,
                     ra.generation,
@@ -655,8 +795,10 @@ async fn reconcile(
                     &gw_ns,
                     ra.section_name.as_deref(),
                     ra.accepted,
+                    &ra.accepted_reason,
                     &ra.message,
                     ra.refs_resolved,
+                    &ra.refs_reason,
                     &ra.refs_message,
                     route_programmed,
                     ra.generation,
@@ -673,8 +815,10 @@ async fn reconcile(
                     &gw_ns,
                     ra.section_name.as_deref(),
                     ra.accepted,
+                    &ra.accepted_reason,
                     &ra.message,
                     ra.refs_resolved,
+                    &ra.refs_reason,
                     &ra.refs_message,
                     route_programmed,
                     ra.generation,

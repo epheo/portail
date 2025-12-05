@@ -506,18 +506,31 @@ async fn handle_tcp_connection(
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
 ) -> Result<()> {
-    match TcpStream::connect(backend_addr).await {
-        Ok(mut backend) => {
+    let connect_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(backend_addr),
+    ).await;
+
+    match connect_result {
+        Ok(Ok(mut backend)) => {
             health.record_success(backend_addr);
             backend.set_nodelay(true)?;
             backend.write_all(initial_data).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+            // Errors from copy_bidirectional are expected when either side closes;
+            // don't propagate — the data transfer is best-effort once started.
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
             return Err(anyhow::anyhow!("TCP connect to {} failed: {}", backend_addr, e));
+        }
+        Err(_) => {
+            if health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(health, backend_addr);
+            }
+            return Err(anyhow::anyhow!("TCP connect to {} timed out", backend_addr));
         }
     }
     Ok(())

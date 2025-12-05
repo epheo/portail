@@ -133,7 +133,7 @@ fn analyze_http_request(
 
     if rule.backends.is_empty() {
         return Ok(ProcessingDecision::SendHttpError {
-            error_code: 503,
+            error_code: 500,
             close_connection: !keepalive,
         });
     }
@@ -170,11 +170,25 @@ fn analyze_http_request(
     for filter in &rule.filters {
         match filter {
             HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
+                let redirect_path = match path {
+                    Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
+                    Some(URLRewritePath::ReplacePrefixMatch(value)) => {
+                        // Apply prefix replacement: keep the suffix from the original path
+                        let suffix = &request_info.path[rule.path.len()..];
+                        let needs_slash = !value.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
+                        let mut result = String::with_capacity(value.len() + suffix.len() + usize::from(needs_slash));
+                        result.push_str(value);
+                        if needs_slash { result.push('/'); }
+                        result.push_str(suffix);
+                        result
+                    }
+                    None => request_info.path.to_string(),
+                };
                 let location = build_redirect_location(
                     scheme.as_deref(),
                     hostname.as_deref().unwrap_or(request_info.host),
                     *port,
-                    path.as_deref().unwrap_or(request_info.path),
+                    &redirect_path,
                 );
                 return Ok(ProcessingDecision::HttpRedirect {
                     status_code: *status_code,
