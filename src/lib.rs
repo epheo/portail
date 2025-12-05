@@ -11,6 +11,5 @@ pub mod udp_worker;
 pub mod http_filters;
 pub mod tls;
 pub mod data_plane;
-pub mod ebpf;
 pub mod kubernetes;
 pub mod config_watcher;

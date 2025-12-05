@@ -38,15 +38,9 @@ k8s-openapi = { version = "0.26", features = ["v1_32"] }
 gateway-api = { version = "0.19", features = ["experimental"] }
 futures = "0.3"
 
-# eBPF dependencies - pure Rust eBPF implementation
-aya = { path = "../aya/aya" }
 
-[build-dependencies]
-anyhow = "1.0"
-rustversion = "1.0"
-aya-build = { path = "../aya/aya-build" }
-aya-ebpf = { path = "../aya/ebpf/aya-ebpf" }
-aya-ebpf-macros = { path = "../aya/aya-ebpf-macros" }
+
+
 
 [dev-dependencies]
 criterion = "0.7"

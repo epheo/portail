@@ -7,7 +7,7 @@
 //! On shutdown, the data plane stops accepting new connections and waits up to
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
 
-use std::os::unix::io::{AsRawFd, RawFd};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +30,6 @@ use crate::udp_worker;
 struct TcpListenerEntry {
     worker_id: usize,
     port: u16,
-    raw_fd: RawFd,
     listener: TcpListener,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_passthrough: bool,
@@ -39,7 +38,6 @@ struct TcpListenerEntry {
 struct UdpListenerEntry {
     worker_id: usize,
     port: u16,
-    raw_fd: RawFd,
     socket: UdpSocket,
 }
 
@@ -53,6 +51,7 @@ pub struct DataPlane {
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
+    bound_ports: std::collections::HashSet<u16>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
@@ -104,19 +103,17 @@ impl DataPlane {
                             listener_cfg.address.as_deref(),
                             listener_cfg.interface.as_deref(),
                         )?;
-                        let raw_fd = std_listener.as_raw_fd();
                         let tokio_listener = TcpListener::from_std(std_listener)?;
 
                         tcp_listeners.push(TcpListenerEntry {
                             worker_id,
                             port,
-                            raw_fd,
                             listener: tokio_listener,
                             tls_acceptor: tls_acceptors[i].clone(),
                             tls_passthrough: tls_passthrough_flags[i],
                         });
 
-                        info!("Worker {} TCP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
+                        info!("Worker {} TCP bound to port {} with SO_REUSEPORT", worker_id, port);
                     }
                     Protocol::UDP => {
                         let std_socket = create_reuseport_udp_socket(
@@ -124,21 +121,23 @@ impl DataPlane {
                             listener_cfg.address.as_deref(),
                             listener_cfg.interface.as_deref(),
                         )?;
-                        let raw_fd = std_socket.as_raw_fd();
                         let tokio_socket = UdpSocket::from_std(std_socket)?;
 
                         udp_listeners.push(UdpListenerEntry {
                             worker_id,
                             port,
-                            raw_fd,
                             socket: tokio_socket,
                         });
 
-                        info!("Worker {} UDP bound to port {} (fd={}) with SO_REUSEPORT", worker_id, port, raw_fd);
+                        info!("Worker {} UDP bound to port {} with SO_REUSEPORT", worker_id, port);
                     }
                 }
             }
         }
+
+        let bound_ports: std::collections::HashSet<u16> = tcp_listeners.iter().map(|e| e.port)
+            .chain(udp_listeners.iter().map(|e| e.port))
+            .collect();
 
         Ok(Self {
             tcp_listeners,
@@ -150,16 +149,79 @@ impl DataPlane {
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            bound_ports,
         })
     }
 
-    /// Returns (worker_id, port, raw_fd) tuples for eBPF attachment.
-    pub fn get_listener_fds(&self) -> Vec<(usize, u16, RawFd)> {
-        let tcp_fds = self.tcp_listeners.iter()
-            .map(|e| (e.worker_id, e.port, e.raw_fd));
-        let udp_fds = self.udp_listeners.iter()
-            .map(|e| (e.worker_id, e.port, e.raw_fd));
-        tcp_fds.chain(udp_fds).collect()
+    /// Returns the set of TCP/UDP ports currently being listened on.
+    pub fn active_ports(&self) -> &std::collections::HashSet<u16> {
+        &self.bound_ports
+    }
+
+    /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
+    /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.
+    /// Returns (ports_opened, errors) for caller-side logging.
+    pub fn add_tcp_listeners(
+        &mut self,
+        ports: &[u16],
+        worker_count: usize,
+        routes: Arc<ArcSwap<RouteTable>>,
+        performance_config: &crate::config::PerformanceConfig,
+    ) -> (usize, Vec<(u16, String)>) {
+        let mut opened = 0usize;
+        let mut errors = Vec::new();
+        for &port in ports {
+            if self.bound_ports.contains(&port) {
+                continue;
+            }
+            let mut port_ok = true;
+            for worker_id in 0..worker_count {
+                match create_reuseport_tcp_listener(port, None, None) {
+                    Ok(std_listener) => {
+                        match TcpListener::from_std(std_listener) {
+                            Ok(tokio_listener) => {
+                                let routes = routes.clone();
+                                let health = self.health.clone();
+                                let shutdown = self.shutdown.clone();
+                                let max_idle = self.max_idle_per_backend;
+                                let connect_timeout = performance_config.backend_timeout;
+
+                                let handle = tokio::spawn(async move {
+                                    worker::run_worker(
+                                        worker_id,
+                                        tokio_listener,
+                                        port,
+                                        routes,
+                                        max_idle,
+                                        connect_timeout,
+                                        shutdown,
+                                        None,
+                                        false,
+                                        health,
+                                    ).await;
+                                });
+                                self.task_handles.push(handle);
+                            }
+                            Err(e) => {
+                                errors.push((port, format!("from_std: {}", e)));
+                                port_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push((port, format!("bind worker {}: {}", worker_id, e)));
+                        port_ok = false;
+                        break;
+                    }
+                }
+            }
+            if port_ok {
+                self.bound_ports.insert(port);
+                opened += 1;
+            }
+        }
+        (opened, errors)
     }
 
     /// Start async worker tasks — call after eBPF programs are attached.

@@ -61,18 +61,35 @@ impl PortailConfig {
             tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules",
                 route_idx, http_route.hostnames.len(), http_route.rules.len());
 
-            // Compute effective hostnames by intersecting with listener scope
+            // Compute effective hostnames by intersecting with listener scope.
+            // Per Gateway API spec: empty hostnames means "match all hosts".
             let effective_hostnames = match find_listener_for_route(&http_route.parent_refs, &self.gateway) {
                 Some(listener) => {
-                    let hostnames = intersect_hostnames(listener, &http_route.hostnames);
-                    if hostnames.is_empty() {
-                        tracing::warn!("HTTP route {} has no hostnames matching listener '{}' scope, skipping",
-                            route_idx, listener.name);
-                        continue;
+                    if http_route.hostnames.is_empty() {
+                        // Route has no hostnames = match all.
+                        // Use listener hostname if set, otherwise catch-all "*".
+                        match &listener.hostname {
+                            Some(h) => vec![h.clone()],
+                            None => vec!["*".to_string()],
+                        }
+                    } else {
+                        let hostnames = intersect_hostnames(listener, &http_route.hostnames);
+                        if hostnames.is_empty() {
+                            tracing::warn!("HTTP route {} has no hostnames matching listener '{}' scope, skipping",
+                                route_idx, listener.name);
+                            continue;
+                        }
+                        hostnames
                     }
-                    hostnames
                 }
-                None => http_route.hostnames.clone(),
+                None => {
+                    if http_route.hostnames.is_empty() {
+                        // No listener context AND no route hostnames = catch-all
+                        vec!["*".to_string()]
+                    } else {
+                        http_route.hostnames.clone()
+                    }
+                }
             };
 
             for hostname in &effective_hostnames {

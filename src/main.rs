@@ -15,7 +15,6 @@ mod udp_worker;
 mod http_filters;
 mod tls;
 mod data_plane;
-mod ebpf;
 mod kubernetes;
 mod config_watcher;
 
@@ -37,13 +36,13 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Config generation needs no eBPF — use a minimal single-threaded runtime
+    // Config generation uses minimal runtime
     if args.is_generation_mode() {
         logging::init_logging(args.verbose, None);
         return handle_generation_mode(&args);
     }
 
-    // Validate and example modes also use minimal runtime
+    // Validate and example modes use minimal runtime
     if args.is_validation_mode() || args.example_config {
         let portail_config = if let Some(config_path) = &args.config {
             PortailConfig::load_from_file(config_path)
@@ -61,12 +60,6 @@ fn main() -> Result<()> {
         return handle_example_config_mode(&args);
     }
 
-    // Validate eBPF requirements — fail fast
-    if let Err(e) = ebpf::validate_system_requirements() {
-        eprintln!("eBPF system requirements not met: {}", e);
-        eprintln!("Portail uses single codepath architecture with no fallback behavior.");
-        std::process::exit(1);
-    }
 
     let portail_config = if let Some(config_path) = &args.config {
         PortailConfig::load_from_file(config_path)
@@ -106,42 +99,43 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
           portail_config.udp_routes.len());
 
     // Single Tokio runtime for both control and data planes
-    let mut control_plane = ControlPlane::new(portail_config)?;
+    let control_plane = ControlPlane::new(portail_config)?;
     control_plane.start().await?;
 
     let routes = control_plane.get_routes();
 
-    // In Kubernetes mode, spawn the Gateway API controller
+    let data_plane = std::sync::Arc::new(std::sync::Mutex::new(
+        DataPlane::new(worker_count, &listeners, &performance_config, &cert_dir)?
+    ));
+
+    // Start initial listeners from config file
+    data_plane.lock().unwrap().start(routes.clone());
+    info!("Portail ready: {} workers × {} listeners", worker_count, listeners.len());
+
+    // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
     if args.kubernetes {
         let k8s_routes = routes.clone();
         let controller_name = args.controller_name.clone();
         let token = shutdown_token.clone();
+        let k8s_data_plane = data_plane.clone();
+        let k8s_worker_count = worker_count;
+        let k8s_perf = performance_config.clone();
         tokio::spawn(async move {
-            if let Err(e) = kubernetes::controller::run_controller(k8s_routes, controller_name, token).await {
+            if let Err(e) = kubernetes::controller::run_controller(
+                k8s_routes, controller_name, token, k8s_data_plane, k8s_worker_count, k8s_perf,
+            ).await {
                 error!("Kubernetes controller failed: {}", e);
             }
         });
         info!("Kubernetes Gateway API controller started");
     }
 
-    let mut data_plane = DataPlane::new(worker_count, &listeners, &performance_config, &cert_dir)?;
-
-    // Attach eBPF before starting workers
-    let listener_fds = data_plane.get_listener_fds();
-    info!("Attaching SO_REUSEPORT eBPF programs to {} worker sockets", listener_fds.len());
-    control_plane.attach_worker_reuseport_programs(&listener_fds)?;
-    info!("eBPF programs attached — starting worker tasks");
-
-    data_plane.start(routes.clone());
-
-    info!("Portail ready: {} workers × {} listeners", worker_count, listeners.len());
-
     // In standalone mode, watch the config file for SIGHUP-triggered reloads
     if !args.kubernetes {
         if let Some(config_path) = args.config.clone() {
             let reload_routes = routes;
-            let reload_health = data_plane.health().clone();
+            let reload_health = data_plane.lock().unwrap().health().clone();
             let reload_shutdown = shutdown_token.clone();
             tokio::spawn(async move {
                 config_watcher::watch_config(config_path, reload_routes, reload_health, reload_shutdown).await;
@@ -154,7 +148,9 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
     shutdown_token.cancel();
 
     info!("Shutting down Portail");
-    data_plane.shutdown().await;
+    if let Ok(dp) = std::sync::Arc::try_unwrap(data_plane) {
+        dp.into_inner().unwrap().shutdown().await;
+    }
 
     info!("Portail shutdown complete");
     Ok(())

@@ -72,6 +72,9 @@ struct ControllerCtx {
     client: Client,
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
+    data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
+    worker_count: usize,
+    performance_config: crate::config::PerformanceConfig,
 }
 
 /// Reconcile a GatewayClass: accept ours, reject others with same controllerName
@@ -118,6 +121,9 @@ pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
     shutdown: CancellationToken,
+    data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
+    worker_count: usize,
+    performance_config: crate::config::PerformanceConfig,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
@@ -136,6 +142,9 @@ pub async fn run_controller(
         client: client.clone(),
         routes,
         controller_name,
+        data_plane,
+        worker_count,
+        performance_config,
     });
 
     // Channel to trigger full reconciliation when Secrets/Services/ReferenceGrants change
@@ -310,8 +319,34 @@ async fn reconcile(
             }
         }
     }
-
     // Fetch all routes across all namespaces
+    // But first, dynamically open TCP listeners for ports defined in this Gateway's spec
+    {
+        let desired_ports: Vec<u16> = gateway.spec.listeners.iter()
+            .map(|l| l.port as u16)
+            .collect();
+        info!("Ensuring data plane listeners for ports: {:?}", desired_ports);
+        match ctx.data_plane.lock() {
+            Ok(mut dp) => {
+                let (opened, errors) = dp.add_tcp_listeners(
+                    &desired_ports,
+                    ctx.worker_count,
+                    ctx.routes.clone(),
+                    &ctx.performance_config,
+                );
+                if opened > 0 {
+                    info!("Opened {} new port(s)", opened);
+                }
+                for (port, err) in &errors {
+                    warn!("Failed to bind port {}: {}", port, err);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to lock data plane: {}", e);
+            }
+        }
+    }
+
     let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
     let tcp_routes_api: Api<TCPRoute> = Api::all(ctx.client.clone());
     let tls_routes_api: Api<TLSRoute> = Api::all(ctx.client.clone());

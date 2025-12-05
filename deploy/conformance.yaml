@@ -70,9 +70,8 @@ spec:
         imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:
-          privileged: true
           capabilities:
-            add: ["NET_ADMIN", "SYS_ADMIN", "NET_RAW", "NET_BIND_SERVICE"]
+            add: ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"]
         env:
         - name: NODE_IP
           valueFrom:

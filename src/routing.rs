@@ -8,6 +8,8 @@ use anyhow::{anyhow, Result};
 pub struct RouteTable {
     pub http_routes: FnvHashMap<String, HostEntry>,
     pub wildcard_http_routes: FnvHashMap<String, HostEntry>,
+    /// Catch-all routes: hostname="*" means match any host (fallback)
+    pub catch_all_http_routes: Option<HostEntry>,
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub tls_routes: FnvHashMap<String, Vec<Backend>>,
@@ -19,6 +21,7 @@ impl RouteTable {
         Self {
             http_routes: FnvHashMap::with_capacity_and_hasher(128, Default::default()),
             wildcard_http_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
+            catch_all_http_routes: None,
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -79,6 +82,13 @@ impl RouteTable {
                 if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
                     return Ok(rule);
                 }
+            }
+        }
+
+        // Try catch-all routes (hostname="*", matches any host)
+        if let Some(ref host_entry) = self.catch_all_http_routes {
+            if let Some(rule) = Self::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
+                return Ok(rule);
             }
         }
 
@@ -175,6 +185,16 @@ impl RouteTable {
 
         let host_lower = host.to_ascii_lowercase();
 
+        // Catch-all hostname "*" matches any host (stored separately)
+        if host_lower == "*" {
+            let host_entry = self.catch_all_http_routes.get_or_insert_with(|| HostEntry {
+                rules: Vec::with_capacity(8),
+            });
+            host_entry.rules.push(rule);
+            Self::sort_rules(&mut host_entry.rules);
+            return;
+        }
+
         // Wildcard hosts (*.example.com) are stored by their parent domain
         let (map, key) = if let Some(stripped) = host_lower.strip_prefix("*.") {
             (&mut self.wildcard_http_routes, stripped.to_string())
@@ -187,9 +207,12 @@ impl RouteTable {
         });
 
         host_entry.rules.push(rule);
+        Self::sort_rules(&mut host_entry.rules);
+    }
 
+    fn sort_rules(rules: &mut Vec<HttpRouteRule>) {
         // Sort: exact > regex > prefix, then by path length desc
-        host_entry.rules.sort_by(|a, b| {
+        rules.sort_by(|a, b| {
             fn rank(t: &PathMatchType) -> u8 {
                 match t { PathMatchType::Exact => 0, PathMatchType::RegularExpression => 1, PathMatchType::Prefix => 2 }
             }
