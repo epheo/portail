@@ -103,12 +103,6 @@ check_dependencies() {
         print_status $GREEN "✓ Portail binary found"
     fi
 
-    # Set eBPF capabilities on the binary so it can run without sudo
-    if ! getcap "${PORTAIL_BINARY}" 2>/dev/null | grep -q "cap_bpf"; then
-        print_status $BLUE "Setting eBPF capabilities on binary (requires sudo)..."
-        sudo setcap cap_bpf,cap_net_admin+ep "${PORTAIL_BINARY}"
-        print_status $GREEN "✓ eBPF capabilities set"
-    fi
     
     # Check other required tools
     for tool in curl ab htop ss jq; do

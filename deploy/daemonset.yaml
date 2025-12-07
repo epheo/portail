@@ -24,21 +24,12 @@ spec:
           securityContext:
             capabilities:
               add:
-                - BPF
-                - NET_ADMIN
                 - NET_BIND_SERVICE
-                - SYS_ADMIN
           volumeMounts:
-            - name: bpf
-              mountPath: /sys/fs/bpf
             - name: tls-certs
               mountPath: /etc/portail/certs
               readOnly: true
       volumes:
-        - name: bpf
-          hostPath:
-            path: /sys/fs/bpf
-            type: DirectoryOrCreate
         - name: tls-certs
           secret:
             secretName: portail-tls

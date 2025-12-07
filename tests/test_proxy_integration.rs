@@ -5,8 +5,6 @@
 ///
 /// Requirements:
 /// - Portail binary must be built (`cargo build --release`)
-/// - Linux with eBPF support
-/// - CAP_BPF + CAP_NET_ADMIN capabilities (typically root)
 ///
 /// Run with: cargo test --release --test test_proxy_integration
 
@@ -28,7 +26,6 @@ fn proxy_port(offset: u16) -> u16 {
 }
 
 #[test]
-#[ignore] // Requires eBPF/root — run with: cargo test --release --test test_proxy_integration -- --ignored
 fn test_http_proxy_roundtrip() {
     let backend = TestBackend::spawn("hello from backend");
     let port = proxy_port(1);
@@ -82,7 +79,6 @@ fn test_http_keepalive_reuse() {
 }
 
 #[test]
-#[ignore]
 fn test_http_connection_close() {
     let backend = TestBackend::spawn("close-response");
     let port = proxy_port(3);
@@ -104,7 +100,6 @@ fn test_http_connection_close() {
 }
 
 #[test]
-#[ignore]
 fn test_multiple_backends() {
     let backend_a = TestBackend::spawn("backend-A");
     let backend_b = TestBackend::spawn("backend-B");
@@ -135,7 +130,6 @@ fn test_multiple_backends() {
 }
 
 #[test]
-#[ignore]
 fn test_backend_unreachable() {
     // Point to a port where nothing is listening
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -168,7 +162,6 @@ fn test_backend_unreachable() {
 }
 
 #[test]
-#[ignore]
 fn test_concurrent_requests() {
     let backend = TestBackend::spawn("concurrent-ok");
     let port = proxy_port(6);
@@ -241,7 +234,6 @@ fn test_concurrent_requests() {
 }
 
 #[test]
-#[ignore]
 fn test_large_response_forwarding() {
     let size = 128 * 1024; // 128KB
     let backend = TestBackend::spawn_large(size);
@@ -271,7 +263,6 @@ fn test_large_response_forwarding() {
 // === Mixed Protocol Tests ===
 
 #[test]
-#[ignore]
 fn test_tcp_works_during_http_load() {
     let http_backend = TestBackend::spawn("http-ok");
     let echo = TcpEchoBackend::spawn();
@@ -334,7 +325,6 @@ fn test_tcp_works_during_http_load() {
 // === TCP Proxy Tests ===
 
 #[test]
-#[ignore]
 fn test_tcp_proxy_echo_roundtrip() {
     let echo = TcpEchoBackend::spawn();
     let http_port = proxy_port(10);
@@ -360,7 +350,6 @@ fn test_tcp_proxy_echo_roundtrip() {
 }
 
 #[test]
-#[ignore]
 fn test_tcp_proxy_binary_data() {
     let echo = TcpEchoBackend::spawn();
     let http_port = proxy_port(12);
@@ -389,7 +378,6 @@ fn test_tcp_proxy_binary_data() {
 }
 
 #[test]
-#[ignore]
 fn test_tcp_proxy_eof_propagation() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -471,7 +459,6 @@ fn extract_request_header_value(raw_request: &[u8], name: &str) -> Option<String
 }
 
 #[test]
-#[ignore]
 fn test_url_rewrite_full_path_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(20);
@@ -493,7 +480,6 @@ fn test_url_rewrite_full_path_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_url_rewrite_prefix_replace_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(21);
@@ -515,7 +501,6 @@ fn test_url_rewrite_prefix_replace_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_url_rewrite_hostname_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(22);
@@ -537,7 +522,6 @@ fn test_url_rewrite_hostname_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_request_header_modifier_e2e() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(23);
@@ -560,7 +544,6 @@ fn test_request_header_modifier_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_response_header_modifier_e2e() {
     // Use a TestBackend that adds X-Internal header in its response
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -605,7 +588,6 @@ fn test_response_header_modifier_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_request_redirect_e2e() {
     let port = proxy_port(25);
     let filter = r#"{"type": "RequestRedirect", "requestRedirect": {"hostname": "other.com", "statusCode": 301}}"#;
@@ -627,7 +609,6 @@ fn test_request_redirect_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_request_mirror_e2e() {
     let primary = InspectingBackend::spawn("primary-ok");
     let mirror = InspectingBackend::spawn("mirror-ok");
@@ -654,7 +635,6 @@ fn test_request_mirror_e2e() {
 }
 
 #[test]
-#[ignore]
 fn test_filter_combination_rewrite_plus_header_mod() {
     let backend = InspectingBackend::spawn("ok");
     let port = proxy_port(27);
@@ -678,7 +658,6 @@ fn test_filter_combination_rewrite_plus_header_mod() {
 }
 
 #[test]
-#[ignore]
 fn test_exact_vs_prefix_path_e2e() {
     let backend_exact = InspectingBackend::spawn("exact");
     let backend_prefix = InspectingBackend::spawn("prefix");

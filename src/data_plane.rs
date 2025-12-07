@@ -1,8 +1,7 @@
 //! Tokio-based data plane — creates SO_REUSEPORT listeners and spawns async workers.
 //!
-//! Each worker is a Tokio task sharing the runtime's thread pool. eBPF programs
-//! attach to listener sockets the same way for both TCP and UDP (SO_REUSEPORT
-//! uses the same dest-port offset in the transport header).
+//! Each worker is a Tokio task sharing the runtime's thread pool. SO_REUSEPORT
+//! distributes incoming connections across workers at the kernel level.
 //!
 //! On shutdown, the data plane stops accepting new connections and waits up to
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
@@ -224,7 +223,7 @@ impl DataPlane {
         (opened, errors)
     }
 
-    /// Start async worker tasks — call after eBPF programs are attached.
+    /// Start async worker tasks.
     pub fn start(&mut self, routes: Arc<ArcSwap<RouteTable>>) {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();

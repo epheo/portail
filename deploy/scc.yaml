@@ -5,12 +5,9 @@ metadata:
 allowHostNetwork: true
 allowHostPorts: true
 allowPrivilegedContainer: false
-allowHostDirVolumePlugin: true
+allowHostDirVolumePlugin: false
 allowedCapabilities:
-  - BPF
-  - NET_ADMIN
   - NET_BIND_SERVICE
-  - SYS_ADMIN
 runAsUser:
   type: RunAsAny
 seLinuxContext:
@@ -20,7 +17,6 @@ fsGroup:
 supplementalGroups:
   type: RunAsAny
 volumes:
-  - hostPath
   - secret
   - configMap
 users:
