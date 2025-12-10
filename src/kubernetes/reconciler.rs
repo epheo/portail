@@ -759,7 +759,17 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule> {
 }
 
 fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
-    let method = m.method.as_ref().map(|m| format!("{:?}", m));
+    let method = m.method.as_ref().map(|m| match m {
+        HTTPRouteRulesMatchesMethod::Get => "GET",
+        HTTPRouteRulesMatchesMethod::Head => "HEAD",
+        HTTPRouteRulesMatchesMethod::Post => "POST",
+        HTTPRouteRulesMatchesMethod::Put => "PUT",
+        HTTPRouteRulesMatchesMethod::Delete => "DELETE",
+        HTTPRouteRulesMatchesMethod::Connect => "CONNECT",
+        HTTPRouteRulesMatchesMethod::Options => "OPTIONS",
+        HTTPRouteRulesMatchesMethod::Trace => "TRACE",
+        HTTPRouteRulesMatchesMethod::Patch => "PATCH",
+    }.to_string());
 
     let path = m.path.as_ref().map(|p| {
         let match_type = match p.r#type {
