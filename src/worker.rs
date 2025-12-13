@@ -62,6 +62,8 @@ struct ConnectionState {
     pool: BackendPool,
     selector: BackendSelector,
     health: Arc<HealthRegistry>,
+    /// Whether this connection was accepted via TLS (used for redirect scheme).
+    is_tls: bool,
     /// Reused across keepalive responses to avoid per-response heap allocation.
     header_buf: Vec<u8>,
 }
@@ -112,6 +114,7 @@ pub async fn run_worker(
                                             pool: BackendPool::new(max_idle_per_backend, connect_timeout),
                                             selector: BackendSelector::new(),
                                             health,
+                                            is_tls: true,
                                             header_buf: Vec::with_capacity(1024),
                                         };
                                         if let Err(_e) = handle_connection(conn, peer, state).await {
@@ -130,6 +133,7 @@ pub async fn run_worker(
                                 pool: BackendPool::new(max_idle_per_backend, connect_timeout),
                                 selector: BackendSelector::new(),
                                 health,
+                                is_tls: false,
                                 header_buf: Vec::with_capacity(1024),
                             };
                             tokio::spawn(async move {
@@ -185,7 +189,7 @@ async fn handle_connection(
     loop {
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..n], state.server_port, &state.health)?
+            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {
@@ -338,7 +342,7 @@ async fn handle_http_forward(
 
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..request_bytes], state.server_port, &state.health)?
+            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {
