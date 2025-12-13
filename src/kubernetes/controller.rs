@@ -320,32 +320,8 @@ async fn reconcile(
         }
     }
     // Fetch all routes across all namespaces
-    // But first, dynamically open TCP listeners for ports defined in this Gateway's spec
-    {
-        let desired_ports: Vec<u16> = gateway.spec.listeners.iter()
-            .map(|l| l.port as u16)
-            .collect();
-        info!("Ensuring data plane listeners for ports: {:?}", desired_ports);
-        match ctx.data_plane.lock() {
-            Ok(mut dp) => {
-                let (opened, errors) = dp.add_tcp_listeners(
-                    &desired_ports,
-                    ctx.worker_count,
-                    ctx.routes.clone(),
-                    &ctx.performance_config,
-                );
-                if opened > 0 {
-                    info!("Opened {} new port(s)", opened);
-                }
-                for (port, err) in &errors {
-                    warn!("Failed to bind port {}: {}", port, err);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to lock data plane: {}", e);
-            }
-        }
-    }
+    // Note: dynamic listener creation happens after reconciliation
+    // so we can pass full ListenerConfig with TLS data.
 
     let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
     let tcp_routes_api: Api<TCPRoute> = Api::all(ctx.client.clone());
@@ -635,6 +611,33 @@ async fn reconcile(
             return Ok(Action::requeue(std::time::Duration::from_secs(30)));
         }
     };
+
+    // Dynamically open TCP listeners for ports defined in this Gateway's spec.
+    // Done after reconciliation so ListenerConfig has TLS cert data populated.
+    {
+        let listener_configs = &result.config.gateway.listeners;
+        info!("Ensuring data plane listeners for ports: {:?}",
+            listener_configs.iter().map(|l| l.port).collect::<Vec<_>>());
+        match ctx.data_plane.lock() {
+            Ok(mut dp) => {
+                let (opened, errors) = dp.add_tcp_listeners(
+                    listener_configs,
+                    ctx.worker_count,
+                    ctx.routes.clone(),
+                    &ctx.performance_config,
+                );
+                if opened > 0 {
+                    info!("Opened {} new port(s)", opened);
+                }
+                for (port, err) in &errors {
+                    warn!("Failed to bind port {}: {}", port, err);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to lock data plane: {}", e);
+            }
+        }
+    }
 
     // Merge routes from OTHER managed Gateways so we don't clobber them
     let mut merged_config = result.config.clone();

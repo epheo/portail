@@ -159,20 +159,50 @@ impl DataPlane {
 
     /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
     /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.
+    /// Builds TLS acceptors from in-memory cert data when listeners use HTTPS/TLS.
     /// Returns (ports_opened, errors) for caller-side logging.
     pub fn add_tcp_listeners(
         &mut self,
-        ports: &[u16],
+        listener_configs: &[ListenerConfig],
         worker_count: usize,
         routes: Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
     ) -> (usize, Vec<(u16, String)>) {
         let mut opened = 0usize;
         let mut errors = Vec::new();
-        for &port in ports {
+        for listener_cfg in listener_configs {
+            let port = listener_cfg.port;
             if self.bound_ports.contains(&port) {
                 continue;
             }
+
+            // Build TLS acceptor if this listener needs TLS termination
+            let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls) {
+                (Protocol::HTTPS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
+                    // cert_pem/key_pem are populated by the K8s controller from Secrets
+                    match tls::build_tls_acceptor(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                        Ok(acceptor) => (Some(Arc::new(acceptor)), false),
+                        Err(e) => {
+                            errors.push((port, format!("TLS acceptor build failed: {}", e)));
+                            continue;
+                        }
+                    }
+                }
+                (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
+                    match tls::build_tls_acceptor(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                        Ok(acceptor) => (Some(Arc::new(acceptor)), false),
+                        Err(e) => {
+                            errors.push((port, format!("TLS acceptor build failed: {}", e)));
+                            continue;
+                        }
+                    }
+                }
+                (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
+                    (None, true)
+                }
+                _ => (None, false),
+            };
+
             let mut port_ok = true;
             for worker_id in 0..worker_count {
                 match create_reuseport_tcp_listener(port, None, None) {
@@ -184,6 +214,8 @@ impl DataPlane {
                                 let shutdown = self.shutdown.clone();
                                 let max_idle = self.max_idle_per_backend;
                                 let connect_timeout = performance_config.backend_timeout;
+                                let acceptor = tls_acceptor.clone();
+                                let passthrough = tls_passthrough;
 
                                 let handle = tokio::spawn(async move {
                                     worker::run_worker(
@@ -194,8 +226,8 @@ impl DataPlane {
                                         max_idle,
                                         connect_timeout,
                                         shutdown,
-                                        None,
-                                        false,
+                                        acceptor,
+                                        passthrough,
                                         health,
                                     ).await;
                                 });
