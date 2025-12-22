@@ -578,7 +578,13 @@ async fn reconcile(
                     ls.resolved_refs_reason = "InvalidRouteKinds".into();
                     ls.resolved_refs_message = "One or more route kinds in allowedRoutes are not supported".into();
                 }
+            } else {
+                // No explicit kinds restriction — use protocol-based defaults
+                ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
             }
+        } else {
+            // No allowedRoutes at all — use protocol-based defaults
+            ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
         }
 
         listener_statuses.insert(listener.name.clone(), ls);

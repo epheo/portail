@@ -14,7 +14,7 @@ use gateway_api::gatewayclasses::GatewayClass;
 
 use crate::logging::{debug, warn};
 
-fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
+pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
     match protocol {
         "HTTP" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})],
         "HTTPS" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})],
