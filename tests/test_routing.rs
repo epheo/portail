@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[test]
 fn test_route_table_creation() {
     let table = RouteTable::new();
-    assert!(table.http_routes.is_empty());
+    assert!(table.listener_scopes.is_empty());
     assert!(table.tcp_routes.is_empty());
 }
 
@@ -21,7 +21,7 @@ fn test_route_table_http_routing() {
         vec![backend],
     ));
 
-    let result = table.find_http_route("api.example.com", "GET", "/v1/users/123", &[], "");
+    let result = table.find_http_route("api.example.com", "GET", "/v1/users/123", &[], "", 0);
     assert!(result.is_ok());
 
     let rule = result.unwrap();
@@ -34,7 +34,7 @@ fn test_route_table_http_routing() {
 fn test_route_table_http_routing_no_match() {
     let table = RouteTable::new();
 
-    let result = table.find_http_route("nonexistent.com", "GET", "/api/test", &[], "");
+    let result = table.find_http_route("nonexistent.com", "GET", "/api/test", &[], "", 0);
     assert!(result.is_err());
 }
 
@@ -89,14 +89,14 @@ fn test_path_matching_longest_prefix_first() {
     ));
 
     // Should match longer prefix first
-    let result = table.find_http_route("api.com", "GET", "/api/v1/users", &[], "");
+    let result = table.find_http_route("api.com", "GET", "/api/v1/users", &[], "", 0);
     assert!(result.is_ok());
     let rule = result.unwrap();
     let backend_ref = &rule.backends[0];
     assert_eq!(format!("{}", backend_ref.socket_addr.ip()), "127.0.0.2");
 
     // Should match shorter prefix for non-v1 paths
-    let result = table.find_http_route("api.com", "GET", "/api/v2/users", &[], "");
+    let result = table.find_http_route("api.com", "GET", "/api/v2/users", &[], "", 0);
     assert!(result.is_ok());
     let rule = result.unwrap();
     let backend_ref = &rule.backends[0];
@@ -121,7 +121,7 @@ fn test_exact_path_match_wins_over_prefix() {
     rt.add_http_route("example.com", rule(PathMatchType::Exact, "/foo", 8001));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo", 8002));
 
-    let r = rt.find_http_route("example.com", "GET", "/foo", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/foo", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -131,7 +131,7 @@ fn test_longest_prefix_wins() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/api", 8001));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/api/v1", 8002));
 
-    let r = rt.find_http_route("example.com", "GET", "/api/v1/users", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/api/v1/users", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -140,8 +140,8 @@ fn test_root_prefix_catches_all() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    assert!(rt.find_http_route("example.com", "GET", "/anything/here", &[], "").is_ok());
-    assert!(rt.find_http_route("example.com", "GET", "/", &[], "").is_ok());
+    assert!(rt.find_http_route("example.com", "GET", "/anything/here", &[], "", 0).is_ok());
+    assert!(rt.find_http_route("example.com", "GET", "/", &[], "", 0).is_ok());
 }
 
 #[test]
@@ -149,8 +149,8 @@ fn test_exact_path_no_subpath() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", rule(PathMatchType::Exact, "/foo", 8001));
 
-    assert!(rt.find_http_route("example.com", "GET", "/foo", &[], "").is_ok());
-    assert!(rt.find_http_route("example.com", "GET", "/foo/bar", &[], "").is_err());
+    assert!(rt.find_http_route("example.com", "GET", "/foo", &[], "", 0).is_ok());
+    assert!(rt.find_http_route("example.com", "GET", "/foo/bar", &[], "", 0).is_err());
 }
 
 #[test]
@@ -159,10 +159,10 @@ fn test_prefix_trailing_slash_semantics() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo/", 8001));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/foo", 8002));
 
-    let r = rt.find_http_route("example.com", "GET", "/foo/bar", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/foo/bar", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
-    let r = rt.find_http_route("example.com", "GET", "/foo", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/foo", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -174,7 +174,7 @@ fn test_exact_host_priority_over_wildcard() {
     rt.add_http_route("*.example.com", rule(PathMatchType::Prefix, "/", 8001));
     rt.add_http_route("specific.example.com", rule(PathMatchType::Prefix, "/", 8002));
 
-    let r = rt.find_http_route("specific.example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("specific.example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -183,7 +183,7 @@ fn test_wildcard_host_matching_new() {
     let mut rt = RouteTable::new();
     rt.add_http_route("*.example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    let r = rt.find_http_route("foo.example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("foo.example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -192,7 +192,7 @@ fn test_wildcard_no_match_bare_domain() {
     let mut rt = RouteTable::new();
     rt.add_http_route("*.example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    assert!(rt.find_http_route("example.com", "GET", "/", &[], "").is_err());
+    assert!(rt.find_http_route("example.com", "GET", "/", &[], "", 0).is_err());
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_case_insensitive_host() {
     let mut rt = RouteTable::new();
     rt.add_http_route("api.example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    let r = rt.find_http_route("API.Example.COM", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("API.Example.COM", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -209,7 +209,7 @@ fn test_host_with_port_stripped() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -227,7 +227,7 @@ fn test_single_header_match() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"X-Env: canary\r\n";
-    let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", headers, "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -246,11 +246,11 @@ fn test_multiple_headers_and_logic() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"X-Env: canary\r\nX-Region: us-east\r\n";
-    let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", headers, "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
     let headers = b"X-Env: canary\r\n";
-    let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", headers, "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -266,7 +266,7 @@ fn test_header_match_case_insensitive() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"x-env: canary\r\n";
-    let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", headers, "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 }
 
@@ -282,7 +282,7 @@ fn test_header_match_fallback_to_no_header_rule() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"X-Env: production\r\n";
-    let r = rt.find_http_route("example.com", "GET", "/", headers, "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", headers, "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -298,7 +298,7 @@ fn test_weighted_round_robin_distribution() {
             Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
         ],
     ));
-    let r = rt.find_http_route("test.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
@@ -320,7 +320,7 @@ fn test_equal_weights() {
             Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
         ],
     ));
-    let r = rt.find_http_route("test.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
@@ -342,7 +342,7 @@ fn test_zero_weight_backend_never_selected() {
             Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0 },
         ],
     ));
-    let r = rt.find_http_route("test.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let mut selector = BackendSelector::new();
     for _ in 0..100 {
@@ -366,7 +366,7 @@ fn test_route_carries_filters() {
         vec![backend(8001)],
     ));
 
-    let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.filters.len(), 1);
     assert!(r.has_filters);
     assert!(matches!(&r.filters[0], HttpFilter::RequestHeaderModifier { .. }));
@@ -384,7 +384,7 @@ fn test_url_rewrite_on_route_rule() {
         vec![backend(8001)],
     ));
 
-    let r = rt.find_http_route("example.com", "GET", "/v1/users", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/v1/users", &[], "", 0).unwrap();
     assert_eq!(r.filters.len(), 1);
     assert!(matches!(&r.filters[0], HttpFilter::URLRewrite { .. }));
 }
@@ -400,7 +400,7 @@ fn test_request_mirror_on_route_rule() {
         vec![backend(8001)],
     ));
 
-    let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.filters.len(), 1);
     assert!(matches!(&r.filters[0], HttpFilter::RequestMirror { .. }));
 }
@@ -412,7 +412,7 @@ fn test_has_filters_precomputed() {
     let mut rt = RouteTable::new();
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8001));
 
-    let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", &[], "", 0).unwrap();
     assert!(!r.has_filters);
 }
 
@@ -426,7 +426,7 @@ fn test_cumulative_weights_precomputed() {
             Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
         ],
     ));
-    let r = rt.find_http_route("test.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.total_weight, 4);
     assert_eq!(r.cumulative_weights, vec![3, 4]);
 }
@@ -440,10 +440,10 @@ fn test_method_match_integration() {
         rule(PathMatchType::Prefix, "/", 8001).with_method(Some("DELETE".to_string())));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
-    let r = rt.find_http_route("example.com", "DELETE", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "DELETE", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
-    let r = rt.find_http_route("example.com", "GET", "/", &[], "").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/", &[], "", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -457,10 +457,10 @@ fn test_query_param_match_integration() {
     ));
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/search", 8002));
 
-    let r = rt.find_http_route("example.com", "GET", "/search", &[], "format=json&q=test").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/search", &[], "format=json&q=test", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
-    let r = rt.find_http_route("example.com", "GET", "/search", &[], "q=test").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/search", &[], "q=test", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 
@@ -476,11 +476,11 @@ fn test_method_plus_query_plus_header_integration() {
     rt.add_http_route("example.com", rule(PathMatchType::Prefix, "/", 8002));
 
     let headers = b"X-Version: 2\r\n";
-    let r = rt.find_http_route("example.com", "POST", "/api", headers, "debug=true").unwrap();
+    let r = rt.find_http_route("example.com", "POST", "/api", headers, "debug=true", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8001);
 
     // Wrong method
-    let r = rt.find_http_route("example.com", "GET", "/api", headers, "debug=true").unwrap();
+    let r = rt.find_http_route("example.com", "GET", "/api", headers, "debug=true", 0).unwrap();
     assert_eq!(r.backends[0].socket_addr.port(), 8002);
 }
 

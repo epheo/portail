@@ -82,7 +82,7 @@ pub fn analyze_request(
     }
 
     if is_http_request(request_data) {
-        analyze_http_request(routes, backend_selector, request_data, health, is_tls)
+        analyze_http_request(routes, backend_selector, request_data, health, is_tls, server_port)
     } else {
         analyze_tcp_request(routes, backend_selector, server_port, health)
     }
@@ -119,11 +119,12 @@ fn analyze_http_request(
     request_data: &[u8],
     health: &HealthRegistry,
     is_tls: bool,
+    server_port: u16,
 ) -> Result<ProcessingDecision> {
     let request_info = extract_routing_info(request_data)?;
     let keepalive = request_info.connection_type != ConnectionType::Close;
 
-    let rule = match routes.find_http_route(request_info.host, request_info.method, request_info.path, request_info.header_data, request_info.query_string) {
+    let rule = match routes.find_http_route(request_info.host, request_info.method, request_info.path, request_info.header_data, request_info.query_string, server_port) {
         Ok(rule) => rule,
         Err(_) => {
             return Ok(ProcessingDecision::SendHttpError {

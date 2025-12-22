@@ -587,6 +587,13 @@ async fn reconcile(
             ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
         }
 
+        // If resolved_refs is false, the listener cannot be programmed
+        if !ls.resolved_refs {
+            ls.programmed = false;
+            ls.programmed_reason = "Invalid".into();
+            ls.programmed_message = "Listener has unresolved references".into();
+        }
+
         listener_statuses.insert(listener.name.clone(), ls);
     }
 
@@ -645,8 +652,10 @@ async fn reconcile(
         }
     }
 
-    // Merge routes from OTHER managed Gateways so we don't clobber them
-    let mut merged_config = result.config.clone();
+    // Build a unified route table from ALL managed gateways.
+    // Each gateway's routes are properly scoped by its listeners' (port, hostname).
+    // This replaces the old merge-all pattern which lost listener isolation.
+    let mut all_configs = vec![result.config.clone()];
     let gateways_api: Api<Gateway> = Api::all(ctx.client.clone());
     let all_gateways = gateways_api.list(&ListParams::default()).await.map(|l| l.items).unwrap_or_default();
     for other_gw in &all_gateways {
@@ -658,7 +667,7 @@ async fn reconcile(
         if other_gw.spec.gateway_class_name != *gateway_class_name {
             continue; // Different controller
         }
-        // Reconcile the other gateway and merge its routes
+        // Reconcile the other gateway into its own scoped config
         if let Ok(other_result) = reconcile_to_config(
             other_gw,
             &http_routes,
@@ -670,18 +679,14 @@ async fn reconcile(
             &known_services,
             &cert_data,
         ) {
-            // Merge listeners from other gateways
-            merged_config.gateway.listeners.extend(other_result.config.gateway.listeners);
-            merged_config.http_routes.extend(other_result.config.http_routes);
-            merged_config.tcp_routes.extend(other_result.config.tcp_routes);
-            merged_config.tls_routes.extend(other_result.config.tls_routes);
-            merged_config.udp_routes.extend(other_result.config.udp_routes);
+            all_configs.push(other_result.config);
         }
     }
 
-    let _config = &result.config;
+    // Build a single route table from all configs.
+    // Each config's to_route_table() adds routes scoped by listener (port, hostname).
 
-    // Compute per-listener attached route counts from accepted routes
+    // Compute per-listener attached route counts from accepted routes (for this gateway only)
     let mut listener_route_counts: HashMap<String, i32> = HashMap::new();
     for listener in &gateway.spec.listeners {
         listener_route_counts.insert(listener.name.clone(), 0);
@@ -702,11 +707,22 @@ async fn reconcile(
         }
     }
 
-    // Convert to route table (spawn_blocking: to_route_table does sync DNS resolution)
-    let config_clone = merged_config.clone();
-    let route_table = tokio::task::spawn_blocking(move || config_clone.to_route_table())
-        .await
-        .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
+    let all_configs_clone = all_configs.clone();
+    let route_table = tokio::task::spawn_blocking(move || {
+        let mut combined = crate::routing::RouteTable::new();
+        for config in &all_configs_clone {
+            let rt = config.to_route_table()?;
+            // Merge listener scopes from each gateway's route table
+            combined.listener_scopes.extend(rt.listener_scopes);
+            combined.tcp_routes.extend(rt.tcp_routes);
+            combined.udp_routes.extend(rt.udp_routes);
+            combined.tls_routes.extend(rt.tls_routes);
+            combined.wildcard_tls_routes.extend(rt.wildcard_tls_routes);
+        }
+        Ok::<_, anyhow::Error>(combined)
+    })
+    .await
+    .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
 
     let route_table_ok = match route_table {
         Ok(route_table) => {
@@ -715,10 +731,10 @@ async fn reconcile(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
                 gw_ns,
                 gw_name,
-                merged_config.http_routes.len(),
-                merged_config.tcp_routes.len(),
-                merged_config.tls_routes.len(),
-                merged_config.udp_routes.len(),
+                result.config.http_routes.len(),
+                result.config.tcp_routes.len(),
+                result.config.tls_routes.len(),
+                result.config.udp_routes.len(),
             );
             status::update_gateway_status(
                 &ctx.client,
@@ -755,6 +771,8 @@ async fn reconcile(
     let programmed = route_table_ok;
     {
         use std::collections::BTreeMap;
+        // Use a per-gateway field manager so SSA doesn't overwrite parents from other gateways
+        let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
         // Key: (kind, namespace, name) → Vec of parent statuses
         let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> = BTreeMap::new();
         for ra in &result.route_status {
@@ -781,22 +799,22 @@ async fn reconcile(
             match *kind {
                 "HTTPRoute" => {
                     status::update_route_status::<HTTPRoute>(
-                        &ctx.client, name, ns, parents,
+                        &ctx.client, name, ns, parents, &field_manager,
                     ).await;
                 }
                 "TCPRoute" => {
                     status::update_route_status::<TCPRoute>(
-                        &ctx.client, name, ns, parents,
+                        &ctx.client, name, ns, parents, &field_manager,
                     ).await;
                 }
                 "TLSRoute" => {
                     status::update_route_status::<TLSRoute>(
-                        &ctx.client, name, ns, parents,
+                        &ctx.client, name, ns, parents, &field_manager,
                     ).await;
                 }
                 "UDPRoute" => {
                     status::update_route_status::<UDPRoute>(
-                        &ctx.client, name, ns, parents,
+                        &ctx.client, name, ns, parents, &field_manager,
                     ).await;
                 }
                 _ => {}

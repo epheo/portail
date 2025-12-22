@@ -308,6 +308,10 @@ pub enum HttpRouteFilter {
         #[serde(rename = "requestMirror")]
         config: RequestMirrorConfig,
     },
+    BackendRequestHeaderModifier {
+        #[serde(rename = "backendRequestHeaderModifier")]
+        config: HeaderModifierConfig,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

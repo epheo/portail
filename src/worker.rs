@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::health::HealthRegistry;
-use crate::http_filters::{apply_request_modifications, apply_response_header_mods, dispatch_mirrors};
+use crate::http_filters::{apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors};
 use crate::http_parser::find_header_end;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
@@ -291,13 +291,24 @@ async fn handle_http_forward(
         if let Some(ref fd) = filter_data {
             let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
             if has_mods {
-                let modified = apply_request_modifications(
-                    &buf[..request_bytes],
+                let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+                let modified_headers = apply_request_header_modifications(
+                    &buf[..header_end],
                     fd.request_header_mods.as_ref(),
                     fd.url_rewrite.as_ref(),
                 );
-                if !fd.mirror_addrs.is_empty() { dispatch_mirrors(&fd.mirror_addrs, &modified); }
-                backend.write_all(&modified).await?;
+                // Mirror needs full request (headers + body)
+                if !fd.mirror_addrs.is_empty() {
+                    let mut mirror_data = modified_headers.clone();
+                    mirror_data.extend_from_slice(&buf[header_end..request_bytes]);
+                    dispatch_mirrors(&fd.mirror_addrs, &mirror_data);
+                }
+                // Send modified headers, then original body — zero-copy for body
+                backend.write_all(&modified_headers).await?;
+                let body = &buf[header_end..request_bytes];
+                if !body.is_empty() {
+                    backend.write_all(body).await?;
+                }
             } else {
                 if !fd.mirror_addrs.is_empty() { dispatch_mirrors(&fd.mirror_addrs, &buf[..request_bytes]); }
                 backend.write_all(&buf[..request_bytes]).await?;

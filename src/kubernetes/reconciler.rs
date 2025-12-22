@@ -2491,13 +2491,13 @@ mod tests {
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
 
-        let rule = rt.find_http_route("app.example.com", "GET", "/health", &[], "").unwrap();
+        let rule = rt.find_http_route("app.example.com", "GET", "/health", &[], "", 8080).unwrap();
         assert_eq!(rule.backends[0].socket_addr.port(), 3001);
 
-        let rule = rt.find_http_route("app.example.com", "GET", "/api/users", &[], "").unwrap();
+        let rule = rt.find_http_route("app.example.com", "GET", "/api/users", &[], "", 8080).unwrap();
         assert_eq!(rule.backends[0].socket_addr.port(), 3000);
 
-        assert!(rt.find_http_route("other.com", "GET", "/api", &[], "").is_err());
+        assert!(rt.find_http_route("other.com", "GET", "/api", &[], "", 8080).is_err());
     }
 
     #[test]
@@ -2631,7 +2631,7 @@ mod tests {
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
 
-        let rule = rt.find_http_route("example.com", "GET", "/anything", &[], "").unwrap();
+        let rule = rt.find_http_route("example.com", "GET", "/anything", &[], "", 8080).unwrap();
         assert_eq!(rule.filters.len(), 1);
         assert!(rule.has_filters);
     }
@@ -2706,7 +2706,7 @@ mod tests {
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
 
-        let rule = rt.find_http_route("app.com", "GET", "/", &[], "").unwrap();
+        let rule = rt.find_http_route("app.com", "GET", "/", &[], "", 8080).unwrap();
         assert_eq!(rule.backends.len(), 2);
         assert_eq!(rule.total_weight, 4);
         assert_eq!(rule.cumulative_weights, vec![3, 4]);

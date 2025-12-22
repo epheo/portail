@@ -271,6 +271,7 @@ pub async fn update_route_status<K>(
     route_name: &str,
     route_namespace: &str,
     parents: &[RouteParentStatus],
+    field_manager: &str,
 )
 where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
@@ -344,7 +345,7 @@ where
     });
 
     match api
-        .patch_status(route_name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
+        .patch_status(route_name, &PatchParams::apply(field_manager).force(), &Patch::Apply(status))
         .await
     {
         Ok(_) => debug!("Updated {} {}/{} status ({} parents)", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name, parents.len()),

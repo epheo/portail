@@ -22,18 +22,15 @@ pub(crate) fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
     }
 }
 
-/// Apply request modifications: header mods and/or URL rewrite.
-/// Operates on raw bytes — no intermediate String allocations.
-pub(crate) fn apply_request_modifications(
-    original: &[u8],
+/// Apply request header modifications only — returns modified headers (including trailing \r\n\r\n).
+/// Body bytes are NOT included; the caller sends them separately from the original buffer.
+/// This keeps body handling zero-copy on the filter path.
+pub(crate) fn apply_request_header_modifications(
+    header_region: &[u8],
     header_mods: Option<&HeaderModifications>,
     url_rewrite: Option<&URLRewrite>,
 ) -> Vec<u8> {
-    let header_end = find_header_end(original).unwrap_or(original.len());
-    let header_region = &original[..header_end];
-    let body = &original[header_end..];
-
-    let mut out = Vec::with_capacity(original.len() + 256);
+    let mut out = Vec::with_capacity(header_region.len() + 256);
     let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
 
     // Process line by line on raw bytes
@@ -139,7 +136,22 @@ pub(crate) fn apply_request_modifications(
     }
 
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
+    out
+}
+
+/// Apply request modifications: header mods and/or URL rewrite.
+/// Returns full modified request (headers + body). Used for mirror dispatch
+/// where a complete copy is needed, and for backwards compatibility in tests.
+pub(crate) fn apply_request_modifications(
+    original: &[u8],
+    header_mods: Option<&HeaderModifications>,
+    url_rewrite: Option<&URLRewrite>,
+) -> Vec<u8> {
+    let header_end = find_header_end(original).unwrap_or(original.len());
+    let mut out = apply_request_header_modifications(
+        &original[..header_end], header_mods, url_rewrite,
+    );
+    out.extend_from_slice(&original[header_end..]);
     out
 }
 
