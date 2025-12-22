@@ -247,23 +247,30 @@ pub async fn update_gateway_class_status(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Per-parent status entry for a route.
+pub struct RouteParentStatus {
+    pub controller_name: String,
+    pub gateway_name: String,
+    pub gateway_namespace: String,
+    pub section_name: Option<String>,
+    pub accepted: bool,
+    pub accepted_reason: String,
+    pub message: String,
+    pub refs_resolved: bool,
+    pub refs_reason: String,
+    pub refs_message: String,
+    pub programmed: bool,
+    pub generation: Option<i64>,
+}
+
+/// Update the status of a route resource with all parent statuses in a single patch.
+/// This prevents SSA from overwriting previous parent entries when a route
+/// references multiple listeners or gateways.
 pub async fn update_route_status<K>(
     client: &Client,
     route_name: &str,
     route_namespace: &str,
-    controller_name: &str,
-    gateway_name: &str,
-    gateway_namespace: &str,
-    section_name: Option<&str>,
-    accepted: bool,
-    accepted_reason: &str,
-    message: &str,
-    refs_resolved: bool,
-    refs_reason: &str,
-    refs_message: &str,
-    programmed: bool,
-    generation: Option<i64>,
+    parents: &[RouteParentStatus],
 )
 where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
@@ -277,15 +284,48 @@ where
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let mut parent_ref = serde_json::json!({
-        "group": "gateway.networking.k8s.io",
-        "kind": "Gateway",
-        "name": gateway_name,
-        "namespace": gateway_namespace,
-    });
-    if let Some(section) = section_name {
-        parent_ref["sectionName"] = serde_json::json!(section);
-    }
+    let parent_entries: Vec<serde_json::Value> = parents.iter().map(|p| {
+        let mut parent_ref = serde_json::json!({
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "name": p.gateway_name,
+            "namespace": p.gateway_namespace,
+        });
+        if let Some(section) = &p.section_name {
+            parent_ref["sectionName"] = serde_json::json!(section);
+        }
+
+        serde_json::json!({
+            "controllerName": p.controller_name,
+            "parentRef": parent_ref,
+            "conditions": [
+                {
+                    "type": "Accepted",
+                    "status": if p.accepted { "True" } else { "False" },
+                    "reason": p.accepted_reason,
+                    "message": p.message,
+                    "lastTransitionTime": now,
+                    "observedGeneration": p.generation,
+                },
+                {
+                    "type": "ResolvedRefs",
+                    "status": if p.refs_resolved { "True" } else { "False" },
+                    "reason": p.refs_reason,
+                    "message": p.refs_message,
+                    "lastTransitionTime": now,
+                    "observedGeneration": p.generation,
+                },
+                {
+                    "type": "Programmed",
+                    "status": if p.programmed { "True" } else { "False" },
+                    "reason": if p.programmed { "Programmed" } else { "Invalid" },
+                    "message": if p.programmed { "Route programmed into data plane" } else { "Route not yet programmed" },
+                    "lastTransitionTime": now,
+                    "observedGeneration": p.generation,
+                },
+            ],
+        })
+    }).collect();
 
     // Derive apiVersion and kind from the concrete K type
     let api_version = <K as kube::Resource>::api_version(&Default::default()).to_string();
@@ -299,38 +339,7 @@ where
             "namespace": route_namespace,
         },
         "status": {
-            "parents": [
-                {
-                    "controllerName": controller_name,
-                    "parentRef": parent_ref,
-                    "conditions": [
-                        {
-                            "type": "Accepted",
-                            "status": if accepted { "True" } else { "False" },
-                            "reason": accepted_reason,
-                            "message": message,
-                            "lastTransitionTime": now,
-                            "observedGeneration": generation,
-                        },
-                        {
-                            "type": "ResolvedRefs",
-                            "status": if refs_resolved { "True" } else { "False" },
-                            "reason": refs_reason,
-                            "message": refs_message,
-                            "lastTransitionTime": now,
-                            "observedGeneration": generation,
-                        },
-                        {
-                            "type": "Programmed",
-                            "status": if programmed { "True" } else { "False" },
-                            "reason": if programmed { "Programmed" } else { "Invalid" },
-                            "message": if programmed { "Route programmed into data plane" } else { "Route not yet programmed" },
-                            "lastTransitionTime": now,
-                            "observedGeneration": generation,
-                        },
-                    ],
-                }
-            ],
+            "parents": parent_entries,
         }
     });
 
@@ -338,7 +347,7 @@ where
         .patch_status(route_name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
         .await
     {
-        Ok(_) => debug!("Updated {} {}/{} status", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name),
+        Ok(_) => debug!("Updated {} {}/{} status ({} parents)", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name, parents.len()),
         Err(e) => warn!("Failed to update route {}/{} status: {}", route_namespace, route_name, e),
     }
 }

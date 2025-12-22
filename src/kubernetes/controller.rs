@@ -749,92 +749,58 @@ async fn reconcile(
         }
     };
 
-    // Update per-route status
+    // Update per-route status — group by (kind, name, namespace) to write all
+    // parent statuses in a single patch (prevents SSA from overwriting previous entries
+    // when a route references multiple listeners/gateways).
     let programmed = route_table_ok;
-    for ra in &result.route_status {
-        let route_programmed = ra.accepted && programmed;
-        match ra.kind {
-            "HTTPRoute" => {
-                status::update_route_status::<HTTPRoute>(
-                    &ctx.client,
-                    &ra.name,
-                    &ra.namespace,
-                    &ctx.controller_name,
-                    &gw_name,
-                    &gw_ns,
-                    ra.section_name.as_deref(),
-                    ra.accepted,
-                    &ra.accepted_reason,
-                    &ra.message,
-                    ra.refs_resolved,
-                    &ra.refs_reason,
-                    &ra.refs_message,
-                    route_programmed,
-                    ra.generation,
-                )
-                .await;
+    {
+        use std::collections::BTreeMap;
+        // Key: (kind, namespace, name) → Vec of parent statuses
+        let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> = BTreeMap::new();
+        for ra in &result.route_status {
+            let route_programmed = ra.accepted && programmed;
+            grouped.entry((ra.kind, &ra.namespace, &ra.name)).or_default().push(
+                status::RouteParentStatus {
+                    controller_name: ctx.controller_name.clone(),
+                    gateway_name: gw_name.clone(),
+                    gateway_namespace: gw_ns.clone(),
+                    section_name: ra.section_name.clone(),
+                    accepted: ra.accepted,
+                    accepted_reason: ra.accepted_reason.clone(),
+                    message: ra.message.clone(),
+                    refs_resolved: ra.refs_resolved,
+                    refs_reason: ra.refs_reason.clone(),
+                    refs_message: ra.refs_message.clone(),
+                    programmed: route_programmed,
+                    generation: ra.generation,
+                },
+            );
+        }
+
+        for ((kind, ns, name), parents) in &grouped {
+            match *kind {
+                "HTTPRoute" => {
+                    status::update_route_status::<HTTPRoute>(
+                        &ctx.client, name, ns, parents,
+                    ).await;
+                }
+                "TCPRoute" => {
+                    status::update_route_status::<TCPRoute>(
+                        &ctx.client, name, ns, parents,
+                    ).await;
+                }
+                "TLSRoute" => {
+                    status::update_route_status::<TLSRoute>(
+                        &ctx.client, name, ns, parents,
+                    ).await;
+                }
+                "UDPRoute" => {
+                    status::update_route_status::<UDPRoute>(
+                        &ctx.client, name, ns, parents,
+                    ).await;
+                }
+                _ => {}
             }
-            "TCPRoute" => {
-                status::update_route_status::<TCPRoute>(
-                    &ctx.client,
-                    &ra.name,
-                    &ra.namespace,
-                    &ctx.controller_name,
-                    &gw_name,
-                    &gw_ns,
-                    ra.section_name.as_deref(),
-                    ra.accepted,
-                    &ra.accepted_reason,
-                    &ra.message,
-                    ra.refs_resolved,
-                    &ra.refs_reason,
-                    &ra.refs_message,
-                    route_programmed,
-                    ra.generation,
-                )
-                .await;
-            }
-            "TLSRoute" => {
-                status::update_route_status::<TLSRoute>(
-                    &ctx.client,
-                    &ra.name,
-                    &ra.namespace,
-                    &ctx.controller_name,
-                    &gw_name,
-                    &gw_ns,
-                    ra.section_name.as_deref(),
-                    ra.accepted,
-                    &ra.accepted_reason,
-                    &ra.message,
-                    ra.refs_resolved,
-                    &ra.refs_reason,
-                    &ra.refs_message,
-                    route_programmed,
-                    ra.generation,
-                )
-                .await;
-            }
-            "UDPRoute" => {
-                status::update_route_status::<UDPRoute>(
-                    &ctx.client,
-                    &ra.name,
-                    &ra.namespace,
-                    &ctx.controller_name,
-                    &gw_name,
-                    &gw_ns,
-                    ra.section_name.as_deref(),
-                    ra.accepted,
-                    &ra.accepted_reason,
-                    &ra.message,
-                    ra.refs_resolved,
-                    &ra.refs_reason,
-                    &ra.refs_message,
-                    route_programmed,
-                    ra.generation,
-                )
-                .await;
-            }
-            _ => {}
         }
     }
 
