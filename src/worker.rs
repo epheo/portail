@@ -101,33 +101,64 @@ pub async fn run_worker(
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();
 
-                        if tls_passthrough {
+                        if tls_passthrough && acceptor.is_none() {
+                            // Pure passthrough mode (no TLS termination cert available)
                             tokio::spawn(async move {
                                 if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes, health).await {
                                     debug!("TLS passthrough from {} closed: {}", peer, _e);
                                 }
                             });
                         } else if let Some(acceptor) = acceptor {
+                            // TLS termination mode — but first check if this SNI
+                            // should be passed through instead of terminated.
+                            // This handles the case where both HTTPS/Terminate and
+                            // TLS/Passthrough listeners share the same port.
                             let selector = shared_selector.clone();
                             tokio::spawn(async move {
-                                match acceptor.accept(tcp_stream).await {
-                                    Ok(tls_stream) => {
-                                        let conn = Connection::Tls { inner: tls_stream };
-                                        let state = ConnectionState {
-                                            server_port,
-                                            routes,
-                                            pool: BackendPool::new(max_idle_per_backend, connect_timeout),
-                                            selector,
-                                            health,
-                                            is_tls: true,
-                                            header_buf: Vec::with_capacity(1024),
-                                        };
-                                        if let Err(_e) = handle_connection(conn, peer, state).await {
-                                            debug!("TLS connection from {} closed: {}", peer, _e);
+                                // Peek ClientHello for SNI to decide dispatch mode
+                                let should_passthrough = {
+                                    let mut peek_buf = [0u8; 16384];
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        tcp_stream.peek(&mut peek_buf),
+                                    ).await {
+                                        Ok(Ok(n)) if n > 0 => {
+                                            let sni = crate::tls::extract_sni(&peek_buf[..n]);
+                                            if let Some(ref hostname) = sni {
+                                                let rt = routes.load();
+                                                rt.has_tls_passthrough_route(hostname, server_port)
+                                            } else {
+                                                false
+                                            }
                                         }
+                                        _ => false,
                                     }
-                                    Err(e) => {
-                                        debug!("TLS handshake failed from {}: {}", peer, e);
+                                };
+
+                                if should_passthrough {
+                                    if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes, health).await {
+                                        debug!("TLS passthrough from {} closed: {}", peer, _e);
+                                    }
+                                } else {
+                                    match acceptor.accept(tcp_stream).await {
+                                        Ok(tls_stream) => {
+                                            let conn = Connection::Tls { inner: tls_stream };
+                                            let state = ConnectionState {
+                                                server_port,
+                                                routes,
+                                                pool: BackendPool::new(max_idle_per_backend, connect_timeout),
+                                                selector,
+                                                health,
+                                                is_tls: true,
+                                                header_buf: Vec::with_capacity(1024),
+                                            };
+                                            if let Err(_e) = handle_connection(conn, peer, state).await {
+                                                debug!("TLS connection from {} closed: {}", peer, _e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("TLS handshake failed from {}: {}", peer, e);
+                                        }
                                     }
                                 }
                             });

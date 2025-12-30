@@ -412,6 +412,22 @@ impl RouteTable {
             .and_then(|backends| backends.first())
             .map(|b| b.socket_addr)
     }
+
+    /// Check if a TLS passthrough route exists for this SNI hostname.
+    /// Used by the worker to dynamically decide between passthrough and termination.
+    pub fn has_tls_passthrough_route(&self, sni: &str, _server_port: u16) -> bool {
+        let sni_lower = sni.to_ascii_lowercase();
+        if self.tls_routes.contains_key(&sni_lower) {
+            return true;
+        }
+        if let Some(dot_pos) = sni_lower.find('.') {
+            let parent = &sni_lower[dot_pos + 1..];
+            if self.wildcard_tls_routes.contains_key(parent) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Default for RouteTable {
