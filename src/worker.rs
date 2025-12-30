@@ -60,7 +60,7 @@ struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: BackendPool,
-    selector: BackendSelector,
+    selector: Arc<std::sync::Mutex<BackendSelector>>,
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
@@ -83,6 +83,10 @@ pub async fn run_worker(
 ) {
     info!("Worker {} accepting on port {}", worker_id, server_port);
 
+    // Shared selector across all connections in this worker so weighted routing
+    // counters increment properly across separate TCP connections.
+    let shared_selector = Arc::new(std::sync::Mutex::new(BackendSelector::new()));
+
     loop {
         tokio::select! {
             biased;
@@ -104,6 +108,7 @@ pub async fn run_worker(
                                 }
                             });
                         } else if let Some(acceptor) = acceptor {
+                            let selector = shared_selector.clone();
                             tokio::spawn(async move {
                                 match acceptor.accept(tcp_stream).await {
                                     Ok(tls_stream) => {
@@ -112,7 +117,7 @@ pub async fn run_worker(
                                             server_port,
                                             routes,
                                             pool: BackendPool::new(max_idle_per_backend, connect_timeout),
-                                            selector: BackendSelector::new(),
+                                            selector,
                                             health,
                                             is_tls: true,
                                             header_buf: Vec::with_capacity(1024),
@@ -127,11 +132,12 @@ pub async fn run_worker(
                                 }
                             });
                         } else {
+                            let selector = shared_selector.clone();
                             let state = ConnectionState {
                                 server_port,
                                 routes,
                                 pool: BackendPool::new(max_idle_per_backend, connect_timeout),
-                                selector: BackendSelector::new(),
+                                selector,
                                 health,
                                 is_tls: false,
                                 header_buf: Vec::with_capacity(1024),
@@ -189,7 +195,8 @@ async fn handle_connection(
     loop {
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
+            let mut selector = state.selector.lock().unwrap();
+            request_processor::analyze_request(&route_table, &mut selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {
@@ -353,7 +360,8 @@ async fn handle_http_forward(
 
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &mut state.selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
+            let mut selector = state.selector.lock().unwrap();
+            request_processor::analyze_request(&route_table, &mut selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {

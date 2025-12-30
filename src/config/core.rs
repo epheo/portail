@@ -328,6 +328,7 @@ fn build_routing_rule(
 /// - Listener "*.example.com" accepts "foo.example.com" and "*.example.com"
 /// - Listener "example.com" accepts only "example.com"
 /// - Route "*.example.com" is within listener "*.example.com"
+/// - Route "*.specific.com" intersects with listener "very.specific.com"
 fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
     let lh = listener_hostname.to_ascii_lowercase();
     let rh = route_hostname.to_ascii_lowercase();
@@ -343,13 +344,25 @@ fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
                 && rh.as_bytes()[rh.len() - listener_parent.len() - 1] == b'.'
         }
     } else {
-        // Exact listener: route hostname must match exactly (or route can be more specific wildcard)
-        rh == lh
+        // Exact listener hostname
+        if let Some(route_parent) = rh.strip_prefix("*.") {
+            // Exact listener "very.specific.com", wildcard route "*.specific.com"
+            // -> match if the listener hostname is under the route's wildcard scope
+            lh.ends_with(route_parent) && lh.len() > route_parent.len()
+                && lh.as_bytes()[lh.len() - route_parent.len() - 1] == b'.'
+        } else {
+            // Both exact -> must match exactly
+            rh == lh
+        }
     }
 }
 
 /// Compute the intersection of listener hostname scope with route hostnames.
-/// Returns the set of route hostnames that are valid within the listener's scope.
+/// Returns the set of effective hostnames that result from the intersection.
+/// Per Gateway API spec, the intersection is the more specific of the two:
+///   - listener "very.specific.com" ∩ route "*.specific.com" → "very.specific.com"
+///   - listener "*.example.com" ∩ route "foo.example.com" → "foo.example.com"
+///   - listener "*.example.com" ∩ route "*.example.com" → "*.example.com"
 fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) -> Vec<String> {
     match &listener.hostname {
         None => {
@@ -357,9 +370,23 @@ fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) ->
             route_hostnames.to_vec()
         }
         Some(listener_hostname) => {
+            let lh = listener_hostname.to_ascii_lowercase();
             route_hostnames.iter()
                 .filter(|rh| hostname_matches(listener_hostname, rh))
-                .cloned()
+                .map(|rh| {
+                    let rh_lower = rh.to_ascii_lowercase();
+                    // Return the more specific of the two hostnames
+                    if rh_lower.starts_with("*.") && !lh.starts_with("*.") {
+                        // Route is wildcard, listener is exact → use listener (more specific)
+                        lh.clone()
+                    } else if lh.starts_with("*.") && !rh_lower.starts_with("*.") {
+                        // Listener is wildcard, route is exact → use route (more specific)
+                        rh_lower
+                    } else {
+                        // Both same type → use route hostname
+                        rh_lower
+                    }
+                })
                 .collect()
         }
     }
