@@ -33,6 +33,11 @@ pub(crate) fn apply_request_header_modifications(
     let mut out = Vec::with_capacity(header_region.len() + 256);
     let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
 
+    // Track which set headers were applied (matched existing headers)
+    let mut set_applied: Vec<bool> = header_mods
+        .map(|m| vec![false; m.set.len()])
+        .unwrap_or_default();
+
     // Process line by line on raw bytes
     let mut pos = 0;
     let mut first_line = true;
@@ -112,7 +117,9 @@ pub(crate) fn apply_request_header_modifications(
             if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
                 continue;
             }
-            if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name_str)) {
+            if let Some((idx, set_header)) = mods.set.iter().enumerate()
+                .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str)) {
+                set_applied[idx] = true;
                 out.extend_from_slice(set_header.name.as_bytes());
                 out.extend_from_slice(b": ");
                 out.extend_from_slice(set_header.value.as_bytes());
@@ -125,8 +132,17 @@ pub(crate) fn apply_request_header_modifications(
         out.extend_from_slice(b"\r\n");
     }
 
-    // Add headers
+    // Add headers from "set" that didn't match any existing header (set = replace OR add)
     if let Some(mods) = header_mods {
+        for (idx, h) in mods.set.iter().enumerate() {
+            if !set_applied[idx] {
+                out.extend_from_slice(h.name.as_bytes());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(h.value.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        // Add headers from "add" (always appended)
         for h in mods.add.iter() {
             out.extend_from_slice(h.name.as_bytes());
             out.extend_from_slice(b": ");
@@ -139,21 +155,6 @@ pub(crate) fn apply_request_header_modifications(
     out
 }
 
-/// Apply request modifications: header mods and/or URL rewrite.
-/// Returns full modified request (headers + body). Used for mirror dispatch
-/// where a complete copy is needed, and for backwards compatibility in tests.
-pub(crate) fn apply_request_modifications(
-    original: &[u8],
-    header_mods: Option<&HeaderModifications>,
-    url_rewrite: Option<&URLRewrite>,
-) -> Vec<u8> {
-    let header_end = find_header_end(original).unwrap_or(original.len());
-    let mut out = apply_request_header_modifications(
-        &original[..header_end], header_mods, url_rewrite,
-    );
-    out.extend_from_slice(&original[header_end..]);
-    out
-}
 
 /// Apply response header modifications to buffered response headers.
 /// Returns the modified header region (including trailing \r\n\r\n).
@@ -162,6 +163,7 @@ pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModificati
     let mut out = Vec::with_capacity(headers.len() + 256);
     let mut pos = 0;
     let mut first_line = true;
+    let mut set_applied = vec![false; mods.set.len()];
 
     while pos < headers.len() {
         let line_start = pos;
@@ -211,7 +213,9 @@ pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModificati
             continue;
         }
 
-        if let Some(set_header) = mods.set.iter().find(|h| h.name.eq_ignore_ascii_case(name_str)) {
+        if let Some((idx, set_header)) = mods.set.iter().enumerate()
+            .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str)) {
+            set_applied[idx] = true;
             out.extend_from_slice(set_header.name.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(set_header.value.as_bytes());
@@ -223,7 +227,16 @@ pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModificati
         out.extend_from_slice(b"\r\n");
     }
 
-    // Add headers
+    // Add "set" headers that didn't match any existing header (set = replace OR add)
+    for (idx, h) in mods.set.iter().enumerate() {
+        if !set_applied[idx] {
+            out.extend_from_slice(h.name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(h.value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    // Add headers (always appended)
     for h in mods.add.iter() {
         out.extend_from_slice(h.name.as_bytes());
         out.extend_from_slice(b": ");
@@ -243,12 +256,12 @@ mod tests {
 
     #[test]
     fn test_apply_modifications_path_rewrite() {
-        let request = b"GET /old/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let headers = b"GET /old/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: None,
             path: Some(RewrittenPath::Full("/new/path".to_string())),
         };
-        let result = apply_request_modifications(request, None, Some(&rewrite));
+        let result = apply_request_header_modifications(headers, None, Some(&rewrite));
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.starts_with("GET /new/path HTTP/1.1\r\n"));
@@ -257,12 +270,12 @@ mod tests {
 
     #[test]
     fn test_apply_modifications_host_rewrite() {
-        let request = b"GET / HTTP/1.1\r\nHost: original.example.com\r\n\r\n";
+        let headers = b"GET / HTTP/1.1\r\nHost: original.example.com\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: Some("rewritten.example.com".to_string()),
             path: None,
         };
-        let result = apply_request_modifications(request, None, Some(&rewrite));
+        let result = apply_request_header_modifications(headers, None, Some(&rewrite));
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.contains("Host: rewritten.example.com"));
@@ -271,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_apply_modifications_combined() {
-        let request = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
+        let headers = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: Some("new.com".to_string()),
             path: Some(RewrittenPath::Full("/new".to_string())),
@@ -281,7 +294,7 @@ mod tests {
             set: std::sync::Arc::new(vec![]),
             remove: std::sync::Arc::new(vec!["User-Agent".to_string()]),
         };
-        let result = apply_request_modifications(request, Some(&mods), Some(&rewrite));
+        let result = apply_request_header_modifications(headers, Some(&mods), Some(&rewrite));
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.starts_with("GET /new HTTP/1.1\r\n"));
@@ -292,8 +305,8 @@ mod tests {
 
     #[test]
     fn test_apply_modifications_no_mods_passthrough() {
-        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let result = apply_request_modifications(request, None, None);
+        let headers = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = apply_request_header_modifications(headers, None, None);
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.starts_with("GET / HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: example.com"));

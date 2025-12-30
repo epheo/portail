@@ -259,12 +259,14 @@ fn build_rule_components(
 
     let mut backends = Vec::new();
     for backend_ref in &rule.backend_refs {
+        let backend_filters = convert_filters(&backend_ref.filters)?;
         match routing::Backend::with_weight(
             backend_ref.name.clone(),
             backend_ref.port,
             backend_ref.weight,
         ) {
-            Ok(backend) => {
+            Ok(mut backend) => {
+                backend.filters = backend_filters;
                 backends.push(backend);
                 tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
             }
@@ -408,25 +410,10 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                 )?;
                 Self::RequestMirror { backend_addr: backend.socket_addr }
             }
-            HttpRouteFilter::BackendRequestHeaderModifier { config } => {
-                // Same as RequestHeaderModifier — per Gateway API spec, identical structure
-                Self::RequestHeaderModifier {
-                    add: std::sync::Arc::new(config.add.clone()),
-                    set: std::sync::Arc::new(config.set.clone()),
-                    remove: std::sync::Arc::new(config.remove.clone()),
-                }
-            }
         })
     }
 }
 
-/// Extract the path string from an HttpURLRewritePath for redirect Location header
-fn rewrite_path_to_string(p: &HttpURLRewritePath) -> String {
-    match p {
-        HttpURLRewritePath::ReplaceFullPath { value } => value.clone(),
-        HttpURLRewritePath::ReplacePrefixMatch { value } => value.clone(),
-    }
-}
 
 impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
     fn from(p: &HttpURLRewritePath) -> Self {

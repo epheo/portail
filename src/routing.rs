@@ -76,14 +76,17 @@ impl ListenerScope {
             }
         }
 
-        // Try wildcard: strip first label (e.g. "foo.example.com" -> "example.com")
-        if let Some(dot_pos) = host.find('.') {
-            let parent = &host[dot_pos + 1..];
+        // Try wildcard: walk up domain labels (e.g. "foo.bar.example.com" ->
+        // try "bar.example.com", then "example.com") to find *.example.com routes
+        let mut remainder = host;
+        while let Some(dot_pos) = remainder.find('.') {
+            let parent = &remainder[dot_pos + 1..];
             if let Some(host_entry) = self.wildcard_http_routes.get(parent) {
                 if let Some(rule) = RouteTable::find_best_rule_match(&host_entry.rules, method, path, header_data, query_string) {
                     return Some(rule);
                 }
             }
+            remainder = parent;
         }
 
         // Try catch-all routes (hostname="*", matches any host)
@@ -99,7 +102,7 @@ impl ListenerScope {
     /// Add a route to this listener scope.
     fn add_route(&mut self, route_host: &str, mut rule: HttpRouteRule) {
         // Pre-compute metadata to avoid per-request work
-        rule.has_filters = !rule.filters.is_empty();
+        rule.has_filters = !rule.filters.is_empty() || rule.backends.iter().any(|b| !b.filters.is_empty());
         let mut cumulative = 0u64;
         rule.cumulative_weights = rule.backends.iter().map(|b| {
             cumulative += b.weight as u64;
@@ -327,14 +330,36 @@ impl RouteTable {
     }
 
     fn sort_rules(rules: &mut Vec<HttpRouteRule>) {
-        // Sort: exact > regex > prefix, then by path length desc
+        // Sort by specificity (most specific first):
+        // 1. Method presence (rules with method match first)
+        // 2. Path type: exact > regex > prefix
+        // 3. Path length (longer first)
+        // 4. Header matcher count (more matchers = higher priority)
+        // 5. Query param matcher count (more matchers = higher priority)
         rules.sort_by(|a, b| {
+            // 1. Path match type: exact > regex > prefix
             fn rank(t: &PathMatchType) -> u8 {
                 match t { PathMatchType::Exact => 0, PathMatchType::RegularExpression => 1, PathMatchType::Prefix => 2 }
             }
             let r = rank(&a.path_match_type).cmp(&rank(&b.path_match_type));
             if r != std::cmp::Ordering::Equal { return r; }
-            b.path.len().cmp(&a.path.len())
+
+            // 2. Path length (longer = more specific = higher priority)
+            let r = b.path.len().cmp(&a.path.len());
+            if r != std::cmp::Ordering::Equal { return r; }
+
+            // 3. Method match presence (rules with method > rules without)
+            let am = a.method_match.is_some() as u8;
+            let bm = b.method_match.is_some() as u8;
+            let r = bm.cmp(&am);
+            if r != std::cmp::Ordering::Equal { return r; }
+
+            // 4. Header matcher count (more matchers = higher priority)
+            let r = b.header_matches.len().cmp(&a.header_matches.len());
+            if r != std::cmp::Ordering::Equal { return r; }
+
+            // 5. Query param matcher count
+            b.query_param_matches.len().cmp(&a.query_param_matches.len())
         });
     }
 
@@ -532,6 +557,8 @@ pub struct HttpHeader {
 pub struct Backend {
     pub socket_addr: std::net::SocketAddr,
     pub weight: u32,
+    /// Per-backend filters (e.g. BackendRequestHeaderModifier)
+    pub filters: Vec<HttpFilter>,
 }
 
 impl Backend {
@@ -553,7 +580,7 @@ impl Backend {
                 .ok_or_else(|| anyhow!("No addresses found for hostname {}:{}", address, port))?
         };
 
-        Ok(Self { socket_addr, weight })
+        Ok(Self { socket_addr, weight, filters: vec![] })
     }
 }
 
@@ -629,7 +656,7 @@ mod tests {
     }
 
     fn backend(port: u16) -> Backend {
-        Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1 }
+        Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1, filters: vec![] }
     }
 
     fn rule(path_type: PathMatchType, path: &str, backends: Vec<Backend>) -> HttpRouteRule {
@@ -732,8 +759,8 @@ mod tests {
         rt.add_http_route("test.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
-                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
-                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
             ],
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();

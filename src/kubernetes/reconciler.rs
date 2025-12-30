@@ -6,7 +6,7 @@ use gateway_api::gateways::{
     GatewayListenersAllowedRoutesNamespacesFrom,
 };
 use gateway_api::httproutes::*;
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::referencegrants::{ReferenceGrant, ReferenceGrantSpec, ReferenceGrantFrom, ReferenceGrantTo};
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
@@ -195,6 +195,12 @@ fn hostname_matches(pattern: &str, candidate: &str) -> bool {
 
 /// Check if a route targets a specific listener by sectionName, and if so, whether
 /// the listener's namespace/hostname/kind policy allows the route.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RouteAllowResult {
+    Allowed,
+    Rejected(&'static str),
+}
+
 fn route_allowed_for_listener<T: ParentRefAccess>(
     parent_refs: &Option<Vec<T>>,
     gateway_name: &str,
@@ -204,33 +210,36 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
     route_kind: &str,
     route_hostnames: &[String],
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
-) -> bool {
+) -> RouteAllowResult {
     let refs = match parent_refs.as_ref() {
         Some(r) => r,
-        None => return false,
+        None => return RouteAllowResult::Rejected("NoMatchingParent"),
     };
-    refs.iter().any(|pr| {
+    let mut best_reason: &str = "NoMatchingParent";
+    for pr in refs {
         if !parent_ref_matches_gateway(pr, gateway_name, gateway_ns) {
-            return false;
+            continue;
         }
-        // If sectionName is specified, it must match this listener
         if let Some(section) = pr.ref_section_name() {
             if section != listener.name {
-                return false;
+                continue;
             }
         }
-        // If port is specified, it must match this listener's port
         if let Some(port) = pr.ref_port() {
             if port != listener.port as i32 {
-                return false;
+                continue;
             }
         }
-        // Check hostname intersection (only for HTTP/HTTPS/TLS listeners)
         if !hostnames_intersect(listener.hostname.as_deref(), route_hostnames) {
-            return false;
+            best_reason = "NoMatchingListenerHostname";
+            continue;
         }
-        is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespace_labels)
-    })
+        if is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespace_labels) {
+            return RouteAllowResult::Allowed;
+        }
+        best_reason = "NotAllowedByListeners";
+    }
+    RouteAllowResult::Rejected(best_reason)
 }
 
 /// Convert Kubernetes Gateway API resources into a PortailConfig.
@@ -269,6 +278,7 @@ pub fn reconcile_to_config(
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |r| r.spec.hostnames.clone().unwrap_or_default(),
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
+        |c, invalid: &HashSet<(String, u16)>| { for rule in &mut c.rules { rule.backend_refs.retain(|b| !invalid.contains(&(b.name.clone(), b.port))); } },
         &mut route_status,
     );
 
@@ -288,6 +298,7 @@ pub fn reconcile_to_config(
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |_r| vec![],  // TCPRoute has no hostname matching
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
+        |c, invalid: &HashSet<(String, u16)>| { for rule in &mut c.rules { rule.backend_refs.retain(|b| !invalid.contains(&(b.name.clone(), b.port))); } },
         &mut route_status,
     );
 
@@ -307,6 +318,7 @@ pub fn reconcile_to_config(
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |r| r.spec.hostnames.clone(),
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
+        |c, invalid: &HashSet<(String, u16)>| { for rule in &mut c.rules { rule.backend_refs.retain(|b| !invalid.contains(&(b.name.clone(), b.port))); } },
         &mut route_status,
     );
 
@@ -326,6 +338,7 @@ pub fn reconcile_to_config(
         |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
         |_r| vec![],  // UDPRoute has no hostname matching
         |c| c.rules.iter().flat_map(|r| r.backend_refs.iter().map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))).collect(),
+        |c, invalid: &HashSet<(String, u16)>| { for rule in &mut c.rules { rule.backend_refs.retain(|b| !invalid.contains(&(b.name.clone(), b.port))); } },
         &mut route_status,
     );
 
@@ -359,6 +372,7 @@ fn collect_routes<R, P, C>(
     get_parent_section_names: impl Fn(&R) -> Vec<Option<String>>,
     get_hostnames: impl Fn(&R) -> Vec<String>,
     get_backend_refs: impl Fn(&C) -> Vec<(&str, u16, &str, &str)>,
+    remove_invalid_backends: impl Fn(&mut C, &HashSet<(String, u16)>),
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<C>
 where
@@ -376,8 +390,10 @@ where
 
         // Check namespace + hostname scoping against at least one listener
         let route_hostnames = get_hostnames(route);
-        let allowed = listeners.iter().any(|l| {
-            route_allowed_for_listener(
+        let mut allowed = false;
+        let mut rejection_reason = "NoMatchingParent";
+        for l in listeners {
+            match route_allowed_for_listener(
                 get_parent_refs(route),
                 gateway_name,
                 l,
@@ -386,18 +402,38 @@ where
                 kind,
                 &route_hostnames,
                 namespace_labels,
-            )
-        });
+            ) {
+                RouteAllowResult::Allowed => {
+                    allowed = true;
+                    break;
+                }
+                RouteAllowResult::Rejected(reason) => {
+                    let priority = |r: &str| match r {
+                        "NotAllowedByListeners" => 2,
+                        "NoMatchingListenerHostname" => 1,
+                        _ => 0,
+                    };
+                    if priority(reason) > priority(rejection_reason) {
+                        rejection_reason = reason;
+                    }
+                }
+            }
+        }
 
         if !allowed {
+            let message = match rejection_reason {
+                "NoMatchingListenerHostname" => "Route hostnames do not intersect with any listener hostname",
+                "NoMatchingParent" => "No matching listener found for route parentRef",
+                _ => "Route not allowed by any listener policy (namespace/hostname/kind)",
+            };
             for section_name in &section_names {
                 route_status.push(RouteAcceptance {
                     name: name.to_string(),
                     namespace: route_ns.to_string(),
                     kind,
                     accepted: false,
-                    accepted_reason: "NotAllowedByListeners".to_string(),
-                    message: "Route not allowed by any listener policy (namespace/hostname/kind)".to_string(),
+                    accepted_reason: rejection_reason.to_string(),
+                    message: message.to_string(),
                     refs_resolved: true,
                     refs_reason: "ResolvedRefs".to_string(),
                     refs_message: "All references resolved".to_string(),
@@ -409,13 +445,14 @@ where
         }
 
         match convert(route) {
-            Ok(config) => {
+            Ok(mut config) => {
                 let mut refs_resolved = true;
                 let mut refs_messages = Vec::new();
                 let mut refs_reason = "ResolvedRefs".to_string();
+                let mut invalid_backends: HashSet<(String, u16)> = HashSet::new();
 
                 // Validate backend refs: check group/kind, cross-namespace grants, and service existence
-                for (backend_name, _port, group, ref_kind) in get_backend_refs(&config) {
+                for (backend_name, port, group, ref_kind) in get_backend_refs(&config) {
                     // Check group/kind — must be core ("") group and "Service" kind (or defaults)
                     if (group != "" && group != "core") || (ref_kind != "Service" && ref_kind != "") {
                         refs_resolved = false;
@@ -423,6 +460,7 @@ where
                         refs_messages.push(format!(
                             "Unsupported backend ref group/kind: {}/{}", group, ref_kind
                         ));
+                        invalid_backends.insert((backend_name.to_string(), port));
                         continue;
                     }
 
@@ -440,6 +478,7 @@ where
                                 "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
                                 svc_name, svc_ns
                             ));
+                            invalid_backends.insert((backend_name.to_string(), port));
                             continue;
                         }
                         // Service existence check
@@ -449,8 +488,14 @@ where
                             refs_messages.push(format!(
                                 "Backend service {}.{} not found", svc_name, svc_ns
                             ));
+                            invalid_backends.insert((backend_name.to_string(), port));
                         }
                     }
+                }
+
+                // Remove invalid backends so the data plane returns 500 for them
+                if !invalid_backends.is_empty() {
+                    remove_invalid_backends(&mut config, &invalid_backends);
                 }
 
                 let refs_message = if refs_resolved {
@@ -983,6 +1028,7 @@ fn convert_mirror_config(
             weight: 1,
             group: rm.backend_ref.group.clone().unwrap_or_default(),
             kind: rm.backend_ref.kind.clone().unwrap_or_else(|| "Service".to_string()),
+            filters: vec![],
         },
     }
 }
@@ -994,7 +1040,38 @@ fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> Backend
         weight: br.weight.unwrap_or(1) as u32,
         group: br.group.clone().unwrap_or_default(),
         kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
+        filters: convert_backend_ref_filters(&br.filters),
     }
+}
+
+/// Convert per-backend filters (e.g. BackendRequestHeaderModifier).
+fn convert_backend_ref_filters(filters: &Option<Vec<HTTPRouteRulesBackendRefsFilters>>) -> Vec<HttpRouteFilter> {
+    let Some(filters) = filters else { return vec![] };
+    filters.iter().filter_map(|f| {
+        match f.r#type {
+            HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+                let hm = f.request_header_modifier.as_ref()?;
+                Some(HttpRouteFilter::RequestHeaderModifier {
+                    config: HeaderModifierConfig {
+                        add: hm.add.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
+                        set: hm.set.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
+                        remove: hm.remove.clone().unwrap_or_default(),
+                    }
+                })
+            }
+            HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+                let hm = f.response_header_modifier.as_ref()?;
+                Some(HttpRouteFilter::ResponseHeaderModifier {
+                    config: HeaderModifierConfig {
+                        add: hm.add.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
+                        set: hm.set.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
+                        remove: hm.remove.clone().unwrap_or_default(),
+                    }
+                })
+            }
+            _ => None,  // Other filter types not valid at backend level
+        }
+    }).collect()
 }
 
 fn convert_timeouts(t: &HTTPRouteRulesTimeouts) -> HttpRouteTimeouts {
@@ -1027,6 +1104,7 @@ fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<TcpRouteCon
                     weight: br.weight.unwrap_or(1) as u32,
                     group: br.group.clone().unwrap_or_default(),
                     kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
+                    filters: vec![],
                 })
                 .collect();
             TcpRouteRule { backend_refs }
@@ -1058,6 +1136,7 @@ fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<TlsRouteCon
                     weight: br.weight.unwrap_or(1) as u32,
                     group: br.group.clone().unwrap_or_default(),
                     kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
+                    filters: vec![],
                 })
                 .collect();
             TlsRouteRule { backend_refs }
@@ -1089,6 +1168,7 @@ fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteCon
                     weight: br.weight.unwrap_or(1) as u32,
                     group: br.group.clone().unwrap_or_default(),
                     kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
+                    filters: vec![],
                 })
                 .collect();
             UdpRouteRule { backend_refs }
@@ -1110,7 +1190,21 @@ mod tests {
     fn default_ns_labels() -> HashMap<String, BTreeMap<String, String>> {
         let mut m = HashMap::new();
         m.insert("default".to_string(), BTreeMap::new());
+        m.insert("db".to_string(), BTreeMap::new());
+        m.insert("other-ns".to_string(), BTreeMap::new());
         m
+    }
+
+    fn test_known_services() -> HashSet<(String, String)> {
+        [
+            ("api-svc", "default"), ("web-svc", "default"), ("db-svc", "default"),
+            ("my-svc", "default"), ("canary", "default"), ("stable", "default"),
+            ("coredns", "default"), ("backend-tls", "default"),
+            ("postgres-primary", "default"), ("postgres-replica", "db"),
+            ("echo-svc", "default"), ("mirror-svc", "default"),
+            ("svc", "default"), ("v1-svc", "default"), ("v2-svc", "default"),
+            ("127.0.0.1", "default"),
+        ].iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
     }
 
     /// Replace DNS-style backend names (e.g. "127.0.0.1.default.svc") with raw
@@ -1223,7 +1317,7 @@ mod tests {
         let ns_labels = default_ns_labels();
 
         let result =
-            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.gateway.name, "test-gw");
         assert_eq!(result.config.gateway.listeners.len(), 1);
@@ -1273,7 +1367,7 @@ mod tests {
             &[],
             &ns_labels,
             &[],
-            &HashSet::new(),
+            &test_known_services(),
             &HashMap::new(),
         )
         .unwrap();
@@ -1289,7 +1383,7 @@ mod tests {
         let ns_labels = default_ns_labels();
 
         let result =
-            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+            reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.gateway.listeners[0].protocol, Protocol::HTTP);
         assert_eq!(result.config.http_routes[0].rules.len(), 1);
@@ -1326,7 +1420,7 @@ mod tests {
         let mut ns_labels = default_ns_labels();
         ns_labels.insert("other-ns".to_string(), BTreeMap::new());
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert_eq!(result.config.http_routes.len(), 0);
         assert!(!result.route_status[0].accepted);
     }
@@ -1350,7 +1444,7 @@ mod tests {
         let mut ns_labels = default_ns_labels();
         ns_labels.insert("other-ns".to_string(), BTreeMap::new());
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert_eq!(result.config.http_routes.len(), 1);
         assert!(result.route_status[0].accepted);
     }
@@ -1380,11 +1474,11 @@ mod tests {
             BTreeMap::from([("env".to_string(), "prod".to_string())]),
         );
 
-        let result = reconcile_to_config(&gw, &[route.clone()], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route.clone()], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert_eq!(result.config.http_routes.len(), 1);
 
         ns_labels.insert("prod-ns".to_string(), BTreeMap::from([("env".to_string(), "staging".to_string())]));
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert_eq!(result.config.http_routes.len(), 0);
     }
 
@@ -1394,7 +1488,7 @@ mod tests {
     fn test_reconcile_no_routes() {
         let gw = test_gateway();
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.gateway.name, "test-gw");
         assert!(result.config.http_routes.is_empty());
@@ -1428,7 +1522,7 @@ mod tests {
             },
             status: None,
         };
-        let result = reconcile_to_config(&gw, &[orphan], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[orphan], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert!(result.config.http_routes.is_empty());
     }
 
@@ -1515,7 +1609,7 @@ mod tests {
     fn test_multiple_listeners() {
         let gw = multi_listener_gateway();
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.gateway.listeners.len(), 5);
         assert_eq!(result.config.gateway.listeners[0].protocol, Protocol::HTTP);
@@ -1529,7 +1623,7 @@ mod tests {
     fn test_tls_terminate_listener() {
         let gw = multi_listener_gateway();
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         let https = &result.config.gateway.listeners[1];
         let tls = https.tls.as_ref().unwrap();
@@ -1541,7 +1635,7 @@ mod tests {
     fn test_tls_passthrough_listener() {
         let gw = multi_listener_gateway();
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         let tls_listener = &result.config.gateway.listeners[3];
         let tls = tls_listener.tls.as_ref().unwrap();
@@ -1571,7 +1665,7 @@ mod tests {
             status: None,
         };
         let ns_labels = default_ns_labels();
-        assert!(reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).is_err());
+        assert!(reconcile_to_config(&gw, &[], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).is_err());
     }
 
     // ---- TCP route conversion ----
@@ -1615,7 +1709,28 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[], &[tcp_route], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        // ReferenceGrant allowing TCPRoute in default NS to reference Service in db NS
+        let ref_grant = ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("allow-db".to_string()),
+                namespace: Some("db".to_string()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "TCPRoute".to_string(),
+                    namespace: "default".to_string(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: "".to_string(),
+                    kind: "Service".to_string(),
+                    name: None,
+                }],
+            },
+        };
+
+        let result = reconcile_to_config(&gw, &[], &[tcp_route], &[], &[], &ns_labels, &[ref_grant], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.tcp_routes.len(), 1);
         let rule = &result.config.tcp_routes[0].rules[0];
@@ -1658,7 +1773,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[], &[], &[tls_route], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[tls_route], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.tls_routes.len(), 1);
         assert_eq!(result.config.tls_routes[0].hostnames, vec!["secure.example.com", "*.internal.example.com"]);
@@ -1697,7 +1812,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[], &[], &[], &[udp_route], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[], &[], &[udp_route], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.udp_routes.len(), 1);
         assert_eq!(result.config.udp_routes[0].rules[0].backend_refs[0].name, "coredns.default.svc");
@@ -1741,7 +1856,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let m = &result.config.http_routes[0].rules[0].matches[0];
         assert_eq!(m.path.as_ref().unwrap().match_type, HttpPathMatchType::Exact);
         assert_eq!(m.path.as_ref().unwrap().value, "/health");
@@ -1782,7 +1897,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let m = &result.config.http_routes[0].rules[0].matches[0];
         assert_eq!(m.path.as_ref().unwrap().match_type, HttpPathMatchType::RegularExpression);
         assert_eq!(m.path.as_ref().unwrap().value, "/users/\\d+");
@@ -1837,7 +1952,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let headers = &result.config.http_routes[0].rules[0].matches[0].headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].name, "X-Env");
@@ -1893,7 +2008,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let qps = &result.config.http_routes[0].rules[0].matches[0].query_params;
         assert_eq!(qps.len(), 2);
         assert_eq!(qps[0].name, "format");
@@ -1941,7 +2056,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let backends = &result.config.http_routes[0].rules[0].backend_refs;
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0].name, "stable.default.svc");
@@ -1977,7 +2092,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let br = &result.config.http_routes[0].rules[0].backend_refs[0];
         assert_eq!(br.port, 80);
         assert_eq!(br.weight, 1);
@@ -2037,7 +2152,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         assert_eq!(result.config.http_routes[0].rules.len(), 2);
         assert_eq!(result.config.http_routes[0].rules[0].backend_refs[0].name, "v1-svc.default.svc");
         assert_eq!(result.config.http_routes[0].rules[1].backend_refs[0].name, "v2-svc.default.svc");
@@ -2088,7 +2203,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let filters = &result.config.http_routes[0].rules[0].filters;
         assert_eq!(filters.len(), 1);
         match &filters[0] {
@@ -2141,7 +2256,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
             HttpRouteFilter::ResponseHeaderModifier { config } => {
                 assert_eq!(config.add[0].name, "X-Response");
@@ -2190,7 +2305,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
             HttpRouteFilter::RequestRedirect { config } => {
                 assert_eq!(config.scheme.as_deref(), Some("https"));
@@ -2243,7 +2358,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
             HttpRouteFilter::URLRewrite { config } => {
                 assert_eq!(config.hostname.as_deref(), Some("internal.example.com"));
@@ -2294,7 +2409,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
             HttpRouteFilter::RequestMirror { config } => {
                 assert_eq!(config.backend_ref.name, "shadow-svc.staging.svc");
@@ -2338,7 +2453,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let timeouts = result.config.http_routes[0].rules[0].timeouts.as_ref().unwrap();
         assert_eq!(timeouts.request, Some(std::time::Duration::from_secs(30)));
         assert_eq!(timeouts.backend_request, Some(std::time::Duration::from_secs(10)));
@@ -2401,7 +2516,7 @@ mod tests {
             status: None,
         };
 
-        let result = reconcile_to_config(&gw, &[http_route], &[tcp_route], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[http_route], &[tcp_route], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.config.http_routes.len(), 1);
         assert_eq!(result.config.tcp_routes.len(), 1);
@@ -2486,7 +2601,7 @@ mod tests {
         };
 
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let mut config = result.config;
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
@@ -2549,7 +2664,7 @@ mod tests {
         };
 
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[], &[tcp_route], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[], &[tcp_route], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let mut config = result.config;
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
@@ -2626,7 +2741,7 @@ mod tests {
         };
 
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let mut config = result.config;
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
@@ -2701,7 +2816,7 @@ mod tests {
         };
 
         let ns_labels = default_ns_labels();
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
         let mut config = result.config;
         fixup_backends_for_test(&mut config);
         let rt = config.to_route_table().unwrap();
@@ -2720,7 +2835,7 @@ mod tests {
         let ns_labels = default_ns_labels();
         let route = test_http_route();
 
-        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &HashSet::new(), &HashMap::new()).unwrap();
+        let result = reconcile_to_config(&gw, &[route], &[], &[], &[], &ns_labels, &[], &test_known_services(), &HashMap::new()).unwrap();
 
         assert_eq!(result.route_status.len(), 1);
         assert!(result.route_status[0].accepted);

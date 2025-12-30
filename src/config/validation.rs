@@ -485,7 +485,7 @@ mod tests {
     }
 
     fn default_backend() -> BackendRef {
-        BackendRef { name: "127.0.0.1".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string() }
+        BackendRef { name: "127.0.0.1".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string(), filters: vec![] }
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
         let rule = make_rule(
             vec![HttpRouteFilter::RequestMirror {
                 config: RequestMirrorConfig {
-                    backend_ref: BackendRef { name: "".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string() },
+                    backend_ref: BackendRef { name: "".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string(), filters: vec![] },
                 },
             }],
             vec![default_backend()],

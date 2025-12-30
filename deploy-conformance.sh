@@ -3,10 +3,8 @@
 # Usage: ./deploy-conformance.sh [--skip-build] [--skip-deploy] [--skip-tests]
 set -euo pipefail
 
-IMAGE="quay.io/epheo/portail:latest"
+IMAGE="registry.desku.be/portail:conformance"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEPLOY_DIR="$PROJECT_DIR/deploy"
-GATEWAY_API_VERSION="v1.4.1"
 
 export KUBECONFIG="$PROJECT_DIR/.kubeconfig-local"
 
@@ -23,50 +21,40 @@ for arg in "$@"; do
   esac
 done
 
-# Get supported features from the binary (single source of truth)
-SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
+SUPPORTED_FEATURES="HTTPRoute,HTTPRouteSchemeRedirect,HTTPRouteDestinationPortMatching"
+SUPPORTED_FEATURES+=",HTTPRouteHostRewrite,HTTPRoutePathRewrite,HTTPRouteRequestMirror"
+SUPPORTED_FEATURES+=",ReferenceGrant,Gateway,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching"
+SUPPORTED_FEATURES+=",HTTPRouteRequestHeaderModification,GatewayPort8080"
+SUPPORTED_FEATURES+=",HTTPRouteBackendRequestHeaderModification"
+SUPPORTED_FEATURES+=",HTTPRoutePathRedirect,HTTPRoutePortRedirect"
+SUPPORTED_FEATURES+=",HTTPRouteResponseHeaderModification"
+SUPPORTED_FEATURES+=",TLSRoute,UDPRoute"
 
 # ── 1. Build binary ──────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [1/6] Building release binary ━━━"
+  echo "━━━ [1/5] Building release binary ━━━"
   cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
   echo "✓ Binary built"
 fi
 
 # ── 2. Build container image ─────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [2/6] Building container image ━━━"
+  echo "━━━ [2/5] Building container image ━━━"
   podman build -t "$IMAGE" -f "$PROJECT_DIR/Containerfile" "$PROJECT_DIR"
   echo "✓ Image built: $IMAGE"
 fi
 
 # ── 3. Push image ────────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [3/6] Pushing image ━━━"
+  echo "━━━ [3/5] Pushing image ━━━"
   podman push "$IMAGE"
   echo "✓ Image pushed"
 fi
 
-# ── 4. Install Gateway API experimental CRDs ────────────────────
+# ── 4. Deploy to MicroShift ──────────────────────────────────────
 if [ "$SKIP_DEPLOY" = false ]; then
-  echo "━━━ [4/6] Installing Gateway API experimental CRDs ($GATEWAY_API_VERSION) ━━━"
-  # Portail requires experimental-channel CRDs for TCPRoute/TLSRoute/UDPRoute.
-  # --server-side --force-conflicts avoids "annotations too long" on HTTPRoute CRD.
-  kubectl apply --server-side --force-conflicts \
-    -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
-  echo "✓ Experimental CRDs installed"
-fi
-
-# ── 5. Deploy portail using deploy/*.yaml ────────────────────────
-if [ "$SKIP_DEPLOY" = false ]; then
-  echo "━━━ [5/6] Deploying portail to cluster ━━━"
-  kubectl apply -f "$DEPLOY_DIR/namespace.yaml"
-  kubectl apply -f "$DEPLOY_DIR/rbac.yaml"
-  kubectl apply -f "$DEPLOY_DIR/scc.yaml" 2>/dev/null || true  # SCC is OpenShift-only
-  kubectl apply -f "$DEPLOY_DIR/gatewayclass.yaml"
-  kubectl apply -f "$DEPLOY_DIR/daemonset.yaml"
-  # Override image with the actual registry image
-  kubectl set image daemonset/portail portail="$IMAGE" -n portail-system
+  echo "━━━ [4/5] Deploying to MicroShift ━━━"
+  kubectl apply -f "$PROJECT_DIR/deploy/conformance.yaml"
   kubectl rollout restart daemonset/portail -n portail-system
   echo "Waiting for rollout..."
   kubectl rollout status daemonset/portail -n portail-system --timeout=120s
@@ -74,9 +62,9 @@ if [ "$SKIP_DEPLOY" = false ]; then
   echo "✓ Deployed and ready"
 fi
 
-# ── 6. Run conformance tests ─────────────────────────────────────
+# ── 5. Run conformance tests ─────────────────────────────────────
 if [ "$SKIP_TESTS" = false ]; then
-  echo "━━━ [6/6] Running conformance tests ━━━"
+  echo "━━━ [5/5] Running conformance tests ━━━"
   cd "$PROJECT_DIR/gateway-api-conformance"
   go test -v -timeout 20m ./conformance -run TestConformance -args \
     -gateway-class=portail \

@@ -308,10 +308,6 @@ pub enum HttpRouteFilter {
         #[serde(rename = "requestMirror")]
         config: RequestMirrorConfig,
     },
-    BackendRequestHeaderModifier {
-        #[serde(rename = "backendRequestHeaderModifier")]
-        config: HeaderModifierConfig,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +343,9 @@ pub struct BackendRef {
     /// Original kind from the gateway-api backendRef (default "Service")
     #[serde(default = "default_backend_kind", skip_serializing_if = "is_default_kind")]
     pub kind: String,
+    /// Per-backend filters (e.g. BackendRequestHeaderModifier)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<HttpRouteFilter>,
 }
 
 fn default_backend_kind() -> String {

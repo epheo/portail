@@ -152,10 +152,6 @@ impl DataPlane {
         })
     }
 
-    /// Returns the set of TCP/UDP ports currently being listened on.
-    pub fn active_ports(&self) -> &std::collections::HashSet<u16> {
-        &self.bound_ports
-    }
 
     /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
     /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.

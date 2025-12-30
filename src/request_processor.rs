@@ -31,6 +31,24 @@ pub enum RewrittenPath {
     PrefixReplaced(String),
 }
 
+/// Join a prefix replacement with the remaining suffix from the original path.
+/// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
+fn join_prefix_path(prefix: &str, suffix: &str) -> String {
+    // Strip trailing slash from prefix if suffix starts with slash
+    let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
+        &prefix[..prefix.len() - 1]
+    } else {
+        prefix
+    };
+    let needs_slash = !prefix.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
+    let mut result = String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash));
+    result.push_str(prefix);
+    if needs_slash { result.push('/'); }
+    result.push_str(suffix);
+    if result.is_empty() { result.push('/'); }
+    result
+}
+
 /// Filter data only allocated when a route actually has filters.
 #[derive(Debug, Clone)]
 pub struct HttpFilterData {
@@ -134,6 +152,36 @@ fn analyze_http_request(
         }
     };
 
+    // Check for redirect filters FIRST — redirect rules often have no backends,
+    // so we must handle them before the empty-backends check.
+    if rule.has_filters {
+        for filter in &rule.filters {
+            if let HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } = filter {
+                let redirect_path = match path {
+                    Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
+                    Some(URLRewritePath::ReplacePrefixMatch(value)) => {
+                        join_prefix_path(value, &request_info.path[rule.path.len()..])
+                    }
+                    None => request_info.path.to_string(),
+                };
+                let default_scheme = if is_tls { "https" } else { "http" };
+                let location = build_redirect_location(
+                    scheme.as_deref(),
+                    hostname.as_deref().unwrap_or(request_info.host),
+                    *port,
+                    &redirect_path,
+                    default_scheme,
+                    server_port,
+                );
+                return Ok(ProcessingDecision::HttpRedirect {
+                    status_code: *status_code,
+                    location,
+                    keepalive,
+                });
+            }
+        }
+    }
+
     if rule.backends.is_empty() {
         return Ok(ProcessingDecision::SendHttpError {
             error_code: 500,
@@ -172,34 +220,9 @@ fn analyze_http_request(
 
     for filter in &rule.filters {
         match filter {
-            HttpFilter::RequestRedirect { scheme, hostname, port, path, status_code } => {
-                let redirect_path = match path {
-                    Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
-                    Some(URLRewritePath::ReplacePrefixMatch(value)) => {
-                        // Apply prefix replacement: keep the suffix from the original path
-                        let suffix = &request_info.path[rule.path.len()..];
-                        let needs_slash = !value.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-                        let mut result = String::with_capacity(value.len() + suffix.len() + usize::from(needs_slash));
-                        result.push_str(value);
-                        if needs_slash { result.push('/'); }
-                        result.push_str(suffix);
-                        result
-                    }
-                    None => request_info.path.to_string(),
-                };
-                let default_scheme = if is_tls { "https" } else { "http" };
-                let location = build_redirect_location(
-                    scheme.as_deref(),
-                    hostname.as_deref().unwrap_or(request_info.host),
-                    *port,
-                    &redirect_path,
-                    default_scheme,
-                );
-                return Ok(ProcessingDecision::HttpRedirect {
-                    status_code: *status_code,
-                    location,
-                    keepalive,
-                });
+            HttpFilter::RequestRedirect { .. } => {
+                // Handled above, before backend selection — unreachable here
+                unreachable!("redirect filters are handled before backend selection");
             }
             HttpFilter::RequestHeaderModifier { add, set, remove } => {
                 request_header_mods = Some(HeaderModifications {
@@ -219,14 +242,7 @@ fn analyze_http_request(
                 let rewritten_path = path.as_ref().map(|p| match p {
                     URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
                     URLRewritePath::ReplacePrefixMatch(value) => {
-                        let suffix = &request_info.path[rule.path.len()..];
-                        let needs_slash = !value.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-                        let cap = value.len() + suffix.len() + if needs_slash { 1 } else { 0 };
-                        let mut result = String::with_capacity(cap);
-                        result.push_str(value);
-                        if needs_slash { result.push('/'); }
-                        result.push_str(suffix);
-                        RewrittenPath::PrefixReplaced(result)
+                        RewrittenPath::PrefixReplaced(join_prefix_path(value, &request_info.path[rule.path.len()..]))
                     }
                 });
                 url_rewrite = Some(URLRewrite {
@@ -237,6 +253,58 @@ fn analyze_http_request(
             HttpFilter::RequestMirror { backend_addr } => {
                 mirror_addrs.push(*backend_addr);
             }
+        }
+    }
+
+    // Apply per-backend filters (e.g. BackendRequestHeaderModifier)
+    for filter in &selected_backend.filters {
+        match filter {
+            HttpFilter::RequestHeaderModifier { add, set, remove } => {
+                // Merge with rule-level mods: backend-level is additive
+                match &mut request_header_mods {
+                    Some(existing) => {
+                        let mut merged_add: Vec<_> = (*existing.add).clone();
+                        merged_add.extend((*add).iter().cloned());
+                        existing.add = Arc::new(merged_add);
+                        let mut merged_set: Vec<_> = (*existing.set).clone();
+                        merged_set.extend((*set).iter().cloned());
+                        existing.set = Arc::new(merged_set);
+                        let mut merged_remove: Vec<_> = (*existing.remove).clone();
+                        merged_remove.extend((*remove).iter().cloned());
+                        existing.remove = Arc::new(merged_remove);
+                    }
+                    None => {
+                        request_header_mods = Some(HeaderModifications {
+                            add: Arc::clone(add),
+                            set: Arc::clone(set),
+                            remove: Arc::clone(remove),
+                        });
+                    }
+                }
+            }
+            HttpFilter::ResponseHeaderModifier { add, set, remove } => {
+                match &mut response_header_mods {
+                    Some(existing) => {
+                        let mut merged_add: Vec<_> = (*existing.add).clone();
+                        merged_add.extend((*add).iter().cloned());
+                        existing.add = Arc::new(merged_add);
+                        let mut merged_set: Vec<_> = (*existing.set).clone();
+                        merged_set.extend((*set).iter().cloned());
+                        existing.set = Arc::new(merged_set);
+                        let mut merged_remove: Vec<_> = (*existing.remove).clone();
+                        merged_remove.extend((*remove).iter().cloned());
+                        existing.remove = Arc::new(merged_remove);
+                    }
+                    None => {
+                        response_header_mods = Some(HeaderModifications {
+                            add: Arc::clone(add),
+                            set: Arc::clone(set),
+                            remove: Arc::clone(remove),
+                        });
+                    }
+                }
+            }
+            _ => {} // Other filter types not valid at backend level
         }
     }
 
@@ -260,11 +328,27 @@ fn build_redirect_location(
     port: Option<u16>,
     path: &str,
     default_scheme: &str,
+    incoming_port: u16,
 ) -> String {
-    let scheme = scheme.unwrap_or(default_scheme);
-    match port {
-        Some(p) => format!("{}://{}:{}{}", scheme, hostname, p, path),
-        None => format!("{}://{}{}", scheme, hostname, path),
+    let final_scheme = scheme.unwrap_or(default_scheme);
+    let scheme_changed = scheme.is_some() && final_scheme != default_scheme;
+
+    // Determine effective port:
+    // 1. Explicit port from redirect filter → always use it
+    // 2. Scheme changed but no port specified → use new scheme's default (omit)
+    // 3. Scheme unchanged and no port specified → preserve incoming port
+    let effective_port = match port {
+        Some(p) => Some(p),
+        None if scheme_changed => None, // use default for new scheme
+        None => Some(incoming_port),    // preserve incoming port
+    };
+
+    // Omit port if it's the well-known default for the final scheme
+    match effective_port {
+        Some(p) if !((final_scheme == "http" && p == 80) || (final_scheme == "https" && p == 443)) => {
+            format!("{}://{}:{}{}", final_scheme, hostname, p, path)
+        }
+        _ => format!("{}://{}{}", final_scheme, hostname, path),
     }
 }
 
@@ -363,7 +447,7 @@ mod tests {
             vec![],
             vec![],
             filters,
-            vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1 }],
+            vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1, filters: vec![] }],
         ));
         rt
     }
@@ -571,7 +655,7 @@ mod tests {
                 path: None,
                 status_code: 301,
             }],
-            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 }],
+            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] }],
         ));
         let mut sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");

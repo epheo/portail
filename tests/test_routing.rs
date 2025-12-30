@@ -106,7 +106,7 @@ fn test_path_matching_longest_prefix_first() {
 // --- Gateway API HTTPRoute spec coverage ---
 
 fn backend(port: u16) -> Backend {
-    Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1 }
+    Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1, filters: vec![] }
 }
 
 fn rule(path_type: PathMatchType, path: &str, port: u16) -> HttpRouteRule {
@@ -294,8 +294,8 @@ fn test_weighted_round_robin_distribution() {
     rt.add_http_route("test.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
         vec![
-            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
-            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
         ],
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -316,8 +316,8 @@ fn test_equal_weights() {
     rt.add_http_route("test.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
         vec![
-            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
-            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
         ],
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -338,8 +338,8 @@ fn test_zero_weight_backend_never_selected() {
     rt.add_http_route("test.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
         vec![
-            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1 },
-            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0 },
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0, filters: vec![] },
         ],
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -422,8 +422,8 @@ fn test_cumulative_weights_precomputed() {
     rt.add_http_route("test.com", HttpRouteRule::new(
         PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
         vec![
-            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3 },
-            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1 },
+            Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
+            Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
         ],
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
