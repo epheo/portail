@@ -200,6 +200,43 @@ impl DataPlane {
             };
 
             let mut port_ok = true;
+            if listener_cfg.protocol == Protocol::UDP {
+                // Create UDP listener
+                match create_reuseport_udp_socket(port, None, None) {
+                    Ok(std_socket) => {
+                        match UdpSocket::from_std(std_socket) {
+                            Ok(tokio_socket) => {
+                                let routes = routes.clone();
+                                let health = self.health.clone();
+                                let shutdown = self.shutdown.clone();
+                                let session_timeout = self.udp_session_timeout;
+                                let socket = Arc::new(tokio_socket);
+
+                                let handle = tokio::spawn(async move {
+                                    udp_worker::run_udp_worker(
+                                        0, // single worker for UDP
+                                        socket,
+                                        port,
+                                        routes,
+                                        session_timeout,
+                                        shutdown,
+                                        health,
+                                    ).await;
+                                });
+                                self.task_handles.push(handle);
+                            }
+                            Err(e) => {
+                                errors.push((port, format!("UDP from_std: {}", e)));
+                                port_ok = false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push((port, format!("UDP bind: {}", e)));
+                        port_ok = false;
+                    }
+                }
+            } else {
             for worker_id in 0..worker_count {
                 match create_reuseport_tcp_listener(port, None, None) {
                     Ok(std_listener) => {
@@ -242,6 +279,7 @@ impl DataPlane {
                         break;
                     }
                 }
+            }
             }
             if port_ok {
                 self.bound_ports.insert(port);
