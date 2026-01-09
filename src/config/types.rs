@@ -127,6 +127,11 @@ pub struct PortailConfig {
 
     #[serde(default)]
     pub performance: PerformanceConfig,
+
+    /// Pod IP + targetPort overrides for headless services (not serialized).
+    /// Map: (backend_fqdn, service_port) → Vec<(pod_ip, target_port)>
+    #[serde(skip)]
+    pub endpoint_overrides: std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification

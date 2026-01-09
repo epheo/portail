@@ -10,6 +10,7 @@ use kube::runtime::reflector::ObjectRef;
 use kube::Client;
 use kube::ResourceExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use tokio_util::sync::CancellationToken;
 
 use gateway_api::gatewayclasses::GatewayClass;
@@ -136,6 +137,7 @@ pub async fn run_controller(
     let udp_routes: Api<UDPRoute> = Api::all(client.clone());
     let secrets: Api<Secret> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
+    let endpoint_slices: Api<EndpointSlice> = Api::all(client.clone());
     let reference_grants: Api<gateway_api::referencegrants::ReferenceGrant> = Api::all(client.clone());
 
     let ctx = Arc::new(ControllerCtx {
@@ -154,6 +156,7 @@ pub async fn run_controller(
     for watcher_stream in [
         watcher::watcher(secrets, watcher::Config::default()).map(|_| ()).boxed(),
         watcher::watcher(services, watcher::Config::default()).map(|_| ()).boxed(),
+        watcher::watcher(endpoint_slices, watcher::Config::default()).map(|_| ()).boxed(),
         watcher::watcher(reference_grants, watcher::Config::default()).map(|_| ()).boxed(),
     ] {
         let tx = reconcile_tx.clone();
@@ -442,22 +445,133 @@ async fn reconcile(
         }
     }
 
-    // Fetch Services for backend existence validation
+    // Fetch Services for backend existence validation + headless service detection
     let services_api: Api<Service> = Api::all(ctx.client.clone());
-    let known_services: HashSet<(String, String)> = services_api
+    let all_services = services_api
         .list(&ListParams::default())
         .await
-        .map(|list| {
-            list.items
-                .into_iter()
-                .filter_map(|svc| {
-                    let name = svc.metadata.name?;
-                    let ns = svc.metadata.namespace.unwrap_or_else(|| "default".to_string());
-                    Some((name, ns))
-                })
-                .collect()
-        })
+        .map(|list| list.items)
         .unwrap_or_default();
+
+    let known_services: HashSet<(String, String)> = all_services
+        .iter()
+        .filter_map(|svc| {
+            let name = svc.metadata.name.as_ref()?;
+            let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+            Some((name.clone(), ns.to_string()))
+        })
+        .collect();
+
+    // Detect headless services and fetch their EndpointSlices for pod IP + targetPort resolution.
+    // For headless services (clusterIP: None), DNS returns pod IPs but kube-proxy doesn't
+    // translate service port → targetPort, so we need EndpointSlice data.
+    // Map: (svc_fqdn, service_port) → Vec<(pod_ip, target_port)>
+    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
+
+    let headless_services: Vec<(&str, &str)> = all_services
+        .iter()
+        .filter_map(|svc| {
+            let spec = svc.spec.as_ref()?;
+            let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
+            if cluster_ip == "None" || cluster_ip.is_empty() {
+                let name = svc.metadata.name.as_deref()?;
+                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+                Some((name, ns))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !headless_services.is_empty() {
+        let ep_api: Api<EndpointSlice> = Api::all(ctx.client.clone());
+        let all_endpoint_slices = ep_api
+            .list(&ListParams::default())
+            .await
+            .map(|list| list.items)
+            .unwrap_or_default();
+
+        for (svc_name, svc_ns) in &headless_services {
+            // Find EndpointSlices for this service (labeled kubernetes.io/service-name)
+            let matching_slices: Vec<&EndpointSlice> = all_endpoint_slices
+                .iter()
+                .filter(|eps| {
+                    let eps_ns = eps.metadata.namespace.as_deref().unwrap_or("default");
+                    if eps_ns != *svc_ns {
+                        return false;
+                    }
+                    eps.metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("kubernetes.io/service-name"))
+                        .is_some_and(|v| v == *svc_name)
+                })
+                .collect();
+
+            let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+
+            // Get the service's declared ports for mapping service_port → targetPort
+            let svc_spec = all_services
+                .iter()
+                .find(|s| {
+                    s.metadata.name.as_deref() == Some(svc_name)
+                        && s.metadata.namespace.as_deref().unwrap_or("default") == *svc_ns
+                })
+                .and_then(|s| s.spec.as_ref());
+
+            for eps in &matching_slices {
+                // Only use IPv4 slices
+                if eps.address_type != "IPv4" {
+                    continue;
+                }
+
+                let endpoints = &eps.endpoints;
+
+                let eps_ports = eps.ports.as_deref().unwrap_or_default();
+
+                // For each service port, find the corresponding EndpointSlice port
+                if let Some(svc_ports) = svc_spec.and_then(|s| s.ports.as_ref()) {
+                    for sp in svc_ports {
+                        let service_port = sp.port as u16;
+                        let port_name = sp.name.as_deref().unwrap_or("");
+
+                        // Find matching endpoint port by name
+                        let target_port = eps_ports
+                            .iter()
+                            .find(|ep| {
+                                ep.name.as_deref().unwrap_or("") == port_name
+                            })
+                            .and_then(|ep| ep.port)
+                            .unwrap_or(service_port as i32) as u16;
+
+                        let key = (svc_fqdn.clone(), service_port);
+                        let entry = endpoint_overrides.entry(key).or_default();
+                        for endpoint in endpoints {
+                            // Only include ready endpoints
+                            let is_ready = endpoint
+                                .conditions
+                                .as_ref()
+                                .and_then(|c| c.ready)
+                                .unwrap_or(true);
+                            if is_ready {
+                                for addr in &endpoint.addresses {
+                                    entry.push((addr.clone(), target_port));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !endpoint_overrides.is_empty() {
+            info!(
+                "Found {} headless endpoint overrides for {} services",
+                endpoint_overrides.values().map(|v| v.len()).sum::<usize>(),
+                endpoint_overrides.len(),
+            );
+        }
+    }
 
     // --- Per-listener validation: compute ListenerStatus for each listener ---
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
@@ -608,6 +722,7 @@ async fn reconcile(
         &reference_grants,
         &known_services,
         &cert_data,
+        &endpoint_overrides,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -678,6 +793,7 @@ async fn reconcile(
             &reference_grants,
             &known_services,
             &cert_data,
+            &endpoint_overrides,
         ) {
             all_configs.push(other_result.config);
         }

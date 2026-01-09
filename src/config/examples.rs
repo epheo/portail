@@ -57,6 +57,7 @@ impl PortailConfig {
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
             },
+            endpoint_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -242,6 +243,7 @@ impl PortailConfig {
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
             },
+            endpoint_overrides: std::collections::HashMap::new(),
         }
     }
 

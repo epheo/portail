@@ -76,7 +76,7 @@ impl PortailConfig {
 
                 for hostname in &effective_hostnames {
                     for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname)?;
+                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
                         for route_match in &rule.matches {
                             let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
                             route_table.add_http_route_for_listener(0, None, hostname, routing_rule);
@@ -112,7 +112,7 @@ impl PortailConfig {
                         tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
                             rule_idx, rule.matches.len(), rule.backend_refs.len());
 
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname)?;
+                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
 
                         for route_match in &rule.matches {
                             let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
@@ -254,12 +254,40 @@ fn build_rule_components(
     rule: &HttpRouteRule,
     _rule_idx: usize,
     _hostname: &str,
+    endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
 ) -> Result<(Vec<crate::routing::Backend>, Vec<crate::routing::HttpFilter>)> {
     use crate::routing;
 
     let mut backends = Vec::new();
     for backend_ref in &rule.backend_refs {
         let backend_filters = convert_filters(&backend_ref.filters)?;
+
+        // Check if this backend has endpoint overrides (headless service)
+        let override_key = (backend_ref.name.clone(), backend_ref.port);
+        if let Some(endpoints) = endpoint_overrides.get(&override_key) {
+            if !endpoints.is_empty() {
+                tracing::debug!("        Headless backend {}:{} -> {} pod endpoints",
+                    backend_ref.name, backend_ref.port, endpoints.len());
+                for (pod_ip, target_port) in endpoints {
+                    match routing::Backend::with_weight(
+                        pod_ip.clone(),
+                        *target_port,
+                        backend_ref.weight,
+                    ) {
+                        Ok(mut backend) => {
+                            backend.filters = backend_filters.clone();
+                            backends.push(backend);
+                        }
+                        Err(e) => {
+                            tracing::warn!("        Skipping headless endpoint {}:{} - {}", pod_ip, target_port, e);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Standard DNS-based resolution
         match routing::Backend::with_weight(
             backend_ref.name.clone(),
             backend_ref.port,
