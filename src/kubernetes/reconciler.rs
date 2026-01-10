@@ -12,6 +12,10 @@ use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
 
 use crate::config::*;
+use crate::logging::warn;
+
+/// TLS certificate data keyed by (secret_name, namespace) → (cert_pem, key_pem).
+type CertData = HashMap<(String, String), (Vec<u8>, Vec<u8>)>;
 
 pub struct ReconcileResult {
     pub config: PortailConfig,
@@ -226,7 +230,7 @@ fn route_allowed_for_listener<T: ParentRefAccess>(
             }
         }
         if let Some(port) = pr.ref_port() {
-            if port != listener.port as i32 {
+            if port != listener.port {
                 continue;
             }
         }
@@ -254,7 +258,7 @@ pub fn reconcile_to_config(
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
     reference_grants: &[ReferenceGrant],
     known_services: &HashSet<(String, String)>,
-    cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>,
+    cert_data: &CertData,
     endpoint_overrides: &HashMap<(String, u16), Vec<(String, u16)>>,
 ) -> Result<ReconcileResult> {
     let gateway_config = convert_gateway(gateway, cert_data)?;
@@ -456,7 +460,7 @@ where
                 // Validate backend refs: check group/kind, cross-namespace grants, and service existence
                 for (backend_name, port, group, ref_kind) in get_backend_refs(&config) {
                     // Check group/kind — must be core ("") group and "Service" kind (or defaults)
-                    if (group != "" && group != "core") || (ref_kind != "Service" && ref_kind != "") {
+                    if (!group.is_empty() && group != "core") || (ref_kind != "Service" && !ref_kind.is_empty()) {
                         refs_resolved = false;
                         refs_reason = "InvalidKind".to_string();
                         refs_messages.push(format!(
@@ -560,7 +564,7 @@ fn all_section_names_for_gateway<T: ParentRefAccess>(
         .unwrap_or_else(|| vec![None])
 }
 
-fn convert_gateway(gw: &Gateway, cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>) -> Result<GatewayConfig> {
+fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<GatewayConfig> {
     let name = gw
         .metadata
         .name
@@ -582,7 +586,7 @@ fn convert_gateway(gw: &Gateway, cert_data: &HashMap<(String, String), (Vec<u8>,
     })
 }
 
-fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>) -> Result<ListenerConfig> {
+fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &CertData) -> Result<ListenerConfig> {
     let protocol = match l.protocol.as_str() {
         "HTTP" => Protocol::HTTP,
         "HTTPS" => Protocol::HTTPS,
@@ -880,6 +884,21 @@ fn convert_query_param_match(q: &HTTPRouteRulesMatchesQueryParams) -> HttpQueryP
     }
 }
 
+/// Convert any K8s header modifier struct with add/set/remove fields into HeaderModifierConfig.
+macro_rules! convert_header_mod {
+    ($hm:expr) => {
+        HeaderModifierConfig {
+            add: $hm.add.as_ref()
+                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
+                .unwrap_or_default(),
+            set: $hm.set.as_ref()
+                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
+                .unwrap_or_default(),
+            remove: $hm.remove.clone().unwrap_or_default(),
+        }
+    };
+}
+
 fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteFilter> {
     match f.r#type {
         HTTPRouteRulesFiltersType::RequestHeaderModifier => {
@@ -929,21 +948,6 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
         }
         _ => Err(anyhow!("unsupported filter type")),
     }
-}
-
-/// Convert any K8s header modifier struct with add/set/remove fields into HeaderModifierConfig.
-macro_rules! convert_header_mod {
-    ($hm:expr) => {
-        HeaderModifierConfig {
-            add: $hm.add.as_ref()
-                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
-                .unwrap_or_default(),
-            set: $hm.set.as_ref()
-                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
-                .unwrap_or_default(),
-            remove: $hm.remove.clone().unwrap_or_default(),
-        }
-    };
 }
 
 fn convert_redirect_config(rr: &HTTPRouteRulesFiltersRequestRedirect) -> RequestRedirectConfig {
@@ -1068,10 +1072,24 @@ fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
 }
 
 /// Shared conversion for L4 backend refs (TCP/TLS/UDP all have the same fields).
-fn convert_l4_backend_ref<B: L4BackendRefAccess>(br: &B, ns: &str, default_port: i64) -> BackendRef {
+/// `default_port`: protocol-implied default (TCP=80, TLS=443) or `None` if port is required (UDP).
+fn convert_l4_backend_ref<B: L4BackendRefAccess>(br: &B, ns: &str, protocol: &str, default_port: Option<i32>) -> BackendRef {
+    let port = match br.br_port() {
+        Some(p) => p as u16,
+        None => match default_port {
+            Some(dp) => {
+                warn!("{} backend ref '{}' missing port, defaulting to {}", protocol, br.br_name(), dp);
+                dp as u16
+            }
+            None => {
+                warn!("{} backend ref '{}' missing required port, using 0", protocol, br.br_name());
+                0
+            }
+        }
+    };
     BackendRef {
         name: backend_dns_name(br.br_name(), br.br_namespace(), ns),
-        port: br.br_port().unwrap_or(default_port) as u16,
+        port,
         weight: br.br_weight().unwrap_or(1) as u32,
         group: br.br_group().unwrap_or_default().to_string(),
         kind: br.br_kind().map(String::from).unwrap_or_else(|| "Service".to_string()),
@@ -1082,8 +1100,8 @@ fn convert_l4_backend_ref<B: L4BackendRefAccess>(br: &B, ns: &str, default_port:
 trait L4BackendRefAccess {
     fn br_name(&self) -> &str;
     fn br_namespace(&self) -> Option<&str>;
-    fn br_port(&self) -> Option<i64>;
-    fn br_weight(&self) -> Option<i64>;
+    fn br_port(&self) -> Option<i32>;
+    fn br_weight(&self) -> Option<i32>;
     fn br_group(&self) -> Option<&str>;
     fn br_kind(&self) -> Option<&str>;
 }
@@ -1091,8 +1109,8 @@ trait L4BackendRefAccess {
 impl L4BackendRefAccess for TCPRouteRulesBackendRefs {
     fn br_name(&self) -> &str { &self.name }
     fn br_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn br_port(&self) -> Option<i64> { self.port }
-    fn br_weight(&self) -> Option<i64> { self.weight }
+    fn br_port(&self) -> Option<i32> { self.port }
+    fn br_weight(&self) -> Option<i32> { self.weight }
     fn br_group(&self) -> Option<&str> { self.group.as_deref() }
     fn br_kind(&self) -> Option<&str> { self.kind.as_deref() }
 }
@@ -1100,8 +1118,8 @@ impl L4BackendRefAccess for TCPRouteRulesBackendRefs {
 impl L4BackendRefAccess for TLSRouteRulesBackendRefs {
     fn br_name(&self) -> &str { &self.name }
     fn br_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn br_port(&self) -> Option<i64> { self.port }
-    fn br_weight(&self) -> Option<i64> { self.weight }
+    fn br_port(&self) -> Option<i32> { self.port }
+    fn br_weight(&self) -> Option<i32> { self.weight }
     fn br_group(&self) -> Option<&str> { self.group.as_deref() }
     fn br_kind(&self) -> Option<&str> { self.kind.as_deref() }
 }
@@ -1109,8 +1127,8 @@ impl L4BackendRefAccess for TLSRouteRulesBackendRefs {
 impl L4BackendRefAccess for UDPRouteRulesBackendRefs {
     fn br_name(&self) -> &str { &self.name }
     fn br_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn br_port(&self) -> Option<i64> { self.port }
-    fn br_weight(&self) -> Option<i64> { self.weight }
+    fn br_port(&self) -> Option<i32> { self.port }
+    fn br_weight(&self) -> Option<i32> { self.weight }
     fn br_group(&self) -> Option<&str> { self.group.as_deref() }
     fn br_kind(&self) -> Option<&str> { self.kind.as_deref() }
 }
@@ -1121,7 +1139,7 @@ fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<TcpRouteCon
 
     let rules = route.spec.rules.iter()
         .map(|r| TcpRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, 80)).collect(),
+            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "TCP", Some(80))).collect(),
         })
         .collect();
 
@@ -1135,7 +1153,7 @@ fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<TlsRouteCon
 
     let rules = route.spec.rules.iter()
         .map(|r| TlsRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, 443)).collect(),
+            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "TLS", Some(443))).collect(),
         })
         .collect();
 
@@ -1148,7 +1166,7 @@ fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteCon
 
     let rules = route.spec.rules.iter()
         .map(|r| UdpRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, 80)).collect(),
+            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "UDP", None)).collect(),
         })
         .collect();
 
@@ -1159,6 +1177,7 @@ fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteCon
 mod tests {
     use super::*;
     use gateway_api::gateways::*;
+    use gateway_api::referencegrants::{ReferenceGrantSpec, ReferenceGrantFrom, ReferenceGrantTo};
     use kube::core::ObjectMeta;
 
     fn default_ns_labels() -> HashMap<String, BTreeMap<String, String>> {

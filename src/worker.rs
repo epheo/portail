@@ -238,7 +238,7 @@ async fn handle_connection(
                 let forward_fut = handle_http_forward(
                     &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, &mut state,
                 );
-                let ka = if let Some(req_timeout) = request_timeout {
+                let ka = if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
                     match tokio::time::timeout(req_timeout, forward_fut).await {
                         Ok(result) => result?,
                         Err(_) => {
@@ -305,7 +305,9 @@ async fn handle_http_forward(
     let mut per_rule_timeout = initial_backend_timeout;
 
     loop {
-        let timeout_dur = per_rule_timeout.unwrap_or(std::time::Duration::from_secs(30));
+        let timeout_dur = per_rule_timeout
+            .filter(|d| !d.is_zero())
+            .unwrap_or(std::time::Duration::from_secs(30));
         let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
@@ -460,7 +462,7 @@ async fn forward_http_response(
 
             header_buf.extend_from_slice(&buf[..n]);
 
-            if let Some(header_end) = find_header_end(&header_buf) {
+            if let Some(header_end) = find_header_end(header_buf) {
                 headers_parsed = true;
 
                 // With mods: apply modifications and write buffered data now
@@ -530,7 +532,10 @@ async fn handle_tls_passthrough(
     }
 
     let sni = tls::extract_sni(&peek_buf[..n]);
-    let hostname = sni.as_deref().unwrap_or("");
+    let hostname = match sni.as_deref() {
+        Some(h) => h,
+        None => return Err(anyhow::anyhow!("TLS passthrough: no SNI in ClientHello, cannot route")),
+    };
 
     let route_table = routes.load();
     let backend_addr = route_table.resolve_tls_passthrough(hostname, server_port)

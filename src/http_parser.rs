@@ -192,9 +192,19 @@ pub fn extract_routing_info(
             None => (raw_path, ""),
         };
 
+        // Per RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header.
+        // HTTP/1.0 clients may omit it, so use empty string for routing to handle.
+        let resolved_host = match host {
+            Some(h) => h,
+            None if http_version == HttpVersion::Http11 => {
+                return Err(anyhow::anyhow!("Missing required Host header in HTTP/1.1 request"));
+            }
+            None => "",
+        };
+
         Ok(HttpRequestInfo {
             method: method.unwrap_or("GET"),
-            host: host.unwrap_or("localhost"),
+            host: resolved_host,
             path: clean_path,
             query_string,
             connection_type,

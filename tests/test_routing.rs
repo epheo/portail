@@ -2,6 +2,7 @@ use portail::routing::{
     RouteTable, Backend, HttpRouteRule, HttpFilter, HttpHeader, URLRewritePath,
     PathMatchType, HeaderMatch, QueryParamMatch, BackendSelector, ValueMatcher,
 };
+use portail::health::HealthRegistry;
 use std::sync::Arc;
 
 #[test]
@@ -300,10 +301,11 @@ fn test_weighted_round_robin_distribution() {
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
+    let health = HealthRegistry::new();
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..400 {
-        let idx = selector.select_weighted_backend(42, r);
+        let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
         counts[idx] += 1;
     }
     assert_eq!(counts[0], 300);
@@ -322,10 +324,11 @@ fn test_equal_weights() {
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
+    let health = HealthRegistry::new();
     let mut selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..100 {
-        let idx = selector.select_weighted_backend(42, r);
+        let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
         counts[idx] += 1;
     }
     assert_eq!(counts[0], 50);
@@ -344,9 +347,10 @@ fn test_zero_weight_backend_never_selected() {
     ));
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
+    let health = HealthRegistry::new();
     let mut selector = BackendSelector::new();
     for _ in 0..100 {
-        let idx = selector.select_weighted_backend(42, r);
+        let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
         assert_eq!(idx, 0, "zero-weight backend should never be selected");
     }
 }

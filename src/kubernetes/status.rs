@@ -47,15 +47,15 @@ pub struct ListenerStatus {
 impl Default for ListenerStatus {
     fn default() -> Self {
         Self {
-            accepted: true,
-            accepted_reason: "Accepted".into(),
-            accepted_message: "Listener accepted".into(),
-            programmed: true,
-            programmed_reason: "Programmed".into(),
-            programmed_message: "Programmed".into(),
-            resolved_refs: true,
-            resolved_refs_reason: "ResolvedRefs".into(),
-            resolved_refs_message: "All references resolved".into(),
+            accepted: false,
+            accepted_reason: "Pending".into(),
+            accepted_message: "Listener validation pending".into(),
+            programmed: false,
+            programmed_reason: "Pending".into(),
+            programmed_message: "Listener programming pending".into(),
+            resolved_refs: false,
+            resolved_refs_reason: "Pending".into(),
+            resolved_refs_message: "Reference resolution pending".into(),
             conflicted: false,
             conflicted_reason: "NoConflicts".into(),
             conflicted_message: "No conflicts detected".into(),
@@ -67,8 +67,10 @@ impl Default for ListenerStatus {
 pub async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
+    accepted: bool,
+    accepted_message: &str,
     programmed: bool,
-    message: &str,
+    programmed_message: &str,
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
 ) {
@@ -82,9 +84,9 @@ pub async fn update_gateway_status(
     let conditions = vec![
         Condition {
             type_: "Accepted".to_string(),
-            status: "True".to_string(),
-            reason: "Accepted".to_string(),
-            message: "Gateway accepted by portail controller".to_string(),
+            status: if accepted { "True" } else { "False" }.to_string(),
+            reason: if accepted { "Accepted" } else { "InvalidParameters" }.to_string(),
+            message: accepted_message.to_string(),
             last_transition_time: now.clone(),
             observed_generation: generation,
         },
@@ -92,7 +94,7 @@ pub async fn update_gateway_status(
             type_: "Programmed".to_string(),
             status: if programmed { "True" } else { "False" }.to_string(),
             reason: if programmed { "Programmed" } else { "Invalid" }.to_string(),
-            message: message.to_string(),
+            message: programmed_message.to_string(),
             last_transition_time: now.clone(),
             observed_generation: generation,
         },
@@ -206,25 +208,11 @@ pub async fn update_gateway_class_status(
         observed_generation: generation,
     }];
 
-    // Declare supported features so the conformance suite can auto-detect them
-    let supported_features = vec![
-        serde_json::json!({"name": "Gateway"}),
-        serde_json::json!({"name": "GatewayPort8080"}),
-        serde_json::json!({"name": "HTTPRoute"}),
-        serde_json::json!({"name": "HTTPRouteBackendRequestHeaderModification"}),
-        serde_json::json!({"name": "HTTPRouteDestinationPortMatching"}),
-        serde_json::json!({"name": "HTTPRouteHostRewrite"}),
-        serde_json::json!({"name": "HTTPRouteMethodMatching"}),
-        serde_json::json!({"name": "HTTPRoutePathRedirect"}),
-        serde_json::json!({"name": "HTTPRoutePathRewrite"}),
-        serde_json::json!({"name": "HTTPRoutePortRedirect"}),
-        serde_json::json!({"name": "HTTPRouteQueryParamMatching"}),
-        serde_json::json!({"name": "HTTPRouteRequestHeaderModification"}),
-        serde_json::json!({"name": "HTTPRouteRequestMirror"}),
-        serde_json::json!({"name": "HTTPRouteResponseHeaderModification"}),
-        serde_json::json!({"name": "HTTPRouteSchemeRedirect"}),
-        serde_json::json!({"name": "ReferenceGrant"}),
-    ];
+    // Declare supported features from the canonical list
+    let supported_features: Vec<serde_json::Value> = super::features::SUPPORTED_FEATURES
+        .iter()
+        .map(|name| serde_json::json!({"name": name}))
+        .collect();
 
     let status = serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",

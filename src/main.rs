@@ -36,6 +36,12 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Print supported features and exit
+    if args.supported_features {
+        println!("{}", kubernetes::features::SUPPORTED_FEATURES.join(","));
+        return Ok(());
+    }
+
     // Config generation uses minimal runtime
     if args.is_generation_mode() {
         logging::init_logging(args.verbose, None);

@@ -62,6 +62,11 @@ pub struct Args {
     #[arg(long, default_value = "portail.epheo.eu/gateway-controller")]
     #[arg(help = "Controller name to match against GatewayClass spec.controllerName")]
     pub controller_name: String,
+
+    /// Print supported Gateway API features as a comma-separated list and exit
+    #[arg(long)]
+    #[arg(help = "Print supported features (for conformance test integration) and exit")]
+    pub supported_features: bool,
 }
 
 impl Args {
@@ -135,6 +140,7 @@ mod tests {
             cert_dir: None,
             kubernetes: false,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_ok());
 
@@ -149,6 +155,7 @@ mod tests {
             cert_dir: None,
             kubernetes: false,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_ok());
 
@@ -163,6 +170,7 @@ mod tests {
             cert_dir: None,
             kubernetes: false,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_err());
     }
@@ -180,6 +188,7 @@ mod tests {
             cert_dir: None,
             kubernetes: false,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_err());
 
@@ -194,6 +203,7 @@ mod tests {
             cert_dir: None,
             kubernetes: false,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_err());
     }
@@ -211,6 +221,7 @@ mod tests {
             cert_dir: None,
             kubernetes: true,
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
+            supported_features: false,
         };
         assert!(args.validate().is_err());
     }

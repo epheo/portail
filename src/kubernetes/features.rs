@@ -3,7 +3,6 @@
 /// Keep sorted alphabetically for easy diffing.
 pub const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
-    "GatewayHTTPListenerIsolation",
     "GatewayPort8080",
     "HTTPRoute",
     "HTTPRouteBackendRequestHeaderModification",
@@ -11,7 +10,6 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
     "HTTPRouteMethodMatching",
-    "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
     "HTTPRoutePathRewrite",

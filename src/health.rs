@@ -66,11 +66,17 @@ pub struct HealthRegistry {
     backends: DashMap<SocketAddr, BackendHealth>,
 }
 
-impl HealthRegistry {
-    pub fn new() -> Self {
+impl Default for HealthRegistry {
+    fn default() -> Self {
         Self {
             backends: DashMap::new(),
         }
+    }
+}
+
+impl HealthRegistry {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Remove all tracked backend health state.

@@ -591,18 +591,21 @@ async fn reconcile(
 
     for listener in &gateway.spec.listeners {
         let mut ls = status::ListenerStatus::default();
+        let mut refs_failed = false;
 
         // Check protocol conflict
         if conflicted_ports.contains(&listener.port) {
             ls.accepted = false;
             ls.accepted_reason = "ProtocolConflict".into();
             ls.accepted_message = "Listener port conflicts with another listener using a different protocol".into();
-            ls.programmed = false;
-            ls.programmed_reason = "Invalid".into();
-            ls.programmed_message = "Listener not programmed due to port conflict".into();
             ls.conflicted = true;
             ls.conflicted_reason = "ProtocolConflict".into();
             ls.conflicted_message = "Listener port shared with another listener using different protocol".into();
+        } else {
+            // No conflict — listener is accepted
+            ls.accepted = true;
+            ls.accepted_reason = "Accepted".into();
+            ls.accepted_message = "Listener accepted".into();
         }
 
         // Validate TLS certificateRefs for HTTPS/TLS listeners
@@ -612,8 +615,8 @@ async fn reconcile(
                     // Check group/kind — must be core ("") group and "Secret" kind
                     let group = cert_ref.group.as_deref().unwrap_or("");
                     let kind_str = cert_ref.kind.as_deref().unwrap_or("Secret");
-                    if group != "" || kind_str != "Secret" {
-                        ls.resolved_refs = false;
+                    if !group.is_empty() || kind_str != "Secret" {
+                        refs_failed = true;
                         ls.resolved_refs_reason = "InvalidCertificateRef".into();
                         ls.resolved_refs_message = format!(
                             "Unsupported certificateRef group/kind: {}/{}", group, kind_str
@@ -640,7 +643,7 @@ async fn reconcile(
                             from_ok && to_ok
                         });
                         if !grant_allows {
-                            ls.resolved_refs = false;
+                            refs_failed = true;
                             ls.resolved_refs_reason = "RefNotPermitted".into();
                             ls.resolved_refs_message = format!(
                                 "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
@@ -652,7 +655,7 @@ async fn reconcile(
 
                     // Check Secret existence and format
                     if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
-                        ls.resolved_refs = false;
+                        refs_failed = true;
                         ls.resolved_refs_reason = "InvalidCertificateRef".into();
                         ls.resolved_refs_message = format!(
                             "Secret {}/{} not found or missing tls.crt/tls.key",
@@ -663,7 +666,7 @@ async fn reconcile(
             }
         } else if matches!(listener.protocol.as_str(), "HTTPS" | "TLS") {
             // HTTPS/TLS listener without TLS config
-            ls.resolved_refs = false;
+            refs_failed = true;
             ls.resolved_refs_reason = "InvalidCertificateRef".into();
             ls.resolved_refs_message = "HTTPS/TLS listener requires TLS configuration".into();
         }
@@ -688,7 +691,7 @@ async fn reconcile(
                 }
                 ls.supported_kinds = supported;
                 if has_invalid {
-                    ls.resolved_refs = false;
+                    refs_failed = true;
                     ls.resolved_refs_reason = "InvalidRouteKinds".into();
                     ls.resolved_refs_message = "One or more route kinds in allowedRoutes are not supported".into();
                 }
@@ -701,14 +704,54 @@ async fn reconcile(
             ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
         }
 
-        // If resolved_refs is false, the listener cannot be programmed
-        if !ls.resolved_refs {
+        // Promote resolved_refs to true if all checks passed
+        if !refs_failed {
+            ls.resolved_refs = true;
+            ls.resolved_refs_reason = "ResolvedRefs".into();
+            ls.resolved_refs_message = "All references resolved".into();
+        }
+
+        // Programmed depends on both accepted and resolved_refs
+        if ls.accepted && ls.resolved_refs {
+            ls.programmed = true;
+            ls.programmed_reason = "Programmed".into();
+            ls.programmed_message = "Programmed".into();
+        } else {
             ls.programmed = false;
             ls.programmed_reason = "Invalid".into();
-            ls.programmed_message = "Listener has unresolved references".into();
+            ls.programmed_message = if !ls.accepted {
+                "Listener not programmed due to acceptance failure".into()
+            } else {
+                "Listener has unresolved references".into()
+            };
         }
 
         listener_statuses.insert(listener.name.clone(), ls);
+    }
+
+    // Compute Gateway-level Accepted condition from listener validation
+    let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
+    let mut gateway_accepted = true;
+    let mut gateway_accepted_message = "Gateway accepted by portail controller".to_string();
+
+    for listener in &gateway.spec.listeners {
+        if !supported_protocols.contains(&listener.protocol.as_str()) {
+            gateway_accepted = false;
+            gateway_accepted_message = format!(
+                "Listener '{}' uses unsupported protocol '{}'",
+                listener.name, listener.protocol
+            );
+            break;
+        }
+    }
+
+    // If all listeners are in conflict or have unresolved refs, the gateway is not accepted
+    if gateway_accepted && !listener_statuses.is_empty() {
+        let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
+        if all_rejected {
+            gateway_accepted = false;
+            gateway_accepted_message = "All listeners are rejected due to conflicts or errors".to_string();
+        }
     }
 
     // Build config for the triggered Gateway
@@ -730,6 +773,8 @@ async fn reconcile(
             status::update_gateway_status(
                 &ctx.client,
                 &gateway,
+                gateway_accepted,
+                &gateway_accepted_message,
                 false,
                 &format!("Reconciliation failed: {}", e),
                 &HashMap::new(),
@@ -852,16 +897,32 @@ async fn reconcile(
                 result.config.tls_routes.len(),
                 result.config.udp_routes.len(),
             );
+
+            // Verify data plane has bound all required ports before reporting Programmed
+            let required_ports: Vec<u16> = gateway.spec.listeners.iter().map(|l| l.port as u16).collect();
+            let dp_ready = match ctx.data_plane.lock() {
+                Ok(dp) => dp.is_ready_for_ports(&required_ports),
+                Err(_) => false,
+            };
+            let (programmed, programmed_msg) = if dp_ready {
+                (true, "Programmed")
+            } else {
+                warn!("Data plane not ready: not all listener ports are bound");
+                (false, "Data plane not ready: not all listener ports are bound")
+            };
+
             status::update_gateway_status(
                 &ctx.client,
                 &gateway,
-                true,
-                "Programmed",
+                gateway_accepted,
+                &gateway_accepted_message,
+                programmed,
+                programmed_msg,
                 &listener_route_counts,
                 &listener_statuses,
             )
             .await;
-            true
+            dp_ready
         }
         Err(e) => {
             error!(
@@ -871,6 +932,8 @@ async fn reconcile(
             status::update_gateway_status(
                 &ctx.client,
                 &gateway,
+                gateway_accepted,
+                &gateway_accepted_message,
                 false,
                 &format!("Route table conversion failed: {}", e),
                 &listener_route_counts,

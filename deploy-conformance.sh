@@ -21,17 +21,8 @@ for arg in "$@"; do
   esac
 done
 
-SUPPORTED_FEATURES="HTTPRoute,HTTPRouteSchemeRedirect,HTTPRouteDestinationPortMatching"
-SUPPORTED_FEATURES+=",HTTPRouteHostRewrite,HTTPRoutePathRewrite,HTTPRouteRequestMirror"
-SUPPORTED_FEATURES+=",ReferenceGrant,Gateway,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching"
-SUPPORTED_FEATURES+=",HTTPRouteRequestHeaderModification,GatewayPort8080"
-SUPPORTED_FEATURES+=",HTTPRouteBackendRequestHeaderModification"
-SUPPORTED_FEATURES+=",HTTPRoutePathRedirect,HTTPRoutePortRedirect"
-SUPPORTED_FEATURES+=",HTTPRouteResponseHeaderModification"
-SUPPORTED_FEATURES+=",TLSRoute,UDPRoute"
-SUPPORTED_FEATURES+=",HTTPRouteRequestTimeout,HTTPRouteBackendTimeout"
-SUPPORTED_FEATURES+=",HTTPRouteRequestMultipleMirrors"
-SUPPORTED_FEATURES+=",HTTPRouteParentRefPort"
+# Get supported features from the binary (single source of truth)
+SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
 
 # ── 1. Build binary ──────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then

@@ -7,7 +7,6 @@
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
 
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -367,6 +366,11 @@ impl DataPlane {
         }
 
         info!("Data plane shutdown complete");
+    }
+
+    /// Check if all the specified ports are bound and ready to serve traffic.
+    pub fn is_ready_for_ports(&self, required_ports: &[u16]) -> bool {
+        required_ports.iter().all(|p| self.bound_ports.contains(p))
     }
 
     /// Get a reference to the shared health registry.

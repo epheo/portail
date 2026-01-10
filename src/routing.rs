@@ -244,6 +244,12 @@ impl RouteTable {
         scope.add_route(route_host, rule);
     }
 
+    /// Test convenience: add an HTTP route to a default catch-all scope on port 0.
+    #[allow(dead_code)]
+    pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
+        self.add_http_route_for_listener(0, None, host, rule);
+    }
+
     #[inline(always)]
     pub fn find_tcp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
         if let Some(backend_list) = self.tcp_routes.get(&server_port) {
@@ -774,10 +780,11 @@ mod tests {
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
+        let health = crate::health::HealthRegistry::new();
         let mut selector = BackendSelector::new();
         let mut counts = [0u32; 2];
         for _ in 0..400 {
-            let idx = selector.select_weighted_backend(42, r);
+            let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
             counts[idx] += 1;
         }
         assert_eq!(counts[0], 300);
