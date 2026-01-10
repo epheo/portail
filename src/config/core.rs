@@ -227,22 +227,26 @@ fn find_listeners_for_route<'a>(parent_refs: &[ParentRef], gateway: &'a GatewayC
 
     let mut matched = Vec::new();
     for pr in parent_refs {
-        match &pr.section_name {
-            Some(section) => {
-                // Specific listener requested
-                if let Some(listener) = gateway.listeners.iter().find(|l| l.name == *section) {
-                    if !matched.iter().any(|l: &&ListenerConfig| l.name == listener.name) {
-                        matched.push(listener);
-                    }
+        // Filter listeners by sectionName and/or port from the parentRef
+        let candidates: Vec<&ListenerConfig> = gateway.listeners.iter().filter(|l| {
+            // If sectionName is specified, listener name must match
+            if let Some(section) = &pr.section_name {
+                if l.name != *section {
+                    return false;
                 }
             }
-            None => {
-                // No sectionName: route attaches to ALL listeners
-                for listener in &gateway.listeners {
-                    if !matched.iter().any(|l: &&ListenerConfig| l.name == listener.name) {
-                        matched.push(listener);
-                    }
+            // If port is specified, listener port must match
+            if let Some(port) = pr.port {
+                if l.port != port as u16 {
+                    return false;
                 }
+            }
+            true
+        }).collect();
+
+        for listener in candidates {
+            if !matched.iter().any(|l: &&ListenerConfig| l.name == listener.name) {
+                matched.push(listener);
             }
         }
     }

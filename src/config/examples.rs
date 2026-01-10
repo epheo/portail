@@ -26,6 +26,7 @@ impl PortailConfig {
                     parent_refs: vec![ParentRef {
                         name: "minimal-gateway".to_string(),
                         section_name: Some("http".to_string()),
+                        port: None,
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
@@ -109,6 +110,7 @@ impl PortailConfig {
                     parent_refs: vec![ParentRef {
                         name: "development-gateway".to_string(),
                         section_name: Some("http".to_string()),
+                        port: None,
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
@@ -129,6 +131,7 @@ impl PortailConfig {
                     parent_refs: vec![ParentRef {
                         name: "development-gateway".to_string(),
                         section_name: Some("http".to_string()),
+                        port: None,
                     }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
@@ -143,7 +146,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![],
@@ -153,7 +156,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![],
@@ -163,7 +166,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![],
@@ -173,7 +176,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![],
@@ -183,7 +186,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![HttpRouteFilter::URLRewrite {
@@ -198,7 +201,7 @@ impl PortailConfig {
                     }],
                 },
                 HttpRouteConfig {
-                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()) }],
+                    parent_refs: vec![ParentRef { name: "development-gateway".to_string(), section_name: Some("http".to_string()), port: None }],
                     hostnames: vec!["localhost".to_string()],
                     rules: vec![HttpRouteRule {
                         filters: vec![HttpRouteFilter::RequestMirror {
@@ -218,6 +221,7 @@ impl PortailConfig {
                     parent_refs: vec![ParentRef {
                         name: "development-gateway".to_string(),
                         section_name: Some("tcp-ssh".to_string()),
+                        port: None,
                     }],
                     rules: vec![TcpRouteRule {
                         backend_refs: vec![BackendRef {

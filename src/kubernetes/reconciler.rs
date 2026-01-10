@@ -696,6 +696,7 @@ fn extract_parent_refs<T: ParentRefAccess>(
                 .map(|pr| ParentRef {
                     name: pr.ref_name().to_string(),
                     section_name: pr.ref_section_name().map(String::from),
+                    port: pr.ref_port(),
                 })
                 .collect()
         })
