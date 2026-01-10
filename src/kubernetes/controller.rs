@@ -234,7 +234,7 @@ fn map_route_to_gateways<T: ParentRefLike>(
         .as_ref()
         .map(|refs| {
             refs.iter()
-                .filter(|pr| pr.kind().map_or(true, |k| k == "Gateway"))
+                .filter(|pr| pr.kind().is_none_or(|k| k == "Gateway"))
                 .map(|pr| {
                     let ns = pr.namespace().unwrap_or(route_namespace);
                     ObjectRef::new(pr.name()).within(ns)
@@ -401,7 +401,7 @@ async fn reconcile(
                                     && f.namespace == gw_ns
                             });
                             let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group == "" && t.kind == "Secret"
+                                t.group.is_empty() && t.kind == "Secret"
                                     && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
                             });
                             from_ok && to_ok
@@ -634,7 +634,7 @@ async fn reconcile(
                                     && f.namespace == gw_ns
                             });
                             let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group == "" && t.kind == "Secret"
+                                t.group.is_empty() && t.kind == "Secret"
                                     && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
                             });
                             from_ok && to_ok

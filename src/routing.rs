@@ -244,13 +244,6 @@ impl RouteTable {
         scope.add_route(route_host, rule);
     }
 
-    /// Backwards-compatible: add an HTTP route to a default catch-all scope on port 0.
-    /// Used by tests that don't need listener scoping.
-    pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
-        // Use a default "any port, any listener" scope for backwards compatibility
-        self.add_http_route_for_listener(0, None, host, rule);
-    }
-
     #[inline(always)]
     pub fn find_tcp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
         if let Some(backend_list) = self.tcp_routes.get(&server_port) {
@@ -329,7 +322,7 @@ impl RouteTable {
         None
     }
 
-    fn sort_rules(rules: &mut Vec<HttpRouteRule>) {
+    fn sort_rules(rules: &mut [HttpRouteRule]) {
         // Sort by specificity (most specific first):
         // 1. Method presence (rules with method match first)
         // 2. Path type: exact > regex > prefix
@@ -1025,28 +1018,6 @@ pub struct BackendSelector {
 impl BackendSelector {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Select backend using weighted round-robin with pre-computed weights.
-    /// Uses O(log n) binary search on pre-computed cumulative_weights.
-    #[inline(always)]
-    pub fn select_weighted_backend(
-        &mut self,
-        route_hash: u64,
-        rule: &HttpRouteRule,
-    ) -> usize {
-        if rule.backends.len() <= 1 {
-            return 0;
-        }
-        if rule.total_weight == 0 {
-            return 0;
-        }
-
-        let counter = self.route_counters.entry(route_hash).or_insert(0);
-        let slot = *counter % rule.total_weight;
-        *counter = counter.wrapping_add(1);
-
-        rule.cumulative_weights.partition_point(|&cw| cw <= slot)
     }
 
     /// Health-aware weighted backend selection.

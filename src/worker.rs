@@ -198,10 +198,10 @@ pub async fn run_worker(
 
 async fn handle_connection(
     mut client: Connection,
-    peer: SocketAddr,
+    _peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
-    let conn_start = std::time::Instant::now();
+    let _conn_start = std::time::Instant::now();
     client.set_nodelay(true)?;
 
     let mut buf = vec![0u8; 65536];

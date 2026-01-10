@@ -119,7 +119,7 @@ impl PortailConfig {
                             tracing::debug!("      Adding route: {} {} -> {} backends (listener {}:{:?})",
                                 hostname, routing_rule.path, backends.len(), listener.port, listener.hostname);
                             route_table.add_http_route_for_listener(
-                                listener.port as u16,
+                                listener.port,
                                 listener.hostname.as_deref(),
                                 hostname,
                                 routing_rule,

@@ -63,7 +63,7 @@ impl DataPlane {
         worker_count: usize,
         listeners: &[ListenerConfig],
         performance_config: &PerformanceConfig,
-        cert_dir: &PathBuf,
+        cert_dir: &std::path::Path,
     ) -> Result<Self> {
         let health = Arc::new(HealthRegistry::new());
 

@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::http_parser::find_header_end;
 use crate::request_processor::{HeaderModifications, URLRewrite, RewrittenPath};
 
 /// Fire-and-forget mirror dispatch. Response is discarded per Gateway API spec.

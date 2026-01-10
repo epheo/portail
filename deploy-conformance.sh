@@ -29,6 +29,9 @@ SUPPORTED_FEATURES+=",HTTPRouteBackendRequestHeaderModification"
 SUPPORTED_FEATURES+=",HTTPRoutePathRedirect,HTTPRoutePortRedirect"
 SUPPORTED_FEATURES+=",HTTPRouteResponseHeaderModification"
 SUPPORTED_FEATURES+=",TLSRoute,UDPRoute"
+SUPPORTED_FEATURES+=",HTTPRouteRequestTimeout,HTTPRouteBackendTimeout"
+SUPPORTED_FEATURES+=",HTTPRouteRequestMultipleMirrors"
+SUPPORTED_FEATURES+=",HTTPRouteParentRefPort"
 
 # ── 1. Build binary ──────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
