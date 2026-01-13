@@ -68,6 +68,7 @@ pub async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
     accepted: bool,
+    accepted_reason: &str,
     accepted_message: &str,
     programmed: bool,
     programmed_message: &str,
@@ -85,7 +86,7 @@ pub async fn update_gateway_status(
         Condition {
             type_: "Accepted".to_string(),
             status: if accepted { "True" } else { "False" }.to_string(),
-            reason: if accepted { "Accepted" } else { "InvalidParameters" }.to_string(),
+            reason: if accepted { "Accepted" } else { accepted_reason }.to_string(),
             message: accepted_message.to_string(),
             last_transition_time: now.clone(),
             observed_generation: generation,

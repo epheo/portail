@@ -33,7 +33,10 @@ pub struct RouteAcceptance {
     pub refs_reason: String,
     pub refs_message: String,
     pub generation: Option<i64>,
+    /// The parentRef sectionName (for route status reporting)
     pub section_name: Option<String>,
+    /// The actual listener names this route was accepted by (for attached route counting)
+    pub listener_names: Vec<String>,
 }
 
 /// Check if a route in `route_ns` is allowed by the listener's allowedRoutes policy.
@@ -394,9 +397,10 @@ where
         let (name, generation) = get_identity(route);
         let section_names = get_parent_section_names(route);
 
-        // Check namespace + hostname scoping against at least one listener
+        // Check namespace + hostname scoping against each listener.
+        // Track which listeners accept this route (for attached route counting).
         let route_hostnames = get_hostnames(route);
-        let mut allowed = false;
+        let mut accepted_listener_names: Vec<String> = Vec::new();
         let mut rejection_reason = "NoMatchingParent";
         for l in listeners {
             match route_allowed_for_listener(
@@ -410,8 +414,7 @@ where
                 namespace_labels,
             ) {
                 RouteAllowResult::Allowed => {
-                    allowed = true;
-                    break;
+                    accepted_listener_names.push(l.name.clone());
                 }
                 RouteAllowResult::Rejected(reason) => {
                     let priority = |r: &str| match r {
@@ -426,7 +429,7 @@ where
             }
         }
 
-        if !allowed {
+        if accepted_listener_names.is_empty() {
             let message = match rejection_reason {
                 "NoMatchingListenerHostname" => "Route hostnames do not intersect with any listener hostname",
                 "NoMatchingParent" => "No matching listener found for route parentRef",
@@ -445,6 +448,7 @@ where
                     refs_message: "All references resolved".to_string(),
                     generation,
                     section_name: section_name.clone(),
+                    listener_names: vec![],
                 });
             }
             continue;
@@ -523,6 +527,7 @@ where
                         refs_message: refs_message.clone(),
                         generation,
                         section_name: section_name.clone(),
+                        listener_names: accepted_listener_names.clone(),
                     });
                 }
                 configs.push(config);
@@ -541,6 +546,7 @@ where
                         refs_message: format!("Conversion failed: {}", e),
                         generation,
                         section_name: section_name.clone(),
+                        listener_names: vec![],
                     });
                 }
             }

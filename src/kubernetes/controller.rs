@@ -732,11 +732,13 @@ async fn reconcile(
     // Compute Gateway-level Accepted condition from listener validation
     let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
     let mut gateway_accepted = true;
+    let mut gateway_accepted_reason = "Accepted".to_string();
     let mut gateway_accepted_message = "Gateway accepted by portail controller".to_string();
 
     for listener in &gateway.spec.listeners {
         if !supported_protocols.contains(&listener.protocol.as_str()) {
             gateway_accepted = false;
+            gateway_accepted_reason = "InvalidParameters".to_string();
             gateway_accepted_message = format!(
                 "Listener '{}' uses unsupported protocol '{}'",
                 listener.name, listener.protocol
@@ -745,11 +747,30 @@ async fn reconcile(
         }
     }
 
+    // Validate spec.addresses — reject if any address has an unsupported type
+    // Per Gateway API spec, supported types are "IPAddress" (default) and "Hostname"
+    if gateway_accepted {
+        if let Some(addresses) = &gateway.spec.addresses {
+            for addr in addresses {
+                let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
+                if addr_type != "IPAddress" && addr_type != "Hostname" {
+                    gateway_accepted = false;
+                    gateway_accepted_reason = "UnsupportedAddress".to_string();
+                    gateway_accepted_message = format!(
+                        "Unsupported address type '{}' in spec.addresses", addr_type
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     // If all listeners are in conflict or have unresolved refs, the gateway is not accepted
     if gateway_accepted && !listener_statuses.is_empty() {
         let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
         if all_rejected {
             gateway_accepted = false;
+            gateway_accepted_reason = "InvalidListeners".to_string();
             gateway_accepted_message = "All listeners are rejected due to conflicts or errors".to_string();
         }
     }
@@ -774,6 +795,7 @@ async fn reconcile(
                 &ctx.client,
                 &gateway,
                 gateway_accepted,
+                &gateway_accepted_reason,
                 &gateway_accepted_message,
                 false,
                 &format!("Reconciliation failed: {}", e),
@@ -847,23 +869,16 @@ async fn reconcile(
     // Build a single route table from all configs.
     // Each config's to_route_table() adds routes scoped by listener (port, hostname).
 
-    // Compute per-listener attached route counts from accepted routes (for this gateway only)
+    // Compute per-listener attached route counts from accepted routes (for this gateway only).
+    // Use the listener_names field which tracks exactly which listeners each route was accepted by.
     let mut listener_route_counts: HashMap<String, i32> = HashMap::new();
     for listener in &gateway.spec.listeners {
         listener_route_counts.insert(listener.name.clone(), 0);
     }
     for ra in &result.route_status {
         if ra.accepted {
-            match &ra.section_name {
-                Some(section) => {
-                    *listener_route_counts.entry(section.clone()).or_insert(0) += 1;
-                }
-                None => {
-                    // No sectionName means the route attaches to ALL listeners
-                    for count in listener_route_counts.values_mut() {
-                        *count += 1;
-                    }
-                }
+            for listener_name in &ra.listener_names {
+                *listener_route_counts.entry(listener_name.clone()).or_insert(0) += 1;
             }
         }
     }
@@ -915,6 +930,7 @@ async fn reconcile(
                 &ctx.client,
                 &gateway,
                 gateway_accepted,
+                &gateway_accepted_reason,
                 &gateway_accepted_message,
                 programmed,
                 programmed_msg,
@@ -933,6 +949,7 @@ async fn reconcile(
                 &ctx.client,
                 &gateway,
                 gateway_accepted,
+                &gateway_accepted_reason,
                 &gateway_accepted_message,
                 false,
                 &format!("Route table conversion failed: {}", e),
