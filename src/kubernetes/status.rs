@@ -242,6 +242,7 @@ pub struct RouteParentStatus {
     pub gateway_name: String,
     pub gateway_namespace: String,
     pub section_name: Option<String>,
+    pub port: Option<i32>,
     pub accepted: bool,
     pub accepted_reason: String,
     pub message: String,
@@ -283,6 +284,9 @@ where
         });
         if let Some(section) = &p.section_name {
             parent_ref["sectionName"] = serde_json::json!(section);
+        }
+        if let Some(port) = p.port {
+            parent_ref["port"] = serde_json::json!(port);
         }
 
         serde_json::json!({

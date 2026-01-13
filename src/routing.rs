@@ -33,25 +33,27 @@ impl ListenerScope {
     /// Check if a request Host header matches this listener's hostname constraint.
     /// Returns a match priority: higher = better match.
     /// Returns None if the host doesn't match this listener.
-    fn hostname_match_priority(&self, request_host: &str) -> Option<u8> {
+    fn hostname_match_priority(&self, request_host: &str) -> Option<u32> {
         match &self.listener_hostname {
             None => Some(0), // Catch-all listener: lowest priority
             Some(lh) => {
                 let lh_lower = lh.to_ascii_lowercase();
                 if let Some(parent) = lh_lower.strip_prefix("*.") {
                     // Wildcard listener (e.g., *.example.com)
+                    // More specific wildcards get higher priority:
+                    // *.foo.example.com (len 15) > *.example.com (len 11)
                     let rh = request_host.to_ascii_lowercase();
                     if rh.ends_with(parent) && rh.len() > parent.len()
                         && rh.as_bytes()[rh.len() - parent.len() - 1] == b'.'
                     {
-                        Some(1) // Wildcard match: medium priority
+                        Some(1 + parent.len() as u32) // Longer suffix = more specific = higher priority
                     } else {
                         None
                     }
                 } else {
                     // Exact listener hostname
                     if request_host.eq_ignore_ascii_case(&lh_lower) {
-                        Some(2) // Exact match: highest priority
+                        Some(u32::MAX) // Exact match: highest priority
                     } else {
                         None
                     }
@@ -191,31 +193,45 @@ impl RouteTable {
             &host_lower
         };
 
-        // Collect matching scopes for this port, sorted by hostname match priority (highest first)
-        // We iterate in priority order: exact hostname > wildcard > catch-all
-        let mut best_priority: Option<u8> = None;
-        let mut best_result: Option<&'a HttpRouteRule> = None;
+        // Phase 1: Find the highest hostname match priority among all matching scopes.
+        // Per Gateway API listener isolation, once a hostname is claimed by a specific
+        // listener, routes from less specific listeners are invisible to that hostname.
+        let mut highest_priority: Option<u32> = None;
 
         for scope in &self.listener_scopes {
-            // Port 0 = any-port wildcard (for backwards-compat / file-based configs)
             if scope.port != 0 && scope.port != server_port {
                 continue;
             }
             if let Some(priority) = scope.hostname_match_priority(host_key) {
-                // Only try this scope if it's >= the best priority we've found a result for
-                if best_priority.is_some_and(|bp| priority < bp) {
-                    continue;
-                }
-                if let Some(rule) = scope.lookup_http_route(host_key, method, path, header_data, query_string) {
-                    if best_priority.is_none() || priority > best_priority.unwrap() {
-                        best_priority = Some(priority);
-                        best_result = Some(rule);
-                    }
+                if highest_priority.is_none() || priority > highest_priority.unwrap() {
+                    highest_priority = Some(priority);
                 }
             }
         }
 
-        best_result.ok_or_else(|| anyhow!("No HTTP route found for host={} path={} port={}", host_key, path, server_port))
+        let highest_priority = match highest_priority {
+            Some(p) => p,
+            None => return Err(anyhow!("No HTTP route found for host={} path={} port={}", host_key, path, server_port)),
+        };
+
+        // Phase 2: Only search routes in scopes at the highest matching priority.
+        // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
+        // (priority 1), routes from the catch-all listener (priority 0) are excluded.
+        for scope in &self.listener_scopes {
+            if scope.port != 0 && scope.port != server_port {
+                continue;
+            }
+            if let Some(priority) = scope.hostname_match_priority(host_key) {
+                if priority < highest_priority {
+                    continue; // Skip lower-priority scopes (listener isolation)
+                }
+                if let Some(rule) = scope.lookup_http_route(host_key, method, path, header_data, query_string) {
+                    return Ok(rule);
+                }
+            }
+        }
+
+        Err(anyhow!("No HTTP route found for host={} path={} port={}", host_key, path, server_port))
     }
 
     /// Add an HTTP route scoped to a specific listener (port + hostname).

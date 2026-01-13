@@ -883,10 +883,9 @@ async fn reconcile(
         }
     }
 
-    let all_configs_clone = all_configs.clone();
     let route_table = tokio::task::spawn_blocking(move || {
         let mut combined = crate::routing::RouteTable::new();
-        for config in &all_configs_clone {
+        for config in &all_configs {
             let rt = config.to_route_table()?;
             // Merge listener scopes from each gateway's route table
             combined.listener_scopes.extend(rt.listener_scopes);
@@ -979,6 +978,7 @@ async fn reconcile(
                     gateway_name: gw_name.clone(),
                     gateway_namespace: gw_ns.clone(),
                     section_name: ra.section_name.clone(),
+                    port: None,
                     accepted: ra.accepted,
                     accepted_reason: ra.accepted_reason.clone(),
                     message: ra.message.clone(),
