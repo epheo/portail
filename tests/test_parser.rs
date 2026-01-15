@@ -20,11 +20,10 @@ fn test_parse_http_headers_fast_post() {
 
 #[test]
 fn test_parse_http_headers_fast_no_host() {
+    // HTTP/1.1 requires a Host header per RFC 7230 §5.4
     let request = b"GET /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n";
-
-    let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.path, "/api");
-    assert_eq!(result.host, "localhost"); // Default fallback when no Host header
+    let result = extract_routing_info(request);
+    assert!(result.is_err(), "HTTP/1.1 without Host header should be rejected");
 }
 
 #[test]
@@ -129,10 +128,10 @@ fn test_parse_http_headers_fast_empty_request() {
 
 #[test]
 fn test_parse_http_headers_fast_minimal_valid_request() {
+    // HTTP/1.1 without Host header is invalid per RFC 7230 §5.4
     let request = b"GET / HTTP/1.1\r\n\r\n";
-    let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.path, "/");
-    assert_eq!(result.host, "localhost");
+    let result = extract_routing_info(request);
+    assert!(result.is_err(), "HTTP/1.1 without Host header should be rejected");
 }
 
 #[test]
