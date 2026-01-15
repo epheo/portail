@@ -6,7 +6,7 @@ It runs as a DaemonSet with `hostNetwork: true`, binding directly to node ports 
 
 ## Conformance
 
-**All 382 tests passing** against the official Gateway API conformance suite.
+**346 / 383 tests passing** (90%) against the official Gateway API conformance suite.
 
 Supported features:
 
@@ -27,7 +27,7 @@ Supported features:
 
 ```bash
 # Install Gateway API CRDs
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml
 
 # Deploy Portail
 kubectl apply -f deploy/namespace.yaml

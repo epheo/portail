@@ -6,7 +6,7 @@
 - Gateway API CRDs installed (experimental channel recommended)
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml
 ```
 
 ## Deploy
@@ -40,7 +40,7 @@ Or use a pre-built image from the registry:
 
 ```yaml
 # In deploy/daemonset.yaml, set the image:
-image: quay.io/epheo/portail:latest
+image: registry.desku.be/portail:v0.2.0
 ```
 
 ## Network Model

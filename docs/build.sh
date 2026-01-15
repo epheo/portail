@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build HTML documentation from Markdown files using pandoc.
-# Output goes to docs/html/
+# Output goes to docs/*.html alongside the source .md files.
 #
 # Usage: ./docs/build.sh
 #
@@ -9,15 +9,11 @@
 set -euo pipefail
 
 DOCS_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUT_DIR="$DOCS_DIR/html"
-
-mkdir -p "$OUT_DIR"
 
 for f in "$DOCS_DIR"/*.md; do
-  base="$(basename "${f%.md}")"
-  out="$OUT_DIR/$base.html"
+  out="${f%.md}.html"
   pandoc "$f" -s --metadata title="Portail" -o "$out"
-  echo "  $base.html"
+  echo "  $(basename "$out")"
 done
 
-echo "Done. Output in docs/html/"
+echo "Done."
