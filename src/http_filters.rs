@@ -21,68 +21,41 @@ pub(crate) fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
     }
 }
 
-/// Apply request header modifications only — returns modified headers (including trailing \r\n\r\n).
-/// Body bytes are NOT included; the caller sends them separately from the original buffer.
-/// This keeps body handling zero-copy on the filter path.
-pub(crate) fn apply_request_header_modifications(
-    header_region: &[u8],
-    header_mods: Option<&HeaderModifications>,
-    url_rewrite: Option<&URLRewrite>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(header_region.len() + 256);
-    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
-
-    // Track which set headers were applied (matched existing headers)
-    let mut set_applied: Vec<bool> = header_mods
+/// Core header modification engine shared by request and response paths.
+///
+/// Iterates raw header bytes line-by-line, applying set/add/remove operations.
+/// The first line (request-line or status-line) is written to `out` by the caller
+/// before invoking this function — this only processes header lines that follow.
+///
+/// `rewrite_hostname`: if Some, replaces the Host header value (request path only).
+fn apply_header_mods_inner(
+    header_lines: &[u8],
+    mods: Option<&HeaderModifications>,
+    rewrite_hostname: Option<&str>,
+    out: &mut Vec<u8>,
+) {
+    // Track which "set" headers were applied (matched existing headers)
+    let mut set_applied: Vec<bool> = mods
         .map(|m| vec![false; m.set.len()])
         .unwrap_or_default();
 
-    // Process line by line on raw bytes
     let mut pos = 0;
-    let mut first_line = true;
-    while pos < header_region.len() {
+    while pos < header_lines.len() {
         let line_start = pos;
-        // Find \r\n boundary
-        while pos < header_region.len() && header_region[pos] != b'\r' && header_region[pos] != b'\n' {
+        while pos < header_lines.len() && header_lines[pos] != b'\r' && header_lines[pos] != b'\n' {
             pos += 1;
         }
-        let line = &header_region[line_start..pos];
+        let line = &header_lines[line_start..pos];
 
         // Skip past CRLF
-        if pos < header_region.len() && header_region[pos] == b'\r' { pos += 1; }
-        if pos < header_region.len() && header_region[pos] == b'\n' { pos += 1; }
+        if pos < header_lines.len() && header_lines[pos] == b'\r' { pos += 1; }
+        if pos < header_lines.len() && header_lines[pos] == b'\n' { pos += 1; }
 
         if line.is_empty() {
             continue;
         }
 
-        if first_line {
-            first_line = false;
-            // Request line: rewrite path if needed
-            if let Some(rewrite) = url_rewrite {
-                if let Some(ref rewritten) = rewrite.path {
-                    let new_path = match rewritten {
-                        RewrittenPath::Full(p) => p.as_bytes(),
-                        RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
-                    };
-                    // Find METHOD and VERSION by locating the two spaces
-                    if let Some(sp1) = line.iter().position(|&b| b == b' ') {
-                        if let Some(sp2) = line[sp1 + 1..].iter().position(|&b| b == b' ') {
-                            out.extend_from_slice(&line[..sp1 + 1]);
-                            out.extend_from_slice(new_path);
-                            out.extend_from_slice(&line[sp1 + 1 + sp2..]);
-                            out.extend_from_slice(b"\r\n");
-                            continue;
-                        }
-                    }
-                }
-            }
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            continue;
-        }
-
-        // Header line: find colon to extract name
+        // Find colon to extract header name
         let colon_pos = match line.iter().position(|&b| b == b':') {
             Some(p) => p,
             None => {
@@ -102,7 +75,8 @@ pub(crate) fn apply_request_header_modifications(
                 continue;
             }
         }
-        if let Some(mods) = header_mods {
+
+        if let Some(mods) = mods {
             let name_str = match std::str::from_utf8(name) {
                 Ok(s) => s,
                 Err(_) => {
@@ -131,8 +105,8 @@ pub(crate) fn apply_request_header_modifications(
         out.extend_from_slice(b"\r\n");
     }
 
-    // Add headers from "set" that didn't match any existing header (set = replace OR add)
-    if let Some(mods) = header_mods {
+    // Add "set" headers that didn't match any existing header (set = replace OR add)
+    if let Some(mods) = mods {
         for (idx, h) in mods.set.iter().enumerate() {
             if !set_applied[idx] {
                 out.extend_from_slice(h.name.as_bytes());
@@ -141,7 +115,7 @@ pub(crate) fn apply_request_header_modifications(
                 out.extend_from_slice(b"\r\n");
             }
         }
-        // Add headers from "add" (always appended)
+        // Add headers (always appended)
         for h in mods.add.iter() {
             out.extend_from_slice(h.name.as_bytes());
             out.extend_from_slice(b": ");
@@ -151,6 +125,61 @@ pub(crate) fn apply_request_header_modifications(
     }
 
     out.extend_from_slice(b"\r\n");
+}
+
+/// Split raw header bytes into (first_line, rest) at the first CRLF boundary.
+/// Returns (first_line_bytes, remaining_bytes_after_crlf).
+fn split_first_line(header_region: &[u8]) -> (&[u8], &[u8]) {
+    let mut pos = 0;
+    while pos < header_region.len() && header_region[pos] != b'\r' && header_region[pos] != b'\n' {
+        pos += 1;
+    }
+    let first_line = &header_region[..pos];
+    // Skip CRLF
+    if pos < header_region.len() && header_region[pos] == b'\r' { pos += 1; }
+    if pos < header_region.len() && header_region[pos] == b'\n' { pos += 1; }
+    (first_line, &header_region[pos..])
+}
+
+/// Apply request header modifications only — returns modified headers (including trailing \r\n\r\n).
+/// Body bytes are NOT included; the caller sends them separately from the original buffer.
+/// This keeps body handling zero-copy on the filter path.
+pub(crate) fn apply_request_header_modifications(
+    header_region: &[u8],
+    header_mods: Option<&HeaderModifications>,
+    url_rewrite: Option<&URLRewrite>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(header_region.len() + 256);
+    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
+
+    let (first_line, rest) = split_first_line(header_region);
+
+    // Request line: rewrite path if needed
+    if let Some(rewrite) = url_rewrite {
+        if let Some(ref rewritten) = rewrite.path {
+            let new_path = match rewritten {
+                RewrittenPath::Full(p) => p.as_bytes(),
+                RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
+            };
+            if let Some(sp1) = first_line.iter().position(|&b| b == b' ') {
+                if let Some(sp2) = first_line[sp1 + 1..].iter().position(|&b| b == b' ') {
+                    out.extend_from_slice(&first_line[..sp1 + 1]);
+                    out.extend_from_slice(new_path);
+                    out.extend_from_slice(&first_line[sp1 + 1 + sp2..]);
+                    out.extend_from_slice(b"\r\n");
+
+                    apply_header_mods_inner(rest, header_mods, rewrite_hostname, &mut out);
+                    return out;
+                }
+            }
+        }
+    }
+
+    // No path rewrite — pass first line through
+    out.extend_from_slice(first_line);
+    out.extend_from_slice(b"\r\n");
+
+    apply_header_mods_inner(rest, header_mods, rewrite_hostname, &mut out);
     out
 }
 
@@ -160,90 +189,14 @@ pub(crate) fn apply_request_header_modifications(
 /// Operates on raw bytes — no intermediate String allocations.
 pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModifications) -> Vec<u8> {
     let mut out = Vec::with_capacity(headers.len() + 256);
-    let mut pos = 0;
-    let mut first_line = true;
-    let mut set_applied = vec![false; mods.set.len()];
 
-    while pos < headers.len() {
-        let line_start = pos;
-        // Find end of line
-        while pos < headers.len() && headers[pos] != b'\r' && headers[pos] != b'\n' {
-            pos += 1;
-        }
-        let line = &headers[line_start..pos];
+    let (status_line, rest) = split_first_line(headers);
 
-        // Skip past CRLF
-        if pos < headers.len() && headers[pos] == b'\r' { pos += 1; }
-        if pos < headers.len() && headers[pos] == b'\n' { pos += 1; }
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if first_line {
-            // Status line: pass through unchanged
-            first_line = false;
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            continue;
-        }
-
-        // Header line: find colon to extract name
-        let colon_pos = match line.iter().position(|&b| b == b':') {
-            Some(p) => p,
-            None => {
-                out.extend_from_slice(line);
-                out.extend_from_slice(b"\r\n");
-                continue;
-            }
-        };
-        let name = &line[..colon_pos];
-
-        let name_str = match std::str::from_utf8(name) {
-            Ok(s) => s,
-            Err(_) => {
-                out.extend_from_slice(line);
-                out.extend_from_slice(b"\r\n");
-                continue;
-            }
-        };
-
-        if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
-            continue;
-        }
-
-        if let Some((idx, set_header)) = mods.set.iter().enumerate()
-            .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str)) {
-            set_applied[idx] = true;
-            out.extend_from_slice(set_header.name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(set_header.value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-            continue;
-        }
-
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
-    }
-
-    // Add "set" headers that didn't match any existing header (set = replace OR add)
-    for (idx, h) in mods.set.iter().enumerate() {
-        if !set_applied[idx] {
-            out.extend_from_slice(h.name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(h.value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
-    // Add headers (always appended)
-    for h in mods.add.iter() {
-        out.extend_from_slice(h.name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(h.value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-
+    // Status line: pass through unchanged
+    out.extend_from_slice(status_line);
     out.extend_from_slice(b"\r\n");
+
+    apply_header_mods_inner(rest, Some(mods), None, &mut out);
     out
 }
 

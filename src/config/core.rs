@@ -150,8 +150,8 @@ impl PortailConfig {
             }
         }
 
-        tracing::debug!("Route table conversion completed: {} HTTP routes, {} TCP routes, {} UDP routes",
-            route_table.listener_scopes.len(), route_table.tcp_routes.len(), route_table.udp_routes.len());
+        tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
+            route_table.listener_scopes.values().map(|v| v.len()).sum::<usize>(), route_table.tcp_routes.len(), route_table.udp_routes.len());
 
         Ok(route_table)
     }

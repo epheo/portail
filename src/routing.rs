@@ -9,7 +9,8 @@ use anyhow::{anyhow, Result};
 /// Routes are only matched within the scope whose listener hostname matches the request.
 #[derive(Debug, Clone)]
 pub struct ListenerScope {
-    /// Port this listener is bound to
+    /// Port this listener is bound to (redundant with the HashMap key; kept for Debug).
+    #[allow(dead_code)]
     pub port: u16,
     /// Optional hostname constraint (None = catch-all for this port)
     pub listener_hostname: Option<String>,
@@ -142,8 +143,9 @@ impl ListenerScope {
 
 #[derive(Debug, Clone)]
 pub struct RouteTable {
-    /// Per-listener HTTP route scopes
-    pub listener_scopes: Vec<ListenerScope>,
+    /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
+    /// Port 0 is a wildcard that matches any port (used in file-based configs / tests).
+    pub listener_scopes: FnvHashMap<u16, Vec<ListenerScope>>,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
@@ -154,7 +156,7 @@ pub struct RouteTable {
 impl RouteTable {
     pub fn new() -> Self {
         Self {
-            listener_scopes: Vec::with_capacity(16),
+            listener_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -193,15 +195,15 @@ impl RouteTable {
             &host_lower
         };
 
+        // O(1) port lookup, then iterate only matching scopes.
+        // Also check port-0 wildcard scopes (file-based configs / tests).
+        let port_scopes = self.listener_scopes.get(&server_port);
+        let wildcard_scopes = if server_port != 0 { self.listener_scopes.get(&0) } else { None };
+
         // Phase 1: Find the highest hostname match priority among all matching scopes.
-        // Per Gateway API listener isolation, once a hostname is claimed by a specific
-        // listener, routes from less specific listeners are invisible to that hostname.
         let mut highest_priority: Option<u32> = None;
 
-        for scope in &self.listener_scopes {
-            if scope.port != 0 && scope.port != server_port {
-                continue;
-            }
+        for scope in port_scopes.into_iter().chain(wildcard_scopes).flat_map(|v| v.iter()) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if highest_priority.is_none() || priority > highest_priority.unwrap() {
                     highest_priority = Some(priority);
@@ -217,13 +219,10 @@ impl RouteTable {
         // Phase 2: Only search routes in scopes at the highest matching priority.
         // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
         // (priority 1), routes from the catch-all listener (priority 0) are excluded.
-        for scope in &self.listener_scopes {
-            if scope.port != 0 && scope.port != server_port {
-                continue;
-            }
+        for scope in port_scopes.into_iter().chain(wildcard_scopes).flat_map(|v| v.iter()) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if priority < highest_priority {
-                    continue; // Skip lower-priority scopes (listener isolation)
+                    continue;
                 }
                 if let Some(rule) = scope.lookup_http_route(host_key, method, path, header_data, query_string) {
                     return Ok(rule);
@@ -243,17 +242,18 @@ impl RouteTable {
         route_host: &str,
         rule: HttpRouteRule,
     ) {
-        // Find or create the listener scope
-        let scope = match self.listener_scopes.iter_mut().find(|s| {
-            s.port == listener_port && s.listener_hostname.as_deref() == listener_hostname
+        // Find or create the listener scope within the port bucket
+        let scopes = self.listener_scopes.entry(listener_port).or_default();
+        let scope = match scopes.iter_mut().find(|s| {
+            s.listener_hostname.as_deref() == listener_hostname
         }) {
             Some(s) => s,
             None => {
-                self.listener_scopes.push(ListenerScope::new(
+                scopes.push(ListenerScope::new(
                     listener_port,
                     listener_hostname.map(|s| s.to_string()),
                 ));
-                self.listener_scopes.last_mut().unwrap()
+                scopes.last_mut().unwrap()
             }
         };
 
@@ -797,7 +797,7 @@ mod tests {
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
         let health = crate::health::HealthRegistry::new();
-        let mut selector = BackendSelector::new();
+        let selector = BackendSelector::new();
         let mut counts = [0u32; 2];
         for _ in 0..400 {
             let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
@@ -1032,15 +1032,28 @@ mod tests {
     }
 }
 
-/// Weighted round-robin backend selector
+/// Weighted round-robin backend selector.
+///
+/// Uses DashMap for lock-free per-route counters, allowing `&self` access
+/// without an outer Mutex. Each route hash gets its own atomic counter.
 #[derive(Debug, Default)]
 pub struct BackendSelector {
-    route_counters: FnvHashMap<u64, u64>,
+    route_counters: dashmap::DashMap<u64, std::sync::atomic::AtomicU64, fnv::FnvBuildHasher>,
 }
 
 impl BackendSelector {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            route_counters: dashmap::DashMap::with_hasher(Default::default()),
+        }
+    }
+
+    /// Atomically fetch-and-increment the counter for a route hash.
+    #[inline(always)]
+    fn next_counter(&self, route_hash: u64) -> u64 {
+        let entry = self.route_counters.entry(route_hash)
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        entry.value().fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Health-aware weighted backend selection.
@@ -1055,7 +1068,7 @@ impl BackendSelector {
     /// The slow path is O(n) on backend count which is acceptable because
     /// n is typically 2–5 and this path is only taken during partial failures.
     pub fn select_healthy_weighted_backend(
-        &mut self,
+        &self,
         route_hash: u64,
         rule: &HttpRouteRule,
         health: &crate::health::HealthRegistry,
@@ -1067,12 +1080,9 @@ impl BackendSelector {
         }
 
         if backends.len() == 1 {
-            // Single backend: always return it so the worker can attempt a
-            // connection and record the failure — there is no alternative anyway.
             return Some(0);
         }
 
-        // One linear pass: count healthy backends and sum their weights.
         let mut healthy_weight: u64 = 0;
         let mut healthy_count: usize = 0;
         for b in backends {
@@ -1086,22 +1096,18 @@ impl BackendSelector {
             return None;
         }
 
-        let counter = self.route_counters.entry(route_hash).or_insert(0);
+        let counter = self.next_counter(route_hash);
 
         if healthy_count == backends.len() {
-            // Fast path — all healthy, use pre-computed cumulative_weights.
             if rule.total_weight == 0 {
                 return Some(0);
             }
-            let slot = *counter % rule.total_weight;
-            *counter = counter.wrapping_add(1);
+            let slot = counter % rule.total_weight;
             return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
         }
 
-        // Slow path — some backends are unhealthy; recompute distribution over
-        // the healthy subset only.
-        let slot = *counter % healthy_weight;
-        *counter = counter.wrapping_add(1);
+        // Slow path — some backends are unhealthy
+        let slot = counter % healthy_weight;
 
         let mut cumulative: u64 = 0;
         for (i, b) in backends.iter().enumerate() {
@@ -1114,16 +1120,12 @@ impl BackendSelector {
             }
         }
 
-        // Unreachable given healthy_weight > 0, but fall back to first healthy
-        // backend rather than panic.
         backends.iter().position(|b| health.is_healthy(&b.socket_addr))
     }
 
     /// Simple round-robin (for equal-weight backends or non-HTTP routes)
-    pub fn select_backend(&mut self, route_hash: u64, backend_count: usize) -> usize {
-        let counter = self.route_counters.entry(route_hash).or_insert(0);
-        let count = *counter as usize;
-        *counter = counter.wrapping_add(1);
+    pub fn select_backend(&self, route_hash: u64, backend_count: usize) -> usize {
+        let count = self.next_counter(route_hash) as usize;
 
         if backend_count.is_power_of_two() {
             count & (backend_count - 1)

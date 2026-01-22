@@ -35,7 +35,7 @@ pub async fn run_udp_worker(
     info!("UDP worker {} listening on port {}", worker_id, server_port);
 
     let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
-    let mut selector = BackendSelector::new();
+    let selector = BackendSelector::new();
     let mut buf = vec![0u8; 65536];
 
     // Use a monotonic epoch for last_active tracking (shared between main loop and reaper)
@@ -95,7 +95,7 @@ pub async fn run_udp_worker(
                         // New session — route lookup
                         let decision = {
                             let route_table = routes.load();
-                            match request_processor::analyze_udp_request(&route_table, &mut selector, server_port, &health) {
+                            match request_processor::analyze_udp_request(&route_table, &selector, server_port, &health) {
                                 Ok(d) => d,
                                 Err(e) => {
                                     warn!("UDP routing error for port {}: {}", server_port, e);

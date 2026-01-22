@@ -5,8 +5,8 @@ use futures::StreamExt;
 use kube::api::{Api, ListParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
-use kube::runtime::Controller;
-use kube::runtime::reflector::ObjectRef;
+use kube::runtime::{reflector, Controller, WatchStreamExt};
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::Client;
 use kube::ResourceExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
@@ -76,6 +76,17 @@ struct ControllerCtx {
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     worker_count: usize,
     performance_config: crate::config::PerformanceConfig,
+    // Reflector stores — cached local copies of cluster resources
+    store_http_routes: Store<HTTPRoute>,
+    store_tcp_routes: Store<TCPRoute>,
+    store_tls_routes: Store<TLSRoute>,
+    store_udp_routes: Store<UDPRoute>,
+    store_namespaces: Store<Namespace>,
+    store_services: Store<Service>,
+    store_endpoint_slices: Store<EndpointSlice>,
+    store_reference_grants: Store<ReferenceGrant>,
+    store_secrets: Store<Secret>,
+    store_gateways: Store<Gateway>,
 }
 
 /// Reconcile a GatewayClass: accept ours, reject others with same controllerName
@@ -118,6 +129,30 @@ async fn reconcile_gateway_class(
     Ok(Action::await_change())
 }
 
+/// Helper: create a reflector store for a resource type, spawn a background task
+/// to drive it, and optionally send a reconcile trigger on each event.
+fn spawn_reflector<K>(
+    api: Api<K>,
+    reconcile_tx: Option<tokio::sync::mpsc::Sender<()>>,
+) -> Store<K>
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + Sync + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    let writer = reflector::store::Writer::default();
+    let reader = writer.as_reader();
+    let rf = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()));
+    tokio::spawn(async move {
+        let mut stream = std::pin::pin!(rf.applied_objects());
+        while stream.next().await.is_some() {
+            if let Some(tx) = &reconcile_tx {
+                let _ = tx.try_send(());
+            }
+        }
+    });
+    reader
+}
+
 pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
@@ -130,15 +165,33 @@ pub async fn run_controller(
     info!("Kubernetes client connected, starting Gateway API controller");
 
     let gateway_classes: Api<GatewayClass> = Api::all(client.clone());
-    let gateways: Api<Gateway> = Api::all(client.clone());
     let http_routes: Api<HTTPRoute> = Api::all(client.clone());
     let tcp_routes: Api<TCPRoute> = Api::all(client.clone());
     let tls_routes: Api<TLSRoute> = Api::all(client.clone());
     let udp_routes: Api<UDPRoute> = Api::all(client.clone());
-    let secrets: Api<Secret> = Api::all(client.clone());
-    let services: Api<Service> = Api::all(client.clone());
-    let endpoint_slices: Api<EndpointSlice> = Api::all(client.clone());
-    let reference_grants: Api<gateway_api::referencegrants::ReferenceGrant> = Api::all(client.clone());
+    let gateways: Api<Gateway> = Api::all(client.clone());
+
+    // Channel to trigger full reconciliation when secondary resources change
+    let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
+
+    // Create reflector stores — cached local copies of all cluster resources.
+    // Each reflector watches the API server and keeps the store up to date.
+    // Secrets/Services/EndpointSlices/ReferenceGrants/Namespaces trigger
+    // full reconciliation via the channel; route stores are read-only caches
+    // (route changes trigger targeted reconciliation via Controller::watches).
+    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), None);
+    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), None);
+    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), None);
+    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), None);
+    let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_secrets = spawn_reflector(Api::<Secret>::all(client.clone()), Some(reconcile_tx.clone()));
+
+    // Gateway store: populated by a separate reflector so reconcile() can iterate
+    // all gateways without re-listing from the API server.
+    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), None);
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -147,26 +200,17 @@ pub async fn run_controller(
         data_plane,
         worker_count,
         performance_config,
+        store_http_routes,
+        store_tcp_routes,
+        store_tls_routes,
+        store_udp_routes,
+        store_namespaces,
+        store_services,
+        store_endpoint_slices,
+        store_reference_grants,
+        store_secrets,
+        store_gateways,
     });
-
-    // Channel to trigger full reconciliation when Secrets/Services/ReferenceGrants change
-    let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
-
-    // Spawn background watchers that feed into the reconcile trigger
-    for watcher_stream in [
-        watcher::watcher(secrets, watcher::Config::default()).map(|_| ()).boxed(),
-        watcher::watcher(services, watcher::Config::default()).map(|_| ()).boxed(),
-        watcher::watcher(endpoint_slices, watcher::Config::default()).map(|_| ()).boxed(),
-        watcher::watcher(reference_grants, watcher::Config::default()).map(|_| ()).boxed(),
-    ] {
-        let tx = reconcile_tx.clone();
-        tokio::spawn(async move {
-            let mut stream = std::pin::pin!(watcher_stream);
-            while stream.next().await.is_some() {
-                let _ = tx.send(()).await;
-            }
-        });
-    }
 
     let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
 
@@ -322,65 +366,25 @@ async fn reconcile(
             }
         }
     }
-    // Fetch all routes across all namespaces
-    // Note: dynamic listener creation happens after reconciliation
-    // so we can pass full ListenerConfig with TLS data.
 
-    let http_routes_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
-    let tcp_routes_api: Api<TCPRoute> = Api::all(ctx.client.clone());
-    let tls_routes_api: Api<TLSRoute> = Api::all(ctx.client.clone());
-    let udp_routes_api: Api<UDPRoute> = Api::all(ctx.client.clone());
+    // Read all resources from reflector caches — no API server calls.
+    let http_routes: Vec<HTTPRoute> = ctx.store_http_routes.state().iter().map(|arc| (**arc).clone()).collect();
+    let tcp_routes: Vec<TCPRoute> = ctx.store_tcp_routes.state().iter().map(|arc| (**arc).clone()).collect();
+    let tls_routes: Vec<TLSRoute> = ctx.store_tls_routes.state().iter().map(|arc| (**arc).clone()).collect();
+    let udp_routes: Vec<UDPRoute> = ctx.store_udp_routes.state().iter().map(|arc| (**arc).clone()).collect();
 
-    let http_routes = http_routes_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
-
-    let tcp_routes = tcp_routes_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
-
-    let tls_routes = tls_routes_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
-
-    let udp_routes = udp_routes_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
-
-    // Pre-fetch namespace labels for allowedRoutes selector matching
-    let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
-    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ns_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| {
-            list.items
-                .into_iter()
-                .filter_map(|ns| {
-                    let name = ns.metadata.name?;
-                    let labels = ns.metadata.labels.unwrap_or_default();
-                    Some((name, labels))
-                })
-                .collect()
+    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ctx.store_namespaces.state()
+        .iter()
+        .filter_map(|ns| {
+            let name = ns.metadata.name.clone()?;
+            let labels = ns.metadata.labels.clone().unwrap_or_default();
+            Some((name, labels))
         })
-        .unwrap_or_default();
+        .collect();
 
-    // Fetch ReferenceGrants for cross-namespace authorization (needed for cert refs too)
-    let grants_api: Api<ReferenceGrant> = Api::all(ctx.client.clone());
-    let reference_grants = grants_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
+    let reference_grants: Vec<ReferenceGrant> = ctx.store_reference_grants.state().iter().map(|arc| (**arc).clone()).collect();
 
-    // Fetch TLS certificate data from Kubernetes Secrets
+    // Fetch TLS certificate data from cached Secrets store
     let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
     for listener in &gateway.spec.listeners {
         if let Some(tls) = &listener.tls {
@@ -415,17 +419,17 @@ async fn reconcile(
                         }
                     }
 
-                    let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), secret_ns);
-                    match secret_api.get(&cert_ref.name).await {
-                        Ok(secret) => {
+                    // Look up secret from reflector cache
+                    let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
+                    match ctx.store_secrets.get(&secret_ref) {
+                        Some(secret) => {
                             if let Some(data) = &secret.data {
                                 let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
                                 let key_pem = data.get("tls.key").map(|b| b.0.clone());
                                 if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
-                                    // Validate PEM format — must contain valid certificate/key markers
                                     let cert_str = String::from_utf8_lossy(&cert);
                                     let key_str = String::from_utf8_lossy(&key);
-                                    if cert_str.contains("BEGIN CERTIFICATE") && 
+                                    if cert_str.contains("BEGIN CERTIFICATE") &&
                                        (key_str.contains("BEGIN PRIVATE KEY") || key_str.contains("BEGIN RSA PRIVATE KEY") || key_str.contains("BEGIN EC PRIVATE KEY")) {
                                         cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
                                     } else {
@@ -436,8 +440,8 @@ async fn reconcile(
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug!("Secret {}/{} not found: {}", secret_ns, cert_ref.name, e);
+                        None => {
+                            debug!("Secret {}/{} not found in cache", secret_ns, cert_ref.name);
                         }
                     }
                 }
@@ -445,13 +449,8 @@ async fn reconcile(
         }
     }
 
-    // Fetch Services for backend existence validation + headless service detection
-    let services_api: Api<Service> = Api::all(ctx.client.clone());
-    let all_services = services_api
-        .list(&ListParams::default())
-        .await
-        .map(|list| list.items)
-        .unwrap_or_default();
+    // Read Services from reflector cache
+    let all_services: Vec<Service> = ctx.store_services.state().iter().map(|arc| (**arc).clone()).collect();
 
     let known_services: HashSet<(String, String)> = all_services
         .iter()
@@ -484,12 +483,7 @@ async fn reconcile(
         .collect();
 
     if !headless_services.is_empty() {
-        let ep_api: Api<EndpointSlice> = Api::all(ctx.client.clone());
-        let all_endpoint_slices = ep_api
-            .list(&ListParams::default())
-            .await
-            .map(|list| list.items)
-            .unwrap_or_default();
+        let all_endpoint_slices: Vec<EndpointSlice> = ctx.store_endpoint_slices.state().iter().map(|arc| (**arc).clone()).collect();
 
         for (svc_name, svc_ns) in &headless_services {
             // Find EndpointSlices for this service (labeled kubernetes.io/service-name)
@@ -836,22 +830,20 @@ async fn reconcile(
 
     // Build a unified route table from ALL managed gateways.
     // Each gateway's routes are properly scoped by its listeners' (port, hostname).
-    // This replaces the old merge-all pattern which lost listener isolation.
+    // Read other gateways from reflector cache — no API server call.
     let mut all_configs = vec![result.config.clone()];
-    let gateways_api: Api<Gateway> = Api::all(ctx.client.clone());
-    let all_gateways = gateways_api.list(&ListParams::default()).await.map(|l| l.items).unwrap_or_default();
-    for other_gw in &all_gateways {
-        let other_name = other_gw.metadata.name.as_deref().unwrap_or("");
-        let other_ns = other_gw.metadata.namespace.as_deref().unwrap_or("default");
+    for other_gw_arc in ctx.store_gateways.state() {
+        let other_name = other_gw_arc.metadata.name.as_deref().unwrap_or("");
+        let other_ns = other_gw_arc.metadata.namespace.as_deref().unwrap_or("default");
         if other_name == gw_name && other_ns == gw_ns {
             continue; // Skip the gateway we just reconciled
         }
-        if other_gw.spec.gateway_class_name != *gateway_class_name {
+        if other_gw_arc.spec.gateway_class_name != *gateway_class_name {
             continue; // Different controller
         }
         // Reconcile the other gateway into its own scoped config
         if let Ok(other_result) = reconcile_to_config(
-            other_gw,
+            &other_gw_arc,
             &http_routes,
             &tcp_routes,
             &tls_routes,
@@ -888,7 +880,9 @@ async fn reconcile(
         for config in &all_configs {
             let rt = config.to_route_table()?;
             // Merge listener scopes from each gateway's route table
-            combined.listener_scopes.extend(rt.listener_scopes);
+            for (port, scopes) in rt.listener_scopes {
+                combined.listener_scopes.entry(port).or_default().extend(scopes);
+            }
             combined.tcp_routes.extend(rt.tcp_routes);
             combined.udp_routes.extend(rt.udp_routes);
             combined.tls_routes.extend(rt.tls_routes);

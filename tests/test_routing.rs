@@ -302,7 +302,7 @@ fn test_weighted_round_robin_distribution() {
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let health = HealthRegistry::new();
-    let mut selector = BackendSelector::new();
+    let selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..400 {
         let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
@@ -325,7 +325,7 @@ fn test_equal_weights() {
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let health = HealthRegistry::new();
-    let mut selector = BackendSelector::new();
+    let selector = BackendSelector::new();
     let mut counts = [0u32; 2];
     for _ in 0..100 {
         let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
@@ -348,7 +348,7 @@ fn test_zero_weight_backend_never_selected() {
     let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
 
     let health = HealthRegistry::new();
-    let mut selector = BackendSelector::new();
+    let selector = BackendSelector::new();
     for _ in 0..100 {
         let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
         assert_eq!(idx, 0, "zero-weight backend should never be selected");

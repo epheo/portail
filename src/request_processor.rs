@@ -89,7 +89,7 @@ pub enum ProcessingDecision {
 
 pub fn analyze_request(
     routes: &RouteTable,
-    backend_selector: &mut BackendSelector,
+    backend_selector: &BackendSelector,
     request_data: &[u8],
     server_port: u16,
     health: &HealthRegistry,
@@ -133,7 +133,7 @@ fn compute_route_hash(path: &str) -> u64 {
 
 fn analyze_http_request(
     routes: &RouteTable,
-    backend_selector: &mut BackendSelector,
+    backend_selector: &BackendSelector,
     request_data: &[u8],
     health: &HealthRegistry,
     is_tls: bool,
@@ -354,7 +354,7 @@ fn build_redirect_location(
 
 pub fn analyze_udp_request(
     routes: &RouteTable,
-    backend_selector: &mut BackendSelector,
+    backend_selector: &BackendSelector,
     server_port: u16,
     health: &HealthRegistry,
 ) -> Result<ProcessingDecision> {
@@ -368,7 +368,7 @@ pub fn analyze_udp_request(
 
 fn analyze_tcp_request(
     routes: &RouteTable,
-    backend_selector: &mut BackendSelector,
+    backend_selector: &BackendSelector,
     server_port: u16,
     health: &HealthRegistry,
 ) -> Result<ProcessingDecision> {
@@ -381,7 +381,7 @@ fn analyze_tcp_request(
 }
 
 fn analyze_l4_request<'a>(
-    backend_selector: &mut BackendSelector,
+    backend_selector: &BackendSelector,
     server_port: u16,
     proto: &str,
     lookup: impl FnOnce(u16) -> Result<&'a Vec<crate::routing::Backend>>,

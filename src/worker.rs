@@ -60,7 +60,7 @@ struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: BackendPool,
-    selector: Arc<std::sync::Mutex<BackendSelector>>,
+    selector: Arc<BackendSelector>,
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
@@ -85,7 +85,7 @@ pub async fn run_worker(
 
     // Shared selector across all connections in this worker so weighted routing
     // counters increment properly across separate TCP connections.
-    let shared_selector = Arc::new(std::sync::Mutex::new(BackendSelector::new()));
+    let shared_selector = Arc::new(BackendSelector::new());
 
     loop {
         tokio::select! {
@@ -226,8 +226,7 @@ async fn handle_connection(
     loop {
         let decision = {
             let route_table = state.routes.load();
-            let mut selector = state.selector.lock().unwrap();
-            request_processor::analyze_request(&route_table, &mut selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
+            request_processor::analyze_request(&route_table, &state.selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {
@@ -393,8 +392,7 @@ async fn handle_http_forward(
 
         let decision = {
             let route_table = state.routes.load();
-            let mut selector = state.selector.lock().unwrap();
-            request_processor::analyze_request(&route_table, &mut selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
+            request_processor::analyze_request(&route_table, &state.selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
         };
 
         match decision {

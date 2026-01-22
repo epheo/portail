@@ -66,7 +66,7 @@ fn reload_routes(
     let config = PortailConfig::load_from_file(config_path)?;
     let route_table = config.to_route_table()?;
 
-    let http_count = route_table.listener_scopes.len();
+    let http_count: usize = route_table.listener_scopes.values().map(|v| v.len()).sum();
     let tcp_count = route_table.tcp_routes.len();
     let udp_count = route_table.udp_routes.len();
 
