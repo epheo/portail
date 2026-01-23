@@ -35,7 +35,16 @@ impl futures::Stream for ReconcileStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.0.lock() {
-            Ok(mut rx) => rx.poll_recv(cx),
+            Ok(mut rx) => {
+                match rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(())) => {
+                        // Drain all buffered events so bursts coalesce into one reconcile
+                        while rx.try_recv().is_ok() {}
+                        std::task::Poll::Ready(Some(()))
+                    }
+                    other => other,
+                }
+            }
             Err(_) => std::task::Poll::Ready(None),
         }
     }
@@ -165,33 +174,47 @@ pub async fn run_controller(
     info!("Kubernetes client connected, starting Gateway API controller");
 
     let gateway_classes: Api<GatewayClass> = Api::all(client.clone());
-    let http_routes: Api<HTTPRoute> = Api::all(client.clone());
-    let tcp_routes: Api<TCPRoute> = Api::all(client.clone());
-    let tls_routes: Api<TLSRoute> = Api::all(client.clone());
-    let udp_routes: Api<UDPRoute> = Api::all(client.clone());
     let gateways: Api<Gateway> = Api::all(client.clone());
 
     // Channel to trigger full reconciliation when secondary resources change
     let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
 
     // Create reflector stores — cached local copies of all cluster resources.
-    // Each reflector watches the API server and keeps the store up to date.
-    // Secrets/Services/EndpointSlices/ReferenceGrants/Namespaces trigger
-    // full reconciliation via the channel; route stores are read-only caches
-    // (route changes trigger targeted reconciliation via Controller::watches).
-    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), None);
-    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), None);
-    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), None);
-    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), None);
+    // Each reflector maintains a single watch stream to the API server and keeps
+    // the store up to date. ALL reflectors trigger reconciliation via the channel
+    // so we do NOT use Controller::watches() — this avoids duplicate watch streams.
+    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()));
+    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
     let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()));
     let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()));
     let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()));
     let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_secrets = spawn_reflector(Api::<Secret>::all(client.clone()), Some(reconcile_tx.clone()));
 
-    // Gateway store: populated by a separate reflector so reconcile() can iterate
-    // all gateways without re-listing from the API server.
-    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), None);
+    // Only watch TLS secrets — avoids watching all service account tokens etc.
+    let secrets_api = Api::<Secret>::all(client.clone());
+    let store_secrets = {
+        let writer = reflector::store::Writer::default();
+        let reader = writer.as_reader();
+        let secret_watcher = watcher::watcher(
+            secrets_api,
+            watcher::Config::default().fields("type=kubernetes.io/tls"),
+        );
+        let rf = reflector::reflector(writer, secret_watcher);
+        let tx = reconcile_tx.clone();
+        tokio::spawn(async move {
+            let mut stream = std::pin::pin!(rf.applied_objects());
+            while stream.next().await.is_some() {
+                let _ = tx.try_send(());
+            }
+        });
+        reader
+    };
+
+    // Gateway reflector — also triggers reconciliation so we don't need a
+    // separate Controller watch for it.
+    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()));
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -230,22 +253,6 @@ pub async fn run_controller(
     });
 
     let controller = Controller::new(gateways.clone(), watcher::Config::default())
-        .watches(http_routes, watcher::Config::default(), |route| {
-            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-            map_route_to_gateways(&route.spec.parent_refs, route_ns)
-        })
-        .watches(tcp_routes, watcher::Config::default(), |route| {
-            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-            map_route_to_gateways(&route.spec.parent_refs, route_ns)
-        })
-        .watches(tls_routes, watcher::Config::default(), |route| {
-            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-            map_route_to_gateways(&route.spec.parent_refs, route_ns)
-        })
-        .watches(udp_routes, watcher::Config::default(), |route| {
-            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-            map_route_to_gateways(&route.spec.parent_refs, route_ns)
-        })
         .reconcile_all_on(reconcile_stream)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
@@ -269,54 +276,6 @@ pub async fn run_controller(
     Ok(())
 }
 
-/// Map a route's parentRefs to Gateway ObjectRefs to trigger reconciliation.
-fn map_route_to_gateways<T: ParentRefLike>(
-    parent_refs: &Option<Vec<T>>,
-    route_namespace: &str,
-) -> Vec<ObjectRef<Gateway>> {
-    parent_refs
-        .as_ref()
-        .map(|refs| {
-            refs.iter()
-                .filter(|pr| pr.kind().is_none_or(|k| k == "Gateway"))
-                .map(|pr| {
-                    let ns = pr.namespace().unwrap_or(route_namespace);
-                    ObjectRef::new(pr.name()).within(ns)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-trait ParentRefLike {
-    fn name(&self) -> &str;
-    fn namespace(&self) -> Option<&str>;
-    fn kind(&self) -> Option<&str>;
-}
-
-impl ParentRefLike for gateway_api::httproutes::HTTPRouteParentRefs {
-    fn name(&self) -> &str { &self.name }
-    fn namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn kind(&self) -> Option<&str> { self.kind.as_deref() }
-}
-
-impl ParentRefLike for gateway_api::experimental::tcproutes::TCPRouteParentRefs {
-    fn name(&self) -> &str { &self.name }
-    fn namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn kind(&self) -> Option<&str> { self.kind.as_deref() }
-}
-
-impl ParentRefLike for gateway_api::experimental::tlsroutes::TLSRouteParentRefs {
-    fn name(&self) -> &str { &self.name }
-    fn namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn kind(&self) -> Option<&str> { self.kind.as_deref() }
-}
-
-impl ParentRefLike for gateway_api::experimental::udproutes::UDPRouteParentRefs {
-    fn name(&self) -> &str { &self.name }
-    fn namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-    fn kind(&self) -> Option<&str> { self.kind.as_deref() }
-}
 
 async fn reconcile(
     gateway: Arc<Gateway>,
