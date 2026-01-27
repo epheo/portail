@@ -139,10 +139,14 @@ async fn reconcile_gateway_class(
 }
 
 /// Helper: create a reflector store for a resource type, spawn a background task
-/// to drive it, and optionally send a reconcile trigger on each event.
+/// to drive it, and optionally send a reconcile trigger.
+/// When `generation_filter` is true, only triggers reconciliation on spec changes
+/// (metadata.generation change). Set to true for CRDs, false for core resources
+/// like Secrets/Services which don't reliably set generation.
 fn spawn_reflector<K>(
     api: Api<K>,
     reconcile_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    generation_filter: bool,
 ) -> Store<K>
 where
     K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -152,10 +156,26 @@ where
     let reader = writer.as_reader();
     let rf = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()));
     tokio::spawn(async move {
+        let mut generations: HashMap<String, i64> = HashMap::new();
         let mut stream = std::pin::pin!(rf.applied_objects());
-        while stream.next().await.is_some() {
+        while let Some(result) = stream.next().await {
+            let obj = match result {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
             if let Some(tx) = &reconcile_tx {
-                let _ = tx.try_send(());
+                if generation_filter {
+                    let key = format!("{}/{}",
+                        obj.meta().namespace.as_deref().unwrap_or(""),
+                        obj.meta().name.as_deref().unwrap_or(""));
+                    let gen = obj.meta().generation.unwrap_or(0);
+                    let prev = generations.insert(key, gen);
+                    if prev.is_none() || prev != Some(gen) {
+                        let _ = tx.try_send(());
+                    }
+                } else {
+                    let _ = tx.try_send(());
+                }
             }
         }
     });
@@ -179,18 +199,18 @@ pub async fn run_controller(
     // Channel to trigger full reconciliation when secondary resources change
     let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
 
-    // Create reflector stores — cached local copies of all cluster resources.
-    // Each reflector maintains a single watch stream to the API server and keeps
-    // the store up to date. ALL reflectors trigger reconciliation via the channel
-    // so we do NOT use Controller::watches() — this avoids duplicate watch streams.
-    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()));
-    let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()));
+    // CRD reflectors — generation_filter=true to skip status-only updates
+    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
+
+    // Core resource reflectors — generation_filter=false (core resources don't
+    // reliably set metadata.generation, and we need to react to data changes)
+    let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()), false);
+    let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()), false);
+    let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()), false);
+    let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()), false);
 
     // Only watch TLS secrets — avoids watching all service account tokens etc.
     let secrets_api = Api::<Secret>::all(client.clone());
@@ -212,9 +232,8 @@ pub async fn run_controller(
         reader
     };
 
-    // Gateway reflector — also triggers reconciliation so we don't need a
-    // separate Controller watch for it.
-    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()));
+    // Gateway reflector — generation_filter=true to skip our own status updates
+    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()), true);
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -947,23 +966,27 @@ async fn reconcile(
         for ((kind, ns, name), parents) in &grouped {
             match *kind {
                 "HTTPRoute" => {
+                    let existing = get_existing_route_parents_from_store(&ctx.store_http_routes, ns, name);
                     status::update_route_status::<HTTPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager,
+                        &ctx.client, name, ns, parents, &field_manager, &existing,
                     ).await;
                 }
                 "TCPRoute" => {
+                    let existing = get_existing_route_parents_from_store(&ctx.store_tcp_routes, ns, name);
                     status::update_route_status::<TCPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager,
+                        &ctx.client, name, ns, parents, &field_manager, &existing,
                     ).await;
                 }
                 "TLSRoute" => {
+                    let existing = get_existing_route_parents_from_store(&ctx.store_tls_routes, ns, name);
                     status::update_route_status::<TLSRoute>(
-                        &ctx.client, name, ns, parents, &field_manager,
+                        &ctx.client, name, ns, parents, &field_manager, &existing,
                     ).await;
                 }
                 "UDPRoute" => {
+                    let existing = get_existing_route_parents_from_store(&ctx.store_udp_routes, ns, name);
                     status::update_route_status::<UDPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager,
+                        &ctx.client, name, ns, parents, &field_manager, &existing,
                     ).await;
                 }
                 _ => {}
@@ -990,4 +1013,30 @@ fn error_policy_gc(
 ) -> Action {
     warn!("GatewayClass reconciliation error, requeueing");
     Action::requeue(std::time::Duration::from_secs(5))
+}
+
+/// Read existing parent status conditions from a route's reflector store entry.
+fn get_existing_route_parents_from_store<K>(
+    store: &Store<K>,
+    ns: &str,
+    name: &str,
+) -> Vec<serde_json::Value>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + serde::Serialize
+        + Clone
+        + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    let obj_ref = ObjectRef::<K>::new(name).within(ns);
+    match store.get(&obj_ref) {
+        Some(route) => {
+            let val = serde_json::to_value(route.as_ref()).unwrap_or_default();
+            val.pointer("/status/parents")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        }
+        None => vec![],
+    }
 }
