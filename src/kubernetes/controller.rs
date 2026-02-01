@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 use futures::StreamExt;
-use kube::api::{Api, ListParams};
-use kube::runtime::controller::Action;
+use kube::api::Api;
 use kube::runtime::watcher;
-use kube::runtime::{reflector, Controller, WatchStreamExt};
+use kube::runtime::{reflector, WatchStreamExt};
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::Client;
 use kube::ResourceExt;
@@ -23,32 +22,6 @@ use gateway_api::experimental::udproutes::UDPRoute;
 
 use crate::routing::RouteTable;
 use crate::logging::{info, warn, error, debug};
-
-/// Sync-safe Stream wrapper over an mpsc receiver.
-/// Required because `reconcile_all_on` needs `Send + Sync`.
-struct ReconcileStream(std::sync::Mutex<tokio::sync::mpsc::Receiver<()>>);
-
-impl futures::Stream for ReconcileStream {
-    type Item = ();
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.0.lock() {
-            Ok(mut rx) => {
-                match rx.poll_recv(cx) {
-                    std::task::Poll::Ready(Some(())) => {
-                        // Drain all buffered events so bursts coalesce into one reconcile
-                        while rx.try_recv().is_ok() {}
-                        std::task::Poll::Ready(Some(()))
-                    }
-                    other => other,
-                }
-            }
-            Err(_) => std::task::Poll::Ready(None),
-        }
-    }
-}
 
 use super::reconciler::reconcile_to_config;
 use super::status;
@@ -96,46 +69,42 @@ struct ControllerCtx {
     store_reference_grants: Store<ReferenceGrant>,
     store_secrets: Store<Secret>,
     store_gateways: Store<Gateway>,
+    store_gateway_classes: Store<GatewayClass>,
 }
 
-/// Reconcile a GatewayClass: accept ours, reject others with same controllerName
-async fn reconcile_gateway_class(
-    gc: Arc<GatewayClass>,
-    ctx: Arc<ControllerCtx>,
-) -> Result<Action, ReconcileError> {
-    let gc_name = gc.name_any();
-    debug!("Reconciling GatewayClass {}", gc_name);
+/// Reconcile all GatewayClasses from the store: accept ours, reject others.
+/// Uses reflector store — zero API server calls.
+async fn reconcile_gateway_classes(ctx: &ControllerCtx) {
+    let mut accepted_name: Option<String> = None;
 
-    if gc.spec.controller_name != ctx.controller_name {
-        debug!("GatewayClass {} has controller '{}', not ours", gc_name, gc.spec.controller_name);
-        return Ok(Action::await_change());
-    }
-
-    // Accept this GatewayClass
-    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
-
-    // Reject other GatewayClasses with same controllerName
-    let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-    if let Ok(all_gcs) = gc_api.list(&ListParams::default()).await {
-        for other_gc in &all_gcs.items {
-            if other_gc.spec.controller_name == ctx.controller_name
-                && other_gc.name_any() != gc_name
-            {
-                status::update_gateway_class_status(
-                    &ctx.client,
-                    other_gc,
-                    false,
-                    &format!(
-                        "Another GatewayClass '{}' is already accepted by this controller",
-                        gc_name
-                    ),
-                )
-                .await;
-            }
+    // First pass: find the first GatewayClass that matches our controller
+    for gc_arc in ctx.store_gateway_classes.state() {
+        if gc_arc.spec.controller_name == ctx.controller_name {
+            accepted_name = Some(gc_arc.name_any());
+            break;
         }
     }
 
-    Ok(Action::await_change())
+    let Some(accepted) = &accepted_name else {
+        return; // No GatewayClass for our controller
+    };
+
+    // Second pass: accept ours, reject duplicates
+    for gc_arc in ctx.store_gateway_classes.state() {
+        if gc_arc.spec.controller_name != ctx.controller_name {
+            continue;
+        }
+        if gc_arc.name_any() == *accepted {
+            status::update_gateway_class_status(&ctx.client, &gc_arc, true, "Accepted by portail").await;
+        } else {
+            status::update_gateway_class_status(
+                &ctx.client,
+                &gc_arc,
+                false,
+                &format!("Another GatewayClass '{}' is already accepted by this controller", accepted),
+            ).await;
+        }
+    }
 }
 
 /// Helper: create a reflector store for a resource type, spawn a background task
@@ -193,32 +162,29 @@ pub async fn run_controller(
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
 
-    let gateway_classes: Api<GatewayClass> = Api::all(client.clone());
-    let gateways: Api<Gateway> = Api::all(client.clone());
-
-    // Channel to trigger full reconciliation when secondary resources change
-    let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
+    // Channel to trigger reconciliation when resources change
+    let (reconcile_tx, mut reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
 
     // CRD reflectors — generation_filter=true to skip status-only updates
     let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_gateway_classes = spawn_reflector(Api::<GatewayClass>::all(client.clone()), Some(reconcile_tx.clone()), true);
 
-    // Core resource reflectors — generation_filter=false (core resources don't
-    // reliably set metadata.generation, and we need to react to data changes)
+    // Core resource reflectors — generation_filter=false
     let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()), false);
 
     // Only watch TLS secrets — avoids watching all service account tokens etc.
-    let secrets_api = Api::<Secret>::all(client.clone());
     let store_secrets = {
         let writer = reflector::store::Writer::default();
         let reader = writer.as_reader();
         let secret_watcher = watcher::watcher(
-            secrets_api,
+            Api::<Secret>::all(client.clone()),
             watcher::Config::default().fields("type=kubernetes.io/tls"),
         );
         let rf = reflector::reflector(writer, secret_watcher);
@@ -231,9 +197,6 @@ pub async fn run_controller(
         });
         reader
     };
-
-    // Gateway reflector — generation_filter=true to skip our own status updates
-    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()), true);
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -252,66 +215,65 @@ pub async fn run_controller(
         store_reference_grants,
         store_secrets,
         store_gateways,
+        store_gateway_classes,
     });
-
-    let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
-
-    // Spawn GatewayClass controller so we accept GatewayClasses proactively
-    let gc_ctx = ctx.clone();
-    let gc_api = gateway_classes.clone();
-    tokio::spawn(async move {
-        let gc_controller = Controller::new(gc_api, watcher::Config::default())
-            .shutdown_on_signal()
-            .run(reconcile_gateway_class, error_policy_gc, gc_ctx);
-        gc_controller.for_each(|result| async move {
-            match result {
-                Ok(_) => {}
-                Err(e) => warn!("GatewayClass reconciliation error: {}", e),
-            }
-        }).await;
-    });
-
-    let controller = Controller::new(gateways.clone(), watcher::Config::default())
-        .reconcile_all_on(reconcile_stream)
-        .shutdown_on_signal()
-        .run(reconcile, error_policy, ctx);
 
     info!("Gateway API controller started, watching for resource changes");
 
-    tokio::select! {
-        _ = controller.for_each(|result| async move {
-            match result {
-                Ok((_obj_ref, _action)) => {}
-                Err(e) => warn!("Reconciliation error: {}", e),
+    // Simple debounced reconcile loop — no kube-rs Controller overhead.
+    // All resource changes flow through the channel. On each event:
+    //   1. Drain buffered events
+    //   2. Wait 1s for more events to coalesce
+    //   3. Drain again
+    //   4. Reconcile GatewayClasses, then all Gateways
+    loop {
+        tokio::select! {
+            _ = reconcile_rx.recv() => {
+                // Drain buffered events
+                while reconcile_rx.try_recv().is_ok() {}
+                // Debounce: wait 1s for more events
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                while reconcile_rx.try_recv().is_ok() {}
+
+                // Phase 1: Reconcile GatewayClasses
+                reconcile_gateway_classes(&ctx).await;
+
+                // Phase 2: Reconcile all Gateways
+                for gw_arc in ctx.store_gateways.state() {
+                    if let Err(e) = reconcile_one(&gw_arc, &ctx).await {
+                        warn!("Reconcile error for Gateway {}/{}: {}",
+                            gw_arc.metadata.namespace.as_deref().unwrap_or("default"),
+                            gw_arc.metadata.name.as_deref().unwrap_or("?"),
+                            e);
+                    }
+                }
             }
-        }) => {
-            info!("Controller stream ended");
-        }
-        _ = shutdown.cancelled() => {
-            info!("Controller received shutdown signal");
+            _ = shutdown.cancelled() => {
+                info!("Controller received shutdown signal");
+                break;
+            }
         }
     }
 
     Ok(())
 }
 
-
-async fn reconcile(
-    gateway: Arc<Gateway>,
-    ctx: Arc<ControllerCtx>,
-) -> Result<Action, ReconcileError> {
+async fn reconcile_one(
+    gateway: &Gateway,
+    ctx: &ControllerCtx,
+) -> Result<(), ReconcileError> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
 
-    // Verify this Gateway's class is managed by us
-    let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+    // Verify this Gateway's class is managed by us — read from store, no API call
     let gateway_class_name = &gateway.spec.gateway_class_name;
-    let gc = match gc_api.get(gateway_class_name).await {
-        Ok(gc) => gc,
-        Err(e) => {
-            debug!("GatewayClass '{}' not found: {}", gateway_class_name, e);
-            return Ok(Action::await_change());
+    let gc_ref = ObjectRef::<GatewayClass>::new(gateway_class_name);
+    let gc = match ctx.store_gateway_classes.get(&gc_ref) {
+        Some(gc) => gc,
+        None => {
+            debug!("GatewayClass '{}' not in store", gateway_class_name);
+            return Ok(());
         }
     };
 
@@ -320,29 +282,7 @@ async fn reconcile(
             "Gateway {}/{} references GatewayClass '{}' with controller '{}', not ours ('{}')",
             gw_ns, gw_name, gateway_class_name, gc.spec.controller_name, ctx.controller_name
         );
-        return Ok(Action::await_change());
-    }
-
-    status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
-
-    // Explicitly reject other GatewayClasses with the same controllerName
-    if let Ok(all_gcs) = gc_api.list(&ListParams::default()).await {
-        for other_gc in &all_gcs.items {
-            if other_gc.spec.controller_name == ctx.controller_name
-                && other_gc.name_any() != gc.name_any()
-            {
-                status::update_gateway_class_status(
-                    &ctx.client,
-                    other_gc,
-                    false,
-                    &format!(
-                        "Another GatewayClass '{}' is already accepted by this controller",
-                        gc.name_any()
-                    ),
-                )
-                .await;
-            }
-        }
+        return Ok(());
     }
 
     // Read all resources from reflector caches — no API server calls.
@@ -775,7 +715,7 @@ async fn reconcile(
                 &listener_statuses,
             )
             .await;
-            return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            return Err(ReconcileError::Reconcile(e.to_string()));
         }
     };
 
@@ -994,25 +934,7 @@ async fn reconcile(
         }
     }
 
-    Ok(Action::requeue(std::time::Duration::from_secs(300)))
-}
-
-fn error_policy(
-    _obj: Arc<Gateway>,
-    _error: &ReconcileError,
-    _ctx: Arc<ControllerCtx>,
-) -> Action {
-    warn!("Controller reconciliation error, requeueing");
-    Action::requeue(std::time::Duration::from_secs(5))
-}
-
-fn error_policy_gc(
-    _obj: Arc<GatewayClass>,
-    _error: &ReconcileError,
-    _ctx: Arc<ControllerCtx>,
-) -> Action {
-    warn!("GatewayClass reconciliation error, requeueing");
-    Action::requeue(std::time::Duration::from_secs(5))
+    Ok(())
 }
 
 /// Read existing parent status conditions from a route's reflector store entry.
