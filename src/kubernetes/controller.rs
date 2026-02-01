@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures::StreamExt;
 use kube::api::Api;
+use kube::runtime::controller::Action;
 use kube::runtime::watcher;
-use kube::runtime::{reflector, WatchStreamExt};
+use kube::runtime::{reflector, Controller, WatchStreamExt, predicates};
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::Client;
 use kube::ResourceExt;
@@ -25,6 +27,22 @@ use crate::logging::{info, warn, error, debug};
 
 use super::reconciler::reconcile_to_config;
 use super::status;
+
+/// Sync-safe Stream wrapper over an mpsc receiver for reconcile_all_on.
+struct ReconcileStream(std::sync::Mutex<tokio::sync::mpsc::Receiver<()>>);
+
+impl futures::Stream for ReconcileStream {
+    type Item = ();
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.0.lock() {
+            Ok(mut rx) => rx.poll_recv(cx),
+            Err(_) => std::task::Poll::Ready(None),
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -162,32 +180,40 @@ pub async fn run_controller(
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
 
-    // Channel to trigger reconciliation when resources change
-    let (reconcile_tx, mut reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
+    // Channel for secondary resources to trigger reconciliation
+    let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
 
-    // CRD reflectors — generation_filter=true to skip status-only updates
+    // --- Primary resource: Gateway ---
+    // Use Controller::for_stream() with predicate_filter(predicates::generation)
+    // to filter out status-only changes at the stream level.
+    let gw_writer = reflector::store::Writer::default();
+    let store_gateways = gw_writer.as_reader();
+    let gw_stream = reflector::reflector(gw_writer,
+        watcher::watcher(Api::<Gateway>::all(client.clone()), watcher::Config::default()))
+        .default_backoff()
+        .applied_objects()
+        .predicate_filter(predicates::generation);
+
+    // --- Secondary CRD reflectors (generation-filtered via spawn_reflector) ---
     let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
-    let store_gateways = spawn_reflector(Api::<Gateway>::all(client.clone()), Some(reconcile_tx.clone()), true);
     let store_gateway_classes = spawn_reflector(Api::<GatewayClass>::all(client.clone()), Some(reconcile_tx.clone()), true);
 
-    // Core resource reflectors — generation_filter=false
+    // --- Core resource reflectors (no generation filter) ---
     let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()), false);
     let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()), false);
 
-    // Only watch TLS secrets — avoids watching all service account tokens etc.
+    // Only watch TLS secrets
     let store_secrets = {
         let writer = reflector::store::Writer::default();
         let reader = writer.as_reader();
-        let secret_watcher = watcher::watcher(
-            Api::<Secret>::all(client.clone()),
-            watcher::Config::default().fields("type=kubernetes.io/tls"),
-        );
-        let rf = reflector::reflector(writer, secret_watcher);
+        let rf = reflector::reflector(writer,
+            watcher::watcher(Api::<Secret>::all(client.clone()),
+                watcher::Config::default().fields("type=kubernetes.io/tls")));
         let tx = reconcile_tx.clone();
         tokio::spawn(async move {
             let mut stream = std::pin::pin!(rf.applied_objects());
@@ -197,6 +223,9 @@ pub async fn run_controller(
         });
         reader
     };
+
+    // Clone the gateway store for both ControllerCtx and Controller::for_stream()
+    let store_gateways_for_controller = store_gateways.clone();
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -218,50 +247,48 @@ pub async fn run_controller(
         store_gateway_classes,
     });
 
+    // Wrap the secondary resource channel as a Stream for reconcile_all_on
+    let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
+
+    // Controller::for_stream() reuses our reflector stream (no duplicate watcher).
+    // predicate_filter(predicates::generation) on the stream filters status-only
+    // changes before they reach the Controller — breaking the feedback loop.
+    // Built-in 1s debounce coalesces bursts of events.
+    let controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
+        .reconcile_all_on(reconcile_stream)
+        .with_config(
+            kube::runtime::controller::Config::default()
+                .debounce(Duration::from_secs(1))
+        )
+        .shutdown_on_signal()
+        .run(reconcile, error_policy, ctx);
+
     info!("Gateway API controller started, watching for resource changes");
 
-    // Simple debounced reconcile loop — no kube-rs Controller overhead.
-    // All resource changes flow through the channel. On each event:
-    //   1. Drain buffered events
-    //   2. Wait 1s for more events to coalesce
-    //   3. Drain again
-    //   4. Reconcile GatewayClasses, then all Gateways
-    loop {
-        tokio::select! {
-            _ = reconcile_rx.recv() => {
-                // Drain buffered events
-                while reconcile_rx.try_recv().is_ok() {}
-                // Debounce: wait 1s for more events
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                while reconcile_rx.try_recv().is_ok() {}
-
-                // Phase 1: Reconcile GatewayClasses
-                reconcile_gateway_classes(&ctx).await;
-
-                // Phase 2: Reconcile all Gateways
-                for gw_arc in ctx.store_gateways.state() {
-                    if let Err(e) = reconcile_one(&gw_arc, &ctx).await {
-                        warn!("Reconcile error for Gateway {}/{}: {}",
-                            gw_arc.metadata.namespace.as_deref().unwrap_or("default"),
-                            gw_arc.metadata.name.as_deref().unwrap_or("?"),
-                            e);
-                    }
-                }
+    tokio::select! {
+        _ = controller.for_each(|result| async move {
+            match result {
+                Ok((_obj_ref, _action)) => {}
+                Err(e) => warn!("Reconciliation error: {}", e),
             }
-            _ = shutdown.cancelled() => {
-                info!("Controller received shutdown signal");
-                break;
-            }
+        }) => {
+            info!("Controller stream ended");
+        }
+        _ = shutdown.cancelled() => {
+            info!("Controller received shutdown signal");
         }
     }
 
     Ok(())
 }
 
-async fn reconcile_one(
-    gateway: &Gateway,
-    ctx: &ControllerCtx,
-) -> Result<(), ReconcileError> {
+async fn reconcile(
+    gateway: Arc<Gateway>,
+    ctx: Arc<ControllerCtx>,
+) -> Result<Action, ReconcileError> {
+    // Reconcile GatewayClasses on each pass (cheap — reads from store)
+    reconcile_gateway_classes(&ctx).await;
+
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
@@ -273,7 +300,7 @@ async fn reconcile_one(
         Some(gc) => gc,
         None => {
             debug!("GatewayClass '{}' not in store", gateway_class_name);
-            return Ok(());
+            return Ok(Action::await_change());
         }
     };
 
@@ -282,7 +309,7 @@ async fn reconcile_one(
             "Gateway {}/{} references GatewayClass '{}' with controller '{}', not ours ('{}')",
             gw_ns, gw_name, gateway_class_name, gc.spec.controller_name, ctx.controller_name
         );
-        return Ok(());
+        return Ok(Action::await_change());
     }
 
     // Read all resources from reflector caches — no API server calls.
@@ -934,7 +961,16 @@ async fn reconcile_one(
         }
     }
 
-    Ok(())
+    Ok(Action::await_change())
+}
+
+fn error_policy(
+    _obj: Arc<Gateway>,
+    _error: &ReconcileError,
+    _ctx: Arc<ControllerCtx>,
+) -> Action {
+    warn!("Controller reconciliation error, requeueing in 30s");
+    Action::requeue(Duration::from_secs(30))
 }
 
 /// Read existing parent status conditions from a route's reflector store entry.
