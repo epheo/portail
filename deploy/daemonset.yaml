@@ -15,18 +15,16 @@ spec:
         app: portail
     spec:
       serviceAccountName: portail-controller
-      imagePullSecrets:
-      - name: registry-creds
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: portail
-        image: registry.desku.be/portail:latest
-        imagePullPolicy: Always
+        image: portail:latest
         args: ["--kubernetes"]
         securityContext:
           capabilities:
-            add: ["NET_BIND_SERVICE"]
+            add:
+              - NET_BIND_SERVICE
         env:
         - name: NODE_IP
           valueFrom:
@@ -36,9 +34,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        resources:
-          requests:
-            memory: "64Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
+        volumeMounts:
+          - name: tls-certs
+            mountPath: /etc/portail/certs
+            readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: portail-tls
+            optional: true
