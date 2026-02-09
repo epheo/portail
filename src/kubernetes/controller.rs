@@ -144,24 +144,41 @@ where
     let rf = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()));
     tokio::spawn(async move {
         let mut generations: HashMap<String, i64> = HashMap::new();
-        let mut stream = std::pin::pin!(rf.applied_objects());
+        // Process the raw reflector stream (not applied_objects()) to receive
+        // both Apply and Delete events. Without handling deletes, delete+recreate
+        // of a resource with the same name retains the old generation in the
+        // HashMap and suppresses the reconcile trigger.
+        let mut stream = std::pin::pin!(rf);
         while let Some(result) = stream.next().await {
-            let obj = match result {
-                Ok(o) => o,
+            let event = match result {
+                Ok(e) => e,
                 Err(_) => continue,
             };
             if let Some(tx) = &reconcile_tx {
-                if generation_filter {
-                    let key = format!("{}/{}",
-                        obj.meta().namespace.as_deref().unwrap_or(""),
-                        obj.meta().name.as_deref().unwrap_or(""));
-                    let gen = obj.meta().generation.unwrap_or(0);
-                    let prev = generations.insert(key, gen);
-                    if prev.is_none() || prev != Some(gen) {
+                match &event {
+                    watcher::Event::Delete(obj) => {
+                        // Remove stale generation entry so the next create triggers correctly
+                        let key = format!("{}/{}",
+                            obj.meta().namespace.as_deref().unwrap_or(""),
+                            obj.meta().name.as_deref().unwrap_or(""));
+                        generations.remove(&key);
                         let _ = tx.try_send(());
                     }
-                } else {
-                    let _ = tx.try_send(());
+                    watcher::Event::Apply(obj) | watcher::Event::InitApply(obj) => {
+                        if generation_filter {
+                            let key = format!("{}/{}",
+                                obj.meta().namespace.as_deref().unwrap_or(""),
+                                obj.meta().name.as_deref().unwrap_or(""));
+                            let gen = obj.meta().generation.unwrap_or(0);
+                            let prev = generations.insert(key, gen);
+                            if prev.is_none() || prev != Some(gen) {
+                                let _ = tx.try_send(());
+                            }
+                        } else {
+                            let _ = tx.try_send(());
+                        }
+                    }
+                    _ => {} // Init, InitDone — no action needed
                 }
             }
         }
