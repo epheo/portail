@@ -65,6 +65,8 @@ if [ "$SKIP_DEPLOY" = false ]; then
   kubectl apply -f "$DEPLOY_DIR/scc.yaml" 2>/dev/null || true  # SCC is OpenShift-only
   kubectl apply -f "$DEPLOY_DIR/gatewayclass.yaml"
   kubectl apply -f "$DEPLOY_DIR/daemonset.yaml"
+  # Override image with the actual registry image
+  kubectl set image daemonset/portail portail="$IMAGE" -n portail-system
   kubectl rollout restart daemonset/portail -n portail-system
   echo "Waiting for rollout..."
   kubectl rollout status daemonset/portail -n portail-system --timeout=120s
