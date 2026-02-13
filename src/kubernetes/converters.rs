@@ -73,7 +73,7 @@ pub(crate) fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &Ce
                 let (cert_pem, key_pem) = cert_data.get(&key)
                     .map(|(c, k)| (Some(c.clone()), Some(k.clone())))
                     .unwrap_or((None, None));
-                CertificateRef { name: r.name.clone(), hostname: l.hostname.clone(), cert_pem, key_pem }
+                CertificateRef { name: r.name.clone(), cert_pem, key_pem }
             }).collect())
             .unwrap_or_default();
         TlsConfig {
