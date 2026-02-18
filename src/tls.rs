@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 use pin_project_lite::pin_project;
 use rustls::ServerConfig;
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -75,21 +76,54 @@ impl Connection {
     }
 }
 
+/// Dynamic TLS acceptor that supports hot-reloading certificates.
+/// Workers hold an `Arc<DynamicTlsAcceptor>` and call `accept()` per connection,
+/// which always reads the latest `ServerConfig` via `ArcSwap`.
+#[derive(Clone)]
+pub struct DynamicTlsAcceptor {
+    config: Arc<ArcSwap<ServerConfig>>,
+}
+
+impl DynamicTlsAcceptor {
+    /// Create a new dynamic acceptor from an initial `ServerConfig`.
+    pub fn new(config: ServerConfig) -> Self {
+        Self {
+            config: Arc::new(ArcSwap::new(Arc::new(config))),
+        }
+    }
+
+    /// Swap the TLS config with a new one. Takes effect on the next connection.
+    pub fn update(&self, config: ServerConfig) {
+        self.config.store(Arc::new(config));
+    }
+
+    /// Build a `TlsAcceptor` from the current config snapshot.
+    /// Called once per incoming TLS connection.
+    pub fn acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(self.config.load_full())
+    }
+}
+
 /// SNI-based certificate resolver.
 /// Selects the appropriate certificate based on the ClientHello server_name.
+/// Returns None if no matching cert is found (no fallback to a default cert).
 #[derive(Debug)]
 struct SniCertResolver {
     /// Exact hostname -> certified key
     certs: HashMap<String, Arc<CertifiedKey>>,
     /// Wildcard: parent domain -> certified key (e.g. "example.com" matches "*.example.com")
     wildcard_certs: HashMap<String, Arc<CertifiedKey>>,
-    /// Default certificate (first loaded)
-    default: Arc<CertifiedKey>,
+    /// Fallback certificate (first loaded) — used only when there's a single cert
+    /// or when the client provides no SNI at all.
+    fallback: Option<Arc<CertifiedKey>>,
 }
 
 impl ResolvesServerCert for SniCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
+        let sni = match client_hello.server_name() {
+            Some(s) => s,
+            None => return self.fallback.clone(), // No SNI: use fallback if available
+        };
         let sni_lower = sni.to_ascii_lowercase();
 
         // Exact match
@@ -105,7 +139,9 @@ impl ResolvesServerCert for SniCertResolver {
             }
         }
 
-        Some(self.default.clone())
+        // No match — don't serve an unrelated cert.
+        // rustls will send a TLS alert "unrecognized_name".
+        None
     }
 }
 
@@ -151,12 +187,9 @@ fn build_certified_key(certs: Vec<rustls::pki_types::CertificateDer<'static>>, k
     Ok(CertifiedKey::new(certs, signing_key))
 }
 
-/// Load PEM cert+key from disk and build a TLS acceptor.
-/// Supports multiple certificates with SNI-based selection.
-///
-/// In standalone mode, `name` from CertificateRef resolves to:
-///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
-pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
+/// Build a `ServerConfig` from certificate references.
+/// This is the reusable core — called by both standalone and K8s modes.
+pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<ServerConfig> {
     if cert_refs.is_empty() {
         return Err(anyhow!("TLS Terminate mode requires at least one certificateRef"));
     }
@@ -167,23 +200,22 @@ pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Resu
     if cert_refs.len() == 1 {
         // Single cert fast path — no resolver overhead
         let (certs, key) = load_cert_and_key(&cert_refs[0], cert_dir)?;
-        let config = ServerConfig::builder()
+        return ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| anyhow!("TLS config error: {}", e))?;
-        return Ok(TlsAcceptor::from(Arc::new(config)));
+            .map_err(|e| anyhow!("TLS config error: {}", e));
     }
 
     // Multiple certs — use SNI resolver
     let mut certs_map = HashMap::new();
     let mut wildcard_map = HashMap::new();
-    let mut default_key = None;
+    let mut fallback_key = None;
 
     for cert_ref in cert_refs {
         let (certs, key) = load_cert_and_key(cert_ref, cert_dir)?;
         let certified_key = Arc::new(build_certified_key(certs, key)?);
-        if default_key.is_none() {
-            default_key = Some(certified_key.clone());
+        if fallback_key.is_none() {
+            fallback_key = Some(certified_key.clone());
         }
 
         let name_lower = cert_ref.name.to_ascii_lowercase();
@@ -197,13 +229,21 @@ pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Resu
     let resolver = SniCertResolver {
         certs: certs_map,
         wildcard_certs: wildcard_map,
-        default: default_key.unwrap(),
+        fallback: fallback_key,
     };
 
-    let config = ServerConfig::builder()
+    Ok(ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+        .with_cert_resolver(Arc::new(resolver)))
+}
 
+/// Build a static TLS acceptor (standalone mode).
+/// Supports multiple certificates with SNI-based selection.
+///
+/// In standalone mode, `name` from CertificateRef resolves to:
+///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
+pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
+    let config = build_server_config(cert_refs, cert_dir)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

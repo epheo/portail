@@ -765,6 +765,7 @@ async fn reconcile(
 
     // Dynamically open TCP listeners for ports defined in this Gateway's spec.
     // Done after reconciliation so ListenerConfig has TLS cert data populated.
+    // Also updates TLS configs for already-bound ports (cert hot-reload).
     {
         let listener_configs = &result.config.gateway.listeners;
         info!("Ensuring data plane listeners for ports: {:?}",
@@ -782,6 +783,15 @@ async fn reconcile(
                 }
                 for (port, err) in &errors {
                     warn!("Failed to bind port {}: {}", port, err);
+                }
+                // Hot-reload TLS certs for all HTTPS/TLS listeners on every reconcile.
+                // Picks up Secret changes from cert-manager, external-secrets, etc.
+                let (tls_updated, tls_errors) = dp.update_tls_configs(listener_configs);
+                if tls_updated > 0 {
+                    debug!("Refreshed TLS config for {} listener(s)", tls_updated);
+                }
+                for (port, err) in &tls_errors {
+                    warn!("TLS config update failed for port {}: {}", port, err);
                 }
             }
             Err(e) => {

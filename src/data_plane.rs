@@ -13,7 +13,6 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
@@ -21,7 +20,7 @@ use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
-use crate::tls;
+use crate::tls::{self, DynamicTlsAcceptor};
 use crate::worker;
 use crate::udp_worker;
 
@@ -29,7 +28,7 @@ struct TcpListenerEntry {
     worker_id: usize,
     port: u16,
     listener: TcpListener,
-    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
     tls_passthrough: bool,
 }
 
@@ -50,6 +49,8 @@ pub struct DataPlane {
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
     bound_ports: std::collections::HashSet<u16>,
+    /// Per-port dynamic TLS acceptors for hot-reload support.
+    tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
@@ -70,14 +71,14 @@ impl DataPlane {
         let mut udp_listeners = Vec::new();
 
         // Pre-build TLS acceptors (shared across workers for the same listener)
-        let mut tls_acceptors: Vec<Option<Arc<TlsAcceptor>>> = Vec::with_capacity(listeners.len());
+        let mut tls_acceptors: Vec<Option<Arc<DynamicTlsAcceptor>>> = Vec::with_capacity(listeners.len());
         let mut tls_passthrough_flags: Vec<bool> = Vec::with_capacity(listeners.len());
 
         for listener_cfg in listeners {
             match (&listener_cfg.protocol, &listener_cfg.tls) {
                 (Protocol::HTTPS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
-                    let acceptor = tls::build_tls_acceptor(&tls_cfg.certificate_refs, cert_dir)?;
-                    tls_acceptors.push(Some(Arc::new(acceptor)));
+                    let config = tls::build_server_config(&tls_cfg.certificate_refs, cert_dir)?;
+                    tls_acceptors.push(Some(Arc::new(DynamicTlsAcceptor::new(config))));
                     tls_passthrough_flags.push(false);
                 }
                 (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
@@ -148,6 +149,7 @@ impl DataPlane {
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             bound_ports,
+            tls_configs: std::collections::HashMap::new(),
         })
     }
 
@@ -155,6 +157,7 @@ impl DataPlane {
     /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
     /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.
     /// Builds TLS acceptors from in-memory cert data when listeners use HTTPS/TLS.
+    /// For already-bound ports, updates the TLS config via DynamicTlsAcceptor hot-reload.
     /// Returns (ports_opened, errors) for caller-side logging.
     pub fn add_tcp_listeners(
         &mut self,
@@ -167,27 +170,26 @@ impl DataPlane {
         let mut errors = Vec::new();
         for listener_cfg in listener_configs {
             let port = listener_cfg.port;
-            if self.bound_ports.contains(&port) {
-                continue;
-            }
 
-            // Build TLS acceptor if this listener needs TLS termination
+            // Build DynamicTlsAcceptor if this listener needs TLS termination
             let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls) {
-                (Protocol::HTTPS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
-                    // cert_pem/key_pem are populated by the K8s controller from Secrets
-                    match tls::build_tls_acceptor(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
-                        Ok(acceptor) => (Some(Arc::new(acceptor)), false),
-                        Err(e) => {
-                            errors.push((port, format!("TLS acceptor build failed: {}", e)));
-                            continue;
+                (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
+                    if tls_cfg.mode == TlsMode::Terminate =>
+                {
+                    match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                        Ok(config) => {
+                            // If port is already bound, hot-reload the TLS config
+                            if let Some(existing) = self.tls_configs.get(&port) {
+                                existing.update(config);
+                                info!("Hot-reloaded TLS config for port {}", port);
+                                continue; // Port already has workers, just update TLS
+                            }
+                            let dyn_acceptor = Arc::new(DynamicTlsAcceptor::new(config));
+                            self.tls_configs.insert(port, dyn_acceptor.clone());
+                            (Some(dyn_acceptor), false)
                         }
-                    }
-                }
-                (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
-                    match tls::build_tls_acceptor(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
-                        Ok(acceptor) => (Some(Arc::new(acceptor)), false),
                         Err(e) => {
-                            errors.push((port, format!("TLS acceptor build failed: {}", e)));
+                            errors.push((port, format!("TLS config build failed: {}", e)));
                             continue;
                         }
                     }
@@ -197,6 +199,10 @@ impl DataPlane {
                 }
                 _ => (None, false),
             };
+
+            if self.bound_ports.contains(&port) {
+                continue; // Port already bound, no TLS to update (non-TLS or passthrough)
+            }
 
             let mut port_ok = true;
             if listener_cfg.protocol == Protocol::UDP {
@@ -286,6 +292,39 @@ impl DataPlane {
             }
         }
         (opened, errors)
+    }
+
+    /// Update TLS configs for all listeners from the latest reconciled config.
+    /// Called on every reconcile to pick up Secret changes (cert-manager rotation, etc.).
+    /// Returns the number of ports updated and any errors.
+    pub fn update_tls_configs(
+        &self,
+        listener_configs: &[ListenerConfig],
+    ) -> (usize, Vec<(u16, String)>) {
+        let mut updated = 0;
+        let mut errors = Vec::new();
+        for listener_cfg in listener_configs {
+            let port = listener_cfg.port;
+            match (&listener_cfg.protocol, &listener_cfg.tls) {
+                (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
+                    if tls_cfg.mode == TlsMode::Terminate =>
+                {
+                    if let Some(existing) = self.tls_configs.get(&port) {
+                        match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                            Ok(config) => {
+                                existing.update(config);
+                                updated += 1;
+                            }
+                            Err(e) => {
+                                errors.push((port, format!("TLS config rebuild failed: {}", e)));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (updated, errors)
     }
 
     /// Start async worker tasks.

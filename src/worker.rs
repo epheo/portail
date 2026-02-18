@@ -9,7 +9,6 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
@@ -20,7 +19,7 @@ use crate::http_parser::find_header_end;
 use crate::logging::{warn, info, debug};
 use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
-use crate::tls::{self, Connection};
+use crate::tls::{self, Connection, DynamicTlsAcceptor};
 
 /// Quick check if data starts with a known HTTP method.
 /// Used to decide whether to accumulate headers or pass through for raw TCP.
@@ -77,7 +76,7 @@ pub async fn run_worker(
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     shutdown: CancellationToken,
-    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
     tls_passthrough: bool,
     health: Arc<HealthRegistry>,
 ) {
@@ -140,7 +139,7 @@ pub async fn run_worker(
                                         debug!("TLS passthrough from {} closed: {}", peer, _e);
                                     }
                                 } else {
-                                    match acceptor.accept(tcp_stream).await {
+                                    match acceptor.acceptor().accept(tcp_stream).await {
                                         Ok(tls_stream) => {
                                             let conn = Connection::Tls { inner: tls_stream };
                                             let state = ConnectionState {

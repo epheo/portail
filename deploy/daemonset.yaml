@@ -34,12 +34,3 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        volumeMounts:
-          - name: tls-certs
-            mountPath: /etc/portail/certs
-            readOnly: true
-      volumes:
-        - name: tls-certs
-          secret:
-            secretName: portail-tls
-            optional: true
