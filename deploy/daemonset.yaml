@@ -17,9 +17,12 @@ spec:
       serviceAccountName: portail-controller
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      imagePullSecrets:
+      - name: registry-credentials
       containers:
       - name: portail
-        image: portail:latest
+        image: registry.desku.be/portail:latest
+        imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:
           capabilities:
