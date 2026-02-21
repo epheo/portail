@@ -346,7 +346,8 @@ async fn reconcile(
 
     let reference_grants: Vec<ReferenceGrant> = ctx.store_reference_grants.state().iter().map(|arc| (**arc).clone()).collect();
 
-    // Fetch TLS certificate data from cached Secrets store
+    // Fetch TLS certificate data from cached Secrets store for THIS gateway.
+    // Other gateways get their own cert_data in the all_configs loop below.
     let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
     for listener in &gateway.spec.listeners {
         if let Some(tls) = &listener.tls {
@@ -804,6 +805,54 @@ async fn reconcile(
             continue; // Different controller
         }
         // Reconcile the other gateway into its own scoped config
+        // Load cert_data for this other gateway (each gateway needs its own
+        // namespace context for cross-namespace ReferenceGrant checks)
+        let other_gw_ns = other_ns.to_string();
+        let mut other_cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
+        for listener in &other_gw_arc.spec.listeners {
+            if let Some(tls) = &listener.tls {
+                if let Some(cert_refs) = &tls.certificate_refs {
+                    for cert_ref in cert_refs {
+                        let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&other_gw_ns);
+
+                        if secret_ns != other_gw_ns {
+                            let grant_allows = reference_grants.iter().any(|grant| {
+                                let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
+                                if grant_ns != secret_ns { return false; }
+                                let from_ok = grant.spec.from.iter().any(|f| {
+                                    f.group == "gateway.networking.k8s.io"
+                                        && f.kind == "Gateway"
+                                        && f.namespace == other_gw_ns
+                                });
+                                let to_ok = grant.spec.to.iter().any(|t| {
+                                    t.group.is_empty() && t.kind == "Secret"
+                                        && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
+                                });
+                                from_ok && to_ok
+                            });
+                            if !grant_allows { continue; }
+                        }
+
+                        let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
+                        if let Some(secret) = ctx.store_secrets.get(&secret_ref) {
+                            if let Some(data) = &secret.data {
+                                let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
+                                let key_pem = data.get("tls.key").map(|b| b.0.clone());
+                                if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
+                                    let cert_str = String::from_utf8_lossy(&cert);
+                                    let key_str = String::from_utf8_lossy(&key);
+                                    if cert_str.contains("BEGIN CERTIFICATE") &&
+                                       (key_str.contains("BEGIN PRIVATE KEY") || key_str.contains("BEGIN RSA PRIVATE KEY") || key_str.contains("BEGIN EC PRIVATE KEY")) {
+                                        other_cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(other_result) = reconcile_to_config(
             &other_gw_arc,
             &http_routes,
@@ -813,7 +862,7 @@ async fn reconcile(
             &namespace_labels,
             &reference_grants,
             &known_services,
-            &cert_data,
+            &other_cert_data,
             &endpoint_overrides,
         ) {
             all_configs.push(other_result.config);

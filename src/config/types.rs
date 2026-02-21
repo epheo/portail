@@ -64,6 +64,10 @@ pub enum TlsMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CertificateRef {
     pub name: String,
+    /// The listener hostname associated with this cert (for SNI routing).
+    /// e.g. "*.desku.be", "example.org", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     #[serde(skip)]
     pub cert_pem: Option<Vec<u8>>,
     #[serde(skip)]
