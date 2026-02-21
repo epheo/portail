@@ -765,7 +765,6 @@ async fn reconcile(
 
     // Dynamically open TCP listeners for ports defined in this Gateway's spec.
     // Done after reconciliation so ListenerConfig has TLS cert data populated.
-    // Also updates TLS configs for already-bound ports (cert hot-reload).
     {
         let listener_configs = &result.config.gateway.listeners;
         info!("Ensuring data plane listeners for ports: {:?}",
@@ -783,15 +782,6 @@ async fn reconcile(
                 }
                 for (port, err) in &errors {
                     warn!("Failed to bind port {}: {}", port, err);
-                }
-                // Hot-reload TLS certs for all HTTPS/TLS listeners on every reconcile.
-                // Picks up Secret changes from cert-manager, external-secrets, etc.
-                let (tls_updated, tls_errors) = dp.update_tls_configs(listener_configs);
-                if tls_updated > 0 {
-                    debug!("Refreshed TLS config for {} listener(s)", tls_updated);
-                }
-                for (port, err) in &tls_errors {
-                    warn!("TLS config update failed for port {}: {}", port, err);
                 }
             }
             Err(e) => {
@@ -827,6 +817,58 @@ async fn reconcile(
             &endpoint_overrides,
         ) {
             all_configs.push(other_result.config);
+        }
+    }
+
+    // Merge TLS cert refs from ALL gateways per port, then hot-reload.
+    // This ensures the SNI resolver has certs from all gateways sharing a port
+    // (e.g. public *.desku.be + private *.mmt + conformance test example.org on port 443).
+    {
+        use crate::config::{ListenerConfig as LC, TlsConfig, TlsMode, Protocol as P, CertificateRef};
+        let mut merged_certs_by_port: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
+        let mut port_protocol: HashMap<u16, P> = HashMap::new();
+        for config in &all_configs {
+            for listener in &config.gateway.listeners {
+                if let Some(tls_cfg) = &listener.tls {
+                    if tls_cfg.mode == TlsMode::Terminate && !tls_cfg.certificate_refs.is_empty() {
+                        merged_certs_by_port.entry(listener.port)
+                            .or_default()
+                            .extend(tls_cfg.certificate_refs.clone());
+                        port_protocol.entry(listener.port)
+                            .or_insert_with(|| listener.protocol.clone());
+                    }
+                }
+            }
+        }
+        if !merged_certs_by_port.is_empty() {
+            let merged_listeners: Vec<LC> = merged_certs_by_port.into_iter().map(|(port, cert_refs)| {
+                LC {
+                    name: format!("merged-tls-{}", port),
+                    protocol: port_protocol.remove(&port).unwrap_or(P::HTTPS),
+                    port,
+                    hostname: None,
+                    address: None,
+                    interface: None,
+                    tls: Some(TlsConfig {
+                        mode: TlsMode::Terminate,
+                        certificate_refs: cert_refs,
+                    }),
+                }
+            }).collect();
+            match ctx.data_plane.lock() {
+                Ok(dp) => {
+                    let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
+                    if tls_updated > 0 {
+                        debug!("Refreshed merged TLS config for {} port(s)", tls_updated);
+                    }
+                    for (port, err) in &tls_errors {
+                        warn!("Merged TLS config update failed for port {}: {}", port, err);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to lock data plane for TLS update: {}", e);
+                }
+            }
         }
     }
 
