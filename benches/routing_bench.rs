@@ -39,7 +39,7 @@ fn routing_benchmark(c: &mut Criterion) {
         let host = format!("host{}.example.com", size / 2);
         group.bench_with_input(BenchmarkId::new("http_route_lookup", size), &table, |b, table| {
             b.iter(|| {
-                std::hint::black_box(table.find_http_route(&host, "GET", "/api/users", &[], ""))
+                std::hint::black_box(table.find_http_route(&host, "GET", "/api/users", &[], "", 443))
             })
         });
     }
@@ -54,13 +54,13 @@ fn routing_benchmark(c: &mut Criterion) {
 
     c.bench_function("path_matching_simple", |b| {
         b.iter(|| {
-            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/", &[], ""))
+            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/", &[], "", 443))
         })
     });
 
     c.bench_function("path_matching_complex", |b| {
         b.iter(|| {
-            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/api/v1/users/123/profile", &[], ""))
+            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/api/v1/users/123/profile", &[], "", 443))
         })
     });
 
