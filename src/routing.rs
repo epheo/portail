@@ -1030,6 +1030,64 @@ mod tests {
         let addr = rt.resolve_tls_passthrough("other.example.org", 8443);
         assert_eq!(addr, Some("127.0.0.1:9999".parse().unwrap()));
     }
+
+    #[test]
+    fn test_equal_weights() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("test.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
+            vec![
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
+            ],
+        ));
+        let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
+
+        let health = crate::health::HealthRegistry::new();
+        let selector = BackendSelector::new();
+        let mut counts = [0u32; 2];
+        for _ in 0..100 {
+            let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
+            counts[idx] += 1;
+        }
+        assert_eq!(counts[0], 50);
+        assert_eq!(counts[1], 50);
+    }
+
+    #[test]
+    fn test_zero_weight_backend_never_selected() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("test.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
+            vec![
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0, filters: vec![] },
+            ],
+        ));
+        let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
+
+        let health = crate::health::HealthRegistry::new();
+        let selector = BackendSelector::new();
+        for _ in 0..100 {
+            let idx = selector.select_healthy_weighted_backend(42, r, &health).unwrap();
+            assert_eq!(idx, 0, "zero-weight backend should never be selected");
+        }
+    }
+
+    #[test]
+    fn test_cumulative_weights_precomputed() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route("test.com", HttpRouteRule::new(
+            PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
+            vec![
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
+            ],
+        ));
+        let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
+        assert_eq!(r.total_weight, 4);
+        assert_eq!(r.cumulative_weights, vec![3, 4]);
+    }
 }
 
 /// Weighted round-robin backend selector.

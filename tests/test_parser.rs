@@ -115,15 +115,7 @@ fn test_parse_http_headers_fast_different_methods() {
 fn test_parse_http_headers_fast_empty_request() {
     let request = b"";
     let result = extract_routing_info(request);
-    match result {
-        Ok(info) => {
-            assert_eq!(info.path, "/");
-            assert_eq!(info.host, "localhost");
-        }
-        Err(_) => {
-            // Error is also acceptable for empty input
-        }
-    }
+    assert!(result.is_err(), "empty request should be rejected");
 }
 
 #[test]
