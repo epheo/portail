@@ -946,4 +946,42 @@ mod tests {
         let result = super::intersect_hostnames(&listener, &route_hostnames);
         assert_eq!(result, vec!["api.example.com"]);
     }
+
+    #[test]
+    fn test_external_name_endpoint_override_resolves() {
+        // Simulate what the controller does for ExternalName services:
+        // endpoint_overrides maps (svc_fqdn, port) → (externalName, port)
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
+                "workerThreads": 1
+            },
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
+                "hostnames": ["proxy.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "backendRefs": [{"name": "external-api.default.svc", "port": 443}]
+                }]
+            }]
+        }"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+        assert!(config.validate().is_ok());
+
+        // Insert ExternalName override: svc FQDN → external DNS name
+        config.endpoint_overrides.insert(
+            ("external-api.default.svc".to_string(), 443),
+            vec![("httpbin.org".to_string(), 443)],
+        );
+
+        // to_route_table should resolve "httpbin.org" via DNS
+        let rt = config.to_route_table();
+        assert!(rt.is_ok(), "ExternalName DNS resolution should succeed: {:?}", rt.err());
+        let rt = rt.unwrap();
+
+        let rule = rt.find_http_route("proxy.example.com", "GET", "/", &[], "", 8080).unwrap();
+        assert!(!rule.backends.is_empty(), "should have resolved ExternalName backend");
+        assert_eq!(rule.backends[0].socket_addr.port(), 443);
+    }
 }

@@ -530,6 +530,48 @@ async fn reconcile(
         }
     }
 
+    // --- ExternalName services: resolve externalName DNS targets ---
+    // ExternalName services don't create EndpointSlices, so we insert
+    // their DNS target directly into endpoint_overrides for resolution
+    // at route-table build time via Backend::with_weight().
+    for svc in &all_services {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        let svc_type = spec.type_.as_deref().unwrap_or("");
+        if svc_type != "ExternalName" {
+            continue;
+        }
+        let external_name = match spec.external_name.as_deref() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let svc_name = match svc.metadata.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+
+        // Use declared service ports, or skip if none
+        if let Some(ports) = spec.ports.as_ref() {
+            for sp in ports {
+                let service_port = sp.port as u16;
+                let key = (svc_fqdn.clone(), service_port);
+                endpoint_overrides
+                    .entry(key)
+                    .or_default()
+                    .push((external_name.to_string(), service_port));
+            }
+            info!(
+                "ExternalName service {}.{} -> {} (ports: {})",
+                svc_name, svc_ns, external_name,
+                ports.iter().map(|p| p.port.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
     // --- Per-listener validation: compute ListenerStatus for each listener ---
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
 
