@@ -84,8 +84,8 @@ pub async fn run_udp_worker(
                         // Update last_active or create new session
                         if let Some(session) = sessions.get(&client_addr) {
                             session.last_active.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(e) = session.backend_socket.send(&buf[..n]).await {
-                                debug!("UDP send to backend failed for {}: {}", client_addr, e);
+                            if let Err(_e) = session.backend_socket.send(&buf[..n]).await {
+                                debug!("UDP send to backend failed for {}: {}", client_addr, _e);
                                 drop(session);
                                 sessions.remove(&client_addr);
                             }

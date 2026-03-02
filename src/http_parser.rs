@@ -54,6 +54,12 @@ pub struct HttpRequestInfo<'a> {
     pub connection_type: ConnectionType,
     /// Raw header bytes for lazy header matching (zero-copy)
     pub header_data: &'a [u8],
+    /// Content-Length of the request body (None if header absent)
+    pub content_length: Option<usize>,
+    /// Whether Transfer-Encoding: chunked is present
+    pub is_chunked: bool,
+    /// Whether this is a WebSocket/protocol upgrade request
+    pub is_upgrade: bool,
 }
 
 /// Extract complete HTTP routing information with zero-copy parsing
@@ -70,6 +76,9 @@ pub fn extract_routing_info(
         let mut path: Option<&str> = None;
         let mut host: Option<&str> = None;
         let mut raw_connection_type = ConnectionType::Default;
+        let mut content_length: Option<usize> = None;
+        let mut is_chunked = false;
+        let mut is_upgrade = false;
         let mut http_version = HttpVersion::Http11;
 
         // Parse first line (method, path, version)
@@ -142,6 +151,30 @@ pub fn extract_routing_info(
 
                     host = std::str::from_utf8(&line[value_start..normalized_end]).ok();
 
+                } else if line.len() >= 16 && line[..16].eq_ignore_ascii_case(b"Content-Length: ") {
+                    if let Ok(val) = std::str::from_utf8(&line[16..]).ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .ok_or(()) {
+                        content_length = Some(val);
+                    }
+                } else if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
+                    let mut vs = 15;
+                    while vs < line.len() && line[vs] == b' ' { vs += 1; }
+                    if let Ok(val) = std::str::from_utf8(&line[vs..]).ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .ok_or(()) {
+                        content_length = Some(val);
+                    }
+                } else if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"Transfer-Encoding:") {
+                    let mut vs = 18;
+                    while vs < line.len() && line[vs] == b' ' { vs += 1; }
+                    if let Ok(val) = std::str::from_utf8(&line[vs..]) {
+                        if val.trim().eq_ignore_ascii_case("chunked") {
+                            is_chunked = true;
+                        }
+                    }
+                } else if line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Upgrade:") {
+                    is_upgrade = true;
                 } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
                     let mut value_start = 11;
                     while value_start < line.len() && line[value_start] == b' ' {
@@ -209,5 +242,8 @@ pub fn extract_routing_info(
             query_string,
             connection_type,
             header_data,
+            content_length,
+            is_chunked,
+            is_upgrade,
         })
 }

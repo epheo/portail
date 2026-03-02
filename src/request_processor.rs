@@ -68,6 +68,9 @@ pub enum ProcessingDecision {
         filters: Option<Box<HttpFilterData>>,
         backend_timeout: Option<std::time::Duration>,
         request_timeout: Option<std::time::Duration>,
+        content_length: Option<usize>,
+        is_chunked: bool,
+        is_upgrade: bool,
     },
     HttpRedirect {
         status_code: u16,
@@ -209,6 +212,9 @@ fn analyze_http_request(
             filters: None,
             backend_timeout: rule.backend_request_timeout,
             request_timeout: rule.request_timeout,
+            content_length: request_info.content_length,
+            is_chunked: request_info.is_chunked,
+            is_upgrade: request_info.is_upgrade,
         });
     }
 
@@ -319,6 +325,9 @@ fn analyze_http_request(
         })),
         backend_timeout: rule.backend_request_timeout,
         request_timeout: rule.request_timeout,
+        content_length: request_info.content_length,
+        is_chunked: request_info.is_chunked,
+        is_upgrade: request_info.is_upgrade,
     })
 }
 

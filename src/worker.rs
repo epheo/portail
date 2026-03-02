@@ -155,8 +155,8 @@ pub async fn run_worker(
                                                 debug!("TLS connection from {} closed: {}", peer, _e);
                                             }
                                         }
-                                        Err(e) => {
-                                            debug!("TLS handshake failed from {}: {}", peer, e);
+                                        Err(_e) => {
+                                            debug!("TLS handshake failed from {}: {}", peer, _e);
                                         }
                                     }
                                 }
@@ -232,9 +232,9 @@ async fn handle_connection(
             ProcessingDecision::TcpForward { backend_addr } => {
                 return handle_tcp_connection(client, backend_addr, &buf[..n], Arc::clone(&state.health)).await;
             }
-            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout } => {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout, content_length, is_chunked, is_upgrade } => {
                 let forward_fut = handle_http_forward(
-                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, &mut state,
+                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, content_length, is_chunked, is_upgrade, &mut state,
                 );
                 let ka = if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
                     match tokio::time::timeout(req_timeout, forward_fut).await {
@@ -294,6 +294,9 @@ async fn handle_http_forward(
     initial_keepalive: bool,
     initial_filters: Option<Box<HttpFilterData>>,
     initial_backend_timeout: Option<std::time::Duration>,
+    initial_content_length: Option<usize>,
+    initial_is_chunked: bool,
+    initial_is_upgrade: bool,
     state: &mut ConnectionState,
 ) -> Result<bool> {
     let mut backend_addr = initial_backend_addr;
@@ -301,6 +304,9 @@ async fn handle_http_forward(
     let mut request_bytes = initial_bytes;
     let mut filter_data = initial_filters;
     let mut per_rule_timeout = initial_backend_timeout;
+    let mut req_content_length = initial_content_length;
+    let mut req_is_chunked = initial_is_chunked;
+    let mut req_is_upgrade = initial_is_upgrade;
 
     loop {
         let timeout_dur = per_rule_timeout
@@ -326,10 +332,12 @@ async fn handle_http_forward(
             }
         };
 
+        // Determine header boundary for body separation
+        let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+
         if let Some(ref fd) = filter_data {
             let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
             if has_mods {
-                let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
                 let modified_headers = apply_request_header_modifications(
                     &buf[..header_end],
                     fd.request_header_mods.as_ref(),
@@ -353,6 +361,54 @@ async fn handle_http_forward(
             }
         } else {
             backend.write_all(&buf[..request_bytes]).await?;
+        }
+
+        // --- Relay remaining request body bytes (the core POST fix) ---
+        let body_in_initial = request_bytes.saturating_sub(header_end);
+        if let Some(cl) = req_content_length {
+            let mut remaining = cl.saturating_sub(body_in_initial);
+            while remaining > 0 {
+                let n = client.read(&mut buf[..]).await?;
+                if n == 0 { break; }
+                let to_send = n.min(remaining);
+                backend.write_all(&buf[..to_send]).await?;
+                remaining -= to_send;
+            }
+        } else if req_is_chunked {
+            // Relay chunked body until 0\r\n\r\n terminator
+            let mut chunked_tail = [0u8; 5];
+            let mut chunked_tail_len: usize = 0;
+            // Check if terminator was already in the initial buffer body
+            if body_in_initial > 0 {
+                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[header_end..request_bytes]);
+            }
+            while !is_chunked_terminator(&chunked_tail, chunked_tail_len) {
+                let n = client.read(&mut buf[..]).await?;
+                if n == 0 { break; }
+                backend.write_all(&buf[..n]).await?;
+                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
+            }
+        }
+
+        // --- WebSocket / protocol upgrade handling ---
+        if req_is_upgrade {
+            // For upgrades, forward the backend response headers then switch
+            // to bidirectional streaming for the remainder of the connection.
+            let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
+            let _response_complete = match tokio::time::timeout(
+                timeout_dur,
+                forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
+            ).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    send_error_response(client, 504).await?;
+                    return Ok(false);
+                }
+            };
+            // After sending the 101 response, switch to raw bidirectional streaming.
+            // Errors are expected when either side closes — best-effort.
+            let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
+            return Ok(false);
         }
 
         let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
@@ -395,11 +451,14 @@ async fn handle_http_forward(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _ } => {
+            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _, content_length: cl, is_chunked: ch, is_upgrade: up } => {
                 backend_addr = addr;
                 keepalive = ka;
                 filter_data = filters;
                 per_rule_timeout = bt;
+                req_content_length = cl;
+                req_is_chunked = ch;
+                req_is_upgrade = up;
             }
             ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
                 send_redirect_response(client, status_code, &location).await?;

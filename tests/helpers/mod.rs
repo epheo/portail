@@ -588,6 +588,7 @@ fn handle_inspecting_connection(
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let mut buf = [0u8; 8192];
+    let mut accum = Vec::new();
     loop {
         if shutdown.load(Ordering::Relaxed) { return; }
 
@@ -597,14 +598,38 @@ fn handle_inspecting_connection(
             Err(_) => return,
         };
 
-        let request = &buf[..n];
-        if !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            continue;
+        accum.extend_from_slice(&buf[..n]);
+
+        // Find end of headers
+        let header_end = match accum.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => pos + 4,
+            None => continue,
+        };
+
+        // Parse Content-Length to know how much body to expect
+        let headers_str = std::str::from_utf8(&accum[..header_end]).unwrap_or("");
+        let content_length: usize = headers_str
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+
+        let total_expected = header_end + content_length;
+
+        // Keep reading until we have the full body
+        while accum.len() < total_expected {
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            accum.extend_from_slice(&buf[..n]);
         }
 
-        received.lock().unwrap().push(request.to_vec());
+        received.lock().unwrap().push(accum.clone());
 
-        let keep_alive = request_is_keepalive(request);
+        let keep_alive = request_is_keepalive(&accum);
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}",
@@ -612,6 +637,8 @@ fn handle_inspecting_connection(
             if keep_alive { "keep-alive" } else { "close" },
             body
         );
+
+        accum.clear();
 
         if stream.write_all(response.as_bytes()).is_err() { return; }
         if !keep_alive { return; }

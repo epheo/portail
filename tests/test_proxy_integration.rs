@@ -731,3 +731,84 @@ fn test_exact_vs_prefix_path_e2e() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// === POST Body Forwarding Tests ===
+
+#[test]
+fn test_post_body_forwarded() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(30);
+    let proxy = PortailProcess::spawn(
+        &[("localhost", "/", backend.addr)],
+        port,
+    );
+
+    // 4KB JSON body — fits in the initial 64KB buffer
+    let body = format!("{{\"data\": \"{}\"}}", "x".repeat(4000));
+    let request = format!(
+        "POST /api/query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    let response = http_request(proxy.proxy_addr, request.as_bytes())
+        .expect("POST should return a response");
+
+    let status = extract_status(&response).expect("valid HTTP status");
+    assert_eq!(status, 200, "expected 200 OK, got {}", status);
+
+    thread::sleep(Duration::from_millis(200));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty(), "backend should have received a request");
+
+    // Verify the full body was forwarded
+    let received = &requests[0];
+    let header_end = received.windows(4).position(|w| w == b"\r\n\r\n")
+        .expect("should find header boundary") + 4;
+    let received_body = &received[header_end..];
+    assert_eq!(
+        received_body.len(), body.len(),
+        "backend received {} body bytes, expected {}",
+        received_body.len(), body.len()
+    );
+    assert_eq!(
+        std::str::from_utf8(received_body).unwrap(), body,
+        "body content mismatch"
+    );
+}
+
+#[test]
+fn test_post_large_body_forwarded() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(31);
+    let proxy = PortailProcess::spawn(
+        &[("localhost", "/", backend.addr)],
+        port,
+    );
+
+    // 128KB body — exceeds the 64KB initial buffer, requires body relay
+    let body = "x".repeat(128 * 1024);
+    let request = format!(
+        "POST /api/ds/query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    let response = http_request_timeout(proxy.proxy_addr, request.as_bytes(), Duration::from_secs(10))
+        .expect("large POST should return a response (not timeout)");
+
+    let status = extract_status(&response).expect("valid HTTP status");
+    assert_eq!(status, 200, "expected 200 OK, got {}", status);
+
+    thread::sleep(Duration::from_millis(200));
+    let requests = backend.received_requests();
+    assert!(!requests.is_empty(), "backend should have received a request");
+
+    let received = &requests[0];
+    let header_end = received.windows(4).position(|w| w == b"\r\n\r\n")
+        .expect("should find header boundary") + 4;
+    let received_body = &received[header_end..];
+    assert_eq!(
+        received_body.len(), body.len(),
+        "backend received {} body bytes, expected {} (128KB)",
+        received_body.len(), body.len()
+    );
+}
