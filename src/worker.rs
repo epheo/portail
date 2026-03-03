@@ -236,15 +236,21 @@ async fn handle_connection(
                 let forward_fut = handle_http_forward(
                     &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, content_length, is_chunked, is_upgrade, &mut state,
                 );
-                let ka = if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
-                    match tokio::time::timeout(req_timeout, forward_fut).await {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            let _ = send_error_response(&mut client, 504).await;
-                            return Ok(());
+                let ka = if !is_upgrade {
+                    if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
+                        match tokio::time::timeout(req_timeout, forward_fut).await {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                let _ = send_error_response(&mut client, 504).await;
+                                return Ok(());
+                            }
                         }
+                    } else {
+                        forward_fut.await?
                     }
                 } else {
+                    // Upgrades (WebSocket) must not be wrapped in request_timeout —
+                    // the bidirectional stream is long-lived.
                     forward_fut.await?
                 };
                 if !ka {
@@ -405,6 +411,10 @@ async fn handle_http_forward(
                     return Ok(false);
                 }
             };
+            // Flush the TLS stream so the browser receives the 101 before
+            // we switch to bidirectional streaming. Without this, the encrypted
+            // 101 response may remain buffered and the browser never upgrades.
+            client.flush().await?;
             // After sending the 101 response, switch to raw bidirectional streaming.
             // Errors are expected when either side closes — best-effort.
             let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
