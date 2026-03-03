@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
-use crate::config::{ListenerConfig, PerformanceConfig, Protocol, TlsMode};
+use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
@@ -51,10 +51,33 @@ pub struct DataPlane {
     bound_ports: std::collections::HashSet<u16>,
     /// Per-port dynamic TLS acceptors for hot-reload support.
     tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
+    /// Per-port cert fingerprint to skip no-op TLS reloads.
+    tls_cert_hashes: std::collections::HashMap<u16, u64>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Compute a fingerprint of all cert PEM bytes for change detection.
+/// Uses FNV-1a for speed — collision resistance isn't critical here,
+/// a false positive just triggers one extra ServerConfig rebuild.
+fn compute_cert_fingerprint(refs: &[CertificateRef]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = fnv::FnvHasher::default();
+    for r in refs {
+        if let Some(pem) = &r.cert_pem {
+            hasher.write(pem);
+        }
+        if let Some(pem) = &r.key_pem {
+            hasher.write(pem);
+        }
+        hasher.write(r.name.as_bytes());
+        if let Some(h) = &r.hostname {
+            hasher.write(h.as_bytes());
+        }
+    }
+    hasher.finish()
+}
 
 impl DataPlane {
     /// Create listeners for all (worker, listener) combinations.
@@ -150,6 +173,7 @@ impl DataPlane {
             active_connections: Arc::new(AtomicUsize::new(0)),
             bound_ports,
             tls_configs: std::collections::HashMap::new(),
+            tls_cert_hashes: std::collections::HashMap::new(),
         })
     }
 
@@ -178,9 +202,14 @@ impl DataPlane {
                 {
                     match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
                         Ok(config) => {
-                            // If port is already bound, hot-reload the TLS config
+                            // If port is already bound, hot-reload the TLS config only if certs changed
                             if let Some(existing) = self.tls_configs.get(&port) {
+                                let fingerprint = compute_cert_fingerprint(&tls_cfg.certificate_refs);
+                                if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
+                                    continue; // Certs unchanged — skip hot-reload
+                                }
                                 existing.update(config);
+                                self.tls_cert_hashes.insert(port, fingerprint);
                                 info!("Hot-reloaded TLS config for port {}", port);
                                 continue; // Port already has workers, just update TLS
                             }
@@ -298,7 +327,7 @@ impl DataPlane {
     /// Called on every reconcile to pick up Secret changes (cert-manager rotation, etc.).
     /// Returns the number of ports updated and any errors.
     pub fn update_tls_configs(
-        &self,
+        &mut self,
         listener_configs: &[ListenerConfig],
     ) -> (usize, Vec<(u16, String)>) {
         let mut updated = 0;
@@ -310,9 +339,14 @@ impl DataPlane {
                     if tls_cfg.mode == TlsMode::Terminate =>
                 {
                     if let Some(existing) = self.tls_configs.get(&port) {
+                        let fingerprint = compute_cert_fingerprint(&tls_cfg.certificate_refs);
+                        if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
+                            continue; // Certs unchanged — skip hot-reload
+                        }
                         match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
                             Ok(config) => {
                                 existing.update(config);
+                                self.tls_cert_hashes.insert(port, fingerprint);
                                 updated += 1;
                             }
                             Err(e) => {

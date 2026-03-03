@@ -947,7 +947,7 @@ async fn reconcile(
                 }
             }).collect();
             match ctx.data_plane.lock() {
-                Ok(dp) => {
+                Ok(mut dp) => {
                     let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
                     if tls_updated > 0 {
                         debug!("Refreshed merged TLS config for {} port(s)", tls_updated);
