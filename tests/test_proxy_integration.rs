@@ -1,12 +1,12 @@
-/// End-to-end proxy integration tests for Portail.
-///
-/// These tests spawn a real Portail process and backend TCP servers,
-/// send actual HTTP traffic through the proxy, and verify responses.
-///
-/// Requirements:
-/// - Portail binary must be built (`cargo build --release`)
-///
-/// Run with: cargo test --release --test test_proxy_integration
+//! End-to-end proxy integration tests for Portail.
+//!
+//! These tests spawn a real Portail process and backend TCP servers,
+//! send actual HTTP traffic through the proxy, and verify responses.
+//!
+//! Requirements:
+//! - Portail binary must be built (`cargo build --release`)
+//!
+//! Run with: cargo test --release --test test_proxy_integration
 
 mod helpers;
 
@@ -34,9 +34,7 @@ fn test_http_proxy_roundtrip() {
         port,
     );
 
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
+    let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
     let response = http_request(proxy.proxy_addr, request.as_bytes())
         .expect("proxy should return a response");
 
@@ -114,14 +112,14 @@ fn test_multiple_backends() {
         port,
     );
 
-    let req_a = format!("GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let req_a = "GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
     let resp_a = http_request(proxy.proxy_addr, req_a.as_bytes()).expect("route /a");
     assert_eq!(
         std::str::from_utf8(extract_body(&resp_a)).unwrap().trim(),
         "backend-A"
     );
 
-    let req_b = format!("GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let req_b = "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
     let resp_b = http_request(proxy.proxy_addr, req_b.as_bytes()).expect("route /b");
     assert_eq!(
         std::str::from_utf8(extract_body(&resp_b)).unwrap().trim(),

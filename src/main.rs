@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
 use anyhow::Result;
 use logging::{info, error};
 

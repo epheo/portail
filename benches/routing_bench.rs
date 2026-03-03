@@ -101,7 +101,7 @@ fn memory_benchmark(c: &mut Criterion) {
 
     c.bench_function("add_http_route", |b| {
         b.iter_batched(
-            || RouteTable::new(),
+            RouteTable::new,
             |mut table| {
                 let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
                 table.add_http_route("host.com", make_rule("/api", backend));

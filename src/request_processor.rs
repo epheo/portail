@@ -469,9 +469,9 @@ mod tests {
                 path: Some(URLRewritePath::ReplaceFullPath("/new".to_string())),
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/old", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -491,9 +491,9 @@ mod tests {
                 path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/users", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -513,9 +513,9 @@ mod tests {
                 path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/v1", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -535,9 +535,9 @@ mod tests {
                 path: Some(URLRewritePath::ReplacePrefixMatch("/api".to_string())),
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/users", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -558,9 +558,9 @@ mod tests {
                 path: None,
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -588,9 +588,9 @@ mod tests {
                 },
             ],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/test", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -609,9 +609,9 @@ mod tests {
                 backend_addr: "127.0.0.1:9999".parse().unwrap(),
             }],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -631,9 +631,9 @@ mod tests {
                 HttpFilter::RequestMirror { backend_addr: "127.0.0.1:9999".parse().unwrap() },
             ],
         );
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
@@ -657,9 +657,9 @@ mod tests {
             }],
             vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] }],
         ));
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         assert!(matches!(decision, ProcessingDecision::HttpRedirect { status_code: 301, .. }));
     }
@@ -667,9 +667,9 @@ mod tests {
     #[test]
     fn test_no_filters_no_overhead() {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
-        let mut sel = BackendSelector::new();
+        let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &mut sel, &req, 8080, &health(), false).unwrap();
+        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             assert!(filters.is_none());

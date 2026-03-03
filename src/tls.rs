@@ -258,6 +258,7 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
 ///
 /// In standalone mode, `name` from CertificateRef resolves to:
 ///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
+#[cfg(test)]
 pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
     let config = build_server_config(cert_refs, cert_dir)?;
     Ok(TlsAcceptor::from(Arc::new(config)))

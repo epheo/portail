@@ -40,7 +40,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         b.iter(|| {
             for request in requests {
                 let info = extract_routing_info(request).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
                 let _ = std::hint::black_box(result);
             }
         })
@@ -50,7 +50,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         let request = b"POST /login HTTP/1.1\r\nHost: auth.api.com\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n";
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
             let _ = std::hint::black_box(result);
         })
     });
@@ -59,7 +59,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         let request = b"GET /search?q=electronics&category=phones&sort=price HTTP/1.1\r\nHost: products.api.com\r\nAccept: application/json\r\nUser-Agent: mobile-app/2.1\r\n\r\n";
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
             let _ = std::hint::black_box(result);
         })
     });
@@ -72,7 +72,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
 
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = health_table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+            let result = health_table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
             let _ = std::hint::black_box(result);
         })
     });
@@ -81,7 +81,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         let request = b"GET /nonexistent HTTP/1.1\r\nHost: unknown.api.com\r\n\r\n";
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
             let _ = std::hint::black_box(result);
         })
     });
@@ -109,14 +109,14 @@ fn throughput_simulation(c: &mut Criterion) {
             for _ in 0..800 {
                 for request in popular_requests.iter().take(4) {
                     let info = extract_routing_info(request.as_bytes()).unwrap();
-                    let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+                    let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
                     let _ = std::hint::black_box(result);
                 }
             }
 
             for request in regular_requests.iter().take(200) {
                 let info = extract_routing_info(request.as_bytes()).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
                 let _ = std::hint::black_box(result);
             }
         })
@@ -139,7 +139,7 @@ fn latency_scenarios(c: &mut Criterion) {
         c.bench_function(&format!("latency_scenario_{}", name), |b| {
             b.iter(|| {
                 let info = extract_routing_info(request).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string);
+                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
                 let _ = std::hint::black_box(result);
             })
         });
