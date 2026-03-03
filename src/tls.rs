@@ -248,9 +248,16 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
         fallback: fallback_key,
     };
 
-    Ok(ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver)))
+        .with_cert_resolver(Arc::new(resolver));
+
+    // Advertise HTTP/1.1 via ALPN. Without this, browsers may negotiate HTTP/2
+    // during the TLS handshake. Portail only speaks HTTP/1.1, and WebSocket
+    // upgrades (Connection: Upgrade) are exclusively HTTP/1.1.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(config)
 }
 
 /// Build a static TLS acceptor (standalone mode).

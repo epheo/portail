@@ -812,3 +812,155 @@ fn test_post_large_body_forwarded() {
         received_body.len(), body.len()
     );
 }
+
+// === WebSocket Upgrade Tests ===
+
+/// Minimal WebSocket-like backend: accepts the upgrade, sends 101, then echoes raw data.
+fn spawn_websocket_backend() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                    stream.set_nonblocking(false).ok();
+
+                    // Read the upgrade request
+                    let mut buf = [0u8; 4096];
+                    let mut accum = Vec::new();
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        accum.extend_from_slice(&buf[..n]);
+                        if accum.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    // Verify it's an upgrade request
+                    let req_str = String::from_utf8_lossy(&accum);
+                    if !req_str.to_lowercase().contains("upgrade") {
+                        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                        continue;
+                    }
+
+                    // Send 101 Switching Protocols
+                    let response = "HTTP/1.1 101 Switching Protocols\r\n\
+                                    Upgrade: websocket\r\n\
+                                    Connection: Upgrade\r\n\r\n";
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        continue;
+                    }
+
+                    // Echo loop: read data and echo it back (raw, no WS framing)
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (addr, shutdown)
+}
+
+#[test]
+fn test_websocket_upgrade_through_proxy() {
+    let (backend_addr, shutdown) = spawn_websocket_backend();
+    let port = proxy_port(32);
+    let proxy = PortailProcess::spawn(
+        &[("localhost", "/", backend_addr)],
+        port,
+    );
+
+    // Connect to the proxy and send a WebSocket upgrade request
+    let proxy_addr = proxy.proxy_addr;
+    let mut stream = std::net::TcpStream::connect_timeout(&proxy_addr, Duration::from_secs(5))
+        .expect("connect to proxy");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let upgrade_request = "GET /api/live/ws HTTP/1.1\r\n\
+                           Host: localhost\r\n\
+                           Upgrade: websocket\r\n\
+                           Connection: Upgrade\r\n\
+                           Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                           Sec-WebSocket-Version: 13\r\n\r\n";
+    stream.write_all(upgrade_request.as_bytes()).expect("send upgrade request");
+
+    // Read the 101 response
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for 101 response, got {} bytes: {:?}",
+                response.len(), String::from_utf8_lossy(&response));
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("connection closed before 101 response"),
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => panic!("read error waiting for 101: {}", e),
+        }
+    }
+
+    let status = extract_status(&response).expect("valid HTTP status in upgrade response");
+    assert_eq!(status, 101, "expected 101 Switching Protocols, got {}", status);
+
+    // Now the connection should be in raw bidirectional mode.
+    // Send some data and verify it echoes back.
+    let test_data = b"hello websocket through proxy";
+    stream.write_all(test_data).expect("write test data after upgrade");
+
+    let mut echo_buf = [0u8; 256];
+    let mut echo_response = Vec::new();
+    let echo_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while echo_response.len() < test_data.len() {
+        if std::time::Instant::now() > echo_deadline {
+            break;
+        }
+        match stream.read(&mut echo_buf) {
+            Ok(0) => break,
+            Ok(n) => echo_response.extend_from_slice(&echo_buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        echo_response, test_data,
+        "data should echo through WebSocket upgrade, got {:?}",
+        String::from_utf8_lossy(&echo_response)
+    );
+
+    drop(stream);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+}
