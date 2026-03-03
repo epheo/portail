@@ -27,20 +27,29 @@ This creates:
 - A `GatewayClass` named `portail` with controller name `portail.epheo.eu/gateway-controller`
 - A `DaemonSet` running one pod per node with `hostNetwork: true`
 
+### OpenShift / MicroShift
+
+On OpenShift-based clusters, the default security policy prevents `hostNetwork` and `NET_BIND_SERVICE`. Apply the SecurityContextConstraints:
+
+```bash
+kubectl apply -f deploy/scc.yaml
+```
+
+This grants the `portail-controller` service account permission to use host networking and bind to privileged ports.
+
 ## Container Image
+
+The pre-built image is available on Quay.io:
+
+```
+quay.io/epheo/portail:latest
+```
 
 Build from source:
 
 ```bash
 cargo build --release
-podman build -t portail:latest -f Containerfile .
-```
-
-Or use a pre-built image from the registry:
-
-```yaml
-# In deploy/daemonset.yaml, set the image:
-image: registry.desku.be/portail:v0.2.0
+podman build -t quay.io/epheo/portail:latest -f Containerfile .
 ```
 
 ## Network Model
@@ -62,6 +71,8 @@ sudo firewall-cmd --reload
 ## TLS Certificates
 
 Portail reads TLS certificates from Kubernetes Secrets referenced in your Gateway listener's `certificateRefs`. It works with cert-manager or any other Secret-based certificate management.
+
+TLS certificates are hot-reloaded when the underlying Secret changes — no restart required. Multiple Gateways sharing a port have their certificates merged automatically for SNI-based selection.
 
 Example with cert-manager:
 
@@ -95,6 +106,27 @@ spec:
       mode: Terminate
       certificateRefs:
       - name: app-tls-secret
+```
+
+## Configuration
+
+### Custom Controller Name
+
+To use a custom controller name (e.g., for running multiple Portail instances):
+
+```bash
+portail --kubernetes --controller-name my-org.example.com/gateway-controller
+```
+
+Update the `GatewayClass` to match:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: portail
+spec:
+  controllerName: my-org.example.com/gateway-controller
 ```
 
 ## Verifying

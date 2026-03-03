@@ -17,11 +17,9 @@ spec:
       serviceAccountName: portail-controller
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      imagePullSecrets:
-      - name: registry-credentials
       containers:
       - name: portail
-        image: registry.desku.be/portail:latest
+        image: quay.io/epheo/portail:latest
         imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:

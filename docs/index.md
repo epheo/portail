@@ -4,24 +4,20 @@ Portail is a Kubernetes [Gateway API](https://gateway-api.sigs.k8s.io/) controll
 
 It runs as a DaemonSet with `hostNetwork: true`, binding directly to node ports — no Service or LoadBalancer indirection. A single binary handles both the control plane (watching Gateway API resources) and the data plane (proxying traffic).
 
-## Conformance
-
-**346 / 383 tests passing** (90%) against the official Gateway API conformance suite.
+## Gateway API Conformance
 
 Supported features:
 
-- HTTP routing (path, header, query param, method matching)
-- Request/response header modification
-- URL rewrite and redirect
-- Request mirroring (single and multiple mirrors)
-- Weighted backend routing
-- Request and backend timeouts
-- TLS termination and passthrough (SNI-based)
-- TCP and UDP routing
-- Listener hostname isolation
-- Port-based listener isolation
-- Cross-namespace routing with ReferenceGrant
-- Named route rules
+- **HTTP routing**: path prefix/exact, header, query parameter, and method matching
+- **Traffic management**: weighted backend routing, request/backend timeouts
+- **Header modification**: request and response header add/set/remove, backend request headers
+- **URL manipulation**: path rewrite, prefix replace, hostname rewrite, path/port/scheme redirect
+- **Request mirroring**: single and multiple mirrors
+- **TLS**: termination with SNI-based cert selection, passthrough, hot-reload on Secret changes
+- **Protocol support**: HTTP/1.1, TCP, TLS, UDP routing; WebSocket upgrades
+- **Multi-tenancy**: listener hostname and port isolation, cross-namespace routing with ReferenceGrant
+- **Backend types**: ClusterIP, headless (EndpointSlice), ExternalName services
+- **Named route rules**
 
 ## Quick Start
 
@@ -79,6 +75,12 @@ Portail can also run without Kubernetes, loading routes from a config file:
 # Generate a starter config
 portail --generate-config development --output config.yaml
 
+# Validate without running
+portail --config config.yaml --validate-only
+
+# Inspect parsed config
+portail --config config.yaml --check-config
+
 # Run with config file
 portail --config config.yaml
 ```
@@ -86,8 +88,6 @@ portail --config config.yaml
 ## Links
 
 - [Installation Guide](install.md)
-- [Configuration Examples](configuration.md)
-- [Architecture](architecture.md)
 
 ## License
 
