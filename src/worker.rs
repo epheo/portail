@@ -432,6 +432,10 @@ async fn handle_http_forward(
                 return Ok(false);
             }
         };
+        // Flush the TLS stream so the client receives all response bytes.
+        // Without this, the tail of large responses may remain buffered in
+        // rustls and stall the client (plain TCP is unaffected — no-op flush).
+        client.flush().await?;
 
         if response_complete && keepalive {
             state.pool.release(backend_addr, backend);

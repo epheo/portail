@@ -233,7 +233,7 @@ fn test_concurrent_requests() {
 
 #[test]
 fn test_large_response_forwarding() {
-    let size = 128 * 1024; // 128KB
+    let size = 645 * 1024; // 645KB — matches HA frontend JS bundle size
     let backend = TestBackend::spawn_large(size);
     let port = proxy_port(7);
     let proxy = PortailProcess::spawn(
@@ -241,21 +241,23 @@ fn test_large_response_forwarding() {
         port,
     );
 
-    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    let response = http_request_timeout(proxy.proxy_addr, request, Duration::from_secs(10))
-        .expect("large response should complete");
+    // 20 rapid requests to catch intermittent TLS flush stalls (~5% rate)
+    for i in 0..20 {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let response = http_request_timeout(proxy.proxy_addr, request, Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("request {}: large response timed out: {}", i, e));
 
-    let status = extract_status(&response).expect("valid HTTP status");
-    assert_eq!(status, 200);
+        let status = extract_status(&response).expect("valid HTTP status");
+        assert_eq!(status, 200, "request {}: expected 200, got {}", i, status);
 
-    let body = extract_body(&response);
-    assert_eq!(
-        body.len(),
-        size,
-        "expected {} bytes, got {}",
-        size,
-        body.len()
-    );
+        let body = extract_body(&response);
+        assert_eq!(
+            body.len(),
+            size,
+            "request {}: expected {} bytes, got {} (partial delivery)",
+            i, size, body.len()
+        );
+    }
 }
 
 // === Mixed Protocol Tests ===
