@@ -85,12 +85,12 @@ pub async fn run_worker(
     tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
     tls_passthrough: bool,
     health: Arc<HealthRegistry>,
+    selector: Arc<BackendSelector>,
 ) {
     info!("Worker {} accepting on port {}", worker_id, server_port);
 
-    // Shared selector across all connections in this worker so weighted routing
-    // counters increment properly across separate TCP connections.
-    let shared_selector = Arc::new(BackendSelector::new());
+    // Selector is shared across ALL workers (not just this one) so weighted
+    // round-robin counters produce the correct distribution globally.
 
     loop {
         tokio::select! {
@@ -118,7 +118,7 @@ pub async fn run_worker(
                             // should be passed through instead of terminated.
                             // This handles the case where both HTTPS/Terminate and
                             // TLS/Passthrough listeners share the same port.
-                            let selector = shared_selector.clone();
+                            let selector = selector.clone();
                             tokio::spawn(async move {
                                 // Peek ClientHello for SNI to decide dispatch mode
                                 let should_passthrough = {
@@ -168,7 +168,7 @@ pub async fn run_worker(
                                 }
                             });
                         } else {
-                            let selector = shared_selector.clone();
+                            let selector = selector.clone();
                             let state = ConnectionState {
                                 server_port,
                                 routes,

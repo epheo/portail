@@ -25,24 +25,9 @@ use gateway_api::referencegrants::ReferenceGrant;
 use crate::logging::{debug, error, info, warn};
 use crate::routing::RouteTable;
 
+use super::parent_ref::ParentRefAccess;
 use super::reconciler::reconcile_to_config;
 use super::status;
-
-/// Sync-safe Stream wrapper over an mpsc receiver for reconcile_all_on.
-struct ReconcileStream(std::sync::Mutex<tokio::sync::mpsc::Receiver<()>>);
-
-impl futures::Stream for ReconcileStream {
-    type Item = ();
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.0.lock() {
-            Ok(mut rx) => rx.poll_recv(cx),
-            Err(_) => std::task::Poll::Ready(None),
-        }
-    }
-}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -90,56 +75,16 @@ struct ControllerCtx {
     store_gateway_classes: Store<GatewayClass>,
 }
 
-/// Reconcile all GatewayClasses from the store: accept ours, reject others.
-/// Uses reflector store — zero API server calls.
-async fn reconcile_gateway_classes(ctx: &ControllerCtx) {
-    let mut accepted_name: Option<String> = None;
-
-    // First pass: find the first GatewayClass that matches our controller
-    for gc_arc in ctx.store_gateway_classes.state() {
-        if gc_arc.spec.controller_name == ctx.controller_name {
-            accepted_name = Some(gc_arc.name_any());
-            break;
-        }
-    }
-
-    let Some(accepted) = &accepted_name else {
-        return; // No GatewayClass for our controller
-    };
-
-    // Second pass: accept ours, reject duplicates
-    for gc_arc in ctx.store_gateway_classes.state() {
-        if gc_arc.spec.controller_name != ctx.controller_name {
-            continue;
-        }
-        if gc_arc.name_any() == *accepted {
-            status::update_gateway_class_status(&ctx.client, &gc_arc, true, "Accepted by portail")
-                .await;
-        } else {
-            status::update_gateway_class_status(
-                &ctx.client,
-                &gc_arc,
-                false,
-                &format!(
-                    "Another GatewayClass '{}' is already accepted by this controller",
-                    accepted
-                ),
-            )
-            .await;
-        }
-    }
-}
-
-/// Helper: create a reflector store for a resource type, spawn a background task
-/// to drive it, and optionally send a reconcile trigger.
-/// When `generation_filter` is true, only triggers reconciliation on spec changes
-/// (metadata.generation change). Set to true for CRDs, false for core resources
-/// like Secrets/Services which don't reliably set generation.
-fn spawn_reflector<K>(
+/// Create a reflector for a resource type, returning the store and a stream.
+/// The stream is consumed by `Controller::watches_stream()` which both drives
+/// the reflector (keeping the store up to date) and triggers reconciliation
+/// of mapped Gateway(s) when resources change.
+fn create_reflector<K>(
     api: Api<K>,
-    reconcile_tx: Option<tokio::sync::mpsc::Sender<()>>,
-    generation_filter: bool,
-) -> Store<K>
+) -> (
+    Store<K>,
+    impl futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static,
+)
 where
     K: kube::Resource
         + Clone
@@ -152,54 +97,53 @@ where
 {
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
-    let rf = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()));
-    tokio::spawn(async move {
-        let mut generations: HashMap<String, i64> = HashMap::new();
-        // Process the raw reflector stream (not applied_objects()) to receive
-        // both Apply and Delete events. Without handling deletes, delete+recreate
-        // of a resource with the same name retains the old generation in the
-        // HashMap and suppresses the reconcile trigger.
-        let mut stream = std::pin::pin!(rf);
-        while let Some(result) = stream.next().await {
-            let event = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if let Some(tx) = &reconcile_tx {
-                match &event {
-                    watcher::Event::Delete(obj) => {
-                        // Remove stale generation entry so the next create triggers correctly
-                        let key = format!(
-                            "{}/{}",
-                            obj.meta().namespace.as_deref().unwrap_or(""),
-                            obj.meta().name.as_deref().unwrap_or("")
-                        );
-                        generations.remove(&key);
-                        let _ = tx.try_send(());
-                    }
-                    watcher::Event::Apply(obj) | watcher::Event::InitApply(obj) => {
-                        if generation_filter {
-                            let key = format!(
-                                "{}/{}",
-                                obj.meta().namespace.as_deref().unwrap_or(""),
-                                obj.meta().name.as_deref().unwrap_or("")
-                            );
-                            let gen = obj.meta().generation.unwrap_or(0);
-                            let prev = generations.insert(key, gen);
-                            if prev.is_none() || prev != Some(gen) {
-                                let _ = tx.try_send(());
-                            }
-                        } else {
-                            let _ = tx.try_send(());
-                        }
-                    }
-                    _ => {} // Init, InitDone — no action needed
-                }
+    let stream = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()))
+        .default_backoff()
+        .touched_objects(); // touched_objects includes deletes; applied_objects drops them
+    (reader, stream)
+}
+
+// ---------------------------------------------------------------------------
+// Mapper functions: map secondary resource events to Gateway ObjectRef(s)
+// ---------------------------------------------------------------------------
+
+/// Map a route to the Gateway(s) it targets via parentRefs.
+fn map_route_to_gateways<R: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>>(
+    route: &R,
+    parent_refs: &Option<Vec<impl ParentRefAccess>>,
+    store: &Store<Gateway>,
+) -> Vec<ObjectRef<Gateway>> {
+    let route_ns = route.namespace().unwrap_or_default();
+    let mut refs = Vec::new();
+    if let Some(prs) = parent_refs {
+        for pr in prs {
+            if pr.ref_group().is_some_and(|g| g != "gateway.networking.k8s.io") {
+                continue;
+            }
+            if pr.ref_kind().is_some_and(|k| k != "Gateway") {
+                continue;
+            }
+            let gw_ns = pr.ref_namespace().unwrap_or(&route_ns);
+            let obj_ref = ObjectRef::<Gateway>::new(pr.ref_name()).within(gw_ns);
+            if store.get(&obj_ref).is_some() {
+                refs.push(obj_ref);
             }
         }
-    });
-    reader
+    }
+    refs
 }
+
+/// Map any resource to ALL managed gateways (used for infrequently-changing
+/// resources like Service, Namespace, ReferenceGrant where targeted mapping
+/// adds complexity for negligible CPU gain).
+fn all_gateway_refs(store: &Store<Gateway>) -> Vec<ObjectRef<Gateway>> {
+    store
+        .state()
+        .into_iter()
+        .map(|gw| ObjectRef::from_obj(&*gw))
+        .collect()
+}
+
 
 pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
@@ -212,12 +156,9 @@ pub async fn run_controller(
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
 
-    // Channel for secondary resources to trigger reconciliation
-    let (reconcile_tx, reconcile_rx) = tokio::sync::mpsc::channel::<()>(16);
-
     // --- Primary resource: Gateway ---
-    // Use Controller::for_stream() with predicate_filter(predicates::generation)
-    // to filter out status-only changes at the stream level.
+    // predicate_filter(predicates::generation) filters status-only changes,
+    // breaking the reconcile → status patch → watch event feedback loop.
     let gw_writer = reflector::store::Writer::default();
     let store_gateways = gw_writer.as_reader();
     let gw_stream = reflector::reflector(
@@ -231,83 +172,59 @@ pub async fn run_controller(
     .applied_objects()
     .predicate_filter(predicates::generation);
 
-    // --- Secondary CRD reflectors (generation-filtered via spawn_reflector) ---
-    let store_http_routes = spawn_reflector(
-        Api::<HTTPRoute>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        true,
-    );
-    let store_tcp_routes = spawn_reflector(
-        Api::<TCPRoute>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        true,
-    );
-    let store_tls_routes = spawn_reflector(
-        Api::<TLSRoute>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        true,
-    );
-    let store_udp_routes = spawn_reflector(
-        Api::<UDPRoute>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        true,
-    );
-    let store_gateway_classes = spawn_reflector(
-        Api::<GatewayClass>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        true,
-    );
+    // --- Secondary resources ---
+    // Each resource gets a reflector (store + stream). The stream feeds into
+    // Controller::watches_stream() with a mapper that targets affected Gateway(s).
+    // This is the standard kube-rs/controller-runtime pattern: secondary resource
+    // events go through a separate path unaffected by the primary predicate_filter.
 
-    // --- Core resource reflectors (no generation filter) ---
-    let store_namespaces = spawn_reflector(
-        Api::<Namespace>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        false,
-    );
-    let store_services = spawn_reflector(
-        Api::<Service>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        false,
-    );
-    let store_endpoint_slices = spawn_reflector(
-        Api::<EndpointSlice>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        false,
-    );
-    let store_reference_grants = spawn_reflector(
-        Api::<ReferenceGrant>::all(client.clone()),
-        Some(reconcile_tx.clone()),
-        false,
-    );
+    // CRD reflectors — generation-filtered to ignore status-only changes
+    let (store_http_routes, http_route_stream) =
+        create_reflector(Api::<HTTPRoute>::all(client.clone()));
+    let (store_tcp_routes, tcp_route_stream) =
+        create_reflector(Api::<TCPRoute>::all(client.clone()));
+    let (store_tls_routes, tls_route_stream) =
+        create_reflector(Api::<TLSRoute>::all(client.clone()));
+    let (store_udp_routes, udp_route_stream) =
+        create_reflector(Api::<UDPRoute>::all(client.clone()));
+    // GatewayClass: managed by a separate Controller (below).
+    // We create that controller early to get its store for ControllerCtx lookups.
+    let gc_api = Api::<GatewayClass>::all(client.clone());
+    let gc_controller = Controller::new(gc_api, watcher::Config::default());
+    let store_gateway_classes = gc_controller.store();
 
-    // Only watch TLS secrets
-    let store_secrets = {
+    // Core resource reflectors — no generation filter (core types don't reliably set it)
+    let (store_namespaces, namespace_stream) =
+        create_reflector(Api::<Namespace>::all(client.clone()));
+    let (store_services, service_stream) =
+        create_reflector(Api::<Service>::all(client.clone()));
+    let (store_endpoint_slices, endpoint_slice_stream) =
+        create_reflector(Api::<EndpointSlice>::all(client.clone()));
+    let (store_reference_grants, reference_grant_stream) =
+        create_reflector(Api::<ReferenceGrant>::all(client.clone()));
+
+    // TLS secrets — field-filtered to avoid watching all secrets
+    let (store_secrets, secret_stream) = {
         let writer = reflector::store::Writer::default();
         let reader = writer.as_reader();
-        let rf = reflector::reflector(
+        let stream = reflector::reflector(
             writer,
             watcher::watcher(
                 Api::<Secret>::all(client.clone()),
                 watcher::Config::default().fields("type=kubernetes.io/tls"),
             ),
-        );
-        let tx = reconcile_tx.clone();
-        tokio::spawn(async move {
-            let mut stream = std::pin::pin!(rf.applied_objects());
-            while stream.next().await.is_some() {
-                let _ = tx.try_send(());
-            }
-        });
-        reader
+        )
+        .default_backoff()
+        .touched_objects();
+        (reader, stream)
     };
 
-    // Clone the gateway store for both ControllerCtx and Controller::for_stream()
     let store_gateways_for_controller = store_gateways.clone();
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
         routes,
-        controller_name,
+        controller_name: controller_name.clone(),
         data_plane,
         worker_count,
         performance_config,
@@ -321,32 +238,116 @@ pub async fn run_controller(
         store_reference_grants,
         store_secrets,
         store_gateways,
-        store_gateway_classes,
+        store_gateway_classes: store_gateway_classes.clone(),
     });
 
-    // Wrap the secondary resource channel as a Stream for reconcile_all_on
-    let reconcile_stream = ReconcileStream(std::sync::Mutex::new(reconcile_rx));
+    // --- Gateway controller ---
+    // Primary: Gateway stream with generation predicate (breaks feedback loop).
+    // Secondary: watches_stream() per resource type with targeted mappers.
+    //
+    // Routes → map to parent Gateway(s) via parentRefs (targeted)
+    // Secret → map to Gateways referencing it in TLS config (targeted)
+    // EndpointSlice → map via Service→Route→Gateway (targeted)
+    // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
 
-    // Controller::for_stream() reuses our reflector stream (no duplicate watcher).
-    // predicate_filter(predicates::generation) on the stream filters status-only
-    // changes before they reach the Controller — breaking the feedback loop.
-    // Built-in 1s debounce coalesces bursts of events.
-    let controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
-        .reconcile_all_on(reconcile_stream)
-        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
+    // Each watches_stream closure captures an owned gateway store clone via move.
+    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
+        std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
+
+    let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
+        // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
+        // No predicate_filter here: it caches generation per object key and never
+        // clears on delete, so delete+recreate with the same name (common in
+        // conformance tests) would be suppressed. The status feedback loop is
+        // already broken by the primary Gateway stream's predicate filter.
+        .watches_stream(http_route_stream, move |route: HTTPRoute| {
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw1)
+        })
+        .watches_stream(tcp_route_stream, move |route: TCPRoute| {
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw2)
+        })
+        .watches_stream(tls_route_stream, move |route: TLSRoute| {
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw3)
+        })
+        .watches_stream(udp_route_stream, move |route: UDPRoute| {
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw4)
+        })
+        // Secret: targeted — only reconcile Gateways referencing this secret in TLS
+        .watches_stream(secret_stream, move |secret: Secret| -> Vec<ObjectRef<Gateway>> {
+            let secret_name = secret.metadata.name.as_deref().unwrap_or("");
+            let secret_ns = secret.metadata.namespace.as_deref().unwrap_or("default");
+            gw5.state()
+                .into_iter()
+                .filter(|g| {
+                    let gw_ns = g.metadata.namespace.as_deref().unwrap_or("default");
+                    g.spec.listeners.iter().any(|l| {
+                        l.tls.as_ref().is_some_and(|tls| {
+                            tls.certificate_refs.as_ref().is_some_and(|refs| {
+                                refs.iter().any(|cr| {
+                                    cr.name == secret_name
+                                        && cr.namespace.as_deref().unwrap_or(gw_ns) == secret_ns
+                                })
+                            })
+                        })
+                    })
+                })
+                .map(|g| ObjectRef::from_obj(&*g))
+                .collect()
+        })
+        // EndpointSlice, Service, Namespace, ReferenceGrant: broad — reconcile all
+        // Gateways. These have complex multi-hop mappings and the 1s debounce
+        // coalesces frequent EndpointSlice events from pod scaling/readiness.
+        .watches_stream(endpoint_slice_stream, move |_: EndpointSlice| {
+            all_gateway_refs(&gw6)
+        })
+        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw7))
+        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw8))
+        .watches_stream(reference_grant_stream, {
+            let gw = ctx.store_gateways.clone();
+            move |_: ReferenceGrant| all_gateway_refs(&gw)
+        })
+        .with_config(
+            kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)),
+        )
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
+
+    // --- GatewayClass controller ---
+    // Separate controller: accepts/rejects GatewayClasses independently of Gateways.
+    // Controller::new() manages its own reflector and store, guaranteeing the store
+    // is populated (after InitDone) before any reconcile fires — no timing bugs.
+    // The same store is shared with ControllerCtx for Gateway reconcile lookups,
+    // eliminating the need for a separate GatewayClass reflector.
+    let gc_ctx = Arc::new(GatewayClassCtx {
+        client,
+        controller_name,
+        store: store_gateway_classes,
+    });
+    let gc_controller = gc_controller
+        .with_config(
+            kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)),
+        )
+        .shutdown_on_signal()
+        .run(reconcile_gateway_class, gc_error_policy, gc_ctx);
 
     info!("Gateway API controller started, watching for resource changes");
 
     tokio::select! {
-        _ = controller.for_each(|result| async move {
+        _ = gw_controller.for_each(|result| async move {
             match result {
                 Ok((_obj_ref, _action)) => {}
-                Err(e) => warn!("Reconciliation error: {}", e),
+                Err(e) => warn!("Gateway reconciliation error: {}", e),
             }
         }) => {
-            info!("Controller stream ended");
+            info!("Gateway controller stream ended");
+        }
+        _ = gc_controller.for_each(|result| async move {
+            match result {
+                Ok((_obj_ref, _action)) => {}
+                Err(e) => warn!("GatewayClass reconciliation error: {}", e),
+            }
+        }) => {
+            info!("GatewayClass controller stream ended");
         }
         _ = shutdown.cancelled() => {
             info!("Controller received shutdown signal");
@@ -360,9 +361,6 @@ async fn reconcile(
     gateway: Arc<Gateway>,
     ctx: Arc<ControllerCtx>,
 ) -> Result<Action, ReconcileError> {
-    // Reconcile GatewayClasses on each pass (cheap — reads from store)
-    reconcile_gateway_classes(&ctx).await;
-
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
@@ -373,8 +371,8 @@ async fn reconcile(
     let gc = match ctx.store_gateway_classes.get(&gc_ref) {
         Some(gc) => gc,
         None => {
-            debug!("GatewayClass '{}' not in store", gateway_class_name);
-            return Ok(Action::await_change());
+            debug!("GatewayClass '{}' not in store yet, requeueing", gateway_class_name);
+            return Ok(Action::requeue(Duration::from_secs(1)));
         }
     };
 
@@ -1341,7 +1339,70 @@ async fn reconcile(
 }
 
 fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
-    warn!("Controller reconciliation error, requeueing in 30s");
+    warn!("Gateway reconciliation error, requeueing in 30s");
+    Action::requeue(Duration::from_secs(30))
+}
+
+// ---------------------------------------------------------------------------
+// GatewayClass controller — runs alongside the Gateway controller
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct GatewayClassCtx {
+    client: Client,
+    controller_name: String,
+    store: Store<GatewayClass>,
+}
+
+async fn reconcile_gateway_class(
+    gc: Arc<GatewayClass>,
+    ctx: Arc<GatewayClassCtx>,
+) -> Result<Action, ReconcileError> {
+    if gc.spec.controller_name != ctx.controller_name {
+        return Ok(Action::await_change());
+    }
+
+    // Accept the oldest GatewayClass for our controller (per Gateway API spec).
+    // The store is guaranteed populated — Controller::new() waits for InitDone.
+    let accepted = ctx
+        .store
+        .state()
+        .iter()
+        .filter(|g| g.spec.controller_name == ctx.controller_name)
+        .min_by_key(|g| g.metadata.creation_timestamp.clone())
+        .map(|g| g.name_any());
+
+    let is_accepted = accepted.as_deref() == Some(gc.name_any().as_str());
+    if is_accepted {
+        status::update_gateway_class_status(
+            &ctx.client,
+            &gc,
+            true,
+            "Accepted by portail",
+        )
+        .await;
+    } else {
+        status::update_gateway_class_status(
+            &ctx.client,
+            &gc,
+            false,
+            &format!(
+                "Another GatewayClass '{}' is already accepted by this controller",
+                accepted.unwrap_or_default()
+            ),
+        )
+        .await;
+    }
+
+    Ok(Action::await_change())
+}
+
+fn gc_error_policy(
+    _obj: Arc<GatewayClass>,
+    _error: &ReconcileError,
+    _ctx: Arc<GatewayClassCtx>,
+) -> Action {
+    warn!("GatewayClass reconciliation error, requeueing in 30s");
     Action::requeue(Duration::from_secs(30))
 }
 

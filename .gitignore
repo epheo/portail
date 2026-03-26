@@ -5,4 +5,6 @@ tests/integration/reports
 certs/gateway-api-conformance/
 certs/
 conformance-results.log
+conformance-report.yaml
 .kubeconfig-local
+.kubeconfig-kind

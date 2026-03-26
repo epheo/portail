@@ -1,27 +1,44 @@
 #!/usr/bin/env bash
-# Build, push, deploy, and run Gateway API conformance tests.
-# Usage: ./deploy-conformance.sh [--skip-build] [--skip-deploy] [--skip-tests]
+# Build, deploy, and run Gateway API conformance tests in an ephemeral Kind cluster.
+# Usage: ./deploy-conformance.sh [--skip-build] [--skip-deploy] [--skip-tests] [--no-kind] [--no-cleanup]
 set -euo pipefail
 
 IMAGE="quay.io/epheo/portail:latest"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_DIR="$PROJECT_DIR/deploy"
 GATEWAY_API_VERSION="v1.4.1"
-
-export KUBECONFIG="$PROJECT_DIR/.kubeconfig-local"
+PORTAIL_VERSION="v0.1.0"
+REPORT_OUTPUT="$PROJECT_DIR/conformance-report.yaml"
 
 SKIP_BUILD=false
 SKIP_DEPLOY=false
 SKIP_TESTS=false
+USE_KIND=true
+CLEANUP=true
 
 for arg in "$@"; do
   case "$arg" in
     --skip-build)  SKIP_BUILD=true ;;
     --skip-deploy) SKIP_DEPLOY=true ;;
     --skip-tests)  SKIP_TESTS=true ;;
+    --no-kind)     USE_KIND=false ;;
+    --no-cleanup)  CLEANUP=false ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
+
+# ── 0. Set up cluster ────────────────────────────────────────────
+if [ "$USE_KIND" = true ]; then
+  KUBECONFIG_PATH="$PROJECT_DIR/.kubeconfig-kind"
+  "$PROJECT_DIR/hack/kind-cluster.sh" create
+  export KUBECONFIG="$KUBECONFIG_PATH"
+
+  if [ "$CLEANUP" = true ]; then
+    trap '"$PROJECT_DIR/hack/kind-cluster.sh" delete' EXIT
+  fi
+else
+  export KUBECONFIG="${KUBECONFIG:-$PROJECT_DIR/.kubeconfig-local}"
+fi
 
 # Get supported features from the binary (single source of truth)
 SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
@@ -40,11 +57,20 @@ if [ "$SKIP_BUILD" = false ]; then
   echo "✓ Image built: $IMAGE"
 fi
 
-# ── 3. Push image ────────────────────────────────────────────────
+# ── 3. Push / load image ─────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [3/6] Pushing image ━━━"
-  podman push "$IMAGE"
-  echo "✓ Image pushed"
+  if [ "$USE_KIND" = true ]; then
+    echo "━━━ [3/6] Loading image into Kind cluster ━━━"
+    rm -f /tmp/portail-image.tar
+    podman save --format docker-archive "$IMAGE" -o /tmp/portail-image.tar
+    kind load image-archive /tmp/portail-image.tar --name "${CLUSTER_NAME:-portail}"
+    rm -f /tmp/portail-image.tar
+    echo "✓ Image loaded into Kind"
+  else
+    echo "━━━ [3/6] Pushing image ━━━"
+    podman push "$IMAGE"
+    echo "✓ Image pushed"
+  fi
 fi
 
 # ── 4. Install Gateway API experimental CRDs ────────────────────
@@ -67,6 +93,11 @@ if [ "$SKIP_DEPLOY" = false ]; then
   kubectl apply -f "$DEPLOY_DIR/daemonset.yaml"
   # Override image with the actual registry image
   kubectl set image daemonset/portail portail="$IMAGE" -n portail-system
+  if [ "$USE_KIND" = true ]; then
+    # Image is loaded locally — prevent pulling from registry
+    kubectl patch daemonset/portail -n portail-system \
+      -p '{"spec":{"template":{"spec":{"containers":[{"name":"portail","imagePullPolicy":"IfNotPresent"}]}}}}'
+  fi
   kubectl rollout restart daemonset/portail -n portail-system
   echo "Waiting for rollout..."
   kubectl rollout status daemonset/portail -n portail-system --timeout=120s
@@ -78,10 +109,47 @@ fi
 if [ "$SKIP_TESTS" = false ]; then
   echo "━━━ [6/6] Running conformance tests ━━━"
   cd "$PROJECT_DIR/gateway-api-conformance"
-  go test -v -timeout 20m ./conformance -run TestConformance -args \
-    -gateway-class=portail \
-    -conformance-profiles=GATEWAY-HTTP,GATEWAY-TLS \
-    -supported-features="$SUPPORTED_FEATURES" \
-    2>&1 | tee "$PROJECT_DIR/conformance-results.log"
+
+  if [ "$USE_KIND" = true ]; then
+    # Build the test binary on the host, then run it inside the Kind container
+    # where pod IPs are directly reachable (rootless Podman can't bind port 80).
+    echo "Building conformance test binary..."
+    CGO_ENABLED=0 go test -c -o /tmp/conformance.test ./conformance
+    CONTAINER_NAME="${CLUSTER_NAME:-portail}-control-plane"
+    podman cp /tmp/conformance.test "$CONTAINER_NAME":/conformance.test
+    podman cp "$KUBECONFIG" "$CONTAINER_NAME":/kubeconfig
+    rm -f /tmp/conformance.test
+
+    echo "Running conformance tests inside Kind container..."
+    podman exec -e KUBECONFIG=/etc/kubernetes/admin.conf "$CONTAINER_NAME" /conformance.test \
+      -test.v -test.timeout 20m -test.run TestConformance \
+      -gateway-class=portail \
+      -conformance-profiles=GATEWAY-HTTP,GATEWAY-TLS \
+      -supported-features="$SUPPORTED_FEATURES" \
+      -report-output=/conformance-report.yaml \
+      -organization=epheo \
+      -project=portail \
+      -url=https://github.com/epheo/portail \
+      -version="$PORTAIL_VERSION" \
+      -contact=@epheo \
+      2>&1 | tee "$PROJECT_DIR/conformance-results.log"
+
+    # Copy report back to host
+    podman cp "$CONTAINER_NAME":/conformance-report.yaml "$REPORT_OUTPUT" 2>/dev/null || true
+  else
+    go test -v -timeout 20m ./conformance -run TestConformance -args \
+      -gateway-class=portail \
+      -conformance-profiles=GATEWAY-HTTP,GATEWAY-TLS \
+      -supported-features="$SUPPORTED_FEATURES" \
+      -report-output="$REPORT_OUTPUT" \
+      -organization=epheo \
+      -project=portail \
+      -url=https://github.com/epheo/portail \
+      -version="$PORTAIL_VERSION" \
+      -contact=@epheo \
+      2>&1 | tee "$PROJECT_DIR/conformance-results.log"
+  fi
+
   echo "━━━ Done ━━━"
+  echo "Conformance report written to: $REPORT_OUTPUT"
 fi

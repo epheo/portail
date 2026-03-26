@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
-use crate::routing::RouteTable;
+use crate::routing::{BackendSelector, RouteTable};
 use crate::tls::{self, DynamicTlsAcceptor};
 use crate::udp_worker;
 use crate::worker;
@@ -52,6 +52,8 @@ pub struct DataPlane {
     tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
     /// Per-port cert fingerprint to skip no-op TLS reloads.
     tls_cert_hashes: std::collections::HashMap<u16, u64>,
+    /// Shared backend selector across all workers for correct weighted distribution.
+    selector: Arc<BackendSelector>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
@@ -182,6 +184,7 @@ impl DataPlane {
             bound_ports,
             tls_configs: std::collections::HashMap::new(),
             tls_cert_hashes: std::collections::HashMap::new(),
+            selector: Arc::new(BackendSelector::new()),
         })
     }
 
@@ -296,6 +299,7 @@ impl DataPlane {
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;
 
+                                let selector = self.selector.clone();
                                 let handle = tokio::spawn(async move {
                                     worker::run_worker(
                                         worker_id,
@@ -308,6 +312,7 @@ impl DataPlane {
                                         acceptor,
                                         passthrough,
                                         health,
+                                        selector,
                                     )
                                     .await;
                                 });
@@ -387,6 +392,7 @@ impl DataPlane {
             let shutdown = self.shutdown.clone();
             let max_idle = self.max_idle_per_backend;
             let connect_timeout = self.connect_timeout;
+            let selector = self.selector.clone();
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
@@ -400,6 +406,7 @@ impl DataPlane {
                     entry.tls_acceptor,
                     entry.tls_passthrough,
                     health,
+                    selector,
                 )
                 .await;
             });
