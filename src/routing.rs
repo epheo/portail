@@ -590,6 +590,10 @@ pub struct Backend {
     pub weight: u32,
     /// Per-backend filters (e.g. BackendRequestHeaderModifier)
     pub filters: Vec<HttpFilter>,
+    /// Whether to use TLS when connecting to this backend
+    pub use_tls: bool,
+    /// Hostname for TLS SNI (the original DNS name before resolution)
+    pub server_name: String,
 }
 
 impl Backend {
@@ -598,6 +602,7 @@ impl Backend {
     }
 
     pub fn with_weight(address: String, port: u16, weight: u32) -> Result<Self> {
+        let server_name = address.clone();
         let socket_addr = if let Ok(ip) = address.parse::<std::net::IpAddr>() {
             std::net::SocketAddr::new(ip, port)
         } else {
@@ -611,7 +616,7 @@ impl Backend {
                 .ok_or_else(|| anyhow!("No addresses found for hostname {}:{}", address, port))?
         };
 
-        Ok(Self { socket_addr, weight, filters: vec![] })
+        Ok(Self { socket_addr, weight, filters: vec![], use_tls: false, server_name })
     }
 }
 
@@ -687,7 +692,7 @@ mod tests {
     }
 
     fn backend(port: u16) -> Backend {
-        Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1, filters: vec![] }
+        Backend { socket_addr: format!("127.0.0.1:{}", port).parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() }
     }
 
     fn rule(path_type: PathMatchType, path: &str, backends: Vec<Backend>) -> HttpRouteRule {
@@ -790,8 +795,8 @@ mod tests {
         rt.add_http_route("test.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
-                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
-                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![], use_tls: false, server_name: String::new() },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() },
             ],
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -1037,8 +1042,8 @@ mod tests {
         rt.add_http_route("test.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
-                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
-                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() },
             ],
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -1060,8 +1065,8 @@ mod tests {
         rt.add_http_route("test.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
-                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] },
-                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 0, filters: vec![], use_tls: false, server_name: String::new() },
             ],
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();
@@ -1080,8 +1085,8 @@ mod tests {
         rt.add_http_route("test.com", HttpRouteRule::new(
             PathMatchType::Prefix, "/".to_string(), vec![], vec![], vec![],
             vec![
-                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![] },
-                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![] },
+                Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 3, filters: vec![], use_tls: false, server_name: String::new() },
+                Backend { socket_addr: "127.0.0.1:8002".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() },
             ],
         ));
         let r = rt.find_http_route("test.com", "GET", "/", &[], "", 0).unwrap();

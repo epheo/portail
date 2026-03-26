@@ -76,7 +76,7 @@ impl PortailConfig {
 
                 for hostname in &effective_hostnames {
                     for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
+                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides, &self.app_protocol_overrides)?;
                         for route_match in &rule.matches {
                             let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
                             route_table.add_http_route_for_listener(0, None, hostname, routing_rule);
@@ -112,7 +112,7 @@ impl PortailConfig {
                         tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
                             rule_idx, rule.matches.len(), rule.backend_refs.len());
 
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides)?;
+                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides, &self.app_protocol_overrides)?;
 
                         for route_match in &rule.matches {
                             let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
@@ -259,6 +259,7 @@ fn build_rule_components(
     _rule_idx: usize,
     _hostname: &str,
     endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
+    app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
 ) -> Result<(Vec<crate::routing::Backend>, Vec<crate::routing::HttpFilter>)> {
     use crate::routing;
 
@@ -266,8 +267,13 @@ fn build_rule_components(
     for backend_ref in &rule.backend_refs {
         let backend_filters = convert_filters(&backend_ref.filters)?;
 
-        // Check if this backend has endpoint overrides (headless service)
+        // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
         let override_key = (backend_ref.name.clone(), backend_ref.port);
+        let effective_app_protocol = backend_ref.app_protocol.as_deref()
+            .or_else(|| app_protocol_overrides.get(&override_key).map(|s| s.as_str()));
+        let backend_use_tls = effective_app_protocol == Some("https");
+
+        // Check if this backend has endpoint overrides (headless service)
         if let Some(endpoints) = endpoint_overrides.get(&override_key) {
             if !endpoints.is_empty() {
                 tracing::debug!("        Headless backend {}:{} -> {} pod endpoints",
@@ -280,6 +286,7 @@ fn build_rule_components(
                     ) {
                         Ok(mut backend) => {
                             backend.filters = backend_filters.clone();
+                            backend.use_tls = backend_use_tls;
                             backends.push(backend);
                         }
                         Err(e) => {
@@ -299,8 +306,9 @@ fn build_rule_components(
         ) {
             Ok(mut backend) => {
                 backend.filters = backend_filters;
+                backend.use_tls = backend_use_tls;
+                tracing::debug!("        Backend: {}:{} weight={} tls={}", backend_ref.name, backend_ref.port, backend_ref.weight, backend.use_tls);
                 backends.push(backend);
-                tracing::debug!("        Backend: {}:{} weight={}", backend_ref.name, backend_ref.port, backend_ref.weight);
             }
             Err(e) => {
                 tracing::warn!("        Skipping backend {}:{} - DNS resolution failed: {}", backend_ref.name, backend_ref.port, e);

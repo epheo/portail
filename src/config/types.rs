@@ -136,6 +136,11 @@ pub struct PortailConfig {
     /// Map: (backend_fqdn, service_port) → Vec<(pod_ip, target_port)>
     #[serde(skip)]
     pub endpoint_overrides: std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
+
+    /// Application protocol overrides from Service port specs (not serialized).
+    /// Map: (backend_fqdn, service_port) → app_protocol (e.g. "https")
+    #[serde(skip)]
+    pub app_protocol_overrides: std::collections::HashMap<(String, u16), String>,
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
@@ -357,6 +362,9 @@ pub struct BackendRef {
     /// Per-backend filters (e.g. BackendRequestHeaderModifier)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<HttpRouteFilter>,
+    /// Application protocol for backend connections (e.g. "https" for TLS backends)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_protocol: Option<String>,
 }
 
 fn default_backend_kind() -> String {

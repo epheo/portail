@@ -232,9 +232,9 @@ async fn handle_connection(
             ProcessingDecision::TcpForward { backend_addr } => {
                 return handle_tcp_connection(client, backend_addr, &buf[..n], Arc::clone(&state.health)).await;
             }
-            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout, content_length, is_chunked, is_upgrade } => {
+            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout, content_length, is_chunked, is_upgrade, backend_use_tls, backend_server_name } => {
                 let forward_fut = handle_http_forward(
-                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, content_length, is_chunked, is_upgrade, &mut state,
+                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, content_length, is_chunked, is_upgrade, backend_use_tls, backend_server_name, &mut state,
                 );
                 let ka = if !is_upgrade {
                     if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
@@ -303,6 +303,8 @@ async fn handle_http_forward(
     initial_content_length: Option<usize>,
     initial_is_chunked: bool,
     initial_is_upgrade: bool,
+    initial_backend_use_tls: bool,
+    initial_backend_server_name: String,
     state: &mut ConnectionState,
 ) -> Result<bool> {
     let mut backend_addr = initial_backend_addr;
@@ -313,12 +315,14 @@ async fn handle_http_forward(
     let mut req_content_length = initial_content_length;
     let mut req_is_chunked = initial_is_chunked;
     let mut req_is_upgrade = initial_is_upgrade;
+    let mut use_tls = initial_backend_use_tls;
+    let mut server_name = initial_backend_server_name;
 
     loop {
         let timeout_dur = per_rule_timeout
             .filter(|d| !d.is_zero())
             .unwrap_or(std::time::Duration::from_secs(30));
-        let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr)).await {
+        let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr, use_tls, &server_name)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 warn!("Backend {} connect failed: {}", backend_addr, e);
@@ -465,7 +469,7 @@ async fn handle_http_forward(
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _, content_length: cl, is_chunked: ch, is_upgrade: up } => {
+            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _, content_length: cl, is_chunked: ch, is_upgrade: up, backend_use_tls: tls, backend_server_name: sn } => {
                 backend_addr = addr;
                 keepalive = ka;
                 filter_data = filters;
@@ -473,6 +477,8 @@ async fn handle_http_forward(
                 req_content_length = cl;
                 req_is_chunked = ch;
                 req_is_upgrade = up;
+                use_tls = tls;
+                server_name = sn;
             }
             ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
                 send_redirect_response(client, status_code, &location).await?;
@@ -502,7 +508,7 @@ async fn handle_http_forward(
 /// buffers headers only for completion tracking. Zero buffering delay.
 /// With mods: buffers until headers complete, applies modifications, then writes.
 async fn forward_http_response(
-    backend: &mut TcpStream,
+    backend: &mut Connection,
     client: &mut Connection,
     buf: &mut [u8],
     response_mods: Option<&HeaderModifications>,

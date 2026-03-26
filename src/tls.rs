@@ -13,17 +13,21 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificateRef;
 
 pin_project! {
     /// Unified connection type — avoids making every handler function generic.
+    /// Supports plain TCP, server-side TLS (for accepting client connections),
+    /// and client-side TLS (for connecting to HTTPS backends).
     #[project = ConnectionProj]
     pub enum Connection {
         Plain { #[pin] inner: TcpStream },
-        Tls { #[pin] inner: TlsStream<TcpStream> },
+        Tls { #[pin] inner: ServerTlsStream<TcpStream> },
+        ClientTls { #[pin] inner: ClientTlsStream<TcpStream> },
     }
 }
 
@@ -36,6 +40,7 @@ impl AsyncRead for Connection {
         match self.project() {
             ConnectionProj::Plain { inner } => inner.poll_read(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_read(cx, buf),
+            ConnectionProj::ClientTls { inner } => inner.poll_read(cx, buf),
         }
     }
 }
@@ -49,6 +54,7 @@ impl AsyncWrite for Connection {
         match self.project() {
             ConnectionProj::Plain { inner } => inner.poll_write(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_write(cx, buf),
+            ConnectionProj::ClientTls { inner } => inner.poll_write(cx, buf),
         }
     }
 
@@ -56,6 +62,7 @@ impl AsyncWrite for Connection {
         match self.project() {
             ConnectionProj::Plain { inner } => inner.poll_flush(cx),
             ConnectionProj::Tls { inner } => inner.poll_flush(cx),
+            ConnectionProj::ClientTls { inner } => inner.poll_flush(cx),
         }
     }
 
@@ -63,6 +70,7 @@ impl AsyncWrite for Connection {
         match self.project() {
             ConnectionProj::Plain { inner } => inner.poll_shutdown(cx),
             ConnectionProj::Tls { inner } => inner.poll_shutdown(cx),
+            ConnectionProj::ClientTls { inner } => inner.poll_shutdown(cx),
         }
     }
 }
@@ -72,6 +80,20 @@ impl Connection {
         match self {
             Connection::Plain { inner } => inner.set_nodelay(nodelay),
             Connection::Tls { inner } => inner.get_ref().0.set_nodelay(nodelay),
+            Connection::ClientTls { inner } => inner.get_ref().0.set_nodelay(nodelay),
+        }
+    }
+
+    /// Non-blocking probe for connection liveness (used by backend pool).
+    /// For plain TCP, delegates to TcpStream::try_read.
+    /// For TLS, returns WouldBlock — TLS connections cannot be probed without
+    /// consuming state, so we optimistically treat them as alive.
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Connection::Plain { inner } => inner.try_read(buf),
+            Connection::Tls { .. } | Connection::ClientTls { .. } => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "tls probe skipped"))
+            }
         }
     }
 }

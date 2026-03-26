@@ -572,6 +572,30 @@ async fn reconcile(
         }
     }
 
+    // --- Build appProtocol overrides from Service port specs ---
+    // Map: (svc_fqdn, service_port) → appProtocol (e.g. "https")
+    let mut app_protocol_overrides: HashMap<(String, u16), String> = HashMap::new();
+    for svc in &all_services {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        let svc_name = match svc.metadata.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        if let Some(ports) = spec.ports.as_ref() {
+            for sp in ports {
+                if let Some(ref app_proto) = sp.app_protocol {
+                    let key = (svc_fqdn.clone(), sp.port as u16);
+                    app_protocol_overrides.insert(key, app_proto.clone());
+                }
+            }
+        }
+    }
+
     // --- Per-listener validation: compute ListenerStatus for each listener ---
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
 
@@ -786,6 +810,7 @@ async fn reconcile(
         &known_services,
         &cert_data,
         &endpoint_overrides,
+        &app_protocol_overrides,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -906,6 +931,7 @@ async fn reconcile(
             &known_services,
             &other_cert_data,
             &endpoint_overrides,
+            &app_protocol_overrides,
         ) {
             all_configs.push(other_result.config);
         }

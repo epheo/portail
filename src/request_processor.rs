@@ -71,6 +71,8 @@ pub enum ProcessingDecision {
         content_length: Option<usize>,
         is_chunked: bool,
         is_upgrade: bool,
+        backend_use_tls: bool,
+        backend_server_name: String,
     },
     HttpRedirect {
         status_code: u16,
@@ -215,6 +217,8 @@ fn analyze_http_request(
             content_length: request_info.content_length,
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
+            backend_use_tls: selected_backend.use_tls,
+            backend_server_name: selected_backend.server_name.clone(),
         });
     }
 
@@ -328,6 +332,8 @@ fn analyze_http_request(
         content_length: request_info.content_length,
         is_chunked: request_info.is_chunked,
         is_upgrade: request_info.is_upgrade,
+        backend_use_tls: selected_backend.use_tls,
+        backend_server_name: selected_backend.server_name.clone(),
     })
 }
 
@@ -456,7 +462,7 @@ mod tests {
             vec![],
             vec![],
             filters,
-            vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1, filters: vec![] }],
+            vec![Backend { socket_addr: format!("127.0.0.1:{}", backend_port).parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() }],
         ));
         rt
     }
@@ -664,7 +670,7 @@ mod tests {
                 path: None,
                 status_code: 301,
             }],
-            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![] }],
+            vec![Backend { socket_addr: "127.0.0.1:8001".parse().unwrap(), weight: 1, filters: vec![], use_tls: false, server_name: String::new() }],
         ));
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");

@@ -355,6 +355,7 @@ fn convert_mirror_config(
             group: rm.backend_ref.group.clone().unwrap_or_default(),
             kind: rm.backend_ref.kind.clone().unwrap_or_else(|| "Service".to_string()),
             filters: vec![],
+            app_protocol: None,
         },
     }
 }
@@ -371,6 +372,7 @@ pub(crate) fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str)
         group: br.group.clone().unwrap_or_default(),
         kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
         filters: convert_backend_ref_filters(&br.filters),
+        app_protocol: None,
     }
 }
 
@@ -447,6 +449,7 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(br: &B, ns: &str, pr
         group: br.br_group().unwrap_or_default().to_string(),
         kind: br.br_kind().map(String::from).unwrap_or_else(|| "Service".to_string()),
         filters: vec![],
+        app_protocol: None,
     }
 }
 
