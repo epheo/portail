@@ -5,14 +5,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use gateway_api::gateways::{
-    GatewayListeners,
-    GatewayListenersAllowedRoutesNamespacesFrom,
-};
+use gateway_api::gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom};
 use gateway_api::referencegrants::ReferenceGrant;
 
 use super::hostname::hostnames_intersect;
-use super::parent_ref::{ParentRefAccess, parent_ref_matches_gateway};
+use super::parent_ref::{parent_ref_matches_gateway, ParentRefAccess};
 
 /// Result of checking whether a route is allowed to attach to a listener.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,9 +42,7 @@ pub(crate) fn is_route_allowed_by_listener(
     if let Some(ref allowed) = listener.allowed_routes {
         if let Some(ref kinds) = allowed.kinds {
             if !kinds.is_empty() {
-                let kind_allowed = kinds.iter().any(|k| {
-                    k.kind == route_kind
-                });
+                let kind_allowed = kinds.iter().any(|k| k.kind == route_kind);
                 if !kind_allowed {
                     return false;
                 }
@@ -63,9 +58,7 @@ pub(crate) fn is_route_allowed_by_listener(
         Some(ns) => ns,
     };
     match &namespaces.from {
-        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => {
-            route_ns == gateway_ns
-        }
+        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gateway_ns,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
             let labels = match namespace_labels.get(route_ns) {
@@ -154,7 +147,13 @@ pub(crate) fn route_allowed_for_listener<T: ParentRefAccess>(
             best_reason = "NoMatchingListenerHostname";
             continue;
         }
-        if is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespace_labels) {
+        if is_route_allowed_by_listener(
+            listener,
+            gateway_ns,
+            route_ns,
+            route_kind,
+            namespace_labels,
+        ) {
             return RouteAllowResult::Allowed;
         }
         best_reason = "NotAllowedByListeners";
@@ -185,14 +184,13 @@ pub(crate) fn is_reference_allowed(
             continue;
         }
 
-        let from_match = grant.spec.from.iter().any(|f| {
-            f.group == from_group && f.kind == from_kind && f.namespace == from_namespace
-        });
+        let from_match =
+            grant.spec.from.iter().any(|f| {
+                f.group == from_group && f.kind == from_kind && f.namespace == from_namespace
+            });
 
         let to_match = grant.spec.to.iter().any(|t| {
-            t.group == to_group
-                && t.kind == to_kind
-                && t.name.as_ref().is_none_or(|n| n == to_name)
+            t.group == to_group && t.kind == to_kind && t.name.as_ref().is_none_or(|n| n == to_name)
         });
 
         if from_match && to_match {

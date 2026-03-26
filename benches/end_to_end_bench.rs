@@ -1,10 +1,17 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use portail::http_parser::extract_routing_info;
-use portail::routing::{RouteTable, Backend, HttpRouteRule, PathMatchType};
+use portail::routing::{Backend, HttpRouteRule, PathMatchType, RouteTable};
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
-    HttpRouteRule::new(PathMatchType::Prefix, path.to_string(), vec![], vec![], vec![], vec![backend])
+    HttpRouteRule::new(
+        PathMatchType::Prefix,
+        path.to_string(),
+        vec![],
+        vec![],
+        vec![],
+        vec![backend],
+    )
 }
 
 fn end_to_end_benchmark(c: &mut Criterion) {
@@ -24,7 +31,8 @@ fn end_to_end_benchmark(c: &mut Criterion) {
     ];
 
     for (host, path, backend_addr) in &services {
-        let backend = Backend::new(backend_addr.to_string(), 8080).expect("Failed to create backend");
+        let backend =
+            Backend::new(backend_addr.to_string(), 8080).expect("Failed to create backend");
         table.add_http_route(host, make_rule(path, backend));
     }
 
@@ -40,7 +48,14 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         b.iter(|| {
             for request in requests {
                 let info = extract_routing_info(request).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+                let result = table.find_http_route(
+                    info.host,
+                    info.method,
+                    info.path,
+                    info.header_data,
+                    info.query_string,
+                    80,
+                );
                 let _ = std::hint::black_box(result);
             }
         })
@@ -66,13 +81,21 @@ fn end_to_end_benchmark(c: &mut Criterion) {
 
     c.bench_function("e2e_health_check_processing", |b| {
         let request = b"GET /health HTTP/1.1\r\nHost: api.com\r\n\r\n";
-        let health_backend = Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create health backend");
+        let health_backend =
+            Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create health backend");
         let mut health_table = RouteTable::new();
         health_table.add_http_route("api.com", make_rule("/health", health_backend));
 
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = health_table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+            let result = health_table.find_http_route(
+                info.host,
+                info.method,
+                info.path,
+                info.header_data,
+                info.query_string,
+                80,
+            );
             let _ = std::hint::black_box(result);
         })
     });
@@ -81,7 +104,14 @@ fn end_to_end_benchmark(c: &mut Criterion) {
         let request = b"GET /nonexistent HTTP/1.1\r\nHost: unknown.api.com\r\n\r\n";
         b.iter(|| {
             let info = extract_routing_info(request).unwrap();
-            let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+            let result = table.find_http_route(
+                info.host,
+                info.method,
+                info.path,
+                info.header_data,
+                info.query_string,
+                80,
+            );
             let _ = std::hint::black_box(result);
         })
     });
@@ -92,16 +122,27 @@ fn throughput_simulation(c: &mut Criterion) {
 
     for i in 0..100 {
         let host = format!("service{}.api.com", i);
-        let backend = Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create backend");
+        let backend =
+            Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create backend");
         table.add_http_route(&host, make_rule("/api", backend));
     }
 
     let popular_requests: Vec<_> = (0..20)
-        .map(|i| format!("GET /api/data HTTP/1.1\r\nHost: service{}.api.com\r\n\r\n", i))
+        .map(|i| {
+            format!(
+                "GET /api/data HTTP/1.1\r\nHost: service{}.api.com\r\n\r\n",
+                i
+            )
+        })
         .collect();
 
     let regular_requests: Vec<_> = (20..100)
-        .map(|i| format!("GET /api/data HTTP/1.1\r\nHost: service{}.api.com\r\n\r\n", i))
+        .map(|i| {
+            format!(
+                "GET /api/data HTTP/1.1\r\nHost: service{}.api.com\r\n\r\n",
+                i
+            )
+        })
         .collect();
 
     c.bench_function("throughput_simulation_1000_requests", |b| {
@@ -109,14 +150,28 @@ fn throughput_simulation(c: &mut Criterion) {
             for _ in 0..800 {
                 for request in popular_requests.iter().take(4) {
                     let info = extract_routing_info(request.as_bytes()).unwrap();
-                    let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+                    let result = table.find_http_route(
+                        info.host,
+                        info.method,
+                        info.path,
+                        info.header_data,
+                        info.query_string,
+                        80,
+                    );
                     let _ = std::hint::black_box(result);
                 }
             }
 
             for request in regular_requests.iter().take(200) {
                 let info = extract_routing_info(request.as_bytes()).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+                let result = table.find_http_route(
+                    info.host,
+                    info.method,
+                    info.path,
+                    info.header_data,
+                    info.query_string,
+                    80,
+                );
                 let _ = std::hint::black_box(result);
             }
         })
@@ -125,7 +180,8 @@ fn throughput_simulation(c: &mut Criterion) {
 
 fn latency_scenarios(c: &mut Criterion) {
     let mut table = RouteTable::new();
-    let backend = Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create fast backend");
+    let backend =
+        Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create fast backend");
     table.add_http_route("fast.api.com", make_rule("/", backend));
 
     let scenarios = [
@@ -139,7 +195,14 @@ fn latency_scenarios(c: &mut Criterion) {
         c.bench_function(&format!("latency_scenario_{}", name), |b| {
             b.iter(|| {
                 let info = extract_routing_info(request).unwrap();
-                let result = table.find_http_route(info.host, info.method, info.path, info.header_data, info.query_string, 80);
+                let result = table.find_http_route(
+                    info.host,
+                    info.method,
+                    info.path,
+                    info.header_data,
+                    info.query_string,
+                    80,
+                );
                 let _ = std::hint::black_box(result);
             })
         });

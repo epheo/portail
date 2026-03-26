@@ -9,19 +9,27 @@ impl PortailConfig {
         self.gateway.validate()?;
 
         for (i, route) in self.http_routes.iter().enumerate() {
-            route.validate().map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
+            route
+                .validate()
+                .map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
         }
 
         for (i, route) in self.tcp_routes.iter().enumerate() {
-            route.validate().map_err(|e| anyhow!("TCP route {}: {}", i, e))?;
+            route
+                .validate()
+                .map_err(|e| anyhow!("TCP route {}: {}", i, e))?;
         }
 
         for (i, route) in self.tls_routes.iter().enumerate() {
-            route.validate().map_err(|e| anyhow!("TLS route {}: {}", i, e))?;
+            route
+                .validate()
+                .map_err(|e| anyhow!("TLS route {}: {}", i, e))?;
         }
 
         for (i, route) in self.udp_routes.iter().enumerate() {
-            route.validate().map_err(|e| anyhow!("UDP route {}: {}", i, e))?;
+            route
+                .validate()
+                .map_err(|e| anyhow!("UDP route {}: {}", i, e))?;
         }
 
         self.validate_port_conflicts()?;
@@ -40,7 +48,8 @@ impl PortailConfig {
                 let proto_family = if is_udp { "UDP" } else { "TCP" };
                 return Err(anyhow!(
                     "Port conflict: {} port {} is already in use by another listener",
-                    proto_family, listener.port
+                    proto_family,
+                    listener.port
                 ));
             }
         }
@@ -72,7 +81,10 @@ impl HttpRouteConfig {
             }
             // Wildcard hostnames must be "*.domain" format
             if hostname.starts_with('*') && !hostname.starts_with("*.") {
-                return Err(anyhow!("Wildcard hostname must use '*.domain' format: {}", hostname));
+                return Err(anyhow!(
+                    "Wildcard hostname must use '*.domain' format: {}",
+                    hostname
+                ));
             }
         }
 
@@ -81,7 +93,8 @@ impl HttpRouteConfig {
         }
 
         for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate().map_err(|e| anyhow!("HTTP route rule {}: {}", i, e))?;
+            rule.validate()
+                .map_err(|e| anyhow!("HTTP route rule {}: {}", i, e))?;
         }
 
         Ok(())
@@ -103,7 +116,8 @@ impl TcpRouteConfig {
         }
 
         for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate().map_err(|e| anyhow!("TCP route rule {}: {}", i, e))?;
+            rule.validate()
+                .map_err(|e| anyhow!("TCP route rule {}: {}", i, e))?;
         }
 
         Ok(())
@@ -121,7 +135,9 @@ impl GatewayConfig {
         }
 
         for (i, listener) in self.listeners.iter().enumerate() {
-            listener.validate().map_err(|e| anyhow!("Listener {}: {}", i, e))?;
+            listener
+                .validate()
+                .map_err(|e| anyhow!("Listener {}: {}", i, e))?;
         }
 
         if self.worker_threads == 0 {
@@ -147,29 +163,43 @@ impl ListenerConfig {
 
             // Basic interface name validation (Linux interface naming rules)
             if interface.len() > 15 {
-                return Err(anyhow!("Interface name '{}' is too long (max 15 characters)", interface));
+                return Err(anyhow!(
+                    "Interface name '{}' is too long (max 15 characters)",
+                    interface
+                ));
             }
 
             if interface.contains(' ') || interface.contains('/') || interface.contains(':') {
-                return Err(anyhow!("Interface name '{}' contains invalid characters", interface));
+                return Err(anyhow!(
+                    "Interface name '{}' contains invalid characters",
+                    interface
+                ));
             }
         }
 
         if let Some(ref addr) = self.address {
-            addr.parse::<std::net::IpAddr>()
-                .map_err(|_| anyhow!("Invalid bind address '{}': must be a valid IPv4 or IPv6 address", addr))?;
+            addr.parse::<std::net::IpAddr>().map_err(|_| {
+                anyhow!(
+                    "Invalid bind address '{}': must be a valid IPv4 or IPv6 address",
+                    addr
+                )
+            })?;
         }
 
         // TLS config validation per protocol
         match self.protocol {
             Protocol::HTTPS => {
-                let tls_cfg = self.tls.as_ref()
+                let tls_cfg = self
+                    .tls
+                    .as_ref()
                     .ok_or_else(|| anyhow!("HTTPS listener requires tls config"))?;
                 if tls_cfg.mode != TlsMode::Terminate {
                     return Err(anyhow!("HTTPS listener requires tls mode Terminate"));
                 }
                 if tls_cfg.certificate_refs.is_empty() {
-                    return Err(anyhow!("HTTPS listener requires at least one certificateRef"));
+                    return Err(anyhow!(
+                        "HTTPS listener requires at least one certificateRef"
+                    ));
                 }
                 for (i, cert_ref) in tls_cfg.certificate_refs.iter().enumerate() {
                     if cert_ref.name.is_empty() {
@@ -178,7 +208,9 @@ impl ListenerConfig {
                 }
             }
             Protocol::TLS => {
-                let tls_cfg = self.tls.as_ref()
+                let tls_cfg = self
+                    .tls
+                    .as_ref()
                     .ok_or_else(|| anyhow!("TLS listener requires tls config"))?;
                 if tls_cfg.mode != TlsMode::Passthrough {
                     return Err(anyhow!("TLS listener requires tls mode Passthrough"));
@@ -186,7 +218,10 @@ impl ListenerConfig {
             }
             Protocol::HTTP | Protocol::TCP | Protocol::UDP => {
                 if self.tls.is_some() {
-                    return Err(anyhow!("{:?} listener must not have tls config", self.protocol));
+                    return Err(anyhow!(
+                        "{:?} listener must not have tls config",
+                        self.protocol
+                    ));
                 }
             }
         }
@@ -207,24 +242,38 @@ impl ParentRef {
 
 impl HttpRouteRule {
     fn validate(&self) -> Result<()> {
-        let has_redirect = self.filters.iter().any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
-        let has_rewrite = self.filters.iter().any(|f| matches!(f, HttpRouteFilter::URLRewrite { .. }));
+        let has_redirect = self
+            .filters
+            .iter()
+            .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
+        let has_rewrite = self
+            .filters
+            .iter()
+            .any(|f| matches!(f, HttpRouteFilter::URLRewrite { .. }));
 
         if has_redirect && has_rewrite {
-            return Err(anyhow!("URLRewrite and RequestRedirect are mutually exclusive"));
+            return Err(anyhow!(
+                "URLRewrite and RequestRedirect are mutually exclusive"
+            ));
         }
 
         // backend_refs can be empty when a redirect filter is present
         if self.backend_refs.is_empty() && !has_redirect {
-            return Err(anyhow!("HTTP route rule must have at least one backend_ref (or a RequestRedirect filter)"));
+            return Err(anyhow!(
+                "HTTP route rule must have at least one backend_ref (or a RequestRedirect filter)"
+            ));
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+            backend_ref
+                .validate()
+                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
         }
 
         for (i, match_rule) in self.matches.iter().enumerate() {
-            match_rule.validate().map_err(|e| anyhow!("Match rule {}: {}", i, e))?;
+            match_rule
+                .validate()
+                .map_err(|e| anyhow!("Match rule {}: {}", i, e))?;
         }
 
         for (i, filter) in self.filters.iter().enumerate() {
@@ -242,8 +291,15 @@ const VALID_HTTP_METHODS: &[&str] = &[
 impl HttpRouteMatch {
     fn validate(&self) -> Result<()> {
         if let Some(ref method) = self.method {
-            if !VALID_HTTP_METHODS.iter().any(|m| m.eq_ignore_ascii_case(method)) {
-                return Err(anyhow!("Invalid HTTP method '{}'. Must be one of: {}", method, VALID_HTTP_METHODS.join(", ")));
+            if !VALID_HTTP_METHODS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(method))
+            {
+                return Err(anyhow!(
+                    "Invalid HTTP method '{}'. Must be one of: {}",
+                    method,
+                    VALID_HTTP_METHODS.join(", ")
+                ));
             }
         }
 
@@ -271,7 +327,10 @@ impl HttpPathMatch {
             regex::Regex::new(&self.value)
                 .map_err(|e| anyhow!("Invalid path regex '{}': {}", self.value, e))?;
         } else if !self.value.starts_with('/') {
-            return Err(anyhow!("Path match value must start with '/': {}", self.value));
+            return Err(anyhow!(
+                "Path match value must start with '/': {}",
+                self.value
+            ));
         }
 
         Ok(())
@@ -289,7 +348,9 @@ impl TlsRouteConfig {
         }
 
         if self.hostnames.is_empty() {
-            return Err(anyhow!("TLS route must have at least one hostname for SNI matching"));
+            return Err(anyhow!(
+                "TLS route must have at least one hostname for SNI matching"
+            ));
         }
 
         for hostname in &self.hostnames {
@@ -297,7 +358,10 @@ impl TlsRouteConfig {
                 return Err(anyhow!("TLS route hostname cannot be empty"));
             }
             if hostname.starts_with('*') && !hostname.starts_with("*.") {
-                return Err(anyhow!("Wildcard hostname must use '*.domain' format: {}", hostname));
+                return Err(anyhow!(
+                    "Wildcard hostname must use '*.domain' format: {}",
+                    hostname
+                ));
             }
         }
 
@@ -306,7 +370,8 @@ impl TlsRouteConfig {
         }
 
         for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate().map_err(|e| anyhow!("TLS route rule {}: {}", i, e))?;
+            rule.validate()
+                .map_err(|e| anyhow!("TLS route rule {}: {}", i, e))?;
         }
 
         Ok(())
@@ -320,7 +385,9 @@ impl TlsRouteRule {
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+            backend_ref
+                .validate()
+                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
         }
 
         Ok(())
@@ -342,7 +409,8 @@ impl UdpRouteConfig {
         }
 
         for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate().map_err(|e| anyhow!("UDP route rule {}: {}", i, e))?;
+            rule.validate()
+                .map_err(|e| anyhow!("UDP route rule {}: {}", i, e))?;
         }
 
         Ok(())
@@ -356,7 +424,9 @@ impl UdpRouteRule {
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+            backend_ref
+                .validate()
+                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
         }
 
         Ok(())
@@ -370,7 +440,9 @@ impl TcpRouteRule {
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref.validate().map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+            backend_ref
+                .validate()
+                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
         }
 
         Ok(())
@@ -386,7 +458,10 @@ impl BackendRef {
         validate_port(self.port, "Backend ref port")?;
 
         if self.weight > 1_000_000 {
-            return Err(anyhow!("Backend weight must be 0-1000000, got {}", self.weight));
+            return Err(anyhow!(
+                "Backend weight must be 0-1000000, got {}",
+                self.weight
+            ));
         }
 
         Ok(())
@@ -406,8 +481,15 @@ fn validate_header_match(hm: &HttpHeaderMatch) -> Result<()> {
         return Err(anyhow!("Header match name cannot be empty"));
     }
     // RFC 7230: header field names are tokens (visible ASCII, no delimiters)
-    if !hm.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
-        return Err(anyhow!("Header match name '{}' contains invalid characters", hm.name));
+    if !hm
+        .name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    {
+        return Err(anyhow!(
+            "Header match name '{}' contains invalid characters",
+            hm.name
+        ));
     }
     if hm.match_type == StringMatchType::RegularExpression {
         regex::Regex::new(&hm.value)
@@ -421,7 +503,10 @@ fn validate_query_param_match(qp: &HttpQueryParamMatch) -> Result<()> {
         return Err(anyhow!("Query param name cannot be empty"));
     }
     if qp.name.contains('&') || qp.name.contains('=') {
-        return Err(anyhow!("Query param name '{}' must not contain '&' or '='", qp.name));
+        return Err(anyhow!(
+            "Query param name '{}' must not contain '&' or '='",
+            qp.name
+        ));
     }
     if qp.match_type == StringMatchType::RegularExpression {
         regex::Regex::new(&qp.value)
@@ -444,21 +529,35 @@ fn validate_rewrite_path(p: &HttpURLRewritePath) -> Result<()> {
 fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
     match filter {
         HttpRouteFilter::RequestRedirect { config } => {
-            if config.scheme.is_none() && config.hostname.is_none() && config.port.is_none() && config.path.is_none() {
-                return Err(anyhow!("RequestRedirect must set at least one of: scheme, hostname, port, path"));
+            if config.scheme.is_none()
+                && config.hostname.is_none()
+                && config.port.is_none()
+                && config.path.is_none()
+            {
+                return Err(anyhow!(
+                    "RequestRedirect must set at least one of: scheme, hostname, port, path"
+                ));
             }
             match config.status_code {
                 301 | 302 | 303 | 307 | 308 => {}
-                _ => return Err(anyhow!("RequestRedirect status_code must be 301, 302, 303, 307, or 308, got {}", config.status_code)),
+                _ => {
+                    return Err(anyhow!(
+                        "RequestRedirect status_code must be 301, 302, 303, 307, or 308, got {}",
+                        config.status_code
+                    ))
+                }
             }
             if let Some(ref p) = config.path {
                 validate_rewrite_path(p).map_err(|e| anyhow!("RequestRedirect {}", e))?;
             }
         }
-        HttpRouteFilter::RequestHeaderModifier { .. } | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
+        HttpRouteFilter::RequestHeaderModifier { .. }
+        | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
         HttpRouteFilter::URLRewrite { config } => {
             if config.hostname.is_none() && config.path.is_none() {
-                return Err(anyhow!("URLRewrite must set at least one of: hostname, path"));
+                return Err(anyhow!(
+                    "URLRewrite must set at least one of: hostname, path"
+                ));
             }
             if let Some(ref p) = config.path {
                 validate_rewrite_path(p).map_err(|e| anyhow!("URLRewrite {}", e))?;
@@ -485,13 +584,26 @@ mod tests {
     }
 
     fn default_backend() -> BackendRef {
-        BackendRef { name: "127.0.0.1".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string(), filters: vec![], app_protocol: None }
+        BackendRef {
+            name: "127.0.0.1".to_string(),
+            port: 8080,
+            weight: 1,
+            group: String::new(),
+            kind: "Service".to_string(),
+            filters: vec![],
+            app_protocol: None,
+        }
     }
 
     #[test]
     fn test_url_rewrite_requires_at_least_one_field() {
         let rule = make_rule(
-            vec![HttpRouteFilter::URLRewrite { config: URLRewriteConfig { hostname: None, path: None } }],
+            vec![HttpRouteFilter::URLRewrite {
+                config: URLRewriteConfig {
+                    hostname: None,
+                    path: None,
+                },
+            }],
             vec![default_backend()],
         );
         assert!(rule.validate().is_err());
@@ -503,7 +615,9 @@ mod tests {
             vec![HttpRouteFilter::URLRewrite {
                 config: URLRewriteConfig {
                     hostname: None,
-                    path: Some(HttpURLRewritePath::ReplaceFullPath { value: "foo".to_string() }),
+                    path: Some(HttpURLRewritePath::ReplaceFullPath {
+                        value: "foo".to_string(),
+                    }),
                 },
             }],
             vec![default_backend()],
@@ -541,7 +655,15 @@ mod tests {
         let rule = make_rule(
             vec![HttpRouteFilter::RequestMirror {
                 config: RequestMirrorConfig {
-                    backend_ref: BackendRef { name: "".to_string(), port: 8080, weight: 1, group: String::new(), kind: "Service".to_string(), filters: vec![], app_protocol: None },
+                    backend_ref: BackendRef {
+                        name: "".to_string(),
+                        port: 8080,
+                        weight: 1,
+                        group: String::new(),
+                        kind: "Service".to_string(),
+                        filters: vec![],
+                        app_protocol: None,
+                    },
                 },
             }],
             vec![default_backend()],
@@ -555,7 +677,9 @@ mod tests {
             vec![HttpRouteFilter::URLRewrite {
                 config: URLRewriteConfig {
                     hostname: None,
-                    path: Some(HttpURLRewritePath::ReplaceFullPath { value: "/new".to_string() }),
+                    path: Some(HttpURLRewritePath::ReplaceFullPath {
+                        value: "/new".to_string(),
+                    }),
                 },
             }],
             vec![default_backend()],
@@ -569,7 +693,9 @@ mod tests {
             vec![HttpRouteFilter::URLRewrite {
                 config: URLRewriteConfig {
                     hostname: None,
-                    path: Some(HttpURLRewritePath::ReplacePrefixMatch { value: "/v2".to_string() }),
+                    path: Some(HttpURLRewritePath::ReplacePrefixMatch {
+                        value: "/v2".to_string(),
+                    }),
                 },
             }],
             vec![default_backend()],
@@ -630,46 +756,70 @@ mod tests {
 
     #[test]
     fn test_https_requires_terminate_mode() {
-        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
-            mode: TlsMode::Passthrough,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
-        }));
+        let listener = make_listener(
+            Protocol::HTTPS,
+            Some(TlsConfig {
+                mode: TlsMode::Passthrough,
+                certificate_refs: vec![CertificateRef {
+                    name: "cert".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
         assert!(listener.validate().is_err());
     }
 
     #[test]
     fn test_https_requires_certificate_refs() {
-        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
-            mode: TlsMode::Terminate,
-            certificate_refs: vec![],
-        }));
+        let listener = make_listener(
+            Protocol::HTTPS,
+            Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: vec![],
+            }),
+        );
         assert!(listener.validate().is_err());
     }
 
     #[test]
     fn test_https_valid_tls_config() {
-        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
-            mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "my-cert".to_string(), ..Default::default() }],
-        }));
+        let listener = make_listener(
+            Protocol::HTTPS,
+            Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: vec![CertificateRef {
+                    name: "my-cert".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
         assert!(listener.validate().is_ok());
     }
 
     #[test]
     fn test_tls_requires_passthrough_mode() {
-        let listener = make_listener(Protocol::TLS, Some(TlsConfig {
-            mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
-        }));
+        let listener = make_listener(
+            Protocol::TLS,
+            Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: vec![CertificateRef {
+                    name: "cert".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
         assert!(listener.validate().is_err());
     }
 
     #[test]
     fn test_tls_passthrough_valid() {
-        let listener = make_listener(Protocol::TLS, Some(TlsConfig {
-            mode: TlsMode::Passthrough,
-            certificate_refs: vec![],
-        }));
+        let listener = make_listener(
+            Protocol::TLS,
+            Some(TlsConfig {
+                mode: TlsMode::Passthrough,
+                certificate_refs: vec![],
+            }),
+        );
         assert!(listener.validate().is_ok());
     }
 
@@ -681,29 +831,44 @@ mod tests {
 
     #[test]
     fn test_http_rejects_tls_config() {
-        let listener = make_listener(Protocol::HTTP, Some(TlsConfig {
-            mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "cert".to_string(), ..Default::default() }],
-        }));
+        let listener = make_listener(
+            Protocol::HTTP,
+            Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: vec![CertificateRef {
+                    name: "cert".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
         assert!(listener.validate().is_err());
     }
 
     #[test]
     fn test_tcp_rejects_tls_config() {
-        let mut listener = make_listener(Protocol::TCP, Some(TlsConfig {
-            mode: TlsMode::Passthrough,
-            certificate_refs: vec![],
-        }));
+        let mut listener = make_listener(
+            Protocol::TCP,
+            Some(TlsConfig {
+                mode: TlsMode::Passthrough,
+                certificate_refs: vec![],
+            }),
+        );
         listener.port = 2222;
         assert!(listener.validate().is_err());
     }
 
     #[test]
     fn test_https_empty_cert_name_rejected() {
-        let listener = make_listener(Protocol::HTTPS, Some(TlsConfig {
-            mode: TlsMode::Terminate,
-            certificate_refs: vec![CertificateRef { name: "".to_string(), ..Default::default() }],
-        }));
+        let listener = make_listener(
+            Protocol::HTTPS,
+            Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: vec![CertificateRef {
+                    name: "".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
         assert!(listener.validate().is_err());
     }
 }

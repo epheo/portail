@@ -1,18 +1,18 @@
 //! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
 //! Sessions are identified by source address and expire after a configurable timeout.
 
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::health::HealthRegistry;
-use crate::logging::{warn, info, debug};
+use crate::logging::{debug, info, warn};
 use crate::request_processor::{self, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
 
@@ -67,7 +67,6 @@ pub async fn run_udp_worker(
             }
         }
     });
-
 
     loop {
         tokio::select! {

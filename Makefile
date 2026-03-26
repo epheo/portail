@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration bench
+.PHONY: build test test-all test-integration bench fmt clippy
 
 build:
 	cargo build --release
@@ -14,3 +14,9 @@ test-integration:
 
 bench:
 	cargo bench
+
+fmt:
+	cargo fmt
+
+clippy:
+	cargo clippy --all-targets -- -D warnings

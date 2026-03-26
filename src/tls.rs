@@ -8,13 +8,13 @@ use std::task::{Context, Poll};
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use pin_project_lite::pin_project;
-use rustls::ServerConfig;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificateRef;
@@ -91,9 +91,10 @@ impl Connection {
     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Connection::Plain { inner } => inner.try_read(buf),
-            Connection::Tls { .. } | Connection::ClientTls { .. } => {
-                Err(io::Error::new(io::ErrorKind::WouldBlock, "tls probe skipped"))
-            }
+            Connection::Tls { .. } | Connection::ClientTls { .. } => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "tls probe skipped",
+            )),
         }
     }
 }
@@ -167,7 +168,13 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
-fn parse_pem_cert_and_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+fn parse_pem_cert_and_key(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("Failed to parse certificate PEM: {}", e))?;
@@ -183,7 +190,13 @@ fn parse_pem_cert_and_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<(Vec<rustls
     Ok((certs, key))
 }
 
-fn load_cert_and_key(cert_ref: &CertificateRef, cert_dir: &Path) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+fn load_cert_and_key(
+    cert_ref: &CertificateRef,
+    cert_dir: &Path,
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     // Prefer in-memory PEM bytes (from K8s Secrets) over filesystem
     if let (Some(cert_pem), Some(key_pem)) = (&cert_ref.cert_pem, &cert_ref.key_pem) {
         return parse_pem_cert_and_key(cert_pem, key_pem);
@@ -192,19 +205,29 @@ fn load_cert_and_key(cert_ref: &CertificateRef, cert_dir: &Path) -> Result<(Vec<
     let cert_path = cert_dir.join(format!("{}.crt", cert_ref.name));
     let key_path = cert_dir.join(format!("{}.key", cert_ref.name));
 
-    let cert_pem = std::fs::read(&cert_path)
-        .map_err(|e| anyhow!("Failed to read certificate '{}': {}", cert_path.display(), e))?;
+    let cert_pem = std::fs::read(&cert_path).map_err(|e| {
+        anyhow!(
+            "Failed to read certificate '{}': {}",
+            cert_path.display(),
+            e
+        )
+    })?;
     let key_pem = std::fs::read(&key_path)
         .map_err(|e| anyhow!("Failed to read key '{}': {}", key_path.display(), e))?;
 
     parse_pem_cert_and_key(&cert_pem, &key_pem)
 }
 
-fn build_certified_key(certs: Vec<rustls::pki_types::CertificateDer<'static>>, key: rustls::pki_types::PrivateKeyDer<'static>) -> Result<CertifiedKey> {
+fn build_certified_key(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<CertifiedKey> {
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
-    let signing_key = provider.key_provider.load_private_key(key)
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
         .map_err(|e| anyhow!("Failed to load private key: {}", e))?;
     Ok(CertifiedKey::new(certs, signing_key))
 }
@@ -215,7 +238,9 @@ fn build_certified_key(certs: Vec<rustls::pki_types::CertificateDer<'static>>, k
 /// rather than failing the entire config — essential for multi-gateway merging.
 pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<ServerConfig> {
     if cert_refs.is_empty() {
-        return Err(anyhow!("TLS Terminate mode requires at least one certificateRef"));
+        return Err(anyhow!(
+            "TLS Terminate mode requires at least one certificateRef"
+        ));
     }
 
     // Ensure a process-level CryptoProvider is available
@@ -260,9 +285,11 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
 
     // If no certs loaded successfully, that's an error
     if certs_map.is_empty() && wildcard_map.is_empty() {
-        return Err(anyhow!("No valid certificates could be loaded from {} ref(s)", cert_refs.len()));
+        return Err(anyhow!(
+            "No valid certificates could be loaded from {} ref(s)",
+            cert_refs.len()
+        ));
     }
-
 
     let resolver = SniCertResolver {
         certs: certs_map,
@@ -480,7 +507,10 @@ mod tests {
         let hostname = b"api.staging.example.com";
         let sni_ext = build_sni_extension(hostname);
         let record = build_tls_record(&build_client_hello(&sni_ext));
-        assert_eq!(extract_sni(&record), Some("api.staging.example.com".to_string()));
+        assert_eq!(
+            extract_sni(&record),
+            Some("api.staging.example.com".to_string())
+        );
     }
 
     #[test]
@@ -491,7 +521,10 @@ mod tests {
     #[test]
     fn test_extract_sni_not_handshake_type() {
         // Application data (0x17) instead of handshake (0x16)
-        assert_eq!(extract_sni(&[0x17, 0x03, 0x01, 0x00, 0x05, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            extract_sni(&[0x17, 0x03, 0x01, 0x00, 0x05, 0, 0, 0, 0, 0]),
+            None
+        );
     }
 
     #[test]
@@ -506,8 +539,16 @@ mod tests {
             let key_path = dir_path.join(format!("{}.key", name));
             let cert_path = dir_path.join(format!("{}.crt", name));
             let status = Command::new("openssl")
-                .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                       "-nodes", "-keyout"])
+                .args([
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:prime256v1",
+                    "-nodes",
+                    "-keyout",
+                ])
                 .arg(&key_path)
                 .args(["-out"])
                 .arg(&cert_path)
@@ -523,11 +564,21 @@ mod tests {
         }
 
         let cert_refs = vec![
-            CertificateRef { name: "cert-a".to_string(), ..Default::default() },
-            CertificateRef { name: "cert-b".to_string(), ..Default::default() },
+            CertificateRef {
+                name: "cert-a".to_string(),
+                ..Default::default()
+            },
+            CertificateRef {
+                name: "cert-b".to_string(),
+                ..Default::default()
+            },
         ];
         let result = build_tls_acceptor(&cert_refs, dir_path);
-        assert!(result.is_ok(), "multi-cert TLS acceptor should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "multi-cert TLS acceptor should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -538,7 +589,10 @@ mod tests {
 
     #[test]
     fn test_build_tls_acceptor_missing_cert_file() {
-        let refs = vec![CertificateRef { name: "nonexistent".to_string(), ..Default::default() }];
+        let refs = vec![CertificateRef {
+            name: "nonexistent".to_string(),
+            ..Default::default()
+        }];
         let result = build_tls_acceptor(&refs, std::path::Path::new("/tmp"));
         assert!(result.is_err());
     }
@@ -550,15 +604,25 @@ mod tests {
         let key_path = dir.path().join("key.pem");
         let cert_path = dir.path().join("cert.pem");
         let output = Command::new("openssl")
-            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                   "-nodes", "-keyout"])
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-keyout",
+            ])
             .arg(&key_path)
             .args(["-out"])
             .arg(&cert_path)
             .args(["-days", "1", "-subj", &format!("/CN={}", cn)])
             .output()
             .ok()?;
-        if !output.status.success() { return None; }
+        if !output.status.success() {
+            return None;
+        }
         let cert_pem = std::fs::read(&cert_path).ok()?;
         let key_pem = std::fs::read(&key_path).ok()?;
         Some((cert_pem, key_pem))
@@ -594,7 +658,8 @@ mod tests {
             key_pem: Some(key_pem2),
             ..Default::default()
         };
-        let new_config = build_server_config(&[cert_ref2], std::path::Path::new("/unused")).unwrap();
+        let new_config =
+            build_server_config(&[cert_ref2], std::path::Path::new("/unused")).unwrap();
         dynamic.update(new_config);
 
         // Can still get an acceptor (now using new config)
@@ -627,7 +692,11 @@ mod tests {
 
         // Build a merged ServerConfig with all 3 certs (simulates what controller does)
         let result = build_server_config(&all_refs, std::path::Path::new("/unused"));
-        assert!(result.is_ok(), "merged multi-gateway config should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "merged multi-gateway config should succeed: {:?}",
+            result.err()
+        );
 
         // Verify DynamicTlsAcceptor can use it
         let dynamic = DynamicTlsAcceptor::new(result.unwrap());

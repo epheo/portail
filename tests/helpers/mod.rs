@@ -152,7 +152,11 @@ impl TcpEchoBackend {
             }
         });
 
-        Self { addr, shutdown, handle: Some(handle) }
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -162,13 +166,17 @@ fn handle_echo_connection(mut stream: TcpStream, shutdown: &AtomicBool) {
 
     let mut buf = [0u8; 8192];
     loop {
-        if shutdown.load(Ordering::Relaxed) { return; }
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         let n = match stream.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
             Err(_) => return,
         };
-        if stream.write_all(&buf[..n]).is_err() { return; }
+        if stream.write_all(&buf[..n]).is_err() {
+            return;
+        }
     }
 }
 
@@ -195,8 +203,12 @@ pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::i
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
             Err(e) => return Err(e),
         }
     }
@@ -264,7 +276,10 @@ impl PortailProcess {
                             status, stderr
                         );
                     }
-                    panic!("Portail did not start accepting connections on {} within 5s", wait_addr);
+                    panic!(
+                        "Portail did not start accepting connections on {} within 5s",
+                        wait_addr
+                    );
                 }
                 if TcpStream::connect_timeout(wait_addr, Duration::from_millis(100)).is_ok() {
                     break;
@@ -281,10 +296,7 @@ impl PortailProcess {
     }
 
     /// Spawn with filtered routes (hostname, path, backend, filters_json).
-    pub fn spawn_with_filters(
-        routes: &[(&str, &str, SocketAddr, &str)],
-        proxy_port: u16,
-    ) -> Self {
+    pub fn spawn_with_filters(routes: &[(&str, &str, SocketAddr, &str)], proxy_port: u16) -> Self {
         let config = build_test_config_with_filters(routes, proxy_port);
         let config_file = tempfile::Builder::new()
             .suffix(".json")
@@ -314,7 +326,11 @@ impl PortailProcess {
             thread::sleep(Duration::from_millis(50));
         }
 
-        Self { child, _config_file: config_file, proxy_addr }
+        Self {
+            child,
+            _config_file: config_file,
+            proxy_addr,
+        }
     }
 }
 
@@ -420,8 +436,17 @@ fn response_is_complete(data: &[u8]) -> bool {
     };
 
     let headers = std::str::from_utf8(&data[..header_end]).unwrap_or("");
-    if let Some(cl_line) = headers.lines().find(|l| l.to_lowercase().starts_with("content-length:")) {
-        if let Ok(cl) = cl_line.split(':').nth(1).unwrap_or("").trim().parse::<usize>() {
+    if let Some(cl_line) = headers
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+    {
+        if let Ok(cl) = cl_line
+            .split(':')
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .parse::<usize>()
+        {
             return data.len() >= header_end + cl;
         }
     }
@@ -484,7 +509,9 @@ fn build_test_config_with_tcp(
       "parentRefs": [{{"name": "test-gateway", "sectionName": "{}"}}],
       "rules": [{{"backendRefs": [{{"name": "{}", "port": {}}}]}}]
     }}"#,
-            name, backend_addr.ip(), backend_addr.port()
+            name,
+            backend_addr.ip(),
+            backend_addr.port()
         ));
     }
 
@@ -570,7 +597,12 @@ impl InspectingBackend {
             }
         });
 
-        Self { addr, shutdown, handle: Some(handle), received }
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+            received,
+        }
     }
 
     pub fn received_requests(&self) -> Vec<Vec<u8>> {
@@ -590,7 +622,9 @@ fn handle_inspecting_connection(
     let mut buf = [0u8; 8192];
     let mut accum = Vec::new();
     loop {
-        if shutdown.load(Ordering::Relaxed) { return; }
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
 
         let n = match stream.read(&mut buf) {
             Ok(0) => return,
@@ -640,8 +674,12 @@ fn handle_inspecting_connection(
 
         accum.clear();
 
-        if stream.write_all(response.as_bytes()).is_err() { return; }
-        if !keep_alive { return; }
+        if stream.write_all(response.as_bytes()).is_err() {
+            return;
+        }
+        if !keep_alive {
+            return;
+        }
     }
 }
 
@@ -678,7 +716,10 @@ pub fn build_test_config_with_filters(
                 {}
                 "backendRefs": [{{"name": "{}", "port": {}}}]
             }}"#,
-            path, filters_part, backend_addr.ip(), backend_addr.port()
+            path,
+            filters_part,
+            backend_addr.ip(),
+            backend_addr.port()
         ));
     }
 

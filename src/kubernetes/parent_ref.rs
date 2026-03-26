@@ -3,10 +3,10 @@
 //! Reduces boilerplate with macros — all four route types (HTTP, TCP, TLS, UDP)
 //! share identical field layouts for parentRefs and backendRefs.
 
-use gateway_api::httproutes::*;
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
+use gateway_api::httproutes::*;
 
 use crate::config::ParentRef;
 
@@ -26,12 +26,24 @@ pub(crate) trait ParentRefAccess {
 macro_rules! impl_parent_ref_access {
     ($ty:ty) => {
         impl ParentRefAccess for $ty {
-            fn ref_name(&self) -> &str { &self.name }
-            fn ref_section_name(&self) -> Option<&str> { self.section_name.as_deref() }
-            fn ref_group(&self) -> Option<&str> { self.group.as_deref() }
-            fn ref_kind(&self) -> Option<&str> { self.kind.as_deref() }
-            fn ref_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-            fn ref_port(&self) -> Option<i32> { self.port }
+            fn ref_name(&self) -> &str {
+                &self.name
+            }
+            fn ref_section_name(&self) -> Option<&str> {
+                self.section_name.as_deref()
+            }
+            fn ref_group(&self) -> Option<&str> {
+                self.group.as_deref()
+            }
+            fn ref_kind(&self) -> Option<&str> {
+                self.kind.as_deref()
+            }
+            fn ref_namespace(&self) -> Option<&str> {
+                self.namespace.as_deref()
+            }
+            fn ref_port(&self) -> Option<i32> {
+                self.port
+            }
         }
     };
 }
@@ -57,12 +69,24 @@ pub(crate) trait L4BackendRefAccess {
 macro_rules! impl_l4_backend_ref_access {
     ($ty:ty) => {
         impl L4BackendRefAccess for $ty {
-            fn br_name(&self) -> &str { &self.name }
-            fn br_namespace(&self) -> Option<&str> { self.namespace.as_deref() }
-            fn br_port(&self) -> Option<i32> { self.port }
-            fn br_weight(&self) -> Option<i32> { self.weight }
-            fn br_group(&self) -> Option<&str> { self.group.as_deref() }
-            fn br_kind(&self) -> Option<&str> { self.kind.as_deref() }
+            fn br_name(&self) -> &str {
+                &self.name
+            }
+            fn br_namespace(&self) -> Option<&str> {
+                self.namespace.as_deref()
+            }
+            fn br_port(&self) -> Option<i32> {
+                self.port
+            }
+            fn br_weight(&self) -> Option<i32> {
+                self.weight
+            }
+            fn br_group(&self) -> Option<&str> {
+                self.group.as_deref()
+            }
+            fn br_kind(&self) -> Option<&str> {
+                self.kind.as_deref()
+            }
         }
     };
 }
@@ -76,7 +100,11 @@ impl_l4_backend_ref_access!(UDPRouteRulesBackendRefs);
 // ---------------------------------------------------------------------------
 
 /// Check if a parentRef matches this gateway (name + group + kind + namespace).
-pub(crate) fn parent_ref_matches_gateway<T: ParentRefAccess>(pr: &T, gateway_name: &str, gateway_ns: &str) -> bool {
+pub(crate) fn parent_ref_matches_gateway<T: ParentRefAccess>(
+    pr: &T,
+    gateway_name: &str,
+    gateway_ns: &str,
+) -> bool {
     if pr.ref_name() != gateway_name {
         return false;
     }
@@ -102,10 +130,17 @@ pub(crate) fn parent_ref_matches_gateway<T: ParentRefAccess>(pr: &T, gateway_nam
 }
 
 /// Check if any parentRef in the route targets the given gateway.
-pub(crate) fn route_targets_gateway<T: ParentRefAccess>(parent_refs: &Option<Vec<T>>, gateway_name: &str, gateway_ns: &str) -> bool {
+pub(crate) fn route_targets_gateway<T: ParentRefAccess>(
+    parent_refs: &Option<Vec<T>>,
+    gateway_name: &str,
+    gateway_ns: &str,
+) -> bool {
     parent_refs
         .as_ref()
-        .map(|refs| refs.iter().any(|pr| parent_ref_matches_gateway(pr, gateway_name, gateway_ns)))
+        .map(|refs| {
+            refs.iter()
+                .any(|pr| parent_ref_matches_gateway(pr, gateway_name, gateway_ns))
+        })
         .unwrap_or(false)
 }
 
@@ -135,7 +170,8 @@ pub(crate) fn all_section_names_for_gateway<T: ParentRefAccess>(
     gateway_name: &str,
     gateway_ns: &str,
 ) -> Vec<Option<String>> {
-    parent_refs.as_ref()
+    parent_refs
+        .as_ref()
         .map(|refs| {
             refs.iter()
                 .filter(|pr| parent_ref_matches_gateway(*pr, gateway_name, gateway_ns))

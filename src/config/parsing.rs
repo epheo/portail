@@ -1,6 +1,6 @@
-use serde::{Deserialize, Deserializer, Serializer, de::Error as DeError};
-use std::time::Duration;
 use anyhow::{anyhow, Result};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serializer};
+use std::time::Duration;
 
 /// Deserialize human-readable durations like "10s", "500ms", "1m"
 pub(crate) fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -21,7 +21,9 @@ where
 }
 
 /// Deserialize optional human-readable duration
-pub(crate) fn deserialize_duration_opt<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+pub(crate) fn deserialize_duration_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -33,7 +35,10 @@ where
 }
 
 /// Serialize optional Duration to human-readable format
-pub(crate) fn serialize_duration_opt<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_duration_opt<S>(
+    duration: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -54,7 +59,10 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     let (number_part, suffix) = if s.ends_with("ns") {
         (s.trim_end_matches("ns"), Duration::from_nanos(1))
     } else if s.ends_with("us") || s.ends_with("μs") {
-        (s.trim_end_matches("us").trim_end_matches("μs"), Duration::from_micros(1))
+        (
+            s.trim_end_matches("us").trim_end_matches("μs"),
+            Duration::from_micros(1),
+        )
     } else if s.ends_with("ms") {
         (s.trim_end_matches("ms"), Duration::from_millis(1))
     } else if s.ends_with("s") {
@@ -64,17 +72,23 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     } else if s.ends_with("h") {
         (s.trim_end_matches("h"), Duration::from_secs(3600))
     } else {
-        return Err(anyhow!("Invalid duration format: {}. Expected format like '10s', '500ms', '1m'", s));
+        return Err(anyhow!(
+            "Invalid duration format: {}. Expected format like '10s', '500ms', '1m'",
+            s
+        ));
     };
 
-    let number: f64 = number_part.parse()
+    let number: f64 = number_part
+        .parse()
         .map_err(|_| anyhow!("Invalid number in duration: {}", s))?;
 
     if number < 0.0 {
         return Err(anyhow!("Duration cannot be negative: {}", s));
     }
 
-    Ok(Duration::from_nanos((number * suffix.as_nanos() as f64) as u64))
+    Ok(Duration::from_nanos(
+        (number * suffix.as_nanos() as f64) as u64,
+    ))
 }
 
 /// Format Duration to human-readable string, preserving sub-unit remainders.

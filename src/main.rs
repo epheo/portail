@@ -1,30 +1,30 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 use anyhow::Result;
-use logging::{info, error};
+use logging::{error, info};
 
-mod logging;
-mod routing;
+mod backend_pool;
 mod cli;
 mod config;
-mod control_plane;
-mod http_parser;
-mod request_processor;
-mod backend_pool;
-mod health;
-mod worker;
-mod udp_worker;
-mod http_filters;
-mod tls;
-mod data_plane;
-mod kubernetes;
 mod config_watcher;
+mod control_plane;
+mod data_plane;
+mod health;
+mod http_filters;
+mod http_parser;
+mod kubernetes;
+mod logging;
+mod request_processor;
+mod routing;
+mod tls;
+mod udp_worker;
+mod worker;
 
+use clap::Parser;
+use cli::Args;
+use config::PortailConfig;
 use control_plane::ControlPlane;
 use data_plane::DataPlane;
-use cli::Args;
-use clap::Parser;
-use config::PortailConfig;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<()> {
@@ -57,7 +57,8 @@ fn main() -> Result<()> {
                 .map_err(|e| {
                     eprintln!("Failed to load configuration file: {}", e);
                     std::process::exit(1);
-                }).unwrap()
+                })
+                .unwrap()
         } else {
             PortailConfig::default()
         };
@@ -68,13 +69,13 @@ fn main() -> Result<()> {
         return handle_example_config_mode(&args);
     }
 
-
     let portail_config = if let Some(config_path) = &args.config {
         PortailConfig::load_from_file(config_path)
             .map_err(|e| {
                 eprintln!("Failed to load configuration file: {}", e);
                 std::process::exit(1);
-            }).unwrap()
+            })
+            .unwrap()
     } else {
         PortailConfig::default()
     };
@@ -98,13 +99,18 @@ fn main() -> Result<()> {
 async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usize) -> Result<()> {
     let performance_config = portail_config.performance.clone();
     let listeners = portail_config.gateway.listeners.clone();
-    let cert_dir = args.cert_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("certs"));
+    let cert_dir = args
+        .cert_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("certs"));
 
-    info!("Configuration loaded: {} listeners, {} HTTP routes, {} TCP routes, {} UDP routes",
-          portail_config.gateway.listeners.len(),
-          portail_config.http_routes.len(),
-          portail_config.tcp_routes.len(),
-          portail_config.udp_routes.len());
+    info!(
+        "Configuration loaded: {} listeners, {} HTTP routes, {} TCP routes, {} UDP routes",
+        portail_config.gateway.listeners.len(),
+        portail_config.http_routes.len(),
+        portail_config.tcp_routes.len(),
+        portail_config.udp_routes.len()
+    );
 
     // Single Tokio runtime for both control and data planes
     let control_plane = ControlPlane::new(portail_config)?;
@@ -112,13 +118,20 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
 
     let routes = control_plane.get_routes();
 
-    let data_plane = std::sync::Arc::new(std::sync::Mutex::new(
-        DataPlane::new(worker_count, &listeners, &performance_config, &cert_dir)?
-    ));
+    let data_plane = std::sync::Arc::new(std::sync::Mutex::new(DataPlane::new(
+        worker_count,
+        &listeners,
+        &performance_config,
+        &cert_dir,
+    )?));
 
     // Start initial listeners from config file
     data_plane.lock().unwrap().start(routes.clone());
-    info!("Portail ready: {} workers × {} listeners", worker_count, listeners.len());
+    info!(
+        "Portail ready: {} workers × {} listeners",
+        worker_count,
+        listeners.len()
+    );
 
     // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
@@ -131,8 +144,15 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
         let k8s_perf = performance_config.clone();
         tokio::spawn(async move {
             if let Err(e) = kubernetes::controller::run_controller(
-                k8s_routes, controller_name, token, k8s_data_plane, k8s_worker_count, k8s_perf,
-            ).await {
+                k8s_routes,
+                controller_name,
+                token,
+                k8s_data_plane,
+                k8s_worker_count,
+                k8s_perf,
+            )
+            .await
+            {
                 error!("Kubernetes controller failed: {}", e);
             }
         });
@@ -146,7 +166,13 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
             let reload_health = data_plane.lock().unwrap().health().clone();
             let reload_shutdown = shutdown_token.clone();
             tokio::spawn(async move {
-                config_watcher::watch_config(config_path, reload_routes, reload_health, reload_shutdown).await;
+                config_watcher::watch_config(
+                    config_path,
+                    reload_routes,
+                    reload_health,
+                    reload_shutdown,
+                )
+                .await;
             });
         }
     }
@@ -166,7 +192,10 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
 
 /// Handle validation modes (--validate-only, --check-config)
 fn handle_validation_mode(args: &Args) -> Result<()> {
-    let config_path = args.config.as_ref().expect("Config path required for validation modes");
+    let config_path = args
+        .config
+        .as_ref()
+        .expect("Config path required for validation modes");
 
     if args.validate_only {
         info!("Validating configuration file: {:?}", config_path);
@@ -204,7 +233,10 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
             Ok(config) => {
                 println!("Parsed configuration:");
                 println!("---");
-                println!("{}", serde_json::to_string_pretty(&config).expect("Failed to serialize own config"));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&config).expect("Failed to serialize own config")
+                );
                 println!("---");
 
                 println!();
@@ -212,7 +244,19 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
                 println!("  HTTP Routes: {}", config.http_routes.len());
                 println!("  TCP Routes: {}", config.tcp_routes.len());
                 println!("  Worker Threads: {}", config.gateway.worker_threads);
-                println!("  HTTP Listeners: {:?}", config.gateway.listeners.iter().filter(|l| matches!(l.protocol, config::Protocol::HTTP | config::Protocol::HTTPS)).map(|l| l.port).collect::<Vec<_>>());
+                println!(
+                    "  HTTP Listeners: {:?}",
+                    config
+                        .gateway
+                        .listeners
+                        .iter()
+                        .filter(|l| matches!(
+                            l.protocol,
+                            config::Protocol::HTTP | config::Protocol::HTTPS
+                        ))
+                        .map(|l| l.port)
+                        .collect::<Vec<_>>()
+                );
 
                 info!("Configuration check completed");
             }
@@ -249,7 +293,10 @@ fn handle_example_config_mode(_args: &Args) -> Result<()> {
 
 /// Handle config generation mode (--generate-config)
 fn handle_generation_mode(args: &Args) -> Result<()> {
-    let config_type = args.generate_config.as_ref().expect("generate_config should be Some");
+    let config_type = args
+        .generate_config
+        .as_ref()
+        .expect("generate_config should be Some");
 
     info!("Generating {} configuration", config_type);
 
@@ -263,39 +310,58 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
     };
 
     let (output_content, format_name) = if let Some(output_path) = &args.output {
-        let (output_content, _format_name) = match output_path.extension().and_then(|ext| ext.to_str()) {
-            Some("json") => {
-                let content = config.to_json_pretty()
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize config to JSON: {}", e))?;
-                (content, "JSON")
-            }
-            Some("yaml") | Some("yml") => {
-                let content = config.to_yaml_pretty()
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize config to YAML: {}", e))?;
-                (content, "YAML")
-            }
-            Some(ext) => {
-                error!("Unsupported output file extension: .{}. Supported formats: .json, .yaml, .yml", ext);
-                std::process::exit(1);
-            }
-            None => {
-                error!("Output file must have an extension (.json, .yaml, .yml)");
-                std::process::exit(1);
-            }
-        };
+        let (output_content, _format_name) =
+            match output_path.extension().and_then(|ext| ext.to_str()) {
+                Some("json") => {
+                    let content = config.to_json_pretty().map_err(|e| {
+                        anyhow::anyhow!("Failed to serialize config to JSON: {}", e)
+                    })?;
+                    (content, "JSON")
+                }
+                Some("yaml") | Some("yml") => {
+                    let content = config.to_yaml_pretty().map_err(|e| {
+                        anyhow::anyhow!("Failed to serialize config to YAML: {}", e)
+                    })?;
+                    (content, "YAML")
+                }
+                Some(ext) => {
+                    error!(
+                    "Unsupported output file extension: .{}. Supported formats: .json, .yaml, .yml",
+                    ext
+                );
+                    std::process::exit(1);
+                }
+                None => {
+                    error!("Output file must have an extension (.json, .yaml, .yml)");
+                    std::process::exit(1);
+                }
+            };
 
-        std::fs::write(output_path, &output_content)
-            .map_err(|e| anyhow::anyhow!("Failed to write configuration file '{}': {}", output_path.display(), e))?;
+        std::fs::write(output_path, &output_content).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write configuration file '{}': {}",
+                output_path.display(),
+                e
+            )
+        })?;
 
-        info!("Generated {} configuration written to: {}", config_type, output_path.display());
+        info!(
+            "Generated {} configuration written to: {}",
+            config_type,
+            output_path.display()
+        );
         return Ok(());
     } else {
-        let content = config.to_yaml_pretty()
+        let content = config
+            .to_yaml_pretty()
             .map_err(|e| anyhow::anyhow!("Failed to serialize config to YAML: {}", e))?;
         (content, "YAML")
     };
 
-    println!("# Generated {} configuration ({})", config_type, format_name);
+    println!(
+        "# Generated {} configuration ({})",
+        config_type, format_name
+    );
     println!("# Use --output <file> to save to a file");
     println!();
     print!("{}", output_content);

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::parsing::{deserialize_duration, serialize_duration, deserialize_duration_opt, serialize_duration_opt};
+use super::parsing::{
+    deserialize_duration, deserialize_duration_opt, serialize_duration, serialize_duration_opt,
+};
 
 /// Protocol types following Kubernetes Gateway API specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,17 +91,15 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             name: default_gateway_name(),
-            listeners: vec![
-                ListenerConfig {
-                    name: "http".to_string(),
-                    protocol: Protocol::HTTP,
-                    port: 8080,
-                    hostname: None,
-                    address: None,
-                    interface: None,
-                    tls: None,
-                },
-            ],
+            listeners: vec![ListenerConfig {
+                name: "http".to_string(),
+                protocol: Protocol::HTTP,
+                port: 8080,
+                hostname: None,
+                address: None,
+                interface: None,
+                tls: None,
+            }],
             worker_threads: default_worker_threads(),
         }
     }
@@ -185,9 +185,19 @@ pub struct HttpRouteRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRouteTimeouts {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_duration_opt",
+        serialize_with = "serialize_duration_opt"
+    )]
     pub request: Option<Duration>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_duration_opt", serialize_with = "serialize_duration_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_duration_opt",
+        serialize_with = "serialize_duration_opt"
+    )]
     pub backend_request: Option<Duration>,
 }
 
@@ -351,13 +361,19 @@ pub use crate::routing::HttpHeader;
 pub struct BackendRef {
     pub name: String,
     pub port: u16,
-    #[serde(default = "default_backend_weight", skip_serializing_if = "is_default_weight")]
+    #[serde(
+        default = "default_backend_weight",
+        skip_serializing_if = "is_default_weight"
+    )]
     pub weight: u32,
     /// Original group from the gateway-api backendRef (empty string = core API group)
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
     /// Original kind from the gateway-api backendRef (default "Service")
-    #[serde(default = "default_backend_kind", skip_serializing_if = "is_default_kind")]
+    #[serde(
+        default = "default_backend_kind",
+        skip_serializing_if = "is_default_kind"
+    )]
     pub kind: String,
     /// Per-backend filters (e.g. BackendRequestHeaderModifier)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -514,10 +530,18 @@ pub enum LogOutput {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
-    #[serde(default = "default_backend_timeout", deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        default = "default_backend_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub backend_timeout: Duration,
 
-    #[serde(default = "default_udp_session_timeout", deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
+    #[serde(
+        default = "default_udp_session_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
     pub udp_session_timeout: Duration,
 }
 

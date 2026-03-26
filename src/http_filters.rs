@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::request_processor::{HeaderModifications, URLRewrite, RewrittenPath};
+use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
 
 /// Fire-and-forget mirror dispatch. Response is discarded per Gateway API spec.
 pub(crate) fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
@@ -35,9 +35,7 @@ fn apply_header_mods_inner(
     out: &mut Vec<u8>,
 ) {
     // Track which "set" headers were applied (matched existing headers)
-    let mut set_applied: Vec<bool> = mods
-        .map(|m| vec![false; m.set.len()])
-        .unwrap_or_default();
+    let mut set_applied: Vec<bool> = mods.map(|m| vec![false; m.set.len()]).unwrap_or_default();
 
     let mut pos = 0;
     while pos < header_lines.len() {
@@ -48,8 +46,12 @@ fn apply_header_mods_inner(
         let line = &header_lines[line_start..pos];
 
         // Skip past CRLF
-        if pos < header_lines.len() && header_lines[pos] == b'\r' { pos += 1; }
-        if pos < header_lines.len() && header_lines[pos] == b'\n' { pos += 1; }
+        if pos < header_lines.len() && header_lines[pos] == b'\r' {
+            pos += 1;
+        }
+        if pos < header_lines.len() && header_lines[pos] == b'\n' {
+            pos += 1;
+        }
 
         if line.is_empty() {
             continue;
@@ -90,8 +92,12 @@ fn apply_header_mods_inner(
             if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
                 continue;
             }
-            if let Some((idx, set_header)) = mods.set.iter().enumerate()
-                .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str)) {
+            if let Some((idx, set_header)) = mods
+                .set
+                .iter()
+                .enumerate()
+                .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str))
+            {
                 set_applied[idx] = true;
                 out.extend_from_slice(set_header.name.as_bytes());
                 out.extend_from_slice(b": ");
@@ -136,8 +142,12 @@ fn split_first_line(header_region: &[u8]) -> (&[u8], &[u8]) {
     }
     let first_line = &header_region[..pos];
     // Skip CRLF
-    if pos < header_region.len() && header_region[pos] == b'\r' { pos += 1; }
-    if pos < header_region.len() && header_region[pos] == b'\n' { pos += 1; }
+    if pos < header_region.len() && header_region[pos] == b'\r' {
+        pos += 1;
+    }
+    if pos < header_region.len() && header_region[pos] == b'\n' {
+        pos += 1;
+    }
     (first_line, &header_region[pos..])
 }
 
@@ -183,7 +193,6 @@ pub(crate) fn apply_request_header_modifications(
     out
 }
 
-
 /// Apply response header modifications to buffered response headers.
 /// Returns the modified header region (including trailing \r\n\r\n).
 /// Operates on raw bytes — no intermediate String allocations.
@@ -203,7 +212,7 @@ pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModificati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request_processor::{URLRewrite, RewrittenPath, HeaderModifications};
+    use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
     use crate::routing::HttpHeader;
 
     #[test]
@@ -242,7 +251,10 @@ mod tests {
             path: Some(RewrittenPath::Full("/new".to_string())),
         };
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![HttpHeader { name: "X-Added".to_string(), value: "yes".to_string() }]),
+            add: std::sync::Arc::new(vec![HttpHeader {
+                name: "X-Added".to_string(),
+                value: "yes".to_string(),
+            }]),
             set: std::sync::Arc::new(vec![]),
             remove: std::sync::Arc::new(vec!["User-Agent".to_string()]),
         };
@@ -268,7 +280,10 @@ mod tests {
     fn test_apply_response_header_mods_add() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![HttpHeader { name: "X-Custom".to_string(), value: "added".to_string() }]),
+            add: std::sync::Arc::new(vec![HttpHeader {
+                name: "X-Custom".to_string(),
+                value: "added".to_string(),
+            }]),
             set: std::sync::Arc::new(vec![]),
             remove: std::sync::Arc::new(vec![]),
         };
@@ -296,7 +311,10 @@ mod tests {
         let headers = b"HTTP/1.1 200 OK\r\nServer: old-server\r\n\r\n";
         let mods = HeaderModifications {
             add: std::sync::Arc::new(vec![]),
-            set: std::sync::Arc::new(vec![HttpHeader { name: "Server".to_string(), value: "portail".to_string() }]),
+            set: std::sync::Arc::new(vec![HttpHeader {
+                name: "Server".to_string(),
+                value: "portail".to_string(),
+            }]),
             remove: std::sync::Arc::new(vec![]),
         };
         let result = apply_response_header_mods(headers, &mods);

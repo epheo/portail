@@ -6,23 +6,22 @@
 //! On shutdown, the data plane stops accepting new connections and waits up to
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
 
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use anyhow::Result;
 use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use anyhow::Result;
 
 use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
 use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 use crate::tls::{self, DynamicTlsAcceptor};
-use crate::worker;
 use crate::udp_worker;
+use crate::worker;
 
 struct TcpListenerEntry {
     worker_id: usize,
@@ -94,7 +93,8 @@ impl DataPlane {
         let mut udp_listeners = Vec::new();
 
         // Pre-build TLS acceptors (shared across workers for the same listener)
-        let mut tls_acceptors: Vec<Option<Arc<DynamicTlsAcceptor>>> = Vec::with_capacity(listeners.len());
+        let mut tls_acceptors: Vec<Option<Arc<DynamicTlsAcceptor>>> =
+            Vec::with_capacity(listeners.len());
         let mut tls_passthrough_flags: Vec<bool> = Vec::with_capacity(listeners.len());
 
         for listener_cfg in listeners {
@@ -135,7 +135,10 @@ impl DataPlane {
                             tls_passthrough: tls_passthrough_flags[i],
                         });
 
-                        info!("Worker {} TCP bound to port {} with SO_REUSEPORT", worker_id, port);
+                        info!(
+                            "Worker {} TCP bound to port {} with SO_REUSEPORT",
+                            worker_id, port
+                        );
                     }
                     Protocol::UDP => {
                         let std_socket = create_reuseport_udp_socket(
@@ -151,13 +154,18 @@ impl DataPlane {
                             socket: tokio_socket,
                         });
 
-                        info!("Worker {} UDP bound to port {} with SO_REUSEPORT", worker_id, port);
+                        info!(
+                            "Worker {} UDP bound to port {} with SO_REUSEPORT",
+                            worker_id, port
+                        );
                     }
                 }
             }
         }
 
-        let bound_ports: std::collections::HashSet<u16> = tcp_listeners.iter().map(|e| e.port)
+        let bound_ports: std::collections::HashSet<u16> = tcp_listeners
+            .iter()
+            .map(|e| e.port)
             .chain(udp_listeners.iter().map(|e| e.port))
             .collect();
 
@@ -177,7 +185,6 @@ impl DataPlane {
         })
     }
 
-
     /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
     /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.
     /// Builds TLS acceptors from in-memory cert data when listeners use HTTPS/TLS.
@@ -196,15 +203,20 @@ impl DataPlane {
             let port = listener_cfg.port;
 
             // Build DynamicTlsAcceptor if this listener needs TLS termination
-            let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls) {
+            let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls)
+            {
                 (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
                     if tls_cfg.mode == TlsMode::Terminate =>
                 {
-                    match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                    match tls::build_server_config(
+                        &tls_cfg.certificate_refs,
+                        std::path::Path::new("/unused"),
+                    ) {
                         Ok(config) => {
                             // If port is already bound, hot-reload the TLS config only if certs changed
                             if let Some(existing) = self.tls_configs.get(&port) {
-                                let fingerprint = compute_cert_fingerprint(&tls_cfg.certificate_refs);
+                                let fingerprint =
+                                    compute_cert_fingerprint(&tls_cfg.certificate_refs);
                                 if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
                                     continue; // Certs unchanged — skip hot-reload
                                 }
@@ -255,7 +267,8 @@ impl DataPlane {
                                         session_timeout,
                                         shutdown,
                                         health,
-                                    ).await;
+                                    )
+                                    .await;
                                 });
                                 self.task_handles.push(handle);
                             }
@@ -271,10 +284,9 @@ impl DataPlane {
                     }
                 }
             } else {
-            for worker_id in 0..worker_count {
-                match create_reuseport_tcp_listener(port, None, None) {
-                    Ok(std_listener) => {
-                        match TcpListener::from_std(std_listener) {
+                for worker_id in 0..worker_count {
+                    match create_reuseport_tcp_listener(port, None, None) {
+                        Ok(std_listener) => match TcpListener::from_std(std_listener) {
                             Ok(tokio_listener) => {
                                 let routes = routes.clone();
                                 let health = self.health.clone();
@@ -296,7 +308,8 @@ impl DataPlane {
                                         acceptor,
                                         passthrough,
                                         health,
-                                    ).await;
+                                    )
+                                    .await;
                                 });
                                 self.task_handles.push(handle);
                             }
@@ -305,15 +318,14 @@ impl DataPlane {
                                 port_ok = false;
                                 break;
                             }
+                        },
+                        Err(e) => {
+                            errors.push((port, format!("bind worker {}: {}", worker_id, e)));
+                            port_ok = false;
+                            break;
                         }
                     }
-                    Err(e) => {
-                        errors.push((port, format!("bind worker {}: {}", worker_id, e)));
-                        port_ok = false;
-                        break;
-                    }
                 }
-            }
             }
             if port_ok {
                 self.bound_ports.insert(port);
@@ -343,7 +355,10 @@ impl DataPlane {
                         if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
                             continue; // Certs unchanged — skip hot-reload
                         }
-                        match tls::build_server_config(&tls_cfg.certificate_refs, std::path::Path::new("/unused")) {
+                        match tls::build_server_config(
+                            &tls_cfg.certificate_refs,
+                            std::path::Path::new("/unused"),
+                        ) {
                             Ok(config) => {
                                 existing.update(config);
                                 self.tls_cert_hashes.insert(port, fingerprint);
@@ -385,7 +400,8 @@ impl DataPlane {
                     entry.tls_acceptor,
                     entry.tls_passthrough,
                     health,
-                ).await;
+                )
+                .await;
             });
 
             self.task_handles.push(handle);
@@ -399,13 +415,25 @@ impl DataPlane {
             let session_timeout = self.udp_session_timeout;
 
             let handle = tokio::spawn(async move {
-                udp_worker::run_udp_worker(entry.worker_id, socket, entry.port, routes, session_timeout, shutdown, health).await;
+                udp_worker::run_udp_worker(
+                    entry.worker_id,
+                    socket,
+                    entry.port,
+                    routes,
+                    session_timeout,
+                    shutdown,
+                    health,
+                )
+                .await;
             });
 
             self.task_handles.push(handle);
         }
 
-        info!("Data plane started: {} TCP + {} UDP worker tasks", tcp_count, udp_count);
+        info!(
+            "Data plane started: {} TCP + {} UDP worker tasks",
+            tcp_count, udp_count
+        );
     }
 
     /// Signal shutdown and wait for in-flight connections to drain (up to 30s).
@@ -424,13 +452,17 @@ impl DataPlane {
                 info!("Waiting for {} in-flight connection(s) to drain", count);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-        }).await;
+        })
+        .await;
 
         match drain_result {
             Ok(()) => info!("All connections drained"),
             Err(_) => {
                 let remaining = active.load(Ordering::Acquire);
-                warn!("Drain timeout after {:?}: {} connections still active", DRAIN_TIMEOUT, remaining);
+                warn!(
+                    "Drain timeout after {:?}: {} connections still active",
+                    DRAIN_TIMEOUT, remaining
+                );
             }
         }
 
@@ -457,11 +489,16 @@ fn create_reuseport_tcp_listener(
     bind_addr: Option<&str>,
     interface: Option<&str>,
 ) -> Result<std::net::TcpListener> {
-    use socket2::{Socket, Domain, Type, Protocol};
+    use socket2::{Domain, Protocol, Socket, Type};
 
-    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse()
-        .map_err(|e| anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e))?;
-    let domain = if ip.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse().map_err(|e| {
+        anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e)
+    })?;
+    let domain = if ip.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
@@ -482,11 +519,16 @@ fn create_reuseport_udp_socket(
     bind_addr: Option<&str>,
     interface: Option<&str>,
 ) -> Result<std::net::UdpSocket> {
-    use socket2::{Socket, Domain, Type, Protocol};
+    use socket2::{Domain, Protocol, Socket, Type};
 
-    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse()
-        .map_err(|e| anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e))?;
-    let domain = if ip.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let ip: std::net::IpAddr = bind_addr.unwrap_or("0.0.0.0").parse().map_err(|e| {
+        anyhow::anyhow!("Invalid bind address '{}': {}", bind_addr.unwrap_or(""), e)
+    })?;
+    let domain = if ip.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;

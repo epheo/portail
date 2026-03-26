@@ -4,14 +4,14 @@
 //! Reuses idle backend connections across requests to amortize TCP handshake cost.
 //! Supports both plain TCP and TLS backend connections.
 
+use crate::logging::debug;
+use crate::tls::Connection;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use anyhow::Result;
-use crate::logging::debug;
-use crate::tls::Connection;
 
 pub struct BackendPool {
     pools: HashMap<SocketAddr, Vec<Connection>>,
@@ -37,7 +37,12 @@ impl BackendPool {
         }
     }
 
-    pub async fn acquire(&mut self, addr: SocketAddr, use_tls: bool, server_name: &str) -> Result<Connection> {
+    pub async fn acquire(
+        &mut self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Result<Connection> {
         // Try reuse an idle connection — pop and probe until we find a live one.
         if let Some(conns) = self.pools.get_mut(&addr) {
             while let Some(conn) = conns.pop() {
@@ -56,20 +61,22 @@ impl BackendPool {
 
         // No reusable connection — open a new one
         debug!("Pool miss: connecting to {} (tls={})", addr, use_tls);
-        let tcp = tokio::time::timeout(
-            self.connect_timeout,
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
+        let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
+            .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
 
         tcp.set_nodelay(true)?;
 
         if use_tls {
             let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
-                .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
-            let tls_stream = self.tls_connector.connect(domain, tcp).await
+                .unwrap_or_else(|_| {
+                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+                });
+            let tls_stream = self
+                .tls_connector
+                .connect(domain, tcp)
+                .await
                 .map_err(|e| anyhow::anyhow!("Backend TLS handshake failed {}: {}", addr, e))?;
             Ok(Connection::ClientTls { inner: tls_stream })
         } else {

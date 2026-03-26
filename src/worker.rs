@@ -3,20 +3,22 @@
 //! HTTP request/response proxying with keepalive and backend connection pooling,
 //! raw TCP bidirectional forwarding, TLS termination, and TLS passthrough.
 
+use anyhow::Result;
+use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use anyhow::Result;
 
 use crate::backend_pool::BackendPool;
 use crate::health::HealthRegistry;
-use crate::http_filters::{apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors};
+use crate::http_filters::{
+    apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
+};
 use crate::http_parser::find_header_end;
-use crate::logging::{warn, info, debug};
+use crate::logging::{debug, info, warn};
 use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
 use crate::routing::{BackendSelector, RouteTable};
 use crate::tls::{self, Connection, DynamicTlsAcceptor};
@@ -38,7 +40,11 @@ fn looks_like_http(data: &[u8]) -> bool {
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
 /// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
-async fn read_remaining_headers(client: &mut Connection, buf: &mut [u8], already_read: usize) -> Result<usize> {
+async fn read_remaining_headers(
+    client: &mut Connection,
+    buf: &mut [u8],
+    already_read: usize,
+) -> Result<usize> {
     let mut total = already_read;
     loop {
         let n = client.read(&mut buf[total..]).await?;
@@ -225,16 +231,52 @@ async fn handle_connection(
     loop {
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &state.selector, &buf[..n], state.server_port, &state.health, state.is_tls)?
+            request_processor::analyze_request(
+                &route_table,
+                &state.selector,
+                &buf[..n],
+                state.server_port,
+                &state.health,
+                state.is_tls,
+            )?
         };
 
         match decision {
             ProcessingDecision::TcpForward { backend_addr } => {
-                return handle_tcp_connection(client, backend_addr, &buf[..n], Arc::clone(&state.health)).await;
+                return handle_tcp_connection(
+                    client,
+                    backend_addr,
+                    &buf[..n],
+                    Arc::clone(&state.health),
+                )
+                .await;
             }
-            ProcessingDecision::HttpForward { backend_addr, keepalive, filters, backend_timeout, request_timeout, content_length, is_chunked, is_upgrade, backend_use_tls, backend_server_name } => {
+            ProcessingDecision::HttpForward {
+                backend_addr,
+                keepalive,
+                filters,
+                backend_timeout,
+                request_timeout,
+                content_length,
+                is_chunked,
+                is_upgrade,
+                backend_use_tls,
+                backend_server_name,
+            } => {
                 let forward_fut = handle_http_forward(
-                    &mut client, &mut buf, n, backend_addr, keepalive, filters, backend_timeout, content_length, is_chunked, is_upgrade, backend_use_tls, backend_server_name, &mut state,
+                    &mut client,
+                    &mut buf,
+                    n,
+                    backend_addr,
+                    keepalive,
+                    filters,
+                    backend_timeout,
+                    content_length,
+                    is_chunked,
+                    is_upgrade,
+                    backend_use_tls,
+                    backend_server_name,
+                    &mut state,
                 );
                 let ka = if !is_upgrade {
                     if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
@@ -257,13 +299,20 @@ async fn handle_connection(
                     return Ok(());
                 }
             }
-            ProcessingDecision::HttpRedirect { status_code, location, keepalive } => {
+            ProcessingDecision::HttpRedirect {
+                status_code,
+                location,
+                keepalive,
+            } => {
                 send_redirect_response(&mut client, status_code, &location).await?;
                 if !keepalive {
                     return Ok(());
                 }
             }
-            ProcessingDecision::SendHttpError { error_code, close_connection } => {
+            ProcessingDecision::SendHttpError {
+                error_code,
+                close_connection,
+            } => {
                 send_error_response(&mut client, error_code).await?;
                 if close_connection {
                     return Ok(());
@@ -322,7 +371,12 @@ async fn handle_http_forward(
         let timeout_dur = per_rule_timeout
             .filter(|d| !d.is_zero())
             .unwrap_or(std::time::Duration::from_secs(30));
-        let mut backend = match tokio::time::timeout(timeout_dur, state.pool.acquire(backend_addr, use_tls, &server_name)).await {
+        let mut backend = match tokio::time::timeout(
+            timeout_dur,
+            state.pool.acquire(backend_addr, use_tls, &server_name),
+        )
+        .await
+        {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 warn!("Backend {} connect failed: {}", backend_addr, e);
@@ -366,7 +420,9 @@ async fn handle_http_forward(
                     backend.write_all(body).await?;
                 }
             } else {
-                if !fd.mirror_addrs.is_empty() { dispatch_mirrors(&fd.mirror_addrs, &buf[..request_bytes]); }
+                if !fd.mirror_addrs.is_empty() {
+                    dispatch_mirrors(&fd.mirror_addrs, &buf[..request_bytes]);
+                }
                 backend.write_all(&buf[..request_bytes]).await?;
             }
         } else {
@@ -379,7 +435,9 @@ async fn handle_http_forward(
             let mut remaining = cl.saturating_sub(body_in_initial);
             while remaining > 0 {
                 let n = client.read(&mut buf[..]).await?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 let to_send = n.min(remaining);
                 backend.write_all(&buf[..to_send]).await?;
                 remaining -= to_send;
@@ -390,11 +448,17 @@ async fn handle_http_forward(
             let mut chunked_tail_len: usize = 0;
             // Check if terminator was already in the initial buffer body
             if body_in_initial > 0 {
-                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[header_end..request_bytes]);
+                append_chunked_tail(
+                    &mut chunked_tail,
+                    &mut chunked_tail_len,
+                    &buf[header_end..request_bytes],
+                );
             }
             while !is_chunked_terminator(&chunked_tail, chunked_tail_len) {
                 let n = client.read(&mut buf[..]).await?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 backend.write_all(&buf[..n]).await?;
                 append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
             }
@@ -404,11 +468,15 @@ async fn handle_http_forward(
         if req_is_upgrade {
             // For upgrades, forward the backend response headers then switch
             // to bidirectional streaming for the remainder of the connection.
-            let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
+            let resp_mods = filter_data
+                .as_ref()
+                .and_then(|fd| fd.response_header_mods.as_ref());
             let _response_complete = match tokio::time::timeout(
                 timeout_dur,
                 forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result?,
                 Err(_) => {
                     send_error_response(client, 504).await?;
@@ -425,11 +493,15 @@ async fn handle_http_forward(
             return Ok(false);
         }
 
-        let resp_mods = filter_data.as_ref().and_then(|fd| fd.response_header_mods.as_ref());
+        let resp_mods = filter_data
+            .as_ref()
+            .and_then(|fd| fd.response_header_mods.as_ref());
         let response_complete = match tokio::time::timeout(
             timeout_dur,
             forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
-        ).await {
+        )
+        .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 send_error_response(client, 504).await?;
@@ -465,11 +537,29 @@ async fn handle_http_forward(
 
         let decision = {
             let route_table = state.routes.load();
-            request_processor::analyze_request(&route_table, &state.selector, &buf[..request_bytes], state.server_port, &state.health, state.is_tls)?
+            request_processor::analyze_request(
+                &route_table,
+                &state.selector,
+                &buf[..request_bytes],
+                state.server_port,
+                &state.health,
+                state.is_tls,
+            )?
         };
 
         match decision {
-            ProcessingDecision::HttpForward { backend_addr: addr, keepalive: ka, filters, backend_timeout: bt, request_timeout: _, content_length: cl, is_chunked: ch, is_upgrade: up, backend_use_tls: tls, backend_server_name: sn } => {
+            ProcessingDecision::HttpForward {
+                backend_addr: addr,
+                keepalive: ka,
+                filters,
+                backend_timeout: bt,
+                request_timeout: _,
+                content_length: cl,
+                is_chunked: ch,
+                is_upgrade: up,
+                backend_use_tls: tls,
+                backend_server_name: sn,
+            } => {
                 backend_addr = addr;
                 keepalive = ka;
                 filter_data = filters;
@@ -480,21 +570,30 @@ async fn handle_http_forward(
                 use_tls = tls;
                 server_name = sn;
             }
-            ProcessingDecision::HttpRedirect { status_code, location, keepalive: ka } => {
+            ProcessingDecision::HttpRedirect {
+                status_code,
+                location,
+                keepalive: ka,
+            } => {
                 send_redirect_response(client, status_code, &location).await?;
                 if !ka {
                     return Ok(false);
                 }
                 return Ok(true);
             }
-            ProcessingDecision::SendHttpError { error_code, close_connection } => {
+            ProcessingDecision::SendHttpError {
+                error_code,
+                close_connection,
+            } => {
                 send_error_response(client, error_code).await?;
                 if close_connection {
                     return Ok(false);
                 }
                 return Ok(true);
             }
-            ProcessingDecision::TcpForward { .. } | ProcessingDecision::UdpForward { .. } | ProcessingDecision::CloseConnection => {
+            ProcessingDecision::TcpForward { .. }
+            | ProcessingDecision::UdpForward { .. }
+            | ProcessingDecision::CloseConnection => {
                 return Ok(false);
             }
         }
@@ -601,7 +700,11 @@ async fn handle_tls_passthrough(
     let n = match tokio::time::timeout(Duration::from_secs(5), client.peek(&mut peek_buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("TLS passthrough: client sent no data within 5s")),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "TLS passthrough: client sent no data within 5s"
+            ))
+        }
     };
     if n == 0 {
         return Ok(());
@@ -610,11 +713,16 @@ async fn handle_tls_passthrough(
     let sni = tls::extract_sni(&peek_buf[..n]);
     let hostname = match sni.as_deref() {
         Some(h) => h,
-        None => return Err(anyhow::anyhow!("TLS passthrough: no SNI in ClientHello, cannot route")),
+        None => {
+            return Err(anyhow::anyhow!(
+                "TLS passthrough: no SNI in ClientHello, cannot route"
+            ))
+        }
     };
 
     let route_table = routes.load();
-    let backend_addr = route_table.resolve_tls_passthrough(hostname, server_port)
+    let backend_addr = route_table
+        .resolve_tls_passthrough(hostname, server_port)
         .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
 
     match TcpStream::connect(backend_addr).await {
@@ -628,7 +736,11 @@ async fn handle_tls_passthrough(
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
-            return Err(anyhow::anyhow!("TLS passthrough connect to {} failed: {}", backend_addr, e));
+            return Err(anyhow::anyhow!(
+                "TLS passthrough connect to {} failed: {}",
+                backend_addr,
+                e
+            ));
         }
     }
 
@@ -641,10 +753,8 @@ async fn handle_tcp_connection(
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
 ) -> Result<()> {
-    let connect_result = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(backend_addr),
-    ).await;
+    let connect_result =
+        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(backend_addr)).await;
 
     match connect_result {
         Ok(Ok(mut backend)) => {
@@ -659,7 +769,11 @@ async fn handle_tcp_connection(
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
-            return Err(anyhow::anyhow!("TCP connect to {} failed: {}", backend_addr, e));
+            return Err(anyhow::anyhow!(
+                "TCP connect to {} failed: {}",
+                backend_addr,
+                e
+            ));
         }
         Err(_) => {
             if health.record_failure(backend_addr) {
@@ -671,7 +785,11 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-async fn send_redirect_response(client: &mut Connection, status_code: u16, location: &str) -> Result<()> {
+async fn send_redirect_response(
+    client: &mut Connection,
+    status_code: u16,
+    location: &str,
+) -> Result<()> {
     use std::io::Write;
 
     let status_text = match status_code {
@@ -689,10 +807,13 @@ async fn send_redirect_response(client: &mut Connection, status_code: u16, locat
     let _ = write!(
         resp,
         "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: {}\r\n\r\n{} {}",
-        status_code, status_text, location,
+        status_code,
+        status_text,
+        location,
         // body length: digits of status_code (always 3) + 1 space + status_text length
         3 + 1 + status_text.len(),
-        status_code, status_text,
+        status_code,
+        status_text,
     );
 
     client.write_all(&resp).await?;
@@ -701,7 +822,8 @@ async fn send_redirect_response(client: &mut Connection, status_code: u16, locat
 
 async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
     static RESP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\nConnection: close\r\n\r\n400 Bad Request";
-    static RESP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
+    static RESP_404: &[u8] =
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
     static RESP_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
     static RESP_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable";
     static RESP_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n504 Gateway Timeout";
@@ -723,7 +845,9 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
 // --- HTTP response parsing helpers ---
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    crate::routing::find_header_value(headers, "content-length")?.parse().ok()
+    crate::routing::find_header_value(headers, "content-length")?
+        .parse()
+        .ok()
 }
 
 fn is_chunked_transfer(headers: &[u8]) -> bool {
@@ -732,7 +856,9 @@ fn is_chunked_transfer(headers: &[u8]) -> bool {
 }
 
 fn is_no_body_status(headers: &[u8]) -> bool {
-    if headers.len() < 12 { return false; }
+    if headers.len() < 12 {
+        return false;
+    }
     let status = &headers[9..12];
     status == b"204" || status == b"304" || status[0] == b'1'
 }

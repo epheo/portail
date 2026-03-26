@@ -1,11 +1,11 @@
+use crate::logging::{debug, info};
 use anyhow::Result;
-use std::sync::Arc;
 use arc_swap::ArcSwap;
-use crate::logging::{info, debug};
+use std::sync::Arc;
 use tokio::signal;
 
-use crate::routing::RouteTable;
 use crate::config::PortailConfig;
+use crate::routing::RouteTable;
 
 /// Control Plane — shares the main Tokio runtime.
 /// Handles configuration management and routing.
@@ -26,11 +26,15 @@ impl ControlPlane {
 
     pub async fn start(&self) -> Result<()> {
         info!("Starting Control Plane");
-        let route_table = self.config.to_route_table()
-            .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
+        let route_table = self.config.to_route_table().map_err(|e| {
+            anyhow::anyhow!("Failed to convert configuration to route table: {}", e)
+        })?;
         self.update_routes(route_table)?;
-        info!("Routes loaded: {} HTTP routes, {} TCP routes",
-              self.config.http_routes.len(), self.config.tcp_routes.len());
+        info!(
+            "Routes loaded: {} HTTP routes, {} TCP routes",
+            self.config.http_routes.len(),
+            self.config.tcp_routes.len()
+        );
         info!("Control Plane started successfully");
         Ok(())
     }
@@ -41,7 +45,7 @@ impl ControlPlane {
         info!("Control Plane received shutdown signal");
         Ok(())
     }
-    
+
     pub fn update_routes(&self, route_table: RouteTable) -> Result<()> {
         debug!("Updating route configuration");
         self.current_routes.store(Arc::new(route_table));

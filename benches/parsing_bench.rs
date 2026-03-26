@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use portail::http_parser::extract_routing_info;
 use std::time::Duration;
 
@@ -12,56 +12,42 @@ fn parsing_benchmark(c: &mut Criterion) {
     let malformed_request = b"INVALID REQUEST FORMAT WITHOUT PROPER HEADERS\r\n\r\n";
 
     c.bench_function("parse_headers_fast_simple", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(simple_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(simple_request)))
     });
 
     c.bench_function("parse_headers_fast_typical", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(typical_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(typical_request)))
     });
 
     c.bench_function("parse_headers_fast_complex", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(complex_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(complex_request)))
     });
 
     c.bench_function("parse_headers_fast_simple_repeated", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(simple_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(simple_request)))
     });
 
     c.bench_function("parse_headers_fast_typical_repeated", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(typical_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(typical_request)))
     });
 
     c.bench_function("parse_headers_fast_complex_repeated", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(complex_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(complex_request)))
     });
 
     c.bench_function("parse_malformed_request", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(malformed_request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(malformed_request)))
     });
 
     let mut group = c.benchmark_group("parse_by_request_size");
 
     for size in [100, 500, 1000, 2000, 4000].iter() {
         let large_request = generate_large_request(*size);
-        group.bench_with_input(BenchmarkId::new("parse_headers_fast", size), &large_request, |b, req| {
-            b.iter(|| {
-                std::hint::black_box(extract_routing_info(req))
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("parse_headers_fast", size),
+            &large_request,
+            |b, req| b.iter(|| std::hint::black_box(extract_routing_info(req))),
+        );
     }
     group.finish();
 
@@ -70,11 +56,11 @@ fn parsing_benchmark(c: &mut Criterion) {
 
     for method in methods.iter() {
         let request = format!("{} /api/test HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
-        method_group.bench_with_input(BenchmarkId::new("parse_headers_fast", method), &request, |b, req| {
-            b.iter(|| {
-                std::hint::black_box(extract_routing_info(req.as_bytes()))
-            })
-        });
+        method_group.bench_with_input(
+            BenchmarkId::new("parse_headers_fast", method),
+            &request,
+            |b, req| b.iter(|| std::hint::black_box(extract_routing_info(req.as_bytes()))),
+        );
     }
     method_group.finish();
 
@@ -83,17 +69,17 @@ fn parsing_benchmark(c: &mut Criterion) {
         "subdomain.api.com",
         "very.long.subdomain.api.example.com",
         "localhost:8080",
-        "192.168.1.100:3000"
+        "192.168.1.100:3000",
     ];
 
     let mut host_group = c.benchmark_group("parse_by_host_complexity");
     for (i, host) in hosts.iter().enumerate() {
         let request = format!("GET /test HTTP/1.1\r\nHost: {}\r\n\r\n", host);
-        host_group.bench_with_input(BenchmarkId::new("parse_headers_fast", i), &request, |b, req| {
-            b.iter(|| {
-                std::hint::black_box(extract_routing_info(req.as_bytes()))
-            })
-        });
+        host_group.bench_with_input(
+            BenchmarkId::new("parse_headers_fast", i),
+            &request,
+            |b, req| b.iter(|| std::hint::black_box(extract_routing_info(req.as_bytes()))),
+        );
     }
     host_group.finish();
 }
@@ -102,15 +88,11 @@ fn memory_parsing_benchmark(c: &mut Criterion) {
     let request = b"GET /api/test HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
 
     c.bench_function("parse_headers_fast_allocation", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(request)))
     });
 
     c.bench_function("parse_headers_fast_allocation_test", |b| {
-        b.iter(|| {
-            std::hint::black_box(extract_routing_info(request))
-        })
+        b.iter(|| std::hint::black_box(extract_routing_info(request)))
     });
 }
 

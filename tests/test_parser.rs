@@ -2,7 +2,8 @@ use portail::http_parser::{extract_routing_info, ConnectionType};
 
 #[test]
 fn test_parse_http_headers_fast() {
-    let request = b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/7.68.0\r\n\r\n";
+    let request =
+        b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/7.68.0\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api/v1/users");
@@ -23,12 +24,16 @@ fn test_parse_http_headers_fast_no_host() {
     // HTTP/1.1 requires a Host header per RFC 7230 §5.4
     let request = b"GET /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n";
     let result = extract_routing_info(request);
-    assert!(result.is_err(), "HTTP/1.1 without Host header should be rejected");
+    assert!(
+        result.is_err(),
+        "HTTP/1.1 without Host header should be rejected"
+    );
 }
 
 #[test]
 fn test_parse_http_headers_fast_complex_path() {
-    let request = b"GET /api/v1/users/123?filter=active&sort=name HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+    let request =
+        b"GET /api/v1/users/123?filter=active&sort=name HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
     assert_eq!(result.path, "/api/v1/users/123");
@@ -123,7 +128,10 @@ fn test_parse_http_headers_fast_minimal_valid_request() {
     // HTTP/1.1 without Host header is invalid per RFC 7230 §5.4
     let request = b"GET / HTTP/1.1\r\n\r\n";
     let result = extract_routing_info(request);
-    assert!(result.is_err(), "HTTP/1.1 without Host header should be rejected");
+    assert!(
+        result.is_err(),
+        "HTTP/1.1 without Host header should be rejected"
+    );
 }
 
 #[test]

@@ -1,8 +1,8 @@
-pub mod types;
-pub mod parsing;
-pub mod validation;
 pub mod core;
 pub mod examples;
+pub mod parsing;
+pub mod types;
+pub mod validation;
 
 pub use types::*;
 

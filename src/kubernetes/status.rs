@@ -1,26 +1,36 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-use kube::api::{Api, PatchParams, Patch};
-use kube::Client;
-use kube::ResourceExt;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use k8s_openapi::chrono::Utc;
+use kube::api::{Api, Patch, PatchParams};
+use kube::Client;
+use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use gateway_api::gateways::Gateway;
 use gateway_api::gatewayclasses::GatewayClass;
+use gateway_api::gateways::Gateway;
 
 use crate::logging::{debug, warn};
 
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
     match protocol {
-        "HTTP" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})],
-        "HTTPS" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})],
-        "TLS" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TLSRoute"})],
-        "TCP" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TCPRoute"})],
-        "UDP" => vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "UDPRoute"})],
+        "HTTP" => {
+            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
+        }
+        "HTTPS" => {
+            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
+        }
+        "TLS" => {
+            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TLSRoute"})]
+        }
+        "TCP" => {
+            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TCPRoute"})]
+        }
+        "UDP" => {
+            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "UDPRoute"})]
+        }
         _ => vec![],
     }
 }
@@ -122,13 +132,19 @@ pub async fn update_gateway_status(
     let generation = gateway.metadata.generation;
 
     // Read existing conditions to preserve lastTransitionTime when status hasn't changed
-    let existing_conditions: Vec<Condition> = gateway.status.as_ref()
+    let existing_conditions: Vec<Condition> = gateway
+        .status
+        .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .cloned()
         .unwrap_or_default();
 
     let accepted_status = if accepted { "True" } else { "False" };
-    let accepted_reason_str = if accepted { "Accepted" } else { accepted_reason };
+    let accepted_reason_str = if accepted {
+        "Accepted"
+    } else {
+        accepted_reason
+    };
     let programmed_status = if programmed { "True" } else { "False" };
     let programmed_reason_str = if programmed { "Programmed" } else { "Invalid" };
 
@@ -138,7 +154,13 @@ pub async fn update_gateway_status(
             status: accepted_status.to_string(),
             reason: accepted_reason_str.to_string(),
             message: accepted_message.to_string(),
-            last_transition_time: transition_time(&existing_conditions, "Accepted", accepted_status, accepted_reason_str, &now),
+            last_transition_time: transition_time(
+                &existing_conditions,
+                "Accepted",
+                accepted_status,
+                accepted_reason_str,
+                &now,
+            ),
             observed_generation: generation,
         },
         Condition {
@@ -146,18 +168,27 @@ pub async fn update_gateway_status(
             status: programmed_status.to_string(),
             reason: programmed_reason_str.to_string(),
             message: programmed_message.to_string(),
-            last_transition_time: transition_time(&existing_conditions, "Programmed", programmed_status, programmed_reason_str, &now),
+            last_transition_time: transition_time(
+                &existing_conditions,
+                "Programmed",
+                programmed_status,
+                programmed_reason_str,
+                &now,
+            ),
             observed_generation: generation,
         },
     ];
 
     // Read existing listener conditions to preserve their timestamps too
-    let existing_listener_conditions: HashMap<String, Vec<serde_json::Value>> = gateway.status.as_ref()
+    let existing_listener_conditions: HashMap<String, Vec<serde_json::Value>> = gateway
+        .status
+        .as_ref()
         .and_then(|s| s.listeners.as_ref())
         .map(|listeners| {
             // Serialize the typed struct to JSON to access fields dynamically
             let listeners_json = serde_json::to_value(listeners).unwrap_or_default();
-            listeners_json.as_array()
+            listeners_json
+                .as_array()
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|l| {
@@ -260,7 +291,11 @@ pub async fn update_gateway_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
+        .patch_status(
+            &name,
+            &PatchParams::apply("portail").force(),
+            &Patch::Apply(status),
+        )
         .await
     {
         Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
@@ -281,20 +316,32 @@ pub async fn update_gateway_class_status(
     let generation = gc.metadata.generation;
 
     // Preserve lastTransitionTime from existing conditions
-    let existing_conditions: Vec<Condition> = gc.status.as_ref()
+    let existing_conditions: Vec<Condition> = gc
+        .status
+        .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .cloned()
         .unwrap_or_default();
 
     let gc_status = if accepted { "True" } else { "False" };
-    let gc_reason = if accepted { "Accepted" } else { "InvalidParameters" };
+    let gc_reason = if accepted {
+        "Accepted"
+    } else {
+        "InvalidParameters"
+    };
 
     let conditions = vec![Condition {
         type_: "Accepted".to_string(),
         status: gc_status.to_string(),
         reason: gc_reason.to_string(),
         message: message.to_string(),
-        last_transition_time: transition_time(&existing_conditions, "Accepted", gc_status, gc_reason, &now),
+        last_transition_time: transition_time(
+            &existing_conditions,
+            "Accepted",
+            gc_status,
+            gc_reason,
+            &now,
+        ),
         observed_generation: generation,
     }];
 
@@ -317,7 +364,11 @@ pub async fn update_gateway_class_status(
     });
 
     match api
-        .patch_status(&name, &PatchParams::apply("portail").force(), &Patch::Apply(status))
+        .patch_status(
+            &name,
+            &PatchParams::apply("portail").force(),
+            &Patch::Apply(status),
+        )
         .await
     {
         Ok(_) => debug!("Updated GatewayClass {} status", name),
@@ -352,8 +403,7 @@ pub async fn update_route_status<K>(
     parents: &[RouteParentStatus],
     field_manager: &str,
     existing_parents_json: &[serde_json::Value],
-)
-where
+) where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
         + Serialize
         + DeserializeOwned
@@ -441,11 +491,27 @@ where
     });
 
     match api
-        .patch_status(route_name, &PatchParams::apply(field_manager).force(), &Patch::Apply(status))
+        .patch_status(
+            route_name,
+            &PatchParams::apply(field_manager).force(),
+            &Patch::Apply(status),
+        )
         .await
     {
-        Ok(_) => debug!("Updated {} {}/{} status ({} parents)", std::any::type_name::<K>().rsplit("::").next().unwrap_or("Route"), route_namespace, route_name, parents.len()),
-        Err(e) => warn!("Failed to update route {}/{} status: {}", route_namespace, route_name, e),
+        Ok(_) => debug!(
+            "Updated {} {}/{} status ({} parents)",
+            std::any::type_name::<K>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("Route"),
+            route_namespace,
+            route_name,
+            parents.len()
+        ),
+        Err(e) => warn!(
+            "Failed to update route {}/{} status: {}",
+            route_namespace, route_name, e
+        ),
     }
 }
 
@@ -468,7 +534,8 @@ fn find_existing_parent_conditions(
             None => pref.get("sectionName").is_none(),
         };
         if name_match && ns_match && section_match {
-            return parent.get("conditions")
+            return parent
+                .get("conditions")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();

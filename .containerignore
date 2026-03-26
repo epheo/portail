@@ -6,3 +6,7 @@ programs/*.o
 *.md
 .containerignore
 .gitignore
+target/*
+!target/release/
+target/release/*
+!target/release/portail

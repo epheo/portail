@@ -7,14 +7,14 @@
 //! If the new configuration is invalid, the error is logged and the
 //! existing routes remain active (no disruption).
 
+use anyhow::Result;
+use arc_swap::ArcSwap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use arc_swap::ArcSwap;
-use anyhow::Result;
 
 use crate::config::PortailConfig;
 use crate::health::HealthRegistry;
-use crate::logging::{info, warn, error};
+use crate::logging::{error, info, warn};
 use crate::routing::RouteTable;
 
 /// Spawn a background task that listens for SIGHUP and reloads routes.
@@ -27,12 +27,18 @@ pub async fn watch_config(
     health: Arc<HealthRegistry>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    info!("Config watcher started — send SIGHUP to reload routes from {:?}", config_path);
+    info!(
+        "Config watcher started — send SIGHUP to reload routes from {:?}",
+        config_path
+    );
 
     let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(s) => s,
         Err(e) => {
-            warn!("Failed to register SIGHUP handler: {}. Hot reload disabled.", e);
+            warn!(
+                "Failed to register SIGHUP handler: {}. Hot reload disabled.",
+                e
+            );
             return;
         }
     };
@@ -59,10 +65,7 @@ pub async fn watch_config(
 }
 
 /// Re-read the config file, validate it, convert to RouteTable, and swap atomically.
-fn reload_routes(
-    config_path: &PathBuf,
-    routes: &Arc<ArcSwap<RouteTable>>,
-) -> Result<()> {
+fn reload_routes(config_path: &PathBuf, routes: &Arc<ArcSwap<RouteTable>>) -> Result<()> {
     let config = PortailConfig::load_from_file(config_path)?;
     let route_table = config.to_route_table()?;
 
@@ -72,6 +75,9 @@ fn reload_routes(
 
     routes.store(Arc::new(route_table));
 
-    info!("Routes reloaded: {} HTTP, {} TCP, {} UDP", http_count, tcp_count, udp_count);
+    info!(
+        "Routes reloaded: {} HTTP, {} TCP, {} UDP",
+        http_count, tcp_count, udp_count
+    );
     Ok(())
 }

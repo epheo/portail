@@ -1,5 +1,5 @@
-use std::path::Path;
 use anyhow::{anyhow, Result};
+use std::path::Path;
 
 use super::types::*;
 
@@ -13,18 +13,19 @@ impl PortailConfig {
             return Err(anyhow!("Configuration file not found: {}", path.display()));
         }
 
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("Failed to read configuration file '{}': {}", path.display(), e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            anyhow!(
+                "Failed to read configuration file '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
 
         let config = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("json") => {
-                serde_json::from_str::<Self>(&content)
-                    .map_err(|e| anyhow!("JSON parsing error in '{}': {}", path.display(), e))?
-            }
-            Some("yaml") | Some("yml") => {
-                serde_yaml::from_str::<Self>(&content)
-                    .map_err(|e| anyhow!("YAML parsing error in '{}': {}", path.display(), e))?
-            }
+            Some("json") => serde_json::from_str::<Self>(&content)
+                .map_err(|e| anyhow!("JSON parsing error in '{}': {}", path.display(), e))?,
+            Some("yaml") | Some("yml") => serde_yaml::from_str::<Self>(&content)
+                .map_err(|e| anyhow!("YAML parsing error in '{}': {}", path.display(), e))?,
             Some(ext) => {
                 return Err(anyhow!(
                     "Unsupported configuration file format '.{}' in '{}'. Supported formats: .json, .yaml, .yml",
@@ -40,8 +41,13 @@ impl PortailConfig {
             }
         };
 
-        config.validate()
-            .map_err(|e| anyhow!("Configuration validation failed for '{}': {}", path.display(), e))?;
+        config.validate().map_err(|e| {
+            anyhow!(
+                "Configuration validation failed for '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
 
         Ok(config)
     }
@@ -55,15 +61,23 @@ impl PortailConfig {
 
         let mut route_table = routing::RouteTable::new();
 
-        tracing::debug!("Converting {} HTTP routes to route table", self.http_routes.len());
+        tracing::debug!(
+            "Converting {} HTTP routes to route table",
+            self.http_routes.len()
+        );
 
         for (route_idx, http_route) in self.http_routes.iter().enumerate() {
-            tracing::debug!("Processing HTTP route {}: {} hostnames, {} rules",
-                route_idx, http_route.hostnames.len(), http_route.rules.len());
+            tracing::debug!(
+                "Processing HTTP route {}: {} hostnames, {} rules",
+                route_idx,
+                http_route.hostnames.len(),
+                http_route.rules.len()
+            );
 
             // Find all matching listeners for this route's parentRefs.
             // A route may target a specific listener (sectionName) or all listeners (no sectionName).
-            let matched_listeners = find_listeners_for_route(&http_route.parent_refs, &self.gateway);
+            let matched_listeners =
+                find_listeners_for_route(&http_route.parent_refs, &self.gateway);
 
             if matched_listeners.is_empty() {
                 // No matching listener found — route without gateway context.
@@ -76,10 +90,22 @@ impl PortailConfig {
 
                 for hostname in &effective_hostnames {
                     for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides, &self.app_protocol_overrides)?;
+                        let (backends, filters) = build_rule_components(
+                            rule,
+                            rule_idx,
+                            hostname,
+                            &self.endpoint_overrides,
+                            &self.app_protocol_overrides,
+                        )?;
                         for route_match in &rule.matches {
-                            let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
-                            route_table.add_http_route_for_listener(0, None, hostname, routing_rule);
+                            let routing_rule =
+                                build_routing_rule(route_match, &filters, &backends, rule)?;
+                            route_table.add_http_route_for_listener(
+                                0,
+                                None,
+                                hostname,
+                                routing_rule,
+                            );
                         }
                     }
                 }
@@ -98,26 +124,51 @@ impl PortailConfig {
                 } else {
                     let hostnames = intersect_hostnames(listener, &http_route.hostnames);
                     if hostnames.is_empty() {
-                        tracing::warn!("HTTP route {} has no hostnames matching listener '{}' scope, skipping",
-                            route_idx, listener.name);
+                        tracing::warn!(
+                            "HTTP route {} has no hostnames matching listener '{}' scope, skipping",
+                            route_idx,
+                            listener.name
+                        );
                         continue;
                     }
                     hostnames
                 };
 
                 for hostname in &effective_hostnames {
-                    tracing::debug!("  Processing hostname: {} for listener {}:{} ({:?})",
-                        hostname, listener.name, listener.port, listener.hostname);
+                    tracing::debug!(
+                        "  Processing hostname: {} for listener {}:{} ({:?})",
+                        hostname,
+                        listener.name,
+                        listener.port,
+                        listener.hostname
+                    );
                     for (rule_idx, rule) in http_route.rules.iter().enumerate() {
-                        tracing::debug!("    Processing rule {}: {} matches, {} backend_refs",
-                            rule_idx, rule.matches.len(), rule.backend_refs.len());
+                        tracing::debug!(
+                            "    Processing rule {}: {} matches, {} backend_refs",
+                            rule_idx,
+                            rule.matches.len(),
+                            rule.backend_refs.len()
+                        );
 
-                        let (backends, filters) = build_rule_components(rule, rule_idx, hostname, &self.endpoint_overrides, &self.app_protocol_overrides)?;
+                        let (backends, filters) = build_rule_components(
+                            rule,
+                            rule_idx,
+                            hostname,
+                            &self.endpoint_overrides,
+                            &self.app_protocol_overrides,
+                        )?;
 
                         for route_match in &rule.matches {
-                            let routing_rule = build_routing_rule(route_match, &filters, &backends, rule)?;
-                            tracing::debug!("      Adding route: {} {} -> {} backends (listener {}:{:?})",
-                                hostname, routing_rule.path, backends.len(), listener.port, listener.hostname);
+                            let routing_rule =
+                                build_routing_rule(route_match, &filters, &backends, rule)?;
+                            tracing::debug!(
+                                "      Adding route: {} {} -> {} backends (listener {}:{:?})",
+                                hostname,
+                                routing_rule.path,
+                                backends.len(),
+                                listener.port,
+                                listener.hostname
+                            );
                             route_table.add_http_route_for_listener(
                                 listener.port,
                                 listener.hostname.as_deref(),
@@ -136,10 +187,19 @@ impl PortailConfig {
         // Convert TLS routes (SNI-based)
         for tls_route in &self.tls_routes {
             for rule in &tls_route.rules {
-                let backends: Vec<routing::Backend> = rule.backend_refs.iter()
+                let backends: Vec<routing::Backend> = rule
+                    .backend_refs
+                    .iter()
                     .filter_map(|br| {
                         routing::Backend::new(br.name.clone(), br.port)
-                            .map_err(|e| tracing::warn!("Skipping TLS backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
+                            .map_err(|e| {
+                                tracing::warn!(
+                                    "Skipping TLS backend {}:{} - DNS resolution failed: {}",
+                                    br.name,
+                                    br.port,
+                                    e
+                                )
+                            })
                             .ok()
                     })
                     .collect();
@@ -163,16 +223,26 @@ trait L4Route {
 }
 
 impl L4Route for TcpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
+    fn parent_refs(&self) -> &[ParentRef] {
+        &self.parent_refs
+    }
     fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
+        self.rules
+            .iter()
+            .map(|r| r.backend_refs.as_slice())
+            .collect()
     }
 }
 
 impl L4Route for UdpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] { &self.parent_refs }
+    fn parent_refs(&self) -> &[ParentRef] {
+        &self.parent_refs
+    }
     fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules.iter().map(|r| r.backend_refs.as_slice()).collect()
+        self.rules
+            .iter()
+            .map(|r| r.backend_refs.as_slice())
+            .collect()
     }
 }
 
@@ -192,9 +262,12 @@ impl PortailConfig {
                         Protocol::TCP => matches!(l.protocol, Protocol::TCP | Protocol::TLS),
                         _ => l.protocol == protocol,
                     };
-                    if let Some(listener) = self.gateway.listeners.iter()
-                        .find(|l| l.name == *section_name && protocol_matches(l)) {
-
+                    if let Some(listener) = self
+                        .gateway
+                        .listeners
+                        .iter()
+                        .find(|l| l.name == *section_name && protocol_matches(l))
+                    {
                         for backend_refs in route.backend_refs_per_rule() {
                             let backends: Vec<routing::Backend> = backend_refs.iter()
                                 .filter_map(|br| {
@@ -205,7 +278,12 @@ impl PortailConfig {
                                 .collect();
 
                             match protocol {
-                                Protocol::TCP | Protocol::TLS | Protocol::HTTP | Protocol::HTTPS => route_table.add_tcp_route(listener.port, backends),
+                                Protocol::TCP
+                                | Protocol::TLS
+                                | Protocol::HTTP
+                                | Protocol::HTTPS => {
+                                    route_table.add_tcp_route(listener.port, backends)
+                                }
                                 Protocol::UDP => route_table.add_udp_route(listener.port, backends),
                             }
                         }
@@ -220,7 +298,10 @@ impl PortailConfig {
 /// Find all listeners that a route attaches to via its parentRefs.
 /// A route without sectionName attaches to all listeners.
 /// A route with sectionName attaches only to that specific listener.
-fn find_listeners_for_route<'a>(parent_refs: &[ParentRef], gateway: &'a GatewayConfig) -> Vec<&'a ListenerConfig> {
+fn find_listeners_for_route<'a>(
+    parent_refs: &[ParentRef],
+    gateway: &'a GatewayConfig,
+) -> Vec<&'a ListenerConfig> {
     if parent_refs.is_empty() {
         return Vec::new();
     }
@@ -228,24 +309,31 @@ fn find_listeners_for_route<'a>(parent_refs: &[ParentRef], gateway: &'a GatewayC
     let mut matched = Vec::new();
     for pr in parent_refs {
         // Filter listeners by sectionName and/or port from the parentRef
-        let candidates: Vec<&ListenerConfig> = gateway.listeners.iter().filter(|l| {
-            // If sectionName is specified, listener name must match
-            if let Some(section) = &pr.section_name {
-                if l.name != *section {
-                    return false;
+        let candidates: Vec<&ListenerConfig> = gateway
+            .listeners
+            .iter()
+            .filter(|l| {
+                // If sectionName is specified, listener name must match
+                if let Some(section) = &pr.section_name {
+                    if l.name != *section {
+                        return false;
+                    }
                 }
-            }
-            // If port is specified, listener port must match
-            if let Some(port) = pr.port {
-                if l.port != port as u16 {
-                    return false;
+                // If port is specified, listener port must match
+                if let Some(port) = pr.port {
+                    if l.port != port as u16 {
+                        return false;
+                    }
                 }
-            }
-            true
-        }).collect();
+                true
+            })
+            .collect();
 
         for listener in candidates {
-            if !matched.iter().any(|l: &&ListenerConfig| l.name == listener.name) {
+            if !matched
+                .iter()
+                .any(|l: &&ListenerConfig| l.name == listener.name)
+            {
                 matched.push(listener);
             }
         }
@@ -260,7 +348,10 @@ fn build_rule_components(
     _hostname: &str,
     endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
     app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
-) -> Result<(Vec<crate::routing::Backend>, Vec<crate::routing::HttpFilter>)> {
+) -> Result<(
+    Vec<crate::routing::Backend>,
+    Vec<crate::routing::HttpFilter>,
+)> {
     use crate::routing;
 
     let mut backends = Vec::new();
@@ -269,15 +360,22 @@ fn build_rule_components(
 
         // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
         let override_key = (backend_ref.name.clone(), backend_ref.port);
-        let effective_app_protocol = backend_ref.app_protocol.as_deref()
-            .or_else(|| app_protocol_overrides.get(&override_key).map(|s| s.as_str()));
+        let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
+            app_protocol_overrides
+                .get(&override_key)
+                .map(|s| s.as_str())
+        });
         let backend_use_tls = effective_app_protocol == Some("https");
 
         // Check if this backend has endpoint overrides (headless service)
         if let Some(endpoints) = endpoint_overrides.get(&override_key) {
             if !endpoints.is_empty() {
-                tracing::debug!("        Headless backend {}:{} -> {} pod endpoints",
-                    backend_ref.name, backend_ref.port, endpoints.len());
+                tracing::debug!(
+                    "        Headless backend {}:{} -> {} pod endpoints",
+                    backend_ref.name,
+                    backend_ref.port,
+                    endpoints.len()
+                );
                 for (pod_ip, target_port) in endpoints {
                     match routing::Backend::with_weight(
                         pod_ip.clone(),
@@ -290,7 +388,12 @@ fn build_rule_components(
                             backends.push(backend);
                         }
                         Err(e) => {
-                            tracing::warn!("        Skipping headless endpoint {}:{} - {}", pod_ip, target_port, e);
+                            tracing::warn!(
+                                "        Skipping headless endpoint {}:{} - {}",
+                                pod_ip,
+                                target_port,
+                                e
+                            );
                         }
                     }
                 }
@@ -307,11 +410,22 @@ fn build_rule_components(
             Ok(mut backend) => {
                 backend.filters = backend_filters;
                 backend.use_tls = backend_use_tls;
-                tracing::debug!("        Backend: {}:{} weight={} tls={}", backend_ref.name, backend_ref.port, backend_ref.weight, backend.use_tls);
+                tracing::debug!(
+                    "        Backend: {}:{} weight={} tls={}",
+                    backend_ref.name,
+                    backend_ref.port,
+                    backend_ref.weight,
+                    backend.use_tls
+                );
                 backends.push(backend);
             }
             Err(e) => {
-                tracing::warn!("        Skipping backend {}:{} - DNS resolution failed: {}", backend_ref.name, backend_ref.port, e);
+                tracing::warn!(
+                    "        Skipping backend {}:{} - DNS resolution failed: {}",
+                    backend_ref.name,
+                    backend_ref.port,
+                    e
+                );
             }
         }
     }
@@ -331,20 +445,34 @@ fn build_routing_rule(
 
     let (path, path_match_type, path_regex) = if let Some(path_match) = &route_match.path {
         match path_match.match_type {
-            HttpPathMatchType::PathPrefix => (path_match.value.as_str(), routing::PathMatchType::Prefix, None),
-            HttpPathMatchType::Exact => (path_match.value.as_str(), routing::PathMatchType::Exact, None),
+            HttpPathMatchType::PathPrefix => (
+                path_match.value.as_str(),
+                routing::PathMatchType::Prefix,
+                None,
+            ),
+            HttpPathMatchType::Exact => (
+                path_match.value.as_str(),
+                routing::PathMatchType::Exact,
+                None,
+            ),
             HttpPathMatchType::RegularExpression => {
                 let re = regex::Regex::new(&path_match.value)
                     .map_err(|e| anyhow!("Invalid path regex '{}': {}", path_match.value, e))?;
-                (path_match.value.as_str(), routing::PathMatchType::RegularExpression, Some(re))
+                (
+                    path_match.value.as_str(),
+                    routing::PathMatchType::RegularExpression,
+                    Some(re),
+                )
             }
         }
     } else {
         ("/", routing::PathMatchType::Prefix, None)
     };
 
-    let header_matches: Vec<routing::HeaderMatch> = route_match.headers.iter().map(Into::into).collect();
-    let query_param_matches: Vec<routing::QueryParamMatch> = route_match.query_params.iter().map(Into::into).collect();
+    let header_matches: Vec<routing::HeaderMatch> =
+        route_match.headers.iter().map(Into::into).collect();
+    let query_param_matches: Vec<routing::QueryParamMatch> =
+        route_match.query_params.iter().map(Into::into).collect();
 
     let mut routing_rule = routing::HttpRouteRule::new(
         path_match_type,
@@ -353,7 +481,8 @@ fn build_routing_rule(
         query_param_matches,
         filters.to_vec(),
         backends.to_vec(),
-    ).with_method(route_match.method.clone());
+    )
+    .with_method(route_match.method.clone());
     routing_rule.path_regex = path_regex;
     if let Some(ref timeouts) = rule.timeouts {
         routing_rule.request_timeout = timeouts.request;
@@ -380,7 +509,8 @@ fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
             route_parent == listener_parent
         } else {
             // *.example.com listener, foo.example.com route -> match if parent matches
-            rh.ends_with(listener_parent) && rh.len() > listener_parent.len()
+            rh.ends_with(listener_parent)
+                && rh.len() > listener_parent.len()
                 && rh.as_bytes()[rh.len() - listener_parent.len() - 1] == b'.'
         }
     } else {
@@ -388,7 +518,8 @@ fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
         if let Some(route_parent) = rh.strip_prefix("*.") {
             // Exact listener "very.specific.com", wildcard route "*.specific.com"
             // -> match if the listener hostname is under the route's wildcard scope
-            lh.ends_with(route_parent) && lh.len() > route_parent.len()
+            lh.ends_with(route_parent)
+                && lh.len() > route_parent.len()
                 && lh.as_bytes()[lh.len() - route_parent.len() - 1] == b'.'
         } else {
             // Both exact -> must match exactly
@@ -411,7 +542,8 @@ fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) ->
         }
         Some(listener_hostname) => {
             let lh = listener_hostname.to_ascii_lowercase();
-            route_hostnames.iter()
+            route_hostnames
+                .iter()
                 .filter(|rh| hostname_matches(listener_hostname, rh))
                 .map(|rh| {
                     let rh_lower = rh.to_ascii_lowercase();
@@ -433,7 +565,10 @@ fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) ->
 }
 
 fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
-    config_filters.iter().map(crate::routing::HttpFilter::try_from).collect()
+    config_filters
+        .iter()
+        .map(crate::routing::HttpFilter::try_from)
+        .collect()
 }
 
 impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
@@ -441,22 +576,21 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
 
     fn try_from(f: &HttpRouteFilter) -> Result<Self> {
         Ok(match f {
-            HttpRouteFilter::RequestHeaderModifier { config } => {
-                Self::RequestHeaderModifier {
-                    add: std::sync::Arc::new(config.add.clone()),
-                    set: std::sync::Arc::new(config.set.clone()),
-                    remove: std::sync::Arc::new(config.remove.clone()),
-                }
-            }
-            HttpRouteFilter::ResponseHeaderModifier { config } => {
-                Self::ResponseHeaderModifier {
-                    add: std::sync::Arc::new(config.add.clone()),
-                    set: std::sync::Arc::new(config.set.clone()),
-                    remove: std::sync::Arc::new(config.remove.clone()),
-                }
-            }
+            HttpRouteFilter::RequestHeaderModifier { config } => Self::RequestHeaderModifier {
+                add: std::sync::Arc::new(config.add.clone()),
+                set: std::sync::Arc::new(config.set.clone()),
+                remove: std::sync::Arc::new(config.remove.clone()),
+            },
+            HttpRouteFilter::ResponseHeaderModifier { config } => Self::ResponseHeaderModifier {
+                add: std::sync::Arc::new(config.add.clone()),
+                set: std::sync::Arc::new(config.set.clone()),
+                remove: std::sync::Arc::new(config.remove.clone()),
+            },
             HttpRouteFilter::RequestRedirect { config } => {
-                let path = config.path.as_ref().map(crate::routing::URLRewritePath::from);
+                let path = config
+                    .path
+                    .as_ref()
+                    .map(crate::routing::URLRewritePath::from);
                 Self::RequestRedirect {
                     scheme: config.scheme.clone(),
                     hostname: config.hostname.clone(),
@@ -465,35 +599,46 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                     status_code: config.status_code,
                 }
             }
-            HttpRouteFilter::URLRewrite { config } => {
-                Self::URLRewrite {
-                    hostname: config.hostname.clone(),
-                    path: config.path.as_ref().map(crate::routing::URLRewritePath::from),
-                }
-            }
+            HttpRouteFilter::URLRewrite { config } => Self::URLRewrite {
+                hostname: config.hostname.clone(),
+                path: config
+                    .path
+                    .as_ref()
+                    .map(crate::routing::URLRewritePath::from),
+            },
             HttpRouteFilter::RequestMirror { config } => {
                 let backend = crate::routing::Backend::with_weight(
-                    config.backend_ref.name.clone(), config.backend_ref.port, config.backend_ref.weight,
+                    config.backend_ref.name.clone(),
+                    config.backend_ref.port,
+                    config.backend_ref.weight,
                 )?;
-                Self::RequestMirror { backend_addr: backend.socket_addr }
+                Self::RequestMirror {
+                    backend_addr: backend.socket_addr,
+                }
             }
         })
     }
 }
 
-
 impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
     fn from(p: &HttpURLRewritePath) -> Self {
         match p {
             HttpURLRewritePath::ReplaceFullPath { value } => Self::ReplaceFullPath(value.clone()),
-            HttpURLRewritePath::ReplacePrefixMatch { value } => Self::ReplacePrefixMatch(value.clone()),
+            HttpURLRewritePath::ReplacePrefixMatch { value } => {
+                Self::ReplacePrefixMatch(value.clone())
+            }
         }
     }
 }
 
-fn build_value_matcher(value: &str, match_type: &super::types::StringMatchType) -> crate::routing::ValueMatcher {
+fn build_value_matcher(
+    value: &str,
+    match_type: &super::types::StringMatchType,
+) -> crate::routing::ValueMatcher {
     match match_type {
-        super::types::StringMatchType::Exact => crate::routing::ValueMatcher::Exact(value.to_string()),
+        super::types::StringMatchType::Exact => {
+            crate::routing::ValueMatcher::Exact(value.to_string())
+        }
         super::types::StringMatchType::RegularExpression => {
             // Validation ensures regex is valid before we get here
             let re = regex::Regex::new(value).expect("regex validated at config load time");
@@ -504,20 +649,26 @@ fn build_value_matcher(value: &str, match_type: &super::types::StringMatchType) 
 
 impl From<&super::types::HttpHeaderMatch> for crate::routing::HeaderMatch {
     fn from(hm: &super::types::HttpHeaderMatch) -> Self {
-        Self { name: hm.name.to_ascii_lowercase(), matcher: build_value_matcher(&hm.value, &hm.match_type) }
+        Self {
+            name: hm.name.to_ascii_lowercase(),
+            matcher: build_value_matcher(&hm.value, &hm.match_type),
+        }
     }
 }
 
 impl From<&super::types::HttpQueryParamMatch> for crate::routing::QueryParamMatch {
     fn from(qm: &super::types::HttpQueryParamMatch) -> Self {
-        Self { name: qm.name.clone(), matcher: build_value_matcher(&qm.value, &qm.match_type) }
+        Self {
+            name: qm.name.clone(),
+            matcher: build_value_matcher(&qm.value, &qm.match_type),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::*;
     use super::super::parsing::parse_duration;
+    use super::super::*;
     use std::time::Duration;
 
     #[test]
@@ -531,7 +682,6 @@ mod tests {
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("-5s").is_err());
     }
-
 
     #[test]
     fn test_default_config() {
@@ -648,14 +798,30 @@ mod tests {
 
         assert_eq!(config.http_routes.len(), 1);
         assert_eq!(config.http_routes[0].hostnames[0], "api.example.com");
-        assert_eq!(config.http_routes[0].rules[0].matches[0].path.as_ref().unwrap().value, "/v1");
-        assert_eq!(config.http_routes[0].rules[0].backend_refs[0].name, "api-service");
+        assert_eq!(
+            config.http_routes[0].rules[0].matches[0]
+                .path
+                .as_ref()
+                .unwrap()
+                .value,
+            "/v1"
+        );
+        assert_eq!(
+            config.http_routes[0].rules[0].backend_refs[0].name,
+            "api-service"
+        );
         assert_eq!(config.http_routes[0].rules[0].backend_refs[0].port, 3000);
 
         assert_eq!(config.tcp_routes.len(), 1);
         assert_eq!(config.tcp_routes[0].rules[0].backend_refs.len(), 2);
-        assert_eq!(config.tcp_routes[0].rules[0].backend_refs[0].name, "db1-service");
-        assert_eq!(config.tcp_routes[0].rules[0].backend_refs[1].name, "db2-service");
+        assert_eq!(
+            config.tcp_routes[0].rules[0].backend_refs[0].name,
+            "db1-service"
+        );
+        assert_eq!(
+            config.tcp_routes[0].rules[0].backend_refs[1].name,
+            "db2-service"
+        );
     }
 
     #[test]
@@ -765,9 +931,13 @@ mod tests {
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "GET", "/v1/test", &[], "", 8080).unwrap();
+        let rule = rt
+            .find_http_route("example.com", "GET", "/v1/test", &[], "", 8080)
+            .unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert!(matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com"));
+        assert!(
+            matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com")
+        );
     }
 
     #[test]
@@ -790,7 +960,9 @@ mod tests {
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
-        let rule = rt.find_http_route("example.com", "GET", "/", &[], "", 8080).unwrap();
+        let rule = rt
+            .find_http_route("example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
         assert_eq!(rule.filters.len(), 1);
         if let crate::routing::HttpFilter::RequestMirror { backend_addr } = &rule.filters[0] {
             assert_eq!(backend_addr.port(), 9999);
@@ -864,7 +1036,10 @@ mod tests {
         assert!(parsed.validate().is_ok());
 
         // Find the HTTPS listener
-        let https = parsed.gateway.listeners.iter()
+        let https = parsed
+            .gateway
+            .listeners
+            .iter()
             .find(|l| matches!(l.protocol, Protocol::HTTPS))
             .expect("development config should have HTTPS listener");
         let tls = https.tls.as_ref().unwrap();
@@ -879,10 +1054,16 @@ mod tests {
         let parsed: PortailConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.validate().is_ok());
 
-        let https = parsed.gateway.listeners.iter()
+        let https = parsed
+            .gateway
+            .listeners
+            .iter()
             .find(|l| matches!(l.protocol, Protocol::HTTPS))
             .expect("development config should have HTTPS listener");
-        assert_eq!(https.tls.as_ref().unwrap().certificate_refs[0].name, "example-cert");
+        assert_eq!(
+            https.tls.as_ref().unwrap().certificate_refs[0].name,
+            "example-cert"
+        );
     }
 
     #[test]
@@ -947,10 +1128,7 @@ mod tests {
             interface: None,
             tls: None,
         };
-        let route_hostnames = vec![
-            "api.example.com".to_string(),
-            "web.example.com".to_string(),
-        ];
+        let route_hostnames = vec!["api.example.com".to_string(), "web.example.com".to_string()];
         let result = super::intersect_hostnames(&listener, &route_hostnames);
         assert_eq!(result, vec!["api.example.com"]);
     }
@@ -985,11 +1163,20 @@ mod tests {
 
         // to_route_table should resolve "httpbin.org" via DNS
         let rt = config.to_route_table();
-        assert!(rt.is_ok(), "ExternalName DNS resolution should succeed: {:?}", rt.err());
+        assert!(
+            rt.is_ok(),
+            "ExternalName DNS resolution should succeed: {:?}",
+            rt.err()
+        );
         let rt = rt.unwrap();
 
-        let rule = rt.find_http_route("proxy.example.com", "GET", "/", &[], "", 8080).unwrap();
-        assert!(!rule.backends.is_empty(), "should have resolved ExternalName backend");
+        let rule = rt
+            .find_http_route("proxy.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(
+            !rule.backends.is_empty(),
+            "should have resolved ExternalName backend"
+        );
         assert_eq!(rule.backends[0].socket_addr.port(), 443);
     }
 }

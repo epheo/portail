@@ -6,7 +6,9 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 #[command(name = "portail")]
 #[command(about = "High-Performance Kubernetes Gateway API Controller")]
-#[command(long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.")]
+#[command(
+    long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying."
+)]
 pub struct Args {
     /// Configuration file path (JSON or YAML format)
     #[arg(short, long, value_name = "FILE")]
@@ -84,17 +86,24 @@ impl Args {
                         ));
                     }
                     None => {
-                        return Err("Configuration file must have a valid extension (.json, .yaml, .yml)".to_string());
+                        return Err(
+                            "Configuration file must have a valid extension (.json, .yaml, .yml)"
+                                .to_string(),
+                        );
                     }
                 }
             } else {
-                return Err("Configuration file must have an extension (.json, .yaml, .yml)".to_string());
+                return Err(
+                    "Configuration file must have an extension (.json, .yaml, .yml)".to_string(),
+                );
             }
         }
 
         // Validate that check-config and validate-only require config file
         if (self.check_config || self.validate_only) && self.config.is_none() {
-            return Err("--check-config and --validate-only require --config to be specified".to_string());
+            return Err(
+                "--check-config and --validate-only require --config to be specified".to_string(),
+            );
         }
 
         if self.kubernetes && self.config.is_some() {
@@ -113,13 +122,7 @@ impl Args {
     pub fn is_generation_mode(&self) -> bool {
         self.generate_config.is_some()
     }
-    
-
-
-
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +134,6 @@ mod tests {
             config: Some(PathBuf::from("config.json")),
             validate_only: false,
             check_config: false,
-
 
             verbose: 0,
             example_config: false,
@@ -225,5 +227,4 @@ mod tests {
         };
         assert!(args.validate().is_err());
     }
-
 }

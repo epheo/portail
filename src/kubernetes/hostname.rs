@@ -5,7 +5,10 @@
 /// - No listener hostname → all routes match
 /// - No route hostnames → matches any listener
 /// - Wildcard: listener `*.example.com` matches route `foo.example.com`
-pub(crate) fn hostnames_intersect(listener_hostname: Option<&str>, route_hostnames: &[String]) -> bool {
+pub(crate) fn hostnames_intersect(
+    listener_hostname: Option<&str>,
+    route_hostnames: &[String],
+) -> bool {
     let listener_hn = match listener_hostname {
         None => return true, // No listener hostname restriction
         Some(h) => h,

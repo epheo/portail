@@ -1,29 +1,29 @@
+use arc_swap::ArcSwap;
+use futures::StreamExt;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use kube::api::Api;
+use kube::runtime::controller::Action;
+use kube::runtime::reflector::{ObjectRef, Store};
+use kube::runtime::watcher;
+use kube::runtime::{predicates, reflector, Controller, WatchStreamExt};
+use kube::Client;
+use kube::ResourceExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use arc_swap::ArcSwap;
-use futures::StreamExt;
-use kube::api::Api;
-use kube::runtime::controller::Action;
-use kube::runtime::watcher;
-use kube::runtime::{reflector, Controller, WatchStreamExt, predicates};
-use kube::runtime::reflector::{ObjectRef, Store};
-use kube::Client;
-use kube::ResourceExt;
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use tokio_util::sync::CancellationToken;
 
+use gateway_api::experimental::tcproutes::TCPRoute;
+use gateway_api::experimental::tlsroutes::TLSRoute;
+use gateway_api::experimental::udproutes::UDPRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
-use gateway_api::experimental::tcproutes::TCPRoute;
-use gateway_api::experimental::tlsroutes::TLSRoute;
-use gateway_api::experimental::udproutes::UDPRoute;
 
+use crate::logging::{debug, error, info, warn};
 use crate::routing::RouteTable;
-use crate::logging::{info, warn, error, debug};
 
 use super::reconciler::reconcile_to_config;
 use super::status;
@@ -113,14 +113,19 @@ async fn reconcile_gateway_classes(ctx: &ControllerCtx) {
             continue;
         }
         if gc_arc.name_any() == *accepted {
-            status::update_gateway_class_status(&ctx.client, &gc_arc, true, "Accepted by portail").await;
+            status::update_gateway_class_status(&ctx.client, &gc_arc, true, "Accepted by portail")
+                .await;
         } else {
             status::update_gateway_class_status(
                 &ctx.client,
                 &gc_arc,
                 false,
-                &format!("Another GatewayClass '{}' is already accepted by this controller", accepted),
-            ).await;
+                &format!(
+                    "Another GatewayClass '{}' is already accepted by this controller",
+                    accepted
+                ),
+            )
+            .await;
         }
     }
 }
@@ -136,7 +141,13 @@ fn spawn_reflector<K>(
     generation_filter: bool,
 ) -> Store<K>
 where
-    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + Sync + 'static,
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
     let writer = reflector::store::Writer::default();
@@ -158,17 +169,21 @@ where
                 match &event {
                     watcher::Event::Delete(obj) => {
                         // Remove stale generation entry so the next create triggers correctly
-                        let key = format!("{}/{}",
+                        let key = format!(
+                            "{}/{}",
                             obj.meta().namespace.as_deref().unwrap_or(""),
-                            obj.meta().name.as_deref().unwrap_or(""));
+                            obj.meta().name.as_deref().unwrap_or("")
+                        );
                         generations.remove(&key);
                         let _ = tx.try_send(());
                     }
                     watcher::Event::Apply(obj) | watcher::Event::InitApply(obj) => {
                         if generation_filter {
-                            let key = format!("{}/{}",
+                            let key = format!(
+                                "{}/{}",
                                 obj.meta().namespace.as_deref().unwrap_or(""),
-                                obj.meta().name.as_deref().unwrap_or(""));
+                                obj.meta().name.as_deref().unwrap_or("")
+                            );
                             let gen = obj.meta().generation.unwrap_or(0);
                             let prev = generations.insert(key, gen);
                             if prev.is_none() || prev != Some(gen) {
@@ -205,32 +220,77 @@ pub async fn run_controller(
     // to filter out status-only changes at the stream level.
     let gw_writer = reflector::store::Writer::default();
     let store_gateways = gw_writer.as_reader();
-    let gw_stream = reflector::reflector(gw_writer,
-        watcher::watcher(Api::<Gateway>::all(client.clone()), watcher::Config::default()))
-        .default_backoff()
-        .applied_objects()
-        .predicate_filter(predicates::generation);
+    let gw_stream = reflector::reflector(
+        gw_writer,
+        watcher::watcher(
+            Api::<Gateway>::all(client.clone()),
+            watcher::Config::default(),
+        ),
+    )
+    .default_backoff()
+    .applied_objects()
+    .predicate_filter(predicates::generation);
 
     // --- Secondary CRD reflectors (generation-filtered via spawn_reflector) ---
-    let store_http_routes = spawn_reflector(Api::<HTTPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
-    let store_tcp_routes = spawn_reflector(Api::<TCPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
-    let store_tls_routes = spawn_reflector(Api::<TLSRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
-    let store_udp_routes = spawn_reflector(Api::<UDPRoute>::all(client.clone()), Some(reconcile_tx.clone()), true);
-    let store_gateway_classes = spawn_reflector(Api::<GatewayClass>::all(client.clone()), Some(reconcile_tx.clone()), true);
+    let store_http_routes = spawn_reflector(
+        Api::<HTTPRoute>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        true,
+    );
+    let store_tcp_routes = spawn_reflector(
+        Api::<TCPRoute>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        true,
+    );
+    let store_tls_routes = spawn_reflector(
+        Api::<TLSRoute>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        true,
+    );
+    let store_udp_routes = spawn_reflector(
+        Api::<UDPRoute>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        true,
+    );
+    let store_gateway_classes = spawn_reflector(
+        Api::<GatewayClass>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        true,
+    );
 
     // --- Core resource reflectors (no generation filter) ---
-    let store_namespaces = spawn_reflector(Api::<Namespace>::all(client.clone()), Some(reconcile_tx.clone()), false);
-    let store_services = spawn_reflector(Api::<Service>::all(client.clone()), Some(reconcile_tx.clone()), false);
-    let store_endpoint_slices = spawn_reflector(Api::<EndpointSlice>::all(client.clone()), Some(reconcile_tx.clone()), false);
-    let store_reference_grants = spawn_reflector(Api::<ReferenceGrant>::all(client.clone()), Some(reconcile_tx.clone()), false);
+    let store_namespaces = spawn_reflector(
+        Api::<Namespace>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        false,
+    );
+    let store_services = spawn_reflector(
+        Api::<Service>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        false,
+    );
+    let store_endpoint_slices = spawn_reflector(
+        Api::<EndpointSlice>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        false,
+    );
+    let store_reference_grants = spawn_reflector(
+        Api::<ReferenceGrant>::all(client.clone()),
+        Some(reconcile_tx.clone()),
+        false,
+    );
 
     // Only watch TLS secrets
     let store_secrets = {
         let writer = reflector::store::Writer::default();
         let reader = writer.as_reader();
-        let rf = reflector::reflector(writer,
-            watcher::watcher(Api::<Secret>::all(client.clone()),
-                watcher::Config::default().fields("type=kubernetes.io/tls")));
+        let rf = reflector::reflector(
+            writer,
+            watcher::watcher(
+                Api::<Secret>::all(client.clone()),
+                watcher::Config::default().fields("type=kubernetes.io/tls"),
+            ),
+        );
         let tx = reconcile_tx.clone();
         tokio::spawn(async move {
             let mut stream = std::pin::pin!(rf.applied_objects());
@@ -273,10 +333,7 @@ pub async fn run_controller(
     // Built-in 1s debounce coalesces bursts of events.
     let controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
         .reconcile_all_on(reconcile_stream)
-        .with_config(
-            kube::runtime::controller::Config::default()
-                .debounce(Duration::from_secs(1))
-        )
+        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
 
@@ -330,12 +387,34 @@ async fn reconcile(
     }
 
     // Read all resources from reflector caches — no API server calls.
-    let http_routes: Vec<HTTPRoute> = ctx.store_http_routes.state().iter().map(|arc| (**arc).clone()).collect();
-    let tcp_routes: Vec<TCPRoute> = ctx.store_tcp_routes.state().iter().map(|arc| (**arc).clone()).collect();
-    let tls_routes: Vec<TLSRoute> = ctx.store_tls_routes.state().iter().map(|arc| (**arc).clone()).collect();
-    let udp_routes: Vec<UDPRoute> = ctx.store_udp_routes.state().iter().map(|arc| (**arc).clone()).collect();
+    let http_routes: Vec<HTTPRoute> = ctx
+        .store_http_routes
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
+    let tcp_routes: Vec<TCPRoute> = ctx
+        .store_tcp_routes
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
+    let tls_routes: Vec<TLSRoute> = ctx
+        .store_tls_routes
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
+    let udp_routes: Vec<UDPRoute> = ctx
+        .store_udp_routes
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
 
-    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ctx.store_namespaces.state()
+    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ctx
+        .store_namespaces
+        .state()
         .iter()
         .filter_map(|ns| {
             let name = ns.metadata.name.clone()?;
@@ -344,7 +423,12 @@ async fn reconcile(
         })
         .collect();
 
-    let reference_grants: Vec<ReferenceGrant> = ctx.store_reference_grants.state().iter().map(|arc| (**arc).clone()).collect();
+    let reference_grants: Vec<ReferenceGrant> = ctx
+        .store_reference_grants
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
 
     // Fetch TLS certificate data from cached Secrets store for THIS gateway.
     // Other gateways get their own cert_data in the all_configs loop below.
@@ -368,7 +452,8 @@ async fn reconcile(
                                     && f.namespace == gw_ns
                             });
                             let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group.is_empty() && t.kind == "Secret"
+                                t.group.is_empty()
+                                    && t.kind == "Secret"
                                     && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
                             });
                             from_ok && to_ok
@@ -392,14 +477,26 @@ async fn reconcile(
                                 if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
                                     let cert_str = String::from_utf8_lossy(&cert);
                                     let key_str = String::from_utf8_lossy(&key);
-                                    if cert_str.contains("BEGIN CERTIFICATE") &&
-                                       (key_str.contains("BEGIN PRIVATE KEY") || key_str.contains("BEGIN RSA PRIVATE KEY") || key_str.contains("BEGIN EC PRIVATE KEY")) {
-                                        cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
+                                    if cert_str.contains("BEGIN CERTIFICATE")
+                                        && (key_str.contains("BEGIN PRIVATE KEY")
+                                            || key_str.contains("BEGIN RSA PRIVATE KEY")
+                                            || key_str.contains("BEGIN EC PRIVATE KEY"))
+                                    {
+                                        cert_data.insert(
+                                            (cert_ref.name.clone(), secret_ns.to_string()),
+                                            (cert, key),
+                                        );
                                     } else {
-                                        warn!("Secret {}/{} has malformed PEM data", secret_ns, cert_ref.name);
+                                        warn!(
+                                            "Secret {}/{} has malformed PEM data",
+                                            secret_ns, cert_ref.name
+                                        );
                                     }
                                 } else {
-                                    warn!("Secret {}/{} missing tls.crt or tls.key", secret_ns, cert_ref.name);
+                                    warn!(
+                                        "Secret {}/{} missing tls.crt or tls.key",
+                                        secret_ns, cert_ref.name
+                                    );
                                 }
                             }
                         }
@@ -413,7 +510,12 @@ async fn reconcile(
     }
 
     // Read Services from reflector cache
-    let all_services: Vec<Service> = ctx.store_services.state().iter().map(|arc| (**arc).clone()).collect();
+    let all_services: Vec<Service> = ctx
+        .store_services
+        .state()
+        .iter()
+        .map(|arc| (**arc).clone())
+        .collect();
 
     let known_services: HashSet<(String, String)> = all_services
         .iter()
@@ -446,7 +548,12 @@ async fn reconcile(
         .collect();
 
     if !headless_services.is_empty() {
-        let all_endpoint_slices: Vec<EndpointSlice> = ctx.store_endpoint_slices.state().iter().map(|arc| (**arc).clone()).collect();
+        let all_endpoint_slices: Vec<EndpointSlice> = ctx
+            .store_endpoint_slices
+            .state()
+            .iter()
+            .map(|arc| (**arc).clone())
+            .collect();
 
         for (svc_name, svc_ns) in &headless_services {
             // Find EndpointSlices for this service (labeled kubernetes.io/service-name)
@@ -495,11 +602,10 @@ async fn reconcile(
                         // Find matching endpoint port by name
                         let target_port = eps_ports
                             .iter()
-                            .find(|ep| {
-                                ep.name.as_deref().unwrap_or("") == port_name
-                            })
+                            .find(|ep| ep.name.as_deref().unwrap_or("") == port_name)
                             .and_then(|ep| ep.port)
-                            .unwrap_or(service_port as i32) as u16;
+                            .unwrap_or(service_port as i32)
+                            as u16;
 
                         let key = (svc_fqdn.clone(), service_port);
                         let entry = endpoint_overrides.entry(key).or_default();
@@ -566,8 +672,14 @@ async fn reconcile(
             }
             info!(
                 "ExternalName service {}.{} -> {} (ports: {})",
-                svc_name, svc_ns, external_name,
-                ports.iter().map(|p| p.port.to_string()).collect::<Vec<_>>().join(", ")
+                svc_name,
+                svc_ns,
+                external_name,
+                ports
+                    .iter()
+                    .map(|p| p.port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }
@@ -607,7 +719,9 @@ async fn reconcile(
             Some(existing_proto) if *existing_proto != l.protocol => {
                 conflicted_ports.insert(l.port);
             }
-            None => { port_protocols.insert(l.port, l.protocol.clone()); }
+            None => {
+                port_protocols.insert(l.port, l.protocol.clone());
+            }
             _ => {}
         }
     }
@@ -620,10 +734,12 @@ async fn reconcile(
         if conflicted_ports.contains(&listener.port) {
             ls.accepted = false;
             ls.accepted_reason = "ProtocolConflict".into();
-            ls.accepted_message = "Listener port conflicts with another listener using a different protocol".into();
+            ls.accepted_message =
+                "Listener port conflicts with another listener using a different protocol".into();
             ls.conflicted = true;
             ls.conflicted_reason = "ProtocolConflict".into();
-            ls.conflicted_message = "Listener port shared with another listener using different protocol".into();
+            ls.conflicted_message =
+                "Listener port shared with another listener using different protocol".into();
         } else {
             // No conflict — listener is accepted
             ls.accepted = true;
@@ -642,7 +758,8 @@ async fn reconcile(
                         refs_failed = true;
                         ls.resolved_refs_reason = "InvalidCertificateRef".into();
                         ls.resolved_refs_message = format!(
-                            "Unsupported certificateRef group/kind: {}/{}", group, kind_str
+                            "Unsupported certificateRef group/kind: {}/{}",
+                            group, kind_str
                         );
                         continue;
                     }
@@ -653,14 +770,17 @@ async fn reconcile(
                     if secret_ns != gw_ns {
                         let grant_allows = reference_grants.iter().any(|grant| {
                             let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                            if grant_ns != secret_ns { return false; }
+                            if grant_ns != secret_ns {
+                                return false;
+                            }
                             let from_ok = grant.spec.from.iter().any(|f| {
                                 f.group == "gateway.networking.k8s.io"
                                     && f.kind == "Gateway"
                                     && f.namespace == gw_ns
                             });
                             let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group.is_empty() && t.kind == "Secret"
+                                t.group.is_empty()
+                                    && t.kind == "Secret"
                                     && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
                             });
                             from_ok && to_ok
@@ -703,7 +823,9 @@ async fn reconcile(
                 for k in kinds {
                     let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
                     let kind_str = &k.kind;
-                    if group == "gateway.networking.k8s.io" && valid_kinds.contains(&kind_str.as_str()) {
+                    if group == "gateway.networking.k8s.io"
+                        && valid_kinds.contains(&kind_str.as_str())
+                    {
                         supported.push(serde_json::json!({
                             "group": "gateway.networking.k8s.io",
                             "kind": kind_str,
@@ -716,7 +838,8 @@ async fn reconcile(
                 if has_invalid {
                     refs_failed = true;
                     ls.resolved_refs_reason = "InvalidRouteKinds".into();
-                    ls.resolved_refs_message = "One or more route kinds in allowedRoutes are not supported".into();
+                    ls.resolved_refs_message =
+                        "One or more route kinds in allowedRoutes are not supported".into();
                 }
             } else {
                 // No explicit kinds restriction — use protocol-based defaults
@@ -779,9 +902,8 @@ async fn reconcile(
                 if addr_type != "IPAddress" && addr_type != "Hostname" {
                     gateway_accepted = false;
                     gateway_accepted_reason = "UnsupportedAddress".to_string();
-                    gateway_accepted_message = format!(
-                        "Unsupported address type '{}' in spec.addresses", addr_type
-                    );
+                    gateway_accepted_message =
+                        format!("Unsupported address type '{}' in spec.addresses", addr_type);
                     break;
                 }
             }
@@ -794,7 +916,8 @@ async fn reconcile(
         if all_rejected {
             gateway_accepted = false;
             gateway_accepted_reason = "InvalidListeners".to_string();
-            gateway_accepted_message = "All listeners are rejected due to conflicts or errors".to_string();
+            gateway_accepted_message =
+                "All listeners are rejected due to conflicts or errors".to_string();
         }
     }
 
@@ -835,8 +958,10 @@ async fn reconcile(
     // Done after reconciliation so ListenerConfig has TLS cert data populated.
     {
         let listener_configs = &result.config.gateway.listeners;
-        info!("Ensuring data plane listeners for ports: {:?}",
-            listener_configs.iter().map(|l| l.port).collect::<Vec<_>>());
+        info!(
+            "Ensuring data plane listeners for ports: {:?}",
+            listener_configs.iter().map(|l| l.port).collect::<Vec<_>>()
+        );
         match ctx.data_plane.lock() {
             Ok(mut dp) => {
                 let (opened, errors) = dp.add_tcp_listeners(
@@ -864,7 +989,11 @@ async fn reconcile(
     let mut all_configs = vec![result.config.clone()];
     for other_gw_arc in ctx.store_gateways.state() {
         let other_name = other_gw_arc.metadata.name.as_deref().unwrap_or("");
-        let other_ns = other_gw_arc.metadata.namespace.as_deref().unwrap_or("default");
+        let other_ns = other_gw_arc
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or("default");
         if other_name == gw_name && other_ns == gw_ns {
             continue; // Skip the gateway we just reconciled
         }
@@ -884,20 +1013,26 @@ async fn reconcile(
 
                         if secret_ns != other_gw_ns {
                             let grant_allows = reference_grants.iter().any(|grant| {
-                                let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                                if grant_ns != secret_ns { return false; }
+                                let grant_ns =
+                                    grant.metadata.namespace.as_deref().unwrap_or("default");
+                                if grant_ns != secret_ns {
+                                    return false;
+                                }
                                 let from_ok = grant.spec.from.iter().any(|f| {
                                     f.group == "gateway.networking.k8s.io"
                                         && f.kind == "Gateway"
                                         && f.namespace == other_gw_ns
                                 });
                                 let to_ok = grant.spec.to.iter().any(|t| {
-                                    t.group.is_empty() && t.kind == "Secret"
+                                    t.group.is_empty()
+                                        && t.kind == "Secret"
                                         && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
                                 });
                                 from_ok && to_ok
                             });
-                            if !grant_allows { continue; }
+                            if !grant_allows {
+                                continue;
+                            }
                         }
 
                         let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
@@ -908,9 +1043,15 @@ async fn reconcile(
                                 if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
                                     let cert_str = String::from_utf8_lossy(&cert);
                                     let key_str = String::from_utf8_lossy(&key);
-                                    if cert_str.contains("BEGIN CERTIFICATE") &&
-                                       (key_str.contains("BEGIN PRIVATE KEY") || key_str.contains("BEGIN RSA PRIVATE KEY") || key_str.contains("BEGIN EC PRIVATE KEY")) {
-                                        other_cert_data.insert((cert_ref.name.clone(), secret_ns.to_string()), (cert, key));
+                                    if cert_str.contains("BEGIN CERTIFICATE")
+                                        && (key_str.contains("BEGIN PRIVATE KEY")
+                                            || key_str.contains("BEGIN RSA PRIVATE KEY")
+                                            || key_str.contains("BEGIN EC PRIVATE KEY"))
+                                    {
+                                        other_cert_data.insert(
+                                            (cert_ref.name.clone(), secret_ns.to_string()),
+                                            (cert, key),
+                                        );
                                     }
                                 }
                             }
@@ -941,25 +1082,30 @@ async fn reconcile(
     // This ensures the SNI resolver has certs from all gateways sharing a port
     // (e.g. public *.desku.be + private *.mmt + conformance test example.org on port 443).
     {
-        use crate::config::{ListenerConfig as LC, TlsConfig, TlsMode, Protocol as P, CertificateRef};
+        use crate::config::{
+            CertificateRef, ListenerConfig as LC, Protocol as P, TlsConfig, TlsMode,
+        };
         let mut merged_certs_by_port: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
         let mut port_protocol: HashMap<u16, P> = HashMap::new();
         for config in &all_configs {
             for listener in &config.gateway.listeners {
                 if let Some(tls_cfg) = &listener.tls {
                     if tls_cfg.mode == TlsMode::Terminate && !tls_cfg.certificate_refs.is_empty() {
-                        merged_certs_by_port.entry(listener.port)
+                        merged_certs_by_port
+                            .entry(listener.port)
                             .or_default()
                             .extend(tls_cfg.certificate_refs.clone());
-                        port_protocol.entry(listener.port)
+                        port_protocol
+                            .entry(listener.port)
                             .or_insert_with(|| listener.protocol.clone());
                     }
                 }
             }
         }
         if !merged_certs_by_port.is_empty() {
-            let merged_listeners: Vec<LC> = merged_certs_by_port.into_iter().map(|(port, cert_refs)| {
-                LC {
+            let merged_listeners: Vec<LC> = merged_certs_by_port
+                .into_iter()
+                .map(|(port, cert_refs)| LC {
                     name: format!("merged-tls-{}", port),
                     protocol: port_protocol.remove(&port).unwrap_or(P::HTTPS),
                     port,
@@ -970,8 +1116,8 @@ async fn reconcile(
                         mode: TlsMode::Terminate,
                         certificate_refs: cert_refs,
                     }),
-                }
-            }).collect();
+                })
+                .collect();
             match ctx.data_plane.lock() {
                 Ok(mut dp) => {
                     let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
@@ -1001,7 +1147,9 @@ async fn reconcile(
     for ra in &result.route_status {
         if ra.accepted {
             for listener_name in &ra.listener_names {
-                *listener_route_counts.entry(listener_name.clone()).or_insert(0) += 1;
+                *listener_route_counts
+                    .entry(listener_name.clone())
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -1012,7 +1160,11 @@ async fn reconcile(
             let rt = config.to_route_table()?;
             // Merge listener scopes from each gateway's route table
             for (port, scopes) in rt.listener_scopes {
-                combined.listener_scopes.entry(port).or_default().extend(scopes);
+                combined
+                    .listener_scopes
+                    .entry(port)
+                    .or_default()
+                    .extend(scopes);
             }
             combined.tcp_routes.extend(rt.tcp_routes);
             combined.udp_routes.extend(rt.udp_routes);
@@ -1038,7 +1190,12 @@ async fn reconcile(
             );
 
             // Verify data plane has bound all required ports before reporting Programmed
-            let required_ports: Vec<u16> = gateway.spec.listeners.iter().map(|l| l.port as u16).collect();
+            let required_ports: Vec<u16> = gateway
+                .spec
+                .listeners
+                .iter()
+                .map(|l| l.port as u16)
+                .collect();
             let dp_ready = match ctx.data_plane.lock() {
                 Ok(dp) => dp.is_ready_for_ports(&required_ports),
                 Err(_) => false,
@@ -1047,7 +1204,10 @@ async fn reconcile(
                 (true, "Programmed")
             } else {
                 warn!("Data plane not ready: not all listener ports are bound");
-                (false, "Data plane not ready: not all listener ports are bound")
+                (
+                    false,
+                    "Data plane not ready: not all listener ports are bound",
+                )
             };
 
             status::update_gateway_status(
@@ -1094,11 +1254,14 @@ async fn reconcile(
         // Use a per-gateway field manager so SSA doesn't overwrite parents from other gateways
         let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
         // Key: (kind, namespace, name) → Vec of parent statuses
-        let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> = BTreeMap::new();
+        let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> =
+            BTreeMap::new();
         for ra in &result.route_status {
             let route_programmed = ra.accepted && programmed;
-            grouped.entry((ra.kind, &ra.namespace, &ra.name)).or_default().push(
-                status::RouteParentStatus {
+            grouped
+                .entry((ra.kind, &ra.namespace, &ra.name))
+                .or_default()
+                .push(status::RouteParentStatus {
                     controller_name: ctx.controller_name.clone(),
                     gateway_name: gw_name.clone(),
                     gateway_namespace: gw_ns.clone(),
@@ -1112,35 +1275,62 @@ async fn reconcile(
                     refs_message: ra.refs_message.clone(),
                     programmed: route_programmed,
                     generation: ra.generation,
-                },
-            );
+                });
         }
 
         for ((kind, ns, name), parents) in &grouped {
             match *kind {
                 "HTTPRoute" => {
-                    let existing = get_existing_route_parents_from_store(&ctx.store_http_routes, ns, name);
+                    let existing =
+                        get_existing_route_parents_from_store(&ctx.store_http_routes, ns, name);
                     status::update_route_status::<HTTPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager, &existing,
-                    ).await;
+                        &ctx.client,
+                        name,
+                        ns,
+                        parents,
+                        &field_manager,
+                        &existing,
+                    )
+                    .await;
                 }
                 "TCPRoute" => {
-                    let existing = get_existing_route_parents_from_store(&ctx.store_tcp_routes, ns, name);
+                    let existing =
+                        get_existing_route_parents_from_store(&ctx.store_tcp_routes, ns, name);
                     status::update_route_status::<TCPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager, &existing,
-                    ).await;
+                        &ctx.client,
+                        name,
+                        ns,
+                        parents,
+                        &field_manager,
+                        &existing,
+                    )
+                    .await;
                 }
                 "TLSRoute" => {
-                    let existing = get_existing_route_parents_from_store(&ctx.store_tls_routes, ns, name);
+                    let existing =
+                        get_existing_route_parents_from_store(&ctx.store_tls_routes, ns, name);
                     status::update_route_status::<TLSRoute>(
-                        &ctx.client, name, ns, parents, &field_manager, &existing,
-                    ).await;
+                        &ctx.client,
+                        name,
+                        ns,
+                        parents,
+                        &field_manager,
+                        &existing,
+                    )
+                    .await;
                 }
                 "UDPRoute" => {
-                    let existing = get_existing_route_parents_from_store(&ctx.store_udp_routes, ns, name);
+                    let existing =
+                        get_existing_route_parents_from_store(&ctx.store_udp_routes, ns, name);
                     status::update_route_status::<UDPRoute>(
-                        &ctx.client, name, ns, parents, &field_manager, &existing,
-                    ).await;
+                        &ctx.client,
+                        name,
+                        ns,
+                        parents,
+                        &field_manager,
+                        &existing,
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1150,11 +1340,7 @@ async fn reconcile(
     Ok(Action::await_change())
 }
 
-fn error_policy(
-    _obj: Arc<Gateway>,
-    _error: &ReconcileError,
-    _ctx: Arc<ControllerCtx>,
-) -> Action {
+fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
     warn!("Controller reconciliation error, requeueing in 30s");
     Action::requeue(Duration::from_secs(30))
 }

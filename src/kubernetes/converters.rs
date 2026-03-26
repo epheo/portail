@@ -5,16 +5,16 @@
 
 use anyhow::{anyhow, Result};
 
-use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
-use gateway_api::httproutes::*;
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
+use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
+use gateway_api::httproutes::*;
 
 use crate::config::*;
 use crate::logging::warn;
 
-use super::parent_ref::{L4BackendRefAccess, extract_parent_refs};
+use super::parent_ref::{extract_parent_refs, L4BackendRefAccess};
 
 // ---------------------------------------------------------------------------
 // Type alias for TLS certificate data
@@ -49,7 +49,11 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
     })
 }
 
-pub(crate) fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &CertData) -> Result<ListenerConfig> {
+pub(crate) fn convert_listener(
+    l: &GatewayListeners,
+    gw_ns: &str,
+    cert_data: &CertData,
+) -> Result<ListenerConfig> {
     let protocol = match l.protocol.as_str() {
         "HTTP" => Protocol::HTTP,
         "HTTPS" => Protocol::HTTPS,
@@ -67,14 +71,24 @@ pub(crate) fn convert_listener(l: &GatewayListeners, gw_ns: &str, cert_data: &Ce
         let certificate_refs = t
             .certificate_refs
             .as_ref()
-            .map(|refs| refs.iter().map(|r| {
-                let secret_ns = r.namespace.as_deref().unwrap_or(gw_ns);
-                let key = (r.name.clone(), secret_ns.to_string());
-                let (cert_pem, key_pem) = cert_data.get(&key)
-                    .map(|(c, k)| (Some(c.clone()), Some(k.clone())))
-                    .unwrap_or((None, None));
-                CertificateRef { name: r.name.clone(), hostname: l.hostname.clone(), cert_pem, key_pem }
-            }).collect())
+            .map(|refs| {
+                refs.iter()
+                    .map(|r| {
+                        let secret_ns = r.namespace.as_deref().unwrap_or(gw_ns);
+                        let key = (r.name.clone(), secret_ns.to_string());
+                        let (cert_pem, key_pem) = cert_data
+                            .get(&key)
+                            .map(|(c, k)| (Some(c.clone()), Some(k.clone())))
+                            .unwrap_or((None, None));
+                        CertificateRef {
+                            name: r.name.clone(),
+                            hostname: l.hostname.clone(),
+                            cert_pem,
+                            key_pem,
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         TlsConfig {
             mode,
@@ -106,7 +120,12 @@ pub(crate) fn convert_http_route(route: &HTTPRoute, gateway_name: &str) -> Resul
         .spec
         .rules
         .as_ref()
-        .map(|rules| rules.iter().map(|r| convert_http_rule(r, ns)).collect::<Result<Vec<_>>>())
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|r| convert_http_rule(r, ns))
+                .collect::<Result<Vec<_>>>()
+        })
         .transpose()?
         .unwrap_or_default();
 
@@ -127,13 +146,21 @@ pub(crate) fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpR
     let filters = rule
         .filters
         .as_ref()
-        .map(|f| f.iter().filter_map(|f| convert_http_filter(f, ns).ok()).collect::<Vec<_>>())
+        .map(|f| {
+            f.iter()
+                .filter_map(|f| convert_http_filter(f, ns).ok())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     let backend_refs = rule
         .backend_refs
         .as_ref()
-        .map(|refs| refs.iter().map(|br| convert_http_backend_ref(br, ns)).collect::<Vec<_>>())
+        .map(|refs| {
+            refs.iter()
+                .map(|br| convert_http_backend_ref(br, ns))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     let timeouts = rule.timeouts.as_ref().map(convert_timeouts);
@@ -147,17 +174,20 @@ pub(crate) fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpR
 }
 
 pub(crate) fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
-    let method = m.method.as_ref().map(|m| match m {
-        HTTPRouteRulesMatchesMethod::Get => "GET",
-        HTTPRouteRulesMatchesMethod::Head => "HEAD",
-        HTTPRouteRulesMatchesMethod::Post => "POST",
-        HTTPRouteRulesMatchesMethod::Put => "PUT",
-        HTTPRouteRulesMatchesMethod::Delete => "DELETE",
-        HTTPRouteRulesMatchesMethod::Connect => "CONNECT",
-        HTTPRouteRulesMatchesMethod::Options => "OPTIONS",
-        HTTPRouteRulesMatchesMethod::Trace => "TRACE",
-        HTTPRouteRulesMatchesMethod::Patch => "PATCH",
-    }.to_string());
+    let method = m.method.as_ref().map(|m| {
+        match m {
+            HTTPRouteRulesMatchesMethod::Get => "GET",
+            HTTPRouteRulesMatchesMethod::Head => "HEAD",
+            HTTPRouteRulesMatchesMethod::Post => "POST",
+            HTTPRouteRulesMatchesMethod::Put => "PUT",
+            HTTPRouteRulesMatchesMethod::Delete => "DELETE",
+            HTTPRouteRulesMatchesMethod::Connect => "CONNECT",
+            HTTPRouteRulesMatchesMethod::Options => "OPTIONS",
+            HTTPRouteRulesMatchesMethod::Trace => "TRACE",
+            HTTPRouteRulesMatchesMethod::Patch => "PATCH",
+        }
+        .to_string()
+    });
 
     let path = m.path.as_ref().map(|p| {
         let match_type = match p.r#type {
@@ -229,11 +259,29 @@ fn convert_query_param_match(q: &HTTPRouteRulesMatchesQueryParams) -> HttpQueryP
 macro_rules! convert_header_mod {
     ($hm:expr) => {
         HeaderModifierConfig {
-            add: $hm.add.as_ref()
-                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
+            add: $hm
+                .add
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .map(|h| HttpHeader {
+                            name: h.name.clone(),
+                            value: h.value.clone(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
-            set: $hm.set.as_ref()
-                .map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect())
+            set: $hm
+                .set
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .map(|h| HttpHeader {
+                            name: h.name.clone(),
+                            value: h.value.clone(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             remove: $hm.remove.clone().unwrap_or_default(),
         }
@@ -308,33 +356,31 @@ fn convert_redirect_config(rr: &HTTPRouteRulesFiltersRequestRedirect) -> Request
     }
 }
 
-fn convert_path_modifier(p: &HTTPRouteRulesFiltersRequestRedirectPath) -> Option<HttpURLRewritePath> {
+fn convert_path_modifier(
+    p: &HTTPRouteRulesFiltersRequestRedirectPath,
+) -> Option<HttpURLRewritePath> {
     match p.r#type {
-        HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => {
-            p.replace_full_path.as_ref().map(|v| HttpURLRewritePath::ReplaceFullPath {
-                value: v.clone(),
-            })
-        }
-        HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => {
-            p.replace_prefix_match.as_ref().map(|v| HttpURLRewritePath::ReplacePrefixMatch {
-                value: v.clone(),
-            })
-        }
+        HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
+            .replace_full_path
+            .as_ref()
+            .map(|v| HttpURLRewritePath::ReplaceFullPath { value: v.clone() }),
+        HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
+            .replace_prefix_match
+            .as_ref()
+            .map(|v| HttpURLRewritePath::ReplacePrefixMatch { value: v.clone() }),
     }
 }
 
 fn convert_url_rewrite_config(ur: &HTTPRouteRulesFiltersUrlRewrite) -> URLRewriteConfig {
     let path = ur.path.as_ref().and_then(|p| match p.r#type {
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => {
-            p.replace_full_path.as_ref().map(|v| HttpURLRewritePath::ReplaceFullPath {
-                value: v.clone(),
-            })
-        }
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => {
-            p.replace_prefix_match.as_ref().map(|v| HttpURLRewritePath::ReplacePrefixMatch {
-                value: v.clone(),
-            })
-        }
+        HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
+            .replace_full_path
+            .as_ref()
+            .map(|v| HttpURLRewritePath::ReplaceFullPath { value: v.clone() }),
+        HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
+            .replace_prefix_match
+            .as_ref()
+            .map(|v| HttpURLRewritePath::ReplacePrefixMatch { value: v.clone() }),
     });
 
     URLRewriteConfig {
@@ -343,17 +389,22 @@ fn convert_url_rewrite_config(ur: &HTTPRouteRulesFiltersUrlRewrite) -> URLRewrit
     }
 }
 
-fn convert_mirror_config(
-    rm: &HTTPRouteRulesFiltersRequestMirror,
-    ns: &str,
-) -> RequestMirrorConfig {
+fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> RequestMirrorConfig {
     RequestMirrorConfig {
         backend_ref: BackendRef {
-            name: backend_dns_name(&rm.backend_ref.name, rm.backend_ref.namespace.as_deref(), ns),
+            name: backend_dns_name(
+                &rm.backend_ref.name,
+                rm.backend_ref.namespace.as_deref(),
+                ns,
+            ),
             port: rm.backend_ref.port.unwrap_or(80) as u16,
             weight: 1,
             group: rm.backend_ref.group.clone().unwrap_or_default(),
-            kind: rm.backend_ref.kind.clone().unwrap_or_else(|| "Service".to_string()),
+            kind: rm
+                .backend_ref
+                .kind
+                .clone()
+                .unwrap_or_else(|| "Service".to_string()),
             filters: vec![],
             app_protocol: None,
         },
@@ -377,33 +428,84 @@ pub(crate) fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str)
 }
 
 /// Convert per-backend filters (e.g. BackendRequestHeaderModifier).
-pub(crate) fn convert_backend_ref_filters(filters: &Option<Vec<HTTPRouteRulesBackendRefsFilters>>) -> Vec<HttpRouteFilter> {
-    let Some(filters) = filters else { return vec![] };
-    filters.iter().filter_map(|f| {
-        match f.r#type {
-            HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
-                let hm = f.request_header_modifier.as_ref()?;
-                Some(HttpRouteFilter::RequestHeaderModifier {
-                    config: HeaderModifierConfig {
-                        add: hm.add.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
-                        set: hm.set.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
-                        remove: hm.remove.clone().unwrap_or_default(),
-                    }
-                })
+pub(crate) fn convert_backend_ref_filters(
+    filters: &Option<Vec<HTTPRouteRulesBackendRefsFilters>>,
+) -> Vec<HttpRouteFilter> {
+    let Some(filters) = filters else {
+        return vec![];
+    };
+    filters
+        .iter()
+        .filter_map(|f| {
+            match f.r#type {
+                HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+                    let hm = f.request_header_modifier.as_ref()?;
+                    Some(HttpRouteFilter::RequestHeaderModifier {
+                        config: HeaderModifierConfig {
+                            add: hm
+                                .add
+                                .as_ref()
+                                .map(|v| {
+                                    v.iter()
+                                        .map(|h| HttpHeader {
+                                            name: h.name.clone(),
+                                            value: h.value.clone(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            set: hm
+                                .set
+                                .as_ref()
+                                .map(|v| {
+                                    v.iter()
+                                        .map(|h| HttpHeader {
+                                            name: h.name.clone(),
+                                            value: h.value.clone(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            remove: hm.remove.clone().unwrap_or_default(),
+                        },
+                    })
+                }
+                HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+                    let hm = f.response_header_modifier.as_ref()?;
+                    Some(HttpRouteFilter::ResponseHeaderModifier {
+                        config: HeaderModifierConfig {
+                            add: hm
+                                .add
+                                .as_ref()
+                                .map(|v| {
+                                    v.iter()
+                                        .map(|h| HttpHeader {
+                                            name: h.name.clone(),
+                                            value: h.value.clone(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            set: hm
+                                .set
+                                .as_ref()
+                                .map(|v| {
+                                    v.iter()
+                                        .map(|h| HttpHeader {
+                                            name: h.name.clone(),
+                                            value: h.value.clone(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            remove: hm.remove.clone().unwrap_or_default(),
+                        },
+                    })
+                }
+                _ => None, // Other filter types not valid at backend level
             }
-            HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
-                let hm = f.response_header_modifier.as_ref()?;
-                Some(HttpRouteFilter::ResponseHeaderModifier {
-                    config: HeaderModifierConfig {
-                        add: hm.add.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
-                        set: hm.set.as_ref().map(|v| v.iter().map(|h| HttpHeader { name: h.name.clone(), value: h.value.clone() }).collect()).unwrap_or_default(),
-                        remove: hm.remove.clone().unwrap_or_default(),
-                    }
-                })
-            }
-            _ => None,  // Other filter types not valid at backend level
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +515,10 @@ pub(crate) fn convert_backend_ref_filters(filters: &Option<Vec<HTTPRouteRulesBac
 pub(crate) fn convert_timeouts(t: &HTTPRouteRulesTimeouts) -> HttpRouteTimeouts {
     HttpRouteTimeouts {
         request: t.request.as_ref().and_then(|s| parse_gateway_duration(s)),
-        backend_request: t.backend_request.as_ref().and_then(|s| parse_gateway_duration(s)),
+        backend_request: t
+            .backend_request
+            .as_ref()
+            .and_then(|s| parse_gateway_duration(s)),
     }
 }
 
@@ -428,26 +533,43 @@ fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
 
 /// Shared conversion for L4 backend refs (TCP/TLS/UDP all have the same fields).
 /// `default_port`: protocol-implied default (TCP=80, TLS=443) or `None` if port is required (UDP).
-pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(br: &B, ns: &str, protocol: &str, default_port: Option<i32>) -> BackendRef {
+pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
+    br: &B,
+    ns: &str,
+    protocol: &str,
+    default_port: Option<i32>,
+) -> BackendRef {
     let port = match br.br_port() {
         Some(p) => p as u16,
         None => match default_port {
             Some(dp) => {
-                warn!("{} backend ref '{}' missing port, defaulting to {}", protocol, br.br_name(), dp);
+                warn!(
+                    "{} backend ref '{}' missing port, defaulting to {}",
+                    protocol,
+                    br.br_name(),
+                    dp
+                );
                 dp as u16
             }
             None => {
-                warn!("{} backend ref '{}' missing required port, using 0", protocol, br.br_name());
+                warn!(
+                    "{} backend ref '{}' missing required port, using 0",
+                    protocol,
+                    br.br_name()
+                );
                 0
             }
-        }
+        },
     };
     BackendRef {
         name: backend_dns_name(br.br_name(), br.br_namespace(), ns),
         port,
         weight: br.br_weight().unwrap_or(1) as u32,
         group: br.br_group().unwrap_or_default().to_string(),
-        kind: br.br_kind().map(String::from).unwrap_or_else(|| "Service".to_string()),
+        kind: br
+            .br_kind()
+            .map(String::from)
+            .unwrap_or_else(|| "Service".to_string()),
         filters: vec![],
         app_protocol: None,
     }
@@ -457,9 +579,16 @@ pub(crate) fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<
     let ns = route_namespace(&route.metadata);
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
 
-    let rules = route.spec.rules.iter()
+    let rules = route
+        .spec
+        .rules
+        .iter()
         .map(|r| TcpRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "TCP", Some(80))).collect(),
+            backend_refs: r
+                .backend_refs
+                .iter()
+                .map(|br| convert_l4_backend_ref(br, ns, "TCP", Some(80)))
+                .collect(),
         })
         .collect();
 
@@ -471,22 +600,40 @@ pub(crate) fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let hostnames = route.spec.hostnames.clone();
 
-    let rules = route.spec.rules.iter()
+    let rules = route
+        .spec
+        .rules
+        .iter()
         .map(|r| TlsRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "TLS", Some(443))).collect(),
+            backend_refs: r
+                .backend_refs
+                .iter()
+                .map(|br| convert_l4_backend_ref(br, ns, "TLS", Some(443)))
+                .collect(),
         })
         .collect();
 
-    Ok(TlsRouteConfig { parent_refs, hostnames, rules })
+    Ok(TlsRouteConfig {
+        parent_refs,
+        hostnames,
+        rules,
+    })
 }
 
 pub(crate) fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteConfig> {
     let ns = route_namespace(&route.metadata);
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
 
-    let rules = route.spec.rules.iter()
+    let rules = route
+        .spec
+        .rules
+        .iter()
         .map(|r| UdpRouteRule {
-            backend_refs: r.backend_refs.iter().map(|br| convert_l4_backend_ref(br, ns, "UDP", None)).collect(),
+            backend_refs: r
+                .backend_refs
+                .iter()
+                .map(|br| convert_l4_backend_ref(br, ns, "UDP", None))
+                .collect(),
         })
         .collect();
 
@@ -498,7 +645,11 @@ pub(crate) fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<
 // ---------------------------------------------------------------------------
 
 /// Format backend name as `{service}.{namespace}.svc` for DNS resolution.
-pub(crate) fn backend_dns_name(name: &str, namespace: Option<&str>, route_namespace: &str) -> String {
+pub(crate) fn backend_dns_name(
+    name: &str,
+    namespace: Option<&str>,
+    route_namespace: &str,
+) -> String {
     let ns = namespace.unwrap_or(route_namespace);
     format!("{}.{}.svc", name, ns)
 }
