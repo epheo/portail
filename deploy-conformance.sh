@@ -3,7 +3,7 @@
 # Usage: ./deploy-conformance.sh [--skip-build] [--skip-deploy] [--skip-tests] [--no-kind] [--no-cleanup]
 set -euo pipefail
 
-IMAGE="quay.io/epheo/portail:latest"
+IMAGE="ghcr.io/epheo/portail:latest"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_DIR="$PROJECT_DIR/deploy"
 GATEWAY_API_VERSION="v1.4.1"

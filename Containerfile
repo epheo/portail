@@ -1,11 +1,21 @@
-# Build portail in your dev environment first:
-#   cargo build --release
+# Multi-stage build: compile Rust binary, then copy into minimal runtime image.
 #
-# Then build the container image:
-#   podman build -t quay.io/epheo/portail:latest -f Containerfile .
+# Build locally:
+#   podman build -t ghcr.io/epheo/portail:latest -f Containerfile .
+#
+# Or with a pre-built binary (faster iteration):
+#   cargo build --release
+#   podman build --target runtime --build-arg PREBUILT=1 -t ghcr.io/epheo/portail:latest -f Containerfile .
 
-FROM registry.fedoraproject.org/fedora-minimal:43
+FROM docker.io/library/rust:1.86-slim AS builder
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN cargo build --release && strip target/release/portail
+
+FROM registry.fedoraproject.org/fedora-minimal:43 AS runtime
 RUN microdnf install -y libgcc && microdnf clean all
-COPY target/release/portail /usr/local/bin/portail
+COPY --from=builder /src/target/release/portail /usr/local/bin/portail
 ENTRYPOINT ["/usr/local/bin/portail"]
 CMD ["--kubernetes"]

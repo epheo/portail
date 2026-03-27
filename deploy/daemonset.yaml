@@ -19,7 +19,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: portail
-        image: quay.io/epheo/portail:latest
+        image: ghcr.io/epheo/portail:latest
         imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:

@@ -117,7 +117,10 @@ fn map_route_to_gateways<R: kube::Resource<Scope = k8s_openapi::NamespaceResourc
     let mut refs = Vec::new();
     if let Some(prs) = parent_refs {
         for pr in prs {
-            if pr.ref_group().is_some_and(|g| g != "gateway.networking.k8s.io") {
+            if pr
+                .ref_group()
+                .is_some_and(|g| g != "gateway.networking.k8s.io")
+            {
                 continue;
             }
             if pr.ref_kind().is_some_and(|k| k != "Gateway") {
@@ -143,7 +146,6 @@ fn all_gateway_refs(store: &Store<Gateway>) -> Vec<ObjectRef<Gateway>> {
         .map(|gw| ObjectRef::from_obj(&*gw))
         .collect()
 }
-
 
 pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
@@ -196,8 +198,7 @@ pub async fn run_controller(
     // Core resource reflectors — no generation filter (core types don't reliably set it)
     let (store_namespaces, namespace_stream) =
         create_reflector(Api::<Namespace>::all(client.clone()));
-    let (store_services, service_stream) =
-        create_reflector(Api::<Service>::all(client.clone()));
+    let (store_services, service_stream) = create_reflector(Api::<Service>::all(client.clone()));
     let (store_endpoint_slices, endpoint_slice_stream) =
         create_reflector(Api::<EndpointSlice>::all(client.clone()));
     let (store_reference_grants, reference_grant_stream) =
@@ -273,27 +274,30 @@ pub async fn run_controller(
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw4)
         })
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS
-        .watches_stream(secret_stream, move |secret: Secret| -> Vec<ObjectRef<Gateway>> {
-            let secret_name = secret.metadata.name.as_deref().unwrap_or("");
-            let secret_ns = secret.metadata.namespace.as_deref().unwrap_or("default");
-            gw5.state()
-                .into_iter()
-                .filter(|g| {
-                    let gw_ns = g.metadata.namespace.as_deref().unwrap_or("default");
-                    g.spec.listeners.iter().any(|l| {
-                        l.tls.as_ref().is_some_and(|tls| {
-                            tls.certificate_refs.as_ref().is_some_and(|refs| {
-                                refs.iter().any(|cr| {
-                                    cr.name == secret_name
-                                        && cr.namespace.as_deref().unwrap_or(gw_ns) == secret_ns
+        .watches_stream(
+            secret_stream,
+            move |secret: Secret| -> Vec<ObjectRef<Gateway>> {
+                let secret_name = secret.metadata.name.as_deref().unwrap_or("");
+                let secret_ns = secret.metadata.namespace.as_deref().unwrap_or("default");
+                gw5.state()
+                    .into_iter()
+                    .filter(|g| {
+                        let gw_ns = g.metadata.namespace.as_deref().unwrap_or("default");
+                        g.spec.listeners.iter().any(|l| {
+                            l.tls.as_ref().is_some_and(|tls| {
+                                tls.certificate_refs.as_ref().is_some_and(|refs| {
+                                    refs.iter().any(|cr| {
+                                        cr.name == secret_name
+                                            && cr.namespace.as_deref().unwrap_or(gw_ns) == secret_ns
+                                    })
                                 })
                             })
                         })
                     })
-                })
-                .map(|g| ObjectRef::from_obj(&*g))
-                .collect()
-        })
+                    .map(|g| ObjectRef::from_obj(&*g))
+                    .collect()
+            },
+        )
         // EndpointSlice, Service, Namespace, ReferenceGrant: broad — reconcile all
         // Gateways. These have complex multi-hop mappings and the 1s debounce
         // coalesces frequent EndpointSlice events from pod scaling/readiness.
@@ -306,9 +310,7 @@ pub async fn run_controller(
             let gw = ctx.store_gateways.clone();
             move |_: ReferenceGrant| all_gateway_refs(&gw)
         })
-        .with_config(
-            kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)),
-        )
+        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
 
@@ -324,9 +326,7 @@ pub async fn run_controller(
         store: store_gateway_classes,
     });
     let gc_controller = gc_controller
-        .with_config(
-            kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)),
-        )
+        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile_gateway_class, gc_error_policy, gc_ctx);
 
@@ -371,7 +371,10 @@ async fn reconcile(
     let gc = match ctx.store_gateway_classes.get(&gc_ref) {
         Some(gc) => gc,
         None => {
-            debug!("GatewayClass '{}' not in store yet, requeueing", gateway_class_name);
+            debug!(
+                "GatewayClass '{}' not in store yet, requeueing",
+                gateway_class_name
+            );
             return Ok(Action::requeue(Duration::from_secs(1)));
         }
     };
@@ -1374,13 +1377,7 @@ async fn reconcile_gateway_class(
 
     let is_accepted = accepted.as_deref() == Some(gc.name_any().as_str());
     if is_accepted {
-        status::update_gateway_class_status(
-            &ctx.client,
-            &gc,
-            true,
-            "Accepted by portail",
-        )
-        .await;
+        status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
     } else {
         status::update_gateway_class_status(
             &ctx.client,
