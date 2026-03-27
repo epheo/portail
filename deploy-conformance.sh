@@ -40,15 +40,15 @@ else
   export KUBECONFIG="${KUBECONFIG:-$PROJECT_DIR/.kubeconfig-local}"
 fi
 
-# Get supported features from the binary (single source of truth)
-SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
-
 # ── 1. Build binary ──────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
   echo "━━━ [1/6] Building release binary ━━━"
   cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
   echo "✓ Binary built"
 fi
+
+# Get supported features from the binary (single source of truth)
+SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
 
 # ── 2. Build container image ─────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then

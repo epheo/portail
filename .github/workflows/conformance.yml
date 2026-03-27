@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  KIND_EXPERIMENTAL_PROVIDER: podman
+
 jobs:
   conformance:
     name: Gateway API Conformance
