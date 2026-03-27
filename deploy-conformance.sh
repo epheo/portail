@@ -121,6 +121,7 @@ if [ "$SKIP_TESTS" = false ]; then
     rm -f /tmp/conformance.test
 
     echo "Running conformance tests inside Kind container..."
+    TEST_EXIT=0
     podman exec -e KUBECONFIG=/etc/kubernetes/admin.conf "$CONTAINER_NAME" /conformance.test \
       -test.v -test.timeout 20m -test.run TestConformance \
       -gateway-class=portail \
@@ -132,9 +133,9 @@ if [ "$SKIP_TESTS" = false ]; then
       -url=https://github.com/epheo/portail \
       -version="$PORTAIL_VERSION" \
       -contact=@epheo \
-      2>&1 | tee "$PROJECT_DIR/conformance-results.log"
+      2>&1 | tee "$PROJECT_DIR/conformance-results.log" || TEST_EXIT=$?
 
-    # Copy report back to host
+    # Copy report back before cleanup trap fires
     podman cp "$CONTAINER_NAME":/conformance-report.yaml "$REPORT_OUTPUT" 2>/dev/null || true
   else
     go test -v -timeout 20m ./conformance -run TestConformance -args \
@@ -152,4 +153,5 @@ if [ "$SKIP_TESTS" = false ]; then
 
   echo "━━━ Done ━━━"
   echo "Conformance report written to: $REPORT_OUTPUT"
+  exit "${TEST_EXIT:-0}"
 fi
