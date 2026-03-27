@@ -301,6 +301,27 @@ pub struct URLRewriteConfig {
 #[serde(rename_all = "camelCase")]
 pub struct RequestMirrorConfig {
     pub backend_ref: BackendRef,
+    /// Percentage of requests to mirror (0–100). If neither percent nor fraction
+    /// is specified, 100% of requests are mirrored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u32>,
+    /// Fraction of requests to mirror (numerator/denominator).
+    /// Takes precedence over `percent` if both are specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction: Option<MirrorFraction>,
+}
+
+/// Fraction representation for percentage-based mirroring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorFraction {
+    pub numerator: u32,
+    /// Defaults to 100 if not specified (matching Gateway API spec).
+    #[serde(default = "default_fraction_denominator")]
+    pub denominator: u32,
+}
+
+fn default_fraction_denominator() -> u32 {
+    100
 }
 
 /// HTTP route filter (Gateway API spec)

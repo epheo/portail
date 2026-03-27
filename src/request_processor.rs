@@ -53,13 +53,21 @@ fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     result
 }
 
+/// A mirror target with percentage-based dispatch control.
+#[derive(Debug, Clone)]
+pub struct MirrorTarget {
+    pub addr: SocketAddr,
+    /// Percentage of requests to mirror (0–100).
+    pub percent: u32,
+}
+
 /// Filter data only allocated when a route actually has filters.
 #[derive(Debug, Clone)]
 pub struct HttpFilterData {
     pub request_header_mods: Option<HeaderModifications>,
     pub response_header_mods: Option<HeaderModifications>,
     pub url_rewrite: Option<URLRewrite>,
-    pub mirror_addrs: Vec<SocketAddr>,
+    pub mirror_targets: Vec<MirrorTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,7 +262,7 @@ fn analyze_http_request(
     let mut request_header_mods: Option<HeaderModifications> = None;
     let mut response_header_mods: Option<HeaderModifications> = None;
     let mut url_rewrite: Option<URLRewrite> = None;
-    let mut mirror_addrs: Vec<SocketAddr> = Vec::new();
+    let mut mirror_targets: Vec<MirrorTarget> = Vec::new();
 
     for filter in &rule.filters {
         match filter {
@@ -288,8 +296,14 @@ fn analyze_http_request(
                     path: rewritten_path,
                 });
             }
-            HttpFilter::RequestMirror { backend_addr } => {
-                mirror_addrs.push(*backend_addr);
+            HttpFilter::RequestMirror {
+                backend_addr,
+                mirror_percent,
+            } => {
+                mirror_targets.push(MirrorTarget {
+                    addr: *backend_addr,
+                    percent: *mirror_percent,
+                });
             }
         }
     }
@@ -353,7 +367,7 @@ fn analyze_http_request(
             request_header_mods,
             response_header_mods,
             url_rewrite,
-            mirror_addrs,
+            mirror_targets,
         })),
         backend_timeout: rule.backend_request_timeout,
         request_timeout: rule.request_timeout,
@@ -711,6 +725,7 @@ mod tests {
             8001,
             vec![HttpFilter::RequestMirror {
                 backend_addr: "127.0.0.1:9999".parse().unwrap(),
+                mirror_percent: 100,
             }],
         );
         let sel = BackendSelector::new();
@@ -719,8 +734,9 @@ mod tests {
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
-            assert_eq!(fd.mirror_addrs.len(), 1);
-            assert_eq!(fd.mirror_addrs[0], "127.0.0.1:9999".parse().unwrap());
+            assert_eq!(fd.mirror_targets.len(), 1);
+            assert_eq!(fd.mirror_targets[0].addr, "127.0.0.1:9999".parse().unwrap());
+            assert_eq!(fd.mirror_targets[0].percent, 100);
         } else {
             panic!("expected HttpForward");
         }
@@ -736,9 +752,11 @@ mod tests {
             vec![
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9998".parse().unwrap(),
+                    mirror_percent: 50,
                 },
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9999".parse().unwrap(),
+                    mirror_percent: 100,
                 },
             ],
         );
@@ -748,7 +766,9 @@ mod tests {
 
         if let ProcessingDecision::HttpForward { filters, .. } = decision {
             let fd = filters.unwrap();
-            assert_eq!(fd.mirror_addrs.len(), 2);
+            assert_eq!(fd.mirror_targets.len(), 2);
+            assert_eq!(fd.mirror_targets[0].percent, 50);
+            assert_eq!(fd.mirror_targets[1].percent, 100);
         } else {
             panic!("expected HttpForward");
         }

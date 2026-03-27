@@ -16,6 +16,7 @@ use crate::backend_pool::BackendPool;
 use crate::health::HealthRegistry;
 use crate::http_filters::{
     apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
+    MIRROR_BODY_MAX,
 };
 use crate::http_parser::find_header_end;
 use crate::logging::{debug, info, warn};
@@ -399,6 +400,13 @@ async fn handle_http_forward(
         // Determine header boundary for body separation
         let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
 
+        // --- Prepare mirror header data (before body relay) ---
+        // We defer actual mirror dispatch until after the full body is collected.
+        let has_mirrors = filter_data
+            .as_ref()
+            .is_some_and(|fd| !fd.mirror_targets.is_empty());
+        let mut mirror_header_data: Option<Vec<u8>> = None;
+
         if let Some(ref fd) = filter_data {
             let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
             if has_mods {
@@ -407,11 +415,8 @@ async fn handle_http_forward(
                     fd.request_header_mods.as_ref(),
                     fd.url_rewrite.as_ref(),
                 );
-                // Mirror needs full request (headers + body)
-                if !fd.mirror_addrs.is_empty() {
-                    let mut mirror_data = modified_headers.clone();
-                    mirror_data.extend_from_slice(&buf[header_end..request_bytes]);
-                    dispatch_mirrors(&fd.mirror_addrs, &mirror_data);
+                if has_mirrors {
+                    mirror_header_data = Some(modified_headers.clone());
                 }
                 // Send modified headers, then original body — zero-copy for body
                 backend.write_all(&modified_headers).await?;
@@ -420,8 +425,8 @@ async fn handle_http_forward(
                     backend.write_all(body).await?;
                 }
             } else {
-                if !fd.mirror_addrs.is_empty() {
-                    dispatch_mirrors(&fd.mirror_addrs, &buf[..request_bytes]);
+                if has_mirrors {
+                    mirror_header_data = Some(buf[..header_end].to_vec());
                 }
                 backend.write_all(&buf[..request_bytes]).await?;
             }
@@ -430,7 +435,23 @@ async fn handle_http_forward(
         }
 
         // --- Relay remaining request body bytes (the core POST fix) ---
+        // When mirrors are active, tee body chunks into a buffer (up to MIRROR_BODY_MAX).
         let body_in_initial = request_bytes.saturating_sub(header_end);
+        let initial_body = &buf[header_end..request_bytes];
+
+        // Mirror body buffer: only allocated when mirrors need body data.
+        // Starts with the body portion from the initial read.
+        let mut mirror_body: Option<Vec<u8>> = if has_mirrors {
+            let mut mb = Vec::with_capacity(body_in_initial.min(MIRROR_BODY_MAX));
+            let cap = body_in_initial.min(MIRROR_BODY_MAX);
+            mb.extend_from_slice(&initial_body[..cap]);
+            Some(mb)
+        } else {
+            None
+        };
+        // Track if we exceeded the cap (skip mirror dispatch if so)
+        let mut mirror_body_overflow = has_mirrors && body_in_initial > MIRROR_BODY_MAX;
+
         if let Some(cl) = req_content_length {
             let mut remaining = cl.saturating_sub(body_in_initial);
             while remaining > 0 {
@@ -440,6 +461,23 @@ async fn handle_http_forward(
                 }
                 let to_send = n.min(remaining);
                 backend.write_all(&buf[..to_send]).await?;
+
+                // Tee into mirror buffer if within cap
+                if let Some(ref mut mb) = mirror_body {
+                    if !mirror_body_overflow {
+                        let space = MIRROR_BODY_MAX.saturating_sub(mb.len());
+                        if to_send <= space {
+                            mb.extend_from_slice(&buf[..to_send]);
+                        } else {
+                            mirror_body_overflow = true;
+                            warn!(
+                                "mirror body exceeds {}B cap, skipping mirror for this request",
+                                MIRROR_BODY_MAX
+                            );
+                        }
+                    }
+                }
+
                 remaining -= to_send;
             }
         } else if req_is_chunked {
@@ -461,6 +499,34 @@ async fn handle_http_forward(
                 }
                 backend.write_all(&buf[..n]).await?;
                 append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
+
+                // Tee into mirror buffer if within cap
+                if let Some(ref mut mb) = mirror_body {
+                    if !mirror_body_overflow {
+                        let space = MIRROR_BODY_MAX.saturating_sub(mb.len());
+                        if n <= space {
+                            mb.extend_from_slice(&buf[..n]);
+                        } else {
+                            mirror_body_overflow = true;
+                            warn!(
+                                "mirror body exceeds {}B cap, skipping mirror for this request",
+                                MIRROR_BODY_MAX
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Dispatch mirrors with complete request data ---
+        if has_mirrors && !mirror_body_overflow {
+            if let Some(ref fd) = filter_data {
+                let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
+                let body_bytes = mirror_body.as_deref().unwrap_or(&[]);
+                let mut full_request = Vec::with_capacity(header_bytes.len() + body_bytes.len());
+                full_request.extend_from_slice(header_bytes);
+                full_request.extend_from_slice(body_bytes);
+                dispatch_mirrors(&fd.mirror_targets, &full_request);
             }
         }
 

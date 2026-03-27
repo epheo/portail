@@ -390,6 +390,11 @@ fn convert_url_rewrite_config(ur: &HTTPRouteRulesFiltersUrlRewrite) -> URLRewrit
 }
 
 fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> RequestMirrorConfig {
+    let fraction = rm.fraction.as_ref().map(|f| crate::config::MirrorFraction {
+        numerator: f.numerator.max(0) as u32,
+        denominator: f.denominator.map(|d| d.max(1) as u32).unwrap_or(100),
+    });
+    let percent = rm.percent.map(|p| p.clamp(0, 100) as u32);
     RequestMirrorConfig {
         backend_ref: BackendRef {
             name: backend_dns_name(
@@ -408,6 +413,8 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
             filters: vec![],
             app_protocol: None,
         },
+        percent,
+        fraction,
     }
 }
 

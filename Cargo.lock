@@ -1489,6 +1489,7 @@ dependencies = [
  "clap",
  "criterion",
  "dashmap",
+ "fastrand",
  "fnv",
  "futures",
  "gateway-api",

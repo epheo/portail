@@ -664,6 +664,8 @@ mod tests {
                         filters: vec![],
                         app_protocol: None,
                     },
+                    percent: None,
+                    fraction: None,
                 },
             }],
             vec![default_backend()],

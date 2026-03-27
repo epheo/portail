@@ -304,6 +304,8 @@ impl PortailConfig {
                                     filters: vec![],
                                     app_protocol: None,
                                 },
+                                percent: None,
+                                fraction: None,
                             },
                         }],
                         matches: vec![HttpRouteMatch::path_prefix("/mirrored")],

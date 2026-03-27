@@ -612,8 +612,20 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                     config.backend_ref.port,
                     config.backend_ref.weight,
                 )?;
+                // Fraction takes precedence over percent per Gateway API spec.
+                // If neither is set, mirror 100% of requests.
+                let effective_percent = if let Some(ref frac) = config.fraction {
+                    if frac.denominator > 0 {
+                        ((frac.numerator as u64 * 100) / frac.denominator as u64).min(100) as u32
+                    } else {
+                        100
+                    }
+                } else {
+                    config.percent.unwrap_or(100).min(100)
+                };
                 Self::RequestMirror {
                     backend_addr: backend.socket_addr,
+                    mirror_percent: effective_percent,
                 }
             }
         })
@@ -964,8 +976,13 @@ mod tests {
             .find_http_route("example.com", "GET", "/", &[], "", 8080)
             .unwrap();
         assert_eq!(rule.filters.len(), 1);
-        if let crate::routing::HttpFilter::RequestMirror { backend_addr } = &rule.filters[0] {
+        if let crate::routing::HttpFilter::RequestMirror {
+            backend_addr,
+            mirror_percent,
+        } = &rule.filters[0]
+        {
             assert_eq!(backend_addr.port(), 9999);
+            assert_eq!(*mirror_percent, 100); // default when no percent/fraction specified
         } else {
             panic!("expected RequestMirror filter");
         }

@@ -3,19 +3,52 @@
 //! Applies header modifications, URL rewrites, and request mirroring
 //! on raw byte slices — no intermediate String allocations on the request path.
 
-use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
+use crate::logging::warn;
+use crate::request_processor::{HeaderModifications, MirrorTarget, RewrittenPath, URLRewrite};
 
-/// Fire-and-forget mirror dispatch. Response is discarded per Gateway API spec.
-pub(crate) fn dispatch_mirrors(mirror_addrs: &[SocketAddr], data: &[u8]) {
-    for &addr in mirror_addrs {
+/// Maximum request body size (bytes) that will be buffered for mirroring.
+/// Bodies exceeding this are silently skipped (primary request unaffected).
+/// Matches Envoy's default `per_connection_buffer_limit_bytes`.
+pub(crate) const MIRROR_BODY_MAX: usize = 1024 * 1024; // 1 MB
+
+/// Fire-and-forget mirror dispatch with percentage-based filtering and timeout.
+///
+/// For each target, rolls a random number to decide whether to mirror based on
+/// the configured percentage. Spawned tasks are bounded by a total 5s timeout
+/// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends.
+pub(crate) fn dispatch_mirrors(mirror_targets: &[MirrorTarget], data: &[u8]) {
+    for target in mirror_targets {
+        // Probabilistic dispatch: skip if random roll exceeds configured percent
+        if target.percent == 0 {
+            continue;
+        }
+        if target.percent < 100 && fastrand::u32(0..100) >= target.percent {
+            continue;
+        }
+
         let data = data.to_vec();
+        let addr = target.addr;
         tokio::spawn(async move {
-            if let Ok(mut conn) = TcpStream::connect(addr).await {
-                let _ = conn.write_all(&data).await;
+            // Total timeout: 5s covers connect + write. Prevents leaked tasks
+            // when the mirror backend is slow or unreachable.
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let connect_result =
+                    tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await;
+                match connect_result {
+                    Ok(Ok(mut conn)) => {
+                        let _ = conn.write_all(&data).await;
+                    }
+                    _ => {} // connect timeout or error — silently drop
+                }
+            })
+            .await;
+
+            if result.is_err() {
+                warn!("mirror dispatch to {} timed out", addr);
             }
         });
     }

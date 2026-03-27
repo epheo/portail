@@ -40,22 +40,15 @@ else
   export KUBECONFIG="${KUBECONFIG:-$PROJECT_DIR/.kubeconfig-local}"
 fi
 
-# ── 1. Build binary ──────────────────────────────────────────────
+# ── 1. Build container image ─────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [1/6] Building release binary ━━━"
-  cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
-  echo "✓ Binary built"
-fi
-
-# Get supported features from the binary (single source of truth)
-SUPPORTED_FEATURES="$("$PROJECT_DIR/target/release/portail" --supported-features)"
-
-# ── 2. Build container image ─────────────────────────────────────
-if [ "$SKIP_BUILD" = false ]; then
-  echo "━━━ [2/6] Building container image ━━━"
+  echo "━━━ [1/6] Building container image ━━━"
   podman build -t "$IMAGE" -f "$PROJECT_DIR/Containerfile" "$PROJECT_DIR"
   echo "✓ Image built: $IMAGE"
 fi
+
+# Get supported features from the image (single source of truth)
+SUPPORTED_FEATURES="$(podman run --rm "$IMAGE" --supported-features)"
 
 # ── 3. Push / load image ─────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then

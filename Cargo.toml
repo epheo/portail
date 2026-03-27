@@ -13,6 +13,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 dashmap = "6"
 socket2 = { version = "0.6.0", features = ["all"] }
 libc = "0.2"
+fastrand = "2"
 fnv = "1.0"
 memchr = "2"
 regex = "1"

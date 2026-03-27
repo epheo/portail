@@ -639,6 +639,8 @@ pub enum HttpFilter {
     },
     RequestMirror {
         backend_addr: std::net::SocketAddr,
+        /// Percentage of requests to mirror (0–100). Default 100 = mirror all.
+        mirror_percent: u32,
     },
 }
 
