@@ -1120,58 +1120,53 @@ async fn reconcile(
                 Err(_) => false,
             };
             // Check if static addresses are usable by this node
-            let (addrs_usable, addrs_reason, addrs_msg) =
-                if let Some(spec_addrs) = &gateway.spec.addresses {
-                    if spec_addrs.is_empty() {
+            let (addrs_usable, addrs_reason, addrs_msg) = if let Some(spec_addrs) =
+                &gateway.spec.addresses
+            {
+                if spec_addrs.is_empty() {
+                    (true, "Programmed", String::from("Programmed"))
+                } else {
+                    let node_ip = std::env::var("NODE_IP")
+                        .or_else(|_| std::env::var("POD_IP"))
+                        .unwrap_or_default();
+                    let all_usable = spec_addrs.iter().all(|a| {
+                        let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
+                        match addr_type {
+                            "IPAddress" => a.value.as_deref() == Some(node_ip.as_str()),
+                            // Hostname addresses are accepted but we can't verify usability,
+                            // so treat them as usable
+                            "Hostname" => true,
+                            _ => false,
+                        }
+                    });
+                    if all_usable {
                         (true, "Programmed", String::from("Programmed"))
                     } else {
-                        let node_ip = std::env::var("NODE_IP")
-                            .or_else(|_| std::env::var("POD_IP"))
-                            .unwrap_or_default();
-                        let all_usable = spec_addrs.iter().all(|a| {
-                            let addr_type =
-                                a.r#type.as_deref().unwrap_or("IPAddress");
-                            match addr_type {
-                                "IPAddress" => {
-                                    a.value.as_deref() == Some(node_ip.as_str())
-                                }
-                                // Hostname addresses are accepted but we can't verify usability,
-                                // so treat them as usable
-                                "Hostname" => true,
-                                _ => false,
-                            }
-                        });
-                        if all_usable {
-                            (true, "Programmed", String::from("Programmed"))
-                        } else {
-                            (
+                        (
                                 false,
                                 "AddressNotUsable",
                                 String::from(
                                     "One or more addresses in spec.addresses are not usable by this gateway",
                                 ),
                             )
-                        }
                     }
-                } else {
-                    (true, "Programmed", String::from("Programmed"))
-                };
+                }
+            } else {
+                (true, "Programmed", String::from("Programmed"))
+            };
 
-            let (programmed, programmed_reason, programmed_msg) =
-                if !dp_ready {
-                    warn!("Data plane not ready: not all listener ports are bound");
-                    (
-                        false,
-                        "Invalid",
-                        String::from(
-                            "Data plane not ready: not all listener ports are bound",
-                        ),
-                    )
-                } else if !addrs_usable {
-                    (false, addrs_reason, addrs_msg)
-                } else {
-                    (true, "Programmed", String::from("Programmed"))
-                };
+            let (programmed, programmed_reason, programmed_msg) = if !dp_ready {
+                warn!("Data plane not ready: not all listener ports are bound");
+                (
+                    false,
+                    "Invalid",
+                    String::from("Data plane not ready: not all listener ports are bound"),
+                )
+            } else if !addrs_usable {
+                (false, addrs_reason, addrs_msg)
+            } else {
+                (true, "Programmed", String::from("Programmed"))
+            };
 
             status::update_gateway_status(
                 &ctx.client,
