@@ -131,7 +131,7 @@ pub fn analyze_request(
 }
 
 #[inline(always)]
-fn is_http_request(data: &[u8]) -> bool {
+pub(crate) fn is_http_request(data: &[u8]) -> bool {
     if data.len() < 4 {
         return false;
     }

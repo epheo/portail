@@ -24,21 +24,6 @@ use crate::request_processor::{self, HeaderModifications, HttpFilterData, Proces
 use crate::routing::{BackendSelector, RouteTable};
 use crate::tls::{self, Connection, DynamicTlsAcceptor};
 
-/// Quick check if data starts with a known HTTP method.
-/// Used to decide whether to accumulate headers or pass through for raw TCP.
-#[inline]
-fn looks_like_http(data: &[u8]) -> bool {
-    data.starts_with(b"GET ")
-        || data.starts_with(b"POST ")
-        || data.starts_with(b"PUT ")
-        || data.starts_with(b"DELETE ")
-        || data.starts_with(b"HEAD ")
-        || data.starts_with(b"OPTIONS ")
-        || data.starts_with(b"PATCH ")
-        || data.starts_with(b"CONNECT ")
-        || data.starts_with(b"TRACE ")
-}
-
 /// Continue reading from `client` into `buf` starting at offset `already_read`
 /// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
 async fn read_remaining_headers(
@@ -219,7 +204,7 @@ async fn handle_connection(
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
-    if looks_like_http(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
+    if request_processor::is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
         match read_remaining_headers(&mut client, &mut buf, n).await {
             Ok(total) => n = total,
             Err(e) => {
@@ -264,12 +249,11 @@ async fn handle_connection(
                 backend_use_tls,
                 backend_server_name,
             } => {
-                let forward_fut = handle_http_forward(
+                let forward_fut = proxy_http_request(
                     &mut client,
                     &mut buf,
                     n,
                     backend_addr,
-                    keepalive,
                     filters,
                     backend_timeout,
                     content_length,
@@ -296,7 +280,7 @@ async fn handle_connection(
                     // the bidirectional stream is long-lived.
                     forward_fut.await?
                 };
-                if !ka {
+                if !ka || !keepalive {
                     return Ok(());
                 }
             }
@@ -342,227 +326,115 @@ async fn handle_connection(
 
 /// Handle HTTP forward requests in a keepalive loop.
 /// Returns true if the connection should continue (keepalive), false to close.
-async fn handle_http_forward(
+/// Proxy a single HTTP request to a backend and forward the response.
+/// Returns true if the response was fully received (connection reusable for keepalive).
+async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
-    initial_bytes: usize,
-    initial_backend_addr: SocketAddr,
-    initial_keepalive: bool,
-    initial_filters: Option<Box<HttpFilterData>>,
-    initial_backend_timeout: Option<std::time::Duration>,
-    initial_content_length: Option<usize>,
-    initial_is_chunked: bool,
-    initial_is_upgrade: bool,
-    initial_backend_use_tls: bool,
-    initial_backend_server_name: String,
+    request_bytes: usize,
+    backend_addr: SocketAddr,
+    filter_data: Option<Box<HttpFilterData>>,
+    backend_timeout: Option<std::time::Duration>,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    is_upgrade: bool,
+    use_tls: bool,
+    server_name: String,
     state: &mut ConnectionState,
 ) -> Result<bool> {
-    let mut backend_addr = initial_backend_addr;
-    let mut keepalive = initial_keepalive;
-    let mut request_bytes = initial_bytes;
-    let mut filter_data = initial_filters;
-    let mut per_rule_timeout = initial_backend_timeout;
-    let mut req_content_length = initial_content_length;
-    let mut req_is_chunked = initial_is_chunked;
-    let mut req_is_upgrade = initial_is_upgrade;
-    let mut use_tls = initial_backend_use_tls;
-    let mut server_name = initial_backend_server_name;
+    let timeout_dur = backend_timeout
+        .filter(|d| !d.is_zero())
+        .unwrap_or(std::time::Duration::from_secs(30));
 
-    loop {
-        let timeout_dur = per_rule_timeout
-            .filter(|d| !d.is_zero())
-            .unwrap_or(std::time::Duration::from_secs(30));
-        let mut backend = match tokio::time::timeout(
-            timeout_dur,
-            state.pool.acquire(backend_addr, use_tls, &server_name),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                warn!("Backend {} connect failed: {}", backend_addr, e);
-                if state.health.record_failure(backend_addr) {
-                    HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-                }
-                send_error_response(client, 502).await?;
-                return Ok(false);
+    // --- Connect to backend ---
+    let mut backend = match tokio::time::timeout(
+        timeout_dur,
+        state.pool.acquire(backend_addr, use_tls, &server_name),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!("Backend {} connect failed: {}", backend_addr, e);
+            if state.health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
             }
-            Err(_) => {
-                warn!("Backend {} connect timeout", backend_addr);
-                if state.health.record_failure(backend_addr) {
-                    HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-                }
-                send_error_response(client, 504).await?;
-                return Ok(false);
-            }
-        };
-
-        // Determine header boundary for body separation
-        let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-
-        // --- Prepare mirror header data (before body relay) ---
-        // We defer actual mirror dispatch until after the full body is collected.
-        let has_mirrors = filter_data
-            .as_ref()
-            .is_some_and(|fd| !fd.mirror_targets.is_empty());
-        let mut mirror_header_data: Option<Vec<u8>> = None;
-
-        if let Some(ref fd) = filter_data {
-            let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
-            if has_mods {
-                let modified_headers = apply_request_header_modifications(
-                    &buf[..header_end],
-                    fd.request_header_mods.as_ref(),
-                    fd.url_rewrite.as_ref(),
-                );
-                if has_mirrors {
-                    mirror_header_data = Some(modified_headers.clone());
-                }
-                // Send modified headers, then original body — zero-copy for body
-                backend.write_all(&modified_headers).await?;
-                let body = &buf[header_end..request_bytes];
-                if !body.is_empty() {
-                    backend.write_all(body).await?;
-                }
-            } else {
-                if has_mirrors {
-                    mirror_header_data = Some(buf[..header_end].to_vec());
-                }
-                backend.write_all(&buf[..request_bytes]).await?;
-            }
-        } else {
-            backend.write_all(&buf[..request_bytes]).await?;
-        }
-
-        // --- Relay remaining request body bytes (the core POST fix) ---
-        // When mirrors are active, tee body chunks into a buffer (up to MIRROR_BODY_MAX).
-        let body_in_initial = request_bytes.saturating_sub(header_end);
-        let initial_body = &buf[header_end..request_bytes];
-
-        // Mirror body buffer: only allocated when mirrors need body data.
-        // Starts with the body portion from the initial read.
-        let mut mirror_body: Option<Vec<u8>> = if has_mirrors {
-            let mut mb = Vec::with_capacity(body_in_initial.min(MIRROR_BODY_MAX));
-            let cap = body_in_initial.min(MIRROR_BODY_MAX);
-            mb.extend_from_slice(&initial_body[..cap]);
-            Some(mb)
-        } else {
-            None
-        };
-        // Track if we exceeded the cap (skip mirror dispatch if so)
-        let mut mirror_body_overflow = has_mirrors && body_in_initial > MIRROR_BODY_MAX;
-
-        if let Some(cl) = req_content_length {
-            let mut remaining = cl.saturating_sub(body_in_initial);
-            while remaining > 0 {
-                let n = client.read(&mut buf[..]).await?;
-                if n == 0 {
-                    break;
-                }
-                let to_send = n.min(remaining);
-                backend.write_all(&buf[..to_send]).await?;
-
-                // Tee into mirror buffer if within cap
-                if let Some(ref mut mb) = mirror_body {
-                    if !mirror_body_overflow {
-                        let space = MIRROR_BODY_MAX.saturating_sub(mb.len());
-                        if to_send <= space {
-                            mb.extend_from_slice(&buf[..to_send]);
-                        } else {
-                            mirror_body_overflow = true;
-                            warn!(
-                                "mirror body exceeds {}B cap, skipping mirror for this request",
-                                MIRROR_BODY_MAX
-                            );
-                        }
-                    }
-                }
-
-                remaining -= to_send;
-            }
-        } else if req_is_chunked {
-            // Relay chunked body until 0\r\n\r\n terminator
-            let mut chunked_tail = [0u8; 5];
-            let mut chunked_tail_len: usize = 0;
-            // Check if terminator was already in the initial buffer body
-            if body_in_initial > 0 {
-                append_chunked_tail(
-                    &mut chunked_tail,
-                    &mut chunked_tail_len,
-                    &buf[header_end..request_bytes],
-                );
-            }
-            while !is_chunked_terminator(&chunked_tail, chunked_tail_len) {
-                let n = client.read(&mut buf[..]).await?;
-                if n == 0 {
-                    break;
-                }
-                backend.write_all(&buf[..n]).await?;
-                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
-
-                // Tee into mirror buffer if within cap
-                if let Some(ref mut mb) = mirror_body {
-                    if !mirror_body_overflow {
-                        let space = MIRROR_BODY_MAX.saturating_sub(mb.len());
-                        if n <= space {
-                            mb.extend_from_slice(&buf[..n]);
-                        } else {
-                            mirror_body_overflow = true;
-                            warn!(
-                                "mirror body exceeds {}B cap, skipping mirror for this request",
-                                MIRROR_BODY_MAX
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Dispatch mirrors with complete request data ---
-        if has_mirrors && !mirror_body_overflow {
-            if let Some(ref fd) = filter_data {
-                let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
-                let body_bytes = mirror_body.as_deref().unwrap_or(&[]);
-                let mut full_request = Vec::with_capacity(header_bytes.len() + body_bytes.len());
-                full_request.extend_from_slice(header_bytes);
-                full_request.extend_from_slice(body_bytes);
-                dispatch_mirrors(&fd.mirror_targets, &full_request);
-            }
-        }
-
-        // --- WebSocket / protocol upgrade handling ---
-        if req_is_upgrade {
-            // For upgrades, forward the backend response headers then switch
-            // to bidirectional streaming for the remainder of the connection.
-            let resp_mods = filter_data
-                .as_ref()
-                .and_then(|fd| fd.response_header_mods.as_ref());
-            let _response_complete = match tokio::time::timeout(
-                timeout_dur,
-                forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    send_error_response(client, 504).await?;
-                    return Ok(false);
-                }
-            };
-            // Flush the TLS stream so the browser receives the 101 before
-            // we switch to bidirectional streaming. Without this, the encrypted
-            // 101 response may remain buffered and the browser never upgrades.
-            client.flush().await?;
-            // After sending the 101 response, switch to raw bidirectional streaming.
-            // Errors are expected when either side closes — best-effort.
-            let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
+            send_error_response(client, 502).await?;
             return Ok(false);
         }
+        Err(_) => {
+            warn!("Backend {} connect timeout", backend_addr);
+            if state.health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+            }
+            send_error_response(client, 504).await?;
+            return Ok(false);
+        }
+    };
 
+    // --- Send request headers to backend (with optional modifications) ---
+    let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+    let has_mirrors = filter_data
+        .as_ref()
+        .is_some_and(|fd| !fd.mirror_targets.is_empty());
+    let mut mirror_header_data: Option<Vec<u8>> = None;
+
+    if let Some(ref fd) = filter_data {
+        let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
+        if has_mods {
+            let modified_headers = apply_request_header_modifications(
+                &buf[..header_end],
+                fd.request_header_mods.as_ref(),
+                fd.url_rewrite.as_ref(),
+            );
+            if has_mirrors {
+                mirror_header_data = Some(modified_headers.clone());
+            }
+            backend.write_all(&modified_headers).await?;
+            let body = &buf[header_end..request_bytes];
+            if !body.is_empty() {
+                backend.write_all(body).await?;
+            }
+        } else {
+            if has_mirrors {
+                mirror_header_data = Some(buf[..header_end].to_vec());
+            }
+            backend.write_all(&buf[..request_bytes]).await?;
+        }
+    } else {
+        backend.write_all(&buf[..request_bytes]).await?;
+    }
+
+    // --- Relay remaining request body + optional mirror tee ---
+    let mirror_body = relay_request_body(
+        client,
+        &mut backend,
+        buf,
+        header_end,
+        request_bytes,
+        content_length,
+        is_chunked,
+        has_mirrors,
+    )
+    .await?;
+
+    // --- Dispatch mirrors with complete request data ---
+    if let Some(ref body) = mirror_body {
+        if let Some(ref fd) = filter_data {
+            let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
+            let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
+            full_request.extend_from_slice(header_bytes);
+            full_request.extend_from_slice(body);
+            dispatch_mirrors(&fd.mirror_targets, &full_request);
+        }
+    }
+
+    // --- WebSocket / protocol upgrade handling ---
+    if is_upgrade {
         let resp_mods = filter_data
             .as_ref()
             .and_then(|fd| fd.response_header_mods.as_ref());
-        let response_complete = match tokio::time::timeout(
+        let _response_complete = match tokio::time::timeout(
             timeout_dur,
             forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
         )
@@ -574,93 +446,117 @@ async fn handle_http_forward(
                 return Ok(false);
             }
         };
-        // Flush the TLS stream so the client receives all response bytes.
-        // Without this, the tail of large responses may remain buffered in
-        // rustls and stall the client (plain TCP is unaffected — no-op flush).
         client.flush().await?;
+        let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
+        return Ok(false);
+    }
 
-        if response_complete && keepalive {
-            state.pool.release(backend_addr, backend);
-        }
-
-        if !keepalive {
+    // --- Forward response ---
+    let resp_mods = filter_data
+        .as_ref()
+        .and_then(|fd| fd.response_header_mods.as_ref());
+    let response_complete = match tokio::time::timeout(
+        timeout_dur,
+        forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            send_error_response(client, 504).await?;
             return Ok(false);
         }
+    };
+    client.flush().await?;
 
-        request_bytes = client.read(buf).await?;
-        if request_bytes > 0 && find_header_end(&buf[..request_bytes]).is_none() {
-            match read_remaining_headers(client, buf, request_bytes).await {
-                Ok(total) => request_bytes = total,
-                Err(e) => {
-                    let _ = send_error_response(client, 431).await;
-                    return Err(e);
-                }
+    if response_complete {
+        state.pool.release(backend_addr, backend);
+    }
+
+    Ok(response_complete)
+}
+
+/// Relay the request body from client to backend, optionally teeing into a mirror buffer.
+/// Returns `Some(body_bytes)` if mirrors are active and body fits within MIRROR_BODY_MAX,
+/// `None` if no mirrors or body exceeded the cap.
+async fn relay_request_body(
+    client: &mut Connection,
+    backend: &mut Connection,
+    buf: &mut [u8],
+    header_end: usize,
+    request_bytes: usize,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    has_mirrors: bool,
+) -> Result<Option<Vec<u8>>> {
+    let body_in_initial = request_bytes.saturating_sub(header_end);
+    let initial_body = &buf[header_end..request_bytes];
+
+    // Mirror body buffer: only allocated when mirrors need body data.
+    let mut mirror_body: Option<Vec<u8>> = if has_mirrors {
+        let cap = body_in_initial.min(MIRROR_BODY_MAX);
+        let mut mb = Vec::with_capacity(cap);
+        mb.extend_from_slice(&initial_body[..cap]);
+        Some(mb)
+    } else {
+        None
+    };
+    let mut overflow = has_mirrors && body_in_initial > MIRROR_BODY_MAX;
+
+    if let Some(cl) = content_length {
+        let mut remaining = cl.saturating_sub(body_in_initial);
+        while remaining > 0 {
+            let n = client.read(&mut buf[..]).await?;
+            if n == 0 {
+                break;
             }
+            let to_send = n.min(remaining);
+            backend.write_all(&buf[..to_send]).await?;
+            tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..to_send]);
+            remaining -= to_send;
         }
-        if request_bytes == 0 {
-            return Ok(false);
+    } else if is_chunked {
+        let mut chunked_tail = [0u8; 5];
+        let mut chunked_tail_len: usize = 0;
+        if body_in_initial > 0 {
+            append_chunked_tail(
+                &mut chunked_tail,
+                &mut chunked_tail_len,
+                &buf[header_end..request_bytes],
+            );
         }
+        while !is_chunked_terminator(&chunked_tail, chunked_tail_len) {
+            let n = client.read(&mut buf[..]).await?;
+            if n == 0 {
+                break;
+            }
+            backend.write_all(&buf[..n]).await?;
+            append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
+            tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..n]);
+        }
+    }
 
-        let decision = {
-            let route_table = state.routes.load();
-            request_processor::analyze_request(
-                &route_table,
-                &state.selector,
-                &buf[..request_bytes],
-                state.server_port,
-                &state.health,
-                state.is_tls,
-            )?
-        };
+    if overflow {
+        Ok(None)
+    } else {
+        Ok(mirror_body)
+    }
+}
 
-        match decision {
-            ProcessingDecision::HttpForward {
-                backend_addr: addr,
-                keepalive: ka,
-                filters,
-                backend_timeout: bt,
-                request_timeout: _,
-                content_length: cl,
-                is_chunked: ch,
-                is_upgrade: up,
-                backend_use_tls: tls,
-                backend_server_name: sn,
-            } => {
-                backend_addr = addr;
-                keepalive = ka;
-                filter_data = filters;
-                per_rule_timeout = bt;
-                req_content_length = cl;
-                req_is_chunked = ch;
-                req_is_upgrade = up;
-                use_tls = tls;
-                server_name = sn;
-            }
-            ProcessingDecision::HttpRedirect {
-                status_code,
-                location,
-                keepalive: ka,
-            } => {
-                send_redirect_response(client, status_code, &location).await?;
-                if !ka {
-                    return Ok(false);
-                }
-                return Ok(true);
-            }
-            ProcessingDecision::SendHttpError {
-                error_code,
-                close_connection,
-            } => {
-                send_error_response(client, error_code).await?;
-                if close_connection {
-                    return Ok(false);
-                }
-                return Ok(true);
-            }
-            ProcessingDecision::TcpForward { .. }
-            | ProcessingDecision::UdpForward { .. }
-            | ProcessingDecision::CloseConnection => {
-                return Ok(false);
+/// Tee a chunk into the mirror body buffer, tracking overflow.
+#[inline]
+fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chunk: &[u8]) {
+    if let Some(ref mut mb) = mirror_body {
+        if !*overflow {
+            let space = MIRROR_BODY_MAX.saturating_sub(mb.len());
+            if chunk.len() <= space {
+                mb.extend_from_slice(chunk);
+            } else {
+                *overflow = true;
+                warn!(
+                    "mirror body exceeds {}B cap, skipping mirror for this request",
+                    MIRROR_BODY_MAX
+                );
             }
         }
     }

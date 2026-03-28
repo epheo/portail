@@ -357,6 +357,493 @@ pub async fn run_controller(
     Ok(())
 }
 
+/// Resolve TLS certificates for a Gateway from the reflector Secret store.
+/// Iterates all listeners, checks cross-namespace ReferenceGrant permissions,
+/// looks up Secrets, and validates PEM format.
+fn resolve_gateway_certs(
+    gateway: &Gateway,
+    gw_ns: &str,
+    reference_grants: &[ReferenceGrant],
+    store_secrets: &Store<Secret>,
+) -> HashMap<(String, String), (Vec<u8>, Vec<u8>)> {
+    let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
+    for listener in &gateway.spec.listeners {
+        let Some(tls) = &listener.tls else { continue };
+        let Some(cert_refs) = &tls.certificate_refs else {
+            continue;
+        };
+        for cert_ref in cert_refs {
+            let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+
+            // Cross-namespace cert ref requires a ReferenceGrant
+            if secret_ns != gw_ns {
+                let grant_allows = reference_grants.iter().any(|grant| {
+                    let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
+                    if grant_ns != secret_ns {
+                        return false;
+                    }
+                    let from_ok = grant.spec.from.iter().any(|f| {
+                        f.group == "gateway.networking.k8s.io"
+                            && f.kind == "Gateway"
+                            && f.namespace == gw_ns
+                    });
+                    let to_ok = grant.spec.to.iter().any(|t| {
+                        t.group.is_empty()
+                            && t.kind == "Secret"
+                            && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
+                    });
+                    from_ok && to_ok
+                });
+                if !grant_allows {
+                    warn!(
+                        "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                        secret_ns, cert_ref.name
+                    );
+                    continue;
+                }
+            }
+
+            // Look up secret from reflector cache
+            let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
+            match store_secrets.get(&secret_ref) {
+                Some(secret) => {
+                    if let Some(data) = &secret.data {
+                        let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
+                        let key_pem = data.get("tls.key").map(|b| b.0.clone());
+                        if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
+                            let cert_str = String::from_utf8_lossy(&cert);
+                            let key_str = String::from_utf8_lossy(&key);
+                            if cert_str.contains("BEGIN CERTIFICATE")
+                                && (key_str.contains("BEGIN PRIVATE KEY")
+                                    || key_str.contains("BEGIN RSA PRIVATE KEY")
+                                    || key_str.contains("BEGIN EC PRIVATE KEY"))
+                            {
+                                cert_data.insert(
+                                    (cert_ref.name.clone(), secret_ns.to_string()),
+                                    (cert, key),
+                                );
+                            } else {
+                                warn!(
+                                    "Secret {}/{} has malformed PEM data",
+                                    secret_ns, cert_ref.name
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Secret {}/{} missing tls.crt or tls.key",
+                                secret_ns, cert_ref.name
+                            );
+                        }
+                    }
+                }
+                None => {
+                    debug!("Secret {}/{} not found in cache", secret_ns, cert_ref.name);
+                }
+            }
+        }
+    }
+    cert_data
+}
+
+/// Resolve service metadata: known services set, headless endpoint overrides,
+/// ExternalName overrides, and appProtocol overrides.
+fn resolve_services(
+    all_services: &[Service],
+    store_endpoint_slices: &Store<EndpointSlice>,
+) -> (
+    HashSet<(String, String)>,
+    HashMap<(String, u16), Vec<(String, u16)>>,
+    HashMap<(String, u16), String>,
+) {
+    let known_services: HashSet<(String, String)> = all_services
+        .iter()
+        .filter_map(|svc| {
+            let name = svc.metadata.name.as_ref()?;
+            let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+            Some((name.clone(), ns.to_string()))
+        })
+        .collect();
+
+    // Detect headless services and fetch their EndpointSlices for pod IP + targetPort resolution.
+    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
+
+    let headless_services: Vec<(&str, &str)> = all_services
+        .iter()
+        .filter_map(|svc| {
+            let spec = svc.spec.as_ref()?;
+            let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
+            if cluster_ip == "None" || cluster_ip.is_empty() {
+                let name = svc.metadata.name.as_deref()?;
+                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+                Some((name, ns))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !headless_services.is_empty() {
+        let all_endpoint_slices: Vec<EndpointSlice> = store_endpoint_slices
+            .state()
+            .iter()
+            .map(|arc| (**arc).clone())
+            .collect();
+
+        for (svc_name, svc_ns) in &headless_services {
+            let matching_slices: Vec<&EndpointSlice> = all_endpoint_slices
+                .iter()
+                .filter(|eps| {
+                    let eps_ns = eps.metadata.namespace.as_deref().unwrap_or("default");
+                    if eps_ns != *svc_ns {
+                        return false;
+                    }
+                    eps.metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("kubernetes.io/service-name"))
+                        .is_some_and(|v| v == *svc_name)
+                })
+                .collect();
+
+            let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+
+            let svc_spec = all_services
+                .iter()
+                .find(|s| {
+                    s.metadata.name.as_deref() == Some(svc_name)
+                        && s.metadata.namespace.as_deref().unwrap_or("default") == *svc_ns
+                })
+                .and_then(|s| s.spec.as_ref());
+
+            for eps in &matching_slices {
+                if eps.address_type != "IPv4" {
+                    continue;
+                }
+                let endpoints = &eps.endpoints;
+                let eps_ports = eps.ports.as_deref().unwrap_or_default();
+
+                if let Some(svc_ports) = svc_spec.and_then(|s| s.ports.as_ref()) {
+                    for sp in svc_ports {
+                        let service_port = sp.port as u16;
+                        let port_name = sp.name.as_deref().unwrap_or("");
+                        let target_port = eps_ports
+                            .iter()
+                            .find(|ep| ep.name.as_deref().unwrap_or("") == port_name)
+                            .and_then(|ep| ep.port)
+                            .unwrap_or(service_port as i32)
+                            as u16;
+
+                        let key = (svc_fqdn.clone(), service_port);
+                        let entry = endpoint_overrides.entry(key).or_default();
+                        for endpoint in endpoints {
+                            let is_ready = endpoint
+                                .conditions
+                                .as_ref()
+                                .and_then(|c| c.ready)
+                                .unwrap_or(true);
+                            if is_ready {
+                                for addr in &endpoint.addresses {
+                                    entry.push((addr.clone(), target_port));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !endpoint_overrides.is_empty() {
+            info!(
+                "Found {} headless endpoint overrides for {} services",
+                endpoint_overrides.values().map(|v| v.len()).sum::<usize>(),
+                endpoint_overrides.len(),
+            );
+        }
+    }
+
+    // ExternalName services: resolve externalName DNS targets
+    for svc in all_services {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        if spec.type_.as_deref().unwrap_or("") != "ExternalName" {
+            continue;
+        }
+        let external_name = match spec.external_name.as_deref() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let svc_name = match svc.metadata.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+
+        if let Some(ports) = spec.ports.as_ref() {
+            for sp in ports {
+                let service_port = sp.port as u16;
+                let key = (svc_fqdn.clone(), service_port);
+                endpoint_overrides
+                    .entry(key)
+                    .or_default()
+                    .push((external_name.to_string(), service_port));
+            }
+            info!(
+                "ExternalName service {}.{} -> {} (ports: {})",
+                svc_name,
+                svc_ns,
+                external_name,
+                ports
+                    .iter()
+                    .map(|p| p.port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    // Build appProtocol overrides from Service port specs
+    let mut app_protocol_overrides: HashMap<(String, u16), String> = HashMap::new();
+    for svc in all_services {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        let svc_name = match svc.metadata.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        if let Some(ports) = spec.ports.as_ref() {
+            for sp in ports {
+                if let Some(ref app_proto) = sp.app_protocol {
+                    let key = (svc_fqdn.clone(), sp.port as u16);
+                    app_protocol_overrides.insert(key, app_proto.clone());
+                }
+            }
+        }
+    }
+
+    (known_services, endpoint_overrides, app_protocol_overrides)
+}
+
+/// Validate Gateway listeners and compute gateway-level acceptance.
+/// Returns (listener_statuses, gateway_accepted, reason, message).
+fn validate_gateway(
+    gateway: &Gateway,
+    gw_ns: &str,
+    cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>,
+    reference_grants: &[ReferenceGrant],
+) -> (
+    HashMap<String, status::ListenerStatus>,
+    bool,
+    String,
+    String,
+) {
+    let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
+
+    // Detect protocol conflicts: same port, different protocols
+    let mut port_protocols: HashMap<i32, String> = HashMap::new();
+    let mut conflicted_ports: HashSet<i32> = HashSet::new();
+    for l in &gateway.spec.listeners {
+        match port_protocols.get(&l.port) {
+            Some(existing_proto) if *existing_proto != l.protocol => {
+                conflicted_ports.insert(l.port);
+            }
+            None => {
+                port_protocols.insert(l.port, l.protocol.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for listener in &gateway.spec.listeners {
+        let mut ls = status::ListenerStatus::default();
+        let mut refs_failed = false;
+
+        if conflicted_ports.contains(&listener.port) {
+            ls.accepted = false;
+            ls.accepted_reason = "ProtocolConflict".into();
+            ls.accepted_message =
+                "Listener port conflicts with another listener using a different protocol".into();
+            ls.conflicted = true;
+            ls.conflicted_reason = "ProtocolConflict".into();
+            ls.conflicted_message =
+                "Listener port shared with another listener using different protocol".into();
+        } else {
+            ls.accepted = true;
+            ls.accepted_reason = "Accepted".into();
+            ls.accepted_message = "Listener accepted".into();
+        }
+
+        // Validate TLS certificateRefs for HTTPS/TLS listeners
+        if let Some(tls) = &listener.tls {
+            if let Some(cert_refs) = &tls.certificate_refs {
+                for cert_ref in cert_refs {
+                    let group = cert_ref.group.as_deref().unwrap_or("");
+                    let kind_str = cert_ref.kind.as_deref().unwrap_or("Secret");
+                    if !group.is_empty() || kind_str != "Secret" {
+                        refs_failed = true;
+                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
+                        ls.resolved_refs_message = format!(
+                            "Unsupported certificateRef group/kind: {}/{}",
+                            group, kind_str
+                        );
+                        continue;
+                    }
+
+                    let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+
+                    // Cross-namespace cert ref requires ReferenceGrant
+                    if secret_ns != gw_ns {
+                        let grant_allows = reference_grants.iter().any(|grant| {
+                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
+                            if grant_ns != secret_ns {
+                                return false;
+                            }
+                            let from_ok = grant.spec.from.iter().any(|f| {
+                                f.group == "gateway.networking.k8s.io"
+                                    && f.kind == "Gateway"
+                                    && f.namespace == gw_ns
+                            });
+                            let to_ok = grant.spec.to.iter().any(|t| {
+                                t.group.is_empty()
+                                    && t.kind == "Secret"
+                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
+                            });
+                            from_ok && to_ok
+                        });
+                        if !grant_allows {
+                            refs_failed = true;
+                            ls.resolved_refs_reason = "RefNotPermitted".into();
+                            ls.resolved_refs_message = format!(
+                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                                secret_ns, cert_ref.name
+                            );
+                            continue;
+                        }
+                    }
+
+                    if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
+                        refs_failed = true;
+                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
+                        ls.resolved_refs_message = format!(
+                            "Secret {}/{} not found or missing tls.crt/tls.key",
+                            secret_ns, cert_ref.name
+                        );
+                    }
+                }
+            }
+        } else if matches!(listener.protocol.as_str(), "HTTPS" | "TLS") {
+            refs_failed = true;
+            ls.resolved_refs_reason = "InvalidCertificateRef".into();
+            ls.resolved_refs_message = "HTTPS/TLS listener requires TLS configuration".into();
+        }
+
+        // Check allowedRoutes.kinds validity and compute supportedKinds
+        if let Some(allowed_routes) = &listener.allowed_routes {
+            if let Some(kinds) = &allowed_routes.kinds {
+                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute", "GRPCRoute"];
+                let mut supported = Vec::new();
+                let mut has_invalid = false;
+                for k in kinds {
+                    let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+                    let kind_str = &k.kind;
+                    if group == "gateway.networking.k8s.io"
+                        && valid_kinds.contains(&kind_str.as_str())
+                    {
+                        supported.push(serde_json::json!({
+                            "group": "gateway.networking.k8s.io",
+                            "kind": kind_str,
+                        }));
+                    } else {
+                        has_invalid = true;
+                    }
+                }
+                ls.supported_kinds = supported;
+                if has_invalid {
+                    refs_failed = true;
+                    ls.resolved_refs_reason = "InvalidRouteKinds".into();
+                    ls.resolved_refs_message =
+                        "One or more route kinds in allowedRoutes are not supported".into();
+                }
+            } else {
+                ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
+            }
+        } else {
+            ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
+        }
+
+        if !refs_failed {
+            ls.resolved_refs = true;
+            ls.resolved_refs_reason = "ResolvedRefs".into();
+            ls.resolved_refs_message = "All references resolved".into();
+        }
+
+        if ls.accepted && ls.resolved_refs {
+            ls.programmed = true;
+            ls.programmed_reason = "Programmed".into();
+            ls.programmed_message = "Programmed".into();
+        } else {
+            ls.programmed = false;
+            ls.programmed_reason = "Invalid".into();
+            ls.programmed_message = if !ls.accepted {
+                "Listener not programmed due to acceptance failure".into()
+            } else {
+                "Listener has unresolved references".into()
+            };
+        }
+
+        listener_statuses.insert(listener.name.clone(), ls);
+    }
+
+    // Gateway-level acceptance
+    let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
+    let mut accepted = true;
+    let mut reason = "Accepted".to_string();
+    let mut message = "Gateway accepted by portail controller".to_string();
+
+    for listener in &gateway.spec.listeners {
+        if !supported_protocols.contains(&listener.protocol.as_str()) {
+            accepted = false;
+            reason = "InvalidParameters".to_string();
+            message = format!(
+                "Listener '{}' uses unsupported protocol '{}'",
+                listener.name, listener.protocol
+            );
+            break;
+        }
+    }
+
+    if accepted {
+        if let Some(addresses) = &gateway.spec.addresses {
+            for addr in addresses {
+                let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
+                if addr_type != "IPAddress" && addr_type != "Hostname" {
+                    accepted = false;
+                    reason = "UnsupportedAddress".to_string();
+                    message = format!("Unsupported address type '{}' in spec.addresses", addr_type);
+                    break;
+                }
+            }
+        }
+    }
+
+    if accepted && !listener_statuses.is_empty() {
+        let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
+        if all_rejected {
+            accepted = false;
+            reason = "InvalidListeners".to_string();
+            message = "All listeners are rejected due to conflicts or errors".to_string();
+        }
+    }
+
+    (listener_statuses, accepted, reason, message)
+}
+
 async fn reconcile(
     gateway: Arc<Gateway>,
     ctx: Arc<ControllerCtx>,
@@ -433,82 +920,7 @@ async fn reconcile(
 
     // Fetch TLS certificate data from cached Secrets store for THIS gateway.
     // Other gateways get their own cert_data in the all_configs loop below.
-    let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
-    for listener in &gateway.spec.listeners {
-        if let Some(tls) = &listener.tls {
-            if let Some(cert_refs) = &tls.certificate_refs {
-                for cert_ref in cert_refs {
-                    let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&gw_ns);
-
-                    // Cross-namespace cert ref requires a ReferenceGrant
-                    if secret_ns != gw_ns {
-                        let grant_allows = reference_grants.iter().any(|grant| {
-                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                            if grant_ns != secret_ns {
-                                return false;
-                            }
-                            let from_ok = grant.spec.from.iter().any(|f| {
-                                f.group == "gateway.networking.k8s.io"
-                                    && f.kind == "Gateway"
-                                    && f.namespace == gw_ns
-                            });
-                            let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group.is_empty()
-                                    && t.kind == "Secret"
-                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
-                            });
-                            from_ok && to_ok
-                        });
-                        if !grant_allows {
-                            warn!(
-                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                                secret_ns, cert_ref.name
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Look up secret from reflector cache
-                    let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
-                    match ctx.store_secrets.get(&secret_ref) {
-                        Some(secret) => {
-                            if let Some(data) = &secret.data {
-                                let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
-                                let key_pem = data.get("tls.key").map(|b| b.0.clone());
-                                if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
-                                    let cert_str = String::from_utf8_lossy(&cert);
-                                    let key_str = String::from_utf8_lossy(&key);
-                                    if cert_str.contains("BEGIN CERTIFICATE")
-                                        && (key_str.contains("BEGIN PRIVATE KEY")
-                                            || key_str.contains("BEGIN RSA PRIVATE KEY")
-                                            || key_str.contains("BEGIN EC PRIVATE KEY"))
-                                    {
-                                        cert_data.insert(
-                                            (cert_ref.name.clone(), secret_ns.to_string()),
-                                            (cert, key),
-                                        );
-                                    } else {
-                                        warn!(
-                                            "Secret {}/{} has malformed PEM data",
-                                            secret_ns, cert_ref.name
-                                        );
-                                    }
-                                } else {
-                                    warn!(
-                                        "Secret {}/{} missing tls.crt or tls.key",
-                                        secret_ns, cert_ref.name
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            debug!("Secret {}/{} not found in cache", secret_ns, cert_ref.name);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let cert_data = resolve_gateway_certs(&gateway, &gw_ns, &reference_grants, &ctx.store_secrets);
 
     // Read Services from reflector cache
     let all_services: Vec<Service> = ctx
@@ -518,409 +930,11 @@ async fn reconcile(
         .map(|arc| (**arc).clone())
         .collect();
 
-    let known_services: HashSet<(String, String)> = all_services
-        .iter()
-        .filter_map(|svc| {
-            let name = svc.metadata.name.as_ref()?;
-            let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-            Some((name.clone(), ns.to_string()))
-        })
-        .collect();
+    let (known_services, endpoint_overrides, app_protocol_overrides) =
+        resolve_services(&all_services, &ctx.store_endpoint_slices);
 
-    // Detect headless services and fetch their EndpointSlices for pod IP + targetPort resolution.
-    // For headless services (clusterIP: None), DNS returns pod IPs but kube-proxy doesn't
-    // translate service port → targetPort, so we need EndpointSlice data.
-    // Map: (svc_fqdn, service_port) → Vec<(pod_ip, target_port)>
-    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
-
-    let headless_services: Vec<(&str, &str)> = all_services
-        .iter()
-        .filter_map(|svc| {
-            let spec = svc.spec.as_ref()?;
-            let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
-            if cluster_ip == "None" || cluster_ip.is_empty() {
-                let name = svc.metadata.name.as_deref()?;
-                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-                Some((name, ns))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if !headless_services.is_empty() {
-        let all_endpoint_slices: Vec<EndpointSlice> = ctx
-            .store_endpoint_slices
-            .state()
-            .iter()
-            .map(|arc| (**arc).clone())
-            .collect();
-
-        for (svc_name, svc_ns) in &headless_services {
-            // Find EndpointSlices for this service (labeled kubernetes.io/service-name)
-            let matching_slices: Vec<&EndpointSlice> = all_endpoint_slices
-                .iter()
-                .filter(|eps| {
-                    let eps_ns = eps.metadata.namespace.as_deref().unwrap_or("default");
-                    if eps_ns != *svc_ns {
-                        return false;
-                    }
-                    eps.metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("kubernetes.io/service-name"))
-                        .is_some_and(|v| v == *svc_name)
-                })
-                .collect();
-
-            let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
-
-            // Get the service's declared ports for mapping service_port → targetPort
-            let svc_spec = all_services
-                .iter()
-                .find(|s| {
-                    s.metadata.name.as_deref() == Some(svc_name)
-                        && s.metadata.namespace.as_deref().unwrap_or("default") == *svc_ns
-                })
-                .and_then(|s| s.spec.as_ref());
-
-            for eps in &matching_slices {
-                // Only use IPv4 slices
-                if eps.address_type != "IPv4" {
-                    continue;
-                }
-
-                let endpoints = &eps.endpoints;
-
-                let eps_ports = eps.ports.as_deref().unwrap_or_default();
-
-                // For each service port, find the corresponding EndpointSlice port
-                if let Some(svc_ports) = svc_spec.and_then(|s| s.ports.as_ref()) {
-                    for sp in svc_ports {
-                        let service_port = sp.port as u16;
-                        let port_name = sp.name.as_deref().unwrap_or("");
-
-                        // Find matching endpoint port by name
-                        let target_port = eps_ports
-                            .iter()
-                            .find(|ep| ep.name.as_deref().unwrap_or("") == port_name)
-                            .and_then(|ep| ep.port)
-                            .unwrap_or(service_port as i32)
-                            as u16;
-
-                        let key = (svc_fqdn.clone(), service_port);
-                        let entry = endpoint_overrides.entry(key).or_default();
-                        for endpoint in endpoints {
-                            // Only include ready endpoints
-                            let is_ready = endpoint
-                                .conditions
-                                .as_ref()
-                                .and_then(|c| c.ready)
-                                .unwrap_or(true);
-                            if is_ready {
-                                for addr in &endpoint.addresses {
-                                    entry.push((addr.clone(), target_port));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !endpoint_overrides.is_empty() {
-            info!(
-                "Found {} headless endpoint overrides for {} services",
-                endpoint_overrides.values().map(|v| v.len()).sum::<usize>(),
-                endpoint_overrides.len(),
-            );
-        }
-    }
-
-    // --- ExternalName services: resolve externalName DNS targets ---
-    // ExternalName services don't create EndpointSlices, so we insert
-    // their DNS target directly into endpoint_overrides for resolution
-    // at route-table build time via Backend::with_weight().
-    for svc in &all_services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        let svc_type = spec.type_.as_deref().unwrap_or("");
-        if svc_type != "ExternalName" {
-            continue;
-        }
-        let external_name = match spec.external_name.as_deref() {
-            Some(n) if !n.is_empty() => n,
-            _ => continue,
-        };
-        let svc_name = match svc.metadata.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
-        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
-
-        // Use declared service ports, or skip if none
-        if let Some(ports) = spec.ports.as_ref() {
-            for sp in ports {
-                let service_port = sp.port as u16;
-                let key = (svc_fqdn.clone(), service_port);
-                endpoint_overrides
-                    .entry(key)
-                    .or_default()
-                    .push((external_name.to_string(), service_port));
-            }
-            info!(
-                "ExternalName service {}.{} -> {} (ports: {})",
-                svc_name,
-                svc_ns,
-                external_name,
-                ports
-                    .iter()
-                    .map(|p| p.port.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-
-    // --- Build appProtocol overrides from Service port specs ---
-    // Map: (svc_fqdn, service_port) → appProtocol (e.g. "https")
-    let mut app_protocol_overrides: HashMap<(String, u16), String> = HashMap::new();
-    for svc in &all_services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        let svc_name = match svc.metadata.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
-        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
-        if let Some(ports) = spec.ports.as_ref() {
-            for sp in ports {
-                if let Some(ref app_proto) = sp.app_protocol {
-                    let key = (svc_fqdn.clone(), sp.port as u16);
-                    app_protocol_overrides.insert(key, app_proto.clone());
-                }
-            }
-        }
-    }
-
-    // --- Per-listener validation: compute ListenerStatus for each listener ---
-    let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
-
-    // Detect protocol conflicts: same port, different protocols
-    let mut port_protocols: HashMap<i32, String> = HashMap::new();
-    let mut conflicted_ports: HashSet<i32> = HashSet::new();
-    for l in &gateway.spec.listeners {
-        match port_protocols.get(&l.port) {
-            Some(existing_proto) if *existing_proto != l.protocol => {
-                conflicted_ports.insert(l.port);
-            }
-            None => {
-                port_protocols.insert(l.port, l.protocol.clone());
-            }
-            _ => {}
-        }
-    }
-
-    for listener in &gateway.spec.listeners {
-        let mut ls = status::ListenerStatus::default();
-        let mut refs_failed = false;
-
-        // Check protocol conflict
-        if conflicted_ports.contains(&listener.port) {
-            ls.accepted = false;
-            ls.accepted_reason = "ProtocolConflict".into();
-            ls.accepted_message =
-                "Listener port conflicts with another listener using a different protocol".into();
-            ls.conflicted = true;
-            ls.conflicted_reason = "ProtocolConflict".into();
-            ls.conflicted_message =
-                "Listener port shared with another listener using different protocol".into();
-        } else {
-            // No conflict — listener is accepted
-            ls.accepted = true;
-            ls.accepted_reason = "Accepted".into();
-            ls.accepted_message = "Listener accepted".into();
-        }
-
-        // Validate TLS certificateRefs for HTTPS/TLS listeners
-        if let Some(tls) = &listener.tls {
-            if let Some(cert_refs) = &tls.certificate_refs {
-                for cert_ref in cert_refs {
-                    // Check group/kind — must be core ("") group and "Secret" kind
-                    let group = cert_ref.group.as_deref().unwrap_or("");
-                    let kind_str = cert_ref.kind.as_deref().unwrap_or("Secret");
-                    if !group.is_empty() || kind_str != "Secret" {
-                        refs_failed = true;
-                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
-                        ls.resolved_refs_message = format!(
-                            "Unsupported certificateRef group/kind: {}/{}",
-                            group, kind_str
-                        );
-                        continue;
-                    }
-
-                    let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&gw_ns);
-
-                    // Cross-namespace cert ref requires ReferenceGrant
-                    if secret_ns != gw_ns {
-                        let grant_allows = reference_grants.iter().any(|grant| {
-                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                            if grant_ns != secret_ns {
-                                return false;
-                            }
-                            let from_ok = grant.spec.from.iter().any(|f| {
-                                f.group == "gateway.networking.k8s.io"
-                                    && f.kind == "Gateway"
-                                    && f.namespace == gw_ns
-                            });
-                            let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group.is_empty()
-                                    && t.kind == "Secret"
-                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
-                            });
-                            from_ok && to_ok
-                        });
-                        if !grant_allows {
-                            refs_failed = true;
-                            ls.resolved_refs_reason = "RefNotPermitted".into();
-                            ls.resolved_refs_message = format!(
-                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                                secret_ns, cert_ref.name
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Check Secret existence and format
-                    if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
-                        refs_failed = true;
-                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
-                        ls.resolved_refs_message = format!(
-                            "Secret {}/{} not found or missing tls.crt/tls.key",
-                            secret_ns, cert_ref.name
-                        );
-                    }
-                }
-            }
-        } else if matches!(listener.protocol.as_str(), "HTTPS" | "TLS") {
-            // HTTPS/TLS listener without TLS config
-            refs_failed = true;
-            ls.resolved_refs_reason = "InvalidCertificateRef".into();
-            ls.resolved_refs_message = "HTTPS/TLS listener requires TLS configuration".into();
-        }
-
-        // Check allowedRoutes.kinds validity and compute supportedKinds
-        if let Some(allowed_routes) = &listener.allowed_routes {
-            if let Some(kinds) = &allowed_routes.kinds {
-                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute", "GRPCRoute"];
-                let mut supported = Vec::new();
-                let mut has_invalid = false;
-                for k in kinds {
-                    let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-                    let kind_str = &k.kind;
-                    if group == "gateway.networking.k8s.io"
-                        && valid_kinds.contains(&kind_str.as_str())
-                    {
-                        supported.push(serde_json::json!({
-                            "group": "gateway.networking.k8s.io",
-                            "kind": kind_str,
-                        }));
-                    } else {
-                        has_invalid = true;
-                    }
-                }
-                ls.supported_kinds = supported;
-                if has_invalid {
-                    refs_failed = true;
-                    ls.resolved_refs_reason = "InvalidRouteKinds".into();
-                    ls.resolved_refs_message =
-                        "One or more route kinds in allowedRoutes are not supported".into();
-                }
-            } else {
-                // No explicit kinds restriction — use protocol-based defaults
-                ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
-            }
-        } else {
-            // No allowedRoutes at all — use protocol-based defaults
-            ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
-        }
-
-        // Promote resolved_refs to true if all checks passed
-        if !refs_failed {
-            ls.resolved_refs = true;
-            ls.resolved_refs_reason = "ResolvedRefs".into();
-            ls.resolved_refs_message = "All references resolved".into();
-        }
-
-        // Programmed depends on both accepted and resolved_refs
-        if ls.accepted && ls.resolved_refs {
-            ls.programmed = true;
-            ls.programmed_reason = "Programmed".into();
-            ls.programmed_message = "Programmed".into();
-        } else {
-            ls.programmed = false;
-            ls.programmed_reason = "Invalid".into();
-            ls.programmed_message = if !ls.accepted {
-                "Listener not programmed due to acceptance failure".into()
-            } else {
-                "Listener has unresolved references".into()
-            };
-        }
-
-        listener_statuses.insert(listener.name.clone(), ls);
-    }
-
-    // Compute Gateway-level Accepted condition from listener validation
-    let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
-    let mut gateway_accepted = true;
-    let mut gateway_accepted_reason = "Accepted".to_string();
-    let mut gateway_accepted_message = "Gateway accepted by portail controller".to_string();
-
-    for listener in &gateway.spec.listeners {
-        if !supported_protocols.contains(&listener.protocol.as_str()) {
-            gateway_accepted = false;
-            gateway_accepted_reason = "InvalidParameters".to_string();
-            gateway_accepted_message = format!(
-                "Listener '{}' uses unsupported protocol '{}'",
-                listener.name, listener.protocol
-            );
-            break;
-        }
-    }
-
-    // Validate spec.addresses — reject if any address has an unsupported type
-    // Per Gateway API spec, supported types are "IPAddress" (default) and "Hostname"
-    if gateway_accepted {
-        if let Some(addresses) = &gateway.spec.addresses {
-            for addr in addresses {
-                let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
-                if addr_type != "IPAddress" && addr_type != "Hostname" {
-                    gateway_accepted = false;
-                    gateway_accepted_reason = "UnsupportedAddress".to_string();
-                    gateway_accepted_message =
-                        format!("Unsupported address type '{}' in spec.addresses", addr_type);
-                    break;
-                }
-            }
-        }
-    }
-
-    // If all listeners are in conflict or have unresolved refs, the gateway is not accepted
-    if gateway_accepted && !listener_statuses.is_empty() {
-        let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
-        if all_rejected {
-            gateway_accepted = false;
-            gateway_accepted_reason = "InvalidListeners".to_string();
-            gateway_accepted_message =
-                "All listeners are rejected due to conflicts or errors".to_string();
-        }
-    }
+    let (listener_statuses, gateway_accepted, gateway_accepted_reason, gateway_accepted_message) =
+        validate_gateway(&gateway, &gw_ns, &cert_data, &reference_grants);
 
     // Build config for the triggered Gateway
     let result = match reconcile_to_config(
@@ -1005,62 +1019,12 @@ async fn reconcile(
         // Load cert_data for this other gateway (each gateway needs its own
         // namespace context for cross-namespace ReferenceGrant checks)
         let other_gw_ns = other_ns.to_string();
-        let mut other_cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
-        for listener in &other_gw_arc.spec.listeners {
-            if let Some(tls) = &listener.tls {
-                if let Some(cert_refs) = &tls.certificate_refs {
-                    for cert_ref in cert_refs {
-                        let secret_ns = cert_ref.namespace.as_deref().unwrap_or(&other_gw_ns);
-
-                        if secret_ns != other_gw_ns {
-                            let grant_allows = reference_grants.iter().any(|grant| {
-                                let grant_ns =
-                                    grant.metadata.namespace.as_deref().unwrap_or("default");
-                                if grant_ns != secret_ns {
-                                    return false;
-                                }
-                                let from_ok = grant.spec.from.iter().any(|f| {
-                                    f.group == "gateway.networking.k8s.io"
-                                        && f.kind == "Gateway"
-                                        && f.namespace == other_gw_ns
-                                });
-                                let to_ok = grant.spec.to.iter().any(|t| {
-                                    t.group.is_empty()
-                                        && t.kind == "Secret"
-                                        && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
-                                });
-                                from_ok && to_ok
-                            });
-                            if !grant_allows {
-                                continue;
-                            }
-                        }
-
-                        let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
-                        if let Some(secret) = ctx.store_secrets.get(&secret_ref) {
-                            if let Some(data) = &secret.data {
-                                let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
-                                let key_pem = data.get("tls.key").map(|b| b.0.clone());
-                                if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
-                                    let cert_str = String::from_utf8_lossy(&cert);
-                                    let key_str = String::from_utf8_lossy(&key);
-                                    if cert_str.contains("BEGIN CERTIFICATE")
-                                        && (key_str.contains("BEGIN PRIVATE KEY")
-                                            || key_str.contains("BEGIN RSA PRIVATE KEY")
-                                            || key_str.contains("BEGIN EC PRIVATE KEY"))
-                                    {
-                                        other_cert_data.insert(
-                                            (cert_ref.name.clone(), secret_ns.to_string()),
-                                            (cert, key),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let other_cert_data = resolve_gateway_certs(
+            &other_gw_arc,
+            &other_gw_ns,
+            &reference_grants,
+            &ctx.store_secrets,
+        );
 
         if let Ok(other_result) = reconcile_to_config(
             &other_gw_arc,
@@ -1280,59 +1244,25 @@ async fn reconcile(
         }
 
         for ((kind, ns, name), parents) in &grouped {
+            macro_rules! patch_route_status {
+                ($store:expr, $ty:ty) => {{
+                    let existing = get_existing_route_parents_from_store(&$store, ns, name);
+                    status::update_route_status::<$ty>(
+                        &ctx.client,
+                        name,
+                        ns,
+                        parents,
+                        &field_manager,
+                        &existing,
+                    )
+                    .await;
+                }};
+            }
             match *kind {
-                "HTTPRoute" => {
-                    let existing =
-                        get_existing_route_parents_from_store(&ctx.store_http_routes, ns, name);
-                    status::update_route_status::<HTTPRoute>(
-                        &ctx.client,
-                        name,
-                        ns,
-                        parents,
-                        &field_manager,
-                        &existing,
-                    )
-                    .await;
-                }
-                "TCPRoute" => {
-                    let existing =
-                        get_existing_route_parents_from_store(&ctx.store_tcp_routes, ns, name);
-                    status::update_route_status::<TCPRoute>(
-                        &ctx.client,
-                        name,
-                        ns,
-                        parents,
-                        &field_manager,
-                        &existing,
-                    )
-                    .await;
-                }
-                "TLSRoute" => {
-                    let existing =
-                        get_existing_route_parents_from_store(&ctx.store_tls_routes, ns, name);
-                    status::update_route_status::<TLSRoute>(
-                        &ctx.client,
-                        name,
-                        ns,
-                        parents,
-                        &field_manager,
-                        &existing,
-                    )
-                    .await;
-                }
-                "UDPRoute" => {
-                    let existing =
-                        get_existing_route_parents_from_store(&ctx.store_udp_routes, ns, name);
-                    status::update_route_status::<UDPRoute>(
-                        &ctx.client,
-                        name,
-                        ns,
-                        parents,
-                        &field_manager,
-                        &existing,
-                    )
-                    .await;
-                }
+                "HTTPRoute" => patch_route_status!(ctx.store_http_routes, HTTPRoute),
+                "TCPRoute" => patch_route_status!(ctx.store_tcp_routes, TCPRoute),
+                "TLSRoute" => patch_route_status!(ctx.store_tls_routes, TLSRoute),
+                "UDPRoute" => patch_route_status!(ctx.store_udp_routes, UDPRoute),
                 _ => {}
             }
         }

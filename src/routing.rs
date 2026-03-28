@@ -312,7 +312,7 @@ impl RouteTable {
     }
 
     /// Test convenience: add an HTTP route to a default catch-all scope on port 0.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
         self.add_http_route_for_listener(0, None, host, rule);
     }

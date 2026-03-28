@@ -38,11 +38,8 @@ pub(crate) fn dispatch_mirrors(mirror_targets: &[MirrorTarget], data: &[u8]) {
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 let connect_result =
                     tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await;
-                match connect_result {
-                    Ok(Ok(mut conn)) => {
-                        let _ = conn.write_all(&data).await;
-                    }
-                    _ => {} // connect timeout or error — silently drop
+                if let Ok(Ok(mut conn)) = connect_result {
+                    let _ = conn.write_all(&data).await;
                 }
             })
             .await;

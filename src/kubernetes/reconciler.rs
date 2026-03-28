@@ -17,6 +17,207 @@ use super::converters::{
 use super::parent_ref::{all_section_names_for_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, route_allowed_for_listener, RouteAllowResult};
 
+// ---------------------------------------------------------------------------
+// GatewayRoute trait — replaces the 8 closure parameters on collect_routes
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the four Gateway API route types (HTTP, TCP, TLS, UDP).
+/// Each method corresponds to a former closure parameter of `collect_routes`.
+pub(crate) trait GatewayRoute: Sized {
+    type ParentRef: ParentRefAccess;
+    type Config;
+    const KIND: &'static str;
+
+    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
+    fn route_namespace(&self) -> &str;
+    fn identity(&self) -> (&str, Option<i64>);
+    fn hostnames(&self) -> Vec<String>;
+    fn convert(&self, gateway_name: &str) -> Result<Self::Config>;
+    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>>;
+    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
+    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
+}
+
+impl GatewayRoute for HTTPRoute {
+    type ParentRef = HTTPRouteParentRefs;
+    type Config = HttpRouteConfig;
+    const KIND: &'static str = "HTTPRoute";
+
+    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
+        &self.spec.parent_refs
+    }
+    fn route_namespace(&self) -> &str {
+        route_namespace(&self.metadata)
+    }
+    fn identity(&self) -> (&str, Option<i64>) {
+        (
+            self.metadata.name.as_deref().unwrap_or("unknown"),
+            self.metadata.generation,
+        )
+    }
+    fn hostnames(&self) -> Vec<String> {
+        self.spec.hostnames.clone().unwrap_or_default()
+    }
+    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
+        convert_http_route(self, gateway_name)
+    }
+    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
+        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
+    }
+    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.backend_refs
+                    .iter()
+                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
+            })
+            .collect()
+    }
+    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.backend_refs
+                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+        }
+    }
+}
+
+impl GatewayRoute for TCPRoute {
+    type ParentRef = TCPRouteParentRefs;
+    type Config = TcpRouteConfig;
+    const KIND: &'static str = "TCPRoute";
+
+    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
+        &self.spec.parent_refs
+    }
+    fn route_namespace(&self) -> &str {
+        route_namespace(&self.metadata)
+    }
+    fn identity(&self) -> (&str, Option<i64>) {
+        (
+            self.metadata.name.as_deref().unwrap_or("unknown"),
+            self.metadata.generation,
+        )
+    }
+    fn hostnames(&self) -> Vec<String> {
+        vec![]
+    }
+    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
+        convert_tcp_route(self, gateway_name)
+    }
+    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
+        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
+    }
+    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.backend_refs
+                    .iter()
+                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
+            })
+            .collect()
+    }
+    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.backend_refs
+                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+        }
+    }
+}
+
+impl GatewayRoute for TLSRoute {
+    type ParentRef = TLSRouteParentRefs;
+    type Config = TlsRouteConfig;
+    const KIND: &'static str = "TLSRoute";
+
+    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
+        &self.spec.parent_refs
+    }
+    fn route_namespace(&self) -> &str {
+        route_namespace(&self.metadata)
+    }
+    fn identity(&self) -> (&str, Option<i64>) {
+        (
+            self.metadata.name.as_deref().unwrap_or("unknown"),
+            self.metadata.generation,
+        )
+    }
+    fn hostnames(&self) -> Vec<String> {
+        self.spec.hostnames.clone()
+    }
+    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
+        convert_tls_route(self, gateway_name)
+    }
+    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
+        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
+    }
+    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.backend_refs
+                    .iter()
+                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
+            })
+            .collect()
+    }
+    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.backend_refs
+                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+        }
+    }
+}
+
+impl GatewayRoute for UDPRoute {
+    type ParentRef = UDPRouteParentRefs;
+    type Config = UdpRouteConfig;
+    const KIND: &'static str = "UDPRoute";
+
+    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
+        &self.spec.parent_refs
+    }
+    fn route_namespace(&self) -> &str {
+        route_namespace(&self.metadata)
+    }
+    fn identity(&self) -> (&str, Option<i64>) {
+        (
+            self.metadata.name.as_deref().unwrap_or("unknown"),
+            self.metadata.generation,
+        )
+    }
+    fn hostnames(&self) -> Vec<String> {
+        vec![]
+    }
+    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
+        convert_udp_route(self, gateway_name)
+    }
+    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
+        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
+    }
+    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.backend_refs
+                    .iter()
+                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
+            })
+            .collect()
+    }
+    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.backend_refs
+                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+        }
+    }
+}
+
 pub struct ReconcileResult {
     pub config: PortailConfig,
     pub route_status: Vec<RouteAcceptance>,
@@ -61,7 +262,7 @@ pub fn reconcile_to_config(
 
     let mut route_status = Vec::new();
 
-    let http_route_configs = collect_routes(
+    let http_route_configs = collect_routes::<HTTPRoute>(
         http_routes,
         gateway_name,
         gateway_ns,
@@ -69,38 +270,10 @@ pub fn reconcile_to_config(
         namespace_labels,
         reference_grants,
         known_services,
-        "HTTPRoute",
-        |r| &r.spec.parent_refs,
-        |r| route_namespace(&r.metadata),
-        |r| {
-            (
-                r.metadata.name.as_deref().unwrap_or("unknown"),
-                r.metadata.generation,
-            )
-        },
-        |r| convert_http_route(r, gateway_name),
-        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
-        |r| r.spec.hostnames.clone().unwrap_or_default(),
-        |c| {
-            c.rules
-                .iter()
-                .flat_map(|r| {
-                    r.backend_refs
-                        .iter()
-                        .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                })
-                .collect()
-        },
-        |c, invalid: &HashSet<(String, u16)>| {
-            for rule in &mut c.rules {
-                rule.backend_refs
-                    .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-            }
-        },
         &mut route_status,
     );
 
-    let tcp_route_configs = collect_routes(
+    let tcp_route_configs = collect_routes::<TCPRoute>(
         tcp_routes,
         gateway_name,
         gateway_ns,
@@ -108,38 +281,10 @@ pub fn reconcile_to_config(
         namespace_labels,
         reference_grants,
         known_services,
-        "TCPRoute",
-        |r| &r.spec.parent_refs,
-        |r| route_namespace(&r.metadata),
-        |r| {
-            (
-                r.metadata.name.as_deref().unwrap_or("unknown"),
-                r.metadata.generation,
-            )
-        },
-        |r| convert_tcp_route(r, gateway_name),
-        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
-        |_r| vec![], // TCPRoute has no hostname matching
-        |c| {
-            c.rules
-                .iter()
-                .flat_map(|r| {
-                    r.backend_refs
-                        .iter()
-                        .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                })
-                .collect()
-        },
-        |c, invalid: &HashSet<(String, u16)>| {
-            for rule in &mut c.rules {
-                rule.backend_refs
-                    .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-            }
-        },
         &mut route_status,
     );
 
-    let tls_route_configs = collect_routes(
+    let tls_route_configs = collect_routes::<TLSRoute>(
         tls_routes,
         gateway_name,
         gateway_ns,
@@ -147,38 +292,10 @@ pub fn reconcile_to_config(
         namespace_labels,
         reference_grants,
         known_services,
-        "TLSRoute",
-        |r| &r.spec.parent_refs,
-        |r| route_namespace(&r.metadata),
-        |r| {
-            (
-                r.metadata.name.as_deref().unwrap_or("unknown"),
-                r.metadata.generation,
-            )
-        },
-        |r| convert_tls_route(r, gateway_name),
-        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
-        |r| r.spec.hostnames.clone(),
-        |c| {
-            c.rules
-                .iter()
-                .flat_map(|r| {
-                    r.backend_refs
-                        .iter()
-                        .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                })
-                .collect()
-        },
-        |c, invalid: &HashSet<(String, u16)>| {
-            for rule in &mut c.rules {
-                rule.backend_refs
-                    .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-            }
-        },
         &mut route_status,
     );
 
-    let udp_route_configs = collect_routes(
+    let udp_route_configs = collect_routes::<UDPRoute>(
         udp_routes,
         gateway_name,
         gateway_ns,
@@ -186,34 +303,6 @@ pub fn reconcile_to_config(
         namespace_labels,
         reference_grants,
         known_services,
-        "UDPRoute",
-        |r| &r.spec.parent_refs,
-        |r| route_namespace(&r.metadata),
-        |r| {
-            (
-                r.metadata.name.as_deref().unwrap_or("unknown"),
-                r.metadata.generation,
-            )
-        },
-        |r| convert_udp_route(r, gateway_name),
-        |r| all_section_names_for_gateway(&r.spec.parent_refs, gateway_name, gateway_ns),
-        |_r| vec![], // UDPRoute has no hostname matching
-        |c| {
-            c.rules
-                .iter()
-                .flat_map(|r| {
-                    r.backend_refs
-                        .iter()
-                        .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                })
-                .collect()
-        },
-        |c, invalid: &HashSet<(String, u16)>| {
-            for rule in &mut c.rules {
-                rule.backend_refs
-                    .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-            }
-        },
         &mut route_status,
     );
 
@@ -233,7 +322,7 @@ pub fn reconcile_to_config(
 }
 
 /// Generic route collection with namespace scoping and acceptance tracking.
-fn collect_routes<R, P, C>(
+fn collect_routes<R: GatewayRoute>(
     routes: &[R],
     gateway_name: &str,
     gateway_ns: &str,
@@ -241,38 +330,27 @@ fn collect_routes<R, P, C>(
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
     reference_grants: &[ReferenceGrant],
     known_services: &HashSet<(String, String)>,
-    kind: &'static str,
-    get_parent_refs: impl Fn(&R) -> &Option<Vec<P>>,
-    get_namespace: impl Fn(&R) -> &str,
-    get_identity: impl Fn(&R) -> (&str, Option<i64>),
-    convert: impl Fn(&R) -> Result<C>,
-    get_parent_section_names: impl Fn(&R) -> Vec<Option<String>>,
-    get_hostnames: impl Fn(&R) -> Vec<String>,
-    get_backend_refs: impl Fn(&C) -> Vec<(&str, u16, &str, &str)>,
-    remove_invalid_backends: impl Fn(&mut C, &HashSet<(String, u16)>),
     route_status: &mut Vec<RouteAcceptance>,
-) -> Vec<C>
-where
-    P: ParentRefAccess,
-{
+) -> Vec<R::Config> {
+    let kind = R::KIND;
     let mut configs = Vec::new();
     for route in routes {
-        if !route_targets_gateway(get_parent_refs(route), gateway_name, gateway_ns) {
+        if !route_targets_gateway(route.parent_refs(), gateway_name, gateway_ns) {
             continue;
         }
 
-        let route_ns = get_namespace(route);
-        let (name, generation) = get_identity(route);
-        let section_names = get_parent_section_names(route);
+        let route_ns = route.route_namespace();
+        let (name, generation) = route.identity();
+        let section_names = route.section_names_for_gateway(gateway_name, gateway_ns);
 
         // Check namespace + hostname scoping against each listener.
         // Track which listeners accept this route (for attached route counting).
-        let route_hostnames = get_hostnames(route);
+        let route_hostnames = route.hostnames();
         let mut accepted_listener_names: Vec<String> = Vec::new();
         let mut rejection_reason = "NoMatchingParent";
         for l in listeners {
             match route_allowed_for_listener(
-                get_parent_refs(route),
+                route.parent_refs(),
                 gateway_name,
                 l,
                 gateway_ns,
@@ -324,7 +402,7 @@ where
             continue;
         }
 
-        match convert(route) {
+        match route.convert(gateway_name) {
             Ok(mut config) => {
                 let mut refs_resolved = true;
                 let mut refs_messages = Vec::new();
@@ -332,7 +410,7 @@ where
                 let mut invalid_backends: HashSet<(String, u16)> = HashSet::new();
 
                 // Validate backend refs: check group/kind, cross-namespace grants, and service existence
-                for (backend_name, port, group, ref_kind) in get_backend_refs(&config) {
+                for (backend_name, port, group, ref_kind) in R::backend_refs(&config) {
                     // Check group/kind — must be core ("") group and "Service" kind (or defaults)
                     if (!group.is_empty() && group != "core")
                         || (ref_kind != "Service" && !ref_kind.is_empty())
@@ -384,7 +462,7 @@ where
 
                 // Remove invalid backends so the data plane returns 500 for them
                 if !invalid_backends.is_empty() {
-                    remove_invalid_backends(&mut config, &invalid_backends);
+                    R::remove_invalid_backends(&mut config, &invalid_backends);
                 }
 
                 let refs_message = if refs_resolved {
