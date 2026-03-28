@@ -3,8 +3,10 @@
 /// Keep sorted alphabetically for easy diffing.
 pub const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
+    "GatewayAddressEmpty",
     "GatewayHTTPListenerIsolation",
     "GatewayPort8080",
+    "GatewayStaticAddresses",
     "HTTPRoute",
     "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteBackendRequestHeaderModification",
