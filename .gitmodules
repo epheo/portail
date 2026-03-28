@@ -1,3 +1,0 @@
-[submodule "gateway-api-conformance"]
-	path = gateway-api-conformance
-	url = https://github.com/kubernetes-sigs/gateway-api.git

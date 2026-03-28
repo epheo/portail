@@ -101,13 +101,17 @@ fi
 # ── 6. Run conformance tests ─────────────────────────────────────
 if [ "$SKIP_TESTS" = false ]; then
   echo "━━━ [6/6] Running conformance tests ━━━"
-  cd "$PROJECT_DIR/gateway-api-conformance"
+
+  # Determine node IP for GatewayStaticAddresses test.
+  # 198.51.100.1 is RFC 5737 TEST-NET-2 — guaranteed unreachable.
+  NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
   if [ "$USE_KIND" = true ]; then
     # Build the test binary on the host, then run it inside the Kind container
     # where pod IPs are directly reachable (rootless Podman can't bind port 80).
     echo "Building conformance test binary..."
-    CGO_ENABLED=0 go test -c -o /tmp/conformance.test ./conformance
+    cd "$PROJECT_DIR/conformance"
+    CGO_ENABLED=0 go test -c -o /tmp/conformance.test .
     CONTAINER_NAME="${CLUSTER_NAME:-portail}-control-plane"
     podman cp /tmp/conformance.test "$CONTAINER_NAME":/conformance.test
     podman cp "$KUBECONFIG" "$CONTAINER_NAME":/kubeconfig
@@ -115,7 +119,11 @@ if [ "$SKIP_TESTS" = false ]; then
 
     echo "Running conformance tests inside Kind container..."
     TEST_EXIT=0
-    podman exec -e KUBECONFIG=/etc/kubernetes/admin.conf "$CONTAINER_NAME" /conformance.test \
+    podman exec \
+      -e KUBECONFIG=/etc/kubernetes/admin.conf \
+      -e USABLE_ADDRESSES="$NODE_IP" \
+      -e UNUSABLE_ADDRESSES="198.51.100.1" \
+      "$CONTAINER_NAME" /conformance.test \
       -test.v -test.timeout 20m -test.run TestConformance \
       -gateway-class=portail \
       -conformance-profiles=GATEWAY-HTTP,GATEWAY-TLS \
@@ -131,7 +139,9 @@ if [ "$SKIP_TESTS" = false ]; then
     # Copy report back before cleanup trap fires
     podman cp "$CONTAINER_NAME":/conformance-report.yaml "$REPORT_OUTPUT" 2>/dev/null || true
   else
-    go test -v -timeout 20m ./conformance -run TestConformance -args \
+    cd "$PROJECT_DIR/conformance"
+    USABLE_ADDRESSES="$NODE_IP" UNUSABLE_ADDRESSES="198.51.100.1" \
+    go test -v -timeout 20m . -run TestConformance -args \
       -gateway-class=portail \
       -conformance-profiles=GATEWAY-HTTP,GATEWAY-TLS \
       -supported-features="$SUPPORTED_FEATURES" \

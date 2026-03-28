@@ -923,6 +923,7 @@ async fn reconcile(
                 &gateway_accepted_reason,
                 &gateway_accepted_message,
                 false,
+                "Invalid",
                 &format!("Reconciliation failed: {}", e),
                 &HashMap::new(),
                 &listener_statuses,
@@ -1118,15 +1119,59 @@ async fn reconcile(
                 Ok(dp) => dp.is_ready_for_ports(&required_ports),
                 Err(_) => false,
             };
-            let (programmed, programmed_msg) = if dp_ready {
-                (true, "Programmed")
-            } else {
-                warn!("Data plane not ready: not all listener ports are bound");
-                (
-                    false,
-                    "Data plane not ready: not all listener ports are bound",
-                )
-            };
+            // Check if static addresses are usable by this node
+            let (addrs_usable, addrs_reason, addrs_msg) =
+                if let Some(spec_addrs) = &gateway.spec.addresses {
+                    if spec_addrs.is_empty() {
+                        (true, "Programmed", String::from("Programmed"))
+                    } else {
+                        let node_ip = std::env::var("NODE_IP")
+                            .or_else(|_| std::env::var("POD_IP"))
+                            .unwrap_or_default();
+                        let all_usable = spec_addrs.iter().all(|a| {
+                            let addr_type =
+                                a.r#type.as_deref().unwrap_or("IPAddress");
+                            match addr_type {
+                                "IPAddress" => {
+                                    a.value.as_deref() == Some(node_ip.as_str())
+                                }
+                                // Hostname addresses are accepted but we can't verify usability,
+                                // so treat them as usable
+                                "Hostname" => true,
+                                _ => false,
+                            }
+                        });
+                        if all_usable {
+                            (true, "Programmed", String::from("Programmed"))
+                        } else {
+                            (
+                                false,
+                                "AddressNotUsable",
+                                String::from(
+                                    "One or more addresses in spec.addresses are not usable by this gateway",
+                                ),
+                            )
+                        }
+                    }
+                } else {
+                    (true, "Programmed", String::from("Programmed"))
+                };
+
+            let (programmed, programmed_reason, programmed_msg) =
+                if !dp_ready {
+                    warn!("Data plane not ready: not all listener ports are bound");
+                    (
+                        false,
+                        "Invalid",
+                        String::from(
+                            "Data plane not ready: not all listener ports are bound",
+                        ),
+                    )
+                } else if !addrs_usable {
+                    (false, addrs_reason, addrs_msg)
+                } else {
+                    (true, "Programmed", String::from("Programmed"))
+                };
 
             status::update_gateway_status(
                 &ctx.client,
@@ -1135,12 +1180,13 @@ async fn reconcile(
                 &gateway_accepted_reason,
                 &gateway_accepted_message,
                 programmed,
-                programmed_msg,
+                programmed_reason,
+                &programmed_msg,
                 &listener_route_counts,
                 &listener_statuses,
             )
             .await;
-            dp_ready
+            dp_ready && addrs_usable
         }
         Err(e) => {
             error!(
@@ -1154,6 +1200,7 @@ async fn reconcile(
                 &gateway_accepted_reason,
                 &gateway_accepted_message,
                 false,
+                "Invalid",
                 &format!("Route table conversion failed: {}", e),
                 &listener_route_counts,
                 &listener_statuses,

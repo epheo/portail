@@ -2,7 +2,6 @@ target/
 tests/integration/test-content/
 programs/*.o
 tests/integration/reports
-certs/gateway-api-conformance/
 certs/
 conformance-results.log
 conformance-report.yaml

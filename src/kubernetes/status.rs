@@ -120,6 +120,7 @@ pub async fn update_gateway_status(
     accepted_reason: &str,
     accepted_message: &str,
     programmed: bool,
+    programmed_reason: &str,
     programmed_message: &str,
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
@@ -146,7 +147,11 @@ pub async fn update_gateway_status(
         accepted_reason
     };
     let programmed_status = if programmed { "True" } else { "False" };
-    let programmed_reason_str = if programmed { "Programmed" } else { "Invalid" };
+    let programmed_reason_str = if programmed {
+        "Programmed"
+    } else {
+        programmed_reason
+    };
 
     let conditions = vec![
         Condition {
@@ -267,12 +272,23 @@ pub async fn update_gateway_status(
         })
         .collect();
 
-    // Build status.addresses — if spec.addresses is set, mirror those (GatewayStaticAddresses);
-    // otherwise assign from NODE_IP/POD_IP env vars (GatewayAddressEmpty).
+    // Build status.addresses — if spec.addresses is set, report only usable ones
+    // (GatewayStaticAddresses); otherwise assign from NODE_IP/POD_IP env vars (GatewayAddressEmpty).
+    let gateway_ip = std::env::var("NODE_IP")
+        .or_else(|_| std::env::var("POD_IP"))
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
     let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
         if !spec_addrs.is_empty() {
             spec_addrs
                 .iter()
+                .filter(|a| {
+                    let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
+                    match addr_type {
+                        "IPAddress" => a.value.as_deref() == Some(gateway_ip.as_str()),
+                        "Hostname" => true,
+                        _ => false,
+                    }
+                })
                 .map(|a| {
                     serde_json::json!({
                         "type": a.r#type.as_deref().unwrap_or("IPAddress"),
@@ -281,18 +297,12 @@ pub async fn update_gateway_status(
                 })
                 .collect()
         } else {
-            let gateway_ip = std::env::var("NODE_IP")
-                .or_else(|_| std::env::var("POD_IP"))
-                .unwrap_or_else(|_| "0.0.0.0".to_string());
             vec![serde_json::json!({
                 "type": "IPAddress",
                 "value": gateway_ip,
             })]
         }
     } else {
-        let gateway_ip = std::env::var("NODE_IP")
-            .or_else(|_| std::env::var("POD_IP"))
-            .unwrap_or_else(|_| "0.0.0.0".to_string());
         vec![serde_json::json!({
             "type": "IPAddress",
             "value": gateway_ip,
