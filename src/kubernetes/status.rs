@@ -269,27 +269,17 @@ pub async fn update_gateway_status(
 
     // Build status.addresses — if spec.addresses is set, mirror those (GatewayStaticAddresses);
     // otherwise assign from NODE_IP/POD_IP env vars (GatewayAddressEmpty).
-    let addresses: Vec<serde_json::Value> =
-        if let Some(spec_addrs) = &gateway.spec.addresses {
-            if !spec_addrs.is_empty() {
-                spec_addrs
-                    .iter()
-                    .map(|a| {
-                        serde_json::json!({
-                            "type": a.r#type.as_deref().unwrap_or("IPAddress"),
-                            "value": a.value,
-                        })
+    let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
+        if !spec_addrs.is_empty() {
+            spec_addrs
+                .iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "type": a.r#type.as_deref().unwrap_or("IPAddress"),
+                        "value": a.value,
                     })
-                    .collect()
-            } else {
-                let gateway_ip = std::env::var("NODE_IP")
-                    .or_else(|_| std::env::var("POD_IP"))
-                    .unwrap_or_else(|_| "0.0.0.0".to_string());
-                vec![serde_json::json!({
-                    "type": "IPAddress",
-                    "value": gateway_ip,
-                })]
-            }
+                })
+                .collect()
         } else {
             let gateway_ip = std::env::var("NODE_IP")
                 .or_else(|_| std::env::var("POD_IP"))
@@ -298,7 +288,16 @@ pub async fn update_gateway_status(
                 "type": "IPAddress",
                 "value": gateway_ip,
             })]
-        };
+        }
+    } else {
+        let gateway_ip = std::env::var("NODE_IP")
+            .or_else(|_| std::env::var("POD_IP"))
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
+        vec![serde_json::json!({
+            "type": "IPAddress",
+            "value": gateway_ip,
+        })]
+    };
 
     let status = serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
