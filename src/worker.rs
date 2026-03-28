@@ -16,13 +16,11 @@ use crate::backend_pool::BackendPool;
 use crate::health::HealthRegistry;
 use crate::http_filters::{
     apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
-    MIRROR_BODY_MAX,
+    extract_header_mods, extract_url_rewrite, HeaderModifications, MIRROR_BODY_MAX,
 };
 use crate::http_parser::find_header_end;
 use crate::logging::{debug, info, warn};
-use crate::request_processor::{
-    self, extract_header_mods, extract_url_rewrite, HeaderModifications, RequestMeta, RoutingResult,
-};
+use crate::request_processor::{analyze_request, is_http_request, RequestMeta, RoutingResult};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 use crate::tls::{self, Connection, DynamicTlsAcceptor};
 
@@ -206,7 +204,7 @@ async fn handle_connection(
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
-    if request_processor::is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
+    if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
         match read_remaining_headers(&mut client, &mut buf, n).await {
             Ok(total) => n = total,
             Err(e) => {
@@ -218,7 +216,7 @@ async fn handle_connection(
 
     loop {
         let route_table = state.routes.load();
-        let result = request_processor::analyze_request(
+        let result = analyze_request(
             &route_table,
             &state.selector,
             &buf[..n],

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::health::HealthRegistry;
 use crate::logging::{debug, info, warn};
-use crate::request_processor::{self, RoutingResult};
+use crate::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
 
 struct UdpSession {
@@ -94,7 +94,7 @@ pub async fn run_udp_worker(
                         // New session — route lookup
                         let decision = {
                             let route_table = routes.load();
-                            match request_processor::analyze_udp_request(&route_table, &selector, server_port, &health) {
+                            match analyze_udp_request(&route_table, &selector, server_port, &health) {
                                 Ok(d) => d,
                                 Err(e) => {
                                     warn!("UDP routing error for port {}: {}", server_port, e);

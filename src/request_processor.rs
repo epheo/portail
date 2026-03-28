@@ -1,60 +1,19 @@
 //! Request Processing Pipeline
 //!
 //! Analyzes incoming data and produces routing decisions.
+//! Orchestrates http_parser + routing + health into a RoutingResult.
 //! Works on byte slices — no I/O runtime dependency.
+
+use anyhow::Result;
+use std::hash::Hasher;
+use std::net::SocketAddr;
 
 use crate::health::HealthRegistry;
 use crate::http_parser::{extract_routing_info, ConnectionType};
 use crate::logging::{debug, error};
 use crate::routing::{
-    Backend, BackendSelector, HttpFilter, HttpHeader, HttpRouteRule, RouteTable, URLRewritePath,
+    Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
-use anyhow::Result;
-use std::hash::Hasher;
-use std::net::SocketAddr;
-
-/// Borrowed header modification parameters — zero per-request allocation.
-/// References point into the `Arc<Vec<...>>` fields in `HttpFilter` variants.
-#[derive(Debug)]
-pub struct HeaderModifications<'a> {
-    pub add: &'a [HttpHeader],
-    pub set: &'a [HttpHeader],
-    pub remove: &'a [String],
-}
-
-#[derive(Debug, Clone)]
-pub struct URLRewrite {
-    pub hostname: Option<String>,
-    pub path: Option<RewrittenPath>,
-}
-
-#[derive(Debug, Clone)]
-pub enum RewrittenPath {
-    Full(String),
-    PrefixReplaced(String),
-}
-
-/// Join a prefix replacement with the remaining suffix from the original path.
-/// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
-pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
-    // Strip trailing slash from prefix if suffix starts with slash
-    let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
-        &prefix[..prefix.len() - 1]
-    } else {
-        prefix
-    };
-    let needs_slash = !prefix.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-    let mut result = String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash));
-    result.push_str(prefix);
-    if needs_slash {
-        result.push('/');
-    }
-    result.push_str(suffix);
-    if result.is_empty() {
-        result.push('/');
-    }
-    result
-}
 
 /// Stack-allocated request metadata — no heap allocation.
 pub struct RequestMeta {
@@ -87,49 +46,6 @@ pub enum RoutingResult<'a> {
         close_connection: bool,
     },
     CloseConnection,
-}
-
-/// Extract `HeaderModifications` from the first matching filter in a filter list.
-/// Zero-copy: borrows from the Arc internals stored in the route table.
-pub fn extract_header_mods<'a>(
-    filters: &'a [HttpFilter],
-    is_response: bool,
-) -> Option<HeaderModifications<'a>> {
-    for filter in filters {
-        match filter {
-            HttpFilter::RequestHeaderModifier { add, set, remove } if !is_response => {
-                return Some(HeaderModifications { add, set, remove });
-            }
-            HttpFilter::ResponseHeaderModifier { add, set, remove } if is_response => {
-                return Some(HeaderModifications { add, set, remove });
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Extract URL rewrite parameters from rule filters.
-pub fn extract_url_rewrite(
-    filters: &[HttpFilter],
-    rule_path: &str,
-    request_path: &str,
-) -> Option<URLRewrite> {
-    for filter in filters {
-        if let HttpFilter::URLRewrite { hostname, path } = filter {
-            let rewritten_path = path.as_ref().map(|p| match p {
-                URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
-                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
-                    join_prefix_path(value, &request_path[rule_path.len()..]),
-                ),
-            });
-            return Some(URLRewrite {
-                hostname: hostname.clone(),
-                path: rewritten_path,
-            });
-        }
-    }
-    None
 }
 
 pub fn analyze_request<'a>(
@@ -228,7 +144,10 @@ fn analyze_http_request<'a>(
                 let redirect_path = match path {
                     Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
                     Some(URLRewritePath::ReplacePrefixMatch(value)) => {
-                        join_prefix_path(value, &request_info.path[rule.path.len()..])
+                        crate::http_filters::join_prefix_path(
+                            value,
+                            &request_info.path[rule.path.len()..],
+                        )
                     }
                     None => request_info.path.to_string(),
                 };
@@ -350,7 +269,7 @@ fn analyze_l4_request<'a>(
     backend_selector: &BackendSelector,
     server_port: u16,
     proto: &str,
-    lookup: impl FnOnce(u16) -> Result<&'a Vec<crate::routing::Backend>>,
+    lookup: impl FnOnce(u16) -> Result<&'a Vec<Backend>>,
     make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
@@ -411,7 +330,8 @@ mod tests {
     use super::*;
     use crate::health::HealthRegistry;
     use crate::routing::{
-        Backend, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, RouteTable, URLRewritePath,
+        Backend, BackendSelector, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, RouteTable,
+        URLRewritePath,
     };
     use std::sync::Arc;
 
@@ -468,8 +388,12 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/old").unwrap();
-            assert!(matches!(rewrite.path, Some(RewrittenPath::Full(ref p)) if p == "/new"));
+            let rewrite =
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/old")
+                    .unwrap();
+            assert!(
+                matches!(rewrite.path, Some(crate::http_filters::RewrittenPath::Full(ref p)) if p == "/new")
+            );
         } else {
             panic!("expected HttpForward");
         }
@@ -492,9 +416,11 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/v1/users").unwrap();
+            let rewrite =
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1/users")
+                    .unwrap();
             assert!(
-                matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2/users")
+                matches!(rewrite.path, Some(crate::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/v2/users")
             );
         } else {
             panic!("expected HttpForward");
@@ -518,9 +444,11 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/v1").unwrap();
+            let rewrite =
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1")
+                    .unwrap();
             assert!(
-                matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2")
+                matches!(rewrite.path, Some(crate::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/v2")
             );
         } else {
             panic!("expected HttpForward");
@@ -544,9 +472,11 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/users").unwrap();
+            let rewrite =
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/users")
+                    .unwrap();
             assert!(
-                matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/api/users"),
+                matches!(rewrite.path, Some(crate::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/api/users"),
                 "expected /api/users, got {:?}",
                 rewrite.path
             );
@@ -572,7 +502,8 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/").unwrap();
+            let rewrite =
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/").unwrap();
             assert_eq!(rewrite.hostname.as_deref(), Some("new.example.com"));
             assert!(rewrite.path.is_none());
         } else {
@@ -607,8 +538,11 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            assert!(extract_url_rewrite(&rule.filters, &rule.path, "/v1/test").is_some());
-            assert!(extract_header_mods(&rule.filters, false).is_some());
+            assert!(
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1/test")
+                    .is_some()
+            );
+            assert!(crate::http_filters::extract_header_mods(&rule.filters, false).is_some());
         } else {
             panic!("expected HttpForward");
         }

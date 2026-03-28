@@ -311,8 +311,9 @@ impl RouteTable {
         scope.add_route(route_host, rule);
     }
 
-    /// Test convenience: add an HTTP route to a default catch-all scope on port 0.
-    #[cfg(test)]
+    /// Convenience: add an HTTP route to a default catch-all scope on port 0.
+    /// Used by tests and benchmarks.
+    #[allow(dead_code)]
     pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
         self.add_http_route_for_listener(0, None, host, rule);
     }
@@ -1575,3 +1576,4 @@ impl BackendSelector {
         }
     }
 }
+

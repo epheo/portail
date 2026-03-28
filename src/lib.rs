@@ -3,7 +3,6 @@
 pub mod backend_pool;
 pub mod config;
 pub mod config_watcher;
-pub mod control_plane;
 pub mod data_plane;
 pub mod health;
 pub mod http_filters;

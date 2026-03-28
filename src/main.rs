@@ -7,7 +7,6 @@ mod backend_pool;
 mod cli;
 mod config;
 mod config_watcher;
-mod control_plane;
 mod data_plane;
 mod health;
 mod http_filters;
@@ -20,11 +19,12 @@ mod tls;
 mod udp_worker;
 mod worker;
 
+use arc_swap::ArcSwap;
 use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
-use control_plane::ControlPlane;
 use data_plane::DataPlane;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<()> {
@@ -112,11 +112,16 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
         portail_config.udp_routes.len()
     );
 
-    // Single Tokio runtime for both control and data planes
-    let control_plane = ControlPlane::new(portail_config)?;
-    control_plane.start().await?;
-
-    let routes = control_plane.get_routes();
+    // Build initial route table from configuration
+    let route_table = portail_config.to_route_table().map_err(|e| {
+        anyhow::anyhow!("Failed to convert configuration to route table: {}", e)
+    })?;
+    let routes = Arc::new(ArcSwap::from_pointee(route_table));
+    info!(
+        "Routes loaded: {} HTTP routes, {} TCP routes",
+        portail_config.http_routes.len(),
+        portail_config.tcp_routes.len()
+    );
 
     let data_plane = std::sync::Arc::new(std::sync::Mutex::new(DataPlane::new(
         worker_count,
@@ -178,7 +183,8 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
     }
 
     // Wait for shutdown signal
-    control_plane.wait_for_shutdown().await?;
+    tokio::signal::ctrl_c().await?;
+    info!("Received shutdown signal");
     shutdown_token.cancel();
 
     info!("Shutting down Portail");

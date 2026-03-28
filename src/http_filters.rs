@@ -8,8 +8,93 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::logging::warn;
-use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
-use crate::routing::HttpFilter;
+use crate::routing::{HttpFilter, HttpHeader, URLRewritePath};
+
+/// Borrowed header modification parameters — zero per-request allocation.
+/// References point into the `Arc<Vec<...>>` fields in `HttpFilter` variants.
+#[derive(Debug)]
+pub struct HeaderModifications<'a> {
+    pub add: &'a [HttpHeader],
+    pub set: &'a [HttpHeader],
+    pub remove: &'a [String],
+}
+
+#[derive(Debug, Clone)]
+pub struct URLRewrite {
+    pub hostname: Option<String>,
+    pub path: Option<RewrittenPath>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RewrittenPath {
+    Full(String),
+    PrefixReplaced(String),
+}
+
+/// Join a prefix replacement with the remaining suffix from the original path.
+/// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
+pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
+    // Strip trailing slash from prefix if suffix starts with slash
+    let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
+        &prefix[..prefix.len() - 1]
+    } else {
+        prefix
+    };
+    let needs_slash = !prefix.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
+    let mut result = String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash));
+    result.push_str(prefix);
+    if needs_slash {
+        result.push('/');
+    }
+    result.push_str(suffix);
+    if result.is_empty() {
+        result.push('/');
+    }
+    result
+}
+
+/// Extract `HeaderModifications` from the first matching filter in a filter list.
+/// Zero-copy: borrows from the Arc internals stored in the route table.
+pub fn extract_header_mods<'a>(
+    filters: &'a [HttpFilter],
+    is_response: bool,
+) -> Option<HeaderModifications<'a>> {
+    for filter in filters {
+        match filter {
+            HttpFilter::RequestHeaderModifier { add, set, remove } if !is_response => {
+                return Some(HeaderModifications { add, set, remove });
+            }
+            HttpFilter::ResponseHeaderModifier { add, set, remove } if is_response => {
+                return Some(HeaderModifications { add, set, remove });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract URL rewrite parameters from rule filters.
+pub fn extract_url_rewrite(
+    filters: &[HttpFilter],
+    rule_path: &str,
+    request_path: &str,
+) -> Option<URLRewrite> {
+    for filter in filters {
+        if let HttpFilter::URLRewrite { hostname, path } = filter {
+            let rewritten_path = path.as_ref().map(|p| match p {
+                URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
+                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
+                    join_prefix_path(value, &request_path[rule_path.len()..]),
+                ),
+            });
+            return Some(URLRewrite {
+                hostname: hostname.clone(),
+                path: rewritten_path,
+            });
+        }
+    }
+    None
+}
 
 /// Maximum request body size (bytes) that will be buffered for mirroring.
 /// Bodies exceeding this are silently skipped (primary request unaffected).
@@ -254,8 +339,6 @@ pub(crate) fn apply_response_header_mods(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
-    use crate::routing::HttpHeader;
 
     #[test]
     fn test_apply_modifications_path_rewrite() {
