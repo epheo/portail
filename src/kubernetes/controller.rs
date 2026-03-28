@@ -9,7 +9,7 @@ use kube::runtime::watcher;
 use kube::runtime::{predicates, reflector, Controller, WatchStreamExt};
 use kube::Client;
 use kube::ResourceExt;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +26,8 @@ use crate::logging::{debug, error, info, warn};
 use crate::routing::RouteTable;
 
 use super::parent_ref::ParentRefAccess;
-use super::reconciler::reconcile_to_config;
+use super::reconciler::{reconcile_to_config, ClusterSnapshot, ServiceState};
+use super::reference_grants::is_reference_allowed;
 use super::status;
 
 #[derive(Debug)]
@@ -53,26 +54,43 @@ impl From<kube::Error> for ReconcileError {
     }
 }
 
+/// Semantic grouping of reflector stores — cached local copies of cluster resources.
+#[derive(Clone)]
+struct ResourceCache {
+    gateways: Store<Gateway>,
+    gateway_classes: Store<GatewayClass>,
+    http_routes: Store<HTTPRoute>,
+    tcp_routes: Store<TCPRoute>,
+    tls_routes: Store<TLSRoute>,
+    udp_routes: Store<UDPRoute>,
+    namespaces: Store<Namespace>,
+    services: Store<Service>,
+    endpoint_slices: Store<EndpointSlice>,
+    secrets: Store<Secret>,
+    reference_grants: Store<ReferenceGrant>,
+}
+
+/// Read all objects from a reflector store, cloning each.
+fn snapshot<K>(store: &Store<K>) -> Vec<K>
+where
+    K: kube::Resource + Clone,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    store.state().iter().map(|arc| (**arc).clone()).collect()
+}
+
 #[derive(Clone)]
 struct ControllerCtx {
     client: Client,
-    routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
+    cache: ResourceCache,
+    /// Per-gateway config cache — avoids re-reconciling other gateways.
+    /// Populated during reconcile, pruned against the gateway store.
+    config_cache: Arc<std::sync::Mutex<HashMap<(String, String), crate::config::PortailConfig>>>,
+    routes: Arc<ArcSwap<RouteTable>>,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     worker_count: usize,
     performance_config: crate::config::PerformanceConfig,
-    // Reflector stores — cached local copies of cluster resources
-    store_http_routes: Store<HTTPRoute>,
-    store_tcp_routes: Store<TCPRoute>,
-    store_tls_routes: Store<TLSRoute>,
-    store_udp_routes: Store<UDPRoute>,
-    store_namespaces: Store<Namespace>,
-    store_services: Store<Service>,
-    store_endpoint_slices: Store<EndpointSlice>,
-    store_reference_grants: Store<ReferenceGrant>,
-    store_secrets: Store<Secret>,
-    store_gateways: Store<Gateway>,
-    store_gateway_classes: Store<GatewayClass>,
 }
 
 /// Create a reflector for a resource type, returning the store and a stream.
@@ -224,22 +242,25 @@ pub async fn run_controller(
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
-        routes,
         controller_name: controller_name.clone(),
+        config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        cache: ResourceCache {
+            gateways: store_gateways,
+            gateway_classes: store_gateway_classes.clone(),
+            http_routes: store_http_routes,
+            tcp_routes: store_tcp_routes,
+            tls_routes: store_tls_routes,
+            udp_routes: store_udp_routes,
+            namespaces: store_namespaces,
+            services: store_services,
+            endpoint_slices: store_endpoint_slices,
+            secrets: store_secrets,
+            reference_grants: store_reference_grants,
+        },
+        routes,
         data_plane,
         worker_count,
         performance_config,
-        store_http_routes,
-        store_tcp_routes,
-        store_tls_routes,
-        store_udp_routes,
-        store_namespaces,
-        store_services,
-        store_endpoint_slices,
-        store_reference_grants,
-        store_secrets,
-        store_gateways,
-        store_gateway_classes: store_gateway_classes.clone(),
     });
 
     // --- Gateway controller ---
@@ -307,7 +328,7 @@ pub async fn run_controller(
         .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw7))
         .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw8))
         .watches_stream(reference_grant_stream, {
-            let gw = ctx.store_gateways.clone();
+            let gw = ctx.cache.gateways.clone();
             move |_: ReferenceGrant| all_gateway_refs(&gw)
         })
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
@@ -376,31 +397,23 @@ fn resolve_gateway_certs(
             let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
 
             // Cross-namespace cert ref requires a ReferenceGrant
-            if secret_ns != gw_ns {
-                let grant_allows = reference_grants.iter().any(|grant| {
-                    let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                    if grant_ns != secret_ns {
-                        return false;
-                    }
-                    let from_ok = grant.spec.from.iter().any(|f| {
-                        f.group == "gateway.networking.k8s.io"
-                            && f.kind == "Gateway"
-                            && f.namespace == gw_ns
-                    });
-                    let to_ok = grant.spec.to.iter().any(|t| {
-                        t.group.is_empty()
-                            && t.kind == "Secret"
-                            && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
-                    });
-                    from_ok && to_ok
-                });
-                if !grant_allows {
-                    warn!(
-                        "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                        secret_ns, cert_ref.name
-                    );
-                    continue;
-                }
+            if secret_ns != gw_ns
+                && !is_reference_allowed(
+                    reference_grants,
+                    "gateway.networking.k8s.io",
+                    "Gateway",
+                    gw_ns,
+                    "",
+                    "Secret",
+                    secret_ns,
+                    &cert_ref.name,
+                )
+            {
+                warn!(
+                    "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                    secret_ns, cert_ref.name
+                );
+                continue;
             }
 
             // Look up secret from reflector cache
@@ -447,14 +460,7 @@ fn resolve_gateway_certs(
 
 /// Resolve service metadata: known services set, headless endpoint overrides,
 /// ExternalName overrides, and appProtocol overrides.
-fn resolve_services(
-    all_services: &[Service],
-    store_endpoint_slices: &Store<EndpointSlice>,
-) -> (
-    HashSet<(String, String)>,
-    HashMap<(String, u16), Vec<(String, u16)>>,
-    HashMap<(String, u16), String>,
-) {
+fn resolve_services(all_services: &[Service], store_endpoint_slices: &Store<EndpointSlice>) -> ServiceState {
     let known_services: HashSet<(String, String)> = all_services
         .iter()
         .filter_map(|svc| {
@@ -627,7 +633,11 @@ fn resolve_services(
         }
     }
 
-    (known_services, endpoint_overrides, app_protocol_overrides)
+    ServiceState {
+        known_services,
+        endpoint_overrides,
+        app_protocol_overrides,
+    }
 }
 
 /// Validate Gateway listeners and compute gateway-level acceptance.
@@ -698,33 +708,25 @@ fn validate_gateway(
                     let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
 
                     // Cross-namespace cert ref requires ReferenceGrant
-                    if secret_ns != gw_ns {
-                        let grant_allows = reference_grants.iter().any(|grant| {
-                            let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-                            if grant_ns != secret_ns {
-                                return false;
-                            }
-                            let from_ok = grant.spec.from.iter().any(|f| {
-                                f.group == "gateway.networking.k8s.io"
-                                    && f.kind == "Gateway"
-                                    && f.namespace == gw_ns
-                            });
-                            let to_ok = grant.spec.to.iter().any(|t| {
-                                t.group.is_empty()
-                                    && t.kind == "Secret"
-                                    && t.name.as_ref().is_none_or(|n| n == &cert_ref.name)
-                            });
-                            from_ok && to_ok
-                        });
-                        if !grant_allows {
-                            refs_failed = true;
-                            ls.resolved_refs_reason = "RefNotPermitted".into();
-                            ls.resolved_refs_message = format!(
-                                "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                                secret_ns, cert_ref.name
-                            );
-                            continue;
-                        }
+                    if secret_ns != gw_ns
+                        && !is_reference_allowed(
+                            reference_grants,
+                            "gateway.networking.k8s.io",
+                            "Gateway",
+                            gw_ns,
+                            "",
+                            "Secret",
+                            secret_ns,
+                            &cert_ref.name,
+                        )
+                    {
+                        refs_failed = true;
+                        ls.resolved_refs_reason = "RefNotPermitted".into();
+                        ls.resolved_refs_message = format!(
+                            "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+                            secret_ns, cert_ref.name
+                        );
+                        continue;
                     }
 
                     if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
@@ -855,7 +857,7 @@ async fn reconcile(
     // Verify this Gateway's class is managed by us — read from store, no API call
     let gateway_class_name = &gateway.spec.gateway_class_name;
     let gc_ref = ObjectRef::<GatewayClass>::new(gateway_class_name);
-    let gc = match ctx.store_gateway_classes.get(&gc_ref) {
+    let gc = match ctx.cache.gateway_classes.get(&gc_ref) {
         Some(gc) => gc,
         None => {
             debug!(
@@ -875,81 +877,39 @@ async fn reconcile(
     }
 
     // Read all resources from reflector caches — no API server calls.
-    let http_routes: Vec<HTTPRoute> = ctx
-        .store_http_routes
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
-    let tcp_routes: Vec<TCPRoute> = ctx
-        .store_tcp_routes
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
-    let tls_routes: Vec<TLSRoute> = ctx
-        .store_tls_routes
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
-    let udp_routes: Vec<UDPRoute> = ctx
-        .store_udp_routes
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
+    let snapshot = ClusterSnapshot {
+        http_routes: snapshot(&ctx.cache.http_routes),
+        tcp_routes: snapshot(&ctx.cache.tcp_routes),
+        tls_routes: snapshot(&ctx.cache.tls_routes),
+        udp_routes: snapshot(&ctx.cache.udp_routes),
+        namespace_labels: ctx
+            .cache
+            .namespaces
+            .state()
+            .iter()
+            .filter_map(|ns| {
+                let name = ns.metadata.name.clone()?;
+                let labels = ns.metadata.labels.clone().unwrap_or_default();
+                Some((name, labels))
+            })
+            .collect(),
+        reference_grants: snapshot(&ctx.cache.reference_grants),
+        services: snapshot(&ctx.cache.services),
+    };
 
-    let namespace_labels: HashMap<String, BTreeMap<String, String>> = ctx
-        .store_namespaces
-        .state()
-        .iter()
-        .filter_map(|ns| {
-            let name = ns.metadata.name.clone()?;
-            let labels = ns.metadata.labels.clone().unwrap_or_default();
-            Some((name, labels))
-        })
-        .collect();
-
-    let reference_grants: Vec<ReferenceGrant> = ctx
-        .store_reference_grants
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
-
-    // Fetch TLS certificate data from cached Secrets store for THIS gateway.
-    // Other gateways get their own cert_data in the all_configs loop below.
-    let cert_data = resolve_gateway_certs(&gateway, &gw_ns, &reference_grants, &ctx.store_secrets);
-
-    // Read Services from reflector cache
-    let all_services: Vec<Service> = ctx
-        .store_services
-        .state()
-        .iter()
-        .map(|arc| (**arc).clone())
-        .collect();
-
-    let (known_services, endpoint_overrides, app_protocol_overrides) =
-        resolve_services(&all_services, &ctx.store_endpoint_slices);
+    let cert_data = resolve_gateway_certs(
+        &gateway,
+        &gw_ns,
+        &snapshot.reference_grants,
+        &ctx.cache.secrets,
+    );
+    let services = resolve_services(&snapshot.services, &ctx.cache.endpoint_slices);
 
     let (listener_statuses, gateway_accepted, gateway_accepted_reason, gateway_accepted_message) =
-        validate_gateway(&gateway, &gw_ns, &cert_data, &reference_grants);
+        validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
 
     // Build config for the triggered Gateway
-    let result = match reconcile_to_config(
-        &gateway,
-        &http_routes,
-        &tcp_routes,
-        &tls_routes,
-        &udp_routes,
-        &namespace_labels,
-        &reference_grants,
-        &known_services,
-        &cert_data,
-        &endpoint_overrides,
-        &app_protocol_overrides,
-    ) {
+    let result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
@@ -998,50 +958,39 @@ async fn reconcile(
         }
     }
 
-    // Build a unified route table from ALL managed gateways.
-    // Each gateway's routes are properly scoped by its listeners' (port, hostname).
-    // Read other gateways from reflector cache — no API server call.
-    let mut all_configs = vec![result.config.clone()];
-    for other_gw_arc in ctx.store_gateways.state() {
-        let other_name = other_gw_arc.metadata.name.as_deref().unwrap_or("");
-        let other_ns = other_gw_arc
-            .metadata
-            .namespace
-            .as_deref()
-            .unwrap_or("default");
-        if other_name == gw_name && other_ns == gw_ns {
-            continue; // Skip the gateway we just reconciled
-        }
-        if other_gw_arc.spec.gateway_class_name != *gateway_class_name {
-            continue; // Different controller
-        }
-        // Reconcile the other gateway into its own scoped config
-        // Load cert_data for this other gateway (each gateway needs its own
-        // namespace context for cross-namespace ReferenceGrant checks)
-        let other_gw_ns = other_ns.to_string();
-        let other_cert_data = resolve_gateway_certs(
-            &other_gw_arc,
-            &other_gw_ns,
-            &reference_grants,
-            &ctx.store_secrets,
+    // Cache this gateway's config and build the global route table from all cached configs.
+    // This avoids re-reconciling other gateways on every change (O(n) instead of O(n²)).
+    let all_configs = {
+        let mut cache = ctx.config_cache.lock().unwrap();
+        cache.insert(
+            (gw_ns.clone(), gw_name.clone()),
+            result.config.clone(),
         );
-
-        if let Ok(other_result) = reconcile_to_config(
-            &other_gw_arc,
-            &http_routes,
-            &tcp_routes,
-            &tls_routes,
-            &udp_routes,
-            &namespace_labels,
-            &reference_grants,
-            &known_services,
-            &other_cert_data,
-            &endpoint_overrides,
-            &app_protocol_overrides,
-        ) {
-            all_configs.push(other_result.config);
+        // Prune configs for gateways no longer in the store or managed by a different controller
+        let live: HashSet<_> = ctx
+            .cache
+            .gateways
+            .state()
+            .iter()
+            .filter(|g| g.spec.gateway_class_name == *gateway_class_name)
+            .map(|g| {
+                (
+                    g.metadata.namespace.as_deref().unwrap_or("default").to_string(),
+                    g.metadata.name.as_deref().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        cache.retain(|k, _| live.contains(k));
+        // Apply fresh endpoint/appProtocol overrides to all cached configs.
+        // These are global state (derived from Services/EndpointSlices), not per-gateway,
+        // so cached configs must use the current values, not stale ones from their last reconcile.
+        let mut configs: Vec<_> = cache.values().cloned().collect();
+        for config in &mut configs {
+            config.endpoint_overrides = services.endpoint_overrides.clone();
+            config.app_protocol_overrides = services.app_protocol_overrides.clone();
         }
-    }
+        configs
+    };
 
     // Merge TLS cert refs from ALL gateways per port, then hot-reload.
     // This ensures the SNI resolver has certs from all gateways sharing a port
@@ -1259,10 +1208,10 @@ async fn reconcile(
                 }};
             }
             match *kind {
-                "HTTPRoute" => patch_route_status!(ctx.store_http_routes, HTTPRoute),
-                "TCPRoute" => patch_route_status!(ctx.store_tcp_routes, TCPRoute),
-                "TLSRoute" => patch_route_status!(ctx.store_tls_routes, TLSRoute),
-                "UDPRoute" => patch_route_status!(ctx.store_udp_routes, UDPRoute),
+                "HTTPRoute" => patch_route_status!(ctx.cache.http_routes, HTTPRoute),
+                "TCPRoute" => patch_route_status!(ctx.cache.tcp_routes, TCPRoute),
+                "TLSRoute" => patch_route_status!(ctx.cache.tls_routes, TLSRoute),
+                "UDPRoute" => patch_route_status!(ctx.cache.udp_routes, UDPRoute),
                 _ => {}
             }
         }

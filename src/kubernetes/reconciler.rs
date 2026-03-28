@@ -8,6 +8,8 @@ use gateway_api::gateways::{Gateway, GatewayListeners};
 use gateway_api::httproutes::*;
 use gateway_api::referencegrants::ReferenceGrant;
 
+use k8s_openapi::api::core::v1::Service;
+
 use crate::config::*;
 
 use super::converters::{
@@ -16,6 +18,29 @@ use super::converters::{
 };
 use super::parent_ref::{all_section_names_for_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, route_allowed_for_listener, RouteAllowResult};
+
+// ---------------------------------------------------------------------------
+// Reconciliation input types — structured parameters for reconcile_to_config
+// ---------------------------------------------------------------------------
+
+/// Snapshot of all cluster resources needed for reconciliation.
+/// Built once per reconcile from reflector stores.
+pub(crate) struct ClusterSnapshot {
+    pub http_routes: Vec<HTTPRoute>,
+    pub tcp_routes: Vec<TCPRoute>,
+    pub tls_routes: Vec<TLSRoute>,
+    pub udp_routes: Vec<UDPRoute>,
+    pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
+    pub reference_grants: Vec<ReferenceGrant>,
+    pub services: Vec<Service>,
+}
+
+/// Resolved service metadata needed for route table construction.
+pub(crate) struct ServiceState {
+    pub known_services: HashSet<(String, String)>,
+    pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
+    pub app_protocol_overrides: HashMap<(String, u16), String>,
+}
 
 // ---------------------------------------------------------------------------
 // GatewayRoute trait — replaces the 8 closure parameters on collect_routes
@@ -38,185 +63,87 @@ pub(crate) trait GatewayRoute: Sized {
     fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
 }
 
-impl GatewayRoute for HTTPRoute {
-    type ParentRef = HTTPRouteParentRefs;
-    type Config = HttpRouteConfig;
-    const KIND: &'static str = "HTTPRoute";
+/// Implement GatewayRoute for a concrete route type. Only the three type-specific
+/// expressions (parent_refs field path, hostnames body, convert function) differ;
+/// the remaining five methods are identical across HTTP/TCP/TLS/UDP.
+macro_rules! impl_gateway_route {
+    ($ty:ty, $parent:ty, $config:ty, $kind:literal,
+     parent_refs: self.spec.$pr:ident,
+     hostnames: $hn:expr,
+     convert: $cv:path) => {
+        impl GatewayRoute for $ty {
+            type ParentRef = $parent;
+            type Config = $config;
+            const KIND: &'static str = $kind;
 
-    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
-        &self.spec.parent_refs
-    }
-    fn route_namespace(&self) -> &str {
-        route_namespace(&self.metadata)
-    }
-    fn identity(&self) -> (&str, Option<i64>) {
-        (
-            self.metadata.name.as_deref().unwrap_or("unknown"),
-            self.metadata.generation,
-        )
-    }
-    fn hostnames(&self) -> Vec<String> {
-        self.spec.hostnames.clone().unwrap_or_default()
-    }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
-        convert_http_route(self, gateway_name)
-    }
-    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
-        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
-    }
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
-        config
-            .rules
-            .iter()
-            .flat_map(|r| {
-                r.backend_refs
+            fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
+                &self.spec.$pr
+            }
+            fn route_namespace(&self) -> &str {
+                route_namespace(&self.metadata)
+            }
+            fn identity(&self) -> (&str, Option<i64>) {
+                (
+                    self.metadata.name.as_deref().unwrap_or("unknown"),
+                    self.metadata.generation,
+                )
+            }
+            fn hostnames(&self) -> Vec<String> {
+                $hn(self)
+            }
+            fn convert(&self, gw: &str) -> Result<Self::Config> {
+                $cv(self, gw)
+            }
+            fn section_names_for_gateway(
+                &self,
+                gw_name: &str,
+                gw_ns: &str,
+            ) -> Vec<Option<String>> {
+                all_section_names_for_gateway(&self.spec.$pr, gw_name, gw_ns)
+            }
+            fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+                config
+                    .rules
                     .iter()
-                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-            })
-            .collect()
-    }
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
-        for rule in &mut config.rules {
-            rule.backend_refs
-                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+                    .flat_map(|r| {
+                        r.backend_refs.iter().map(|b| {
+                            (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str())
+                        })
+                    })
+                    .collect()
+            }
+            fn remove_invalid_backends(
+                config: &mut Self::Config,
+                invalid: &HashSet<(String, u16)>,
+            ) {
+                for rule in &mut config.rules {
+                    rule.backend_refs
+                        .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
+                }
+            }
         }
-    }
+    };
 }
 
-impl GatewayRoute for TCPRoute {
-    type ParentRef = TCPRouteParentRefs;
-    type Config = TcpRouteConfig;
-    const KIND: &'static str = "TCPRoute";
+impl_gateway_route!(HTTPRoute, HTTPRouteParentRefs, HttpRouteConfig, "HTTPRoute",
+    parent_refs: self.spec.parent_refs,
+    hostnames:   |s: &HTTPRoute| s.spec.hostnames.clone().unwrap_or_default(),
+    convert:     convert_http_route);
 
-    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
-        &self.spec.parent_refs
-    }
-    fn route_namespace(&self) -> &str {
-        route_namespace(&self.metadata)
-    }
-    fn identity(&self) -> (&str, Option<i64>) {
-        (
-            self.metadata.name.as_deref().unwrap_or("unknown"),
-            self.metadata.generation,
-        )
-    }
-    fn hostnames(&self) -> Vec<String> {
-        vec![]
-    }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
-        convert_tcp_route(self, gateway_name)
-    }
-    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
-        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
-    }
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
-        config
-            .rules
-            .iter()
-            .flat_map(|r| {
-                r.backend_refs
-                    .iter()
-                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-            })
-            .collect()
-    }
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
-        for rule in &mut config.rules {
-            rule.backend_refs
-                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-        }
-    }
-}
+impl_gateway_route!(TCPRoute, TCPRouteParentRefs, TcpRouteConfig, "TCPRoute",
+    parent_refs: self.spec.parent_refs,
+    hostnames:   |_: &TCPRoute| vec![],
+    convert:     convert_tcp_route);
 
-impl GatewayRoute for TLSRoute {
-    type ParentRef = TLSRouteParentRefs;
-    type Config = TlsRouteConfig;
-    const KIND: &'static str = "TLSRoute";
+impl_gateway_route!(TLSRoute, TLSRouteParentRefs, TlsRouteConfig, "TLSRoute",
+    parent_refs: self.spec.parent_refs,
+    hostnames:   |s: &TLSRoute| s.spec.hostnames.clone(),
+    convert:     convert_tls_route);
 
-    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
-        &self.spec.parent_refs
-    }
-    fn route_namespace(&self) -> &str {
-        route_namespace(&self.metadata)
-    }
-    fn identity(&self) -> (&str, Option<i64>) {
-        (
-            self.metadata.name.as_deref().unwrap_or("unknown"),
-            self.metadata.generation,
-        )
-    }
-    fn hostnames(&self) -> Vec<String> {
-        self.spec.hostnames.clone()
-    }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
-        convert_tls_route(self, gateway_name)
-    }
-    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
-        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
-    }
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
-        config
-            .rules
-            .iter()
-            .flat_map(|r| {
-                r.backend_refs
-                    .iter()
-                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-            })
-            .collect()
-    }
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
-        for rule in &mut config.rules {
-            rule.backend_refs
-                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-        }
-    }
-}
-
-impl GatewayRoute for UDPRoute {
-    type ParentRef = UDPRouteParentRefs;
-    type Config = UdpRouteConfig;
-    const KIND: &'static str = "UDPRoute";
-
-    fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>> {
-        &self.spec.parent_refs
-    }
-    fn route_namespace(&self) -> &str {
-        route_namespace(&self.metadata)
-    }
-    fn identity(&self) -> (&str, Option<i64>) {
-        (
-            self.metadata.name.as_deref().unwrap_or("unknown"),
-            self.metadata.generation,
-        )
-    }
-    fn hostnames(&self) -> Vec<String> {
-        vec![]
-    }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config> {
-        convert_udp_route(self, gateway_name)
-    }
-    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
-        all_section_names_for_gateway(&self.spec.parent_refs, gw_name, gw_ns)
-    }
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
-        config
-            .rules
-            .iter()
-            .flat_map(|r| {
-                r.backend_refs
-                    .iter()
-                    .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-            })
-            .collect()
-    }
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>) {
-        for rule in &mut config.rules {
-            rule.backend_refs
-                .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-        }
-    }
-}
+impl_gateway_route!(UDPRoute, UDPRouteParentRefs, UdpRouteConfig, "UDPRoute",
+    parent_refs: self.spec.parent_refs,
+    hostnames:   |_: &UDPRoute| vec![],
+    convert:     convert_udp_route);
 
 pub struct ReconcileResult {
     pub config: PortailConfig,
@@ -243,18 +170,11 @@ pub struct RouteAcceptance {
 /// Convert Kubernetes Gateway API resources into a PortailConfig.
 /// This reuses all existing validation, conversion, hostname intersection,
 /// and regex compilation logic via `to_route_table()`.
-pub fn reconcile_to_config(
+pub(crate) fn reconcile_to_config(
     gateway: &Gateway,
-    http_routes: &[HTTPRoute],
-    tcp_routes: &[TCPRoute],
-    tls_routes: &[TLSRoute],
-    udp_routes: &[UDPRoute],
-    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
-    reference_grants: &[ReferenceGrant],
-    known_services: &HashSet<(String, String)>,
+    snapshot: &ClusterSnapshot,
     cert_data: &CertData,
-    endpoint_overrides: &HashMap<(String, u16), Vec<(String, u16)>>,
-    app_protocol_overrides: &HashMap<(String, u16), String>,
+    services: &ServiceState,
 ) -> Result<ReconcileResult> {
     let gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
@@ -263,46 +183,46 @@ pub fn reconcile_to_config(
     let mut route_status = Vec::new();
 
     let http_route_configs = collect_routes::<HTTPRoute>(
-        http_routes,
+        &snapshot.http_routes,
         gateway_name,
         gateway_ns,
         &gateway.spec.listeners,
-        namespace_labels,
-        reference_grants,
-        known_services,
+        &snapshot.namespace_labels,
+        &snapshot.reference_grants,
+        &services.known_services,
         &mut route_status,
     );
 
     let tcp_route_configs = collect_routes::<TCPRoute>(
-        tcp_routes,
+        &snapshot.tcp_routes,
         gateway_name,
         gateway_ns,
         &gateway.spec.listeners,
-        namespace_labels,
-        reference_grants,
-        known_services,
+        &snapshot.namespace_labels,
+        &snapshot.reference_grants,
+        &services.known_services,
         &mut route_status,
     );
 
     let tls_route_configs = collect_routes::<TLSRoute>(
-        tls_routes,
+        &snapshot.tls_routes,
         gateway_name,
         gateway_ns,
         &gateway.spec.listeners,
-        namespace_labels,
-        reference_grants,
-        known_services,
+        &snapshot.namespace_labels,
+        &snapshot.reference_grants,
+        &services.known_services,
         &mut route_status,
     );
 
     let udp_route_configs = collect_routes::<UDPRoute>(
-        udp_routes,
+        &snapshot.udp_routes,
         gateway_name,
         gateway_ns,
         &gateway.spec.listeners,
-        namespace_labels,
-        reference_grants,
-        known_services,
+        &snapshot.namespace_labels,
+        &snapshot.reference_grants,
+        &services.known_services,
         &mut route_status,
     );
 
@@ -313,8 +233,8 @@ pub fn reconcile_to_config(
             tcp_routes: tcp_route_configs,
             tls_routes: tls_route_configs,
             udp_routes: udp_route_configs,
-            endpoint_overrides: endpoint_overrides.clone(),
-            app_protocol_overrides: app_protocol_overrides.clone(),
+            endpoint_overrides: services.endpoint_overrides.clone(),
+            app_protocol_overrides: services.app_protocol_overrides.clone(),
             ..Default::default()
         },
         route_status,
@@ -552,6 +472,34 @@ mod tests {
         .collect()
     }
 
+    /// Build a test ClusterSnapshot with the given routes and optional reference grants.
+    fn test_snapshot(
+        http_routes: Vec<HTTPRoute>,
+        tcp_routes: Vec<TCPRoute>,
+        tls_routes: Vec<TLSRoute>,
+        udp_routes: Vec<UDPRoute>,
+        ns_labels: &HashMap<String, BTreeMap<String, String>>,
+        reference_grants: Vec<ReferenceGrant>,
+    ) -> ClusterSnapshot {
+        ClusterSnapshot {
+            http_routes,
+            tcp_routes,
+            tls_routes,
+            udp_routes,
+            namespace_labels: ns_labels.clone(),
+            reference_grants,
+            services: vec![],
+        }
+    }
+
+    fn empty_services() -> ServiceState {
+        ServiceState {
+            known_services: test_known_services(),
+            endpoint_overrides: HashMap::new(),
+            app_protocol_overrides: HashMap::new(),
+        }
+    }
+
     /// Replace DNS-style backend names (e.g. "127.0.0.1.default.svc") with raw
     /// IPs so to_route_table() can resolve them without real DNS.
     fn fixup_backends_for_test(config: &mut crate::config::PortailConfig) {
@@ -664,16 +612,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -728,16 +669,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[matching_route, other_route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![matching_route, other_route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -756,16 +690,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -806,16 +733,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert_eq!(result.config.http_routes.len(), 0);
@@ -845,16 +765,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert_eq!(result.config.http_routes.len(), 1);
@@ -888,16 +801,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route.clone()],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route.clone()], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert_eq!(result.config.http_routes.len(), 1);
@@ -908,16 +814,9 @@ mod tests {
         );
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert_eq!(result.config.http_routes.len(), 0);
@@ -931,16 +830,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -978,16 +870,9 @@ mod tests {
         };
         let result = reconcile_to_config(
             &gw,
-            &[orphan],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![orphan], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert!(result.config.http_routes.is_empty());
@@ -1078,16 +963,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1105,16 +983,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1130,16 +1001,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1173,16 +1037,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         assert!(reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new()
+            &empty_services(),
         )
         .is_err());
     }
@@ -1251,16 +1108,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[tcp_route],
-            &[],
-            &[],
-            &ns_labels,
-            &[ref_grant],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![tcp_route], vec![], vec![], &ns_labels, vec![ref_grant]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1310,16 +1160,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[tls_route],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![tls_route], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1371,16 +1214,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[],
-            &[],
-            &[udp_route],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![], vec![], vec![udp_route], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -1434,16 +1270,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let m = &result.config.http_routes[0].rules[0].matches[0];
@@ -1491,16 +1320,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let m = &result.config.http_routes[0].rules[0].matches[0];
@@ -1562,16 +1384,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let headers = &result.config.http_routes[0].rules[0].matches[0].headers;
@@ -1633,16 +1448,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let qps = &result.config.http_routes[0].rules[0].matches[0].query_params;
@@ -1694,16 +1502,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let backends = &result.config.http_routes[0].rules[0].backend_refs;
@@ -1743,16 +1544,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let br = &result.config.http_routes[0].rules[0].backend_refs[0];
@@ -1816,16 +1610,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         assert_eq!(result.config.http_routes[0].rules.len(), 2);
@@ -1886,16 +1673,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let filters = &result.config.http_routes[0].rules[0].filters;
@@ -1954,16 +1734,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
@@ -2017,16 +1790,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
@@ -2085,16 +1851,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
@@ -2151,16 +1910,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
@@ -2208,16 +1960,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let timeouts = result.config.http_routes[0].rules[0]
@@ -2290,16 +2035,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[http_route],
-            &[tcp_route],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![http_route], vec![tcp_route], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
@@ -2394,16 +2132,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let mut config = result.config;
@@ -2476,16 +2207,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[],
-            &[tcp_route],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![], vec![tcp_route], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let mut config = result.config;
@@ -2566,16 +2290,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let mut config = result.config;
@@ -2656,16 +2373,9 @@ mod tests {
         let ns_labels = default_ns_labels();
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
         let mut config = result.config;
@@ -2690,16 +2400,9 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &[route],
-            &[],
-            &[],
-            &[],
-            &ns_labels,
-            &[],
-            &test_known_services(),
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &empty_services(),
         )
         .unwrap();
 
