@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build, deploy, and run Gateway API conformance tests in an ephemeral Kind cluster.
-# Usage: ./deploy-conformance.sh [--skip-build] [--skip-deploy] [--skip-tests] [--no-kind] [--no-cleanup]
+# Usage: ./conformance-tests.sh [--skip-build] [--skip-deploy] [--skip-tests] [--no-kind] [--no-cleanup]
 set -euo pipefail
 
 IMAGE="ghcr.io/epheo/portail:latest"

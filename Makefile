@@ -22,7 +22,7 @@ clippy:
 	cargo clippy --all-targets -- -D warnings
 
 conformance:
-	./deploy-conformance.sh --no-kind
+	./conformance-tests.sh --no-kind
 
 conformance-kind:
-	./deploy-conformance.sh
+	./conformance-tests.sh

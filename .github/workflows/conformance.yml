@@ -34,7 +34,7 @@ jobs:
           sudo mv ./kind /usr/local/bin/kind
 
       - name: Run conformance tests
-        run: ./deploy-conformance.sh
+        run: ./conformance-tests.sh
 
       - name: Upload conformance report
         if: always()
