@@ -43,7 +43,7 @@ fi
 # ── 1. Build container image ─────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
   echo "━━━ [1/6] Building container image ━━━"
-  podman build -t "$IMAGE" -f "$PROJECT_DIR/Containerfile" "$PROJECT_DIR"
+  podman build --no-cache -t "$IMAGE" -f "$PROJECT_DIR/Containerfile" "$PROJECT_DIR"
   echo "✓ Image built: $IMAGE"
 fi
 

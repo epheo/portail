@@ -20,8 +20,10 @@ use crate::http_filters::{
 };
 use crate::http_parser::find_header_end;
 use crate::logging::{debug, info, warn};
-use crate::request_processor::{self, HeaderModifications, HttpFilterData, ProcessingDecision};
-use crate::routing::{BackendSelector, RouteTable};
+use crate::request_processor::{
+    self, extract_header_mods, extract_url_rewrite, HeaderModifications, RequestMeta, RoutingResult,
+};
+use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 use crate::tls::{self, Connection, DynamicTlsAcceptor};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
@@ -215,20 +217,18 @@ async fn handle_connection(
     }
 
     loop {
-        let decision = {
-            let route_table = state.routes.load();
-            request_processor::analyze_request(
-                &route_table,
-                &state.selector,
-                &buf[..n],
-                state.server_port,
-                &state.health,
-                state.is_tls,
-            )?
-        };
+        let route_table = state.routes.load();
+        let result = request_processor::analyze_request(
+            &route_table,
+            &state.selector,
+            &buf[..n],
+            state.server_port,
+            &state.health,
+            state.is_tls,
+        )?;
 
-        match decision {
-            ProcessingDecision::TcpForward { backend_addr } => {
+        match result {
+            RoutingResult::TcpForward { backend_addr } => {
                 return handle_tcp_connection(
                     client,
                     backend_addr,
@@ -237,34 +237,15 @@ async fn handle_connection(
                 )
                 .await;
             }
-            ProcessingDecision::HttpForward {
-                backend_addr,
-                keepalive,
-                filters,
-                backend_timeout,
-                request_timeout,
-                content_length,
-                is_chunked,
-                is_upgrade,
-                backend_use_tls,
-                backend_server_name,
+            RoutingResult::HttpForward {
+                backend,
+                rule,
+                meta,
             } => {
-                let forward_fut = proxy_http_request(
-                    &mut client,
-                    &mut buf,
-                    n,
-                    backend_addr,
-                    filters,
-                    backend_timeout,
-                    content_length,
-                    is_chunked,
-                    is_upgrade,
-                    backend_use_tls,
-                    backend_server_name,
-                    &mut state,
-                );
-                let ka = if !is_upgrade {
-                    if let Some(req_timeout) = request_timeout.filter(|d| !d.is_zero()) {
+                let forward_fut =
+                    proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state);
+                let ka = if !meta.is_upgrade {
+                    if let Some(req_timeout) = rule.request_timeout.filter(|d| !d.is_zero()) {
                         match tokio::time::timeout(req_timeout, forward_fut).await {
                             Ok(result) => result?,
                             Err(_) => {
@@ -280,11 +261,11 @@ async fn handle_connection(
                     // the bidirectional stream is long-lived.
                     forward_fut.await?
                 };
-                if !ka || !keepalive {
+                if !ka || !meta.keepalive {
                     return Ok(());
                 }
             }
-            ProcessingDecision::HttpRedirect {
+            RoutingResult::HttpRedirect {
                 status_code,
                 location,
                 keepalive,
@@ -294,7 +275,7 @@ async fn handle_connection(
                     return Ok(());
                 }
             }
-            ProcessingDecision::SendHttpError {
+            RoutingResult::SendHttpError {
                 error_code,
                 close_connection,
             } => {
@@ -303,10 +284,14 @@ async fn handle_connection(
                     return Ok(());
                 }
             }
-            ProcessingDecision::UdpForward { .. } | ProcessingDecision::CloseConnection => {
+            RoutingResult::UdpForward { .. } | RoutingResult::CloseConnection => {
                 return Ok(());
             }
         }
+
+        // Explicitly drop the route table guard before reading the next request.
+        // This allows old route tables to be freed between keepalive iterations.
+        drop(route_table);
 
         n = client.read(&mut buf).await?;
         if n > 0 && find_header_end(&buf[..n]).is_none() {
@@ -324,32 +309,29 @@ async fn handle_connection(
     }
 }
 
-/// Handle HTTP forward requests in a keepalive loop.
-/// Returns true if the connection should continue (keepalive), false to close.
 /// Proxy a single HTTP request to a backend and forward the response.
 /// Returns true if the response was fully received (connection reusable for keepalive).
 async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
     request_bytes: usize,
-    backend_addr: SocketAddr,
-    filter_data: Option<Box<HttpFilterData>>,
-    backend_timeout: Option<std::time::Duration>,
-    content_length: Option<usize>,
-    is_chunked: bool,
-    is_upgrade: bool,
-    use_tls: bool,
-    server_name: String,
+    backend_ref: &crate::routing::Backend,
+    rule: &HttpRouteRule,
+    meta: &RequestMeta,
     state: &mut ConnectionState,
 ) -> Result<bool> {
-    let timeout_dur = backend_timeout
+    let backend_addr = backend_ref.socket_addr;
+    let timeout_dur = rule
+        .backend_request_timeout
         .filter(|d| !d.is_zero())
         .unwrap_or(std::time::Duration::from_secs(30));
 
     // --- Connect to backend ---
     let mut backend = match tokio::time::timeout(
         timeout_dur,
-        state.pool.acquire(backend_addr, use_tls, &server_name),
+        state
+            .pool
+            .acquire(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
     )
     .await
     {
@@ -374,23 +356,48 @@ async fn proxy_http_request(
 
     // --- Send request headers to backend (with optional modifications) ---
     let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-    let has_mirrors = filter_data
-        .as_ref()
-        .is_some_and(|fd| !fd.mirror_targets.is_empty());
+    let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
+    let has_mirrors = has_filters
+        && rule
+            .filters
+            .iter()
+            .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
     let mut mirror_header_data: Option<Vec<u8>> = None;
 
-    if let Some(ref fd) = filter_data {
-        let has_mods = fd.request_header_mods.is_some() || fd.url_rewrite.is_some();
+    if has_filters {
+        // Extract request header mods from rule + backend filter lists (zero-alloc borrows)
+        let rule_mods = extract_header_mods(&rule.filters, false);
+        let request_path = extract_request_path(&buf[..header_end]);
+        let url_rewrite = extract_url_rewrite(
+            &rule.filters,
+            &rule.path,
+            request_path.as_deref().unwrap_or("/"),
+        );
+
+        let has_mods = rule_mods.is_some()
+            || url_rewrite.is_some()
+            || extract_header_mods(&backend_ref.filters, false).is_some();
+
         if has_mods {
+            // Apply rule-level modifications
             let modified_headers = apply_request_header_modifications(
                 &buf[..header_end],
-                fd.request_header_mods.as_ref(),
-                fd.url_rewrite.as_ref(),
+                rule_mods.as_ref(),
+                url_rewrite.as_ref(),
             );
+
+            // Apply backend-level modifications on top if present
+            let final_headers =
+                if let Some(backend_mods) = extract_header_mods(&backend_ref.filters, false) {
+                    apply_request_header_modifications(&modified_headers, Some(&backend_mods), None)
+                } else {
+                    modified_headers
+                };
+
             if has_mirrors {
-                mirror_header_data = Some(modified_headers.clone());
+                mirror_header_data = Some(final_headers.clone());
             }
-            backend.write_all(&modified_headers).await?;
+            backend.write_all(&final_headers).await?;
             let body = &buf[header_end..request_bytes];
             if !body.is_empty() {
                 backend.write_all(body).await?;
@@ -412,31 +419,33 @@ async fn proxy_http_request(
         buf,
         header_end,
         request_bytes,
-        content_length,
-        is_chunked,
+        meta.content_length,
+        meta.is_chunked,
         has_mirrors,
     )
     .await?;
 
     // --- Dispatch mirrors with complete request data ---
     if let Some(ref body) = mirror_body {
-        if let Some(ref fd) = filter_data {
-            let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
-            let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
-            full_request.extend_from_slice(header_bytes);
-            full_request.extend_from_slice(body);
-            dispatch_mirrors(&fd.mirror_targets, &full_request);
-        }
+        let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
+        let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
+        full_request.extend_from_slice(header_bytes);
+        full_request.extend_from_slice(body);
+        dispatch_mirrors(&rule.filters, &full_request);
     }
 
     // --- WebSocket / protocol upgrade handling ---
-    if is_upgrade {
-        let resp_mods = filter_data
-            .as_ref()
-            .and_then(|fd| fd.response_header_mods.as_ref());
+    if meta.is_upgrade {
+        let resp_mods = extract_response_mods(rule, backend_ref);
         let _response_complete = match tokio::time::timeout(
             timeout_dur,
-            forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
+            forward_http_response(
+                &mut backend,
+                client,
+                buf,
+                resp_mods.as_ref(),
+                &mut state.header_buf,
+            ),
         )
         .await
         {
@@ -452,12 +461,16 @@ async fn proxy_http_request(
     }
 
     // --- Forward response ---
-    let resp_mods = filter_data
-        .as_ref()
-        .and_then(|fd| fd.response_header_mods.as_ref());
+    let resp_mods = extract_response_mods(rule, backend_ref);
     let response_complete = match tokio::time::timeout(
         timeout_dur,
-        forward_http_response(&mut backend, client, buf, resp_mods, &mut state.header_buf),
+        forward_http_response(
+            &mut backend,
+            client,
+            buf,
+            resp_mods.as_ref(),
+            &mut state.header_buf,
+        ),
     )
     .await
     {
@@ -474,6 +487,27 @@ async fn proxy_http_request(
     }
 
     Ok(response_complete)
+}
+
+/// Extract response header modifications from rule + backend filters (zero-alloc borrows).
+fn extract_response_mods<'a>(
+    rule: &'a HttpRouteRule,
+    backend: &'a crate::routing::Backend,
+) -> Option<HeaderModifications<'a>> {
+    extract_header_mods(&rule.filters, true).or_else(|| extract_header_mods(&backend.filters, true))
+}
+
+/// Extract the request path from the first line of raw HTTP headers.
+fn extract_request_path(header_bytes: &[u8]) -> Option<String> {
+    let first_line_end = header_bytes.iter().position(|&b| b == b'\r')?;
+    let first_line = std::str::from_utf8(&header_bytes[..first_line_end]).ok()?;
+    first_line.split_whitespace().nth(1).map(|p| {
+        // Strip query string for prefix matching
+        match p.find('?') {
+            Some(pos) => p[..pos].to_string(),
+            None => p.to_string(),
+        }
+    })
 }
 
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.
@@ -572,7 +606,7 @@ async fn forward_http_response(
     backend: &mut Connection,
     client: &mut Connection,
     buf: &mut [u8],
-    response_mods: Option<&HeaderModifications>,
+    response_mods: Option<&HeaderModifications<'_>>,
     header_buf: &mut Vec<u8>,
 ) -> Result<bool> {
     let mut headers_parsed = false;

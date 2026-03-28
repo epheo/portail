@@ -8,7 +8,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::logging::warn;
-use crate::request_processor::{HeaderModifications, MirrorTarget, RewrittenPath, URLRewrite};
+use crate::request_processor::{HeaderModifications, RewrittenPath, URLRewrite};
+use crate::routing::HttpFilter;
 
 /// Maximum request body size (bytes) that will be buffered for mirroring.
 /// Bodies exceeding this are silently skipped (primary request unaffected).
@@ -17,21 +18,29 @@ pub(crate) const MIRROR_BODY_MAX: usize = 1024 * 1024; // 1 MB
 
 /// Fire-and-forget mirror dispatch with percentage-based filtering and timeout.
 ///
+/// Iterates rule filters looking for `RequestMirror` variants.
 /// For each target, rolls a random number to decide whether to mirror based on
 /// the configured percentage. Spawned tasks are bounded by a total 5s timeout
 /// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends.
-pub(crate) fn dispatch_mirrors(mirror_targets: &[MirrorTarget], data: &[u8]) {
-    for target in mirror_targets {
+pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
+    for filter in filters {
+        let (addr, percent) = match filter {
+            HttpFilter::RequestMirror {
+                backend_addr,
+                mirror_percent,
+            } => (*backend_addr, *mirror_percent),
+            _ => continue,
+        };
+
         // Probabilistic dispatch: skip if random roll exceeds configured percent
-        if target.percent == 0 {
+        if percent == 0 {
             continue;
         }
-        if target.percent < 100 && fastrand::u32(0..100) >= target.percent {
+        if percent < 100 && fastrand::u32(0..100) >= percent {
             continue;
         }
 
         let data = data.to_vec();
-        let addr = target.addr;
         tokio::spawn(async move {
             // Total timeout: 5s covers connect + write. Prevents leaked tasks
             // when the mirror backend is slow or unreachable.
@@ -60,7 +69,7 @@ pub(crate) fn dispatch_mirrors(mirror_targets: &[MirrorTarget], data: &[u8]) {
 /// `rewrite_hostname`: if Some, replaces the Host header value (request path only).
 fn apply_header_mods_inner(
     header_lines: &[u8],
-    mods: Option<&HeaderModifications>,
+    mods: Option<&HeaderModifications<'_>>,
     rewrite_hostname: Option<&str>,
     out: &mut Vec<u8>,
 ) {
@@ -186,7 +195,7 @@ fn split_first_line(header_region: &[u8]) -> (&[u8], &[u8]) {
 /// This keeps body handling zero-copy on the filter path.
 pub(crate) fn apply_request_header_modifications(
     header_region: &[u8],
-    header_mods: Option<&HeaderModifications>,
+    header_mods: Option<&HeaderModifications<'_>>,
     url_rewrite: Option<&URLRewrite>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(header_region.len() + 256);
@@ -226,7 +235,10 @@ pub(crate) fn apply_request_header_modifications(
 /// Apply response header modifications to buffered response headers.
 /// Returns the modified header region (including trailing \r\n\r\n).
 /// Operates on raw bytes — no intermediate String allocations.
-pub(crate) fn apply_response_header_mods(headers: &[u8], mods: &HeaderModifications) -> Vec<u8> {
+pub(crate) fn apply_response_header_mods(
+    headers: &[u8],
+    mods: &HeaderModifications<'_>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(headers.len() + 256);
 
     let (status_line, rest) = split_first_line(headers);
@@ -281,12 +293,12 @@ mod tests {
             path: Some(RewrittenPath::Full("/new".to_string())),
         };
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![HttpHeader {
+            add: &[HttpHeader {
                 name: "X-Added".to_string(),
                 value: "yes".to_string(),
-            }]),
-            set: std::sync::Arc::new(vec![]),
-            remove: std::sync::Arc::new(vec!["User-Agent".to_string()]),
+            }],
+            set: &[],
+            remove: &["User-Agent".to_string()],
         };
         let result = apply_request_header_modifications(headers, Some(&mods), Some(&rewrite));
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -310,12 +322,12 @@ mod tests {
     fn test_apply_response_header_mods_add() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![HttpHeader {
+            add: &[HttpHeader {
                 name: "X-Custom".to_string(),
                 value: "added".to_string(),
-            }]),
-            set: std::sync::Arc::new(vec![]),
-            remove: std::sync::Arc::new(vec![]),
+            }],
+            set: &[],
+            remove: &[],
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -326,9 +338,9 @@ mod tests {
     fn test_apply_response_header_mods_remove() {
         let headers = b"HTTP/1.1 200 OK\r\nX-Internal: secret\r\nContent-Length: 5\r\n\r\n";
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![]),
-            set: std::sync::Arc::new(vec![]),
-            remove: std::sync::Arc::new(vec!["X-Internal".to_string()]),
+            add: &[],
+            set: &[],
+            remove: &["X-Internal".to_string()],
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();
@@ -340,12 +352,12 @@ mod tests {
     fn test_apply_response_header_mods_set() {
         let headers = b"HTTP/1.1 200 OK\r\nServer: old-server\r\n\r\n";
         let mods = HeaderModifications {
-            add: std::sync::Arc::new(vec![]),
-            set: std::sync::Arc::new(vec![HttpHeader {
+            add: &[],
+            set: &[HttpHeader {
                 name: "Server".to_string(),
                 value: "portail".to_string(),
-            }]),
-            remove: std::sync::Arc::new(vec![]),
+            }],
+            remove: &[],
         };
         let result = apply_response_header_mods(headers, &mods);
         let result_str = std::str::from_utf8(&result).unwrap();

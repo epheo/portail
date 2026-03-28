@@ -59,6 +59,10 @@ harness = false
 name = "end_to_end_bench"
 harness = false
 
+[[bench]]
+name = "proxy_throughput"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

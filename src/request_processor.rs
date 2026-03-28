@@ -6,17 +6,20 @@
 use crate::health::HealthRegistry;
 use crate::http_parser::{extract_routing_info, ConnectionType};
 use crate::logging::{debug, error};
-use crate::routing::{BackendSelector, HttpFilter, HttpHeader, RouteTable, URLRewritePath};
+use crate::routing::{
+    Backend, BackendSelector, HttpFilter, HttpHeader, HttpRouteRule, RouteTable, URLRewritePath,
+};
 use anyhow::Result;
 use std::hash::Hasher;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-#[derive(Debug, Clone)]
-pub struct HeaderModifications {
-    pub add: Arc<Vec<HttpHeader>>,
-    pub set: Arc<Vec<HttpHeader>>,
-    pub remove: Arc<Vec<String>>,
+/// Borrowed header modification parameters — zero per-request allocation.
+/// References point into the `Arc<Vec<...>>` fields in `HttpFilter` variants.
+#[derive(Debug)]
+pub struct HeaderModifications<'a> {
+    pub add: &'a [HttpHeader],
+    pub set: &'a [HttpHeader],
+    pub remove: &'a [String],
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +36,7 @@ pub enum RewrittenPath {
 
 /// Join a prefix replacement with the remaining suffix from the original path.
 /// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
-fn join_prefix_path(prefix: &str, suffix: &str) -> String {
+pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     // Strip trailing slash from prefix if suffix starts with slash
     let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
         &prefix[..prefix.len() - 1]
@@ -53,38 +56,20 @@ fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     result
 }
 
-/// A mirror target with percentage-based dispatch control.
-#[derive(Debug, Clone)]
-pub struct MirrorTarget {
-    pub addr: SocketAddr,
-    /// Percentage of requests to mirror (0–100).
-    pub percent: u32,
+/// Stack-allocated request metadata — no heap allocation.
+pub struct RequestMeta {
+    pub content_length: Option<usize>,
+    pub is_chunked: bool,
+    pub is_upgrade: bool,
+    pub keepalive: bool,
 }
 
-/// Filter data only allocated when a route actually has filters.
-#[derive(Debug, Clone)]
-pub struct HttpFilterData {
-    pub request_header_mods: Option<HeaderModifications>,
-    pub response_header_mods: Option<HeaderModifications>,
-    pub url_rewrite: Option<URLRewrite>,
-    pub mirror_targets: Vec<MirrorTarget>,
-}
-
-#[derive(Debug, Clone)]
-pub enum ProcessingDecision {
-    /// Boxed filter data keeps the enum small (~40 bytes vs ~256).
-    /// None on the fast path (no filters) avoids the heap allocation entirely.
+/// Routing result that borrows from the RouteTable — zero per-request allocations.
+pub enum RoutingResult<'a> {
     HttpForward {
-        backend_addr: SocketAddr,
-        keepalive: bool,
-        filters: Option<Box<HttpFilterData>>,
-        backend_timeout: Option<std::time::Duration>,
-        request_timeout: Option<std::time::Duration>,
-        content_length: Option<usize>,
-        is_chunked: bool,
-        is_upgrade: bool,
-        backend_use_tls: bool,
-        backend_server_name: String,
+        backend: &'a Backend,
+        rule: &'a HttpRouteRule,
+        meta: RequestMeta,
     },
     HttpRedirect {
         status_code: u16,
@@ -104,16 +89,59 @@ pub enum ProcessingDecision {
     CloseConnection,
 }
 
-pub fn analyze_request(
-    routes: &RouteTable,
+/// Extract `HeaderModifications` from the first matching filter in a filter list.
+/// Zero-copy: borrows from the Arc internals stored in the route table.
+pub fn extract_header_mods<'a>(
+    filters: &'a [HttpFilter],
+    is_response: bool,
+) -> Option<HeaderModifications<'a>> {
+    for filter in filters {
+        match filter {
+            HttpFilter::RequestHeaderModifier { add, set, remove } if !is_response => {
+                return Some(HeaderModifications { add, set, remove });
+            }
+            HttpFilter::ResponseHeaderModifier { add, set, remove } if is_response => {
+                return Some(HeaderModifications { add, set, remove });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract URL rewrite parameters from rule filters.
+pub fn extract_url_rewrite(
+    filters: &[HttpFilter],
+    rule_path: &str,
+    request_path: &str,
+) -> Option<URLRewrite> {
+    for filter in filters {
+        if let HttpFilter::URLRewrite { hostname, path } = filter {
+            let rewritten_path = path.as_ref().map(|p| match p {
+                URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
+                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
+                    join_prefix_path(value, &request_path[rule_path.len()..]),
+                ),
+            });
+            return Some(URLRewrite {
+                hostname: hostname.clone(),
+                path: rewritten_path,
+            });
+        }
+    }
+    None
+}
+
+pub fn analyze_request<'a>(
+    routes: &'a RouteTable,
     backend_selector: &BackendSelector,
     request_data: &[u8],
     server_port: u16,
     health: &HealthRegistry,
     is_tls: bool,
-) -> Result<ProcessingDecision> {
+) -> Result<RoutingResult<'a>> {
     if request_data.is_empty() {
-        return Ok(ProcessingDecision::CloseConnection);
+        return Ok(RoutingResult::CloseConnection);
     }
 
     if is_http_request(request_data) {
@@ -157,14 +185,14 @@ fn compute_route_hash(path: &str) -> u64 {
     hasher.finish()
 }
 
-fn analyze_http_request(
-    routes: &RouteTable,
+fn analyze_http_request<'a>(
+    routes: &'a RouteTable,
     backend_selector: &BackendSelector,
     request_data: &[u8],
     health: &HealthRegistry,
     is_tls: bool,
     server_port: u16,
-) -> Result<ProcessingDecision> {
+) -> Result<RoutingResult<'a>> {
     let request_info = extract_routing_info(request_data)?;
     let keepalive = request_info.connection_type != ConnectionType::Close;
 
@@ -178,7 +206,7 @@ fn analyze_http_request(
     ) {
         Ok(rule) => rule,
         Err(_) => {
-            return Ok(ProcessingDecision::SendHttpError {
+            return Ok(RoutingResult::SendHttpError {
                 error_code: 404,
                 close_connection: !keepalive,
             });
@@ -213,7 +241,7 @@ fn analyze_http_request(
                     default_scheme,
                     server_port,
                 );
-                return Ok(ProcessingDecision::HttpRedirect {
+                return Ok(RoutingResult::HttpRedirect {
                     status_code: *status_code,
                     location,
                     keepalive,
@@ -223,7 +251,7 @@ fn analyze_http_request(
     }
 
     if rule.backends.is_empty() {
-        return Ok(ProcessingDecision::SendHttpError {
+        return Ok(RoutingResult::SendHttpError {
             error_code: 500,
             close_connection: !keepalive,
         });
@@ -234,7 +262,7 @@ fn analyze_http_request(
         match backend_selector.select_healthy_weighted_backend(route_hash, rule, health) {
             Some(idx) => idx,
             None => {
-                return Ok(ProcessingDecision::SendHttpError {
+                return Ok(RoutingResult::SendHttpError {
                     error_code: 503,
                     close_connection: !keepalive,
                 });
@@ -242,140 +270,15 @@ fn analyze_http_request(
         };
     let selected_backend = &rule.backends[backend_index];
 
-    // Fast path: no filters — no Box allocation, enum stays 40 bytes
-    if !rule.has_filters {
-        return Ok(ProcessingDecision::HttpForward {
-            backend_addr: selected_backend.socket_addr,
-            keepalive,
-            filters: None,
-            backend_timeout: rule.backend_request_timeout,
-            request_timeout: rule.request_timeout,
+    Ok(RoutingResult::HttpForward {
+        backend: selected_backend,
+        rule,
+        meta: RequestMeta {
             content_length: request_info.content_length,
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
-            backend_use_tls: selected_backend.use_tls,
-            backend_server_name: selected_backend.server_name.clone(),
-        });
-    }
-
-    // Slow path: process filters, box the result
-    let mut request_header_mods: Option<HeaderModifications> = None;
-    let mut response_header_mods: Option<HeaderModifications> = None;
-    let mut url_rewrite: Option<URLRewrite> = None;
-    let mut mirror_targets: Vec<MirrorTarget> = Vec::new();
-
-    for filter in &rule.filters {
-        match filter {
-            HttpFilter::RequestRedirect { .. } => {
-                // Handled above, before backend selection — unreachable here
-                unreachable!("redirect filters are handled before backend selection");
-            }
-            HttpFilter::RequestHeaderModifier { add, set, remove } => {
-                request_header_mods = Some(HeaderModifications {
-                    add: Arc::clone(add),
-                    set: Arc::clone(set),
-                    remove: Arc::clone(remove),
-                });
-            }
-            HttpFilter::ResponseHeaderModifier { add, set, remove } => {
-                response_header_mods = Some(HeaderModifications {
-                    add: Arc::clone(add),
-                    set: Arc::clone(set),
-                    remove: Arc::clone(remove),
-                });
-            }
-            HttpFilter::URLRewrite { hostname, path } => {
-                let rewritten_path = path.as_ref().map(|p| match p {
-                    URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
-                    URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
-                        join_prefix_path(value, &request_info.path[rule.path.len()..]),
-                    ),
-                });
-                url_rewrite = Some(URLRewrite {
-                    hostname: hostname.clone(),
-                    path: rewritten_path,
-                });
-            }
-            HttpFilter::RequestMirror {
-                backend_addr,
-                mirror_percent,
-            } => {
-                mirror_targets.push(MirrorTarget {
-                    addr: *backend_addr,
-                    percent: *mirror_percent,
-                });
-            }
-        }
-    }
-
-    // Apply per-backend filters (e.g. BackendRequestHeaderModifier)
-    for filter in &selected_backend.filters {
-        match filter {
-            HttpFilter::RequestHeaderModifier { add, set, remove } => {
-                // Merge with rule-level mods: backend-level is additive
-                match &mut request_header_mods {
-                    Some(existing) => {
-                        let mut merged_add: Vec<_> = (*existing.add).clone();
-                        merged_add.extend((*add).iter().cloned());
-                        existing.add = Arc::new(merged_add);
-                        let mut merged_set: Vec<_> = (*existing.set).clone();
-                        merged_set.extend((*set).iter().cloned());
-                        existing.set = Arc::new(merged_set);
-                        let mut merged_remove: Vec<_> = (*existing.remove).clone();
-                        merged_remove.extend((*remove).iter().cloned());
-                        existing.remove = Arc::new(merged_remove);
-                    }
-                    None => {
-                        request_header_mods = Some(HeaderModifications {
-                            add: Arc::clone(add),
-                            set: Arc::clone(set),
-                            remove: Arc::clone(remove),
-                        });
-                    }
-                }
-            }
-            HttpFilter::ResponseHeaderModifier { add, set, remove } => {
-                match &mut response_header_mods {
-                    Some(existing) => {
-                        let mut merged_add: Vec<_> = (*existing.add).clone();
-                        merged_add.extend((*add).iter().cloned());
-                        existing.add = Arc::new(merged_add);
-                        let mut merged_set: Vec<_> = (*existing.set).clone();
-                        merged_set.extend((*set).iter().cloned());
-                        existing.set = Arc::new(merged_set);
-                        let mut merged_remove: Vec<_> = (*existing.remove).clone();
-                        merged_remove.extend((*remove).iter().cloned());
-                        existing.remove = Arc::new(merged_remove);
-                    }
-                    None => {
-                        response_header_mods = Some(HeaderModifications {
-                            add: Arc::clone(add),
-                            set: Arc::clone(set),
-                            remove: Arc::clone(remove),
-                        });
-                    }
-                }
-            }
-            _ => {} // Other filter types not valid at backend level
-        }
-    }
-
-    Ok(ProcessingDecision::HttpForward {
-        backend_addr: selected_backend.socket_addr,
-        keepalive,
-        filters: Some(Box::new(HttpFilterData {
-            request_header_mods,
-            response_header_mods,
-            url_rewrite,
-            mirror_targets,
-        })),
-        backend_timeout: rule.backend_request_timeout,
-        request_timeout: rule.request_timeout,
-        content_length: request_info.content_length,
-        is_chunked: request_info.is_chunked,
-        is_upgrade: request_info.is_upgrade,
-        backend_use_tls: selected_backend.use_tls,
-        backend_server_name: selected_backend.server_name.clone(),
+            keepalive,
+        },
     })
 }
 
@@ -416,13 +319,13 @@ pub fn analyze_udp_request(
     backend_selector: &BackendSelector,
     server_port: u16,
     health: &HealthRegistry,
-) -> Result<ProcessingDecision> {
+) -> Result<RoutingResult<'static>> {
     analyze_l4_request(
         backend_selector,
         server_port,
         "UDP",
         |port| routes.find_udp_backends(port),
-        |addr| ProcessingDecision::UdpForward { backend_addr: addr },
+        |addr| RoutingResult::UdpForward { backend_addr: addr },
         health,
     )
 }
@@ -432,13 +335,13 @@ fn analyze_tcp_request(
     backend_selector: &BackendSelector,
     server_port: u16,
     health: &HealthRegistry,
-) -> Result<ProcessingDecision> {
+) -> Result<RoutingResult<'static>> {
     analyze_l4_request(
         backend_selector,
         server_port,
         "TCP",
         |port| routes.find_tcp_backends(port),
-        |addr| ProcessingDecision::TcpForward { backend_addr: addr },
+        |addr| RoutingResult::TcpForward { backend_addr: addr },
         health,
     )
 }
@@ -448,9 +351,9 @@ fn analyze_l4_request<'a>(
     server_port: u16,
     proto: &str,
     lookup: impl FnOnce(u16) -> Result<&'a Vec<crate::routing::Backend>>,
-    make_decision: impl FnOnce(SocketAddr) -> ProcessingDecision,
+    make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
     health: &HealthRegistry,
-) -> Result<ProcessingDecision> {
+) -> Result<RoutingResult<'static>> {
     let backend_list = match lookup(server_port) {
         Ok(list) => list,
         Err(_) => {
@@ -458,7 +361,7 @@ fn analyze_l4_request<'a>(
                 "{} routing failed for port {}: no route configured",
                 proto, server_port
             );
-            return Ok(ProcessingDecision::CloseConnection);
+            return Ok(RoutingResult::CloseConnection);
         }
     };
 
@@ -467,7 +370,7 @@ fn analyze_l4_request<'a>(
             "{} routing failed for port {}: no backends available",
             proto, server_port
         );
-        return Ok(ProcessingDecision::CloseConnection);
+        return Ok(RoutingResult::CloseConnection);
     }
 
     let route_hash = server_port as u64;
@@ -491,7 +394,7 @@ fn analyze_l4_request<'a>(
                 "{} routing: all backends unhealthy for port {}",
                 proto, server_port
             );
-            return Ok(ProcessingDecision::CloseConnection);
+            return Ok(RoutingResult::CloseConnection);
         }
     };
 
@@ -510,6 +413,7 @@ mod tests {
     use crate::routing::{
         Backend, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, RouteTable, URLRewritePath,
     };
+    use std::sync::Arc;
 
     fn build_route_table(
         host: &str,
@@ -561,11 +465,10 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/old", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            let rewrite = fd.url_rewrite.unwrap();
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/old").unwrap();
             assert!(matches!(rewrite.path, Some(RewrittenPath::Full(ref p)) if p == "/new"));
         } else {
             panic!("expected HttpForward");
@@ -586,11 +489,10 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/users", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            let rewrite = fd.url_rewrite.unwrap();
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/v1/users").unwrap();
             assert!(
                 matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2/users")
             );
@@ -613,11 +515,10 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            let rewrite = fd.url_rewrite.unwrap();
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/v1").unwrap();
             assert!(
                 matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/v2")
             );
@@ -640,11 +541,10 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/users", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            let rewrite = fd.url_rewrite.unwrap();
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/users").unwrap();
             assert!(
                 matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/api/users"),
                 "expected /api/users, got {:?}",
@@ -669,11 +569,10 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            let rewrite = fd.url_rewrite.unwrap();
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let rewrite = extract_url_rewrite(&rule.filters, &rule.path, "/").unwrap();
             assert_eq!(rewrite.hostname.as_deref(), Some("new.example.com"));
             assert!(rewrite.path.is_none());
         } else {
@@ -705,12 +604,11 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/test", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            assert!(fd.url_rewrite.is_some());
-            assert!(fd.request_header_mods.is_some());
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            assert!(extract_url_rewrite(&rule.filters, &rule.path, "/v1/test").is_some());
+            assert!(extract_header_mods(&rule.filters, false).is_some());
         } else {
             panic!("expected HttpForward");
         }
@@ -730,13 +628,23 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            assert_eq!(fd.mirror_targets.len(), 1);
-            assert_eq!(fd.mirror_targets[0].addr, "127.0.0.1:9999".parse().unwrap());
-            assert_eq!(fd.mirror_targets[0].percent, 100);
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let mirrors: Vec<_> = rule
+                .filters
+                .iter()
+                .filter_map(|f| match f {
+                    HttpFilter::RequestMirror {
+                        backend_addr,
+                        mirror_percent,
+                    } => Some((*backend_addr, *mirror_percent)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(mirrors.len(), 1);
+            assert_eq!(mirrors[0].0, "127.0.0.1:9999".parse().unwrap());
+            assert_eq!(mirrors[0].1, 100);
         } else {
             panic!("expected HttpForward");
         }
@@ -762,13 +670,23 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            let fd = filters.unwrap();
-            assert_eq!(fd.mirror_targets.len(), 2);
-            assert_eq!(fd.mirror_targets[0].percent, 50);
-            assert_eq!(fd.mirror_targets[1].percent, 100);
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            let mirrors: Vec<_> = rule
+                .filters
+                .iter()
+                .filter_map(|f| match f {
+                    HttpFilter::RequestMirror {
+                        backend_addr,
+                        mirror_percent,
+                    } => Some((*backend_addr, *mirror_percent)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(mirrors.len(), 2);
+            assert_eq!(mirrors[0].1, 50);
+            assert_eq!(mirrors[1].1, 100);
         } else {
             panic!("expected HttpForward");
         }
@@ -802,11 +720,11 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         assert!(matches!(
-            decision,
-            ProcessingDecision::HttpRedirect {
+            result,
+            RoutingResult::HttpRedirect {
                 status_code: 301,
                 ..
             }
@@ -818,10 +736,10 @@ mod tests {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let decision = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
-        if let ProcessingDecision::HttpForward { filters, .. } = decision {
-            assert!(filters.is_none());
+        if let RoutingResult::HttpForward { rule, .. } = result {
+            assert!(!rule.has_filters);
         } else {
             panic!("expected HttpForward");
         }

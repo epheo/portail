@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::health::HealthRegistry;
 use crate::logging::{debug, info, warn};
-use crate::request_processor::{self, ProcessingDecision};
+use crate::request_processor::{self, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
 
 struct UdpSession {
@@ -104,7 +104,7 @@ pub async fn run_udp_worker(
                         };
 
                         let backend_addr = match decision {
-                            ProcessingDecision::UdpForward { backend_addr } => backend_addr,
+                            RoutingResult::UdpForward { backend_addr } => backend_addr,
                             _ => continue,
                         };
 
