@@ -94,11 +94,7 @@ macro_rules! impl_gateway_route {
             fn convert(&self, gw: &str) -> Result<Self::Config> {
                 $cv(self, gw)
             }
-            fn section_names_for_gateway(
-                &self,
-                gw_name: &str,
-                gw_ns: &str,
-            ) -> Vec<Option<String>> {
+            fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
                 all_section_names_for_gateway(&self.spec.$pr, gw_name, gw_ns)
             }
             fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
@@ -106,9 +102,9 @@ macro_rules! impl_gateway_route {
                     .rules
                     .iter()
                     .flat_map(|r| {
-                        r.backend_refs.iter().map(|b| {
-                            (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str())
-                        })
+                        r.backend_refs
+                            .iter()
+                            .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
                     })
                     .collect()
             }
@@ -669,7 +665,14 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &test_snapshot(vec![matching_route, other_route], vec![], vec![], vec![], &ns_labels, vec![]),
+            &test_snapshot(
+                vec![matching_route, other_route],
+                vec![],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![],
+            ),
             &HashMap::new(),
             &empty_services(),
         )
@@ -801,7 +804,14 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &test_snapshot(vec![route.clone()], vec![], vec![], vec![], &ns_labels, vec![]),
+            &test_snapshot(
+                vec![route.clone()],
+                vec![],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![],
+            ),
             &HashMap::new(),
             &empty_services(),
         )
@@ -1108,7 +1118,14 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &test_snapshot(vec![], vec![tcp_route], vec![], vec![], &ns_labels, vec![ref_grant]),
+            &test_snapshot(
+                vec![],
+                vec![tcp_route],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![ref_grant],
+            ),
             &HashMap::new(),
             &empty_services(),
         )
@@ -2035,7 +2052,14 @@ mod tests {
 
         let result = reconcile_to_config(
             &gw,
-            &test_snapshot(vec![http_route], vec![tcp_route], vec![], vec![], &ns_labels, vec![]),
+            &test_snapshot(
+                vec![http_route],
+                vec![tcp_route],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![],
+            ),
             &HashMap::new(),
             &empty_services(),
         )

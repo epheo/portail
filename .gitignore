@@ -8,3 +8,4 @@ conformance-results.log
 conformance-report.yaml
 .kubeconfig-local
 .kubeconfig-kind
+docs/html

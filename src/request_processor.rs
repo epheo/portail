@@ -445,8 +445,7 @@ mod tests {
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite =
-                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1")
-                    .unwrap();
+                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1").unwrap();
             assert!(
                 matches!(rewrite.path, Some(crate::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/v2")
             );
@@ -538,10 +537,12 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
-            assert!(
-                crate::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1/test")
-                    .is_some()
-            );
+            assert!(crate::http_filters::extract_url_rewrite(
+                &rule.filters,
+                &rule.path,
+                "/v1/test"
+            )
+            .is_some());
             assert!(crate::http_filters::extract_header_mods(&rule.filters, false).is_some());
         } else {
             panic!("expected HttpForward");

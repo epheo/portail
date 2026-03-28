@@ -39,94 +39,17 @@ This grants the `portail-controller` service account permission to use host netw
 
 ## Container Image
 
-The pre-built image is available on Quay.io:
+The pre-built image is available on GitHub Container Registry:
 
 ```
-quay.io/epheo/portail:latest
+ghcr.io/epheo/portail:latest
 ```
 
 Build from source:
 
 ```bash
 cargo build --release
-podman build -t quay.io/epheo/portail:latest -f Containerfile .
-```
-
-## Network Model
-
-Portail uses `hostNetwork: true` — the pod binds directly to the node's network interfaces. Ports defined in your Gateway listeners (e.g., 80, 443, 8080) are opened on the node. No Kubernetes Service or LoadBalancer is needed.
-
-The `NET_BIND_SERVICE` capability allows binding to privileged ports (< 1024) without running as root.
-
-## Firewall
-
-If your node has a firewall, open the ports your Gateway listeners use:
-
-```bash
-sudo firewall-cmd --add-port=80/tcp --permanent
-sudo firewall-cmd --add-port=443/tcp --permanent
-sudo firewall-cmd --reload
-```
-
-## TLS Certificates
-
-Portail reads TLS certificates from Kubernetes Secrets referenced in your Gateway listener's `certificateRefs`. It works with cert-manager or any other Secret-based certificate management.
-
-TLS certificates are hot-reloaded when the underlying Secret changes — no restart required. Multiple Gateways sharing a port have their certificates merged automatically for SNI-based selection.
-
-Example with cert-manager:
-
-```yaml
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: app-tls
-  namespace: default
-spec:
-  secretName: app-tls-secret
-  issuerRef:
-    name: letsencrypt
-    kind: ClusterIssuer
-  dnsNames:
-  - app.example.com
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: secure-gateway
-  namespace: default
-spec:
-  gatewayClassName: portail
-  listeners:
-  - name: https
-    port: 443
-    protocol: HTTPS
-    hostname: "app.example.com"
-    tls:
-      mode: Terminate
-      certificateRefs:
-      - name: app-tls-secret
-```
-
-## Configuration
-
-### Custom Controller Name
-
-To use a custom controller name (e.g., for running multiple Portail instances):
-
-```bash
-portail --kubernetes --controller-name my-org.example.com/gateway-controller
-```
-
-Update the `GatewayClass` to match:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: portail
-spec:
-  controllerName: my-org.example.com/gateway-controller
+podman build -t ghcr.io/epheo/portail:latest -f Containerfile .
 ```
 
 ## Verifying

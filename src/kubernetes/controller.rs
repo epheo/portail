@@ -460,7 +460,10 @@ fn resolve_gateway_certs(
 
 /// Resolve service metadata: known services set, headless endpoint overrides,
 /// ExternalName overrides, and appProtocol overrides.
-fn resolve_services(all_services: &[Service], store_endpoint_slices: &Store<EndpointSlice>) -> ServiceState {
+fn resolve_services(
+    all_services: &[Service],
+    store_endpoint_slices: &Store<EndpointSlice>,
+) -> ServiceState {
     let known_services: HashSet<(String, String)> = all_services
         .iter()
         .filter_map(|svc| {
@@ -962,10 +965,7 @@ async fn reconcile(
     // This avoids re-reconciling other gateways on every change (O(n) instead of O(n²)).
     let all_configs = {
         let mut cache = ctx.config_cache.lock().unwrap();
-        cache.insert(
-            (gw_ns.clone(), gw_name.clone()),
-            result.config.clone(),
-        );
+        cache.insert((gw_ns.clone(), gw_name.clone()), result.config.clone());
         // Prune configs for gateways no longer in the store or managed by a different controller
         let live: HashSet<_> = ctx
             .cache
@@ -975,7 +975,11 @@ async fn reconcile(
             .filter(|g| g.spec.gateway_class_name == *gateway_class_name)
             .map(|g| {
                 (
-                    g.metadata.namespace.as_deref().unwrap_or("default").to_string(),
+                    g.metadata
+                        .namespace
+                        .as_deref()
+                        .unwrap_or("default")
+                        .to_string(),
                     g.metadata.name.as_deref().unwrap_or("").to_string(),
                 )
             })

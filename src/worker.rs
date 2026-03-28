@@ -366,11 +366,8 @@ async fn proxy_http_request(
         // Extract request header mods from rule + backend filter lists (zero-alloc borrows)
         let rule_mods = extract_header_mods(&rule.filters, false);
         let request_path = extract_request_path(&buf[..header_end]);
-        let url_rewrite = extract_url_rewrite(
-            &rule.filters,
-            &rule.path,
-            request_path.as_deref().unwrap_or("/"),
-        );
+        let url_rewrite =
+            extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
 
         let has_mods = rule_mods.is_some()
             || url_rewrite.is_some()
@@ -496,16 +493,12 @@ fn extract_response_mods<'a>(
 }
 
 /// Extract the request path from the first line of raw HTTP headers.
-fn extract_request_path(header_bytes: &[u8]) -> Option<String> {
+/// Zero-allocation: borrows directly from the buffer.
+fn extract_request_path(header_bytes: &[u8]) -> Option<&str> {
     let first_line_end = header_bytes.iter().position(|&b| b == b'\r')?;
     let first_line = std::str::from_utf8(&header_bytes[..first_line_end]).ok()?;
-    first_line.split_whitespace().nth(1).map(|p| {
-        // Strip query string for prefix matching
-        match p.find('?') {
-            Some(pos) => p[..pos].to_string(),
-            None => p.to_string(),
-        }
-    })
+    let path = first_line.split_whitespace().nth(1)?;
+    Some(path.split('?').next().unwrap_or(path))
 }
 
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.

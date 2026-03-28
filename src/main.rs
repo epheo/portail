@@ -1,23 +1,8 @@
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::type_complexity)]
 use anyhow::Result;
-use logging::{error, info};
+use portail::logging::{error, info};
+use portail::*;
 
-mod backend_pool;
 mod cli;
-mod config;
-mod config_watcher;
-mod data_plane;
-mod health;
-mod http_filters;
-mod http_parser;
-mod kubernetes;
-mod logging;
-mod request_processor;
-mod routing;
-mod tls;
-mod udp_worker;
-mod worker;
 
 use arc_swap::ArcSwap;
 use clap::Parser;
@@ -113,9 +98,9 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
     );
 
     // Build initial route table from configuration
-    let route_table = portail_config.to_route_table().map_err(|e| {
-        anyhow::anyhow!("Failed to convert configuration to route table: {}", e)
-    })?;
+    let route_table = portail_config
+        .to_route_table()
+        .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
     let routes = Arc::new(ArcSwap::from_pointee(route_table));
     info!(
         "Routes loaded: {} HTTP routes, {} TCP routes",
