@@ -9,33 +9,45 @@
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
 ```
 
-## Deploy
+## Deployment Patterns
 
-Apply the manifests in order:
+Portail is a single binary. How you deploy it is your choice. Each pattern in `examples/kubernetes/` is a self-contained kustomize overlay.
 
-```bash
-kubectl apply -f deploy/namespace.yaml
-kubectl apply -f deploy/rbac.yaml
-kubectl apply -f deploy/gatewayclass.yaml
-kubectl apply -f deploy/daemonset.yaml
-```
+### DaemonSet (quickstart)
 
-This creates:
-
-- `portail-system` namespace
-- A `ServiceAccount` with RBAC to read Gateway API resources and update their status
-- A `GatewayClass` named `portail` with controller name `portail.epheo.eu/gateway-controller`
-- A `DaemonSet` running one pod per node with `hostNetwork: true`
-
-### OpenShift / MicroShift
-
-On OpenShift-based clusters, the default security policy prevents `hostNetwork` and `NET_BIND_SERVICE`. Apply the SecurityContextConstraints:
+One pod per node with `hostNetwork: true`. Simplest setup, good for single-node and edge.
 
 ```bash
-kubectl apply -f deploy/scc.yaml
+kubectl apply -k examples/kubernetes/daemonset/
 ```
 
-This grants the `portail-controller` service account permission to use host networking and bind to privileged ports.
+### LoadBalancer Service
+
+One Deployment per Gateway, exposed via a LoadBalancer Service. Requires MetalLB or a cloud LB provider. Best for multi-node production.
+
+```bash
+kubectl apply -k examples/kubernetes/loadbalancer/
+```
+
+### Multi-Network (experimental)
+
+A Portail pod attached to multiple UDNs via Multus, routing between isolated networks at L4-L7.
+
+```bash
+kubectl apply -k examples/kubernetes/multi-network/
+```
+
+See each pattern's README for detailed pros, cons, and configuration.
+
+## OpenShift / MicroShift
+
+The DaemonSet pattern requires a SecurityContextConstraints for `hostNetwork` and `NET_BIND_SERVICE`:
+
+```bash
+kubectl apply -f examples/kubernetes/base/scc.yaml
+```
+
+The Deployment-based loadbalancer pattern doesn't need this.
 
 ## Container Image
 
@@ -72,8 +84,5 @@ Look for `Accepted: True` and `Programmed: True` in the conditions.
 ## Uninstall
 
 ```bash
-kubectl delete -f deploy/daemonset.yaml
-kubectl delete -f deploy/gatewayclass.yaml
-kubectl delete -f deploy/rbac.yaml
-kubectl delete -f deploy/namespace.yaml
+kubectl delete -k examples/kubernetes/<pattern>/
 ```

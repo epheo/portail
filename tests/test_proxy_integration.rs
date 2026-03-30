@@ -674,8 +674,7 @@ fn test_exact_vs_prefix_path_e2e() {
         r#"{{
   "gateway": {{
     "name": "test-gateway",
-    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
-    "workerThreads": 1
+    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}]
   }},
   "httpRoutes": [{{
     "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],

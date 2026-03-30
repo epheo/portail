@@ -67,21 +67,15 @@ fn main() -> Result<()> {
 
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
-    let worker_count = portail_config.gateway.worker_threads;
-
-    // Build Tokio runtime with thread count matching the configured worker count
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_count)
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
 
-    info!("Tokio runtime started with {} threads", worker_count);
-
-    rt.block_on(async_main(args, portail_config, worker_count))
+    rt.block_on(async_main(args, portail_config))
 }
 
-async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usize) -> Result<()> {
+async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     let performance_config = portail_config.performance.clone();
     let listeners = portail_config.gateway.listeners.clone();
     let cert_dir = args
@@ -109,7 +103,6 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
     );
 
     let data_plane = std::sync::Arc::new(std::sync::Mutex::new(DataPlane::new(
-        worker_count,
         &listeners,
         &performance_config,
         &cert_dir,
@@ -117,11 +110,7 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
 
     // Start initial listeners from config file
     data_plane.lock().unwrap().start(routes.clone());
-    info!(
-        "Portail ready: {} workers × {} listeners",
-        worker_count,
-        listeners.len()
-    );
+    info!("Portail ready: {} listeners", listeners.len());
 
     // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
@@ -130,7 +119,6 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
         let controller_name = args.controller_name.clone();
         let token = shutdown_token.clone();
         let k8s_data_plane = data_plane.clone();
-        let k8s_worker_count = worker_count;
         let k8s_perf = performance_config.clone();
         tokio::spawn(async move {
             if let Err(e) = kubernetes::controller::run_controller(
@@ -138,7 +126,6 @@ async fn async_main(args: Args, portail_config: PortailConfig, worker_count: usi
                 controller_name,
                 token,
                 k8s_data_plane,
-                k8s_worker_count,
                 k8s_perf,
             )
             .await
@@ -234,7 +221,7 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
                 println!("Configuration Summary:");
                 println!("  HTTP Routes: {}", config.http_routes.len());
                 println!("  TCP Routes: {}", config.tcp_routes.len());
-                println!("  Worker Threads: {}", config.gateway.worker_threads);
+
                 println!(
                     "  HTTP Listeners: {:?}",
                     config

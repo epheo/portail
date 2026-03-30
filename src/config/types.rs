@@ -27,8 +27,10 @@ pub struct GatewayConfig {
     pub name: String,
     pub listeners: Vec<ListenerConfig>,
 
-    #[serde(default = "default_worker_threads")]
-    pub worker_threads: usize,
+    /// Bind addresses from Gateway spec.addresses (IPAddress entries only).
+    /// When non-empty, listeners bind to each address instead of 0.0.0.0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
 }
 
 /// Listener configuration defining protocol and port bindings
@@ -81,12 +83,6 @@ fn default_gateway_name() -> String {
     "portail-gateway".to_string()
 }
 
-fn default_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-}
-
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -100,7 +96,7 @@ impl Default for GatewayConfig {
                 interface: None,
                 tls: None,
             }],
-            worker_threads: default_worker_threads(),
+            addresses: vec![],
         }
     }
 }

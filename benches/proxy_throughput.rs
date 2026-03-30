@@ -1,355 +1,362 @@
-//! Proxy throughput benchmark — measures requests/sec through portail.
+//! Proxy throughput benchmark using rewrk-core + kiss backend.
 //!
-//! Uses the same test infrastructure as integration tests:
-//! spawns a real portail process + mock backend, sends N requests
-//! on keepalive connections, and measures elapsed time.
+//! Spawns kiss (static file server) as backend, portail as proxy,
+//! and uses rewrk-core as the load generator.
+//!
+//! Prerequisites:
+//!   - `kiss` binary in PATH (cargo install kiss)
+//!   - `portail` binary built (cargo build --release)
 //!
 //! Run with: cargo bench --bench proxy_throughput
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
-const WARMUP_REQUESTS: usize = 1_000;
-const BENCHMARK_REQUESTS: usize = 50_000;
-const NUM_CONNECTIONS: usize = 8;
-const PROXY_PORT: u16 = 29_100;
-const FILTER_PROXY_PORT: u16 = 29_200;
+use anyhow::Result;
+use hyper::{Body, Method, Request, Uri};
+use rewrk_core::{
+    Batch, HttpProtocol, Producer, ReWrkBenchmark, RequestBatch, Sample, SampleCollector,
+};
+
+const CONCURRENCY: usize = 64;
+const NUM_WORKERS: usize = 4;
+const REQUESTS_PER_BATCH: usize = 500;
+const BENCH_DURATION: Duration = Duration::from_secs(10);
+
+const PORTAIL_PORT: u16 = 29_100;
+const PORTAIL_FILTER_PORT: u16 = 29_200;
+const KISS_BASE_PORT: u16 = 29_300;
+const NUM_BACKENDS: u16 = 4;
 
 fn main() {
-    println!("=== Portail Proxy Throughput Benchmark ===\n");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    // --- Scenario 1: No-filter path (hot path) ---
-    {
-        let backend = spawn_backend("benchmark-ok");
-        let proxy = spawn_portail_no_filters(backend.addr, PROXY_PORT);
+    rt.block_on(async {
+        println!("=== Portail Proxy Throughput Benchmark ===\n");
 
-        // Warmup
-        run_keepalive_requests(proxy.addr, WARMUP_REQUESTS, 1);
+        let content_dir = PathBuf::from("/tmp/portail_bench_content");
+        std::fs::create_dir_all(&content_dir).expect("create bench content dir");
+        std::fs::write(content_dir.join("bench.txt"), "ok").expect("write bench file");
 
-        // Benchmark: single connection (serial latency)
-        let (reqs, elapsed) = run_keepalive_requests(proxy.addr, BENCHMARK_REQUESTS, 1);
-        let rps = reqs as f64 / elapsed.as_secs_f64();
-        let avg_us = elapsed.as_micros() as f64 / reqs as f64;
-        println!(
-            "No-filter (1 conn):  {:>8} req/s  avg={:.0}µs  ({} reqs in {:.2}s)",
-            rps as u64,
-            avg_us,
-            reqs,
-            elapsed.as_secs_f64()
-        );
+        // Start kiss backends
+        let kiss_handles: Vec<ProcessHandle> = (0..NUM_BACKENDS)
+            .map(|i| spawn_kiss(KISS_BASE_PORT + i, &content_dir))
+            .collect();
+        let backend_ports: Vec<u16> = (0..NUM_BACKENDS).map(|i| KISS_BASE_PORT + i).collect();
 
-        // Benchmark: parallel connections (throughput)
-        let (reqs, elapsed) =
-            run_keepalive_requests(proxy.addr, BENCHMARK_REQUESTS, NUM_CONNECTIONS);
-        let rps = reqs as f64 / elapsed.as_secs_f64();
-        let avg_us = elapsed.as_micros() as f64 / reqs as f64;
-        println!(
-            "No-filter ({} conn): {:>8} req/s  avg={:.0}µs  ({} reqs in {:.2}s)",
-            NUM_CONNECTIONS,
-            rps as u64,
-            avg_us,
-            reqs,
-            elapsed.as_secs_f64()
-        );
-    }
-
-    println!();
-
-    // --- Scenario 2: Filter path (header mods + URL rewrite) ---
-    {
-        let backend = spawn_backend("filtered-ok");
-        let proxy = spawn_portail_with_filters(backend.addr, FILTER_PROXY_PORT);
-
-        // Warmup
-        run_keepalive_requests(proxy.addr, WARMUP_REQUESTS, 1);
-
-        // Benchmark: single connection
-        let (reqs, elapsed) = run_keepalive_requests(proxy.addr, BENCHMARK_REQUESTS, 1);
-        let rps = reqs as f64 / elapsed.as_secs_f64();
-        let avg_us = elapsed.as_micros() as f64 / reqs as f64;
-        println!(
-            "Filter path (1 conn):  {:>8} req/s  avg={:.0}µs  ({} reqs in {:.2}s)",
-            rps as u64,
-            avg_us,
-            reqs,
-            elapsed.as_secs_f64()
-        );
-
-        // Benchmark: parallel connections
-        let (reqs, elapsed) =
-            run_keepalive_requests(proxy.addr, BENCHMARK_REQUESTS, NUM_CONNECTIONS);
-        let rps = reqs as f64 / elapsed.as_secs_f64();
-        let avg_us = elapsed.as_micros() as f64 / reqs as f64;
-        println!(
-            "Filter path ({} conn): {:>8} req/s  avg={:.0}µs  ({} reqs in {:.2}s)",
-            NUM_CONNECTIONS,
-            rps as u64,
-            avg_us,
-            reqs,
-            elapsed.as_secs_f64()
-        );
-    }
-
-    println!("\n=== Benchmark complete ===");
-}
-
-/// Run N requests spread across `num_connections` keepalive connections.
-/// Returns (total_successful_requests, total_elapsed).
-fn run_keepalive_requests(
-    proxy_addr: SocketAddr,
-    total_requests: usize,
-    num_connections: usize,
-) -> (usize, Duration) {
-    let per_conn = total_requests / num_connections;
-    let start = Instant::now();
-
-    let handles: Vec<_> = (0..num_connections)
-        .map(|_| thread::spawn(move || keepalive_burst(proxy_addr, per_conn)))
-        .collect();
-
-    let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    let elapsed = start.elapsed();
-    (total, elapsed)
-}
-
-/// Send `count` HTTP/1.1 keepalive requests on a single TCP connection.
-/// Returns number of successful request/response cycles.
-fn keepalive_burst(addr: SocketAddr, count: usize) -> usize {
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-
-    let request = b"GET /bench HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let mut read_buf = [0u8; 4096];
-    let mut successes = 0;
-
-    for _ in 0..count {
-        if stream.write_all(request).is_err() {
-            break;
-        }
-
-        // Read until we have a complete response
-        let mut response = Vec::with_capacity(256);
-        loop {
-            match stream.read(&mut read_buf) {
-                Ok(0) => return successes,
-                Ok(n) => {
-                    response.extend_from_slice(&read_buf[..n]);
-                    if response_complete(&response) {
-                        break;
-                    }
-                }
-                Err(_) => return successes,
-            }
-        }
-
-        if response.starts_with(b"HTTP/1.1 200") {
-            successes += 1;
-        }
-    }
-
-    successes
-}
-
-fn response_complete(data: &[u8]) -> bool {
-    let header_end = match data.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(pos) => pos + 4,
-        None => return false,
-    };
-    let headers = std::str::from_utf8(&data[..header_end]).unwrap_or("");
-    if let Some(cl_line) = headers
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-    {
-        if let Ok(cl) = cl_line
-            .split(':')
-            .nth(1)
-            .unwrap_or("")
-            .trim()
-            .parse::<usize>()
+        // Baseline: direct to kiss (no proxy)
         {
-            return data.len() >= header_end + cl;
+            println!("--- Direct to kiss (baseline, no proxy) ---");
+            run_bench(KISS_BASE_PORT, "/bench.txt").await;
+        }
+
+        println!();
+
+        // Scenario 1: No filters, single backend
+        {
+            let proxy = spawn_portail_no_filters(&backend_ports[..1], PORTAIL_PORT);
+            println!("--- No-filter path (1 backend) ---");
+            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        println!();
+
+        // Scenario 2: No filters, multiple backends
+        {
+            let proxy = spawn_portail_no_filters(&backend_ports, PORTAIL_PORT);
+            println!("--- No-filter path ({} backends) ---", NUM_BACKENDS);
+            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        println!();
+
+        // Scenario 3: With filters, single backend
+        {
+            let proxy = spawn_portail_with_filters(&backend_ports[..1], PORTAIL_FILTER_PORT);
+            println!("--- Filter path (1 backend) ---");
+            run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        println!();
+
+        // Scenario 4: With filters, multiple backends
+        {
+            let proxy = spawn_portail_with_filters(&backend_ports, PORTAIL_FILTER_PORT);
+            println!("--- Filter path ({} backends) ---", NUM_BACKENDS);
+            run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        drop(kiss_handles);
+        println!("\n=== Benchmark complete ===");
+    });
+}
+
+async fn run_bench(port: u16, path: &str) {
+    let uri = Uri::builder()
+        .scheme("http")
+        .authority(format!("127.0.0.1:{}", port))
+        .path_and_query(path)
+        .build()
+        .unwrap();
+
+    let producer = BenchProducer::new(path, BENCH_DURATION);
+    let collector = BenchCollector::default();
+
+    let mut benchmarker =
+        ReWrkBenchmark::create(uri, CONCURRENCY, HttpProtocol::HTTP1, producer, collector)
+            .await
+            .unwrap();
+    benchmarker.set_num_workers(NUM_WORKERS);
+    benchmarker.set_sample_window(Duration::from_secs(15));
+
+    let wall_start = Instant::now();
+    benchmarker.run().await;
+    let wall_elapsed = wall_start.elapsed();
+
+    let collector = benchmarker.consume_collector().await;
+    collector.print_results(wall_elapsed);
+}
+
+// --- Producer: generates request batches for a fixed duration ---
+
+#[derive(Clone)]
+struct BenchProducer {
+    path: String,
+    duration: Duration,
+    started: Option<Instant>,
+}
+
+impl BenchProducer {
+    fn new(path: &str, duration: Duration) -> Self {
+        Self {
+            path: path.to_string(),
+            duration,
+            started: None,
         }
     }
-    true
 }
 
-// --- Infrastructure ---
+#[rewrk_core::async_trait]
+impl Producer for BenchProducer {
+    fn ready(&mut self) {
+        self.started = Some(Instant::now());
+    }
 
-struct BackendHandle {
-    addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    _handle: thread::JoinHandle<()>,
-}
+    async fn create_batch(&mut self) -> Result<RequestBatch> {
+        let started = self.started.expect("ready() must be called first");
+        if started.elapsed() >= self.duration {
+            return Ok(RequestBatch::End);
+        }
 
-impl Drop for BackendHandle {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = TcpStream::connect(self.addr);
+        let mut requests = Vec::with_capacity(REQUESTS_PER_BATCH);
+        for _ in 0..REQUESTS_PER_BATCH {
+            let uri = Uri::builder().path_and_query(&*self.path).build()?;
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())?;
+            requests.push(request);
+        }
+
+        Ok(RequestBatch::Batch(Batch { tag: 0, requests }))
     }
 }
 
-fn spawn_backend(body: &str) -> BackendHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
-    let addr = listener.local_addr().unwrap();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let body = body.to_string();
+// --- Collector: aggregates samples and prints results ---
 
-    listener.set_nonblocking(true).unwrap();
+#[derive(Default)]
+struct BenchCollector {
+    samples: Vec<Sample>,
+}
 
-    let handle = thread::spawn(move || {
-        while !shutdown_clone.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let body = body.clone();
-                    let sd = shutdown_clone.clone();
-                    thread::spawn(move || backend_handler(stream, &body, &sd));
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => break,
+#[rewrk_core::async_trait]
+impl SampleCollector for BenchCollector {
+    async fn process_sample(&mut self, sample: Sample) -> Result<()> {
+        self.samples.push(sample);
+        Ok(())
+    }
+}
+
+impl BenchCollector {
+    fn print_results(&self, wall_time: Duration) {
+        if self.samples.is_empty() {
+            println!("  No samples collected");
+            return;
+        }
+
+        // Merge all samples
+        let merged = self.samples.iter().cloned().reduce(|a, b| a + b).unwrap();
+
+        let total_reqs = merged.total_successful_requests();
+        let rps = total_reqs as f64 / wall_time.as_secs_f64();
+
+        let lat = merged.latency();
+        let p50 = lat.value_at_percentile(50.0);
+        let p95 = lat.value_at_percentile(95.0);
+        let p99 = lat.value_at_percentile(99.0);
+        let max = lat.max();
+
+        println!("  Requests:    {} ({:.0} req/s)", total_reqs, rps);
+        println!("  Duration:    {:.2}s", wall_time.as_secs_f64());
+        println!(
+            "  Latency:     p50={:.0}µs  p95={:.0}µs  p99={:.0}µs  max={:.0}µs",
+            p50, p95, p99, max
+        );
+
+        if !merged.errors().is_empty() {
+            println!("  Errors:      {}", merged.errors().len());
+            for e in merged.errors().iter().take(3) {
+                println!("    - {:?}", e);
             }
         }
-    });
-
-    BackendHandle {
-        addr,
-        shutdown,
-        _handle: handle,
     }
 }
 
-fn backend_handler(mut stream: TcpStream, body: &str, shutdown: &AtomicBool) {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    stream.set_nodelay(true).ok();
-    let mut buf = [0u8; 4096];
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let response_bytes = response.as_bytes();
+// --- Infrastructure: spawn kiss + portail ---
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-        let n = match stream.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(_) => return,
-        };
-        if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-            continue;
-        }
-        if stream.write_all(response_bytes).is_err() {
-            return;
-        }
-    }
-}
-
-struct ProxyHandle {
-    addr: SocketAddr,
+struct ProcessHandle {
     child: Child,
-    _config: tempfile::NamedTempFile,
 }
 
-impl Drop for ProxyHandle {
+impl Drop for ProcessHandle {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn spawn_portail_no_filters(backend_addr: SocketAddr, port: u16) -> ProxyHandle {
+/// Set PR_SET_PDEATHSIG so the child is killed when the parent dies.
+/// This prevents orphan processes when the bench panics or is Ctrl+C'd.
+fn kill_on_parent_death() -> impl FnMut() -> Result<(), std::io::Error> {
+    || {
+        // SAFETY: prctl with PR_SET_PDEATHSIG is async-signal-safe
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        Ok(())
+    }
+}
+
+fn spawn_kiss(port: u16, content_dir: &PathBuf) -> ProcessHandle {
+    let child = unsafe {
+        Command::new("kiss")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--static-dir")
+            .arg(content_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(kill_on_parent_death())
+            .spawn()
+            .expect("spawn kiss (is it installed? cargo install kiss)")
+    };
+
+    wait_for_port(port);
+    ProcessHandle { child }
+}
+
+fn backend_refs_json(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(|p| format!(r#"{{"name":"127.0.0.1","port":{}}}"#, p))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn spawn_portail_no_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
     let config = format!(
         r#"{{
-  "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}],"workerThreads":2}},
-  "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"http"}}],"hostnames":["localhost"],"rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],"backendRefs":[{{"name":"{}","port":{}}}]}}]}}],
+  "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}]}},
+  "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"http"}}],"hostnames":["127.0.0.1"],"rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],"backendRefs":[{}]}}]}}],
   "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
   "performance": {{}}
 }}"#,
         port,
-        backend_addr.ip(),
-        backend_addr.port()
+        backend_refs_json(backend_ports),
     );
 
     spawn_portail_with_config(&config, port)
 }
 
-fn spawn_portail_with_filters(backend_addr: SocketAddr, port: u16) -> ProxyHandle {
+fn spawn_portail_with_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
     let config = format!(
         r#"{{
-  "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}],"workerThreads":2}},
-  "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"http"}}],"hostnames":["localhost"],"rules":[{{
+  "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}]}},
+  "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"http"}}],"hostnames":["127.0.0.1"],"rules":[{{
     "matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],
     "filters":[
       {{"type":"RequestHeaderModifier","requestHeaderModifier":{{"add":[{{"name":"X-Bench","value":"true"}}],"remove":["Accept"]}}}},
       {{"type":"URLRewrite","urlRewrite":{{"hostname":"rewritten.bench"}}}}
     ],
-    "backendRefs":[{{"name":"{}","port":{}}}]
+    "backendRefs":[{}]
   }}]}}],
   "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
   "performance": {{}}
 }}"#,
         port,
-        backend_addr.ip(),
-        backend_addr.port()
+        backend_refs_json(backend_ports),
     );
 
     spawn_portail_with_config(&config, port)
 }
 
-fn spawn_portail_with_config(config: &str, port: u16) -> ProxyHandle {
+fn spawn_portail_with_config(config: &str, port: u16) -> ProcessHandle {
     let config_file = tempfile::Builder::new()
         .suffix(".json")
         .tempfile()
-        .expect("temp");
+        .expect("create temp config");
     std::fs::write(config_file.path(), config).expect("write config");
 
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let binary = project_root.join("target/release/portail");
-    let bin = if binary.exists() {
-        binary
-    } else {
-        project_root.join("target/debug/portail")
+    let binary = portail_binary_path();
+    let child = unsafe {
+        Command::new(&binary)
+            .arg("--config")
+            .arg(config_file.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(kill_on_parent_death())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {:?}: {}", binary, e))
     };
 
-    let child = Command::new(&bin)
-        .arg("--config")
-        .arg(config_file.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {:?}: {}", bin, e));
+    // Leak the config file so it lives as long as the process
+    std::mem::forget(config_file);
 
+    wait_for_port(port);
+    ProcessHandle { child }
+}
+
+fn portail_binary_path() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let release = root.join("target/release/portail");
+    if release.exists() {
+        return release;
+    }
+    let debug = root.join("target/debug/portail");
+    if debug.exists() {
+        return debug;
+    }
+    panic!("portail binary not found — run cargo build --release");
+}
+
+fn wait_for_port(port: u16) {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if Instant::now() > deadline {
-            panic!("portail didn't start on port {}", port);
+            panic!("port {} not ready within 5s", port);
         }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
-            break;
+            return;
         }
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    ProxyHandle {
-        addr,
-        child,
-        _config: config_file,
+        std::thread::sleep(Duration::from_millis(25));
     }
 }

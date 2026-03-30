@@ -12,6 +12,8 @@ use serde::Serialize;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 
+use crate::kubernetes::controller::UsableAddresses;
+
 use crate::logging::{debug, warn};
 
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
@@ -113,7 +115,7 @@ fn transition_time_json(
     now.to_string()
 }
 
-pub async fn update_gateway_status(
+pub(crate) async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
     accepted: bool,
@@ -124,6 +126,7 @@ pub async fn update_gateway_status(
     programmed_message: &str,
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
+    usable: &UsableAddresses,
 ) {
     let name = gateway.name_any();
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -272,40 +275,48 @@ pub async fn update_gateway_status(
         })
         .collect();
 
-    // Build status.addresses — if spec.addresses is set, report only usable ones
-    // (GatewayStaticAddresses); otherwise assign from NODE_IP/POD_IP env vars (GatewayAddressEmpty).
-    let gateway_ip = std::env::var("NODE_IP")
-        .or_else(|_| std::env::var("POD_IP"))
-        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    // Build status.addresses using pre-computed address discovery.
+    // LB VIPs are preferred (externally reachable), then NODE_IP/POD_IP.
     let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
         if !spec_addrs.is_empty() {
-            spec_addrs
-                .iter()
-                .filter(|a| {
-                    let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
-                    match addr_type {
-                        "IPAddress" => a.value.as_deref() == Some(gateway_ip.as_str()),
+            if usable.is_empty() {
+                // Can't determine usability — report all spec addresses
+                spec_addrs
+                    .iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "type": a.r#type.as_deref().unwrap_or("IPAddress"),
+                            "value": a.value,
+                        })
+                    })
+                    .collect()
+            } else {
+                let known = usable.all();
+                spec_addrs
+                    .iter()
+                    .filter(|a| match a.r#type.as_deref().unwrap_or("IPAddress") {
+                        "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
                         "Hostname" => true,
                         _ => false,
-                    }
-                })
-                .map(|a| {
-                    serde_json::json!({
-                        "type": a.r#type.as_deref().unwrap_or("IPAddress"),
-                        "value": a.value,
                     })
-                })
-                .collect()
+                    .map(|a| {
+                        serde_json::json!({
+                            "type": a.r#type.as_deref().unwrap_or("IPAddress"),
+                            "value": a.value,
+                        })
+                    })
+                    .collect()
+            }
         } else {
             vec![serde_json::json!({
                 "type": "IPAddress",
-                "value": gateway_ip,
+                "value": usable.preferred_ip(),
             })]
         }
     } else {
         vec![serde_json::json!({
             "type": "IPAddress",
-            "value": gateway_ip,
+            "value": usable.preferred_ip(),
         })]
     };
 

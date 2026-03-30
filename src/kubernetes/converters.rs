@@ -35,6 +35,26 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
         .unwrap_or_else(|| "portail-gateway".to_string());
 
     let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+
+    let addresses: Vec<String> = gw
+        .spec
+        .addresses
+        .as_ref()
+        .map(|addrs| {
+            addrs
+                .iter()
+                .filter_map(|a| {
+                    let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
+                    if addr_type == "IPAddress" {
+                        a.value.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let listeners = gw
         .spec
         .listeners
@@ -45,7 +65,7 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
     Ok(GatewayConfig {
         name,
         listeners,
-        ..Default::default()
+        addresses,
     })
 }
 

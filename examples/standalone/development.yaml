@@ -20,7 +20,6 @@ gateway:
     port: 2222
     address: 127.0.0.1
     interface: lo
-  workerThreads: 4
 httpRoutes:
 - parentRefs:
   - name: development-gateway

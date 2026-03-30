@@ -1,0 +1,14 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: portail-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 10.89.0.200-10.89.0.250  # Podman/Kind default (/24). Docker uses 172.18.0.0/16 — adjust accordingly.
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: portail-l2
+  namespace: metallb-system

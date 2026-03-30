@@ -154,8 +154,6 @@ pub async fn run_udp_worker(
                             _backend_task: backend_task,
                             last_active,
                         });
-
-                        debug!("UDP session created: {} -> {} (port {})", client_addr, backend_addr, server_port);
                     }
                     Err(e) => {
                         warn!("UDP worker {} recv_from error: {}", worker_id, e);

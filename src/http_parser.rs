@@ -236,7 +236,21 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     // header_data covers everything from header_start to current pos (end of headers)
     let header_data = &request_data[header_start..pos];
 
+    // Handle absolute-form URIs (RFC 7230 §5.3.2):
+    // "GET http://host/path HTTP/1.1" → extract "/path"
     let raw_path = path.unwrap_or("/");
+    let raw_path = if raw_path.starts_with("http://") || raw_path.starts_with("https://") {
+        // Find the path after scheme://authority
+        match raw_path.find("://") {
+            Some(scheme_end) => match raw_path[scheme_end + 3..].find('/') {
+                Some(path_start) => &raw_path[scheme_end + 3 + path_start..],
+                None => "/",
+            },
+            None => raw_path,
+        }
+    } else {
+        raw_path
+    };
     let (clean_path, query_string) = match raw_path.find('?') {
         Some(pos) => (&raw_path[..pos], &raw_path[pos + 1..]),
         None => (raw_path, ""),

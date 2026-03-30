@@ -17,7 +17,7 @@ impl PortailConfig {
                     interface: None,
                     tls: None,
                 }],
-                worker_threads: 2,
+                addresses: vec![],
             },
             http_routes: vec![HttpRouteConfig {
                 parent_refs: vec![ParentRef {
@@ -101,7 +101,7 @@ impl PortailConfig {
                         tls: None,
                     },
                 ],
-                worker_threads: 4,
+                addresses: vec![],
             },
             http_routes: vec![
                 HttpRouteConfig {

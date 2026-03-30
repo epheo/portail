@@ -140,10 +140,6 @@ impl GatewayConfig {
                 .map_err(|e| anyhow!("Listener {}: {}", i, e))?;
         }
 
-        if self.worker_threads == 0 {
-            return Err(anyhow!("Worker threads must be greater than 0"));
-        }
-
         Ok(())
     }
 }

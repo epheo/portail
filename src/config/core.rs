@@ -718,8 +718,7 @@ mod tests {
                         "protocol": "TCP",
                         "port": 8080
                     }
-                ],
-                "workerThreads": 8
+                ]
             }
         }"#;
 
@@ -744,8 +743,7 @@ mod tests {
                         "protocol": "TCP",
                         "port": 5432
                     }
-                ],
-                "workerThreads": 8
+                ]
             },
             "httpRoutes": [
                 {
@@ -867,8 +865,7 @@ mod tests {
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
             },
             "httpRoutes": [{
                 "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
@@ -902,8 +899,7 @@ mod tests {
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
             },
             "httpRoutes": [{
                 "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
@@ -928,8 +924,7 @@ mod tests {
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
             },
             "httpRoutes": [{
                 "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
@@ -957,8 +952,7 @@ mod tests {
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
             },
             "httpRoutes": [{
                 "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
@@ -1003,8 +997,7 @@ mod tests {
                             "certificateRefs": [{"name": "my-cert"}]
                         }
                     }
-                ],
-                "workerThreads": 1
+                ]
             }
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
@@ -1031,8 +1024,7 @@ mod tests {
                             "mode": "Passthrough"
                         }
                     }
-                ],
-                "workerThreads": 1
+                ]
             }
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
@@ -1157,8 +1149,7 @@ mod tests {
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
-                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}],
-                "workerThreads": 1
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
             },
             "httpRoutes": [{
                 "parentRefs": [{"name": "test-gw", "sectionName": "http"}],

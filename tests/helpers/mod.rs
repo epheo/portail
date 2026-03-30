@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,13 +245,19 @@ impl PortailProcess {
         std::fs::write(config_file.path(), config).expect("write temp config");
 
         let binary = cargo_bin_path();
-        let mut child = Command::new(&binary)
-            .arg("--config")
-            .arg(config_file.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e));
+        let mut child = unsafe {
+            Command::new(&binary)
+                .arg("--config")
+                .arg(config_file.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
+        };
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -267,13 +274,9 @@ impl PortailProcess {
             loop {
                 if std::time::Instant::now() > deadline {
                     if let Ok(Some(status)) = child.try_wait() {
-                        let mut stderr = String::new();
-                        if let Some(ref mut err) = child.stderr {
-                            let _ = err.read_to_string(&mut stderr);
-                        }
                         panic!(
-                            "Portail exited with {} before accepting connections.\nstderr: {}",
-                            status, stderr
+                            "Portail exited with {} before accepting connections.",
+                            status
                         );
                     }
                     panic!(
@@ -305,13 +308,19 @@ impl PortailProcess {
         std::fs::write(config_file.path(), config).expect("write temp config");
 
         let binary = cargo_bin_path();
-        let child = Command::new(&binary)
-            .arg("--config")
-            .arg(config_file.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e));
+        let child = unsafe {
+            Command::new(&binary)
+                .arg("--config")
+                .arg(config_file.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
+        };
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -542,8 +551,7 @@ fn build_test_config_with_tcp(
         r#"{{
   "gateway": {{
     "name": "test-gateway",
-    "listeners": [{}],
-    "workerThreads": 1
+    "listeners": [{}]
   }},
   "httpRoutes": {},
   "tcpRoutes": [{}],
@@ -729,8 +737,7 @@ pub fn build_test_config_with_filters(
         r#"{{
   "gateway": {{
     "name": "test-gateway",
-    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}],
-    "workerThreads": 1
+    "listeners": [{{"name": "http", "protocol": "HTTP", "port": {}}}]
   }},
   "httpRoutes": [{{
     "parentRefs": [{{"name": "test-gateway", "sectionName": "http"}}],

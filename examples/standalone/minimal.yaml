@@ -1,0 +1,30 @@
+gateway:
+  name: minimal-gateway
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 8080
+httpRoutes:
+- parentRefs:
+  - name: minimal-gateway
+    sectionName: http
+  hostnames:
+  - localhost
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api.json
+    backendRefs:
+    - name: api-service
+      port: 3001
+tcpRoutes: []
+udpRoutes: []
+observability:
+  logging:
+    level: info
+    format: pretty
+    output: stdout
+performance:
+  backendTimeout: 30s
+  udpSessionTimeout: 30s

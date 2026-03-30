@@ -5,9 +5,6 @@ on:
     branches: [main]
   workflow_call:
 
-env:
-  KIND_EXPERIMENTAL_PROVIDER: podman
-
 jobs:
   conformance:
     name: Gateway API Conformance
@@ -25,14 +22,9 @@ jobs:
           go-version: '1.24'
           cache-dependency-path: conformance/go.sum
 
-      - name: Install Kind
-        run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
-
       - name: Run conformance tests
-        run: ./conformance-tests.sh
+        working-directory: conformance
+        run: go test -v -timeout 20m -run TestConformance -count=1
 
       - name: Upload conformance report
         if: always()
@@ -40,5 +32,4 @@ jobs:
         with:
           name: conformance-report
           path: |
-            conformance-report.yaml
-            conformance-results.log
+            conformance/reports/

@@ -73,8 +73,6 @@ pub async fn run_worker(
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
 ) {
-    info!("Worker {} accepting on port {}", worker_id, server_port);
-
     // Selector is shared across ALL workers (not just this one) so weighted
     // round-robin counters produce the correct distribution globally.
 
@@ -95,9 +93,7 @@ pub async fn run_worker(
                         if tls_passthrough && acceptor.is_none() {
                             // Pure passthrough mode (no TLS termination cert available)
                             tokio::spawn(async move {
-                                if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes, health).await {
-                                    debug!("TLS passthrough from {} closed: {}", peer, _e);
-                                }
+                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health).await;
                             });
                         } else if let Some(acceptor) = acceptor {
                             // TLS termination mode — but first check if this SNI
@@ -127,9 +123,7 @@ pub async fn run_worker(
                                 };
 
                                 if should_passthrough {
-                                    if let Err(_e) = handle_tls_passthrough(tcp_stream, server_port, routes, health).await {
-                                        debug!("TLS passthrough from {} closed: {}", peer, _e);
-                                    }
+                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health).await;
                                 } else {
                                     match acceptor.acceptor().accept(tcp_stream).await {
                                         Ok(tls_stream) => {
@@ -143,9 +137,7 @@ pub async fn run_worker(
                                                 is_tls: true,
                                                 header_buf: Vec::with_capacity(1024),
                                             };
-                                            if let Err(_e) = handle_connection(conn, peer, state).await {
-                                                debug!("TLS connection from {} closed: {}", peer, _e);
-                                            }
+                                            let _ = handle_connection(conn, peer, state).await;
                                         }
                                         Err(_e) => {
                                             debug!("TLS handshake failed from {}: {}", peer, _e);
@@ -165,16 +157,8 @@ pub async fn run_worker(
                                 header_buf: Vec::with_capacity(1024),
                             };
                             tokio::spawn(async move {
-                                let start = std::time::Instant::now();
                                 let conn = Connection::Plain { inner: tcp_stream };
-                                let result = handle_connection(conn, peer, state).await;
-                                let elapsed = start.elapsed();
-                                match result {
-                                    Ok(()) => info!("{} port={} duration={:?}", peer, server_port, elapsed),
-                                    Err(_e) => {
-                                        debug!("Connection from {} closed: {}", peer, _e);
-                                    }
-                                }
+                                let _ = handle_connection(conn, peer, state).await;
                             });
                         }
                     }

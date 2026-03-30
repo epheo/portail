@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portail
+  namespace: portail-system
+  labels:
+    app: portail
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: portail
+  template:
+    metadata:
+      labels:
+        app: portail
+    spec:
+      serviceAccountName: portail-controller
+      containers:
+      - name: portail
+        image: ghcr.io/epheo/portail:latest
+        imagePullPolicy: Never
+        args: ["--kubernetes"]
+        ports:
+        - containerPort: 80
+          name: http
+        - containerPort: 443
+          name: https
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP

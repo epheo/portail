@@ -1,0 +1,13 @@
+# Route TCP traffic (e.g., SSH) from frontend UDN to backend UDN
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: frontend-ssh-to-backend
+spec:
+  parentRefs:
+  - name: gw-frontend
+    sectionName: tcp
+  rules:
+  - backendRefs:
+    - name: backend-ssh  # Service on udn-backend
+      port: 22

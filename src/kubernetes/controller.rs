@@ -79,6 +79,112 @@ where
     store.state().iter().map(|arc| (**arc).clone()).collect()
 }
 
+/// Addresses routable to this gateway instance, split by source for priority.
+pub(crate) struct UsableAddresses {
+    /// LoadBalancer ingress IPs (externally reachable)
+    pub lb_ips: Vec<String>,
+    /// NODE_IP / POD_IP from env vars (DaemonSet + hostNetwork)
+    pub env_ips: Vec<String>,
+}
+
+impl UsableAddresses {
+    /// All known addresses as a set (for membership checks).
+    pub fn all(&self) -> HashSet<&str> {
+        self.lb_ips
+            .iter()
+            .chain(&self.env_ips)
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    /// Best externally-reachable address: LB VIP first, then NODE_IP/POD_IP.
+    pub fn preferred_ip(&self) -> &str {
+        self.lb_ips
+            .first()
+            .or(self.env_ips.first())
+            .map(|s| s.as_str())
+            .unwrap_or("0.0.0.0")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lb_ips.is_empty() && self.env_ips.is_empty()
+    }
+}
+
+/// Discover addresses routable to this pod via EndpointSlice back-reference.
+///
+/// 1. Find EndpointSlices whose endpoints contain our POD_IP
+/// 2. Resolve the owning Service via `kubernetes.io/service-name` label
+/// 3. Extract LoadBalancer ingress IPs from those Services
+/// 4. Fall back to NODE_IP / POD_IP env vars (DaemonSet + hostNetwork)
+pub(crate) fn discover_usable_addresses(
+    services: &Store<Service>,
+    endpoint_slices: &Store<EndpointSlice>,
+) -> UsableAddresses {
+    let pod_ip = std::env::var("POD_IP").unwrap_or_default();
+
+    let my_ns = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "default".to_string());
+
+    // Find Services that route to this pod via EndpointSlice back-reference
+    let my_service_names: HashSet<String> = if !pod_ip.is_empty() {
+        endpoint_slices
+            .state()
+            .iter()
+            .filter(|eps| eps.metadata.namespace.as_deref() == Some(&my_ns))
+            .filter(|eps| {
+                eps.endpoints
+                    .iter()
+                    .any(|ep| ep.addresses.iter().any(|addr| addr == &pod_ip))
+            })
+            .filter_map(|eps| {
+                eps.metadata
+                    .labels
+                    .as_ref()?
+                    .get("kubernetes.io/service-name")
+                    .cloned()
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Get LB ingress IPs from those Services
+    let lb_ips: Vec<String> = services
+        .state()
+        .iter()
+        .filter(|svc| svc.metadata.namespace.as_deref() == Some(&my_ns))
+        .filter(|svc| {
+            svc.metadata
+                .name
+                .as_deref()
+                .is_some_and(|name| my_service_names.contains(name))
+        })
+        .filter_map(|svc| {
+            svc.status
+                .as_ref()?
+                .load_balancer
+                .as_ref()?
+                .ingress
+                .as_ref()
+        })
+        .flatten()
+        .filter_map(|ingress| ingress.ip.clone())
+        .collect();
+
+    // Env var fallback (DaemonSet + hostNetwork)
+    let mut env_ips = Vec::new();
+    if let Ok(ip) = std::env::var("NODE_IP") {
+        env_ips.push(ip);
+    }
+    if let Ok(ip) = std::env::var("POD_IP") {
+        env_ips.push(ip);
+    }
+
+    UsableAddresses { lb_ips, env_ips }
+}
+
 #[derive(Clone)]
 struct ControllerCtx {
     client: Client,
@@ -89,7 +195,6 @@ struct ControllerCtx {
     config_cache: Arc<std::sync::Mutex<HashMap<(String, String), crate::config::PortailConfig>>>,
     routes: Arc<ArcSwap<RouteTable>>,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
-    worker_count: usize,
     performance_config: crate::config::PerformanceConfig,
 }
 
@@ -170,7 +275,6 @@ pub async fn run_controller(
     controller_name: String,
     shutdown: CancellationToken,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
-    worker_count: usize,
     performance_config: crate::config::PerformanceConfig,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
@@ -259,7 +363,6 @@ pub async fn run_controller(
         },
         routes,
         data_plane,
-        worker_count,
         performance_config,
     });
 
@@ -911,6 +1014,8 @@ async fn reconcile(
     let (listener_statuses, gateway_accepted, gateway_accepted_reason, gateway_accepted_message) =
         validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
 
+    let usable = discover_usable_addresses(&ctx.cache.services, &ctx.cache.endpoint_slices);
+
     // Build config for the triggered Gateway
     let result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
         Ok(r) => r,
@@ -927,11 +1032,26 @@ async fn reconcile(
                 &format!("Reconciliation failed: {}", e),
                 &HashMap::new(),
                 &listener_statuses,
+                &usable,
             )
             .await;
             return Err(ReconcileError::Reconcile(e.to_string()));
         }
     };
+
+    // Determine bind addresses: only use spec.addresses that are local to this pod.
+    // LB VIPs are external routing identities handled by kube-proxy/MetalLB —
+    // the pod binds to 0.0.0.0 for those ports and traffic arrives via
+    // Service routing. DaemonSet+hostNetwork addresses ARE local and should
+    // be bound specifically (interface isolation for multi-network setups).
+    let bind_addresses: Vec<String> = result
+        .config
+        .gateway
+        .addresses
+        .iter()
+        .filter(|addr| usable.env_ips.iter().any(|ip| ip == *addr))
+        .cloned()
+        .collect();
 
     // Dynamically open TCP listeners for ports defined in this Gateway's spec.
     // Done after reconciliation so ListenerConfig has TLS cert data populated.
@@ -941,11 +1061,12 @@ async fn reconcile(
             "Ensuring data plane listeners for ports: {:?}",
             listener_configs.iter().map(|l| l.port).collect::<Vec<_>>()
         );
+
         match ctx.data_plane.lock() {
             Ok(mut dp) => {
                 let (opened, errors) = dp.add_tcp_listeners(
                     listener_configs,
-                    ctx.worker_count,
+                    &bind_addresses,
                     ctx.routes.clone(),
                     &ctx.performance_config,
                 );
@@ -1108,15 +1229,29 @@ async fn reconcile(
                 result.config.udp_routes.len(),
             );
 
-            // Verify data plane has bound all required ports before reporting Programmed
-            let required_ports: Vec<u16> = gateway
-                .spec
-                .listeners
-                .iter()
-                .map(|l| l.port as u16)
-                .collect();
+            // Verify data plane has bound all required (address, port) endpoints.
+            // Must match what we passed to add_tcp_listeners above.
+            let required_endpoints: Vec<(Option<String>, u16)> = if bind_addresses.is_empty() {
+                gateway
+                    .spec
+                    .listeners
+                    .iter()
+                    .map(|l| (None, l.port as u16))
+                    .collect()
+            } else {
+                bind_addresses
+                    .iter()
+                    .flat_map(|addr| {
+                        gateway
+                            .spec
+                            .listeners
+                            .iter()
+                            .map(move |l| (Some(addr.clone()), l.port as u16))
+                    })
+                    .collect()
+            };
             let dp_ready = match ctx.data_plane.lock() {
-                Ok(dp) => dp.is_ready_for_ports(&required_ports),
+                Ok(dp) => dp.is_ready_for_endpoints(&required_endpoints),
                 Err(_) => false,
             };
             // Check if static addresses are usable by this node
@@ -1126,19 +1261,18 @@ async fn reconcile(
                 if spec_addrs.is_empty() {
                     (true, "Programmed", String::from("Programmed"))
                 } else {
-                    let node_ip = std::env::var("NODE_IP")
-                        .or_else(|_| std::env::var("POD_IP"))
-                        .unwrap_or_default();
-                    let all_usable = spec_addrs.iter().all(|a| {
-                        let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
-                        match addr_type {
-                            "IPAddress" => a.value.as_deref() == Some(node_ip.as_str()),
-                            // Hostname addresses are accepted but we can't verify usability,
-                            // so treat them as usable
-                            "Hostname" => true,
-                            _ => false,
-                        }
-                    });
+                    let all_usable = if usable.is_empty() {
+                        true // No known addresses — can't determine, assume usable
+                    } else {
+                        let known = usable.all();
+                        spec_addrs.iter().all(|a| {
+                            match a.r#type.as_deref().unwrap_or("IPAddress") {
+                                "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
+                                "Hostname" => true,
+                                _ => false,
+                            }
+                        })
+                    };
                     if all_usable {
                         (true, "Programmed", String::from("Programmed"))
                     } else {
@@ -1155,15 +1289,30 @@ async fn reconcile(
                 (true, "Programmed", String::from("Programmed"))
             };
 
-            let (programmed, programmed_reason, programmed_msg) = if !dp_ready {
+            let has_static_addrs = gateway
+                .spec
+                .addresses
+                .as_ref()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let (programmed, programmed_reason, programmed_msg) = if !addrs_usable {
+                (false, addrs_reason, addrs_msg)
+            } else if !dp_ready && has_static_addrs {
+                // Static addresses set but bind failed — address not usable on this pod
+                (
+                    false,
+                    "AddressNotUsable",
+                    String::from(
+                        "One or more addresses in spec.addresses are not usable by this gateway",
+                    ),
+                )
+            } else if !dp_ready {
                 warn!("Data plane not ready: not all listener ports are bound");
                 (
                     false,
                     "Invalid",
                     String::from("Data plane not ready: not all listener ports are bound"),
                 )
-            } else if !addrs_usable {
-                (false, addrs_reason, addrs_msg)
             } else {
                 (true, "Programmed", String::from("Programmed"))
             };
@@ -1179,6 +1328,7 @@ async fn reconcile(
                 &programmed_msg,
                 &listener_route_counts,
                 &listener_statuses,
+                &usable,
             )
             .await;
             dp_ready && addrs_usable
@@ -1199,6 +1349,7 @@ async fn reconcile(
                 &format!("Route table conversion failed: {}", e),
                 &listener_route_counts,
                 &listener_statuses,
+                &usable,
             )
             .await;
             false

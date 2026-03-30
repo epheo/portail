@@ -47,7 +47,7 @@ pub struct DataPlane {
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
-    bound_ports: std::collections::HashSet<u16>,
+    bound_endpoints: std::collections::HashSet<(Option<String>, u16)>,
     /// Per-port dynamic TLS acceptors for hot-reload support.
     tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
     /// Per-port cert fingerprint to skip no-op TLS reloads.
@@ -84,11 +84,13 @@ impl DataPlane {
     /// Create listeners for all (worker, listener) combinations.
     /// Sockets are created with SO_REUSEPORT so multiple workers can share the same port.
     pub fn new(
-        worker_count: usize,
         listeners: &[ListenerConfig],
         performance_config: &PerformanceConfig,
         cert_dir: &std::path::Path,
     ) -> Result<Self> {
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let health = Arc::new(HealthRegistry::new());
 
         let mut tcp_listeners = Vec::new();
@@ -136,11 +138,6 @@ impl DataPlane {
                             tls_acceptor: tls_acceptors[i].clone(),
                             tls_passthrough: tls_passthrough_flags[i],
                         });
-
-                        info!(
-                            "Worker {} TCP bound to port {} with SO_REUSEPORT",
-                            worker_id, port
-                        );
                     }
                     Protocol::UDP => {
                         let std_socket = create_reuseport_udp_socket(
@@ -155,20 +152,14 @@ impl DataPlane {
                             port,
                             socket: tokio_socket,
                         });
-
-                        info!(
-                            "Worker {} UDP bound to port {} with SO_REUSEPORT",
-                            worker_id, port
-                        );
                     }
                 }
             }
         }
 
-        let bound_ports: std::collections::HashSet<u16> = tcp_listeners
+        let bound_endpoints: std::collections::HashSet<(Option<String>, u16)> = listeners
             .iter()
-            .map(|e| e.port)
-            .chain(udp_listeners.iter().map(|e| e.port))
+            .map(|l| (l.address.clone(), l.port))
             .collect();
 
         Ok(Self {
@@ -181,7 +172,7 @@ impl DataPlane {
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            bound_ports,
+            bound_endpoints,
             tls_configs: std::collections::HashMap::new(),
             tls_cert_hashes: std::collections::HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
@@ -196,12 +187,24 @@ impl DataPlane {
     pub fn add_tcp_listeners(
         &mut self,
         listener_configs: &[ListenerConfig],
-        worker_count: usize,
+        addresses: &[String],
         routes: Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
     ) -> (usize, Vec<(u16, String)>) {
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let mut opened = 0usize;
         let mut errors = Vec::new();
+
+        // If addresses are specified, bind each listener to each address.
+        // Otherwise, bind to the listener's own address (or 0.0.0.0).
+        let bind_addrs: Vec<Option<&str>> = if addresses.is_empty() {
+            vec![None]
+        } else {
+            addresses.iter().map(|a| Some(a.as_str())).collect()
+        };
+
         for listener_cfg in listener_configs {
             let port = listener_cfg.port;
 
@@ -244,98 +247,110 @@ impl DataPlane {
                 _ => (None, false),
             };
 
-            if self.bound_ports.contains(&port) {
-                continue; // Port already bound, no TLS to update (non-TLS or passthrough)
-            }
+            for &bind_addr in &bind_addrs {
+                let effective_addr = bind_addr.or(listener_cfg.address.as_deref());
+                let endpoint = (effective_addr.map(String::from), port);
+                if self.bound_endpoints.contains(&endpoint) {
+                    continue; // Endpoint already bound
+                }
 
-            let mut port_ok = true;
-            if listener_cfg.protocol == Protocol::UDP {
-                // Create UDP listener
-                match create_reuseport_udp_socket(port, None, None) {
-                    Ok(std_socket) => {
-                        match UdpSocket::from_std(std_socket) {
-                            Ok(tokio_socket) => {
-                                let routes = routes.clone();
-                                let health = self.health.clone();
-                                let shutdown = self.shutdown.clone();
-                                let session_timeout = self.udp_session_timeout;
-                                let socket = Arc::new(tokio_socket);
+                let mut port_ok = true;
+                if listener_cfg.protocol == Protocol::UDP {
+                    // Create UDP listener
+                    match create_reuseport_udp_socket(
+                        port,
+                        effective_addr,
+                        listener_cfg.interface.as_deref(),
+                    ) {
+                        Ok(std_socket) => {
+                            match UdpSocket::from_std(std_socket) {
+                                Ok(tokio_socket) => {
+                                    let routes = routes.clone();
+                                    let health = self.health.clone();
+                                    let shutdown = self.shutdown.clone();
+                                    let session_timeout = self.udp_session_timeout;
+                                    let socket = Arc::new(tokio_socket);
 
-                                let handle = tokio::spawn(async move {
-                                    udp_worker::run_udp_worker(
-                                        0, // single worker for UDP
-                                        socket,
-                                        port,
-                                        routes,
-                                        session_timeout,
-                                        shutdown,
-                                        health,
-                                    )
-                                    .await;
-                                });
-                                self.task_handles.push(handle);
-                            }
-                            Err(e) => {
-                                errors.push((port, format!("UDP from_std: {}", e)));
-                                port_ok = false;
+                                    let handle = tokio::spawn(async move {
+                                        udp_worker::run_udp_worker(
+                                            0, // single worker for UDP
+                                            socket,
+                                            port,
+                                            routes,
+                                            session_timeout,
+                                            shutdown,
+                                            health,
+                                        )
+                                        .await;
+                                    });
+                                    self.task_handles.push(handle);
+                                }
+                                Err(e) => {
+                                    errors.push((port, format!("UDP from_std: {}", e)));
+                                    port_ok = false;
+                                }
                             }
                         }
+                        Err(e) => {
+                            errors.push((port, format!("UDP bind: {}", e)));
+                            port_ok = false;
+                        }
                     }
-                    Err(e) => {
-                        errors.push((port, format!("UDP bind: {}", e)));
-                        port_ok = false;
-                    }
-                }
-            } else {
-                for worker_id in 0..worker_count {
-                    match create_reuseport_tcp_listener(port, None, None) {
-                        Ok(std_listener) => match TcpListener::from_std(std_listener) {
-                            Ok(tokio_listener) => {
-                                let routes = routes.clone();
-                                let health = self.health.clone();
-                                let shutdown = self.shutdown.clone();
-                                let max_idle = self.max_idle_per_backend;
-                                let connect_timeout = performance_config.backend_timeout;
-                                let acceptor = tls_acceptor.clone();
-                                let passthrough = tls_passthrough;
+                } else {
+                    for worker_id in 0..worker_count {
+                        match create_reuseport_tcp_listener(
+                            port,
+                            effective_addr,
+                            listener_cfg.interface.as_deref(),
+                        ) {
+                            Ok(std_listener) => match TcpListener::from_std(std_listener) {
+                                Ok(tokio_listener) => {
+                                    let routes = routes.clone();
+                                    let health = self.health.clone();
+                                    let shutdown = self.shutdown.clone();
+                                    let max_idle = self.max_idle_per_backend;
+                                    let connect_timeout = performance_config.backend_timeout;
+                                    let acceptor = tls_acceptor.clone();
+                                    let passthrough = tls_passthrough;
 
-                                let selector = self.selector.clone();
-                                let handle = tokio::spawn(async move {
-                                    worker::run_worker(
-                                        worker_id,
-                                        tokio_listener,
-                                        port,
-                                        routes,
-                                        max_idle,
-                                        connect_timeout,
-                                        shutdown,
-                                        acceptor,
-                                        passthrough,
-                                        health,
-                                        selector,
-                                    )
-                                    .await;
-                                });
-                                self.task_handles.push(handle);
-                            }
+                                    let selector = self.selector.clone();
+                                    let handle = tokio::spawn(async move {
+                                        worker::run_worker(
+                                            worker_id,
+                                            tokio_listener,
+                                            port,
+                                            routes,
+                                            max_idle,
+                                            connect_timeout,
+                                            shutdown,
+                                            acceptor,
+                                            passthrough,
+                                            health,
+                                            selector,
+                                        )
+                                        .await;
+                                    });
+                                    self.task_handles.push(handle);
+                                }
+                                Err(e) => {
+                                    errors.push((port, format!("from_std: {}", e)));
+                                    port_ok = false;
+                                    break;
+                                }
+                            },
                             Err(e) => {
-                                errors.push((port, format!("from_std: {}", e)));
+                                errors.push((port, format!("bind worker {}: {}", worker_id, e)));
                                 port_ok = false;
                                 break;
                             }
-                        },
-                        Err(e) => {
-                            errors.push((port, format!("bind worker {}: {}", worker_id, e)));
-                            port_ok = false;
-                            break;
                         }
                     }
                 }
-            }
-            if port_ok {
-                self.bound_ports.insert(port);
-                opened += 1;
-            }
+                if port_ok {
+                    self.bound_endpoints.insert(endpoint);
+                    opened += 1;
+                }
+            } // end for bind_addr
         }
         (opened, errors)
     }
@@ -480,9 +495,9 @@ impl DataPlane {
         info!("Data plane shutdown complete");
     }
 
-    /// Check if all the specified ports are bound and ready to serve traffic.
-    pub fn is_ready_for_ports(&self, required_ports: &[u16]) -> bool {
-        required_ports.iter().all(|p| self.bound_ports.contains(p))
+    /// Check if all the specified (address, port) endpoints are bound and ready to serve traffic.
+    pub fn is_ready_for_endpoints(&self, required: &[(Option<String>, u16)]) -> bool {
+        required.iter().all(|ep| self.bound_endpoints.contains(ep))
     }
 
     /// Get a reference to the shared health registry.
