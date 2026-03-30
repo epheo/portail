@@ -1,0 +1,31 @@
+# ClusterUserDefinedNetworks make networks available across namespaces.
+# The namespaceSelector controls which namespaces can attach pods to each network.
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: vpc-frontend
+spec:
+  namespaceSelector:
+    matchLabels:
+      portail.epheo.eu/network: "true"
+  network:
+    topology: Layer2
+    layer2:
+      role: Secondary
+      subnets:
+      - "10.20.1.0/24"
+---
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: vpc-backend
+spec:
+  namespaceSelector:
+    matchLabels:
+      portail.epheo.eu/network: "true"
+  network:
+    topology: Layer2
+    layer2:
+      role: Secondary
+      subnets:
+      - "10.20.2.0/24"

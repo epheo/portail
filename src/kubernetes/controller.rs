@@ -79,12 +79,20 @@ where
     store.state().iter().map(|arc| (**arc).clone()).collect()
 }
 
+/// Custom address type for binding a Gateway to a named network interface.
+/// Used in `spec.addresses[].type` to auto-discover UDN/Multus IPs.
+pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
+
 /// Addresses routable to this gateway instance, split by source for priority.
 pub(crate) struct UsableAddresses {
     /// LoadBalancer ingress IPs (externally reachable)
     pub lb_ips: Vec<String>,
     /// NODE_IP / POD_IP from env vars (DaemonSet + hostNetwork)
     pub env_ips: Vec<String>,
+    /// IPs from local network interfaces (includes secondary/UDN interfaces)
+    pub interface_ips: Vec<String>,
+    /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP)
+    pub network_ips: HashMap<String, String>,
 }
 
 impl UsableAddresses {
@@ -93,6 +101,8 @@ impl UsableAddresses {
         self.lb_ips
             .iter()
             .chain(&self.env_ips)
+            .chain(&self.interface_ips)
+            .chain(self.network_ips.values())
             .map(|s| s.as_str())
             .collect()
     }
@@ -107,8 +117,115 @@ impl UsableAddresses {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lb_ips.is_empty() && self.env_ips.is_empty()
+        self.lb_ips.is_empty()
+            && self.env_ips.is_empty()
+            && self.interface_ips.is_empty()
+            && self.network_ips.is_empty()
     }
+}
+
+/// Resolve a network name to this pod's local IP on that network.
+///
+/// Reads the NetworkAttachmentDefinition to get the subnet CIDR, then matches
+/// it against local interface IPs discovered via `getifaddrs()`.
+async fn resolve_network_to_local_ip(
+    client: &Client,
+    network_name: &str,
+    namespace: &str,
+    local_ips: &[String],
+) -> Option<String> {
+    // Read the NAD in the Gateway's namespace
+    let nad_api: Api<kube::api::DynamicObject> = Api::namespaced_with(
+        client.clone(),
+        namespace,
+        &kube::discovery::ApiResource {
+            group: "k8s.cni.cncf.io".into(),
+            version: "v1".into(),
+            api_version: "k8s.cni.cncf.io/v1".into(),
+            kind: "NetworkAttachmentDefinition".into(),
+            plural: "network-attachment-definitions".into(),
+        },
+    );
+    let nad = match nad_api.get(network_name).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("Failed to read NetworkAttachmentDefinition {namespace}/{network_name}: {e}");
+            return None;
+        }
+    };
+
+    // Extract subnet from spec.config JSON
+    let config_str = nad.data["spec"]["config"].as_str()?;
+    let config: serde_json::Value = serde_json::from_str(config_str).ok()?;
+    let subnets_str = config["subnets"].as_str()?;
+
+    // Parse CIDR and match against local IPs
+    let (net_addr, prefix_len) = parse_cidr(subnets_str)?;
+    for ip_str in local_ips {
+        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+            if ip_in_subnet(ip, net_addr, prefix_len) {
+                return Some(ip_str.clone());
+            }
+        }
+    }
+    warn!(
+        "No local interface IP matches subnet {subnets_str} for network {namespace}/{network_name}"
+    );
+    None
+}
+
+fn parse_cidr(cidr: &str) -> Option<(std::net::Ipv4Addr, u32)> {
+    let (addr_str, len_str) = cidr.split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr_str.parse().ok()?;
+    let len: u32 = len_str.parse().ok()?;
+    Some((addr, len))
+}
+
+fn ip_in_subnet(ip: std::net::Ipv4Addr, network: std::net::Ipv4Addr, prefix_len: u32) -> bool {
+    if prefix_len > 32 {
+        return false;
+    }
+    let mask = if prefix_len == 0 {
+        0u32
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+    u32::from(ip) & mask == u32::from(network) & mask
+}
+
+/// Enumerate IPv4/IPv6 addresses from all local network interfaces.
+/// This discovers secondary network IPs (Multus/UDN) that aren't in POD_IP.
+fn discover_local_interface_ips() -> Vec<String> {
+    let mut ips = Vec::new();
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return ips;
+        }
+        let mut ifa = ifaddrs;
+        while !ifa.is_null() {
+            let addr = (*ifa).ifa_addr;
+            if !addr.is_null() {
+                let family = (*addr).sa_family as i32;
+                if family == libc::AF_INET {
+                    let sa = addr as *const libc::sockaddr_in;
+                    let ip = std::net::Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr));
+                    if !ip.is_loopback() {
+                        ips.push(ip.to_string());
+                    }
+                } else if family == libc::AF_INET6 {
+                    let sa = addr as *const libc::sockaddr_in6;
+                    let ip = std::net::Ipv6Addr::from((*sa).sin6_addr.s6_addr);
+                    if !ip.is_loopback() {
+                        ips.push(ip.to_string());
+                    }
+                }
+            }
+            ifa = (*ifa).ifa_next;
+        }
+        libc::freeifaddrs(ifaddrs);
+    }
+    ips
 }
 
 /// Discover addresses routable to this pod via EndpointSlice back-reference.
@@ -182,7 +299,15 @@ pub(crate) fn discover_usable_addresses(
         env_ips.push(ip);
     }
 
-    UsableAddresses { lb_ips, env_ips }
+    // Discover IPs from all local network interfaces (multi-network / UDN)
+    let interface_ips = discover_local_interface_ips();
+
+    UsableAddresses {
+        lb_ips,
+        env_ips,
+        interface_ips,
+        network_ips: HashMap::new(),
+    }
 }
 
 #[derive(Clone)]
@@ -224,6 +349,47 @@ where
         .default_backoff()
         .touched_objects(); // touched_objects includes deletes; applied_objects drops them
     (reader, stream)
+}
+
+/// Like `create_reflector`, but first probes the API endpoint with a lightweight
+/// list request. If the CRD is not installed (404), returns an empty store and
+/// a stream that never yields, so the controller can still start without it.
+async fn create_optional_reflector<K>(
+    api: Api<K>,
+) -> (
+    Store<K>,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static>>,
+)
+where
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    // Probe with limit=0 — just checks the endpoint exists
+    let probe = api
+        .list(&kube::api::ListParams::default().limit(1))
+        .await;
+    match probe {
+        Err(kube::Error::Api(ref status)) if status.code == 404 => {
+            let kind = std::any::type_name::<K>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("Unknown");
+            warn!("CRD not installed, skipping watcher: {kind}");
+            let writer = reflector::store::Writer::default();
+            let reader = writer.as_reader();
+            (reader, Box::pin(futures::stream::pending()))
+        }
+        _ => {
+            let (store, stream) = create_reflector(api);
+            (store, Box::pin(stream))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +469,15 @@ pub async fn run_controller(
     // events go through a separate path unaffected by the primary predicate_filter.
 
     // CRD reflectors — generation-filtered to ignore status-only changes
+    // HTTPRoute is required (GA); experimental CRDs are optional.
     let (store_http_routes, http_route_stream) =
         create_reflector(Api::<HTTPRoute>::all(client.clone()));
     let (store_tcp_routes, tcp_route_stream) =
-        create_reflector(Api::<TCPRoute>::all(client.clone()));
+        create_optional_reflector(Api::<TCPRoute>::all(client.clone())).await;
     let (store_tls_routes, tls_route_stream) =
-        create_reflector(Api::<TLSRoute>::all(client.clone()));
+        create_optional_reflector(Api::<TLSRoute>::all(client.clone())).await;
     let (store_udp_routes, udp_route_stream) =
-        create_reflector(Api::<UDPRoute>::all(client.clone()));
+        create_optional_reflector(Api::<UDPRoute>::all(client.clone())).await;
     // GatewayClass: managed by a separate Controller (below).
     // We create that controller early to get its store for ControllerCtx lookups.
     let gc_api = Api::<GatewayClass>::all(client.clone());
@@ -930,11 +1097,18 @@ fn validate_gateway(
         if let Some(addresses) = &gateway.spec.addresses {
             for addr in addresses {
                 let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
-                if addr_type != "IPAddress" && addr_type != "Hostname" {
-                    accepted = false;
-                    reason = "UnsupportedAddress".to_string();
-                    message = format!("Unsupported address type '{}' in spec.addresses", addr_type);
-                    break;
+                match addr_type {
+                    "IPAddress" | "Hostname" => {}
+                    t if t == NETWORK_ADDRESS_TYPE => {}
+                    _ => {
+                        accepted = false;
+                        reason = "UnsupportedAddress".to_string();
+                        message = format!(
+                            "Unsupported address type '{}' in spec.addresses",
+                            addr_type
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1014,10 +1188,40 @@ async fn reconcile(
     let (listener_statuses, gateway_accepted, gateway_accepted_reason, gateway_accepted_message) =
         validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
 
-    let usable = discover_usable_addresses(&ctx.cache.services, &ctx.cache.endpoint_slices);
+    let mut usable = discover_usable_addresses(&ctx.cache.services, &ctx.cache.endpoint_slices);
+
+    // Resolve portail.epheo.eu/Network address types to actual IPs.
+    // Reads the NetworkAttachmentDefinition to get the subnet, then matches
+    // against local interface IPs discovered via getifaddrs().
+    if let Some(spec_addrs) = &gateway.spec.addresses {
+        for addr in spec_addrs {
+            if addr.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE) {
+                let network_name = addr.value.as_deref().unwrap_or("");
+                if let Some(ip) = resolve_network_to_local_ip(
+                    &ctx.client,
+                    network_name,
+                    &gw_ns,
+                    &usable.interface_ips,
+                )
+                .await
+                {
+                    info!(
+                        "Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}"
+                    );
+                    usable
+                        .network_ips
+                        .insert(network_name.to_string(), ip);
+                } else {
+                    warn!(
+                        "Gateway {gw_ns}/{gw_name}: could not resolve network '{network_name}' to a local IP"
+                    );
+                }
+            }
+        }
+    }
 
     // Build config for the triggered Gateway
-    let result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
+    let mut result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
@@ -1039,17 +1243,39 @@ async fn reconcile(
         }
     };
 
+    // Replace network-name entries in config addresses with resolved IPs.
+    // This happens after reconcile_to_config() which copies spec.addresses values as-is.
+    if !usable.network_ips.is_empty() {
+        let resolved: Vec<String> = result
+            .config
+            .gateway
+            .addresses
+            .iter()
+            .map(|addr| {
+                usable
+                    .network_ips
+                    .get(addr)
+                    .cloned()
+                    .unwrap_or_else(|| addr.clone())
+            })
+            .collect();
+        result.config.gateway.addresses = resolved;
+    }
+
     // Determine bind addresses: only use spec.addresses that are local to this pod.
     // LB VIPs are external routing identities handled by kube-proxy/MetalLB —
     // the pod binds to 0.0.0.0 for those ports and traffic arrives via
     // Service routing. DaemonSet+hostNetwork addresses ARE local and should
     // be bound specifically (interface isolation for multi-network setups).
+    let network_ip_set: HashSet<&str> = usable.network_ips.values().map(|s| s.as_str()).collect();
     let bind_addresses: Vec<String> = result
         .config
         .gateway
         .addresses
         .iter()
-        .filter(|addr| usable.env_ips.iter().any(|ip| ip == *addr))
+        .filter(|addr| {
+            usable.env_ips.iter().any(|ip| ip == *addr) || network_ip_set.contains(addr.as_str())
+        })
         .cloned()
         .collect();
 
@@ -1269,6 +1495,11 @@ async fn reconcile(
                             match a.r#type.as_deref().unwrap_or("IPAddress") {
                                 "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
                                 "Hostname" => true,
+                                t if t == NETWORK_ADDRESS_TYPE => {
+                                    // Resolved if the network name is in network_ips
+                                    let name = a.value.as_deref().unwrap_or("");
+                                    usable.network_ips.contains_key(name)
+                                }
                                 _ => false,
                             }
                         })

@@ -1,0 +1,19 @@
+# Gateway on the frontend network.
+# Portail resolves vpc-frontend to its local IP on that network.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw-frontend
+  namespace: portail-system
+spec:
+  gatewayClassName: portail
+  addresses:
+  - type: portail.epheo.eu/Network
+    value: vpc-frontend
+  listeners:
+  - name: tcp-postgres
+    port: 5432
+    protocol: TCP
+  - name: tcp-ssh
+    port: 2222
+    protocol: TCP

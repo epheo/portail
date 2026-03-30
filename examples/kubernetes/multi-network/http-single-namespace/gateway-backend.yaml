@@ -5,9 +5,9 @@ metadata:
 spec:
   gatewayClassName: portail
   addresses:
-  - type: IPAddress
-    value: "10.10.2.1"  # Portail's IP on udn-backend
+  - type: portail.epheo.eu/Network
+    value: udn-backend
   listeners:
   - name: http
-    port: 80
+    port: 8080
     protocol: HTTP

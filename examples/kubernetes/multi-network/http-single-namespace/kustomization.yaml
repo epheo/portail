@@ -1,9 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- ../base
+- ../../base
 - deployment.yaml
 - gateway-frontend.yaml
 - gateway-backend.yaml
 - httproute.yaml
-- tcproute.yaml
+patches:
+- path: rbac-patch.yaml

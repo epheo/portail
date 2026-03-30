@@ -1,4 +1,6 @@
-# Route HTTP traffic from frontend UDN to backend UDN
+# Route HTTP traffic from frontend UDN to backend UDN.
+# Pods on udn-frontend can reach backend-service (on udn-backend)
+# by connecting to portail's frontend address (gw-frontend).
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -6,13 +8,11 @@ metadata:
 spec:
   parentRefs:
   - name: gw-frontend
-  hostnames:
-  - api.internal
   rules:
   - matches:
     - path:
         type: PathPrefix
         value: /
     backendRefs:
-    - name: backend-service  # Service on udn-backend
+    - name: backend-service
       port: 8080

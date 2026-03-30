@@ -1,0 +1,15 @@
+# Route TCP traffic (e.g., SSH) from frontend UDN to backend UDN.
+# Requires TCPRoute CRD (experimental, not installed on all clusters).
+# Not included in kustomization.yaml by default — apply manually if available.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: frontend-ssh-to-backend
+spec:
+  parentRefs:
+  - name: gw-frontend
+    sectionName: tcp
+  rules:
+  - backendRefs:
+    - name: backend-ssh
+      port: 22

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-frontend
+  labels:
+    portail.epheo.eu/network: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-backend
+  labels:
+    portail.epheo.eu/network: "true"

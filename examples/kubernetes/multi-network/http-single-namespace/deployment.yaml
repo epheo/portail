@@ -1,0 +1,88 @@
+apiVersion: k8s.ovn.org/v1
+kind: UserDefinedNetwork
+metadata:
+  name: udn-frontend
+spec:
+  topology: Layer2
+  layer2:
+    role: Secondary
+    subnets:
+    - "10.10.1.0/24"
+---
+apiVersion: k8s.ovn.org/v1
+kind: UserDefinedNetwork
+metadata:
+  name: udn-backend
+spec:
+  topology: Layer2
+  layer2:
+    role: Secondary
+    subnets:
+    - "10.10.2.0/24"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portail
+  labels:
+    app: portail
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portail
+  template:
+    metadata:
+      labels:
+        app: portail
+      annotations:
+        k8s.v1.cni.cncf.io/networks: udn-frontend, udn-backend
+    spec:
+      serviceAccountName: portail-controller
+      containers:
+      - name: portail
+        image: ghcr.io/epheo/portail:latest
+        args: ["--kubernetes"]
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          seccompProfile:
+            type: RuntimeDefault
+---
+# Test backend: nginx on udn-backend only
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-web
+  labels:
+    app: backend-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-web
+  template:
+    metadata:
+      labels:
+        app: backend-web
+      annotations:
+        k8s.v1.cni.cncf.io/networks: udn-backend
+    spec:
+      containers:
+      - name: nginx
+        image: docker.io/nginxinc/nginx-unprivileged:alpine
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: backend-web
+  ports:
+  - port: 8080
+    targetPort: 8080

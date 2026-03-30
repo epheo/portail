@@ -12,7 +12,7 @@ use serde::Serialize;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 
-use crate::kubernetes::controller::UsableAddresses;
+use crate::kubernetes::controller::{UsableAddresses, NETWORK_ADDRESS_TYPE};
 
 use crate::logging::{debug, warn};
 
@@ -279,31 +279,39 @@ pub(crate) async fn update_gateway_status(
     // LB VIPs are preferred (externally reachable), then NODE_IP/POD_IP.
     let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
         if !spec_addrs.is_empty() {
-            if usable.is_empty() {
-                // Can't determine usability — report all spec addresses
-                spec_addrs
-                    .iter()
-                    .map(|a| {
-                        serde_json::json!({
-                            "type": a.r#type.as_deref().unwrap_or("IPAddress"),
-                            "value": a.value,
-                        })
-                    })
-                    .collect()
-            } else {
+            {
                 let known = usable.all();
                 spec_addrs
                     .iter()
-                    .filter(|a| match a.r#type.as_deref().unwrap_or("IPAddress") {
-                        "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
-                        "Hostname" => true,
-                        _ => false,
-                    })
-                    .map(|a| {
-                        serde_json::json!({
-                            "type": a.r#type.as_deref().unwrap_or("IPAddress"),
-                            "value": a.value,
-                        })
+                    .filter_map(|a| {
+                        let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
+                        match addr_type {
+                            t if t == NETWORK_ADDRESS_TYPE => {
+                                // Resolve network name to IPAddress for status
+                                let name = a.value.as_deref().unwrap_or("");
+                                let ip = usable.network_ips.get(name)?;
+                                Some(serde_json::json!({
+                                    "type": "IPAddress",
+                                    "value": ip,
+                                }))
+                            }
+                            "IPAddress" => {
+                                let v = a.value.as_deref().unwrap_or("");
+                                if usable.is_empty() || known.contains(v) {
+                                    Some(serde_json::json!({
+                                        "type": "IPAddress",
+                                        "value": v,
+                                    }))
+                                } else {
+                                    None
+                                }
+                            }
+                            "Hostname" => Some(serde_json::json!({
+                                "type": "Hostname",
+                                "value": a.value,
+                            })),
+                            _ => None,
+                        }
                     })
                     .collect()
             }
