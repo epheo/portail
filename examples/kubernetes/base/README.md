@@ -2,12 +2,8 @@
 
 Shared Kubernetes resources required by all deployment patterns:
 
-## OpenShift / MicroShift
+- `namespace.yaml` — the `portail-system` namespace
+- `rbac.yaml` — ServiceAccount, ClusterRole, and ClusterRoleBinding
+- `gatewayclass.yaml` — the `portail` GatewayClass
 
-On OpenShift-based clusters, apply the SecurityContextConstraints for hostNetwork and NET_BIND_SERVICE:
-
-```bash
-kubectl apply -f scc.yaml
-```
-
-This is only needed for the `daemonset/` pattern. Deployment-based patterns don't require hostNetwork.
+Each deployment pattern overlay adds its own workload, security, and networking resources.

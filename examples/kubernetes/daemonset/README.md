@@ -24,3 +24,11 @@ kubectl apply -k .
 - Not multi-node HA (each node is independent, no shared VIP)
 - Requires `hostNetwork: true` and `NET_BIND_SERVICE` capability
 - Port conflicts if multiple Gateways use the same port
+
+## OpenShift / MicroShift
+
+On OpenShift-based clusters, apply the SecurityContextConstraints for hostNetwork and NET_BIND_SERVICE:
+
+```bash
+kubectl apply -f scc.yaml
+```

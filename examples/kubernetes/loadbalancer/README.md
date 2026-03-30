@@ -15,7 +15,7 @@ kubectl apply -k .
 ## Pros
 
 - HA: multiple replicas spread across nodes
-- No `hostNetwork` required, no special capabilities
+- No `hostNetwork` required, only `NET_BIND_SERVICE` for privileged ports
 - No port conflicts between Gateways (each has its own pods)
 - Kubernetes-native: standard Deployment + Service pattern
 - Each Gateway is isolated in its own network namespace

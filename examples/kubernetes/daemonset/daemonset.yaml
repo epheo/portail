@@ -23,9 +23,12 @@ spec:
         imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:
+          allowPrivilegeEscalation: false
           capabilities:
-            add:
-              - NET_BIND_SERVICE
+            drop: [ALL]
+            add: [NET_BIND_SERVICE]
+          seccompProfile:
+            type: RuntimeDefault
         env:
         - name: NODE_IP
           valueFrom:
