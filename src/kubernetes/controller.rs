@@ -87,8 +87,6 @@ pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
 pub(crate) struct UsableAddresses {
     /// LoadBalancer ingress IPs (externally reachable)
     pub lb_ips: Vec<String>,
-    /// NODE_IP / POD_IP from env vars (DaemonSet + hostNetwork)
-    pub env_ips: Vec<String>,
     /// IPs from local network interfaces (includes secondary/UDN interfaces)
     pub interface_ips: Vec<String>,
     /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP)
@@ -100,25 +98,23 @@ impl UsableAddresses {
     pub fn all(&self) -> HashSet<&str> {
         self.lb_ips
             .iter()
-            .chain(&self.env_ips)
             .chain(&self.interface_ips)
             .chain(self.network_ips.values())
             .map(|s| s.as_str())
             .collect()
     }
 
-    /// Best externally-reachable address: LB VIP first, then NODE_IP/POD_IP.
+    /// Best externally-reachable address: LB VIP first, then local interface IP.
     pub fn preferred_ip(&self) -> &str {
         self.lb_ips
             .first()
-            .or(self.env_ips.first())
+            .or(self.interface_ips.first())
             .map(|s| s.as_str())
             .unwrap_or("0.0.0.0")
     }
 
     pub fn is_empty(&self) -> bool {
         self.lb_ips.is_empty()
-            && self.env_ips.is_empty()
             && self.interface_ips.is_empty()
             && self.network_ips.is_empty()
     }
@@ -194,7 +190,7 @@ fn ip_in_subnet(ip: std::net::Ipv4Addr, network: std::net::Ipv4Addr, prefix_len:
 }
 
 /// Enumerate IPv4/IPv6 addresses from all local network interfaces.
-/// This discovers secondary network IPs (Multus/UDN) that aren't in POD_IP.
+/// Discovers all routable IPs for EndpointSlice matching, bind-address filtering, and status reporting.
 fn discover_local_interface_ips() -> Vec<String> {
     let mut ips = Vec::new();
     unsafe {
@@ -216,7 +212,8 @@ fn discover_local_interface_ips() -> Vec<String> {
                 } else if family == libc::AF_INET6 {
                     let sa = addr as *const libc::sockaddr_in6;
                     let ip = std::net::Ipv6Addr::from((*sa).sin6_addr.s6_addr);
-                    if !ip.is_loopback() {
+                    let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+                    if !ip.is_loopback() && !is_link_local {
                         ips.push(ip.to_string());
                     }
                 }
@@ -230,22 +227,23 @@ fn discover_local_interface_ips() -> Vec<String> {
 
 /// Discover addresses routable to this pod via EndpointSlice back-reference.
 ///
-/// 1. Find EndpointSlices whose endpoints contain our POD_IP
-/// 2. Resolve the owning Service via `kubernetes.io/service-name` label
-/// 3. Extract LoadBalancer ingress IPs from those Services
-/// 4. Fall back to NODE_IP / POD_IP env vars (DaemonSet + hostNetwork)
+/// 1. Enumerate local interface IPs (pod IP, host IPs if hostNetwork, secondary networks)
+/// 2. Find EndpointSlices whose endpoints match any local IP
+/// 3. Resolve the owning Service via `kubernetes.io/service-name` label
+/// 4. Extract LoadBalancer ingress IPs from those Services
 pub(crate) fn discover_usable_addresses(
     services: &Store<Service>,
     endpoint_slices: &Store<EndpointSlice>,
 ) -> UsableAddresses {
-    let pod_ip = std::env::var("POD_IP").unwrap_or_default();
+    let interface_ips = discover_local_interface_ips();
+    let local_ip_set: HashSet<&str> = interface_ips.iter().map(|s| s.as_str()).collect();
 
     let my_ns = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "default".to_string());
 
     // Find Services that route to this pod via EndpointSlice back-reference
-    let my_service_names: HashSet<String> = if !pod_ip.is_empty() {
+    let my_service_names: HashSet<String> = if !local_ip_set.is_empty() {
         endpoint_slices
             .state()
             .iter()
@@ -253,7 +251,7 @@ pub(crate) fn discover_usable_addresses(
             .filter(|eps| {
                 eps.endpoints
                     .iter()
-                    .any(|ep| ep.addresses.iter().any(|addr| addr == &pod_ip))
+                    .any(|ep| ep.addresses.iter().any(|addr| local_ip_set.contains(addr.as_str())))
             })
             .filter_map(|eps| {
                 eps.metadata
@@ -290,21 +288,8 @@ pub(crate) fn discover_usable_addresses(
         .filter_map(|ingress| ingress.ip.clone())
         .collect();
 
-    // Env var fallback (DaemonSet + hostNetwork)
-    let mut env_ips = Vec::new();
-    if let Ok(ip) = std::env::var("NODE_IP") {
-        env_ips.push(ip);
-    }
-    if let Ok(ip) = std::env::var("POD_IP") {
-        env_ips.push(ip);
-    }
-
-    // Discover IPs from all local network interfaces (multi-network / UDN)
-    let interface_ips = discover_local_interface_ips();
-
     UsableAddresses {
         lb_ips,
-        env_ips,
         interface_ips,
         network_ips: HashMap::new(),
     }
@@ -1274,7 +1259,7 @@ async fn reconcile(
         .addresses
         .iter()
         .filter(|addr| {
-            usable.env_ips.iter().any(|ip| ip == *addr) || network_ip_set.contains(addr.as_str())
+            usable.interface_ips.iter().any(|ip| ip == *addr) || network_ip_set.contains(addr.as_str())
         })
         .cloned()
         .collect();

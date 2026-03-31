@@ -276,7 +276,7 @@ pub(crate) async fn update_gateway_status(
         .collect();
 
     // Build status.addresses using pre-computed address discovery.
-    // LB VIPs are preferred (externally reachable), then NODE_IP/POD_IP.
+    // LB VIPs are preferred (externally reachable), then local interface IPs.
     let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
         if !spec_addrs.is_empty() {
             {

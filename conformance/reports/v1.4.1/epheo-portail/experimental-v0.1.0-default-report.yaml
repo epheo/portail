@@ -1,5 +1,5 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-03-30T12:49:25Z"
+date: "2026-03-30T16:16:22Z"
 gatewayAPIChannel: experimental
 gatewayAPIVersion: v1.4.1
 implementation:
@@ -12,27 +12,6 @@ implementation:
 kind: ConformanceReport
 mode: default
 profiles:
-- core:
-    result: success
-    statistics:
-      Failed: 0
-      Passed: 11
-      Skipped: 0
-  extended:
-    result: success
-    statistics:
-      Failed: 0
-      Passed: 2
-      Skipped: 0
-    supportedFeatures:
-    - GatewayAddressEmpty
-    - GatewayHTTPListenerIsolation
-    - GatewayPort8080
-    - GatewayStaticAddresses
-    unsupportedFeatures:
-    - GatewayInfrastructurePropagation
-  name: GATEWAY-TLS
-  summary: Core tests succeeded. Extended tests succeeded.
 - core:
     result: success
     statistics:
@@ -75,6 +54,27 @@ profiles:
     - HTTPRouteBackendProtocolH2C
     - HTTPRouteCORS
   name: GATEWAY-HTTP
+  summary: Core tests succeeded. Extended tests succeeded.
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 11
+      Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 2
+      Skipped: 0
+    supportedFeatures:
+    - GatewayAddressEmpty
+    - GatewayHTTPListenerIsolation
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    unsupportedFeatures:
+    - GatewayInfrastructurePropagation
+  name: GATEWAY-TLS
   summary: Core tests succeeded. Extended tests succeeded.
 succeededProvisionalTests:
 - GatewayOptionalAddressValue

@@ -16,18 +16,24 @@ spec:
         app: portail
     spec:
       serviceAccountName: portail-controller
+      securityContext:
+        sysctls:
+        - name: net.ipv4.ip_unprivileged_port_start
+          value: "0"
       containers:
       - name: portail
         image: ghcr.io/epheo/portail:latest
         imagePullPolicy: Never
         args: ["--kubernetes"]
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          seccompProfile:
+            type: RuntimeDefault
         ports:
         - containerPort: 80
           name: http
         - containerPort: 443
           name: https
-        env:
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP

@@ -17,24 +17,19 @@ spec:
       serviceAccountName: portail-controller
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        sysctls:
+        - name: net.ipv4.ip_unprivileged_port_start
+          value: "0"
       containers:
       - name: portail
         image: ghcr.io/epheo/portail:latest
         imagePullPolicy: Always
         args: ["--kubernetes"]
         securityContext:
+          runAsNonRoot: true
           allowPrivilegeEscalation: false
           capabilities:
             drop: [ALL]
-            add: [NET_BIND_SERVICE]
           seccompProfile:
             type: RuntimeDefault
-        env:
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.hostIP
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
