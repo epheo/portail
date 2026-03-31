@@ -18,5 +18,6 @@ RUN cargo build --release --bin portail && strip target/release/portail
 FROM registry.fedoraproject.org/fedora-minimal:43 AS runtime
 RUN microdnf install -y libgcc && microdnf clean all
 COPY --from=builder /src/target/release/portail /usr/local/bin/portail
+USER 1000
 ENTRYPOINT ["/usr/local/bin/portail"]
 CMD ["--kubernetes"]

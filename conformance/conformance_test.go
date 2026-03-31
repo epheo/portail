@@ -76,7 +76,20 @@ func setup(provider *cluster.Provider, runtime string, cleanup func()) error {
 	projectDir := filepath.Dir(mustGetwd())
 
 	log.Println("Creating Kind cluster...")
-	if err := provider.Create(clusterName, cluster.CreateWithWaitForReady(2*time.Minute)); err != nil {
+	kindConfig := []byte(`kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    allowedUnsafeSysctls:
+    - "net.ipv4.ip_unprivileged_port_start"
+`)
+	if err := provider.Create(clusterName,
+		cluster.CreateWithRawConfig(kindConfig),
+		cluster.CreateWithWaitForReady(2*time.Minute),
+	); err != nil {
 		if !strings.Contains(err.Error(), "already exist") {
 			return fmt.Errorf("create cluster: %w", err)
 		}
