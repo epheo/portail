@@ -114,9 +114,7 @@ impl UsableAddresses {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lb_ips.is_empty()
-            && self.interface_ips.is_empty()
-            && self.network_ips.is_empty()
+        self.lb_ips.is_empty() && self.interface_ips.is_empty() && self.network_ips.is_empty()
     }
 }
 
@@ -249,9 +247,11 @@ pub(crate) fn discover_usable_addresses(
             .iter()
             .filter(|eps| eps.metadata.namespace.as_deref() == Some(&my_ns))
             .filter(|eps| {
-                eps.endpoints
-                    .iter()
-                    .any(|ep| ep.addresses.iter().any(|addr| local_ip_set.contains(addr.as_str())))
+                eps.endpoints.iter().any(|ep| {
+                    ep.addresses
+                        .iter()
+                        .any(|addr| local_ip_set.contains(addr.as_str()))
+                })
             })
             .filter_map(|eps| {
                 eps.metadata
@@ -356,9 +356,7 @@ where
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
     // Probe with limit=0 — just checks the endpoint exists
-    let probe = api
-        .list(&kube::api::ListParams::default().limit(1))
-        .await;
+    let probe = api.list(&kube::api::ListParams::default().limit(1)).await;
     match probe {
         Err(kube::Error::Api(ref status)) if status.code == 404 => {
             let kind = std::any::type_name::<K>()
@@ -1088,10 +1086,8 @@ fn validate_gateway(
                     _ => {
                         accepted = false;
                         reason = "UnsupportedAddress".to_string();
-                        message = format!(
-                            "Unsupported address type '{}' in spec.addresses",
-                            addr_type
-                        );
+                        message =
+                            format!("Unsupported address type '{}' in spec.addresses", addr_type);
                         break;
                     }
                 }
@@ -1190,12 +1186,8 @@ async fn reconcile(
                 )
                 .await
                 {
-                    info!(
-                        "Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}"
-                    );
-                    usable
-                        .network_ips
-                        .insert(network_name.to_string(), ip);
+                    info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
+                    usable.network_ips.insert(network_name.to_string(), ip);
                 } else {
                     warn!(
                         "Gateway {gw_ns}/{gw_name}: could not resolve network '{network_name}' to a local IP"
@@ -1259,7 +1251,8 @@ async fn reconcile(
         .addresses
         .iter()
         .filter(|addr| {
-            usable.interface_ips.iter().any(|ip| ip == *addr) || network_ip_set.contains(addr.as_str())
+            usable.interface_ips.iter().any(|ip| ip == *addr)
+                || network_ip_set.contains(addr.as_str())
         })
         .cloned()
         .collect();
