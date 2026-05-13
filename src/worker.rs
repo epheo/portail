@@ -224,25 +224,12 @@ async fn handle_connection(
                 rule,
                 meta,
             } => {
-                let forward_fut =
-                    proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state);
-                let ka = if !meta.is_upgrade {
-                    if let Some(req_timeout) = rule.request_timeout.filter(|d| !d.is_zero()) {
-                        match tokio::time::timeout(req_timeout, forward_fut).await {
-                            Ok(result) => result?,
-                            Err(_) => {
-                                let _ = send_error_response(&mut client, 504).await;
-                                return Ok(());
-                            }
-                        }
-                    } else {
-                        forward_fut.await?
-                    }
-                } else {
-                    // Upgrades (WebSocket) must not be wrapped in request_timeout —
-                    // the bidirectional stream is long-lived.
-                    forward_fut.await?
-                };
+                // proxy_http_request owns all timing for the request lifecycle —
+                // backend_request_timeout (connect + TTFB) and request_timeout
+                // (total deadline) are applied phase-aware inside.
+                let ka =
+                    proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state)
+                        .await?;
                 if !ka || !meta.keepalive {
                     return Ok(());
                 }
@@ -293,6 +280,20 @@ async fn handle_connection(
 
 /// Proxy a single HTTP request to a backend and forward the response.
 /// Returns true if the response was fully received (connection reusable for keepalive).
+///
+/// Owns all timing for the request lifecycle. Two timeouts come in from the rule:
+///
+/// - `backend_request_timeout` — single shared budget covering pool acquire,
+///   TCP/TLS connect, request send, and response time-to-first-byte. On expiry
+///   we are still in the SAFE zone (no client bytes written), so a `504` is
+///   well-formed.
+/// - `request_timeout` — total request lifetime, applied as an absolute
+///   `Instant` deadline. Clamps the SAFE-zone phases too, then bounds the body
+///   stream. On body-phase expiry we are in the UNSAFE zone (response headers
+///   already on the wire); we emit an encoding-aware terminator instead of a
+///   bogus `504` that would corrupt framing.
+///
+/// WebSocket upgrades skip the total deadline (long-lived stream).
 async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
@@ -302,15 +303,26 @@ async fn proxy_http_request(
     meta: &RequestMeta,
     state: &mut ConnectionState,
 ) -> Result<bool> {
+    use std::time::Instant;
+
     let backend_addr = backend_ref.socket_addr;
-    let timeout_dur = rule
+    let backend_budget = rule
         .backend_request_timeout
         .filter(|d| !d.is_zero())
-        .unwrap_or(std::time::Duration::from_secs(30));
+        .unwrap_or(Duration::from_secs(30));
+    let total_deadline = if meta.is_upgrade {
+        None
+    } else {
+        rule.request_timeout
+            .filter(|d| !d.is_zero())
+            .map(|d| Instant::now() + d)
+    };
+    let backend_phase_start = Instant::now();
 
-    // --- Connect to backend ---
+    // --- Connect to backend (shares backend_budget with TTFB) ---
+    let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
     let mut backend = match tokio::time::timeout(
-        timeout_dur,
+        connect_budget,
         state
             .pool
             .acquire(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
@@ -337,7 +349,7 @@ async fn proxy_http_request(
     };
 
     // --- Send request headers to backend (with optional modifications) ---
-    let header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
     let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
     let has_mirrors = has_filters
         && rule
@@ -349,7 +361,7 @@ async fn proxy_http_request(
     if has_filters {
         // Extract request header mods from rule + backend filter lists (zero-alloc borrows)
         let rule_mods = extract_header_mods(&rule.filters, false);
-        let request_path = extract_request_path(&buf[..header_end]);
+        let request_path = extract_request_path(&buf[..req_header_end]);
         let url_rewrite =
             extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
 
@@ -360,7 +372,7 @@ async fn proxy_http_request(
         if has_mods {
             // Apply rule-level modifications
             let modified_headers = apply_request_header_modifications(
-                &buf[..header_end],
+                &buf[..req_header_end],
                 rule_mods.as_ref(),
                 url_rewrite.as_ref(),
             );
@@ -377,13 +389,13 @@ async fn proxy_http_request(
                 mirror_header_data = Some(final_headers.clone());
             }
             backend.write_all(&final_headers).await?;
-            let body = &buf[header_end..request_bytes];
+            let body = &buf[req_header_end..request_bytes];
             if !body.is_empty() {
                 backend.write_all(body).await?;
             }
         } else {
             if has_mirrors {
-                mirror_header_data = Some(buf[..header_end].to_vec());
+                mirror_header_data = Some(buf[..req_header_end].to_vec());
             }
             backend.write_all(&buf[..request_bytes]).await?;
         }
@@ -396,7 +408,7 @@ async fn proxy_http_request(
         client,
         &mut backend,
         buf,
-        header_end,
+        req_header_end,
         request_bytes,
         meta.content_length,
         meta.is_chunked,
@@ -406,59 +418,89 @@ async fn proxy_http_request(
 
     // --- Dispatch mirrors with complete request data ---
     if let Some(ref body) = mirror_body {
-        let header_bytes = mirror_header_data.as_deref().unwrap_or(&buf[..header_end]);
+        let header_bytes = mirror_header_data
+            .as_deref()
+            .unwrap_or(&buf[..req_header_end]);
         let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
         full_request.extend_from_slice(header_bytes);
         full_request.extend_from_slice(body);
         dispatch_mirrors(&rule.filters, &full_request);
     }
 
+    // --- Phase 1: read response headers from backend (SAFE zone — abortable) ---
+    let header_budget = clamp_to_deadline(
+        backend_budget.saturating_sub(backend_phase_start.elapsed()),
+        total_deadline,
+    );
+    let resp_mods = extract_response_mods(rule, backend_ref);
+    let (resp_header_end, framing) = match tokio::time::timeout(
+        header_budget,
+        read_response_headers(&mut backend, buf, &mut state.header_buf),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            // SAFE zone: nothing on client wire yet, 504 is well-formed.
+            send_error_response(client, 504).await?;
+            return Ok(false);
+        }
+    };
+
+    // ── SAFE → UNSAFE boundary: first client write happens here. After this
+    //    point we must not inject a new HTTP response on expiry/error. ──
+    if let Some(mods) = resp_mods.as_ref() {
+        let modified = apply_response_header_mods(&state.header_buf[..resp_header_end], mods);
+        client.write_all(&modified).await?;
+        if state.header_buf.len() > resp_header_end {
+            client
+                .write_all(&state.header_buf[resp_header_end..])
+                .await?;
+        }
+    } else {
+        // Single write: headers + same-read body tail.
+        client.write_all(&state.header_buf).await?;
+    }
+
     // --- WebSocket / protocol upgrade handling ---
     if meta.is_upgrade {
-        let resp_mods = extract_response_mods(rule, backend_ref);
-        let _response_complete = match tokio::time::timeout(
-            timeout_dur,
-            forward_http_response(
-                &mut backend,
-                client,
-                buf,
-                resp_mods.as_ref(),
-                &mut state.header_buf,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                send_error_response(client, 504).await?;
-                return Ok(false);
-            }
-        };
         client.flush().await?;
         let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
         return Ok(false);
     }
 
-    // --- Forward response ---
-    let resp_mods = extract_response_mods(rule, backend_ref);
-    let response_complete = match tokio::time::timeout(
-        timeout_dur,
-        forward_http_response(
-            &mut backend,
-            client,
-            buf,
-            resp_mods.as_ref(),
-            &mut state.header_buf,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result?,
+    // --- Phase 2: stream response body (UNSAFE zone — encoding-aware on expiry) ---
+    // No per-rule body timeout: streaming is bounded only by `total_deadline` if set.
+    // When unset, the await goes directly to `forward_response_body` with zero timer
+    // overhead on the hot path.
+    let body_result = match total_deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(
+                remaining,
+                forward_response_body(&mut backend, client, buf, framing),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    terminate_stream_gracefully(client, &framing).await;
+                    return Ok(false);
+                }
+            }
+        }
+        None => forward_response_body(&mut backend, client, buf, framing).await,
+    };
+
+    let response_complete = match body_result {
+        Ok(c) => c,
         Err(_) => {
-            send_error_response(client, 504).await?;
+            terminate_stream_gracefully(client, &framing).await;
             return Ok(false);
         }
     };
+
     client.flush().await?;
 
     if response_complete {
@@ -571,92 +613,159 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
     }
 }
 
-/// Forward the backend's HTTP response to the client.
-/// Returns true if the response was fully received (backend connection reusable).
-///
-/// Without mods (passthrough): writes each chunk to client immediately,
-/// buffers headers only for completion tracking. Zero buffering delay.
-/// With mods: buffers until headers complete, applies modifications, then writes.
-async fn forward_http_response(
+/// Response framing derived from raw backend headers. Drives the body-phase loop:
+/// when to stop reading from the backend, and how to terminate the client stream
+/// gracefully on a mid-body timeout. `Copy` so the outer scope can hand a value
+/// to `forward_response_body` and still use it for `terminate_stream_gracefully`.
+#[derive(Clone, Copy)]
+struct ResponseFraming {
+    content_length: Option<usize>,
+    chunked: bool,
+    no_body: bool,
+    /// Body bytes already forwarded to the client from the same backend read that
+    /// completed the response headers. Seeds the body-phase byte counter.
+    body_bytes_already_forwarded: usize,
+    /// Rolling 5-byte tail seeded from any same-read body bytes (chunked responses).
+    chunked_tail: [u8; 5],
+    chunked_tail_len: usize,
+}
+
+/// Cap of bytes accumulated while waiting for backend response headers. Protects
+/// against a backend that never finishes its header block.
+const RESPONSE_HEADER_CAP: usize = 65536;
+
+/// Phase 1 — read response headers from the backend into `header_buf`. Performs
+/// NO writes to the client; aborting/timeout/error before this returns leaves the
+/// client wire untouched, so the caller can still emit a clean `504`.
+/// On return, `header_buf` holds `[headers..header_end][same-read body tail...]`.
+async fn read_response_headers(
+    backend: &mut Connection,
+    buf: &mut [u8],
+    header_buf: &mut Vec<u8>,
+) -> Result<(usize, ResponseFraming)> {
+    header_buf.clear();
+
+    loop {
+        let n = backend.read(buf).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "backend closed before sending response headers"
+            ));
+        }
+        header_buf.extend_from_slice(&buf[..n]);
+
+        if let Some(header_end) = find_header_end(header_buf) {
+            let headers = &header_buf[..header_end];
+            let content_length = parse_content_length(headers);
+            let chunked = is_chunked_transfer(headers);
+            let no_body = is_no_body_status(headers);
+
+            let body_bytes_already_forwarded = header_buf.len() - header_end;
+            let mut chunked_tail = [0u8; 5];
+            let mut chunked_tail_len: usize = 0;
+            if chunked && body_bytes_already_forwarded > 0 {
+                append_chunked_tail(
+                    &mut chunked_tail,
+                    &mut chunked_tail_len,
+                    &header_buf[header_end..],
+                );
+            }
+
+            return Ok((
+                header_end,
+                ResponseFraming {
+                    content_length,
+                    chunked,
+                    no_body,
+                    body_bytes_already_forwarded,
+                    chunked_tail,
+                    chunked_tail_len,
+                },
+            ));
+        }
+
+        if header_buf.len() > RESPONSE_HEADER_CAP {
+            return Err(anyhow::anyhow!("response headers exceed buffer size"));
+        }
+    }
+}
+
+/// Phase 2 — stream response body to the client. Hot path: read → write → check
+/// framing terminator. Returns `Ok(true)` when the response framing completes
+/// cleanly (connection reusable for keepalive); `Ok(false)` on backend EOF
+/// without a terminator.
+async fn forward_response_body(
     backend: &mut Connection,
     client: &mut Connection,
     buf: &mut [u8],
-    response_mods: Option<&HeaderModifications<'_>>,
-    header_buf: &mut Vec<u8>,
+    mut framing: ResponseFraming,
 ) -> Result<bool> {
-    let mut headers_parsed = false;
-    let mut content_length: Option<usize> = None;
-    let mut body_bytes_forwarded: usize = 0;
-    let mut chunked = false;
-    header_buf.clear();
-    // Rolling tail buffer for detecting chunked terminator across read boundaries.
-    // Tracks the last 5 bytes (len of b"0\r\n\r\n") seen so far in the body.
-    let mut chunked_tail = [0u8; 5];
-    let mut chunked_tail_len: usize = 0;
+    if framing.no_body {
+        return Ok(true);
+    }
+    if let Some(cl) = framing.content_length {
+        if framing.body_bytes_already_forwarded >= cl {
+            return Ok(true);
+        }
+    }
+    if framing.chunked && is_chunked_terminator(&framing.chunked_tail, framing.chunked_tail_len) {
+        return Ok(true);
+    }
 
+    let mut body_bytes_forwarded = framing.body_bytes_already_forwarded;
     loop {
         let n = backend.read(buf).await?;
         if n == 0 {
             return Ok(false);
         }
+        client.write_all(&buf[..n]).await?;
+        body_bytes_forwarded += n;
 
-        if !headers_parsed {
-            // Passthrough: write to client before buffering for header parsing
-            if response_mods.is_none() {
-                client.write_all(&buf[..n]).await?;
-            }
-
-            header_buf.extend_from_slice(&buf[..n]);
-
-            if let Some(header_end) = find_header_end(header_buf) {
-                headers_parsed = true;
-
-                // With mods: apply modifications and write buffered data now
-                if let Some(mods) = response_mods {
-                    let modified = apply_response_header_mods(&header_buf[..header_end], mods);
-                    client.write_all(&modified).await?;
-                    if header_buf.len() > header_end {
-                        client.write_all(&header_buf[header_end..]).await?;
-                    }
-                }
-
-                let headers = &header_buf[..header_end];
-                content_length = parse_content_length(headers);
-                chunked = is_chunked_transfer(headers);
-                body_bytes_forwarded = header_buf.len() - header_end;
-
-                if let Some(cl) = content_length {
-                    if body_bytes_forwarded >= cl {
-                        return Ok(true);
-                    }
-                }
-                if chunked {
-                    let body_so_far = &header_buf[header_end..];
-                    append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, body_so_far);
-                    if is_chunked_terminator(&chunked_tail, chunked_tail_len) {
-                        return Ok(true);
-                    }
-                }
-                if is_no_body_status(headers) {
-                    return Ok(true);
-                }
-            }
-        } else {
-            body_bytes_forwarded += n;
-            client.write_all(&buf[..n]).await?;
-
-            if let Some(cl) = content_length {
-                if body_bytes_forwarded >= cl {
-                    return Ok(true);
-                }
-            }
-            if chunked {
-                append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
-                if is_chunked_terminator(&chunked_tail, chunked_tail_len) {
-                    return Ok(true);
-                }
+        if let Some(cl) = framing.content_length {
+            if body_bytes_forwarded >= cl {
+                return Ok(true);
             }
         }
+        if framing.chunked {
+            append_chunked_tail(
+                &mut framing.chunked_tail,
+                &mut framing.chunked_tail_len,
+                &buf[..n],
+            );
+            if is_chunked_terminator(&framing.chunked_tail, framing.chunked_tail_len) {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+/// Best-effort clean shutdown after response headers were already forwarded.
+/// Called when an expiry or backend error strikes during the body phase — we
+/// are past the point where injecting a new HTTP response would be well-formed.
+///
+/// For chunked responses we emit `0\r\n\r\n` so a compliant client treats the
+/// transfer as complete (truncated body, no framing error). The proxy doesn't
+/// track inter-chunk boundaries — only watches a 5-byte rolling tail — so if
+/// the backend stalled mid-chunk-header the terminator is malformed, but no
+/// worse than a bare TCP close.
+///
+/// For Content-Length responses we cannot synthesize the missing bytes; the
+/// caller closes the connection and the client sees a well-defined premature
+/// EOF rather than malformed framing.
+async fn terminate_stream_gracefully(client: &mut Connection, framing: &ResponseFraming) {
+    if framing.chunked {
+        let _ = client.write_all(b"0\r\n\r\n").await;
+        let _ = client.flush().await;
+    }
+}
+
+/// Clamp a phase budget by an optional absolute deadline.
+/// Returns `min(budget, deadline - now)` if a deadline exists, else the budget.
+#[inline]
+fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> Duration {
+    match deadline {
+        Some(d) => budget.min(d.saturating_duration_since(std::time::Instant::now())),
+        None => budget,
     }
 }
 
