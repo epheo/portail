@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend_pool::BackendPool;
+use crate::chunked::ChunkedStream;
 use crate::health::HealthRegistry;
 use crate::http_filters::{
     apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
@@ -433,7 +434,7 @@ async fn proxy_http_request(
         total_deadline,
     );
     let resp_mods = extract_response_mods(rule, backend_ref);
-    let (resp_header_end, framing) = match tokio::time::timeout(
+    let (resp_header_end, mut framing) = match tokio::time::timeout(
         header_budget,
         read_response_headers(&mut backend, buf, &mut state.header_buf),
     )
@@ -479,7 +480,7 @@ async fn proxy_http_request(
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(
                 remaining,
-                forward_response_body(&mut backend, client, buf, framing),
+                forward_response_body(&mut backend, client, buf, &mut framing),
             )
             .await
             {
@@ -490,7 +491,7 @@ async fn proxy_http_request(
                 }
             }
         }
-        None => forward_response_body(&mut backend, client, buf, framing).await,
+        None => forward_response_body(&mut backend, client, buf, &mut framing).await,
     };
 
     let response_complete = match body_result {
@@ -503,11 +504,27 @@ async fn proxy_http_request(
 
     client.flush().await?;
 
-    if response_complete {
+    // Only return the backend to the pool when the response framing is
+    // verifiably clean. `Ok(true)` from the body loop already implies this
+    // by construction (the chunked observer only signals termination at a
+    // true chunk boundary, and content-length matches are exact), but if
+    // the observer ever ended in the Broken state we must not reuse the
+    // connection — there could be stale bytes still on the wire. Also
+    // forces the client connection closed so the client sees a clean EOF.
+    let framing_clean = framing.chunked.as_ref().is_none_or(|s| !s.is_broken());
+    if !framing_clean {
+        warn!(
+            "Backend {} response framing broken; not pooling connection",
+            backend_addr
+        );
+    }
+    let reusable = response_complete && framing_clean;
+
+    if reusable {
         state.pool.release(backend_addr, backend);
     }
 
-    Ok(response_complete)
+    Ok(reusable)
 }
 
 /// Extract response header modifications from rule + backend filters (zero-alloc borrows).
@@ -567,22 +584,17 @@ async fn relay_request_body(
             remaining -= to_send;
         }
     } else if is_chunked {
-        let mut chunked_tail = [0u8; 5];
-        let mut chunked_tail_len: usize = 0;
+        let mut stream = ChunkedStream::new();
         if body_in_initial > 0 {
-            append_chunked_tail(
-                &mut chunked_tail,
-                &mut chunked_tail_len,
-                &buf[header_end..request_bytes],
-            );
+            stream.observe(&buf[header_end..request_bytes]);
         }
-        while !is_chunked_terminator(&chunked_tail, chunked_tail_len) {
+        while !stream.is_terminated() {
             let n = client.read(&mut buf[..]).await?;
             if n == 0 {
                 break;
             }
             backend.write_all(&buf[..n]).await?;
-            append_chunked_tail(&mut chunked_tail, &mut chunked_tail_len, &buf[..n]);
+            stream.observe(&buf[..n]);
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..n]);
         }
     }
@@ -615,19 +627,18 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 
 /// Response framing derived from raw backend headers. Drives the body-phase loop:
 /// when to stop reading from the backend, and how to terminate the client stream
-/// gracefully on a mid-body timeout. `Copy` so the outer scope can hand a value
-/// to `forward_response_body` and still use it for `terminate_stream_gracefully`.
-#[derive(Clone, Copy)]
+/// gracefully on a mid-body timeout.
 struct ResponseFraming {
     content_length: Option<usize>,
-    chunked: bool,
     no_body: bool,
     /// Body bytes already forwarded to the client from the same backend read that
     /// completed the response headers. Seeds the body-phase byte counter.
     body_bytes_already_forwarded: usize,
-    /// Rolling 5-byte tail seeded from any same-read body bytes (chunked responses).
-    chunked_tail: [u8; 5],
-    chunked_tail_len: usize,
+    /// `Some` iff the response uses `Transfer-Encoding: chunked`. Pre-seeded
+    /// with any chunked body bytes that arrived in the same read as the
+    /// response headers, so the observer is already at the correct framing
+    /// position when `forward_response_body` starts looping.
+    chunked: Option<ChunkedStream>,
 }
 
 /// Cap of bytes accumulated while waiting for backend response headers. Protects
@@ -661,25 +672,23 @@ async fn read_response_headers(
             let no_body = is_no_body_status(headers);
 
             let body_bytes_already_forwarded = header_buf.len() - header_end;
-            let mut chunked_tail = [0u8; 5];
-            let mut chunked_tail_len: usize = 0;
-            if chunked && body_bytes_already_forwarded > 0 {
-                append_chunked_tail(
-                    &mut chunked_tail,
-                    &mut chunked_tail_len,
-                    &header_buf[header_end..],
-                );
-            }
+            let chunked = if chunked {
+                let mut stream = ChunkedStream::new();
+                if body_bytes_already_forwarded > 0 {
+                    stream.observe(&header_buf[header_end..]);
+                }
+                Some(stream)
+            } else {
+                None
+            };
 
             return Ok((
                 header_end,
                 ResponseFraming {
                     content_length,
-                    chunked,
                     no_body,
                     body_bytes_already_forwarded,
-                    chunked_tail,
-                    chunked_tail_len,
+                    chunked,
                 },
             ));
         }
@@ -698,7 +707,7 @@ async fn forward_response_body(
     backend: &mut Connection,
     client: &mut Connection,
     buf: &mut [u8],
-    mut framing: ResponseFraming,
+    framing: &mut ResponseFraming,
 ) -> Result<bool> {
     if framing.no_body {
         return Ok(true);
@@ -708,8 +717,10 @@ async fn forward_response_body(
             return Ok(true);
         }
     }
-    if framing.chunked && is_chunked_terminator(&framing.chunked_tail, framing.chunked_tail_len) {
-        return Ok(true);
+    if let Some(stream) = &framing.chunked {
+        if stream.is_terminated() {
+            return Ok(true);
+        }
     }
 
     let mut body_bytes_forwarded = framing.body_bytes_already_forwarded;
@@ -726,13 +737,9 @@ async fn forward_response_body(
                 return Ok(true);
             }
         }
-        if framing.chunked {
-            append_chunked_tail(
-                &mut framing.chunked_tail,
-                &mut framing.chunked_tail_len,
-                &buf[..n],
-            );
-            if is_chunked_terminator(&framing.chunked_tail, framing.chunked_tail_len) {
+        if let Some(stream) = &mut framing.chunked {
+            stream.observe(&buf[..n]);
+            if stream.is_terminated() {
                 return Ok(true);
             }
         }
@@ -753,7 +760,7 @@ async fn forward_response_body(
 /// caller closes the connection and the client sees a well-defined premature
 /// EOF rather than malformed framing.
 async fn terminate_stream_gracefully(client: &mut Connection, framing: &ResponseFraming) {
-    if framing.chunked {
+    if framing.chunked.is_some() {
         let _ = client.write_all(b"0\r\n\r\n").await;
         let _ = client.flush().await;
     }
@@ -941,89 +948,4 @@ fn is_no_body_status(headers: &[u8]) -> bool {
     }
     let status = &headers[9..12];
     status == b"204" || status == b"304" || status[0] == b'1'
-}
-
-/// Append new data to the rolling 5-byte tail buffer used for chunked terminator detection.
-#[inline]
-fn append_chunked_tail(tail: &mut [u8; 5], tail_len: &mut usize, data: &[u8]) {
-    if data.len() >= 5 {
-        // Fast path: new data is large enough to fill the entire tail
-        tail.copy_from_slice(&data[data.len() - 5..]);
-        *tail_len = 5;
-    } else if !data.is_empty() {
-        // Shift existing tail left and append new bytes
-        let keep = 5usize.saturating_sub(data.len()).min(*tail_len);
-        if keep > 0 {
-            tail.copy_within((*tail_len - keep)..*tail_len, 0);
-        }
-        let start = keep;
-        tail[start..start + data.len()].copy_from_slice(data);
-        *tail_len = keep + data.len();
-    }
-}
-
-/// Check if the tail buffer contains the chunked terminator `0\r\n\r\n`.
-#[inline]
-fn is_chunked_terminator(tail: &[u8; 5], tail_len: usize) -> bool {
-    tail_len == 5 && tail == b"0\r\n\r\n"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_chunked_terminator_single_read() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        append_chunked_tail(&mut tail, &mut len, b"some body data0\r\n\r\n");
-        assert!(is_chunked_terminator(&tail, len));
-    }
-
-    #[test]
-    fn test_chunked_terminator_split_across_two_reads() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        // First read ends with "0\r\n"
-        append_chunked_tail(&mut tail, &mut len, b"chunk data0\r\n");
-        assert!(!is_chunked_terminator(&tail, len));
-        // Second read starts with "\r\n"
-        append_chunked_tail(&mut tail, &mut len, b"\r\n");
-        assert!(is_chunked_terminator(&tail, len));
-    }
-
-    #[test]
-    fn test_chunked_terminator_split_byte_by_byte() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        for byte in b"0\r\n\r\n" {
-            append_chunked_tail(&mut tail, &mut len, std::slice::from_ref(byte));
-        }
-        assert!(is_chunked_terminator(&tail, len));
-    }
-
-    #[test]
-    fn test_chunked_terminator_false_positive_resistance() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        // Contains the bytes but not at the end
-        append_chunked_tail(&mut tail, &mut len, b"0\r\n\r\nmore data");
-        assert!(!is_chunked_terminator(&tail, len));
-    }
-
-    #[test]
-    fn test_chunked_terminator_not_enough_data() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        append_chunked_tail(&mut tail, &mut len, b"\r\n");
-        assert!(!is_chunked_terminator(&tail, len));
-    }
-
-    #[test]
-    fn test_chunked_terminator_exact_five_bytes() {
-        let mut tail = [0u8; 5];
-        let mut len = 0;
-        append_chunked_tail(&mut tail, &mut len, b"0\r\n\r\n");
-        assert!(is_chunked_terminator(&tail, len));
-    }
 }

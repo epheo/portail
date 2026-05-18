@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 pub mod backend_pool;
+pub mod chunked;
 pub mod config;
 pub mod config_watcher;
 pub mod data_plane;
