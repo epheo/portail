@@ -115,15 +115,20 @@ fn transition_time_json(
     now.to_string()
 }
 
+/// One Gateway status condition, as computed by the reconciler.
+/// Bundles the previously-loose `(bool, reason, message)` triple.
+#[derive(Clone, Debug)]
+pub(crate) struct GatewayCondition {
+    pub ok: bool,
+    pub reason: String,
+    pub message: String,
+}
+
 pub(crate) async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
-    accepted: bool,
-    accepted_reason: &str,
-    accepted_message: &str,
-    programmed: bool,
-    programmed_reason: &str,
-    programmed_message: &str,
+    accepted: &GatewayCondition,
+    programmed: &GatewayCondition,
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
     usable: &UsableAddresses,
@@ -143,17 +148,17 @@ pub(crate) async fn update_gateway_status(
         .cloned()
         .unwrap_or_default();
 
-    let accepted_status = if accepted { "True" } else { "False" };
-    let accepted_reason_str = if accepted {
+    let accepted_status = if accepted.ok { "True" } else { "False" };
+    let accepted_reason_str = if accepted.ok {
         "Accepted"
     } else {
-        accepted_reason
+        accepted.reason.as_str()
     };
-    let programmed_status = if programmed { "True" } else { "False" };
-    let programmed_reason_str = if programmed {
+    let programmed_status = if programmed.ok { "True" } else { "False" };
+    let programmed_reason_str = if programmed.ok {
         "Programmed"
     } else {
-        programmed_reason
+        programmed.reason.as_str()
     };
 
     let conditions = vec![
@@ -161,7 +166,7 @@ pub(crate) async fn update_gateway_status(
             type_: "Accepted".to_string(),
             status: accepted_status.to_string(),
             reason: accepted_reason_str.to_string(),
-            message: accepted_message.to_string(),
+            message: accepted.message.clone(),
             last_transition_time: transition_time(
                 &existing_conditions,
                 "Accepted",
@@ -175,7 +180,7 @@ pub(crate) async fn update_gateway_status(
             type_: "Programmed".to_string(),
             status: programmed_status.to_string(),
             reason: programmed_reason_str.to_string(),
-            message: programmed_message.to_string(),
+            message: programmed.message.clone(),
             last_transition_time: transition_time(
                 &existing_conditions,
                 "Programmed",

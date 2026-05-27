@@ -320,91 +320,34 @@ async fn proxy_http_request(
     };
     let backend_phase_start = Instant::now();
 
-    // --- Connect to backend (shares backend_budget with TTFB) ---
-    let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
-    let mut backend = match tokio::time::timeout(
-        connect_budget,
-        state
-            .pool
-            .acquire(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("Backend {} connect failed: {}", backend_addr, e);
-            if state.health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-            }
-            send_error_response(client, 502).await?;
-            return Ok(false);
-        }
-        Err(_) => {
-            warn!("Backend {} connect timeout", backend_addr);
-            if state.health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-            }
-            send_error_response(client, 504).await?;
-            return Ok(false);
-        }
-    };
+    // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
+    let mut backend =
+        match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline)
+            .await?
+        {
+            Some(b) => b,
+            None => return Ok(false),
+        };
 
-    // --- Send request headers to backend (with optional modifications) ---
+    // Send request to backend, optionally applying filter modifications.
     let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-    let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
-    let has_mirrors = has_filters
+    let has_mirrors = (rule.has_filters || !backend_ref.filters.is_empty())
         && rule
             .filters
             .iter()
             .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
-    let mut mirror_header_data: Option<Vec<u8>> = None;
+    let mirror_header_data = send_request_to_backend(
+        &mut backend,
+        buf,
+        req_header_end,
+        request_bytes,
+        rule,
+        backend_ref,
+        has_mirrors,
+    )
+    .await?;
 
-    if has_filters {
-        // Extract request header mods from rule + backend filter lists (zero-alloc borrows)
-        let rule_mods = extract_header_mods(&rule.filters, false);
-        let request_path = extract_request_path(&buf[..req_header_end]);
-        let url_rewrite =
-            extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
-
-        let has_mods = rule_mods.is_some()
-            || url_rewrite.is_some()
-            || extract_header_mods(&backend_ref.filters, false).is_some();
-
-        if has_mods {
-            // Apply rule-level modifications
-            let modified_headers = apply_request_header_modifications(
-                &buf[..req_header_end],
-                rule_mods.as_ref(),
-                url_rewrite.as_ref(),
-            );
-
-            // Apply backend-level modifications on top if present
-            let final_headers =
-                if let Some(backend_mods) = extract_header_mods(&backend_ref.filters, false) {
-                    apply_request_header_modifications(&modified_headers, Some(&backend_mods), None)
-                } else {
-                    modified_headers
-                };
-
-            if has_mirrors {
-                mirror_header_data = Some(final_headers.clone());
-            }
-            backend.write_all(&final_headers).await?;
-            let body = &buf[req_header_end..request_bytes];
-            if !body.is_empty() {
-                backend.write_all(body).await?;
-            }
-        } else {
-            if has_mirrors {
-                mirror_header_data = Some(buf[..req_header_end].to_vec());
-            }
-            backend.write_all(&buf[..request_bytes]).await?;
-        }
-    } else {
-        backend.write_all(&buf[..request_bytes]).await?;
-    }
-
-    // --- Relay remaining request body + optional mirror tee ---
+    // Relay remaining request body + optional mirror tee.
     let mirror_body = relay_request_body(
         client,
         &mut backend,
@@ -417,7 +360,6 @@ async fn proxy_http_request(
     )
     .await?;
 
-    // --- Dispatch mirrors with complete request data ---
     if let Some(ref body) = mirror_body {
         let header_bytes = mirror_header_data
             .as_deref()
@@ -428,53 +370,36 @@ async fn proxy_http_request(
         dispatch_mirrors(&rule.filters, &full_request);
     }
 
-    // --- Phase 1: read response headers from backend (SAFE zone — abortable) ---
+    // Forward response headers (SAFE→UNSAFE transition lives inside this call;
+    // on timeout the helper emits a 504 — no client bytes written yet).
     let header_budget = clamp_to_deadline(
         backend_budget.saturating_sub(backend_phase_start.elapsed()),
         total_deadline,
     );
     let resp_mods = extract_response_mods(rule, backend_ref);
-    let (resp_header_end, mut framing) = match tokio::time::timeout(
+    let mut framing = match forward_response_headers(
+        client,
+        &mut backend,
+        buf,
+        &mut state.header_buf,
+        resp_mods.as_ref(),
         header_budget,
-        read_response_headers(&mut backend, buf, &mut state.header_buf),
     )
-    .await
+    .await?
     {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            // SAFE zone: nothing on client wire yet, 504 is well-formed.
-            send_error_response(client, 504).await?;
-            return Ok(false);
-        }
+        Some(f) => f,
+        None => return Ok(false),
     };
 
-    // ── SAFE → UNSAFE boundary: first client write happens here. After this
-    //    point we must not inject a new HTTP response on expiry/error. ──
-    if let Some(mods) = resp_mods.as_ref() {
-        let modified = apply_response_header_mods(&state.header_buf[..resp_header_end], mods);
-        client.write_all(&modified).await?;
-        if state.header_buf.len() > resp_header_end {
-            client
-                .write_all(&state.header_buf[resp_header_end..])
-                .await?;
-        }
-    } else {
-        // Single write: headers + same-read body tail.
-        client.write_all(&state.header_buf).await?;
-    }
-
-    // --- WebSocket / protocol upgrade handling ---
+    // WebSocket / protocol upgrade: switch to raw bidi after headers.
     if meta.is_upgrade {
         client.flush().await?;
         let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
         return Ok(false);
     }
 
-    // --- Phase 2: stream response body (UNSAFE zone — encoding-aware on expiry) ---
-    // No per-rule body timeout: streaming is bounded only by `total_deadline` if set.
-    // When unset, the await goes directly to `forward_response_body` with zero timer
-    // overhead on the hot path.
+    // Stream response body (UNSAFE: headers on wire; expiry → encoding-aware
+    // termination, never a synthetic 504 that would corrupt framing).
     let body_result = match total_deadline {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -504,13 +429,9 @@ async fn proxy_http_request(
 
     client.flush().await?;
 
-    // Only return the backend to the pool when the response framing is
-    // verifiably clean. `Ok(true)` from the body loop already implies this
-    // by construction (the chunked observer only signals termination at a
-    // true chunk boundary, and content-length matches are exact), but if
-    // the observer ever ended in the Broken state we must not reuse the
-    // connection — there could be stale bytes still on the wire. Also
-    // forces the client connection closed so the client sees a clean EOF.
+    // Pool only if framing terminated cleanly. The chunked observer signals
+    // termination at a true chunk boundary; content-length matches are exact.
+    // A Broken state means stale bytes could remain on the wire — don't reuse.
     let framing_clean = framing.chunked.as_ref().is_none_or(|s| !s.is_broken());
     if !framing_clean {
         warn!(
@@ -525,6 +446,138 @@ async fn proxy_http_request(
     }
 
     Ok(reusable)
+}
+
+/// Acquire a backend connection within `backend_budget` (clamped by `total_deadline`).
+/// On any failure or timeout, records health failure and sends `502`/`504` to the
+/// client. Returns `Ok(None)` when the caller should bail out (`return Ok(false)`),
+/// which signals the connection is not reusable.
+async fn connect_to_backend(
+    client: &mut Connection,
+    state: &mut ConnectionState,
+    backend_ref: &crate::routing::Backend,
+    backend_budget: Duration,
+    total_deadline: Option<std::time::Instant>,
+) -> Result<Option<Connection>> {
+    let backend_addr = backend_ref.socket_addr;
+    let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
+    match tokio::time::timeout(
+        connect_budget,
+        state
+            .pool
+            .acquire(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(Some(stream)),
+        Ok(Err(e)) => {
+            warn!("Backend {} connect failed: {}", backend_addr, e);
+            if state.health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+            }
+            send_error_response(client, 502).await?;
+            Ok(None)
+        }
+        Err(_) => {
+            warn!("Backend {} connect timeout", backend_addr);
+            if state.health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+            }
+            send_error_response(client, 504).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Send request headers (with optional filter modifications) and the same-read
+/// body tail to the backend. Returns the buffer captured for mirroring, if any.
+///
+/// Fast path (no filters/mods): one `write_all` covering headers + tail.
+async fn send_request_to_backend(
+    backend: &mut Connection,
+    buf: &[u8],
+    req_header_end: usize,
+    request_bytes: usize,
+    rule: &HttpRouteRule,
+    backend_ref: &crate::routing::Backend,
+    has_mirrors: bool,
+) -> Result<Option<Vec<u8>>> {
+    let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
+    if !has_filters {
+        backend.write_all(&buf[..request_bytes]).await?;
+        return Ok(None);
+    }
+
+    let rule_mods = extract_header_mods(&rule.filters, false);
+    let request_path = extract_request_path(&buf[..req_header_end]);
+    let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
+    let backend_mods = extract_header_mods(&backend_ref.filters, false);
+    let has_mods = rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some();
+
+    if !has_mods {
+        let mirror = has_mirrors.then(|| buf[..req_header_end].to_vec());
+        backend.write_all(&buf[..request_bytes]).await?;
+        return Ok(mirror);
+    }
+
+    let modified_headers = apply_request_header_modifications(
+        &buf[..req_header_end],
+        rule_mods.as_ref(),
+        url_rewrite.as_ref(),
+    );
+    let final_headers = if let Some(bm) = backend_mods {
+        apply_request_header_modifications(&modified_headers, Some(&bm), None)
+    } else {
+        modified_headers
+    };
+    let mirror = has_mirrors.then(|| final_headers.clone());
+    backend.write_all(&final_headers).await?;
+    let body = &buf[req_header_end..request_bytes];
+    if !body.is_empty() {
+        backend.write_all(body).await?;
+    }
+    Ok(mirror)
+}
+
+/// Read response headers from the backend within `header_budget` and forward
+/// them to the client. This is the SAFE→UNSAFE transition: on entry no client
+/// bytes have been written and timeout → `504`; on success the client has the
+/// headers and the caller must use encoding-aware termination on later expiry.
+///
+/// Returns `Ok(None)` when the caller should bail out (`return Ok(false)`).
+async fn forward_response_headers(
+    client: &mut Connection,
+    backend: &mut Connection,
+    buf: &mut [u8],
+    header_buf: &mut Vec<u8>,
+    resp_mods: Option<&HeaderModifications<'_>>,
+    header_budget: Duration,
+) -> Result<Option<ResponseFraming>> {
+    let (resp_header_end, framing) = match tokio::time::timeout(
+        header_budget,
+        read_response_headers(backend, buf, header_buf),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            send_error_response(client, 504).await?;
+            return Ok(None);
+        }
+    };
+
+    // SAFE → UNSAFE: first client write happens here.
+    if let Some(mods) = resp_mods {
+        let modified = apply_response_header_mods(&header_buf[..resp_header_end], mods);
+        client.write_all(&modified).await?;
+        if header_buf.len() > resp_header_end {
+            client.write_all(&header_buf[resp_header_end..]).await?;
+        }
+    } else {
+        client.write_all(header_buf).await?;
+    }
+    Ok(Some(framing))
 }
 
 /// Extract response header modifications from rule + backend filters (zero-alloc borrows).

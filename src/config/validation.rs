@@ -58,20 +58,47 @@ impl PortailConfig {
     }
 }
 
+/// Shared route validation: non-empty `parent_refs`, non-empty `rules`,
+/// per-element validation. Protocol-specific checks (HTTP hostnames, TLS SNI)
+/// stay in the caller.
+fn validate_route<R>(
+    parent_refs: &[ParentRef],
+    rules: &[R],
+    proto: &str,
+    validate_rule: impl Fn(&R) -> Result<()>,
+) -> Result<()> {
+    if parent_refs.is_empty() {
+        return Err(anyhow!("{} route must have at least one parent_ref", proto));
+    }
+    for parent_ref in parent_refs {
+        parent_ref.validate()?;
+    }
+    if rules.is_empty() {
+        return Err(anyhow!("{} route must have at least one rule", proto));
+    }
+    for (i, rule) in rules.iter().enumerate() {
+        validate_rule(rule).map_err(|e| anyhow!("{} route rule {}: {}", proto, i, e))?;
+    }
+    Ok(())
+}
+
+/// Wildcard hostnames must use the `*.domain` form. Empty-check is left to
+/// callers because they emit protocol-specific messages.
+fn validate_hostname_wildcard(hostname: &str) -> Result<()> {
+    if hostname.starts_with('*') && !hostname.starts_with("*.") {
+        return Err(anyhow!(
+            "Wildcard hostname must use '*.domain' format: {}",
+            hostname
+        ));
+    }
+    Ok(())
+}
+
 impl HttpRouteConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.parent_refs.is_empty() {
-            return Err(anyhow!("HTTP route must have at least one parent_ref"));
-        }
-
-        for parent_ref in &self.parent_refs {
-            parent_ref.validate()?;
-        }
-
         if self.hostnames.is_empty() {
             return Err(anyhow!("HTTP route must have at least one hostname"));
         }
-
         for hostname in &self.hostnames {
             if hostname.is_empty() {
                 return Err(anyhow!("Hostname cannot be empty"));
@@ -79,48 +106,15 @@ impl HttpRouteConfig {
             if hostname.contains(':') {
                 return Err(anyhow!("Hostname must not contain port: {}", hostname));
             }
-            // Wildcard hostnames must be "*.domain" format
-            if hostname.starts_with('*') && !hostname.starts_with("*.") {
-                return Err(anyhow!(
-                    "Wildcard hostname must use '*.domain' format: {}",
-                    hostname
-                ));
-            }
+            validate_hostname_wildcard(hostname)?;
         }
-
-        if self.rules.is_empty() {
-            return Err(anyhow!("HTTP route must have at least one rule"));
-        }
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate()
-                .map_err(|e| anyhow!("HTTP route rule {}: {}", i, e))?;
-        }
-
-        Ok(())
+        validate_route(&self.parent_refs, &self.rules, "HTTP", |r| r.validate())
     }
 }
 
 impl TcpRouteConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.parent_refs.is_empty() {
-            return Err(anyhow!("TCP route must have at least one parent_ref"));
-        }
-
-        for parent_ref in &self.parent_refs {
-            parent_ref.validate()?;
-        }
-
-        if self.rules.is_empty() {
-            return Err(anyhow!("TCP route must have at least one rule"));
-        }
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate()
-                .map_err(|e| anyhow!("TCP route rule {}: {}", i, e))?;
-        }
-
-        Ok(())
+        validate_route(&self.parent_refs, &self.rules, "TCP", |r| r.validate())
     }
 }
 
@@ -335,42 +329,18 @@ impl HttpPathMatch {
 
 impl TlsRouteConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.parent_refs.is_empty() {
-            return Err(anyhow!("TLS route must have at least one parent_ref"));
-        }
-
-        for parent_ref in &self.parent_refs {
-            parent_ref.validate()?;
-        }
-
         if self.hostnames.is_empty() {
             return Err(anyhow!(
                 "TLS route must have at least one hostname for SNI matching"
             ));
         }
-
         for hostname in &self.hostnames {
             if hostname.is_empty() {
                 return Err(anyhow!("TLS route hostname cannot be empty"));
             }
-            if hostname.starts_with('*') && !hostname.starts_with("*.") {
-                return Err(anyhow!(
-                    "Wildcard hostname must use '*.domain' format: {}",
-                    hostname
-                ));
-            }
+            validate_hostname_wildcard(hostname)?;
         }
-
-        if self.rules.is_empty() {
-            return Err(anyhow!("TLS route must have at least one rule"));
-        }
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate()
-                .map_err(|e| anyhow!("TLS route rule {}: {}", i, e))?;
-        }
-
-        Ok(())
+        validate_route(&self.parent_refs, &self.rules, "TLS", |r| r.validate())
     }
 }
 
@@ -392,24 +362,7 @@ impl TlsRouteRule {
 
 impl UdpRouteConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.parent_refs.is_empty() {
-            return Err(anyhow!("UDP route must have at least one parent_ref"));
-        }
-
-        for parent_ref in &self.parent_refs {
-            parent_ref.validate()?;
-        }
-
-        if self.rules.is_empty() {
-            return Err(anyhow!("UDP route must have at least one rule"));
-        }
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            rule.validate()
-                .map_err(|e| anyhow!("UDP route rule {}: {}", i, e))?;
-        }
-
-        Ok(())
+        validate_route(&self.parent_refs, &self.rules, "UDP", |r| r.validate())
     }
 }
 

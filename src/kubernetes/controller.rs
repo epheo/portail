@@ -897,18 +897,12 @@ fn resolve_services(
 }
 
 /// Validate Gateway listeners and compute gateway-level acceptance.
-/// Returns (listener_statuses, gateway_accepted, reason, message).
 fn validate_gateway(
     gateway: &Gateway,
     gw_ns: &str,
     cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>,
     reference_grants: &[ReferenceGrant],
-) -> (
-    HashMap<String, status::ListenerStatus>,
-    bool,
-    String,
-    String,
-) {
+) -> (HashMap<String, status::ListenerStatus>, status::GatewayCondition) {
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
 
     // Detect protocol conflicts: same port, different protocols
@@ -1104,7 +1098,260 @@ fn validate_gateway(
         }
     }
 
-    (listener_statuses, accepted, reason, message)
+    (
+        listener_statuses,
+        status::GatewayCondition {
+            ok: accepted,
+            reason,
+            message,
+        },
+    )
+}
+
+/// Resolve `portail.epheo.eu/Network` entries in `spec.addresses` to local IPs.
+/// Reads each named NetworkAttachmentDefinition for its subnet and matches it
+/// against the addresses we already discovered via `getifaddrs()`.
+async fn resolve_network_addresses(
+    client: &Client,
+    gateway: &Gateway,
+    gw_ns: &str,
+    usable: &mut UsableAddresses,
+) {
+    let Some(spec_addrs) = &gateway.spec.addresses else {
+        return;
+    };
+    let gw_name = gateway.name_any();
+    for addr in spec_addrs {
+        if addr.r#type.as_deref() != Some(NETWORK_ADDRESS_TYPE) {
+            continue;
+        }
+        let network_name = addr.value.as_deref().unwrap_or("");
+        match resolve_network_to_local_ip(client, network_name, gw_ns, &usable.interface_ips).await
+        {
+            Some(ip) => {
+                info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
+                usable.network_ips.insert(network_name.to_string(), ip);
+            }
+            None => warn!(
+                "Gateway {gw_ns}/{gw_name}: could not resolve network '{network_name}' to a local IP"
+            ),
+        }
+    }
+}
+
+/// Pick which spec.addresses are bind-targets on this pod. LB VIPs are external
+/// routing identities handled by kube-proxy/MetalLB and bind to 0.0.0.0; only
+/// pod-local interface IPs and resolved Network-type IPs get bound specifically.
+fn compute_bind_addresses(addresses: &[String], usable: &UsableAddresses) -> Vec<String> {
+    let network_ip_set: HashSet<&str> = usable.network_ips.values().map(|s| s.as_str()).collect();
+    addresses
+        .iter()
+        .filter(|addr| {
+            usable.interface_ips.iter().any(|ip| ip == *addr)
+                || network_ip_set.contains(addr.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Open data-plane TCP listeners for this Gateway's ports. Called after the
+/// per-Gateway config is built so ListenerConfig has resolved TLS cert data.
+fn ensure_data_plane_listeners(
+    ctx: &ControllerCtx,
+    listeners: &[crate::config::ListenerConfig],
+    bind_addresses: &[String],
+) {
+    info!(
+        "Ensuring data plane listeners for ports: {:?}",
+        listeners.iter().map(|l| l.port).collect::<Vec<_>>()
+    );
+    match ctx.data_plane.lock() {
+        Ok(mut dp) => {
+            let (opened, errors) =
+                dp.add_tcp_listeners(listeners, bind_addresses, ctx.routes.clone(), &ctx.performance_config);
+            if opened > 0 {
+                info!("Opened {} new port(s)", opened);
+            }
+            for (port, err) in &errors {
+                warn!("Failed to bind port {}: {}", port, err);
+            }
+        }
+        Err(e) => warn!("Failed to lock data plane: {}", e),
+    }
+}
+
+/// Merge TLS cert refs across all Gateways per port and hot-reload the SNI
+/// resolver. Needed when multiple Gateways share a port (e.g. public *.desku.be
+/// + private *.mmt + conformance test example.org on port 443).
+fn merge_and_hot_reload_tls(
+    data_plane: &std::sync::Mutex<crate::data_plane::DataPlane>,
+    all_configs: &[crate::config::PortailConfig],
+) {
+    use crate::config::{CertificateRef, ListenerConfig as LC, Protocol as P, TlsConfig, TlsMode};
+
+    let mut merged_certs_by_port: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
+    let mut port_protocol: HashMap<u16, P> = HashMap::new();
+    for config in all_configs {
+        for listener in &config.gateway.listeners {
+            if let Some(tls_cfg) = &listener.tls {
+                if tls_cfg.mode == TlsMode::Terminate && !tls_cfg.certificate_refs.is_empty() {
+                    merged_certs_by_port
+                        .entry(listener.port)
+                        .or_default()
+                        .extend(tls_cfg.certificate_refs.clone());
+                    port_protocol
+                        .entry(listener.port)
+                        .or_insert_with(|| listener.protocol.clone());
+                }
+            }
+        }
+    }
+    if merged_certs_by_port.is_empty() {
+        return;
+    }
+
+    let merged_listeners: Vec<LC> = merged_certs_by_port
+        .into_iter()
+        .map(|(port, cert_refs)| LC {
+            name: format!("merged-tls-{}", port),
+            protocol: port_protocol.remove(&port).unwrap_or(P::HTTPS),
+            port,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: Some(TlsConfig {
+                mode: TlsMode::Terminate,
+                certificate_refs: cert_refs,
+            }),
+        })
+        .collect();
+
+    match data_plane.lock() {
+        Ok(mut dp) => {
+            let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
+            if tls_updated > 0 {
+                debug!("Refreshed merged TLS config for {} port(s)", tls_updated);
+            }
+            for (port, err) in &tls_errors {
+                warn!("Merged TLS config update failed for port {}: {}", port, err);
+            }
+        }
+        Err(e) => warn!("Failed to lock data plane for TLS update: {}", e),
+    }
+}
+
+/// (address, port) pairs the data plane must be bound to for this Gateway to
+/// be considered Programmed. Mirrors what we just passed to `add_tcp_listeners`.
+fn required_endpoints(gateway: &Gateway, bind_addresses: &[String]) -> Vec<(Option<String>, u16)> {
+    if bind_addresses.is_empty() {
+        gateway
+            .spec
+            .listeners
+            .iter()
+            .map(|l| (None, l.port as u16))
+            .collect()
+    } else {
+        bind_addresses
+            .iter()
+            .flat_map(|addr| {
+                gateway
+                    .spec
+                    .listeners
+                    .iter()
+                    .map(move |l| (Some(addr.clone()), l.port as u16))
+            })
+            .collect()
+    }
+}
+
+/// Compute the `Programmed` condition from address usability and data-plane
+/// readiness. Static addresses that the local pod can't bind to (e.g. an LB VIP
+/// that landed on a different node) flip the condition to `AddressNotUsable`.
+fn compute_programmed_condition(
+    gateway: &Gateway,
+    usable: &UsableAddresses,
+    dp_ready: bool,
+) -> status::GatewayCondition {
+    let has_static_addrs = gateway
+        .spec
+        .addresses
+        .as_ref()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    // No discovered addresses → can't determine; assume usable.
+    let addrs_usable = match &gateway.spec.addresses {
+        None => true,
+        Some(addrs) if addrs.is_empty() => true,
+        Some(_) if usable.is_empty() => true,
+        Some(addrs) => {
+            let known = usable.all();
+            addrs.iter().all(|a| match a.r#type.as_deref().unwrap_or("IPAddress") {
+                "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
+                "Hostname" => true,
+                t if t == NETWORK_ADDRESS_TYPE => {
+                    usable.network_ips.contains_key(a.value.as_deref().unwrap_or(""))
+                }
+                _ => false,
+            })
+        }
+    };
+
+    let (ok, reason, message): (bool, &str, &str) = if !addrs_usable {
+        (
+            false,
+            "AddressNotUsable",
+            "One or more addresses in spec.addresses are not usable by this gateway",
+        )
+    } else if !dp_ready && has_static_addrs {
+        (
+            false,
+            "AddressNotUsable",
+            "One or more addresses in spec.addresses are not usable by this gateway",
+        )
+    } else if !dp_ready {
+        warn!("Data plane not ready: not all listener ports are bound");
+        (
+            false,
+            "Invalid",
+            "Data plane not ready: not all listener ports are bound",
+        )
+    } else {
+        (true, "Programmed", "Programmed")
+    };
+
+    status::GatewayCondition {
+        ok,
+        reason: reason.into(),
+        message: message.into(),
+    }
+}
+
+/// Merge the per-Gateway route tables into a single global RouteTable.
+/// Runs on a blocking thread because `to_route_table()` is CPU-bound parsing.
+async fn build_combined_route_table(
+    all_configs: Vec<crate::config::PortailConfig>,
+) -> anyhow::Result<RouteTable> {
+    tokio::task::spawn_blocking(move || {
+        let mut combined = RouteTable::new();
+        for config in &all_configs {
+            let rt = config.to_route_table()?;
+            for (port, scopes) in rt.listener_scopes {
+                combined
+                    .listener_scopes
+                    .entry(port)
+                    .or_default()
+                    .extend(scopes);
+            }
+            combined.tcp_routes.extend(rt.tcp_routes);
+            combined.udp_routes.extend(rt.udp_routes);
+            combined.tls_routes.extend(rt.tls_routes);
+            combined.wildcard_tls_routes.extend(rt.wildcard_tls_routes);
+        }
+        Ok(combined)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
 }
 
 async fn reconcile(
@@ -1115,7 +1362,7 @@ async fn reconcile(
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
 
-    // Verify this Gateway's class is managed by us — read from store, no API call
+    // Verify this Gateway's class is managed by us — cache read, no API call.
     let gateway_class_name = &gateway.spec.gateway_class_name;
     let gc_ref = ObjectRef::<GatewayClass>::new(gateway_class_name);
     let gc = match ctx.cache.gateway_classes.get(&gc_ref) {
@@ -1128,7 +1375,6 @@ async fn reconcile(
             return Ok(Action::requeue(Duration::from_secs(1)));
         }
     };
-
     if gc.spec.controller_name != ctx.controller_name {
         debug!(
             "Gateway {}/{} references GatewayClass '{}' with controller '{}', not ours ('{}')",
@@ -1137,7 +1383,7 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    // Read all resources from reflector caches — no API server calls.
+    // Snapshot reflector caches in one shot — no API server calls.
     let snapshot = ClusterSnapshot {
         http_routes: snapshot(&ctx.cache.http_routes),
         tcp_routes: snapshot(&ctx.cache.tcp_routes),
@@ -1166,51 +1412,27 @@ async fn reconcile(
     );
     let services = resolve_services(&snapshot.services, &ctx.cache.endpoint_slices);
 
-    let (listener_statuses, gateway_accepted, gateway_accepted_reason, gateway_accepted_message) =
+    let (listener_statuses, accepted_cond) =
         validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
 
     let mut usable = discover_usable_addresses(&ctx.cache.services, &ctx.cache.endpoint_slices);
+    resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
 
-    // Resolve portail.epheo.eu/Network address types to actual IPs.
-    // Reads the NetworkAttachmentDefinition to get the subnet, then matches
-    // against local interface IPs discovered via getifaddrs().
-    if let Some(spec_addrs) = &gateway.spec.addresses {
-        for addr in spec_addrs {
-            if addr.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE) {
-                let network_name = addr.value.as_deref().unwrap_or("");
-                if let Some(ip) = resolve_network_to_local_ip(
-                    &ctx.client,
-                    network_name,
-                    &gw_ns,
-                    &usable.interface_ips,
-                )
-                .await
-                {
-                    info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
-                    usable.network_ips.insert(network_name.to_string(), ip);
-                } else {
-                    warn!(
-                        "Gateway {gw_ns}/{gw_name}: could not resolve network '{network_name}' to a local IP"
-                    );
-                }
-            }
-        }
-    }
-
-    // Build config for the triggered Gateway
+    // Build per-Gateway config; bail out with a failing Programmed condition on error.
     let mut result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
+            let failure = status::GatewayCondition {
+                ok: false,
+                reason: "Invalid".into(),
+                message: format!("Reconciliation failed: {}", e),
+            };
             status::update_gateway_status(
                 &ctx.client,
                 &gateway,
-                gateway_accepted,
-                &gateway_accepted_reason,
-                &gateway_accepted_message,
-                false,
-                "Invalid",
-                &format!("Reconciliation failed: {}", e),
+                &accepted_cond,
+                &failure,
                 &HashMap::new(),
                 &listener_statuses,
                 &usable,
@@ -1220,10 +1442,10 @@ async fn reconcile(
         }
     };
 
-    // Replace network-name entries in config addresses with resolved IPs.
-    // This happens after reconcile_to_config() which copies spec.addresses values as-is.
+    // Substitute resolved IPs for portail.epheo.eu/Network entries (reconcile_to_config
+    // copies spec.addresses values as-is).
     if !usable.network_ips.is_empty() {
-        let resolved: Vec<String> = result
+        result.config.gateway.addresses = result
             .config
             .gateway
             .addresses
@@ -1236,63 +1458,16 @@ async fn reconcile(
                     .unwrap_or_else(|| addr.clone())
             })
             .collect();
-        result.config.gateway.addresses = resolved;
     }
 
-    // Determine bind addresses: only use spec.addresses that are local to this pod.
-    // LB VIPs are external routing identities handled by kube-proxy/MetalLB —
-    // the pod binds to 0.0.0.0 for those ports and traffic arrives via
-    // Service routing. DaemonSet+hostNetwork addresses ARE local and should
-    // be bound specifically (interface isolation for multi-network setups).
-    let network_ip_set: HashSet<&str> = usable.network_ips.values().map(|s| s.as_str()).collect();
-    let bind_addresses: Vec<String> = result
-        .config
-        .gateway
-        .addresses
-        .iter()
-        .filter(|addr| {
-            usable.interface_ips.iter().any(|ip| ip == *addr)
-                || network_ip_set.contains(addr.as_str())
-        })
-        .cloned()
-        .collect();
+    let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
+    ensure_data_plane_listeners(&ctx, &result.config.gateway.listeners, &bind_addresses);
 
-    // Dynamically open TCP listeners for ports defined in this Gateway's spec.
-    // Done after reconciliation so ListenerConfig has TLS cert data populated.
-    {
-        let listener_configs = &result.config.gateway.listeners;
-        info!(
-            "Ensuring data plane listeners for ports: {:?}",
-            listener_configs.iter().map(|l| l.port).collect::<Vec<_>>()
-        );
-
-        match ctx.data_plane.lock() {
-            Ok(mut dp) => {
-                let (opened, errors) = dp.add_tcp_listeners(
-                    listener_configs,
-                    &bind_addresses,
-                    ctx.routes.clone(),
-                    &ctx.performance_config,
-                );
-                if opened > 0 {
-                    info!("Opened {} new port(s)", opened);
-                }
-                for (port, err) in &errors {
-                    warn!("Failed to bind port {}: {}", port, err);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to lock data plane: {}", e);
-            }
-        }
-    }
-
-    // Cache this gateway's config and build the global route table from all cached configs.
-    // This avoids re-reconciling other gateways on every change (O(n) instead of O(n²)).
+    // Cache this gateway's config; rebuild from all cached configs to keep
+    // per-gateway changes O(n) instead of O(n²) across the whole class.
     let all_configs = {
         let mut cache = ctx.config_cache.lock().unwrap();
         cache.insert((gw_ns.clone(), gw_name.clone()), result.config.clone());
-        // Prune configs for gateways no longer in the store or managed by a different controller
         let live: HashSet<_> = ctx
             .cache
             .gateways
@@ -1301,19 +1476,14 @@ async fn reconcile(
             .filter(|g| g.spec.gateway_class_name == *gateway_class_name)
             .map(|g| {
                 (
-                    g.metadata
-                        .namespace
-                        .as_deref()
-                        .unwrap_or("default")
-                        .to_string(),
+                    g.metadata.namespace.as_deref().unwrap_or("default").to_string(),
                     g.metadata.name.as_deref().unwrap_or("").to_string(),
                 )
             })
             .collect();
         cache.retain(|k, _| live.contains(k));
-        // Apply fresh endpoint/appProtocol overrides to all cached configs.
-        // These are global state (derived from Services/EndpointSlices), not per-gateway,
-        // so cached configs must use the current values, not stale ones from their last reconcile.
+        // Endpoint/appProtocol overrides come from cluster Service state, not
+        // per-Gateway; refresh cached entries with the current values.
         let mut configs: Vec<_> = cache.values().cloned().collect();
         for config in &mut configs {
             config.endpoint_overrides = services.endpoint_overrides.clone();
@@ -1322,105 +1492,26 @@ async fn reconcile(
         configs
     };
 
-    // Merge TLS cert refs from ALL gateways per port, then hot-reload.
-    // This ensures the SNI resolver has certs from all gateways sharing a port
-    // (e.g. public *.desku.be + private *.mmt + conformance test example.org on port 443).
-    {
-        use crate::config::{
-            CertificateRef, ListenerConfig as LC, Protocol as P, TlsConfig, TlsMode,
-        };
-        let mut merged_certs_by_port: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
-        let mut port_protocol: HashMap<u16, P> = HashMap::new();
-        for config in &all_configs {
-            for listener in &config.gateway.listeners {
-                if let Some(tls_cfg) = &listener.tls {
-                    if tls_cfg.mode == TlsMode::Terminate && !tls_cfg.certificate_refs.is_empty() {
-                        merged_certs_by_port
-                            .entry(listener.port)
-                            .or_default()
-                            .extend(tls_cfg.certificate_refs.clone());
-                        port_protocol
-                            .entry(listener.port)
-                            .or_insert_with(|| listener.protocol.clone());
-                    }
-                }
-            }
-        }
-        if !merged_certs_by_port.is_empty() {
-            let merged_listeners: Vec<LC> = merged_certs_by_port
-                .into_iter()
-                .map(|(port, cert_refs)| LC {
-                    name: format!("merged-tls-{}", port),
-                    protocol: port_protocol.remove(&port).unwrap_or(P::HTTPS),
-                    port,
-                    hostname: None,
-                    address: None,
-                    interface: None,
-                    tls: Some(TlsConfig {
-                        mode: TlsMode::Terminate,
-                        certificate_refs: cert_refs,
-                    }),
-                })
-                .collect();
-            match ctx.data_plane.lock() {
-                Ok(mut dp) => {
-                    let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
-                    if tls_updated > 0 {
-                        debug!("Refreshed merged TLS config for {} port(s)", tls_updated);
-                    }
-                    for (port, err) in &tls_errors {
-                        warn!("Merged TLS config update failed for port {}: {}", port, err);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to lock data plane for TLS update: {}", e);
-                }
-            }
-        }
-    }
+    merge_and_hot_reload_tls(&ctx.data_plane, &all_configs);
 
-    // Build a single route table from all configs.
-    // Each config's to_route_table() adds routes scoped by listener (port, hostname).
-
-    // Compute per-listener attached route counts from accepted routes (for this gateway only).
-    // Use the listener_names field which tracks exactly which listeners each route was accepted by.
-    let mut listener_route_counts: HashMap<String, i32> = HashMap::new();
-    for listener in &gateway.spec.listeners {
-        listener_route_counts.insert(listener.name.clone(), 0);
-    }
+    // Per-listener attached-route counts, restricted to this Gateway's routes.
+    let mut listener_route_counts: HashMap<String, i32> = gateway
+        .spec
+        .listeners
+        .iter()
+        .map(|l| (l.name.clone(), 0))
+        .collect();
     for ra in &result.route_status {
         if ra.accepted {
             for listener_name in &ra.listener_names {
-                *listener_route_counts
-                    .entry(listener_name.clone())
-                    .or_insert(0) += 1;
+                *listener_route_counts.entry(listener_name.clone()).or_insert(0) += 1;
             }
         }
     }
 
-    let route_table = tokio::task::spawn_blocking(move || {
-        let mut combined = crate::routing::RouteTable::new();
-        for config in &all_configs {
-            let rt = config.to_route_table()?;
-            // Merge listener scopes from each gateway's route table
-            for (port, scopes) in rt.listener_scopes {
-                combined
-                    .listener_scopes
-                    .entry(port)
-                    .or_default()
-                    .extend(scopes);
-            }
-            combined.tcp_routes.extend(rt.tcp_routes);
-            combined.udp_routes.extend(rt.udp_routes);
-            combined.tls_routes.extend(rt.tls_routes);
-            combined.wildcard_tls_routes.extend(rt.wildcard_tls_routes);
-        }
-        Ok::<_, anyhow::Error>(combined)
-    })
-    .await
-    .map_err(|e| ReconcileError::Reconcile(e.to_string()))?;
-
-    let route_table_ok = match route_table {
+    // Build + swap the global RouteTable; on failure produce a failing
+    // Programmed condition (route table build is the last step that can fail).
+    let programmed_cond = match build_combined_route_table(all_configs).await {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
             info!(
@@ -1433,147 +1524,45 @@ async fn reconcile(
                 result.config.udp_routes.len(),
             );
 
-            // Verify data plane has bound all required (address, port) endpoints.
-            // Must match what we passed to add_tcp_listeners above.
-            let required_endpoints: Vec<(Option<String>, u16)> = if bind_addresses.is_empty() {
-                gateway
-                    .spec
-                    .listeners
-                    .iter()
-                    .map(|l| (None, l.port as u16))
-                    .collect()
-            } else {
-                bind_addresses
-                    .iter()
-                    .flat_map(|addr| {
-                        gateway
-                            .spec
-                            .listeners
-                            .iter()
-                            .map(move |l| (Some(addr.clone()), l.port as u16))
-                    })
-                    .collect()
-            };
-            let dp_ready = match ctx.data_plane.lock() {
-                Ok(dp) => dp.is_ready_for_endpoints(&required_endpoints),
-                Err(_) => false,
-            };
-            // Check if static addresses are usable by this node
-            let (addrs_usable, addrs_reason, addrs_msg) = if let Some(spec_addrs) =
-                &gateway.spec.addresses
-            {
-                if spec_addrs.is_empty() {
-                    (true, "Programmed", String::from("Programmed"))
-                } else {
-                    let all_usable = if usable.is_empty() {
-                        true // No known addresses — can't determine, assume usable
-                    } else {
-                        let known = usable.all();
-                        spec_addrs.iter().all(|a| {
-                            match a.r#type.as_deref().unwrap_or("IPAddress") {
-                                "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
-                                "Hostname" => true,
-                                t if t == NETWORK_ADDRESS_TYPE => {
-                                    // Resolved if the network name is in network_ips
-                                    let name = a.value.as_deref().unwrap_or("");
-                                    usable.network_ips.contains_key(name)
-                                }
-                                _ => false,
-                            }
-                        })
-                    };
-                    if all_usable {
-                        (true, "Programmed", String::from("Programmed"))
-                    } else {
-                        (
-                                false,
-                                "AddressNotUsable",
-                                String::from(
-                                    "One or more addresses in spec.addresses are not usable by this gateway",
-                                ),
-                            )
-                    }
-                }
-            } else {
-                (true, "Programmed", String::from("Programmed"))
-            };
-
-            let has_static_addrs = gateway
-                .spec
-                .addresses
-                .as_ref()
-                .map(|a| !a.is_empty())
+            let endpoints = required_endpoints(&gateway, &bind_addresses);
+            let dp_ready = ctx
+                .data_plane
+                .lock()
+                .map(|dp| dp.is_ready_for_endpoints(&endpoints))
                 .unwrap_or(false);
-            let (programmed, programmed_reason, programmed_msg) = if !addrs_usable {
-                (false, addrs_reason, addrs_msg)
-            } else if !dp_ready && has_static_addrs {
-                // Static addresses set but bind failed — address not usable on this pod
-                (
-                    false,
-                    "AddressNotUsable",
-                    String::from(
-                        "One or more addresses in spec.addresses are not usable by this gateway",
-                    ),
-                )
-            } else if !dp_ready {
-                warn!("Data plane not ready: not all listener ports are bound");
-                (
-                    false,
-                    "Invalid",
-                    String::from("Data plane not ready: not all listener ports are bound"),
-                )
-            } else {
-                (true, "Programmed", String::from("Programmed"))
-            };
-
-            status::update_gateway_status(
-                &ctx.client,
-                &gateway,
-                gateway_accepted,
-                &gateway_accepted_reason,
-                &gateway_accepted_message,
-                programmed,
-                programmed_reason,
-                &programmed_msg,
-                &listener_route_counts,
-                &listener_statuses,
-                &usable,
-            )
-            .await;
-            dp_ready && addrs_usable
+            compute_programmed_condition(&gateway, &usable, dp_ready)
         }
         Err(e) => {
             error!(
                 "Failed to build route table for Gateway {}/{}: {}",
                 gw_ns, gw_name, e
             );
-            status::update_gateway_status(
-                &ctx.client,
-                &gateway,
-                gateway_accepted,
-                &gateway_accepted_reason,
-                &gateway_accepted_message,
-                false,
-                "Invalid",
-                &format!("Route table conversion failed: {}", e),
-                &listener_route_counts,
-                &listener_statuses,
-                &usable,
-            )
-            .await;
-            false
+            status::GatewayCondition {
+                ok: false,
+                reason: "Invalid".into(),
+                message: format!("Route table conversion failed: {}", e),
+            }
         }
     };
+    let programmed = programmed_cond.ok;
 
-    // Update per-route status — group by (kind, name, namespace) to write all
-    // parent statuses in a single patch (prevents SSA from overwriting previous entries
-    // when a route references multiple listeners/gateways).
-    let programmed = route_table_ok;
+    status::update_gateway_status(
+        &ctx.client,
+        &gateway,
+        &accepted_cond,
+        &programmed_cond,
+        &listener_route_counts,
+        &listener_statuses,
+        &usable,
+    )
+    .await;
+
+    // Update per-route status — group by (kind, ns, name) so SSA writes all
+    // parent entries together (otherwise multi-listener routes lose previous
+    // entries on each patch).
     {
         use std::collections::BTreeMap;
-        // Use a per-gateway field manager so SSA doesn't overwrite parents from other gateways
         let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
-        // Key: (kind, namespace, name) → Vec of parent statuses
         let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> =
             BTreeMap::new();
         for ra in &result.route_status {
