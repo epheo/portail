@@ -57,6 +57,37 @@ pub struct DataPlane {
 /// Maximum time to wait for in-flight connections on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Merge TLS cert refs across all Terminate listeners on the same port.
+///
+/// One TCP listener per port serves traffic for every (port, hostname) scope,
+/// so its `ServerConfig` must hold every hostname's cert. Building per-listener
+/// would let the last write clobber earlier listeners and strand SNIs — e.g.
+/// `example.org` via a catch-all listener gets dropped when a sibling
+/// `https-with-hostname` listener is processed last, hanging its TLS handshake
+/// until the client times out.
+fn merge_cert_refs_by_port(
+    listener_configs: &[ListenerConfig],
+) -> std::collections::HashMap<u16, Vec<CertificateRef>> {
+    let mut merged: std::collections::HashMap<u16, Vec<CertificateRef>> =
+        std::collections::HashMap::new();
+    for listener_cfg in listener_configs {
+        let Some(tls_cfg) = &listener_cfg.tls else {
+            continue;
+        };
+        if tls_cfg.mode != TlsMode::Terminate {
+            continue;
+        }
+        if !matches!(listener_cfg.protocol, Protocol::HTTPS | Protocol::TLS) {
+            continue;
+        }
+        merged
+            .entry(listener_cfg.port)
+            .or_default()
+            .extend(tls_cfg.certificate_refs.iter().cloned());
+    }
+    merged
+}
+
 /// Compute a fingerprint of all cert PEM bytes for change detection.
 /// Uses FNV-1a for speed — collision resistance isn't critical here,
 /// a false positive just triggers one extra ServerConfig rebuild.
@@ -195,26 +226,9 @@ impl DataPlane {
             addresses.iter().map(|a| Some(a.as_str())).collect()
         };
 
-        // Merge TLS cert refs across all Terminate listeners on the same port —
-        // one TCP listener per port serves traffic for every (port, hostname)
-        // scope, so its ServerConfig must hold every hostname's cert. Building
-        // per-listener would let the last write clobber earlier listeners and
-        // strand SNIs (e.g. `example.org` via catch-all listener gets dropped
-        // when `https-with-hostname` is processed last, hanging its TLS).
-        let mut merged_cert_refs: std::collections::HashMap<u16, Vec<CertificateRef>> =
-            std::collections::HashMap::new();
-        for listener_cfg in listener_configs {
-            if let Some(tls_cfg) = &listener_cfg.tls {
-                if tls_cfg.mode == TlsMode::Terminate
-                    && matches!(listener_cfg.protocol, Protocol::HTTPS | Protocol::TLS)
-                {
-                    merged_cert_refs
-                        .entry(listener_cfg.port)
-                        .or_default()
-                        .extend(tls_cfg.certificate_refs.iter().cloned());
-                }
-            }
-        }
+        // Merge TLS cert refs across all Terminate listeners on the same port
+        // (see `merge_cert_refs_by_port`).
+        let merged_cert_refs = merge_cert_refs_by_port(listener_configs);
 
         for listener_cfg in listener_configs {
             let port = listener_cfg.port;
@@ -356,47 +370,6 @@ impl DataPlane {
             } // end for bind_addr
         }
         (opened, errors)
-    }
-
-    /// Update TLS configs for all listeners from the latest reconciled config.
-    /// Called on every reconcile to pick up Secret changes (cert-manager rotation, etc.).
-    /// Returns the number of ports updated and any errors.
-    pub fn update_tls_configs(
-        &mut self,
-        listener_configs: &[ListenerConfig],
-    ) -> (usize, Vec<(u16, String)>) {
-        let mut updated = 0;
-        let mut errors = Vec::new();
-        for listener_cfg in listener_configs {
-            let port = listener_cfg.port;
-            match (&listener_cfg.protocol, &listener_cfg.tls) {
-                (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
-                    if tls_cfg.mode == TlsMode::Terminate =>
-                {
-                    if let Some(existing) = self.tls_configs.get(&port) {
-                        let fingerprint = compute_cert_fingerprint(&tls_cfg.certificate_refs);
-                        if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
-                            continue; // Certs unchanged — skip hot-reload
-                        }
-                        match tls::build_server_config(
-                            &tls_cfg.certificate_refs,
-                            std::path::Path::new("/unused"),
-                        ) {
-                            Ok(config) => {
-                                existing.update(config);
-                                self.tls_cert_hashes.insert(port, fingerprint);
-                                updated += 1;
-                            }
-                            Err(e) => {
-                                errors.push((port, format!("TLS config rebuild failed: {}", e)));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        (updated, errors)
     }
 
     /// Start async listener tasks (one accept loop per TCP listener / UDP socket).
@@ -562,4 +535,106 @@ fn create_udp_socket(
     socket.bind(&addr.into())?;
 
     Ok(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        CertificateRef, ListenerConfig, Protocol as P, TlsConfig, TlsMode as TM,
+    };
+
+    fn https_listener(name: &str, port: u16, hostname: Option<&str>, cert_name: &str) -> ListenerConfig {
+        ListenerConfig {
+            name: name.into(),
+            protocol: P::HTTPS,
+            port,
+            hostname: hostname.map(str::to_string),
+            address: None,
+            interface: None,
+            tls: Some(TlsConfig {
+                mode: TM::Terminate,
+                certificate_refs: vec![CertificateRef {
+                    name: cert_name.into(),
+                    hostname: hostname.map(str::to_string),
+                    cert_pem: Some(b"PEM-CERT".to_vec()),
+                    key_pem: Some(b"PEM-KEY".to_vec()),
+                }],
+            }),
+        }
+    }
+
+    /// Two TLS-Terminate listeners on the same port — one catch-all, one
+    /// hostname-scoped — must produce one merged cert-ref list under that
+    /// port, in listener order. Regression for the bug where per-listener
+    /// `existing.update(config)` clobbered sibling SNI bindings and hung
+    /// the catch-all's TLS (Gateway API conformance HTTPRouteHTTPSListener).
+    #[test]
+    fn merges_same_port_listeners_into_one_cert_list() {
+        let listeners = vec![
+            https_listener("https", 443, None, "default-cert"),
+            https_listener("https-with-hostname", 443, Some("second.example.org"), "default-cert"),
+        ];
+        let merged = merge_cert_refs_by_port(&listeners);
+
+        assert_eq!(merged.len(), 1, "one port expected");
+        let refs = &merged[&443];
+        assert_eq!(refs.len(), 2, "both listeners' refs must appear");
+        assert_eq!(refs[0].hostname, None, "catch-all listener's ref comes first");
+        assert_eq!(
+            refs[1].hostname.as_deref(),
+            Some("second.example.org"),
+            "hostname-scoped listener's ref preserves its hostname"
+        );
+    }
+
+    /// Listeners on different ports stay isolated; non-TLS / Passthrough
+    /// listeners contribute nothing.
+    #[test]
+    fn merge_respects_port_and_mode() {
+        let mut passthrough = https_listener("tlsp", 9443, Some("passthrough.example.org"), "p");
+        passthrough.protocol = P::TLS;
+        passthrough.tls.as_mut().unwrap().mode = TM::Passthrough;
+
+        let listeners = vec![
+            https_listener("a", 443, None, "ca"),
+            https_listener("b", 8443, Some("b.example.org"), "cb"),
+            passthrough,
+            ListenerConfig {
+                name: "http-only".into(),
+                protocol: P::HTTP,
+                port: 80,
+                hostname: None,
+                address: None,
+                interface: None,
+                tls: None,
+            },
+        ];
+        let merged = merge_cert_refs_by_port(&listeners);
+
+        assert_eq!(merged.keys().copied().collect::<Vec<_>>().len(), 2);
+        assert!(merged.contains_key(&443));
+        assert!(merged.contains_key(&8443));
+        assert!(!merged.contains_key(&9443), "Passthrough must not contribute");
+        assert!(!merged.contains_key(&80), "HTTP must not contribute");
+    }
+
+    /// Fingerprint over a port's merged refs must be stable across calls —
+    /// if it weren't, every reconcile would flip the cache between siblings
+    /// and re-trigger hot-reloads forever (the symptom that originally
+    /// surfaced the bug in `Hot-reloaded TLS config for port 443` log spam).
+    #[test]
+    fn merged_fingerprint_is_stable_across_calls() {
+        let listeners = vec![
+            https_listener("https", 443, None, "c"),
+            https_listener("https-with-hostname", 443, Some("h.example.org"), "c"),
+        ];
+        let m1 = merge_cert_refs_by_port(&listeners);
+        let m2 = merge_cert_refs_by_port(&listeners);
+        assert_eq!(
+            compute_cert_fingerprint(&m1[&443]),
+            compute_cert_fingerprint(&m2[&443]),
+            "deterministic input must hash deterministically",
+        );
+    }
 }
