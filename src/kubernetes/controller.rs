@@ -306,6 +306,12 @@ struct ControllerCtx {
     routes: Arc<ArcSwap<RouteTable>>,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
+    /// When false, the operator owns Gateway/GatewayClass lifecycle status
+    /// (Accepted/Programmed/addresses); portail reports only listener + route status.
+    manage_gateway_status: bool,
+    /// Flipped to true once the data plane has bound this instance's listener
+    /// ports. Surfaced via the readiness endpoint for the pod's readinessProbe.
+    ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Create a reflector for a resource type, returning the store and a stream.
@@ -425,6 +431,8 @@ pub async fn run_controller(
     shutdown: CancellationToken,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
+    manage_gateway_status: bool,
+    ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
@@ -514,6 +522,8 @@ pub async fn run_controller(
         routes,
         data_plane,
         performance_config,
+        manage_gateway_status,
+        ready,
     });
 
     // --- Gateway controller ---
@@ -598,6 +608,7 @@ pub async fn run_controller(
         client,
         controller_name,
         store: store_gateway_classes,
+        manage_gateway_status,
     });
     let gc_controller = gc_controller
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
@@ -1436,6 +1447,7 @@ async fn reconcile(
                 &HashMap::new(),
                 &listener_statuses,
                 &usable,
+                ctx.manage_gateway_status,
             )
             .await;
             return Err(ReconcileError::Reconcile(e.to_string()));
@@ -1530,6 +1542,11 @@ async fn reconcile(
                 .lock()
                 .map(|dp| dp.is_ready_for_endpoints(&endpoints))
                 .unwrap_or(false);
+            // Once the data plane has bound this gateway's listener ports, the
+            // pod is serving — latch readiness on (never flips back).
+            if dp_ready {
+                ctx.ready.store(true, std::sync::atomic::Ordering::Release);
+            }
             compute_programmed_condition(&gateway, &usable, dp_ready)
         }
         Err(e) => {
@@ -1554,6 +1571,7 @@ async fn reconcile(
         &listener_route_counts,
         &listener_statuses,
         &usable,
+        ctx.manage_gateway_status,
     )
     .await;
 
@@ -1629,6 +1647,8 @@ struct GatewayClassCtx {
     client: Client,
     controller_name: String,
     store: Store<GatewayClass>,
+    /// When false, the operator owns GatewayClass status; portail skips writing it.
+    manage_gateway_status: bool,
 }
 
 async fn reconcile_gateway_class(
@@ -1636,6 +1656,11 @@ async fn reconcile_gateway_class(
     ctx: Arc<GatewayClassCtx>,
 ) -> Result<Action, ReconcileError> {
     if gc.spec.controller_name != ctx.controller_name {
+        return Ok(Action::await_change());
+    }
+
+    // When running under portail-operator, the operator owns GatewayClass status.
+    if !ctx.manage_gateway_status {
         return Ok(Action::await_change());
     }
 

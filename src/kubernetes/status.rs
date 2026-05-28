@@ -132,6 +132,7 @@ pub(crate) async fn update_gateway_status(
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
     usable: &UsableAddresses,
+    manage_conditions: bool,
 ) {
     let name = gateway.name_any();
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -333,6 +334,15 @@ pub(crate) async fn update_gateway_status(
         })]
     };
 
+    // portail always owns per-listener status. When the operator manages
+    // lifecycle status, it owns conditions + addresses (written under a
+    // separate field manager); portail omits them so SSA ownership stays
+    // disjoint and the two writers don't clobber each other.
+    let mut status_inner = serde_json::json!({ "listeners": listeners });
+    if manage_conditions {
+        status_inner["conditions"] = serde_json::json!(conditions);
+        status_inner["addresses"] = serde_json::json!(addresses);
+    }
     let status = serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "Gateway",
@@ -340,11 +350,7 @@ pub(crate) async fn update_gateway_status(
             "name": name,
             "namespace": ns,
         },
-        "status": {
-            "conditions": conditions,
-            "listeners": listeners,
-            "addresses": addresses,
-        }
+        "status": status_inner,
     });
 
     match api

@@ -59,6 +59,24 @@ pub struct DataPlane {
 /// Maximum time to wait for in-flight connections on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Number of data-plane worker tasks / `SO_REUSEPORT` listeners per port, and
+/// the Tokio runtime worker-thread count.
+///
+/// Capped so a per-Gateway pod does not spawn one worker per host core: host
+/// core counts can be dozens, and with many small per-Gateway pods that
+/// multiplies into hundreds of threads, exhausting the node's PID/thread limit
+/// (containers then fail to fork). Override with `PORTAIL_MAX_WORKERS`.
+pub fn effective_worker_count() -> usize {
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let cap = std::env::var("PORTAIL_MAX_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
+    avail.min(cap).max(1)
+}
+
 /// Compute a fingerprint of all cert PEM bytes for change detection.
 /// Uses FNV-1a for speed — collision resistance isn't critical here,
 /// a false positive just triggers one extra ServerConfig rebuild.
@@ -88,9 +106,7 @@ impl DataPlane {
         performance_config: &PerformanceConfig,
         cert_dir: &std::path::Path,
     ) -> Result<Self> {
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let worker_count = effective_worker_count();
         let health = Arc::new(HealthRegistry::new());
 
         let mut tcp_listeners = Vec::new();
@@ -191,9 +207,7 @@ impl DataPlane {
         routes: Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
     ) -> (usize, Vec<(u16, String)>) {
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let worker_count = effective_worker_count();
         let mut opened = 0usize;
         let mut errors = Vec::new();
 

@@ -68,6 +68,7 @@ fn main() -> Result<()> {
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(data_plane::effective_worker_count())
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
@@ -120,6 +121,18 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         let token = shutdown_token.clone();
         let k8s_data_plane = data_plane.clone();
         let k8s_perf = performance_config.clone();
+        let manage_gateway_status = args.manage_gateway_status;
+
+        // Readiness flag — flipped true by the reconciler once the data plane
+        // has bound its listener ports. Served on the readiness endpoint so the
+        // operator's readinessProbe gates LB traffic and the Programmed status.
+        let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(readiness::serve_readiness(
+            args.readiness_port,
+            ready_flag.clone(),
+            shutdown_token.clone(),
+        ));
+
         tokio::spawn(async move {
             if let Err(e) = kubernetes::controller::run_controller(
                 k8s_routes,
@@ -127,6 +140,8 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
                 token,
                 k8s_data_plane,
                 k8s_perf,
+                manage_gateway_status,
+                ready_flag,
             )
             .await
             {
