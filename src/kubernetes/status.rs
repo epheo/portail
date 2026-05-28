@@ -9,7 +9,6 @@ use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 
 use crate::kubernetes::controller::{UsableAddresses, NETWORK_ADDRESS_TYPE};
@@ -115,18 +114,24 @@ fn transition_time_json(
     now.to_string()
 }
 
+/// One Gateway status condition, as computed by the reconciler.
+/// Bundles the previously-loose `(bool, reason, message)` triple.
+#[derive(Clone, Debug)]
+pub(crate) struct GatewayCondition {
+    pub ok: bool,
+    pub reason: String,
+    pub message: String,
+}
+
 pub(crate) async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
-    accepted: bool,
-    accepted_reason: &str,
-    accepted_message: &str,
-    programmed: bool,
-    programmed_reason: &str,
-    programmed_message: &str,
+    accepted: &GatewayCondition,
+    programmed: &GatewayCondition,
     listener_route_counts: &HashMap<String, i32>,
     listener_statuses: &HashMap<String, ListenerStatus>,
     usable: &UsableAddresses,
+    manage_conditions: bool,
 ) {
     let name = gateway.name_any();
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -143,17 +148,17 @@ pub(crate) async fn update_gateway_status(
         .cloned()
         .unwrap_or_default();
 
-    let accepted_status = if accepted { "True" } else { "False" };
-    let accepted_reason_str = if accepted {
+    let accepted_status = if accepted.ok { "True" } else { "False" };
+    let accepted_reason_str = if accepted.ok {
         "Accepted"
     } else {
-        accepted_reason
+        accepted.reason.as_str()
     };
-    let programmed_status = if programmed { "True" } else { "False" };
-    let programmed_reason_str = if programmed {
+    let programmed_status = if programmed.ok { "True" } else { "False" };
+    let programmed_reason_str = if programmed.ok {
         "Programmed"
     } else {
-        programmed_reason
+        programmed.reason.as_str()
     };
 
     let conditions = vec![
@@ -161,7 +166,7 @@ pub(crate) async fn update_gateway_status(
             type_: "Accepted".to_string(),
             status: accepted_status.to_string(),
             reason: accepted_reason_str.to_string(),
-            message: accepted_message.to_string(),
+            message: accepted.message.clone(),
             last_transition_time: transition_time(
                 &existing_conditions,
                 "Accepted",
@@ -175,7 +180,7 @@ pub(crate) async fn update_gateway_status(
             type_: "Programmed".to_string(),
             status: programmed_status.to_string(),
             reason: programmed_reason_str.to_string(),
-            message: programmed_message.to_string(),
+            message: programmed.message.clone(),
             last_transition_time: transition_time(
                 &existing_conditions,
                 "Programmed",
@@ -328,6 +333,15 @@ pub(crate) async fn update_gateway_status(
         })]
     };
 
+    // portail always owns per-listener status. When the operator manages
+    // lifecycle status, it owns conditions + addresses (written under a
+    // separate field manager); portail omits them so SSA ownership stays
+    // disjoint and the two writers don't clobber each other.
+    let mut status_inner = serde_json::json!({ "listeners": listeners });
+    if manage_conditions {
+        status_inner["conditions"] = serde_json::json!(conditions);
+        status_inner["addresses"] = serde_json::json!(addresses);
+    }
     let status = serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "Gateway",
@@ -335,11 +349,7 @@ pub(crate) async fn update_gateway_status(
             "name": name,
             "namespace": ns,
         },
-        "status": {
-            "conditions": conditions,
-            "listeners": listeners,
-            "addresses": addresses,
-        }
+        "status": status_inner,
     });
 
     match api
@@ -352,79 +362,6 @@ pub(crate) async fn update_gateway_status(
     {
         Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
         Err(e) => warn!("Failed to update Gateway {}/{} status: {}", ns, name, e),
-    }
-}
-
-pub async fn update_gateway_class_status(
-    client: &Client,
-    gc: &GatewayClass,
-    accepted: bool,
-    message: &str,
-) {
-    let name = gc.name_any();
-    let api: Api<GatewayClass> = Api::all(client.clone());
-
-    let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now());
-    let generation = gc.metadata.generation;
-
-    // Preserve lastTransitionTime from existing conditions
-    let existing_conditions: Vec<Condition> = gc
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .cloned()
-        .unwrap_or_default();
-
-    let gc_status = if accepted { "True" } else { "False" };
-    let gc_reason = if accepted {
-        "Accepted"
-    } else {
-        "InvalidParameters"
-    };
-
-    let conditions = vec![Condition {
-        type_: "Accepted".to_string(),
-        status: gc_status.to_string(),
-        reason: gc_reason.to_string(),
-        message: message.to_string(),
-        last_transition_time: transition_time(
-            &existing_conditions,
-            "Accepted",
-            gc_status,
-            gc_reason,
-            &now,
-        ),
-        observed_generation: generation,
-    }];
-
-    // Declare supported features from the canonical list
-    let supported_features: Vec<serde_json::Value> = super::features::SUPPORTED_FEATURES
-        .iter()
-        .map(|name| serde_json::json!({"name": name}))
-        .collect();
-
-    let status = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "GatewayClass",
-        "metadata": {
-            "name": name,
-        },
-        "status": {
-            "conditions": conditions,
-            "supportedFeatures": supported_features,
-        }
-    });
-
-    match api
-        .patch_status(
-            &name,
-            &PatchParams::apply("portail").force(),
-            &Patch::Apply(status),
-        )
-        .await
-    {
-        Ok(_) => debug!("Updated GatewayClass {} status", name),
-        Err(e) => warn!("Failed to update GatewayClass {} status: {}", name, e),
     }
 }
 

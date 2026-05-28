@@ -25,6 +25,7 @@ const (
 	gatewayAPIVersion = "v1.4.1"
 	portailVersion    = "v0.1.0"
 	portailImage      = "ghcr.io/epheo/portail:latest"
+	operatorImage     = "quay.io/epheo/portail-operator:latest"
 )
 
 var kubeconfigPath string
@@ -63,6 +64,12 @@ func TestMain(m *testing.M) {
 
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
+	// No TimeoutConfig overrides — per-Gateway scoping landed in the
+	// per-gateway-scoping branch, so the suite's upstream defaults
+	// (60s GatewayStatus/RouteCondition/RouteMustHaveParents,
+	// 30s MaxTimeToConsistency, 60s DefaultTestTimeout) leave ample
+	// headroom over the empirically measured worst case (~13s) for
+	// fresh Gateway provisioning through portail-operator.
 	if addrs := os.Getenv("USABLE_ADDRESSES"); addrs != "" {
 		opts.UsableNetworkAddresses = parseAddresses(addrs)
 	}
@@ -100,39 +107,30 @@ nodes:
 	}
 	os.Setenv("KUBECONFIG", kubeconfigPath)
 
-	log.Println("Building and loading image...")
-	if err := sh(runtime, "build", "--no-cache", "-t", portailImage, "-f", filepath.Join(projectDir, "Containerfile"), projectDir); err != nil {
-		return err
-	}
-	archiveFile, err := os.CreateTemp("", "portail-image-*.tar")
-	if err != nil {
-		return fmt.Errorf("create temp archive: %w", err)
-	}
-	archive := archiveFile.Name()
-	archiveFile.Close()
-	defer os.Remove(archive)
-	if err := sh(runtime, "save", "--output", archive, portailImage); err != nil {
-		return err
-	}
-	nodes, err := provider.ListNodes(clusterName)
-	if err != nil {
-		return fmt.Errorf("list kind nodes: %w", err)
-	}
-	for _, node := range nodes {
-		f, err := os.Open(archive)
-		if err != nil {
+	if os.Getenv("SKIP_PORTAIL_BUILD") == "" {
+		log.Println("Building portail image...")
+		if err := sh(runtime, "build", "--no-cache", "-t", portailImage, "-f", filepath.Join(projectDir, "Containerfile"), projectDir); err != nil {
 			return err
 		}
-		// Import without --digests so the :latest tag is assigned from the archive.
-		// kind's nodeutils.LoadImageArchive uses --digests which only stores digest
-		// refs, causing kubelet to pull from the remote registry.
-		cmd := node.Command("ctr", "--namespace=k8s.io", "images", "import", "--all-platforms", "-")
-		cmd.SetStdin(f)
-		err = cmd.Run()
-		f.Close()
-		if err != nil {
-			return fmt.Errorf("load image into node %s: %w", node, err)
-		}
+	} else {
+		log.Println("SKIP_PORTAIL_BUILD set — reusing existing portail image")
+	}
+	log.Println("Loading portail image into Kind...")
+	if err := loadImageIntoKind(provider, runtime, portailImage); err != nil {
+		return err
+	}
+
+	// Build + load the operator image — it provisions the per-Gateway data planes.
+	operatorDir := os.Getenv("OPERATOR_DIR")
+	if operatorDir == "" {
+		operatorDir = filepath.Join(filepath.Dir(projectDir), "portail-operator")
+	}
+	log.Println("Building and loading operator image...")
+	if err := sh(runtime, "build", "--no-cache", "-t", operatorImage, "-f", filepath.Join(operatorDir, "Containerfile"), operatorDir); err != nil {
+		return err
+	}
+	if err := loadImageIntoKind(provider, runtime, operatorImage); err != nil {
+		return err
 	}
 
 	log.Println("Installing Gateway API CRDs...")
@@ -165,22 +163,32 @@ nodes:
 		return err
 	}
 
-	log.Println("Deploying Portail...")
-	manifestsDir := filepath.Join(mustGetwd(), "manifests")
-	if err := kc("apply", "-k", manifestsDir); err != nil {
+	log.Println("Deploying portail-operator...")
+	if err := kc("apply", "-k", filepath.Join(operatorDir, "config", "default")); err != nil {
 		return err
 	}
-	if err := kc("wait", "deployment/portail", "-n", "portail-system",
-		"--for=condition=available", "--timeout=120s"); err != nil {
+	// kustomize ships a placeholder image; point the manager at the loaded one.
+	if err := kc("-n", "portail-operator-system", "set", "image",
+		"deployment/portail-operator-controller-manager", "manager="+operatorImage); err != nil {
+		return err
+	}
+	// One data-plane replica per Gateway keeps the single Kind node's pod/thread
+	// count manageable (appended; Go's flag package takes the last value).
+	if err := kc("-n", "portail-operator-system", "patch",
+		"deployment/portail-operator-controller-manager", "--type=json",
+		"-p", `[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--default-replicas=1"}]`); err != nil {
+		return err
+	}
+	if err := kc("wait", "deployment/portail-operator-controller-manager",
+		"-n", "portail-operator-system", "--for=condition=available", "--timeout=180s"); err != nil {
 		return err
 	}
 
-	log.Println("Waiting for LoadBalancer VIP...")
-	vip, err := waitForVIP("portail-system", "portail", 2*time.Minute)
-	if err != nil {
+	// The operator creates and accepts the GatewayClass under leader election.
+	log.Println("Waiting for GatewayClass 'portail' to be accepted...")
+	if err := waitForGatewayClassAccepted("portail", 2*time.Minute); err != nil {
 		return err
 	}
-	log.Printf("VIP: %s", vip)
 
 	out, err := exec.Command(runtime, "run", "--rm", portailImage, "--supported-features").Output()
 	if err != nil {
@@ -189,9 +197,14 @@ nodes:
 	features := strings.TrimSpace(string(out))
 	log.Printf("Supported features: %s", features)
 
+	// Reserve the top of the MetalLB pool as the "usable" static address for
+	// the GatewayStaticAddresses tests (the operator maps spec.addresses to the
+	// Service's requested LB IP). Auto-assigned VIPs come from the same pool.
+	usableIP := poolEndIP(poolRange)
+
 	// Execute tests on the Kind network: MetalLB L2 VIPs are only reachable
 	// from inside the container network.
-	code, err := execOnKindNetwork(provider, runtime, projectDir, vip, features)
+	code, err := execOnKindNetwork(provider, runtime, projectDir, usableIP, features)
 	if err != nil {
 		return err
 	}
@@ -251,7 +264,7 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 		"registry.fedoraproject.org/fedora-minimal:43",
 		"/conformance.test",
 		"-test.v",
-		"-test.timeout", "15m",
+		"-test.timeout", "25m",
 		"-test.count", "1",
 		"-test.run", "TestConformance",
 		"-gateway-class", "portail",
@@ -375,6 +388,67 @@ metadata:
 `
 	path := filepath.Join(os.TempDir(), "metallb-pool.yaml")
 	return path, os.WriteFile(path, []byte(fmt.Sprintf(tpl, addressRange)), 0644)
+}
+
+// loadImageIntoKind saves a local image and imports it into every Kind node.
+// Imports without --digests so the :latest tag is assigned from the archive —
+// kind's nodeutils.LoadImageArchive uses --digests (digest-only refs), which
+// makes kubelet pull from the remote registry instead of using the local image.
+func loadImageIntoKind(provider *cluster.Provider, runtime, image string) error {
+	archiveFile, err := os.CreateTemp("", "portail-image-*.tar")
+	if err != nil {
+		return fmt.Errorf("create temp archive: %w", err)
+	}
+	archive := archiveFile.Name()
+	archiveFile.Close()
+	defer os.Remove(archive)
+	if err := sh(runtime, "save", "--output", archive, image); err != nil {
+		return err
+	}
+	nodes, err := provider.ListNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("list kind nodes: %w", err)
+	}
+	for _, node := range nodes {
+		f, err := os.Open(archive)
+		if err != nil {
+			return err
+		}
+		cmd := node.Command("ctr", "--namespace=k8s.io", "images", "import", "--all-platforms", "-")
+		cmd.SetStdin(f)
+		err = cmd.Run()
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("load image %s into node %s: %w", image, node, err)
+		}
+	}
+	return nil
+}
+
+// waitForGatewayClassAccepted blocks until the named GatewayClass reports
+// Accepted=True (the operator sets this under leader election).
+func waitForGatewayClassAccepted(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, _ := kcOutput("get", "gatewayclass", name,
+			"-o", `jsonpath={.status.conditions[?(@.type=="Accepted")].status}`)
+		if strings.TrimSpace(string(out)) == "True" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for GatewayClass %s to be Accepted", name)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// poolEndIP returns the last IP of a "start-end" MetalLB pool range.
+func poolEndIP(poolRange string) string {
+	parts := strings.SplitN(poolRange, "-", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return strings.TrimSpace(poolRange)
 }
 
 func waitForVIP(ns, name string, timeout time.Duration) (string, error) {

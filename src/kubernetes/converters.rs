@@ -602,23 +602,29 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
     }
 }
 
+/// Convert a slice of L4 backend refs (TCP/TLS/UDP) to internal `BackendRef`s.
+fn convert_l4_backend_refs<B: L4BackendRefAccess>(
+    refs: &[B],
+    ns: &str,
+    proto: &str,
+    default_port: Option<i32>,
+) -> Vec<BackendRef> {
+    refs.iter()
+        .map(|br| convert_l4_backend_ref(br, ns, proto, default_port))
+        .collect()
+}
+
 pub(crate) fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<TcpRouteConfig> {
     let ns = route_namespace(&route.metadata);
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
-
     let rules = route
         .spec
         .rules
         .iter()
         .map(|r| TcpRouteRule {
-            backend_refs: r
-                .backend_refs
-                .iter()
-                .map(|br| convert_l4_backend_ref(br, ns, "TCP", Some(80)))
-                .collect(),
+            backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "TCP", Some(80)),
         })
         .collect();
-
     Ok(TcpRouteConfig { parent_refs, rules })
 }
 
@@ -626,20 +632,14 @@ pub(crate) fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<
     let ns = route_namespace(&route.metadata);
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let hostnames = route.spec.hostnames.clone();
-
     let rules = route
         .spec
         .rules
         .iter()
         .map(|r| TlsRouteRule {
-            backend_refs: r
-                .backend_refs
-                .iter()
-                .map(|br| convert_l4_backend_ref(br, ns, "TLS", Some(443)))
-                .collect(),
+            backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "TLS", Some(443)),
         })
         .collect();
-
     Ok(TlsRouteConfig {
         parent_refs,
         hostnames,
@@ -650,20 +650,14 @@ pub(crate) fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<
 pub(crate) fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteConfig> {
     let ns = route_namespace(&route.metadata);
     let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
-
     let rules = route
         .spec
         .rules
         .iter()
         .map(|r| UdpRouteRule {
-            backend_refs: r
-                .backend_refs
-                .iter()
-                .map(|br| convert_l4_backend_ref(br, ns, "UDP", None))
-                .collect(),
+            backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "UDP", None),
         })
         .collect();
-
     Ok(UdpRouteConfig { parent_refs, rules })
 }
 

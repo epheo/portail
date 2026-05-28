@@ -9,9 +9,20 @@ jobs:
   conformance:
     name: Gateway API Conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v5
+
+      # The operator provisions the per-Gateway data planes the suite exercises.
+      # Checked out beside the portail repo; OPERATOR_DIR points the harness at it.
+      # NOTE: tracks the operator's main; keep operator + portail conformance
+      # changes released together (cross-repo coupling).
+      - name: Checkout portail-operator
+        uses: actions/checkout@v5
+        with:
+          repository: epheo/portail-operator
+          ref: main
+          path: portail-operator
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -24,7 +35,9 @@ jobs:
 
       - name: Run conformance tests
         working-directory: conformance
-        run: go test -v -timeout 20m -run TestConformance -count=1
+        env:
+          OPERATOR_DIR: ${{ github.workspace }}/portail-operator
+        run: go test -v -timeout 45m -run TestConformance -count=1
 
       - name: Upload conformance report
         if: always()
