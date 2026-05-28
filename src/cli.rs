@@ -79,9 +79,19 @@ pub struct Args {
     pub manage_gateway_status: bool,
 
     /// Port for the readiness endpoint (/readyz) served in Kubernetes mode.
-    #[arg(long, default_value_t = 8081)]
+    /// Default 19099: in the conventional proxy-management range, well clear of
+    /// common Gateway listener ports (80, 443, 8080, 8081, 8443, …) so it does
+    /// not collide with the data plane within the same pod.
+    #[arg(long, default_value_t = 19099)]
     #[arg(help = "Port for the /readyz readiness endpoint (Kubernetes mode)")]
     pub readiness_port: u16,
+
+    /// Restrict the K8s controller to a single Gateway (`namespace/name`).
+    /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
+    /// legacy unscoped mode that watches all Gateways cluster-wide.
+    #[arg(long, value_name = "NS/NAME")]
+    #[arg(help = "Restrict to a single Gateway (format: namespace/name); operator sets this")]
+    pub gateway: Option<String>,
 }
 
 impl Args {
@@ -123,6 +133,9 @@ impl Args {
             return Err("--kubernetes and --config are mutually exclusive".to_string());
         }
 
+        // Validate --gateway format early so a malformed scope fails fast.
+        self.gateway_scope()?;
+
         Ok(())
     }
 
@@ -134,6 +147,26 @@ impl Args {
     /// Determine if the application should exit early (generation mode)
     pub fn is_generation_mode(&self) -> bool {
         self.generate_config.is_some()
+    }
+
+    /// Parse `--gateway namespace/name` into a `(namespace, name)` scope.
+    /// Returns `Ok(None)` when unset, `Err` with a clear message on malformed input.
+    pub fn gateway_scope(&self) -> Result<Option<(String, String)>, String> {
+        match self.gateway.as_deref() {
+            None => Ok(None),
+            Some(s) => {
+                let (ns, name) = s
+                    .split_once('/')
+                    .ok_or_else(|| format!("--gateway must be 'namespace/name', got {:?}", s))?;
+                if ns.is_empty() || name.is_empty() {
+                    return Err(format!(
+                        "--gateway namespace and name must be non-empty, got {:?}",
+                        s
+                    ));
+                }
+                Ok(Some((ns.to_string(), name.to_string())))
+            }
+        }
     }
 }
 
@@ -157,7 +190,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_ok());
 
@@ -174,7 +208,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_ok());
 
@@ -191,7 +226,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_err());
     }
@@ -211,7 +247,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_err());
 
@@ -228,7 +265,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_err());
     }
@@ -248,7 +286,8 @@ mod tests {
             controller_name: "portail.epheo.eu/gateway-controller".to_string(),
             supported_features: false,
             manage_gateway_status: true,
-            readiness_port: 8081,
+            readiness_port: 19099,
+            gateway: None,
         };
         assert!(args.validate().is_err());
     }

@@ -121,6 +121,9 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         let k8s_data_plane = data_plane.clone();
         let k8s_perf = performance_config.clone();
         let manage_gateway_status = args.manage_gateway_status;
+        let gateway_scope = args
+            .gateway_scope()
+            .map_err(|e| anyhow::anyhow!("--gateway: {}", e))?;
 
         // Readiness flag — flipped true by the reconciler once the data plane
         // has bound its listener ports. Served on the readiness endpoint so the
@@ -141,6 +144,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
                 k8s_perf,
                 manage_gateway_status,
                 ready_flag,
+                gateway_scope,
             )
             .await
             {

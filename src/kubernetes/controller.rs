@@ -433,6 +433,7 @@ pub async fn run_controller(
     performance_config: crate::config::PerformanceConfig,
     manage_gateway_status: bool,
     ready: Arc<std::sync::atomic::AtomicBool>,
+    gateway_scope: Option<(String, String)>,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
@@ -440,18 +441,32 @@ pub async fn run_controller(
     // --- Primary resource: Gateway ---
     // predicate_filter(predicates::generation) filters status-only changes,
     // breaking the reconcile → status patch → watch event feedback loop.
+    //
+    // When `gateway_scope` is set (operator-managed Deployments), narrow the
+    // watch to that single Gateway via namespace + `metadata.name` field
+    // selector. The reflector store then holds exactly one object, and every
+    // downstream mapper that already filters by `route_targets_gateway` /
+    // `all_gateway_refs` naturally collapses to "this Gateway or nothing."
+    // Unset = legacy unscoped mode (watch all Gateways cluster-wide).
+    if let Some((ns, name)) = &gateway_scope {
+        info!("Controller scoped to Gateway {}/{}", ns, name);
+    }
     let gw_writer = reflector::store::Writer::default();
     let store_gateways = gw_writer.as_reader();
-    let gw_stream = reflector::reflector(
-        gw_writer,
-        watcher::watcher(
+    let (gw_api, gw_watcher_config) = match &gateway_scope {
+        Some((ns, name)) => (
+            Api::<Gateway>::namespaced(client.clone(), ns),
+            watcher::Config::default().fields(&format!("metadata.name={}", name)),
+        ),
+        None => (
             Api::<Gateway>::all(client.clone()),
             watcher::Config::default(),
         ),
-    )
-    .default_backoff()
-    .applied_objects()
-    .predicate_filter(predicates::generation);
+    };
+    let gw_stream = reflector::reflector(gw_writer, watcher::watcher(gw_api, gw_watcher_config))
+        .default_backoff()
+        .applied_objects()
+        .predicate_filter(predicates::generation);
 
     // --- Secondary resources ---
     // Each resource gets a reflector (store + stream). The stream feeds into
