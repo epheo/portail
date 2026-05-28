@@ -24,7 +24,6 @@ struct UdpSession {
 
 /// Run a UDP recv_from loop on a single socket, dispatching datagrams to per-session backends.
 pub async fn run_udp_worker(
-    worker_id: usize,
     socket: Arc<UdpSocket>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -32,7 +31,7 @@ pub async fn run_udp_worker(
     shutdown: CancellationToken,
     health: Arc<HealthRegistry>,
 ) {
-    info!("UDP worker {} listening on port {}", worker_id, server_port);
+    info!("UDP listener on :{} started", server_port);
 
     let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
     let selector = BackendSelector::new();
@@ -72,7 +71,7 @@ pub async fn run_udp_worker(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                info!("UDP worker {} shutting down", worker_id);
+                info!("UDP listener on :{} shutting down", server_port);
                 break;
             }
             result = socket.recv_from(&mut buf) => {
@@ -156,7 +155,7 @@ pub async fn run_udp_worker(
                         });
                     }
                     Err(e) => {
-                        warn!("UDP worker {} recv_from error: {}", worker_id, e);
+                        warn!("UDP listener on :{} recv_from error: {}", server_port, e);
                     }
                 }
             }

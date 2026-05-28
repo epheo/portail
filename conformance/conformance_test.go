@@ -64,11 +64,11 @@ func TestMain(m *testing.M) {
 
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
-	// The operator provisions a Deployment (pod) per Gateway, so Gateway/Route
-	// status only appears after pod scheduling + startup + reconcile — slower than
-	// an in-process implementation, especially under the suite's load on a single
-	// Kind node. Raise the per-Gateway/Route status timeouts (default 60s) to match
-	// the headroom the suite already allows for GatewayMustHaveCondition (180s).
+	// Per-Gateway pod provisioning latency + reconcile churn from unscoped
+	// portail pods watching the whole cluster require more headroom than the
+	// suite's defaults. This is independent of the data-plane SO_REUSEPORT
+	// cleanup; the right long-term fix is the scoping refactor (one portail
+	// per Gateway watches only its own routes) — until then, bump.
 	opts.TimeoutConfig.GatewayStatusMustHaveListeners = 180 * time.Second
 	opts.TimeoutConfig.GatewayListenersMustHaveConditions = 180 * time.Second
 	opts.TimeoutConfig.HTTPRouteMustHaveCondition = 180 * time.Second

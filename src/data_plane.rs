@@ -1,7 +1,7 @@
-//! Tokio-based data plane — creates SO_REUSEPORT listeners and spawns async workers.
-//!
-//! Each worker is a Tokio task sharing the runtime's thread pool. SO_REUSEPORT
-//! distributes incoming connections across workers at the kernel level.
+//! Tokio-based data plane — one TcpListener (or UdpSocket) per (address, port),
+//! one accept loop per listener. Accept work is distributed across the Tokio
+//! runtime's worker threads, not via per-core SO_REUSEPORT fan-out (which adds
+//! task count without throughput on a single shared runtime).
 //!
 //! On shutdown, the data plane stops accepting new connections and waits up to
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
@@ -24,7 +24,6 @@ use crate::udp_worker;
 use crate::worker;
 
 struct TcpListenerEntry {
-    worker_id: usize,
     port: u16,
     listener: TcpListener,
     tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
@@ -32,7 +31,6 @@ struct TcpListenerEntry {
 }
 
 struct UdpListenerEntry {
-    worker_id: usize,
     port: u16,
     socket: UdpSocket,
 }
@@ -52,30 +50,12 @@ pub struct DataPlane {
     tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
     /// Per-port cert fingerprint to skip no-op TLS reloads.
     tls_cert_hashes: std::collections::HashMap<u16, u64>,
-    /// Shared backend selector across all workers for correct weighted distribution.
+    /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Number of data-plane worker tasks / `SO_REUSEPORT` listeners per port, and
-/// the Tokio runtime worker-thread count.
-///
-/// Capped so a per-Gateway pod does not spawn one worker per host core: host
-/// core counts can be dozens, and with many small per-Gateway pods that
-/// multiplies into hundreds of threads, exhausting the node's PID/thread limit
-/// (containers then fail to fork). Override with `PORTAIL_MAX_WORKERS`.
-pub fn effective_worker_count() -> usize {
-    let avail = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    let cap = std::env::var("PORTAIL_MAX_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4);
-    avail.min(cap).max(1)
-}
 
 /// Compute a fingerprint of all cert PEM bytes for change detection.
 /// Uses FNV-1a for speed — collision resistance isn't critical here,
@@ -99,20 +79,20 @@ fn compute_cert_fingerprint(refs: &[CertificateRef]) -> u64 {
 }
 
 impl DataPlane {
-    /// Create listeners for all (worker, listener) combinations.
-    /// Sockets are created with SO_REUSEPORT so multiple workers can share the same port.
+    /// Create one TcpListener / UdpSocket per (address, port) listener config.
+    /// The Tokio runtime multiplexes accepts across its worker threads; no
+    /// per-core SO_REUSEPORT fan-out is needed for a single-process data plane.
     pub fn new(
         listeners: &[ListenerConfig],
         performance_config: &PerformanceConfig,
         cert_dir: &std::path::Path,
     ) -> Result<Self> {
-        let worker_count = effective_worker_count();
         let health = Arc::new(HealthRegistry::new());
 
         let mut tcp_listeners = Vec::new();
         let mut udp_listeners = Vec::new();
 
-        // Pre-build TLS acceptors (shared across workers for the same listener)
+        // Pre-build TLS acceptors (one per listener config that needs TLS)
         let mut tls_acceptors: Vec<Option<Arc<DynamicTlsAcceptor>>> =
             Vec::with_capacity(listeners.len());
         let mut tls_passthrough_flags: Vec<bool> = Vec::with_capacity(listeners.len());
@@ -135,40 +115,36 @@ impl DataPlane {
             }
         }
 
-        for worker_id in 0..worker_count {
-            for (i, listener_cfg) in listeners.iter().enumerate() {
-                let port = listener_cfg.port;
-                match listener_cfg.protocol {
-                    Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
-                        let std_listener = create_reuseport_tcp_listener(
-                            port,
-                            listener_cfg.address.as_deref(),
-                            listener_cfg.interface.as_deref(),
-                        )?;
-                        let tokio_listener = TcpListener::from_std(std_listener)?;
+        for (i, listener_cfg) in listeners.iter().enumerate() {
+            let port = listener_cfg.port;
+            match listener_cfg.protocol {
+                Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
+                    let std_listener = create_tcp_listener(
+                        port,
+                        listener_cfg.address.as_deref(),
+                        listener_cfg.interface.as_deref(),
+                    )?;
+                    let tokio_listener = TcpListener::from_std(std_listener)?;
 
-                        tcp_listeners.push(TcpListenerEntry {
-                            worker_id,
-                            port,
-                            listener: tokio_listener,
-                            tls_acceptor: tls_acceptors[i].clone(),
-                            tls_passthrough: tls_passthrough_flags[i],
-                        });
-                    }
-                    Protocol::UDP => {
-                        let std_socket = create_reuseport_udp_socket(
-                            port,
-                            listener_cfg.address.as_deref(),
-                            listener_cfg.interface.as_deref(),
-                        )?;
-                        let tokio_socket = UdpSocket::from_std(std_socket)?;
+                    tcp_listeners.push(TcpListenerEntry {
+                        port,
+                        listener: tokio_listener,
+                        tls_acceptor: tls_acceptors[i].clone(),
+                        tls_passthrough: tls_passthrough_flags[i],
+                    });
+                }
+                Protocol::UDP => {
+                    let std_socket = create_udp_socket(
+                        port,
+                        listener_cfg.address.as_deref(),
+                        listener_cfg.interface.as_deref(),
+                    )?;
+                    let tokio_socket = UdpSocket::from_std(std_socket)?;
 
-                        udp_listeners.push(UdpListenerEntry {
-                            worker_id,
-                            port,
-                            socket: tokio_socket,
-                        });
-                    }
+                    udp_listeners.push(UdpListenerEntry {
+                        port,
+                        socket: tokio_socket,
+                    });
                 }
             }
         }
@@ -195,11 +171,12 @@ impl DataPlane {
         })
     }
 
-    /// Dynamically add TCP listeners for new ports. Creates SO_REUSEPORT sockets
-    /// and spawns worker tasks. Called by K8s controller when new Gateway ports are discovered.
-    /// Builds TLS acceptors from in-memory cert data when listeners use HTTPS/TLS.
-    /// For already-bound ports, updates the TLS config via DynamicTlsAcceptor hot-reload.
-    /// Returns (ports_opened, errors) for caller-side logging.
+    /// Dynamically add TCP/UDP listeners for new ports. Called by the K8s
+    /// controller when new Gateway ports are discovered. One listener per
+    /// (address, port); accept work is distributed by the Tokio runtime.
+    /// Builds TLS acceptors from in-memory cert data when listeners use
+    /// HTTPS/TLS. For already-bound ports, updates the TLS config via
+    /// `DynamicTlsAcceptor` hot-reload. Returns `(ports_opened, errors)`.
     pub fn add_tcp_listeners(
         &mut self,
         listener_configs: &[ListenerConfig],
@@ -207,7 +184,6 @@ impl DataPlane {
         routes: Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
     ) -> (usize, Vec<(u16, String)>) {
-        let worker_count = effective_worker_count();
         let mut opened = 0usize;
         let mut errors = Vec::new();
 
@@ -243,7 +219,7 @@ impl DataPlane {
                                 existing.update(config);
                                 self.tls_cert_hashes.insert(port, fingerprint);
                                 info!("Hot-reloaded TLS config for port {}", port);
-                                continue; // Port already has workers, just update TLS
+                                continue; // Port already has a listener, just update TLS
                             }
                             let dyn_acceptor = Arc::new(DynamicTlsAcceptor::new(config));
                             self.tls_configs.insert(port, dyn_acceptor.clone());
@@ -270,93 +246,81 @@ impl DataPlane {
 
                 let mut port_ok = true;
                 if listener_cfg.protocol == Protocol::UDP {
-                    // Create UDP listener
-                    match create_reuseport_udp_socket(
-                        port,
-                        effective_addr,
-                        listener_cfg.interface.as_deref(),
-                    ) {
-                        Ok(std_socket) => {
-                            match UdpSocket::from_std(std_socket) {
-                                Ok(tokio_socket) => {
-                                    let routes = routes.clone();
-                                    let health = self.health.clone();
-                                    let shutdown = self.shutdown.clone();
-                                    let session_timeout = self.udp_session_timeout;
-                                    let socket = Arc::new(tokio_socket);
+                    match create_udp_socket(port, effective_addr, listener_cfg.interface.as_deref())
+                    {
+                        Ok(std_socket) => match UdpSocket::from_std(std_socket) {
+                            Ok(tokio_socket) => {
+                                let routes = routes.clone();
+                                let health = self.health.clone();
+                                let shutdown = self.shutdown.clone();
+                                let session_timeout = self.udp_session_timeout;
+                                let socket = Arc::new(tokio_socket);
 
-                                    let handle = tokio::spawn(async move {
-                                        udp_worker::run_udp_worker(
-                                            0, // single worker for UDP
-                                            socket,
-                                            port,
-                                            routes,
-                                            session_timeout,
-                                            shutdown,
-                                            health,
-                                        )
-                                        .await;
-                                    });
-                                    self.task_handles.push(handle);
-                                }
-                                Err(e) => {
-                                    errors.push((port, format!("UDP from_std: {}", e)));
-                                    port_ok = false;
-                                }
+                                let handle = tokio::spawn(async move {
+                                    udp_worker::run_udp_worker(
+                                        socket,
+                                        port,
+                                        routes,
+                                        session_timeout,
+                                        shutdown,
+                                        health,
+                                    )
+                                    .await;
+                                });
+                                self.task_handles.push(handle);
                             }
-                        }
+                            Err(e) => {
+                                errors.push((port, format!("UDP from_std: {}", e)));
+                                port_ok = false;
+                            }
+                        },
                         Err(e) => {
                             errors.push((port, format!("UDP bind: {}", e)));
                             port_ok = false;
                         }
                     }
                 } else {
-                    for worker_id in 0..worker_count {
-                        match create_reuseport_tcp_listener(
-                            port,
-                            effective_addr,
-                            listener_cfg.interface.as_deref(),
-                        ) {
-                            Ok(std_listener) => match TcpListener::from_std(std_listener) {
-                                Ok(tokio_listener) => {
-                                    let routes = routes.clone();
-                                    let health = self.health.clone();
-                                    let shutdown = self.shutdown.clone();
-                                    let max_idle = self.max_idle_per_backend;
-                                    let connect_timeout = performance_config.backend_timeout;
-                                    let acceptor = tls_acceptor.clone();
-                                    let passthrough = tls_passthrough;
+                    match create_tcp_listener(
+                        port,
+                        effective_addr,
+                        listener_cfg.interface.as_deref(),
+                    ) {
+                        Ok(std_listener) => match TcpListener::from_std(std_listener) {
+                            Ok(tokio_listener) => {
+                                let routes = routes.clone();
+                                let health = self.health.clone();
+                                let shutdown = self.shutdown.clone();
+                                let max_idle = self.max_idle_per_backend;
+                                let connect_timeout = performance_config.backend_timeout;
+                                let acceptor = tls_acceptor.clone();
+                                let passthrough = tls_passthrough;
 
-                                    let selector = self.selector.clone();
-                                    let handle = tokio::spawn(async move {
-                                        worker::run_worker(
-                                            worker_id,
-                                            tokio_listener,
-                                            port,
-                                            routes,
-                                            max_idle,
-                                            connect_timeout,
-                                            shutdown,
-                                            acceptor,
-                                            passthrough,
-                                            health,
-                                            selector,
-                                        )
-                                        .await;
-                                    });
-                                    self.task_handles.push(handle);
-                                }
-                                Err(e) => {
-                                    errors.push((port, format!("from_std: {}", e)));
-                                    port_ok = false;
-                                    break;
-                                }
-                            },
-                            Err(e) => {
-                                errors.push((port, format!("bind worker {}: {}", worker_id, e)));
-                                port_ok = false;
-                                break;
+                                let selector = self.selector.clone();
+                                let handle = tokio::spawn(async move {
+                                    worker::run_worker(
+                                        tokio_listener,
+                                        port,
+                                        routes,
+                                        max_idle,
+                                        connect_timeout,
+                                        shutdown,
+                                        acceptor,
+                                        passthrough,
+                                        health,
+                                        selector,
+                                    )
+                                    .await;
+                                });
+                                self.task_handles.push(handle);
                             }
+                            Err(e) => {
+                                errors.push((port, format!("TCP from_std: {}", e)));
+                                port_ok = false;
+                            }
+                        },
+                        Err(e) => {
+                            errors.push((port, format!("TCP bind: {}", e)));
+                            port_ok = false;
                         }
                     }
                 }
@@ -410,7 +374,7 @@ impl DataPlane {
         (updated, errors)
     }
 
-    /// Start async worker tasks.
+    /// Start async listener tasks (one accept loop per TCP listener / UDP socket).
     pub fn start(&mut self, routes: Arc<ArcSwap<RouteTable>>) {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();
@@ -425,7 +389,6 @@ impl DataPlane {
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
-                    entry.worker_id,
                     entry.listener,
                     entry.port,
                     routes,
@@ -452,7 +415,6 @@ impl DataPlane {
 
             let handle = tokio::spawn(async move {
                 udp_worker::run_udp_worker(
-                    entry.worker_id,
                     socket,
                     entry.port,
                     routes,
@@ -467,7 +429,7 @@ impl DataPlane {
         }
 
         info!(
-            "Data plane started: {} TCP + {} UDP worker tasks",
+            "Data plane started: {} TCP + {} UDP listener tasks",
             tcp_count, udp_count
         );
     }
@@ -520,7 +482,7 @@ impl DataPlane {
     }
 }
 
-fn create_reuseport_tcp_listener(
+fn create_tcp_listener(
     port: u16,
     bind_addr: Option<&str>,
     interface: Option<&str>,
@@ -536,7 +498,6 @@ fn create_reuseport_tcp_listener(
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
     if let Some(iface) = interface {
@@ -550,7 +511,7 @@ fn create_reuseport_tcp_listener(
     Ok(socket.into())
 }
 
-fn create_reuseport_udp_socket(
+fn create_udp_socket(
     port: u16,
     bind_addr: Option<&str>,
     interface: Option<&str>,
@@ -566,7 +527,6 @@ fn create_reuseport_udp_socket(
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
     if let Some(iface) = interface {

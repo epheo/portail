@@ -62,7 +62,6 @@ struct ConnectionState {
 
 /// Run an accept loop on a single listener, spawning a task per connection.
 pub async fn run_worker(
-    worker_id: usize,
     listener: TcpListener,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -74,14 +73,14 @@ pub async fn run_worker(
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
 ) {
-    // Selector is shared across ALL workers (not just this one) so weighted
-    // round-robin counters produce the correct distribution globally.
+    // Selector is shared across all listeners so weighted round-robin counters
+    // produce the correct distribution globally.
 
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                info!("Worker {} shutting down", worker_id);
+                info!("Listener on :{} shutting down", server_port);
                 break;
             }
             result = listener.accept() => {
@@ -164,7 +163,7 @@ pub async fn run_worker(
                         }
                     }
                     Err(e) => {
-                        warn!("Worker {} accept error: {}", worker_id, e);
+                        warn!("Listener on :{} accept error: {}", server_port, e);
                     }
                 }
             }

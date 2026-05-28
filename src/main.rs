@@ -68,7 +68,6 @@ fn main() -> Result<()> {
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(data_plane::effective_worker_count())
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
