@@ -64,18 +64,12 @@ func TestMain(m *testing.M) {
 
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
-	// Per-Gateway pod provisioning latency + reconcile churn from unscoped
-	// portail pods watching the whole cluster require more headroom than the
-	// suite's defaults. This is independent of the data-plane SO_REUSEPORT
-	// cleanup; the right long-term fix is the scoping refactor (one portail
-	// per Gateway watches only its own routes) — until then, bump.
-	opts.TimeoutConfig.GatewayStatusMustHaveListeners = 180 * time.Second
-	opts.TimeoutConfig.GatewayListenersMustHaveConditions = 180 * time.Second
-	opts.TimeoutConfig.HTTPRouteMustHaveCondition = 180 * time.Second
-	opts.TimeoutConfig.TLSRouteMustHaveCondition = 180 * time.Second
-	opts.TimeoutConfig.RouteMustHaveParents = 180 * time.Second
-	opts.TimeoutConfig.MaxTimeToConsistency = 90 * time.Second
-	opts.TimeoutConfig.DefaultTestTimeout = 180 * time.Second
+	// No TimeoutConfig overrides — per-Gateway scoping landed in the
+	// per-gateway-scoping branch, so the suite's upstream defaults
+	// (60s GatewayStatus/RouteCondition/RouteMustHaveParents,
+	// 30s MaxTimeToConsistency, 60s DefaultTestTimeout) leave ample
+	// headroom over the empirically measured worst case (~13s) for
+	// fresh Gateway provisioning through portail-operator.
 	if addrs := os.Getenv("USABLE_ADDRESSES"); addrs != "" {
 		opts.UsableNetworkAddresses = parseAddresses(addrs)
 	}
