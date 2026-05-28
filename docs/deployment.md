@@ -9,7 +9,36 @@
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
 ```
 
-## DaemonSet with Host Networking
+## Recommended: Per-Gateway via portail-operator
+
+For multi-Gateway production setups, deploy [portail-operator](https://github.com/epheo/portail-operator).
+It watches `Gateway` resources and provisions one portail Deployment (+ ServiceAccount,
+RBAC, Service) per Gateway, passing `--gateway namespace/name` so each pod reconciles
+only its own Gateway.
+
+Properties this gives you:
+
+- **Status ownership is unambiguous.** The operator writes
+  Gateway/GatewayClass conditions and `status.addresses`; portail writes only
+  per-listener status and route status. No multi-writer SSA fights.
+- **Per-Gateway isolation.** Each Gateway has its own pod, network namespace,
+  resource limits, replicas, and crash blast radius.
+- **K8s-native scaling.** Standard Deployment knobs apply per Gateway.
+- **`spec.addresses` → MetalLB.** When a Gateway carries an `IPAddress` in
+  `spec.addresses`, the operator wires it onto the generated Service via
+  `loadBalancerIP` + the `metallb.universe.tf/loadBalancerIPs` annotation.
+
+Tradeoffs: one Deployment per Gateway means more pods at scale, and new-Gateway
+latency is the K8s pod startup time (≈5–15s) rather than near-instant. New
+Gateway provisioning depends on the operator being healthy.
+
+Install steps live in the [operator README](https://github.com/epheo/portail-operator).
+
+The patterns below are for **unscoped** deployment without the operator — one portail
+process watches all Gateways cluster-wide. Simpler to deploy, less isolated;
+appropriate for single-Gateway setups, homelabs, or edge.
+
+## Without operator: DaemonSet with Host Networking
 
 One pod per node with `hostNetwork: true`. Simplest setup, good for single-node and edge.
 
@@ -33,15 +62,15 @@ kubectl apply -f examples/kubernetes/daemonset/scc.yaml
 
 See: `examples/kubernetes/daemonset/`
 
-## Deployment with LoadBalancer Service
+## Without operator: Deployment with LoadBalancer Service
 
-One Deployment per Gateway, exposed via a LoadBalancer Service. Requires MetalLB or a cloud LB provider. Best for multi-node production.
+A single portail Deployment watching all Gateways, exposed via a LoadBalancer Service. Requires MetalLB or a cloud LB provider. Suitable for small clusters with one or two Gateways where the operator would be overkill.
 
 ```bash
 kubectl apply -k examples/kubernetes/loadbalancer/
 ```
 
-Portail runs as a regular Deployment (no `hostNetwork`). A Kubernetes Service exposes it externally. Each Gateway gets its own Deployment and Service, isolating Gateways in separate network namespaces.
+Portail runs as a regular Deployment (no `hostNetwork`). A Kubernetes Service exposes it externally. The Deployment serves all Gateways its watch sees; isolate Gateways by deploying to separate namespaces or by switching to the operator path above.
 
 When `spec.addresses` is set on a Gateway, listeners bind to that specific IP. If the IP doesn't exist on the pod's interfaces, the Gateway gets `Programmed=False`. The network itself provides isolation: each Deployment only serves Gateways whose addresses are reachable from its pods.
 
@@ -49,7 +78,7 @@ The same pattern works with **NodePort** or **ClusterIP**. Just change `spec.typ
 
 See: `examples/kubernetes/loadbalancer/`
 
-## Multi-Network Routing
+## Without operator: Multi-Network Routing
 
 A Portail pod attached to multiple User Defined Networks (UDN) via Multus, routing between isolated network segments at L4-L7.
 
