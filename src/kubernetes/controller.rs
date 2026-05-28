@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 use gateway_api::experimental::tcproutes::TCPRoute;
 use gateway_api::experimental::tlsroutes::TLSRoute;
 use gateway_api::experimental::udproutes::UDPRoute;
-use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
@@ -58,7 +57,6 @@ impl From<kube::Error> for ReconcileError {
 #[derive(Clone)]
 struct ResourceCache {
     gateways: Store<Gateway>,
-    gateway_classes: Store<GatewayClass>,
     http_routes: Store<HTTPRoute>,
     tcp_routes: Store<TCPRoute>,
     tls_routes: Store<TLSRoute>,
@@ -83,38 +81,36 @@ where
 /// Used in `spec.addresses[].type` to auto-discover UDN/Multus IPs.
 pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
 
-/// Addresses routable to this gateway instance, split by source for priority.
+/// Addresses available to this gateway instance for binding / reporting.
+/// `status.addresses` (LB VIP / cloud-assigned IPs) is owned by the operator,
+/// so portail only needs locally-bindable IPs.
 pub(crate) struct UsableAddresses {
-    /// LoadBalancer ingress IPs (externally reachable)
-    pub lb_ips: Vec<String>,
-    /// IPs from local network interfaces (includes secondary/UDN interfaces)
+    /// IPs from local network interfaces (includes secondary/UDN interfaces).
     pub interface_ips: Vec<String>,
-    /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP)
+    /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP).
     pub network_ips: HashMap<String, String>,
 }
 
 impl UsableAddresses {
     /// All known addresses as a set (for membership checks).
     pub fn all(&self) -> HashSet<&str> {
-        self.lb_ips
+        self.interface_ips
             .iter()
-            .chain(&self.interface_ips)
             .chain(self.network_ips.values())
             .map(|s| s.as_str())
             .collect()
     }
 
-    /// Best externally-reachable address: LB VIP first, then local interface IP.
+    /// Best locally-bindable address — first interface IP, else `0.0.0.0`.
     pub fn preferred_ip(&self) -> &str {
-        self.lb_ips
+        self.interface_ips
             .first()
-            .or(self.interface_ips.first())
             .map(|s| s.as_str())
             .unwrap_or("0.0.0.0")
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lb_ips.is_empty() && self.interface_ips.is_empty() && self.network_ips.is_empty()
+        self.interface_ips.is_empty() && self.network_ips.is_empty()
     }
 }
 
@@ -223,74 +219,12 @@ fn discover_local_interface_ips() -> Vec<String> {
     ips
 }
 
-/// Discover addresses routable to this pod via EndpointSlice back-reference.
-///
-/// 1. Enumerate local interface IPs (pod IP, host IPs if hostNetwork, secondary networks)
-/// 2. Find EndpointSlices whose endpoints match any local IP
-/// 3. Resolve the owning Service via `kubernetes.io/service-name` label
-/// 4. Extract LoadBalancer ingress IPs from those Services
-pub(crate) fn discover_usable_addresses(
-    services: &Store<Service>,
-    endpoint_slices: &Store<EndpointSlice>,
-) -> UsableAddresses {
-    let interface_ips = discover_local_interface_ips();
-    let local_ip_set: HashSet<&str> = interface_ips.iter().map(|s| s.as_str()).collect();
-
-    let my_ns = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "default".to_string());
-
-    // Find Services that route to this pod via EndpointSlice back-reference
-    let my_service_names: HashSet<String> = if !local_ip_set.is_empty() {
-        endpoint_slices
-            .state()
-            .iter()
-            .filter(|eps| eps.metadata.namespace.as_deref() == Some(&my_ns))
-            .filter(|eps| {
-                eps.endpoints.iter().any(|ep| {
-                    ep.addresses
-                        .iter()
-                        .any(|addr| local_ip_set.contains(addr.as_str()))
-                })
-            })
-            .filter_map(|eps| {
-                eps.metadata
-                    .labels
-                    .as_ref()?
-                    .get("kubernetes.io/service-name")
-                    .cloned()
-            })
-            .collect()
-    } else {
-        HashSet::new()
-    };
-
-    // Get LB ingress IPs from those Services
-    let lb_ips: Vec<String> = services
-        .state()
-        .iter()
-        .filter(|svc| svc.metadata.namespace.as_deref() == Some(&my_ns))
-        .filter(|svc| {
-            svc.metadata
-                .name
-                .as_deref()
-                .is_some_and(|name| my_service_names.contains(name))
-        })
-        .filter_map(|svc| {
-            svc.status
-                .as_ref()?
-                .load_balancer
-                .as_ref()?
-                .ingress
-                .as_ref()
-        })
-        .flatten()
-        .filter_map(|ingress| ingress.ip.clone())
-        .collect();
-
+/// Enumerate IPs available on this pod's local interfaces (pod IP, host IPs
+/// in hostNetwork mode, secondary network IPs from Multus, etc.). The operator
+/// owns Gateway `status.addresses`, so portail only needs locally-bindable IPs.
+pub(crate) fn discover_usable_addresses() -> UsableAddresses {
     UsableAddresses {
-        lb_ips,
-        interface_ips,
+        interface_ips: discover_local_interface_ips(),
         network_ips: HashMap::new(),
     }
 }
@@ -300,9 +234,6 @@ struct ControllerCtx {
     client: Client,
     controller_name: String,
     cache: ResourceCache,
-    /// Per-gateway config cache — avoids re-reconciling other gateways.
-    /// Populated during reconcile, pruned against the gateway store.
-    config_cache: Arc<std::sync::Mutex<HashMap<(String, String), crate::config::PortailConfig>>>,
     routes: Arc<ArcSwap<RouteTable>>,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
@@ -484,11 +415,8 @@ pub async fn run_controller(
         create_optional_reflector(Api::<TLSRoute>::all(client.clone())).await;
     let (store_udp_routes, udp_route_stream) =
         create_optional_reflector(Api::<UDPRoute>::all(client.clone())).await;
-    // GatewayClass: managed by a separate Controller (below).
-    // We create that controller early to get its store for ControllerCtx lookups.
-    let gc_api = Api::<GatewayClass>::all(client.clone());
-    let gc_controller = Controller::new(gc_api, watcher::Config::default());
-    let store_gateway_classes = gc_controller.store();
+    // GatewayClass status is owned by portail-operator now; portail no longer
+    // runs its own GatewayClass controller.
 
     // Core resource reflectors — no generation filter (core types don't reliably set it)
     let (store_namespaces, namespace_stream) =
@@ -520,10 +448,8 @@ pub async fn run_controller(
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
         controller_name: controller_name.clone(),
-        config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         cache: ResourceCache {
             gateways: store_gateways,
-            gateway_classes: store_gateway_classes.clone(),
             http_routes: store_http_routes,
             tcp_routes: store_tcp_routes,
             tls_routes: store_tls_routes,
@@ -613,23 +539,6 @@ pub async fn run_controller(
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
 
-    // --- GatewayClass controller ---
-    // Separate controller: accepts/rejects GatewayClasses independently of Gateways.
-    // Controller::new() manages its own reflector and store, guaranteeing the store
-    // is populated (after InitDone) before any reconcile fires — no timing bugs.
-    // The same store is shared with ControllerCtx for Gateway reconcile lookups,
-    // eliminating the need for a separate GatewayClass reflector.
-    let gc_ctx = Arc::new(GatewayClassCtx {
-        client,
-        controller_name,
-        store: store_gateway_classes,
-        manage_gateway_status,
-    });
-    let gc_controller = gc_controller
-        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
-        .shutdown_on_signal()
-        .run(reconcile_gateway_class, gc_error_policy, gc_ctx);
-
     info!("Gateway API controller started, watching for resource changes");
 
     tokio::select! {
@@ -640,14 +549,6 @@ pub async fn run_controller(
             }
         }) => {
             info!("Gateway controller stream ended");
-        }
-        _ = gc_controller.for_each(|result| async move {
-            match result {
-                Ok((_obj_ref, _action)) => {}
-                Err(e) => warn!("GatewayClass reconciliation error: {}", e),
-            }
-        }) => {
-            info!("GatewayClass controller stream ended");
         }
         _ = shutdown.cancelled() => {
             info!("Controller received shutdown signal");
@@ -1206,66 +1107,6 @@ fn ensure_data_plane_listeners(
     }
 }
 
-/// Merge TLS cert refs across all Gateways per port and hot-reload the SNI
-/// resolver. Needed when multiple Gateways share a port (e.g. public *.desku.be
-/// + private *.mmt + conformance test example.org on port 443).
-fn merge_and_hot_reload_tls(
-    data_plane: &std::sync::Mutex<crate::data_plane::DataPlane>,
-    all_configs: &[crate::config::PortailConfig],
-) {
-    use crate::config::{CertificateRef, ListenerConfig as LC, Protocol as P, TlsConfig, TlsMode};
-
-    let mut merged_certs_by_port: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
-    let mut port_protocol: HashMap<u16, P> = HashMap::new();
-    for config in all_configs {
-        for listener in &config.gateway.listeners {
-            if let Some(tls_cfg) = &listener.tls {
-                if tls_cfg.mode == TlsMode::Terminate && !tls_cfg.certificate_refs.is_empty() {
-                    merged_certs_by_port
-                        .entry(listener.port)
-                        .or_default()
-                        .extend(tls_cfg.certificate_refs.clone());
-                    port_protocol
-                        .entry(listener.port)
-                        .or_insert_with(|| listener.protocol.clone());
-                }
-            }
-        }
-    }
-    if merged_certs_by_port.is_empty() {
-        return;
-    }
-
-    let merged_listeners: Vec<LC> = merged_certs_by_port
-        .into_iter()
-        .map(|(port, cert_refs)| LC {
-            name: format!("merged-tls-{}", port),
-            protocol: port_protocol.remove(&port).unwrap_or(P::HTTPS),
-            port,
-            hostname: None,
-            address: None,
-            interface: None,
-            tls: Some(TlsConfig {
-                mode: TlsMode::Terminate,
-                certificate_refs: cert_refs,
-            }),
-        })
-        .collect();
-
-    match data_plane.lock() {
-        Ok(mut dp) => {
-            let (tls_updated, tls_errors) = dp.update_tls_configs(&merged_listeners);
-            if tls_updated > 0 {
-                debug!("Refreshed merged TLS config for {} port(s)", tls_updated);
-            }
-            for (port, err) in &tls_errors {
-                warn!("Merged TLS config update failed for port {}: {}", port, err);
-            }
-        }
-        Err(e) => warn!("Failed to lock data plane for TLS update: {}", e),
-    }
-}
-
 /// (address, port) pairs the data plane must be bound to for this Gateway to
 /// be considered Programmed. Mirrors what we just passed to `add_tcp_listeners`.
 fn required_endpoints(gateway: &Gateway, bind_addresses: &[String]) -> Vec<(Option<String>, u16)> {
@@ -1290,94 +1131,34 @@ fn required_endpoints(gateway: &Gateway, bind_addresses: &[String]) -> Vec<(Opti
     }
 }
 
-/// Compute the `Programmed` condition from address usability and data-plane
-/// readiness. Static addresses that the local pod can't bind to (e.g. an LB VIP
-/// that landed on a different node) flip the condition to `AddressNotUsable`.
-fn compute_programmed_condition(
-    gateway: &Gateway,
-    usable: &UsableAddresses,
-    dp_ready: bool,
-) -> status::GatewayCondition {
-    let has_static_addrs = gateway
-        .spec
-        .addresses
-        .as_ref()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-
-    // No discovered addresses → can't determine; assume usable.
-    let addrs_usable = match &gateway.spec.addresses {
-        None => true,
-        Some(addrs) if addrs.is_empty() => true,
-        Some(_) if usable.is_empty() => true,
-        Some(addrs) => {
-            let known = usable.all();
-            addrs.iter().all(|a| match a.r#type.as_deref().unwrap_or("IPAddress") {
-                "IPAddress" => known.contains(a.value.as_deref().unwrap_or("")),
-                "Hostname" => true,
-                t if t == NETWORK_ADDRESS_TYPE => {
-                    usable.network_ips.contains_key(a.value.as_deref().unwrap_or(""))
-                }
-                _ => false,
-            })
+/// Compute the `Programmed` condition from data-plane readiness. The operator
+/// owns address-usability semantics for status.addresses; here we just report
+/// whether the data plane has bound this Gateway's listener ports.
+fn compute_programmed_condition(dp_ready: bool) -> status::GatewayCondition {
+    if dp_ready {
+        status::GatewayCondition {
+            ok: true,
+            reason: "Programmed".into(),
+            message: "Programmed".into(),
         }
-    };
-
-    let (ok, reason, message): (bool, &str, &str) = if !addrs_usable {
-        (
-            false,
-            "AddressNotUsable",
-            "One or more addresses in spec.addresses are not usable by this gateway",
-        )
-    } else if !dp_ready && has_static_addrs {
-        (
-            false,
-            "AddressNotUsable",
-            "One or more addresses in spec.addresses are not usable by this gateway",
-        )
-    } else if !dp_ready {
-        warn!("Data plane not ready: not all listener ports are bound");
-        (
-            false,
-            "Invalid",
-            "Data plane not ready: not all listener ports are bound",
-        )
     } else {
-        (true, "Programmed", "Programmed")
-    };
-
-    status::GatewayCondition {
-        ok,
-        reason: reason.into(),
-        message: message.into(),
+        warn!("Data plane not ready: not all listener ports are bound");
+        status::GatewayCondition {
+            ok: false,
+            reason: "Invalid".into(),
+            message: "Data plane not ready: not all listener ports are bound".into(),
+        }
     }
 }
 
-/// Merge the per-Gateway route tables into a single global RouteTable.
-/// Runs on a blocking thread because `to_route_table()` is CPU-bound parsing.
-async fn build_combined_route_table(
-    all_configs: Vec<crate::config::PortailConfig>,
+/// Build the RouteTable from this Gateway's PortailConfig on a blocking thread
+/// (`to_route_table` compiles regexes and resolves backend DNS — both sync).
+async fn build_route_table(
+    config: crate::config::PortailConfig,
 ) -> anyhow::Result<RouteTable> {
-    tokio::task::spawn_blocking(move || {
-        let mut combined = RouteTable::new();
-        for config in &all_configs {
-            let rt = config.to_route_table()?;
-            for (port, scopes) in rt.listener_scopes {
-                combined
-                    .listener_scopes
-                    .entry(port)
-                    .or_default()
-                    .extend(scopes);
-            }
-            combined.tcp_routes.extend(rt.tcp_routes);
-            combined.udp_routes.extend(rt.udp_routes);
-            combined.tls_routes.extend(rt.tls_routes);
-            combined.wildcard_tls_routes.extend(rt.wildcard_tls_routes);
-        }
-        Ok(combined)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
+    tokio::task::spawn_blocking(move || config.to_route_table())
+        .await
+        .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
 }
 
 async fn reconcile(
@@ -1388,26 +1169,9 @@ async fn reconcile(
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
 
-    // Verify this Gateway's class is managed by us — cache read, no API call.
-    let gateway_class_name = &gateway.spec.gateway_class_name;
-    let gc_ref = ObjectRef::<GatewayClass>::new(gateway_class_name);
-    let gc = match ctx.cache.gateway_classes.get(&gc_ref) {
-        Some(gc) => gc,
-        None => {
-            debug!(
-                "GatewayClass '{}' not in store yet, requeueing",
-                gateway_class_name
-            );
-            return Ok(Action::requeue(Duration::from_secs(1)));
-        }
-    };
-    if gc.spec.controller_name != ctx.controller_name {
-        debug!(
-            "Gateway {}/{} references GatewayClass '{}' with controller '{}', not ours ('{}')",
-            gw_ns, gw_name, gateway_class_name, gc.spec.controller_name, ctx.controller_name
-        );
-        return Ok(Action::await_change());
-    }
+    // GatewayClass acceptance is owned by portail-operator; it only provisions a
+    // portail Deployment for Gateways whose class references this controller, so
+    // we can trust the scope and skip an in-process class check here.
 
     // Snapshot reflector caches in one shot — no API server calls.
     let snapshot = ClusterSnapshot {
@@ -1441,7 +1205,7 @@ async fn reconcile(
     let (listener_statuses, accepted_cond) =
         validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
 
-    let mut usable = discover_usable_addresses(&ctx.cache.services, &ctx.cache.endpoint_slices);
+    let mut usable = discover_usable_addresses();
     resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
 
     // Build per-Gateway config; bail out with a failing Programmed condition on error.
@@ -1490,37 +1254,6 @@ async fn reconcile(
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
     ensure_data_plane_listeners(&ctx, &result.config.gateway.listeners, &bind_addresses);
 
-    // Cache this gateway's config; rebuild from all cached configs to keep
-    // per-gateway changes O(n) instead of O(n²) across the whole class.
-    let all_configs = {
-        let mut cache = ctx.config_cache.lock().unwrap();
-        cache.insert((gw_ns.clone(), gw_name.clone()), result.config.clone());
-        let live: HashSet<_> = ctx
-            .cache
-            .gateways
-            .state()
-            .iter()
-            .filter(|g| g.spec.gateway_class_name == *gateway_class_name)
-            .map(|g| {
-                (
-                    g.metadata.namespace.as_deref().unwrap_or("default").to_string(),
-                    g.metadata.name.as_deref().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
-        cache.retain(|k, _| live.contains(k));
-        // Endpoint/appProtocol overrides come from cluster Service state, not
-        // per-Gateway; refresh cached entries with the current values.
-        let mut configs: Vec<_> = cache.values().cloned().collect();
-        for config in &mut configs {
-            config.endpoint_overrides = services.endpoint_overrides.clone();
-            config.app_protocol_overrides = services.app_protocol_overrides.clone();
-        }
-        configs
-    };
-
-    merge_and_hot_reload_tls(&ctx.data_plane, &all_configs);
-
     // Per-listener attached-route counts, restricted to this Gateway's routes.
     let mut listener_route_counts: HashMap<String, i32> = gateway
         .spec
@@ -1536,19 +1269,19 @@ async fn reconcile(
         }
     }
 
-    // Build + swap the global RouteTable; on failure produce a failing
-    // Programmed condition (route table build is the last step that can fail).
-    let programmed_cond = match build_combined_route_table(all_configs).await {
+    // Build + swap the RouteTable; on failure produce a failing Programmed
+    // condition (route table build is the last step that can fail). Counts
+    // are captured before the config is moved into the blocking build.
+    let http_count = result.config.http_routes.len();
+    let tcp_count = result.config.tcp_routes.len();
+    let tls_count = result.config.tls_routes.len();
+    let udp_count = result.config.udp_routes.len();
+    let programmed_cond = match build_route_table(result.config).await {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
             info!(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
-                gw_ns,
-                gw_name,
-                result.config.http_routes.len(),
-                result.config.tcp_routes.len(),
-                result.config.tls_routes.len(),
-                result.config.udp_routes.len(),
+                gw_ns, gw_name, http_count, tcp_count, tls_count, udp_count,
             );
 
             let endpoints = required_endpoints(&gateway, &bind_addresses);
@@ -1562,7 +1295,7 @@ async fn reconcile(
             if dp_ready {
                 ctx.ready.store(true, std::sync::atomic::Ordering::Release);
             }
-            compute_programmed_condition(&gateway, &usable, dp_ready)
+            compute_programmed_condition(dp_ready)
         }
         Err(e) => {
             error!(
@@ -1650,70 +1383,6 @@ async fn reconcile(
 
 fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
     warn!("Gateway reconciliation error, requeueing in 30s");
-    Action::requeue(Duration::from_secs(30))
-}
-
-// ---------------------------------------------------------------------------
-// GatewayClass controller — runs alongside the Gateway controller
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct GatewayClassCtx {
-    client: Client,
-    controller_name: String,
-    store: Store<GatewayClass>,
-    /// When false, the operator owns GatewayClass status; portail skips writing it.
-    manage_gateway_status: bool,
-}
-
-async fn reconcile_gateway_class(
-    gc: Arc<GatewayClass>,
-    ctx: Arc<GatewayClassCtx>,
-) -> Result<Action, ReconcileError> {
-    if gc.spec.controller_name != ctx.controller_name {
-        return Ok(Action::await_change());
-    }
-
-    // When running under portail-operator, the operator owns GatewayClass status.
-    if !ctx.manage_gateway_status {
-        return Ok(Action::await_change());
-    }
-
-    // Accept the oldest GatewayClass for our controller (per Gateway API spec).
-    // The store is guaranteed populated — Controller::new() waits for InitDone.
-    let accepted = ctx
-        .store
-        .state()
-        .iter()
-        .filter(|g| g.spec.controller_name == ctx.controller_name)
-        .min_by_key(|g| g.metadata.creation_timestamp.clone())
-        .map(|g| g.name_any());
-
-    let is_accepted = accepted.as_deref() == Some(gc.name_any().as_str());
-    if is_accepted {
-        status::update_gateway_class_status(&ctx.client, &gc, true, "Accepted by portail").await;
-    } else {
-        status::update_gateway_class_status(
-            &ctx.client,
-            &gc,
-            false,
-            &format!(
-                "Another GatewayClass '{}' is already accepted by this controller",
-                accepted.unwrap_or_default()
-            ),
-        )
-        .await;
-    }
-
-    Ok(Action::await_change())
-}
-
-fn gc_error_policy(
-    _obj: Arc<GatewayClass>,
-    _error: &ReconcileError,
-    _ctx: Arc<GatewayClassCtx>,
-) -> Action {
-    warn!("GatewayClass reconciliation error, requeueing in 30s");
     Action::requeue(Duration::from_secs(30))
 }
 

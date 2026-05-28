@@ -195,24 +195,47 @@ impl DataPlane {
             addresses.iter().map(|a| Some(a.as_str())).collect()
         };
 
+        // Merge TLS cert refs across all Terminate listeners on the same port —
+        // one TCP listener per port serves traffic for every (port, hostname)
+        // scope, so its ServerConfig must hold every hostname's cert. Building
+        // per-listener would let the last write clobber earlier listeners and
+        // strand SNIs (e.g. `example.org` via catch-all listener gets dropped
+        // when `https-with-hostname` is processed last, hanging its TLS).
+        let mut merged_cert_refs: std::collections::HashMap<u16, Vec<CertificateRef>> =
+            std::collections::HashMap::new();
+        for listener_cfg in listener_configs {
+            if let Some(tls_cfg) = &listener_cfg.tls {
+                if tls_cfg.mode == TlsMode::Terminate
+                    && matches!(listener_cfg.protocol, Protocol::HTTPS | Protocol::TLS)
+                {
+                    merged_cert_refs
+                        .entry(listener_cfg.port)
+                        .or_default()
+                        .extend(tls_cfg.certificate_refs.iter().cloned());
+                }
+            }
+        }
+
         for listener_cfg in listener_configs {
             let port = listener_cfg.port;
 
-            // Build DynamicTlsAcceptor if this listener needs TLS termination
+            // Build DynamicTlsAcceptor if this listener needs TLS termination.
+            // Uses the per-port merged cert refs so multi-listener ports get
+            // every hostname's cert in one ServerConfig (see merge above).
             let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls)
             {
                 (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
                     if tls_cfg.mode == TlsMode::Terminate =>
                 {
-                    match tls::build_server_config(
-                        &tls_cfg.certificate_refs,
-                        std::path::Path::new("/unused"),
-                    ) {
+                    let port_refs = merged_cert_refs
+                        .get(&port)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&tls_cfg.certificate_refs);
+                    match tls::build_server_config(port_refs, std::path::Path::new("/unused")) {
                         Ok(config) => {
                             // If port is already bound, hot-reload the TLS config only if certs changed
                             if let Some(existing) = self.tls_configs.get(&port) {
-                                let fingerprint =
-                                    compute_cert_fingerprint(&tls_cfg.certificate_refs);
+                                let fingerprint = compute_cert_fingerprint(port_refs);
                                 if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
                                     continue; // Certs unchanged — skip hot-reload
                                 }
@@ -221,6 +244,8 @@ impl DataPlane {
                                 info!("Hot-reloaded TLS config for port {}", port);
                                 continue; // Port already has a listener, just update TLS
                             }
+                            self.tls_cert_hashes
+                                .insert(port, compute_cert_fingerprint(port_refs));
                             let dyn_acceptor = Arc::new(DynamicTlsAcceptor::new(config));
                             self.tls_configs.insert(port, dyn_acceptor.clone());
                             (Some(dyn_acceptor), false)

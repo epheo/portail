@@ -9,7 +9,6 @@ use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 
 use crate::kubernetes::controller::{UsableAddresses, NETWORK_ADDRESS_TYPE};
@@ -363,79 +362,6 @@ pub(crate) async fn update_gateway_status(
     {
         Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
         Err(e) => warn!("Failed to update Gateway {}/{} status: {}", ns, name, e),
-    }
-}
-
-pub async fn update_gateway_class_status(
-    client: &Client,
-    gc: &GatewayClass,
-    accepted: bool,
-    message: &str,
-) {
-    let name = gc.name_any();
-    let api: Api<GatewayClass> = Api::all(client.clone());
-
-    let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now());
-    let generation = gc.metadata.generation;
-
-    // Preserve lastTransitionTime from existing conditions
-    let existing_conditions: Vec<Condition> = gc
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .cloned()
-        .unwrap_or_default();
-
-    let gc_status = if accepted { "True" } else { "False" };
-    let gc_reason = if accepted {
-        "Accepted"
-    } else {
-        "InvalidParameters"
-    };
-
-    let conditions = vec![Condition {
-        type_: "Accepted".to_string(),
-        status: gc_status.to_string(),
-        reason: gc_reason.to_string(),
-        message: message.to_string(),
-        last_transition_time: transition_time(
-            &existing_conditions,
-            "Accepted",
-            gc_status,
-            gc_reason,
-            &now,
-        ),
-        observed_generation: generation,
-    }];
-
-    // Declare supported features from the canonical list
-    let supported_features: Vec<serde_json::Value> = super::features::SUPPORTED_FEATURES
-        .iter()
-        .map(|name| serde_json::json!({"name": name}))
-        .collect();
-
-    let status = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "GatewayClass",
-        "metadata": {
-            "name": name,
-        },
-        "status": {
-            "conditions": conditions,
-            "supportedFeatures": supported_features,
-        }
-    });
-
-    match api
-        .patch_status(
-            &name,
-            &PatchParams::apply("portail").force(),
-            &Patch::Apply(status),
-        )
-        .await
-    {
-        Ok(_) => debug!("Updated GatewayClass {} status", name),
-        Err(e) => warn!("Failed to update GatewayClass {} status: {}", name, e),
     }
 }
 
