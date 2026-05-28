@@ -540,11 +540,14 @@ fn create_udp_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CertificateRef, ListenerConfig, Protocol as P, TlsConfig, TlsMode as TM,
-    };
+    use crate::config::{CertificateRef, ListenerConfig, Protocol as P, TlsConfig, TlsMode as TM};
 
-    fn https_listener(name: &str, port: u16, hostname: Option<&str>, cert_name: &str) -> ListenerConfig {
+    fn https_listener(
+        name: &str,
+        port: u16,
+        hostname: Option<&str>,
+        cert_name: &str,
+    ) -> ListenerConfig {
         ListenerConfig {
             name: name.into(),
             protocol: P::HTTPS,
@@ -573,14 +576,22 @@ mod tests {
     fn merges_same_port_listeners_into_one_cert_list() {
         let listeners = vec![
             https_listener("https", 443, None, "default-cert"),
-            https_listener("https-with-hostname", 443, Some("second.example.org"), "default-cert"),
+            https_listener(
+                "https-with-hostname",
+                443,
+                Some("second.example.org"),
+                "default-cert",
+            ),
         ];
         let merged = merge_cert_refs_by_port(&listeners);
 
         assert_eq!(merged.len(), 1, "one port expected");
         let refs = &merged[&443];
         assert_eq!(refs.len(), 2, "both listeners' refs must appear");
-        assert_eq!(refs[0].hostname, None, "catch-all listener's ref comes first");
+        assert_eq!(
+            refs[0].hostname, None,
+            "catch-all listener's ref comes first"
+        );
         assert_eq!(
             refs[1].hostname.as_deref(),
             Some("second.example.org"),
@@ -615,7 +626,10 @@ mod tests {
         assert_eq!(merged.keys().copied().collect::<Vec<_>>().len(), 2);
         assert!(merged.contains_key(&443));
         assert!(merged.contains_key(&8443));
-        assert!(!merged.contains_key(&9443), "Passthrough must not contribute");
+        assert!(
+            !merged.contains_key(&9443),
+            "Passthrough must not contribute"
+        );
         assert!(!merged.contains_key(&80), "HTTP must not contribute");
     }
 

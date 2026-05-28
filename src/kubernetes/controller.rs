@@ -829,7 +829,10 @@ fn validate_gateway(
     gw_ns: &str,
     cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>,
     reference_grants: &[ReferenceGrant],
-) -> (HashMap<String, status::ListenerStatus>, status::GatewayCondition) {
+) -> (
+    HashMap<String, status::ListenerStatus>,
+    status::GatewayCondition,
+) {
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
 
     // Detect protocol conflicts: same port, different protocols
@@ -1094,8 +1097,12 @@ fn ensure_data_plane_listeners(
     );
     match ctx.data_plane.lock() {
         Ok(mut dp) => {
-            let (opened, errors) =
-                dp.add_tcp_listeners(listeners, bind_addresses, ctx.routes.clone(), &ctx.performance_config);
+            let (opened, errors) = dp.add_tcp_listeners(
+                listeners,
+                bind_addresses,
+                ctx.routes.clone(),
+                &ctx.performance_config,
+            );
             if opened > 0 {
                 info!("Opened {} new port(s)", opened);
             }
@@ -1153,9 +1160,7 @@ fn compute_programmed_condition(dp_ready: bool) -> status::GatewayCondition {
 
 /// Build the RouteTable from this Gateway's PortailConfig on a blocking thread
 /// (`to_route_table` compiles regexes and resolves backend DNS — both sync).
-async fn build_route_table(
-    config: crate::config::PortailConfig,
-) -> anyhow::Result<RouteTable> {
+async fn build_route_table(config: crate::config::PortailConfig) -> anyhow::Result<RouteTable> {
     tokio::task::spawn_blocking(move || config.to_route_table())
         .await
         .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
@@ -1264,7 +1269,9 @@ async fn reconcile(
     for ra in &result.route_status {
         if ra.accepted {
             for listener_name in &ra.listener_names {
-                *listener_route_counts.entry(listener_name.clone()).or_insert(0) += 1;
+                *listener_route_counts
+                    .entry(listener_name.clone())
+                    .or_insert(0) += 1;
             }
         }
     }

@@ -19,8 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::{info, warn};
 
-const READY_200: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
+const READY_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
 const NOT_READY_503: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot ready";
 

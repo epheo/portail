@@ -75,7 +75,9 @@ pub struct Args {
     /// portail-operator, which owns that status; portail then only reports
     /// per-listener status and route status.
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-    #[arg(help = "Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)")]
+    #[arg(
+        help = "Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)"
+    )]
     pub manage_gateway_status: bool,
 
     /// Port for the readiness endpoint (/readyz) served in Kubernetes mode.

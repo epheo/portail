@@ -321,8 +321,7 @@ async fn proxy_http_request(
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let mut backend =
-        match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline)
-            .await?
+        match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
         {
             Some(b) => b,
             None => return Ok(false),
