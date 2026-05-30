@@ -11,6 +11,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 use k8s_openapi::api::core::v1::Service;
 
 use crate::config::*;
+use crate::logging::warn;
 
 use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
@@ -172,9 +173,18 @@ pub(crate) fn reconcile_to_config(
     cert_data: &CertData,
     services: &ServiceState,
 ) -> Result<ReconcileResult> {
-    let gateway_config = convert_gateway(gateway, cert_data)?;
+    let mut gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
     let gateway_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+
+    // Bind the fronting Service's targetPort: the operator maps the published
+    // (possibly privileged) port -> an unprivileged target the pod binds, so no
+    // NET_BIND_SERVICE is needed. Empty in multi-network mode (no Service), where
+    // listeners fall back to binding their published port directly.
+    let target_ports = resolve_listener_target_ports(&snapshot.services, gateway_ns, gateway_name);
+    for l in &mut gateway_config.listeners {
+        l.target_port = target_ports.get(&l.port).copied();
+    }
 
     let mut route_status = Vec::new();
 
@@ -235,6 +245,65 @@ pub(crate) fn reconcile_to_config(
         },
         route_status,
     })
+}
+
+/// published listener port -> Service `targetPort` for the Service fronting this
+/// Gateway, identified by the label `portail.epheo.eu/gateway == gw_name` in
+/// `gw_ns`. The operator emits exactly one such LoadBalancer Service with numeric
+/// targetPorts; in multi-network mode there is no Service and the result is empty
+/// (listeners then bind their published port directly).
+fn resolve_listener_target_ports(
+    services: &[Service],
+    gw_ns: &str,
+    gw_name: &str,
+) -> HashMap<u16, u16> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    let mut matching = services.iter().filter(|svc| {
+        svc.metadata.namespace.as_deref() == Some(gw_ns)
+            && svc
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("portail.epheo.eu/gateway"))
+                .is_some_and(|v| v == gw_name)
+    });
+
+    let Some(svc) = matching.next() else {
+        return HashMap::new();
+    };
+    if matching.next().is_some() {
+        warn!(
+            "Multiple Services labelled portail.epheo.eu/gateway={} in {}; using {:?}",
+            gw_name,
+            gw_ns,
+            svc.metadata.name.as_deref().unwrap_or("?")
+        );
+    }
+
+    let mut map = HashMap::new();
+    let Some(spec) = svc.spec.as_ref() else {
+        return map;
+    };
+    for p in spec.ports.iter().flatten() {
+        let Ok(published) = u16::try_from(p.port) else {
+            continue;
+        };
+        match &p.target_port {
+            Some(IntOrString::Int(t)) => {
+                if let Ok(target) = u16::try_from(*t) {
+                    map.insert(published, target);
+                }
+            }
+            Some(IntOrString::String(name)) => warn!(
+                "Service for gateway {} uses named targetPort {:?} on port {}; binding the \
+                 published port (operator should emit numeric targetPorts)",
+                gw_name, name, published
+            ),
+            None => {} // omitted targetPort defaults to `port` -> no decoupling
+        }
+    }
+    map
 }
 
 /// Generic route collection with namespace scoping and acceptance tracking.
@@ -2435,5 +2504,112 @@ mod tests {
         assert_eq!(result.route_status[0].kind, "HTTPRoute");
         assert_eq!(result.route_status[0].name, "test-route");
         assert_eq!(result.route_status[0].namespace, "default");
+    }
+
+    // --- fronting-Service targetPort resolution ---
+
+    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    fn fronting_service(ns: &str, gw: &str, ports: &[(i32, Option<IntOrString>)]) -> Service {
+        let mut labels = BTreeMap::new();
+        labels.insert("portail.epheo.eu/gateway".to_string(), gw.to_string());
+        Service {
+            metadata: ObjectMeta {
+                name: Some(format!("portail-{gw}")),
+                namespace: Some(ns.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                ports: Some(
+                    ports
+                        .iter()
+                        .map(|(p, t)| ServicePort {
+                            port: *p,
+                            target_port: t.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn target_ports_maps_privileged_and_unprivileged() {
+        let svc = fronting_service(
+            "default",
+            "gw",
+            &[
+                (80, Some(IntOrString::Int(8000))),
+                (443, Some(IntOrString::Int(8001))),
+                (8080, Some(IntOrString::Int(8080))),
+            ],
+        );
+        let map = resolve_listener_target_ports(&[svc], "default", "gw");
+        assert_eq!(map.get(&80), Some(&8000));
+        assert_eq!(map.get(&443), Some(&8001));
+        assert_eq!(map.get(&8080), Some(&8080));
+    }
+
+    #[test]
+    fn target_ports_empty_without_matching_service() {
+        let wrong_gw = fronting_service("default", "other", &[(80, Some(IntOrString::Int(8000)))]);
+        assert!(resolve_listener_target_ports(&[wrong_gw], "default", "gw").is_empty());
+
+        let wrong_ns = fronting_service("elsewhere", "gw", &[(80, Some(IntOrString::Int(8000)))]);
+        assert!(resolve_listener_target_ports(&[wrong_ns], "default", "gw").is_empty());
+
+        assert!(resolve_listener_target_ports(&[], "default", "gw").is_empty());
+    }
+
+    #[test]
+    fn target_ports_skips_named_target_port() {
+        let svc = fronting_service(
+            "default",
+            "gw",
+            &[
+                (80, Some(IntOrString::String("http".to_string()))),
+                (443, Some(IntOrString::Int(8001))),
+            ],
+        );
+        let map = resolve_listener_target_ports(&[svc], "default", "gw");
+        assert_eq!(map.get(&80), None);
+        assert_eq!(map.get(&443), Some(&8001));
+    }
+
+    #[test]
+    fn reconcile_stamps_listener_target_port_from_fronting_service() {
+        let gw = test_gateway(); // listener "http" published on 8080
+        let snapshot = ClusterSnapshot {
+            http_routes: vec![],
+            tcp_routes: vec![],
+            tls_routes: vec![],
+            udp_routes: vec![],
+            namespace_labels: default_ns_labels(),
+            reference_grants: vec![],
+            services: vec![fronting_service(
+                "default",
+                "test-gw",
+                &[(8080, Some(IntOrString::Int(18080)))],
+            )],
+        };
+        let result =
+            reconcile_to_config(&gw, &snapshot, &HashMap::new(), &empty_services()).unwrap();
+        let http = result
+            .config
+            .gateway
+            .listeners
+            .iter()
+            .find(|l| l.port == 8080)
+            .expect("http listener present");
+        assert_eq!(
+            http.target_port,
+            Some(18080),
+            "listener must carry the fronting Service's targetPort"
+        );
     }
 }

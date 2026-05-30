@@ -692,6 +692,7 @@ mod tests {
             name: "test".to_string(),
             protocol,
             port: 443,
+            target_port: None,
             hostname: None,
             address: None,
             interface: None,

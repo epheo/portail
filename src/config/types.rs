@@ -41,6 +41,12 @@ pub struct ListenerConfig {
     pub name: String,
     pub protocol: Protocol,
     pub port: u16,
+    /// Port the data plane actually binds, when it differs from the published
+    /// `port`. In Kubernetes mode this is the fronting Service's `targetPort`
+    /// (so the pod binds an unprivileged port and the Service maps the
+    /// privileged published port onto it). `None` ⇒ bind `port` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +97,7 @@ impl Default for GatewayConfig {
                 name: "http".to_string(),
                 protocol: Protocol::HTTP,
                 port: 8080,
+                target_port: None,
                 hostname: None,
                 address: None,
                 interface: None,

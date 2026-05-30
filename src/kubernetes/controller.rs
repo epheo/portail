@@ -1114,25 +1114,27 @@ fn ensure_data_plane_listeners(
     }
 }
 
-/// (address, port) pairs the data plane must be bound to for this Gateway to
-/// be considered Programmed. Mirrors what we just passed to `add_tcp_listeners`.
-fn required_endpoints(gateway: &Gateway, bind_addresses: &[String]) -> Vec<(Option<String>, u16)> {
+/// (address, bound-port) pairs the data plane must be bound to for this Gateway
+/// to be considered Programmed. Keyed on each listener's bound port
+/// (`target_port` when the fronting Service decouples it, else the published
+/// port) so a deferred privileged listener keeps the Gateway not-Programmed
+/// until its real socket is up.
+fn required_endpoints(
+    listeners: &[crate::config::ListenerConfig],
+    bind_addresses: &[String],
+) -> Vec<(Option<String>, u16)> {
     if bind_addresses.is_empty() {
-        gateway
-            .spec
-            .listeners
+        listeners
             .iter()
-            .map(|l| (None, l.port as u16))
+            .map(|l| (None, l.target_port.unwrap_or(l.port)))
             .collect()
     } else {
         bind_addresses
             .iter()
             .flat_map(|addr| {
-                gateway
-                    .spec
-                    .listeners
+                listeners
                     .iter()
-                    .map(move |l| (Some(addr.clone()), l.port as u16))
+                    .map(move |l| (Some(addr.clone()), l.target_port.unwrap_or(l.port)))
             })
             .collect()
     }
@@ -1259,6 +1261,14 @@ async fn reconcile(
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
     ensure_data_plane_listeners(&ctx, &result.config.gateway.listeners, &bind_addresses);
 
+    // Readiness keys on each listener's bound port (`target_port` when the
+    // fronting Service decouples it, else the published port). Captured before
+    // `result.config` is moved into the route-table build below. In the brief
+    // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service is
+    // not yet observed, a privileged published bind fails harmlessly and
+    // readiness stays down until the Service (and its targetPort) appear.
+    let required = required_endpoints(&result.config.gateway.listeners, &bind_addresses);
+
     // Per-listener attached-route counts, restricted to this Gateway's routes.
     let mut listener_route_counts: HashMap<String, i32> = gateway
         .spec
@@ -1291,11 +1301,10 @@ async fn reconcile(
                 gw_ns, gw_name, http_count, tcp_count, tls_count, udp_count,
             );
 
-            let endpoints = required_endpoints(&gateway, &bind_addresses);
             let dp_ready = ctx
                 .data_plane
                 .lock()
-                .map(|dp| dp.is_ready_for_endpoints(&endpoints))
+                .map(|dp| dp.is_ready_for_endpoints(&required))
                 .unwrap_or(false);
             // Once the data plane has bound this gateway's listener ports, the
             // pod is serving — latch readiness on (never flips back).
@@ -1416,5 +1425,48 @@ where
                 .unwrap_or_default()
         }
         None => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ListenerConfig, Protocol};
+
+    fn lc(port: u16, target_port: Option<u16>) -> ListenerConfig {
+        ListenerConfig {
+            name: "l".to_string(),
+            protocol: Protocol::HTTP,
+            port,
+            target_port,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn required_endpoints_keys_on_bound_port() {
+        let listeners = [lc(80, Some(8000)), lc(8080, None)];
+        let eps = required_endpoints(&listeners, &[]);
+        assert!(eps.contains(&(None, 8000)));
+        assert!(eps.contains(&(None, 8080)));
+        assert!(
+            !eps.contains(&(None, 80)),
+            "published port must not be the readiness key"
+        );
+    }
+
+    #[test]
+    fn required_endpoints_products_bind_addresses() {
+        let listeners = [lc(443, Some(8001))];
+        let eps = required_endpoints(
+            &listeners,
+            &["10.0.0.1".to_string(), "10.0.0.2".to_string()],
+        );
+        assert_eq!(eps.len(), 2);
+        assert!(eps.contains(&(Some("10.0.0.1".to_string()), 8001)));
+        assert!(eps.contains(&(Some("10.0.0.2".to_string()), 8001)));
     }
 }

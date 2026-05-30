@@ -120,6 +120,7 @@ pub(crate) fn convert_listener(
         name: l.name.clone(),
         protocol,
         port: l.port as u16,
+        target_port: None,
         hostname: l.hostname.clone(),
         address: None,
         interface: None,
