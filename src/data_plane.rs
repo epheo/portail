@@ -147,11 +147,14 @@ impl DataPlane {
         }
 
         for (i, listener_cfg) in listeners.iter().enumerate() {
+            // `port` is the published identity (routing/TLS key); `bound_port` is
+            // the socket we actually bind — the Service's targetPort when set.
             let port = listener_cfg.port;
+            let bound_port = listener_cfg.target_port.unwrap_or(port);
             match listener_cfg.protocol {
                 Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
                     let std_listener = create_tcp_listener(
-                        port,
+                        bound_port,
                         listener_cfg.address.as_deref(),
                         listener_cfg.interface.as_deref(),
                     )?;
@@ -166,7 +169,7 @@ impl DataPlane {
                 }
                 Protocol::UDP => {
                     let std_socket = create_udp_socket(
-                        port,
+                        bound_port,
                         listener_cfg.address.as_deref(),
                         listener_cfg.interface.as_deref(),
                     )?;
@@ -180,9 +183,10 @@ impl DataPlane {
             }
         }
 
+        // Readiness tracks the bound socket, so key endpoints on the bound port.
         let bound_endpoints: std::collections::HashSet<(Option<String>, u16)> = listeners
             .iter()
-            .map(|l| (l.address.clone(), l.port))
+            .map(|l| (l.address.clone(), l.target_port.unwrap_or(l.port)))
             .collect();
 
         Ok(Self {
@@ -231,7 +235,10 @@ impl DataPlane {
         let merged_cert_refs = merge_cert_refs_by_port(listener_configs);
 
         for listener_cfg in listener_configs {
+            // `port` is the published identity (routing/TLS key); `bound_port` is
+            // the socket we actually bind — the Service's targetPort when set.
             let port = listener_cfg.port;
+            let bound_port = listener_cfg.target_port.unwrap_or(port);
 
             // Build DynamicTlsAcceptor if this listener needs TLS termination.
             // Uses the per-port merged cert refs so multi-listener ports get
@@ -278,15 +285,18 @@ impl DataPlane {
 
             for &bind_addr in &bind_addrs {
                 let effective_addr = bind_addr.or(listener_cfg.address.as_deref());
-                let endpoint = (effective_addr.map(String::from), port);
+                let endpoint = (effective_addr.map(String::from), bound_port);
                 if self.bound_endpoints.contains(&endpoint) {
                     continue; // Endpoint already bound
                 }
 
                 let mut port_ok = true;
                 if listener_cfg.protocol == Protocol::UDP {
-                    match create_udp_socket(port, effective_addr, listener_cfg.interface.as_deref())
-                    {
+                    match create_udp_socket(
+                        bound_port,
+                        effective_addr,
+                        listener_cfg.interface.as_deref(),
+                    ) {
                         Ok(std_socket) => match UdpSocket::from_std(std_socket) {
                             Ok(tokio_socket) => {
                                 let routes = routes.clone();
@@ -320,7 +330,7 @@ impl DataPlane {
                     }
                 } else {
                     match create_tcp_listener(
-                        port,
+                        bound_port,
                         effective_addr,
                         listener_cfg.interface.as_deref(),
                     ) {
@@ -497,6 +507,12 @@ fn create_tcp_listener(
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_nonblocking(true)?;
+    // SO_REUSEADDR lets a restart re-bind a port still held in TIME-WAIT by an
+    // older connection. Standard for any long-running proxy / server; unrelated
+    // to SO_REUSEPORT (per-core fan-out, removed in c010a19). Without this, a
+    // graceful restart waits up to net.ipv4.tcp_fin_timeout (60s by default)
+    // per port before it can accept again.
+    socket.set_reuse_address(true)?;
 
     if let Some(iface) = interface {
         socket.bind_device(Some(iface.as_bytes()))?;
@@ -552,6 +568,7 @@ mod tests {
             name: name.into(),
             protocol: P::HTTPS,
             port,
+            target_port: None,
             hostname: hostname.map(str::to_string),
             address: None,
             interface: None,
@@ -615,6 +632,7 @@ mod tests {
                 name: "http-only".into(),
                 protocol: P::HTTP,
                 port: 80,
+                target_port: None,
                 hostname: None,
                 address: None,
                 interface: None,
@@ -650,5 +668,43 @@ mod tests {
             compute_cert_fingerprint(&m2[&443]),
             "deterministic input must hash deterministically",
         );
+    }
+
+    /// A listener with a `target_port` binds that port (the Service's
+    /// targetPort), not the published `port`, and readiness keys on it.
+    #[tokio::test]
+    async fn binds_target_port_not_published() {
+        let listeners = vec![ListenerConfig {
+            name: "http".into(),
+            protocol: P::HTTP,
+            port: 21080,
+            target_port: Some(31080),
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: None,
+        }];
+        let perf = crate::config::PerformanceConfig {
+            backend_timeout: std::time::Duration::from_secs(1),
+            udp_session_timeout: std::time::Duration::from_secs(1),
+        };
+        let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+
+        // Readiness keys on the bound (target) port, not the published port.
+        assert!(dp.is_ready_for_endpoints(&[(None, 31080)]));
+        assert!(!dp.is_ready_for_endpoints(&[(None, 21080)]));
+
+        // The socket really landed on the target port (held by the data plane)...
+        assert!(
+            std::net::TcpListener::bind(("0.0.0.0", 31080u16)).is_err(),
+            "target port must be bound by the data plane"
+        );
+        // ...and the published port was never bound.
+        assert!(
+            std::net::TcpListener::bind(("0.0.0.0", 21080u16)).is_ok(),
+            "published port must not be bound"
+        );
+
+        drop(dp);
     }
 }

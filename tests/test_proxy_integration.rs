@@ -1021,3 +1021,148 @@ fn test_websocket_upgrade_through_proxy() {
     drop(stream);
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+// === HEAD / smuggling regressions ===
+
+/// Backend that responds to every request with a fixed headers-only payload —
+/// declares `Content-Length: N` but sends zero body bytes. Models a correct
+/// HEAD-aware backend; also models a backend that announces a body and never
+/// sends it (the today's-bug scenario: proxy hangs waiting for those N bytes).
+fn spawn_headers_only_backend(
+    content_length: usize,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    listener.set_nonblocking(true).unwrap();
+
+    thread::spawn(move || {
+        while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buf = [0u8; 4096];
+                    let mut accum = Vec::new();
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        accum.extend_from_slice(&buf[..n]);
+                        if accum.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        content_length,
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (addr, shutdown)
+}
+
+#[test]
+fn test_head_no_body_does_not_hang() {
+    // Backend advertises a 100-byte body then sends none — correct HEAD semantics.
+    // Before the fix, the proxy would block in forward_response_body waiting for
+    // 100 bytes the backend (correctly) never sends, and the test would time out.
+    let (backend_addr, shutdown) = spawn_headers_only_backend(100);
+    let port = proxy_port(40);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend_addr)], port);
+
+    let request = b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request_timeout(proxy.proxy_addr, request, Duration::from_secs(3))
+        .expect("HEAD should return headers within timeout (no hang)");
+
+    let status = extract_status(&response).expect("valid HTTP status");
+    assert_eq!(status, 200, "expected 200 OK, got {}", status);
+
+    // RFC 7230 §3.3: HEAD responses have no message body. The body extractor
+    // walks past the header terminator, so any non-empty body would be the
+    // backend's actual body bytes leaking through. The backend sent none,
+    // so the proxy MUST not have invented any either.
+    let body = extract_body(&response);
+    assert!(
+        body.is_empty(),
+        "HEAD response body must be empty, got {} bytes: {:?}",
+        body.len(),
+        std::str::from_utf8(body).unwrap_or("<binary>")
+    );
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn test_te_cl_smuggling_rejected() {
+    // RFC 7230 §3.3.3: a request with both Content-Length AND Transfer-Encoding
+    // is a classic CL/TE desync vector. Industry consensus rejects with 400.
+    let backend = TestBackend::spawn("must-not-be-reached");
+    let port = proxy_port(41);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    // Build a smuggling request: declares CL:5 and TE:chunked. Body looks like
+    // a chunked terminator framing for the TE side, padded with a CL-side
+    // "next request" smuggled in.
+    let smuggled = "POST / HTTP/1.1\r\n\
+                    Host: localhost\r\n\
+                    Content-Length: 5\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    0\r\n\r\n";
+    let response = http_request_timeout(
+        proxy.proxy_addr,
+        smuggled.as_bytes(),
+        Duration::from_secs(3),
+    )
+    .expect("proxy should respond with 400, not hang");
+
+    let status = extract_status(&response).expect("valid HTTP status");
+    assert_eq!(
+        status, 400,
+        "expected 400 Bad Request for TE+CL smuggling, got {}",
+        status
+    );
+}
+
+#[test]
+fn test_duplicate_content_length_conflict_rejected() {
+    // Two Content-Length lines with different values — also a smuggling vector
+    // (different proxies parse the first vs last value, allowing desync).
+    let backend = TestBackend::spawn("must-not-be-reached");
+    let port = proxy_port(42);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let conflict = "POST / HTTP/1.1\r\n\
+                    Host: localhost\r\n\
+                    Content-Length: 5\r\n\
+                    Content-Length: 10\r\n\
+                    Connection: close\r\n\
+                    \r\n\
+                    hello";
+    let response = http_request_timeout(
+        proxy.proxy_addr,
+        conflict.as_bytes(),
+        Duration::from_secs(3),
+    )
+    .expect("proxy should respond with 400, not hang");
+
+    let status = extract_status(&response).expect("valid HTTP status");
+    assert_eq!(
+        status, 400,
+        "expected 400 Bad Request for conflicting Content-Length, got {}",
+        status
+    );
+}

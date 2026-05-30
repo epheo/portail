@@ -60,6 +60,13 @@ pub struct HttpRequestInfo<'a> {
     pub is_chunked: bool,
     /// Whether this is a WebSocket/protocol upgrade request
     pub is_upgrade: bool,
+    /// Set when the request carries headers that constitute a smuggling vector
+    /// per RFC 7230 §3.3.3:
+    /// - both `Content-Length` and `Transfer-Encoding: chunked` present, or
+    /// - multiple `Content-Length` lines with conflicting values.
+    ///
+    /// The caller MUST reject such requests with `400`.
+    pub header_violation: bool,
 }
 
 /// Extract complete HTTP routing information with zero-copy parsing
@@ -81,6 +88,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     let mut is_chunked = false;
     let mut is_upgrade = false;
     let mut http_version = HttpVersion::Http11;
+    // RFC 7230 §3.3.3 smuggling guards. We flag (but keep parsing) so the
+    // request_processor can reject with a clean 400.
+    let mut duplicate_content_length_conflict = false;
 
     // Parse first line (method, path, version)
     let mut line_end = pos;
@@ -164,7 +174,11 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .ok_or(())
                 {
-                    content_length = Some(val);
+                    record_content_length(
+                        val,
+                        &mut content_length,
+                        &mut duplicate_content_length_conflict,
+                    );
                 }
             } else if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
                 let mut vs = 15;
@@ -176,7 +190,11 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .ok_or(())
                 {
-                    content_length = Some(val);
+                    record_content_length(
+                        val,
+                        &mut content_length,
+                        &mut duplicate_content_length_conflict,
+                    );
                 }
             } else if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"Transfer-Encoding:") {
                 let mut vs = 18;
@@ -268,6 +286,11 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         None => "",
     };
 
+    // RFC 7230 §3.3.3: reject both TE+CL coexistence and conflicting duplicate
+    // Content-Length values — both are classic request-smuggling vectors.
+    let header_violation =
+        duplicate_content_length_conflict || (content_length.is_some() && is_chunked);
+
     Ok(HttpRequestInfo {
         method: method.unwrap_or("GET"),
         host: resolved_host,
@@ -278,5 +301,18 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         content_length,
         is_chunked,
         is_upgrade,
+        header_violation,
     })
+}
+
+/// Record a parsed `Content-Length` value, flagging a conflict if a previous
+/// value was different. Multiple identical CL lines are not flagged (RFC 7230
+/// §3.3.2 allows them).
+#[inline]
+fn record_content_length(val: usize, current: &mut Option<usize>, conflict: &mut bool) {
+    match *current {
+        Some(prev) if prev != val => *conflict = true,
+        Some(_) => {} // duplicate but equal — benign
+        None => *current = Some(val),
+    }
 }
