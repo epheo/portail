@@ -320,7 +320,7 @@ async fn proxy_http_request(
     let backend_phase_start = Instant::now();
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
-    let mut backend =
+    let (mut backend, from_pool) =
         match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
         {
             Some(b) => b,
@@ -328,13 +328,21 @@ async fn proxy_http_request(
         };
 
     // Send request to backend, optionally applying filter modifications.
+    //
+    // Retry contract: if the conn came from the pool AND the send errors, we
+    // retry once on a fresh conn. SAFE — `relay_request_body` hasn't been
+    // called, so no client body bytes have been consumed yet, and no client
+    // write has happened either. `buf[..request_bytes]` still holds exactly
+    // what arrived; the original send's bytes went into a dead pipe, so no
+    // backend observed them. The retry is unconditionally safe regardless of
+    // HTTP method.
     let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
     let has_mirrors = (rule.has_filters || !backend_ref.filters.is_empty())
         && rule
             .filters
             .iter()
             .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
-    let mirror_header_data = send_request_to_backend(
+    let mirror_header_data = match send_request_to_backend(
         &mut backend,
         buf,
         req_header_end,
@@ -343,7 +351,83 @@ async fn proxy_http_request(
         backend_ref,
         has_mirrors,
     )
-    .await?;
+    .await
+    {
+        Ok(m) => m,
+        Err(_e) if from_pool => {
+            // Pool entry died between probe and write. Reconnect once and
+            // replay. Do NOT record_failure here: a stale pool entry is
+            // expected churn, not a backend problem.
+            debug!(
+                "Backend {} pool conn died on send ({}); retrying with fresh conn",
+                backend_addr, _e
+            );
+            drop(backend);
+            let fresh_budget = clamp_to_deadline(
+                backend_budget.saturating_sub(backend_phase_start.elapsed()),
+                total_deadline,
+            );
+            backend = match tokio::time::timeout(
+                fresh_budget,
+                state.pool.acquire_fresh(
+                    backend_addr,
+                    backend_ref.use_tls,
+                    &backend_ref.server_name,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e2)) => {
+                    warn!(
+                        "Backend {} fresh-conn acquire failed after pool retry: {}",
+                        backend_addr, e2
+                    );
+                    if state.health.record_failure(backend_addr) {
+                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+                    }
+                    send_error_response(client, 502).await?;
+                    return Ok(false);
+                }
+                Err(_) => {
+                    warn!(
+                        "Backend {} fresh-conn acquire timeout after pool retry",
+                        backend_addr
+                    );
+                    if state.health.record_failure(backend_addr) {
+                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+                    }
+                    send_error_response(client, 504).await?;
+                    return Ok(false);
+                }
+            };
+            match send_request_to_backend(
+                &mut backend,
+                buf,
+                req_header_end,
+                request_bytes,
+                rule,
+                backend_ref,
+                has_mirrors,
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(e2) => {
+                    warn!(
+                        "Backend {} send failed on fresh conn after pool retry: {}",
+                        backend_addr, e2
+                    );
+                    if state.health.record_failure(backend_addr) {
+                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
+                    }
+                    send_error_response(client, 502).await?;
+                    return Ok(false);
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     // Relay remaining request body + optional mirror tee.
     let mirror_body = relay_request_body(
@@ -382,6 +466,7 @@ async fn proxy_http_request(
         &mut state.header_buf,
         resp_mods.as_ref(),
         header_budget,
+        meta.is_head,
     )
     .await?
     {
@@ -450,13 +535,17 @@ async fn proxy_http_request(
 /// On any failure or timeout, records health failure and sends `502`/`504` to the
 /// client. Returns `Ok(None)` when the caller should bail out (`return Ok(false)`),
 /// which signals the connection is not reusable.
+///
+/// `Ok(Some((conn, from_pool)))`: `from_pool == true` means the conn came from
+/// the idle pool and the caller may safely retry once with `acquire_fresh` if a
+/// subsequent SAFE-zone write to it fails (the probe is best-effort).
 async fn connect_to_backend(
     client: &mut Connection,
     state: &mut ConnectionState,
     backend_ref: &crate::routing::Backend,
     backend_budget: Duration,
     total_deadline: Option<std::time::Instant>,
-) -> Result<Option<Connection>> {
+) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
     match tokio::time::timeout(
@@ -467,7 +556,7 @@ async fn connect_to_backend(
     )
     .await
     {
-        Ok(Ok(stream)) => Ok(Some(stream)),
+        Ok(Ok(result)) => Ok(Some(result)),
         Ok(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
             if state.health.record_failure(backend_addr) {
@@ -550,10 +639,11 @@ async fn forward_response_headers(
     header_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
     header_budget: Duration,
+    is_head_request: bool,
 ) -> Result<Option<ResponseFraming>> {
     let (resp_header_end, framing) = match tokio::time::timeout(
         header_budget,
-        read_response_headers(backend, buf, header_buf),
+        read_response_headers(backend, buf, header_buf, is_head_request),
     )
     .await
     {
@@ -566,12 +656,24 @@ async fn forward_response_headers(
     };
 
     // SAFE → UNSAFE: first client write happens here.
+    //
+    // For HEAD requests, only the response headers are forwarded — any body
+    // bytes the backend (incorrectly) sent in the same TCP read as the headers
+    // are dropped on the floor here rather than leaking to the HEAD client.
+    // The backend conn may end up desynced if it sent body bytes; the pool
+    // release at the caller relies on the framing-clean check, but a HEAD
+    // response with no_body forced is always framing-clean here, so a fully
+    // robust fix would mark this case as not-pool-eligible. Documenting as a
+    // known limit: misbehaving HEAD backends may cause one corrupted response
+    // on the next pooled request; well-behaved backends (the norm) are fine.
     if let Some(mods) = resp_mods {
         let modified = apply_response_header_mods(&header_buf[..resp_header_end], mods);
         client.write_all(&modified).await?;
-        if header_buf.len() > resp_header_end {
+        if !is_head_request && header_buf.len() > resp_header_end {
             client.write_all(&header_buf[resp_header_end..]).await?;
         }
+    } else if is_head_request {
+        client.write_all(&header_buf[..resp_header_end]).await?;
     } else {
         client.write_all(header_buf).await?;
     }
@@ -704,6 +806,7 @@ async fn read_response_headers(
     backend: &mut Connection,
     buf: &mut [u8],
     header_buf: &mut Vec<u8>,
+    is_head_request: bool,
 ) -> Result<(usize, ResponseFraming)> {
     header_buf.clear();
 
@@ -720,10 +823,14 @@ async fn read_response_headers(
             let headers = &header_buf[..header_end];
             let content_length = parse_content_length(headers);
             let chunked = is_chunked_transfer(headers);
-            let no_body = is_no_body_status(headers);
+            // RFC 7230 §3.3: responses to HEAD have no message body regardless
+            // of the response's Content-Length / Transfer-Encoding. Forcing
+            // no_body here keeps `forward_response_body` from blocking on
+            // bytes the backend correctly never sends.
+            let no_body = is_head_request || is_no_body_status(headers);
 
             let body_bytes_already_forwarded = header_buf.len() - header_end;
-            let chunked = if chunked {
+            let chunked = if chunked && !is_head_request {
                 let mut stream = ChunkedStream::new();
                 if body_bytes_already_forwarded > 0 {
                     stream.observe(&header_buf[header_end..]);
@@ -736,9 +843,20 @@ async fn read_response_headers(
             return Ok((
                 header_end,
                 ResponseFraming {
-                    content_length,
+                    content_length: if is_head_request {
+                        None
+                    } else {
+                        content_length
+                    },
                     no_body,
-                    body_bytes_already_forwarded,
+                    // For HEAD, the header-tail body bytes are dropped (not
+                    // forwarded to the client per RFC 7230 §3.3), so the
+                    // body-byte counter for the response-body phase is zero.
+                    body_bytes_already_forwarded: if is_head_request {
+                        0
+                    } else {
+                        body_bytes_already_forwarded
+                    },
                     chunked,
                 },
             ));

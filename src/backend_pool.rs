@@ -1,8 +1,16 @@
-//! Per-worker connection pool for persistent backend connections.
+//! Per-connection backend pool for persistent backend connections.
 //!
-//! Each worker owns its own pool — no locks, no contention.
-//! Reuses idle backend connections across requests to amortize TCP handshake cost.
-//! Supports both plain TCP and TLS backend connections.
+//! One pool per accepted client connection — no locks, no contention.
+//! Reuses idle backend connections across keepalive requests on the same client
+//! conn to amortize TCP/TLS handshake cost.
+//!
+//! Cross-client-conn reuse is intentionally out of scope here; see the plan in
+//! `/var/home/epheo/dev/.claude/plans/backend-connection-pooling-is-jiggly-lecun.md`
+//! for the rationale (workload-dependent gain, deferred for measurement).
+//!
+//! On a pool hit `acquire` returns `(Connection, true)`; the caller uses that
+//! signal to retry once with a fresh conn if the pooled conn turns out to be
+//! half-closed by the time we write to it (`acquire_fresh`).
 
 use crate::logging::debug;
 use crate::tls::Connection;
@@ -37,29 +45,65 @@ impl BackendPool {
         }
     }
 
+    /// Get a backend connection — pooled if available and alive, otherwise fresh.
+    ///
+    /// Returns `(Connection, from_pool)`. `from_pool == true` means the caller
+    /// may retry once with `acquire_fresh` if the conn errors during the SAFE
+    /// zone (before any client bytes are read for the body or written): the
+    /// probe is best-effort and a backend can close a pooled conn between the
+    /// probe and our write.
     pub async fn acquire(
         &mut self,
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
-    ) -> Result<Connection> {
+    ) -> Result<(Connection, bool)> {
         // Try reuse an idle connection — pop and probe until we find a live one.
         if let Some(conns) = self.pools.get_mut(&addr) {
             while let Some(conn) = conns.pop() {
-                let mut probe = [0u8; 0];
+                // 1-byte probe: WouldBlock on an idle TCP socket means open with
+                // no readable data — alive. Ok(0) is a peer FIN; Ok(1) is an
+                // unsolicited byte from a supposedly-idle HTTP backend (poisoned
+                // or desynced). In both Ok cases the conn is unusable; the byte
+                // we may have read in the poisoned case is on a conn we're
+                // dropping anyway, so it's harmless.
+                //
+                // For Connection::Tls / ClientTls this resolves to a hardcoded
+                // WouldBlock in tls.rs — TLS state can't be peeked without
+                // consuming framing. The caller's retry-on-from_pool path is
+                // the safety net for stale TLS pool entries.
+                let mut probe = [0u8; 1];
                 match conn.try_read(&mut probe) {
-                    // Would block = connection is alive and idle
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         debug!("Pool hit: reusing connection to {}", addr);
-                        return Ok(conn);
+                        return Ok((conn, true));
                     }
-                    // Zero bytes read or error = stale connection, try next
                     _ => continue,
                 }
             }
         }
 
-        // No reusable connection — open a new one
+        let conn = self.connect_new(addr, use_tls, server_name).await?;
+        Ok((conn, false))
+    }
+
+    /// Open a brand-new backend connection, skipping the pool entirely.
+    /// Used by the caller's retry path when a pooled conn turns out to be stale.
+    pub async fn acquire_fresh(
+        &self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Result<Connection> {
+        self.connect_new(addr, use_tls, server_name).await
+    }
+
+    async fn connect_new(
+        &self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Result<Connection> {
         debug!("Pool miss: connecting to {} (tls={})", addr, use_tls);
         let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
             .await
@@ -132,5 +176,65 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Open a pair of connected tokio TcpStreams: returns (local, remote).
+    /// `remote` is the server-side; closing/writing to it drives the probe outcome.
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) =
+            tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
+                listener.accept().await.unwrap().0
+            },);
+        (client, server)
+    }
+
+    /// Probe an idle TcpStream the way `acquire` does and report the branch taken.
+    #[derive(Debug, PartialEq)]
+    enum ProbeOutcome {
+        Alive,
+        Stale,
+    }
+
+    fn probe_tcp(stream: &TcpStream) -> ProbeOutcome {
+        let mut buf = [0u8; 1];
+        match stream.try_read(&mut buf) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => ProbeOutcome::Alive,
+            _ => ProbeOutcome::Stale,
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_idle_conn_returns_alive() {
+        let (local, _remote) = pair().await;
+        assert_eq!(probe_tcp(&local), ProbeOutcome::Alive);
+    }
+
+    #[tokio::test]
+    async fn probe_half_closed_returns_stale() {
+        let (local, mut remote) = pair().await;
+        // Remote half-closes — local should see Ok(0) on read.
+        remote.shutdown().await.unwrap();
+        // Give the FIN a moment to land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(probe_tcp(&local), ProbeOutcome::Stale);
+    }
+
+    #[tokio::test]
+    async fn probe_unsolicited_byte_returns_stale() {
+        let (local, mut remote) = pair().await;
+        // Remote sends an unsolicited byte — an idle HTTP backend shouldn't
+        // speak first. Probe returns Ok(1); treated as stale (poisoned conn).
+        remote.write_all(b"x").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(probe_tcp(&local), ProbeOutcome::Stale);
     }
 }

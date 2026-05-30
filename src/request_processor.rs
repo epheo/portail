@@ -20,6 +20,11 @@ pub struct RequestMeta {
     pub content_length: Option<usize>,
     pub is_chunked: bool,
     pub is_upgrade: bool,
+    /// True when the request method is HEAD. The response must be treated as
+    /// having no body regardless of `Content-Length`/`Transfer-Encoding` on the
+    /// response — otherwise `forward_response_body` would block reading bytes
+    /// the backend (correctly) never sends.
+    pub is_head: bool,
     pub keepalive: bool,
 }
 
@@ -112,6 +117,21 @@ fn analyze_http_request<'a>(
     let request_info = extract_routing_info(request_data)?;
     let keepalive = request_info.connection_type != ConnectionType::Close;
 
+    // RFC 7230 §3.3.3: reject smuggling vectors at the front door — both
+    // TE+CL coexistence and conflicting duplicate Content-Length values.
+    // Industry consensus (haproxy / envoy / nginx) is to refuse rather than
+    // try to interpret; the message ambiguity itself is the attack surface.
+    if request_info.header_violation {
+        crate::logging::warn!(
+            "Rejecting request with conflicting framing headers (TE+CL or duplicate CL) on port {}",
+            server_port
+        );
+        return Ok(RoutingResult::SendHttpError {
+            error_code: 400,
+            close_connection: true,
+        });
+    }
+
     let rule = match routes.find_http_route(
         request_info.host,
         request_info.method,
@@ -196,6 +216,7 @@ fn analyze_http_request<'a>(
             content_length: request_info.content_length,
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
+            is_head: request_info.method.eq_ignore_ascii_case("HEAD"),
             keepalive,
         },
     })
