@@ -1,7 +1,8 @@
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
@@ -63,7 +64,6 @@ struct ResourceCache {
     udp_routes: Store<UDPRoute>,
     namespaces: Store<Namespace>,
     services: Store<Service>,
-    endpoint_slices: Store<EndpointSlice>,
     secrets: Store<Secret>,
     reference_grants: Store<ReferenceGrant>,
 }
@@ -184,7 +184,7 @@ fn ip_in_subnet(ip: std::net::Ipv4Addr, network: std::net::Ipv4Addr, prefix_len:
 }
 
 /// Enumerate IPv4/IPv6 addresses from all local network interfaces.
-/// Discovers all routable IPs for EndpointSlice matching, bind-address filtering, and status reporting.
+/// Discovers routable IPs for bind-address filtering and status reporting.
 fn discover_local_interface_ips() -> Vec<String> {
     let mut ips = Vec::new();
     unsafe {
@@ -235,6 +235,10 @@ struct ControllerCtx {
     controller_name: String,
     cache: ResourceCache,
     routes: Arc<ArcSwap<RouteTable>>,
+    /// Last config the reconciler built, published for the background DNS-refresh
+    /// task to re-resolve without an apiserver round-trip. `None` until the first
+    /// successful reconcile.
+    config_cell: Arc<ArcSwapOption<crate::config::PortailConfig>>,
     data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
     /// When false, the operator owns Gateway/GatewayClass lifecycle status
@@ -267,9 +271,19 @@ where
 {
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
-    let stream = reflector::reflector(writer, watcher::watcher(api, watcher::Config::default()))
-        .default_backoff()
-        .touched_objects(); // touched_objects includes deletes; applied_objects drops them
+    // Stream the initial list via the WatchList API instead of a single blocking
+    // LIST. Each per-Gateway pod cold-starts by listing ~6 cluster-wide resource
+    // types; with N pods watching + route/Service churn, concurrent blocking LISTs
+    // saturate the apiserver and a fresh pod's reflector sync stalls (measured 1s
+    // isolated → 20s+/never under load), which is the cold-start convergence flake.
+    // Streaming lists are far lighter on the apiserver under that load. Requires
+    // server WatchList support (k8s >= 1.27; default-on >= 1.30).
+    let stream = reflector::reflector(
+        writer,
+        watcher::watcher(api, watcher::Config::default().streaming_lists()),
+    )
+    .default_backoff()
+    .touched_objects(); // touched_objects includes deletes; applied_objects drops them
     (reader, stream)
 }
 
@@ -356,6 +370,110 @@ fn all_gateway_refs(store: &Store<Gateway>) -> Vec<ObjectRef<Gateway>> {
         .collect()
 }
 
+/// Which *gate-able* secondary resources a single-Gateway data plane needs to
+/// watch. Derived by portail-operator from the Gateway's listeners and passed
+/// via `--watch-shape`, so a scoped pod skips cluster-wide watches it will never
+/// consume. The default (`--watch-shape` absent → `WatchShape::all()`) keeps the
+/// legacy broad behavior, so an older operator that does not set the flag still
+/// works unchanged.
+///
+/// IMPORTANT: only resources that never `parentRef` a Gateway may be gated.
+/// Route watches (HTTP/TCP/TLS/UDP) are deliberately NOT here: a route in any
+/// namespace, of any kind, may `parentRef` this Gateway and must receive a
+/// status — attached, or rejected with `NotAllowedByListeners` /
+/// `NoMatchingParent` — which requires the data plane to observe it. Secrets and
+/// Namespace labels do not `parentRef` Gateways, so they are safe to drop.
+#[derive(Clone, Copy, Debug)]
+pub struct WatchShape {
+    pub tls_secrets: bool,
+    pub namespaces: bool,
+}
+
+impl WatchShape {
+    /// Watch every gate-able secondary resource (legacy / unscoped mode).
+    pub fn all() -> Self {
+        Self {
+            tls_secrets: true,
+            namespaces: true,
+        }
+    }
+
+    /// Parse the operator's `--watch-shape` token set. `None` → `all()` (broad,
+    /// legacy). `Some(spec)` → enable only the listed gate-able watches: `tls`
+    /// (a TLS-terminate listener) and `ns-labels` (an `allowedRoutes: Selector`
+    /// listener).
+    pub fn parse(spec: Option<&str>) -> Self {
+        let Some(spec) = spec else {
+            return Self::all();
+        };
+        let mut s = Self {
+            tls_secrets: false,
+            namespaces: false,
+        };
+        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            match token {
+                "tls" => s.tls_secrets = true,
+                "ns-labels" => s.namespaces = true,
+                other => warn!("ignoring unknown --watch-shape token: {other}"),
+            }
+        }
+        s
+    }
+}
+
+/// A boxed reflector stream — the uniform type used by gated watches so the
+/// `Controller` wiring stays identical whether or not the watch is active.
+type BoxedReflectorStream<K> =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static>>;
+
+/// Like `create_reflector` but gated, with a caller-supplied watcher config:
+/// when `enabled` is false, returns an empty store and a stream that never yields
+/// — the controller opens no LIST/WATCH for it — while keeping the `Controller`
+/// wiring uniform. `config` lets callers add a field selector etc. (e.g. the TLS
+/// Secret watch's `type=kubernetes.io/tls`).
+fn create_reflector_gated_with_config<K>(
+    enabled: bool,
+    api: Api<K>,
+    config: watcher::Config,
+) -> (Store<K>, BoxedReflectorStream<K>)
+where
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    if !enabled {
+        let writer = reflector::store::Writer::default();
+        return (writer.as_reader(), Box::pin(futures::stream::pending()));
+    }
+    let writer = reflector::store::Writer::default();
+    let reader = writer.as_reader();
+    let stream = reflector::reflector(writer, watcher::watcher(api, config))
+        .default_backoff()
+        .touched_objects();
+    (reader, Box::pin(stream))
+}
+
+/// The gated counterpart of `create_reflector`: same default streaming-list
+/// config, but opens no LIST/WATCH when `enabled` is false.
+fn create_reflector_gated<K>(enabled: bool, api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
+where
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    create_reflector_gated_with_config(enabled, api, watcher::Config::default().streaming_lists())
+}
+
 pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
@@ -365,6 +483,7 @@ pub async fn run_controller(
     manage_gateway_status: bool,
     ready: Arc<std::sync::atomic::AtomicBool>,
     gateway_scope: Option<(String, String)>,
+    watch_shape: WatchShape,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
@@ -405,45 +524,53 @@ pub async fn run_controller(
     // This is the standard kube-rs/controller-runtime pattern: secondary resource
     // events go through a separate path unaffected by the primary predicate_filter.
 
-    // CRD reflectors — generation-filtered to ignore status-only changes
-    // HTTPRoute is required (GA); experimental CRDs are optional.
+    // CRD reflectors — generation-filtered to ignore status-only changes.
+    // HTTPRoute is required (GA); TCP/TLS/UDPRoute are experimental (optional).
+    // All route watches stay CLUSTER-WIDE and unconditional: a route in any
+    // namespace, of any kind, may parentRef this Gateway and must get a status
+    // (attached, or rejected with NotAllowedByListeners / NoMatchingParent) —
+    // which requires observing it, so route watches cannot be shape-scoped. The
+    // three optional CRDs are probed concurrently so a contended apiserver does
+    // not serialize the cold start.
     let (store_http_routes, http_route_stream) =
         create_reflector(Api::<HTTPRoute>::all(client.clone()));
-    let (store_tcp_routes, tcp_route_stream) =
-        create_optional_reflector(Api::<TCPRoute>::all(client.clone())).await;
-    let (store_tls_routes, tls_route_stream) =
-        create_optional_reflector(Api::<TLSRoute>::all(client.clone())).await;
-    let (store_udp_routes, udp_route_stream) =
-        create_optional_reflector(Api::<UDPRoute>::all(client.clone())).await;
+    let (tcp_reflector, tls_reflector, udp_reflector) = tokio::join!(
+        create_optional_reflector(Api::<TCPRoute>::all(client.clone())),
+        create_optional_reflector(Api::<TLSRoute>::all(client.clone())),
+        create_optional_reflector(Api::<UDPRoute>::all(client.clone())),
+    );
+    let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
+    let (store_tls_routes, tls_route_stream) = tls_reflector;
+    let (store_udp_routes, udp_route_stream) = udp_reflector;
     // GatewayClass status is owned by portail-operator now; portail no longer
     // runs its own GatewayClass controller.
 
-    // Core resource reflectors — no generation filter (core types don't reliably set it)
-    let (store_namespaces, namespace_stream) =
-        create_reflector(Api::<Namespace>::all(client.clone()));
+    // Core resource reflectors — no generation filter (core types don't reliably set it).
+    // The Namespace watch is opened only when a listener uses
+    // `allowedRoutes: Selector` (the only consumer of namespace labels).
+    let (store_namespaces, namespace_stream) = create_reflector_gated(
+        watch_shape.namespaces,
+        Api::<Namespace>::all(client.clone()),
+    );
     let (store_services, service_stream) = create_reflector(Api::<Service>::all(client.clone()));
-    let (store_endpoint_slices, endpoint_slice_stream) =
-        create_reflector(Api::<EndpointSlice>::all(client.clone()));
     let (store_reference_grants, reference_grant_stream) =
         create_reflector(Api::<ReferenceGrant>::all(client.clone()));
 
-    // TLS secrets — field-filtered to avoid watching all secrets
-    let (store_secrets, secret_stream) = {
-        let writer = reflector::store::Writer::default();
-        let reader = writer.as_reader();
-        let stream = reflector::reflector(
-            writer,
-            watcher::watcher(
-                Api::<Secret>::all(client.clone()),
-                watcher::Config::default().fields("type=kubernetes.io/tls"),
-            ),
-        )
-        .default_backoff()
-        .touched_objects();
-        (reader, stream)
-    };
+    // TLS secrets — field-filtered to type=kubernetes.io/tls, and opened only
+    // when the Gateway has a TLS-terminate listener (watch shape).
+    let (store_secrets, secret_stream) = create_reflector_gated_with_config(
+        watch_shape.tls_secrets,
+        Api::<Secret>::all(client.clone()),
+        watcher::Config::default()
+            .fields("type=kubernetes.io/tls")
+            .streaming_lists(),
+    );
 
     let store_gateways_for_controller = store_gateways.clone();
+
+    // Shared cell the reconciler publishes its last-built config into, read by the
+    // background DNS-refresh task to re-resolve backend FQDNs off the apiserver.
+    let config_cell = Arc::new(ArcSwapOption::<crate::config::PortailConfig>::empty());
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -456,16 +583,27 @@ pub async fn run_controller(
             udp_routes: store_udp_routes,
             namespaces: store_namespaces,
             services: store_services,
-            endpoint_slices: store_endpoint_slices,
             secrets: store_secrets,
             reference_grants: store_reference_grants,
         },
         routes,
+        config_cell: config_cell.clone(),
         data_plane,
         performance_config,
         manage_gateway_status,
         ready,
     });
+
+    // STRICT_DNS freshness: re-resolve headless/Service FQDNs on an interval and
+    // swap the route table only when the resolved set changes. This is why the
+    // cluster-wide EndpointSlice watch is unnecessary — DNS already publishes the
+    // per-pod A-records, so pod churn is picked up here without an apiserver watch.
+    crate::dns_refresh::spawn_dns_refresh(
+        config_cell,
+        ctx.routes.clone(),
+        ctx.performance_config.dns_refresh_interval,
+        shutdown.clone(),
+    );
 
     // --- Gateway controller ---
     // Primary: Gateway stream with generation predicate (breaks feedback loop).
@@ -473,12 +611,11 @@ pub async fn run_controller(
     //
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
     // Secret → map to Gateways referencing it in TLS config (targeted)
-    // EndpointSlice → map via Service→Route→Gateway (targeted)
     // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
 
     // Each watches_stream closure captures an owned gateway store clone via move.
-    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
-        std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
+    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7] =
+        std::array::from_fn::<_, 7, _>(|_| store_gateways_for_controller.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
         // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
@@ -523,14 +660,12 @@ pub async fn run_controller(
                     .collect()
             },
         )
-        // EndpointSlice, Service, Namespace, ReferenceGrant: broad — reconcile all
-        // Gateways. These have complex multi-hop mappings and the 1s debounce
-        // coalesces frequent EndpointSlice events from pod scaling/readiness.
-        .watches_stream(endpoint_slice_stream, move |_: EndpointSlice| {
-            all_gateway_refs(&gw6)
-        })
-        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw7))
-        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw8))
+        // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
+        // These have complex multi-hop mappings; the 1s debounce coalesces bursts.
+        // (No EndpointSlice watch: backend pod churn is picked up by the DNS-refresh
+        // task, since a headless Service publishes per-pod A-records at its FQDN.)
+        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw6))
+        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw7))
         .watches_stream(reference_grant_stream, {
             let gw = ctx.cache.gateways.clone();
             move |_: ReferenceGrant| all_gateway_refs(&gw)
@@ -638,12 +773,29 @@ fn resolve_gateway_certs(
     cert_data
 }
 
-/// Resolve service metadata: known services set, headless endpoint overrides,
-/// ExternalName overrides, and appProtocol overrides.
-fn resolve_services(
-    all_services: &[Service],
-    store_endpoint_slices: &Store<EndpointSlice>,
-) -> ServiceState {
+/// A headless Service whose `targetPort` is *named*. The numeric value lives in
+/// the pod/endpoint data, not the Service spec, so it is resolved by the caller
+/// with a one-shot, label-filtered EndpointSlice list (see
+/// [`resolve_named_target_ports`]) — a targeted read, not a watch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NamedTargetPortReq {
+    ns: String,
+    svc: String,
+    service_port: u16,
+    port_name: String,
+}
+
+/// Resolve service metadata: known services set, ExternalName overrides,
+/// appProtocol overrides, and the headless service-port → targetPort map.
+///
+/// Headless pod IPs are not special-cased: their per-pod A-records are resolved
+/// at the data plane via STRICT_DNS ([`crate::routing::Backend::all_with_weight`])
+/// and refreshed by the DNS-refresh task, so no cluster-wide EndpointSlice watch
+/// is needed. The one thing the Service spec cannot give us is a *named*
+/// targetPort's numeric value; those are returned as [`NamedTargetPortReq`]s for
+/// the caller to resolve with a one-shot EndpointSlice list (see
+/// [`resolve_named_target_ports`]) — a targeted read, still no watch.
+fn resolve_services(all_services: &[Service]) -> (ServiceState, Vec<NamedTargetPortReq>) {
     let known_services: HashSet<(String, String)> = all_services
         .iter()
         .filter_map(|svc| {
@@ -653,102 +805,59 @@ fn resolve_services(
         })
         .collect();
 
-    // Detect headless services and fetch their EndpointSlices for pod IP + targetPort resolution.
-    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
-
-    let headless_services: Vec<(&str, &str)> = all_services
-        .iter()
-        .filter_map(|svc| {
-            let spec = svc.spec.as_ref()?;
-            let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
-            if cluster_ip == "None" || cluster_ip.is_empty() {
-                let name = svc.metadata.name.as_deref()?;
-                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-                Some((name, ns))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if !headless_services.is_empty() {
-        let all_endpoint_slices: Vec<EndpointSlice> = store_endpoint_slices
-            .state()
-            .iter()
-            .map(|arc| (**arc).clone())
-            .collect();
-
-        for (svc_name, svc_ns) in &headless_services {
-            let matching_slices: Vec<&EndpointSlice> = all_endpoint_slices
-                .iter()
-                .filter(|eps| {
-                    let eps_ns = eps.metadata.namespace.as_deref().unwrap_or("default");
-                    if eps_ns != *svc_ns {
-                        return false;
-                    }
-                    eps.metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("kubernetes.io/service-name"))
-                        .is_some_and(|v| v == *svc_name)
-                })
-                .collect();
-
-            let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
-
-            let svc_spec = all_services
-                .iter()
-                .find(|s| {
-                    s.metadata.name.as_deref() == Some(svc_name)
-                        && s.metadata.namespace.as_deref().unwrap_or("default") == *svc_ns
-                })
-                .and_then(|s| s.spec.as_ref());
-
-            for eps in &matching_slices {
-                if eps.address_type != "IPv4" {
-                    continue;
-                }
-                let endpoints = &eps.endpoints;
-                let eps_ports = eps.ports.as_deref().unwrap_or_default();
-
-                if let Some(svc_ports) = svc_spec.and_then(|s| s.ports.as_ref()) {
-                    for sp in svc_ports {
-                        let service_port = sp.port as u16;
-                        let port_name = sp.name.as_deref().unwrap_or("");
-                        let target_port = eps_ports
-                            .iter()
-                            .find(|ep| ep.name.as_deref().unwrap_or("") == port_name)
-                            .and_then(|ep| ep.port)
-                            .unwrap_or(service_port as i32)
-                            as u16;
-
-                        let key = (svc_fqdn.clone(), service_port);
-                        let entry = endpoint_overrides.entry(key).or_default();
-                        for endpoint in endpoints {
-                            let is_ready = endpoint
-                                .conditions
-                                .as_ref()
-                                .and_then(|c| c.ready)
-                                .unwrap_or(true);
-                            if is_ready {
-                                for addr in &endpoint.addresses {
-                                    entry.push((addr.clone(), target_port));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    // Headless services have no VIP: the data plane connects directly to the pod
+    // IPs DNS returns, so it must use the targetPort, not the service port. DNS
+    // A-records carry no port, so derive the service-port → targetPort mapping from
+    // the Service spec (which we still watch — no EndpointSlices). A *named*
+    // targetPort is the one value the spec lacks; it is recorded for a one-shot
+    // EndpointSlice list by the caller (no watch) and seeded with a service-port
+    // fallback here so an absent/failed lookup degrades to prior behavior.
+    let mut headless_target_ports: HashMap<(String, u16), u16> = HashMap::new();
+    let mut named_target_ports: Vec<NamedTargetPortReq> = Vec::new();
+    for svc in all_services {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Headless services are marked clusterIP: None (stored as the literal "None").
+        // ClusterIP/LoadBalancer resolve to a VIP and keep the service port (kube-proxy
+        // maps it); ExternalName has no clusterIP and is handled via endpoint_overrides.
+        if spec.cluster_ip.as_deref() != Some("None") {
+            continue;
         }
-
-        if !endpoint_overrides.is_empty() {
-            info!(
-                "Found {} headless endpoint overrides for {} services",
-                endpoint_overrides.values().map(|v| v.len()).sum::<usize>(),
-                endpoint_overrides.len(),
-            );
+        let svc_name = match svc.metadata.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        for sp in spec.ports.iter().flatten() {
+            let service_port = sp.port as u16;
+            let target_port = match sp.target_port.as_ref() {
+                Some(IntOrString::Int(p)) => *p as u16,
+                Some(IntOrString::String(name)) => {
+                    // Numeric value lives in endpoint/pod data, not the spec.
+                    // Defer to a one-shot EndpointSlice list; seed the service-port
+                    // fallback so a failed/absent lookup keeps prior behavior.
+                    named_target_ports.push(NamedTargetPortReq {
+                        ns: svc_ns.to_string(),
+                        svc: svc_name.to_string(),
+                        service_port,
+                        port_name: name.clone(),
+                    });
+                    service_port
+                }
+                // An omitted targetPort defaults to the service port.
+                None => service_port,
+            };
+            headless_target_ports.insert((svc_fqdn.clone(), service_port), target_port);
         }
     }
+
+    // ExternalName services contribute override entries below (built purely from the
+    // Service spec — no EndpointSlices). Headless pod IPs come from DNS; only their
+    // targetPort mapping (above) is taken from the Service spec.
+    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
 
     // ExternalName services: resolve externalName DNS targets
     for svc in all_services {
@@ -816,10 +925,67 @@ fn resolve_services(
         }
     }
 
-    ServiceState {
-        known_services,
-        endpoint_overrides,
-        app_protocol_overrides,
+    (
+        ServiceState {
+            known_services,
+            endpoint_overrides,
+            app_protocol_overrides,
+            headless_target_ports,
+        },
+        named_target_ports,
+    )
+}
+
+/// Pick the numeric value of a named port from a service's EndpointSlices.
+/// All slices of a Service share the same port mapping, so the first match wins.
+/// Returns `None` if no slice publishes a port with that name.
+fn pick_named_port(slices: &[EndpointSlice], port_name: &str) -> Option<u16> {
+    slices
+        .iter()
+        .filter_map(|s| s.ports.as_ref())
+        .flatten()
+        .find(|p| p.name.as_deref() == Some(port_name))
+        .and_then(|p| p.port)
+        .map(|p| p as u16)
+}
+
+/// Resolve headless *named* targetPorts via a one-shot, label-filtered
+/// EndpointSlice list per service — a targeted read, NOT a watch (so it does not
+/// reintroduce the cluster-wide EndpointSlice firehose this branch removed). On
+/// success, overwrites the `(fqdn, service_port)` entry in `out` with the numeric
+/// targetPort; on a miss or API error it leaves the service-port fallback seeded
+/// by [`resolve_services`] in place and warns. Never fatal.
+async fn resolve_named_target_ports(
+    client: &Client,
+    reqs: &[NamedTargetPortReq],
+    out: &mut HashMap<(String, u16), u16>,
+) {
+    for req in reqs {
+        let api: Api<EndpointSlice> = Api::namespaced(client.clone(), &req.ns);
+        let lp = kube::api::ListParams::default()
+            .labels(&format!("kubernetes.io/service-name={}", req.svc));
+        match api.list(&lp).await {
+            Ok(list) => match pick_named_port(&list.items, &req.port_name) {
+                Some(port) => {
+                    let fqdn = format!("{}.{}.svc", req.svc, req.ns);
+                    out.insert((fqdn, req.service_port), port);
+                    debug!(
+                        "Headless {}/{} port {} named targetPort {:?} -> {}",
+                        req.ns, req.svc, req.service_port, req.port_name, port
+                    );
+                }
+                None => warn!(
+                    "Headless {}/{} port {}: named targetPort {:?} not found in \
+                     EndpointSlices; using the service port",
+                    req.ns, req.svc, req.service_port, req.port_name
+                ),
+            },
+            Err(e) => warn!(
+                "Headless {}/{} port {}: EndpointSlice list for named targetPort \
+                 {:?} failed ({}); using the service port",
+                req.ns, req.svc, req.service_port, req.port_name, e
+            ),
+        }
     }
 }
 
@@ -1162,7 +1328,9 @@ fn compute_programmed_condition(dp_ready: bool) -> status::GatewayCondition {
 
 /// Build the RouteTable from this Gateway's PortailConfig on a blocking thread
 /// (`to_route_table` compiles regexes and resolves backend DNS — both sync).
-async fn build_route_table(config: crate::config::PortailConfig) -> anyhow::Result<RouteTable> {
+async fn build_route_table(
+    config: Arc<crate::config::PortailConfig>,
+) -> anyhow::Result<RouteTable> {
     tokio::task::spawn_blocking(move || config.to_route_table())
         .await
         .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
@@ -1207,7 +1375,17 @@ async fn reconcile(
         &snapshot.reference_grants,
         &ctx.cache.secrets,
     );
-    let services = resolve_services(&snapshot.services, &ctx.cache.endpoint_slices);
+    let (mut services, named_reqs) = resolve_services(&snapshot.services);
+    // A headless Service with a *named* targetPort needs endpoint data the Service
+    // spec lacks; resolve those with a one-shot EndpointSlice list (no watch).
+    if !named_reqs.is_empty() {
+        resolve_named_target_ports(
+            &ctx.client,
+            &named_reqs,
+            &mut services.headless_target_ports,
+        )
+        .await;
+    }
 
     let (listener_statuses, accepted_cond) =
         validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
@@ -1293,7 +1471,13 @@ async fn reconcile(
     let tcp_count = result.config.tcp_routes.len();
     let tls_count = result.config.tls_routes.len();
     let udp_count = result.config.udp_routes.len();
-    let programmed_cond = match build_route_table(result.config).await {
+
+    // Publish the built config so the background DNS-refresh task can re-resolve
+    // backend FQDNs without an apiserver round-trip, then move it into the
+    // (blocking) route-table build.
+    let config = Arc::new(result.config);
+    ctx.config_cell.store(Some(config.clone()));
+    let programmed_cond = match build_route_table(config).await {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
             info!(
@@ -1394,7 +1578,30 @@ async fn reconcile(
         }
     }
 
-    Ok(Action::await_change())
+    // Requeue cadence is convergence-driven — see `success_requeue_secs`.
+    let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
+    Ok(Action::requeue(Duration::from_secs(success_requeue_secs(
+        programmed,
+        all_routes_accepted,
+    ))))
+}
+
+/// Requeue cadence after a successful reconcile. A *converged* Gateway — its
+/// data plane Programmed and every attached route Accepted — only needs a slow
+/// safety-net re-check (600s). An unconverged one re-runs in 5s so a status
+/// write that raced an unsynced reflector cache (or a missed watch event) heals
+/// well inside the conformance 60s accept-gate — without an unconditional fast
+/// loop that would re-PATCH status, re-resolve backend DNS, and re-GET NADs on
+/// every pod each cycle (the steady-state apiserver load we are cutting). A
+/// route held permanently not-Accepted keeps the fast cadence, but that is
+/// bounded to one Gateway and the reconcile is a cheap cache read + idempotent
+/// SSA, so it is acceptable.
+fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
+    if programmed && all_routes_accepted {
+        600
+    } else {
+        5
+    }
 }
 
 fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
@@ -1468,5 +1675,144 @@ mod tests {
         assert_eq!(eps.len(), 2);
         assert!(eps.contains(&(Some("10.0.0.1".to_string()), 8001)));
         assert!(eps.contains(&(Some("10.0.0.2".to_string()), 8001)));
+    }
+
+    #[test]
+    fn watch_shape_parse() {
+        // Absent → broad (legacy): every gate-able watch on.
+        let all = WatchShape::parse(None);
+        assert!(all.tls_secrets && all.namespaces);
+
+        // Present-but-empty → minimal: no gate-able extras (routes stay
+        // cluster-wide regardless — they are never gated).
+        let min = WatchShape::parse(Some(""));
+        assert!(!min.tls_secrets && !min.namespaces);
+
+        // TLS-terminate listener only.
+        let tls = WatchShape::parse(Some("tls"));
+        assert!(tls.tls_secrets && !tls.namespaces);
+
+        // Unknown / retired tokens (e.g. the old route-scoping tokens) are
+        // ignored; recognized ones still apply.
+        let u = WatchShape::parse(Some("routes-same, udp-routes, bogus , ns-labels"));
+        assert!(u.namespaces && !u.tls_secrets);
+    }
+
+    #[test]
+    fn success_requeue_cadence() {
+        // Fully converged: slow safety-net re-check only.
+        assert_eq!(success_requeue_secs(true, true), 600);
+        // Data plane not yet Programmed, or a route not yet Accepted (e.g. its
+        // reflector cache has not synced): fast re-check to converge inside the
+        // conformance 60s accept-gate.
+        assert_eq!(success_requeue_secs(false, true), 5);
+        assert_eq!(success_requeue_secs(true, false), 5);
+        assert_eq!(success_requeue_secs(false, false), 5);
+    }
+
+    #[test]
+    fn pick_named_port_matches_by_name() {
+        use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
+        let slice = EndpointSlice {
+            ports: Some(vec![
+                EndpointPort {
+                    name: Some("metrics".to_string()),
+                    port: Some(9000),
+                    ..Default::default()
+                },
+                EndpointPort {
+                    name: Some("http".to_string()),
+                    port: Some(8080),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_named_port(std::slice::from_ref(&slice), "http"),
+            Some(8080)
+        );
+        // Unknown name → None (caller keeps the service-port fallback).
+        assert_eq!(pick_named_port(&[slice], "grpc"), None);
+        // No slices at all → None.
+        assert_eq!(pick_named_port(&[], "http"), None);
+    }
+
+    #[test]
+    fn pick_named_port_scans_across_slices() {
+        use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
+        // The matching port lives in the second slice; the first has none.
+        let empty = EndpointSlice {
+            ports: Some(vec![]),
+            ..Default::default()
+        };
+        let has = EndpointSlice {
+            ports: Some(vec![EndpointPort {
+                name: Some("http".to_string()),
+                port: Some(3000),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(pick_named_port(&[empty, has], "http"), Some(3000));
+    }
+
+    #[test]
+    fn resolve_services_defers_named_targetport() {
+        use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        fn headless(name: &str, ns: &str, port: i32, target: IntOrString) -> Service {
+            Service {
+                metadata: ObjectMeta {
+                    name: Some(name.to_string()),
+                    namespace: Some(ns.to_string()),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    cluster_ip: Some("None".to_string()),
+                    ports: Some(vec![ServicePort {
+                        port,
+                        target_port: Some(target),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        // Named targetPort: emit a resolve request AND seed the service-port
+        // fallback, so an absent/failed EndpointSlice list degrades to prior behavior.
+        let named = headless("db", "prod", 5432, IntOrString::String("pg".to_string()));
+        let (state, reqs) = resolve_services(&[named]);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            (
+                reqs[0].ns.as_str(),
+                reqs[0].svc.as_str(),
+                reqs[0].service_port,
+                reqs[0].port_name.as_str()
+            ),
+            ("prod", "db", 5432, "pg")
+        );
+        assert_eq!(
+            state
+                .headless_target_ports
+                .get(&("db.prod.svc".to_string(), 5432)),
+            Some(&5432),
+            "fallback to the service port until the EndpointSlice list resolves it"
+        );
+
+        // Numeric targetPort: resolved directly from the spec, no request emitted.
+        let numeric = headless("cache", "prod", 6379, IntOrString::Int(6380));
+        let (state, reqs) = resolve_services(&[numeric]);
+        assert!(reqs.is_empty());
+        assert_eq!(
+            state
+                .headless_target_ports
+                .get(&("cache.prod.svc".to_string(), 6379)),
+            Some(&6380)
+        );
     }
 }

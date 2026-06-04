@@ -31,9 +31,12 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "secrets", "services"]
     verbs: ["get", "list", "watch"]
+  # get/list only (NO watch): a one-shot, label-filtered read to resolve a
+  # headless Service's named targetPort to its numeric value. Not a watch —
+  # backend pod churn is tracked via DNS (STRICT_DNS), not EndpointSlices.
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

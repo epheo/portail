@@ -188,6 +188,36 @@ impl RouteTable {
         }
     }
 
+    /// Order-independent fingerprint of every backend socket address in the table.
+    ///
+    /// The DNS-refresh task re-resolves and rebuilds the table on an interval but
+    /// swaps it only when this signature changes, so a churny resolver that merely
+    /// reorders records (or returns an unchanged set) costs nothing. `wrapping_add`
+    /// (commutative, and unlike XOR does not cancel duplicate addresses) makes the
+    /// fold independent of record order across rules and route kinds.
+    pub fn dns_signature(&self) -> u64 {
+        let http_backends = self.listener_scopes.values().flatten().flat_map(|scope| {
+            scope
+                .http_routes
+                .values()
+                .chain(scope.wildcard_http_routes.values())
+                .chain(scope.catch_all_http_routes.iter())
+                .flat_map(|he| he.rules.iter())
+                .flat_map(|rule| rule.backends.iter())
+        });
+        let l4_backends = self
+            .tcp_routes
+            .values()
+            .chain(self.udp_routes.values())
+            .chain(self.tls_routes.values())
+            .chain(self.wildcard_tls_routes.values())
+            .flatten();
+        http_backends
+            .chain(l4_backends)
+            .map(|b| backend_addr_hash(&b.socket_addr))
+            .fold(0u64, |acc, h| acc.wrapping_add(h))
+    }
+
     /// Find an HTTP route rule scoped by the server port and request's Host header.
     ///
     /// 1. Find all listener scopes matching the server port
@@ -669,33 +699,83 @@ pub struct Backend {
     pub server_name: String,
 }
 
+/// Resolve `address` (IP literal or DNS name) to socket addresses for `port`.
+///
+/// An IP literal yields exactly one address. A DNS name resolves to every
+/// record the resolver returns (deduped, resolver order preserved) — this is
+/// the STRICT_DNS contract: a headless Service publishes one A-record per ready
+/// pod at `<svc>.<ns>.svc`, a ClusterIP Service one VIP, an ExternalName a
+/// CNAME chain. Errors if a DNS name resolves to nothing.
+fn resolve_socket_addrs(address: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    use std::net::ToSocketAddrs;
+    let mut seen = std::collections::HashSet::new();
+    let addrs: Vec<std::net::SocketAddr> = format!("{}:{}", address, port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("Failed to resolve hostname {}:{}: {}", address, port, e))?
+        .filter(|sa| seen.insert(*sa))
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow!(
+            "No addresses found for hostname {}:{}",
+            address,
+            port
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Stable per-address hash for [`RouteTable::dns_signature`]. Uses fnv (not the
+/// process-seeded default) so the fingerprint is deterministic across resolves.
+fn backend_addr_hash(addr: &std::net::SocketAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = fnv::FnvHasher::default();
+    addr.hash(&mut h);
+    h.finish()
+}
+
 impl Backend {
     pub fn new(address: String, port: u16) -> Result<Self> {
         Self::with_weight(address, port, 1)
     }
 
+    /// Resolve to a single backend, taking the first resolved address.
+    /// Used where exactly one target is wanted (request mirroring, ExternalName
+    /// overrides). For DNS-based load balancing across all records, use
+    /// [`Backend::all_with_weight`].
     pub fn with_weight(address: String, port: u16, weight: u32) -> Result<Self> {
-        let server_name = address.clone();
-        let socket_addr = if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-            std::net::SocketAddr::new(ip, port)
-        } else {
-            use std::net::ToSocketAddrs;
-            let addr_str = format!("{}:{}", address, port);
-            let mut addrs = addr_str
-                .to_socket_addrs()
-                .map_err(|e| anyhow!("Failed to resolve hostname {}:{}: {}", address, port, e))?;
-            addrs
-                .next()
-                .ok_or_else(|| anyhow!("No addresses found for hostname {}:{}", address, port))?
-        };
-
+        let socket_addr = resolve_socket_addrs(&address, port)?[0];
         Ok(Self {
             socket_addr,
             weight,
             filters: vec![],
             use_tls: false,
-            server_name,
+            server_name: address,
         })
+    }
+
+    /// Resolve to one backend per resolved address (STRICT_DNS-style multi-A).
+    ///
+    /// A headless Service FQDN expands to N pod backends that the existing
+    /// weighted selection load-balances across; a ClusterIP FQDN yields one.
+    /// Each backend carries the same `weight` and the original DNS name as
+    /// `server_name` (for TLS SNI). No "is this headless?" branch — the data
+    /// plane treats every resolved address as an ordinary fixed-`socket_addr`
+    /// backend, so health and pooling are unchanged.
+    pub fn all_with_weight(address: String, port: u16, weight: u32) -> Result<Vec<Self>> {
+        let addrs = resolve_socket_addrs(&address, port)?;
+        Ok(addrs
+            .into_iter()
+            .map(|socket_addr| Self {
+                socket_addr,
+                weight,
+                filters: vec![],
+                use_tls: false,
+                server_name: address.clone(),
+            })
+            .collect())
     }
 }
 
@@ -792,6 +872,94 @@ mod tests {
             vec![],
             backends,
         )
+    }
+
+    // --- STRICT_DNS multi-A resolution + refresh signature ---------------------
+    // Tests stay hermetic: IP literals only, never the system resolver.
+
+    #[test]
+    fn resolve_socket_addrs_ip_literal_is_single_and_resolver_free() {
+        let addrs = resolve_socket_addrs("192.168.1.1", 443).unwrap();
+        assert_eq!(addrs, vec!["192.168.1.1:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn all_with_weight_ip_literal_yields_one_weighted_backend() {
+        let backends = Backend::all_with_weight("10.0.0.5".to_string(), 8080, 3).unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].socket_addr, "10.0.0.5:8080".parse().unwrap());
+        assert_eq!(backends[0].weight, 3);
+        // Original address is retained for TLS SNI.
+        assert_eq!(backends[0].server_name, "10.0.0.5");
+    }
+
+    #[test]
+    fn dns_signature_is_order_independent() {
+        // The resolver may return the same A-records in a different order; that
+        // must not look like a change (no spurious table swap).
+        let mut a = RouteTable::new();
+        a.add_http_route(
+            "h",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![backend(1), backend(2), backend(3)],
+            ),
+        );
+        let mut b = RouteTable::new();
+        b.add_http_route(
+            "h",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![backend(3), backend(1), backend(2)],
+            ),
+        );
+        assert_eq!(a.dns_signature(), b.dns_signature());
+        // Empty table folds to 0.
+        assert_eq!(RouteTable::new().dns_signature(), 0);
+    }
+
+    #[test]
+    fn dns_signature_changes_when_pod_set_changes() {
+        let mut base = RouteTable::new();
+        base.add_http_route(
+            "h",
+            rule(PathMatchType::Prefix, "/", vec![backend(1), backend(2)]),
+        );
+        // A pod scaled in (added address) changes the signature.
+        let mut added = RouteTable::new();
+        added.add_http_route(
+            "h",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![backend(1), backend(2), backend(3)],
+            ),
+        );
+        assert_ne!(base.dns_signature(), added.dns_signature());
+        // A pod replaced (same count, different address) changes the signature —
+        // wrapping_add does not cancel like XOR would.
+        let mut replaced = RouteTable::new();
+        replaced.add_http_route(
+            "h",
+            rule(PathMatchType::Prefix, "/", vec![backend(1), backend(9)]),
+        );
+        assert_ne!(base.dns_signature(), replaced.dns_signature());
+    }
+
+    #[test]
+    fn dns_signature_covers_l4_and_tls_backends() {
+        // DNS churn on a TCP/UDP/TLS backend must also trigger a refresh swap.
+        let mut tcp_a = RouteTable::new();
+        tcp_a.add_tcp_route(7000, vec![backend(1)]);
+        let mut tcp_b = RouteTable::new();
+        tcp_b.add_tcp_route(7000, vec![backend(2)]);
+        assert_ne!(tcp_a.dns_signature(), tcp_b.dns_signature());
+
+        let mut tls = RouteTable::new();
+        tls.add_tls_route("svc.example.com", vec![backend(1)]);
+        assert_ne!(RouteTable::new().dns_signature(), tls.dns_signature());
     }
 
     #[test]
