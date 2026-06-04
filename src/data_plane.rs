@@ -687,6 +687,7 @@ mod tests {
         let perf = crate::config::PerformanceConfig {
             backend_timeout: std::time::Duration::from_secs(1),
             udp_session_timeout: std::time::Duration::from_secs(1),
+            dns_refresh_interval: std::time::Duration::from_secs(1),
         };
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
 

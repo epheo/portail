@@ -5,6 +5,7 @@ pub mod chunked;
 pub mod config;
 pub mod config_watcher;
 pub mod data_plane;
+pub mod dns_refresh;
 pub mod health;
 pub mod http_filters;
 pub mod http_parser;

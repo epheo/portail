@@ -41,6 +41,10 @@ pub(crate) struct ServiceState {
     pub known_services: HashSet<(String, String)>,
     pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
     pub app_protocol_overrides: HashMap<(String, u16), String>,
+    /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
+    /// data plane connects to DNS-resolved pod IPs on the targetPort, not the
+    /// service port (headless has no VIP and DNS carries no port).
+    pub headless_target_ports: HashMap<(String, u16), u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +245,7 @@ pub(crate) fn reconcile_to_config(
             udp_routes: udp_route_configs,
             endpoint_overrides: services.endpoint_overrides.clone(),
             app_protocol_overrides: services.app_protocol_overrides.clone(),
+            headless_target_ports: services.headless_target_ports.clone(),
             ..Default::default()
         },
         route_status,
@@ -562,6 +567,7 @@ mod tests {
             known_services: test_known_services(),
             endpoint_overrides: HashMap::new(),
             app_protocol_overrides: HashMap::new(),
+            headless_target_ports: HashMap::new(),
         }
     }
 

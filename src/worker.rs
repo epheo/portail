@@ -383,22 +383,14 @@ async fn proxy_http_request(
                         "Backend {} fresh-conn acquire failed after pool retry: {}",
                         backend_addr, e2
                     );
-                    if state.health.record_failure(backend_addr) {
-                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-                    }
-                    send_error_response(client, 502).await?;
-                    return Ok(false);
+                    return fail_backend(&state.health, client, backend_addr, 502).await;
                 }
                 Err(_) => {
                     warn!(
                         "Backend {} fresh-conn acquire timeout after pool retry",
                         backend_addr
                     );
-                    if state.health.record_failure(backend_addr) {
-                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-                    }
-                    send_error_response(client, 504).await?;
-                    return Ok(false);
+                    return fail_backend(&state.health, client, backend_addr, 504).await;
                 }
             };
             match send_request_to_backend(
@@ -418,11 +410,7 @@ async fn proxy_http_request(
                         "Backend {} send failed on fresh conn after pool retry: {}",
                         backend_addr, e2
                     );
-                    if state.health.record_failure(backend_addr) {
-                        HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-                    }
-                    send_error_response(client, 502).await?;
-                    return Ok(false);
+                    return fail_backend(&state.health, client, backend_addr, 502).await;
                 }
             }
         }
@@ -524,11 +512,48 @@ async fn proxy_http_request(
     }
     let reusable = response_complete && framing_clean;
 
-    if reusable {
+    // The client got a clean response, but the backend conn returns to the pool
+    // only when `backend_conn_poolable` allows — notably never after HEAD.
+    if backend_conn_poolable(response_complete, framing_clean, meta.is_head) {
         state.pool.release(backend_addr, backend);
+    } else if reusable {
+        debug!(
+            "Backend {} conn not pooled after HEAD (avoids body-desync on reuse)",
+            backend_addr
+        );
     }
 
     Ok(reusable)
+}
+
+/// Whether a backend connection may be returned to the idle pool after a response.
+///
+/// Requires a fully-received response with clean framing, and — additionally —
+/// **never after a HEAD request**. A non-compliant backend may send a response
+/// body (RFC 7230 §3.3 forbids it) that we cannot reliably detect at header time
+/// without blocking: a *compliant* HEAD response legitimately carries
+/// `Content-Length` with no body, so the declared framing is no signal. Reusing
+/// such a conn would bleed leftover body bytes into the next request's response;
+/// HEAD is rare and bodyless, so dropping the conn instead costs almost nothing.
+fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: bool) -> bool {
+    response_complete && framing_clean && !is_head
+}
+
+/// Record a backend failure (spawning a health probe if this newly trips the
+/// backend unhealthy) and send `code` to the client. Returns `Ok(false)` — the
+/// client connection is not reusable. Centralizes the failure boilerplate the
+/// backend-send retry path would otherwise repeat per error arm.
+async fn fail_backend(
+    health: &Arc<HealthRegistry>,
+    client: &mut Connection,
+    addr: std::net::SocketAddr,
+    code: u16,
+) -> Result<bool> {
+    if health.record_failure(addr) {
+        HealthRegistry::spawn_probe(Arc::clone(health), addr);
+    }
+    send_error_response(client, code).await?;
+    Ok(false)
 }
 
 /// Acquire a backend connection within `backend_budget` (clamped by `total_deadline`).
@@ -658,14 +683,11 @@ async fn forward_response_headers(
     // SAFE → UNSAFE: first client write happens here.
     //
     // For HEAD requests, only the response headers are forwarded — any body
-    // bytes the backend (incorrectly) sent in the same TCP read as the headers
-    // are dropped on the floor here rather than leaking to the HEAD client.
-    // The backend conn may end up desynced if it sent body bytes; the pool
-    // release at the caller relies on the framing-clean check, but a HEAD
-    // response with no_body forced is always framing-clean here, so a fully
-    // robust fix would mark this case as not-pool-eligible. Documenting as a
-    // known limit: misbehaving HEAD backends may cause one corrupted response
-    // on the next pooled request; well-behaved backends (the norm) are fine.
+    // bytes the backend (incorrectly, per RFC 7230 §3.3) sent are dropped here
+    // rather than leaking to the HEAD client. Such a backend may also leave
+    // unconsumed body bytes on the wire, so the caller never returns a post-HEAD
+    // conn to the pool (`backend_conn_poolable`) — it is closed instead, which
+    // shuts the desync window without a blocking drain.
     if let Some(mods) = resp_mods {
         let modified = apply_response_header_mods(&header_buf[..resp_header_end], mods);
         client.write_all(&modified).await?;
@@ -1117,4 +1139,23 @@ fn is_no_body_status(headers: &[u8]) -> bool {
     }
     let status = &headers[9..12];
     status == b"204" || status == b"304" || status[0] == b'1'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_conn_pooling_policy() {
+        // A complete, cleanly-framed non-HEAD response is poolable.
+        assert!(backend_conn_poolable(true, true, false));
+        // HEAD is never pooled: a non-compliant backend body would desync the
+        // conn, and we can't tell that apart from a compliant Content-Length at
+        // header time without blocking.
+        assert!(!backend_conn_poolable(true, true, true));
+        // Incomplete or broken-framing responses are never pooled, HEAD or not.
+        assert!(!backend_conn_poolable(false, true, false));
+        assert!(!backend_conn_poolable(true, false, false));
+        assert!(!backend_conn_poolable(false, false, true));
+    }
 }

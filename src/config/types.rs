@@ -144,6 +144,13 @@ pub struct PortailConfig {
     /// Map: (backend_fqdn, service_port) → app_protocol (e.g. "https")
     #[serde(skip)]
     pub app_protocol_overrides: std::collections::HashMap<(String, u16), String>,
+
+    /// Service-port → targetPort mapping for headless services (not serialized).
+    /// Headless services have no VIP, so the data plane connects directly to the
+    /// DNS-resolved pod IPs and must use the targetPort, not the service port —
+    /// DNS A-records carry no port. Map: (backend_fqdn, service_port) → target_port.
+    #[serde(skip)]
+    pub headless_target_ports: std::collections::HashMap<(String, u16), u16>,
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
@@ -567,6 +574,22 @@ pub struct PerformanceConfig {
         serialize_with = "serialize_duration"
     )]
     pub udp_session_timeout: Duration,
+
+    /// How often the background DNS-refresh task re-resolves backend FQDNs and,
+    /// on an actual change, rebuilds + swaps the route table. Bounds how quickly
+    /// both backend-pod churn AND cold-start endpoint readiness are picked up (the
+    /// STRICT_DNS freshness window). Defaults to 5s — matching Envoy's STRICT_DNS
+    /// `dns_refresh_rate` — NOT the DNS TTL: a freshly-created headless Service
+    /// whose per-pod A-records were not yet published at reconcile time must
+    /// converge within seconds, with no EndpointSlice watch. Re-resolution is
+    /// apiserver-free, so this cadence is unaffected by apiserver saturation at
+    /// scale (and, unlike a watch, cannot be delayed by it).
+    #[serde(
+        default = "default_dns_refresh_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub dns_refresh_interval: Duration,
 }
 
 fn default_backend_timeout() -> Duration {
@@ -577,11 +600,16 @@ fn default_udp_session_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_dns_refresh_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             backend_timeout: default_backend_timeout(),
             udp_session_timeout: default_udp_session_timeout(),
+            dns_refresh_interval: default_dns_refresh_interval(),
         }
     }
 }

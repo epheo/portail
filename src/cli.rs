@@ -94,6 +94,23 @@ pub struct Args {
     #[arg(long, value_name = "NS/NAME")]
     #[arg(help = "Restrict to a single Gateway (format: namespace/name); operator sets this")]
     pub gateway: Option<String>,
+
+    /// Operator-supplied watch shape: which *gate-able* secondary resources this
+    /// single-Gateway data plane needs to watch, so it does not open cluster-wide
+    /// watches it will never use. Comma-separated tokens: `tls` (a TLS-terminate
+    /// listener → watch TLS Secrets) and `ns-labels` (an `allowedRoutes: Selector`
+    /// listener → watch Namespace labels). Route watches (HTTP/TCP/TLS/UDP) are
+    /// never gated — any route may parentRef this Gateway and must receive a status
+    /// — so no route token exists; unknown tokens are ignored for operator
+    /// forward/backward-compatibility. Absent = legacy broad mode (watch every
+    /// gate-able resource); present narrows to only the listed extras.
+    /// portail-operator computes it from the Gateway's listeners and re-rolls the
+    /// pod when the shape changes.
+    #[arg(long, value_name = "TOKENS")]
+    #[arg(
+        help = "Operator-set watch shape (comma tokens); absent watches all secondary resources"
+    )]
+    pub watch_shape: Option<String>,
 }
 
 impl Args {
@@ -194,6 +211,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_ok());
 
@@ -212,6 +230,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_ok());
 
@@ -230,6 +249,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_err());
     }
@@ -251,6 +271,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_err());
 
@@ -269,6 +290,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_err());
     }
@@ -290,6 +312,7 @@ mod tests {
             manage_gateway_status: true,
             readiness_port: 19099,
             gateway: None,
+            watch_shape: None,
         };
         assert!(args.validate().is_err());
     }

@@ -55,9 +55,11 @@ impl PortailConfig {
             performance: PerformanceConfig {
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
+                dns_refresh_interval: Duration::from_secs(5),
             },
             endpoint_overrides: std::collections::HashMap::new(),
             app_protocol_overrides: std::collections::HashMap::new(),
+            headless_target_ports: std::collections::HashMap::new(),
         }
     }
 
@@ -356,9 +358,11 @@ impl PortailConfig {
             performance: PerformanceConfig {
                 backend_timeout: Duration::from_secs(30),
                 udp_session_timeout: Duration::from_secs(30),
+                dns_refresh_interval: Duration::from_secs(5),
             },
             endpoint_overrides: std::collections::HashMap::new(),
             app_protocol_overrides: std::collections::HashMap::new(),
+            headless_target_ports: std::collections::HashMap::new(),
         }
     }
 

@@ -67,7 +67,37 @@ fn main() -> Result<()> {
 
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
+    // Size the Tokio runtime to the POD, not the NODE. The default multi-thread
+    // runtime eagerly spawns one worker per `available_parallelism()` (the node's
+    // CPU count), but each operator-provisioned data plane serves a single
+    // Gateway. Packing many per-Gateway pods onto one node would otherwise spawn
+    // (pods × node_cpus) worker threads and exhaust the node's PID/thread budget
+    // long before its CPU or memory — a hard ceiling on Gateway density. Cap to a
+    // small default; high-traffic gateways or standalone use scale up via
+    // PORTAIL_WORKER_THREADS. (The operator should also set CPU/mem requests+limits
+    // and can stamp PORTAIL_WORKER_THREADS to match the pod's CPU allocation.)
+    let worker_threads = std::env::var("PORTAIL_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(2)
+        });
+    let max_blocking_threads = std::env::var("PORTAIL_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(32);
+    info!(
+        "Tokio runtime: {} worker thread(s), {} max blocking thread(s)",
+        worker_threads, max_blocking_threads
+    );
+
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
@@ -124,6 +154,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         let gateway_scope = args
             .gateway_scope()
             .map_err(|e| anyhow::anyhow!("--gateway: {}", e))?;
+        let watch_shape = kubernetes::controller::WatchShape::parse(args.watch_shape.as_deref());
 
         // Readiness flag — flipped true by the reconciler once the data plane
         // has bound its listener ports. Served on the readiness endpoint so the
@@ -145,6 +176,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
                 manage_gateway_status,
                 ready_flag,
                 gateway_scope,
+                watch_shape,
             )
             .await
             {

@@ -96,6 +96,7 @@ impl PortailConfig {
                             hostname,
                             &self.endpoint_overrides,
                             &self.app_protocol_overrides,
+                            &self.headless_target_ports,
                         )?;
                         for route_match in &rule.matches {
                             let routing_rule =
@@ -156,6 +157,7 @@ impl PortailConfig {
                             hostname,
                             &self.endpoint_overrides,
                             &self.app_protocol_overrides,
+                            &self.headless_target_ports,
                         )?;
 
                         for route_match in &rule.matches {
@@ -190,8 +192,8 @@ impl PortailConfig {
                 let backends: Vec<routing::Backend> = rule
                     .backend_refs
                     .iter()
-                    .filter_map(|br| {
-                        routing::Backend::new(br.name.clone(), br.port)
+                    .flat_map(|br| {
+                        routing::Backend::all_with_weight(br.name.clone(), br.port, 1)
                             .map_err(|e| {
                                 tracing::warn!(
                                     "Skipping TLS backend {}:{} - DNS resolution failed: {}",
@@ -200,7 +202,7 @@ impl PortailConfig {
                                     e
                                 )
                             })
-                            .ok()
+                            .unwrap_or_default()
                     })
                     .collect();
 
@@ -270,10 +272,10 @@ impl PortailConfig {
                     {
                         for backend_refs in route.backend_refs_per_rule() {
                             let backends: Vec<routing::Backend> = backend_refs.iter()
-                                .filter_map(|br| {
-                                    routing::Backend::new(br.name.clone(), br.port)
+                                .flat_map(|br| {
+                                    routing::Backend::all_with_weight(br.name.clone(), br.port, 1)
                                         .map_err(|e| tracing::warn!("Skipping L4 backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
-                                        .ok()
+                                        .unwrap_or_default()
                                 })
                                 .collect();
 
@@ -348,6 +350,7 @@ fn build_rule_components(
     _hostname: &str,
     endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
     app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
+    headless_target_ports: &std::collections::HashMap<(String, u16), u16>,
 ) -> Result<(
     Vec<crate::routing::Backend>,
     Vec<crate::routing::HttpFilter>,
@@ -401,23 +404,39 @@ fn build_rule_components(
             }
         }
 
-        // Standard DNS-based resolution
-        match routing::Backend::with_weight(
+        // Standard DNS-based resolution — resolve to every A-record (STRICT_DNS):
+        // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
+        // FQDN to one VIP. The existing weighted selection load-balances across the
+        // resulting flat entries.
+        //
+        // Port: a headless Service has no VIP, so DNS returns pod IPs and we must
+        // connect on the Service's targetPort, not the service port (DNS carries no
+        // port). For ClusterIP the FQDN resolves to the VIP and the service port is
+        // correct (kube-proxy maps it), so there is no override and we keep the ref's
+        // port.
+        let connect_port = headless_target_ports
+            .get(&override_key)
+            .copied()
+            .unwrap_or(backend_ref.port);
+        match routing::Backend::all_with_weight(
             backend_ref.name.clone(),
-            backend_ref.port,
+            connect_port,
             backend_ref.weight,
         ) {
-            Ok(mut backend) => {
-                backend.filters = backend_filters;
-                backend.use_tls = backend_use_tls;
+            Ok(resolved) => {
                 tracing::debug!(
-                    "        Backend: {}:{} weight={} tls={}",
+                    "        Backend: {}:{} weight={} tls={} -> {} address(es)",
                     backend_ref.name,
                     backend_ref.port,
                     backend_ref.weight,
-                    backend.use_tls
+                    backend_use_tls,
+                    resolved.len()
                 );
-                backends.push(backend);
+                for mut backend in resolved {
+                    backend.filters = backend_filters.clone();
+                    backend.use_tls = backend_use_tls;
+                    backends.push(backend);
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -700,6 +719,59 @@ mod tests {
         let config = PortailConfig::default();
         assert!(config.validate().is_ok());
         assert!(!config.gateway.listeners.is_empty());
+    }
+
+    /// Collect every backend socket-address port in the route table (HTTP scopes).
+    fn http_backend_ports(rt: &crate::routing::RouteTable) -> Vec<u16> {
+        let mut ports = Vec::new();
+        for scopes in rt.listener_scopes.values() {
+            for scope in scopes {
+                let entries = scope
+                    .http_routes
+                    .values()
+                    .chain(scope.wildcard_http_routes.values())
+                    .chain(scope.catch_all_http_routes.iter());
+                for he in entries {
+                    for rule in &he.rules {
+                        for b in &rule.backends {
+                            ports.push(b.socket_addr.port());
+                        }
+                    }
+                }
+            }
+        }
+        ports
+    }
+
+    #[test]
+    fn headless_backend_connects_on_target_port() {
+        // IP-literal backend name keeps this hermetic (no DNS). A headless service
+        // has no VIP, so the data plane must connect to the resolved pod IP on the
+        // Service targetPort, not the service port.
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":80}]},
+            "httpRoutes": [{
+                "hostnames": ["example.com"],
+                "rules": [{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "backendRefs":[{"name":"10.0.0.7","port":8080}]}]
+            }]
+        }"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+
+        // No override (ClusterIP-style): keep the service port.
+        let ports = http_backend_ports(&config.to_route_table().unwrap());
+        assert_eq!(ports, vec![8080]);
+
+        // Headless override maps service port 8080 -> targetPort 3000.
+        config
+            .headless_target_ports
+            .insert(("10.0.0.7".to_string(), 8080), 3000);
+        let ports = http_backend_ports(&config.to_route_table().unwrap());
+        assert_eq!(
+            ports,
+            vec![3000],
+            "headless backend must connect on the targetPort, not the service port"
+        );
     }
 
     #[test]
