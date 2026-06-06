@@ -16,10 +16,6 @@ spec:
         app: portail
     spec:
       serviceAccountName: portail-controller
-      securityContext:
-        sysctls:
-        - name: net.ipv4.ip_unprivileged_port_start
-          value: "0"
       containers:
       - name: portail
         image: ghcr.io/epheo/portail:latest
@@ -29,6 +25,12 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: [ALL]
+            # This static manifest binds 80/443 directly (no operator to remap to
+            # an unprivileged targetPort). The image's cap_net_bind_service file
+            # capability + this add let portail bind them — non-root, no sysctl.
+            # Under the operator, service-mode pods bind an unprivileged target
+            # port and need no capability at all.
+            add: [NET_BIND_SERVICE]
           seccompProfile:
             type: RuntimeDefault
         ports:
