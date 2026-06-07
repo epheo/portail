@@ -11,6 +11,7 @@ pub mod http_filters;
 pub mod http_parser;
 pub mod kubernetes;
 pub mod logging;
+pub mod privileges;
 pub mod readiness;
 pub mod request_processor;
 pub mod routing;

@@ -95,6 +95,13 @@ fn main() -> Result<()> {
         worker_threads, max_blocking_threads
     );
 
+    // Raise CAP_NET_BIND_SERVICE to effective *before* the runtime spawns its
+    // worker threads, so they inherit it and direct privileged binds (80/443 in
+    // multi-network/UDN and host-network modes, where no Service remaps the port)
+    // succeed under restricted Pod Security. A no-op in service-mode. See
+    // src/privileges.rs.
+    privileges::raise_net_bind_service();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .max_blocking_threads(max_blocking_threads)
