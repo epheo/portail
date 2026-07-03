@@ -1,3 +1,4 @@
+pub mod addresses;
 pub mod controller;
 pub mod converters;
 pub mod features;

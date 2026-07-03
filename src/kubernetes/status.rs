@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use gateway_api::gateways::Gateway;
 
-use crate::kubernetes::controller::{UsableAddresses, NETWORK_ADDRESS_TYPE};
+use crate::kubernetes::addresses::{UsableAddresses, NETWORK_ADDRESS_TYPE};
 
 use crate::logging::{debug, warn};
 
