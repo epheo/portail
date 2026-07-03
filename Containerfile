@@ -13,6 +13,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
+# Compile-time dependency: config/examples.rs embeds these via include_str!
+COPY examples/standalone/ examples/standalone/
 RUN cargo build --release --bin portail && strip target/release/portail
 
 FROM registry.fedoraproject.org/fedora-minimal:43 AS runtime

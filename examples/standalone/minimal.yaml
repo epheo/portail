@@ -19,6 +19,7 @@ httpRoutes:
     - name: api-service
       port: 3001
 tcpRoutes: []
+tlsRoutes: []
 udpRoutes: []
 observability:
   logging:
@@ -28,3 +29,5 @@ observability:
 performance:
   backendTimeout: 30s
   udpSessionTimeout: 30s
+  dnsRefreshInterval: 5s
+  clientHeaderTimeout: 30s

@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
-use data_plane::DataPlane;
+use proxy::data_plane::DataPlane;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -128,9 +128,12 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         portail_config.udp_routes.len()
     );
 
-    // Build initial route table from configuration
+    // Build initial route table from configuration. Strict: in standalone
+    // mode a backend that fails DNS resolution should fail startup loudly,
+    // not silently serve 5xx. (Kubernetes mode starts from an empty default
+    // config, so strictness costs nothing there.)
     let route_table = portail_config
-        .to_route_table()
+        .to_route_table_strict()
         .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
     let routes = Arc::new(ArcSwap::from_pointee(route_table));
     info!(
@@ -167,7 +170,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         // has bound its listener ports. Served on the readiness endpoint so the
         // operator's readinessProbe gates LB traffic and the Programmed status.
         let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(readiness::serve_readiness(
+        tokio::spawn(admin::serve(
             args.readiness_port,
             ready_flag.clone(),
             shutdown_token.clone(),
@@ -191,6 +194,16 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
             }
         });
         info!("Kubernetes Gateway API controller started");
+    }
+
+    // In standalone mode, the admin endpoint (/metrics + /readyz) is opt-in —
+    // there is no readinessProbe to feed, but benches and dashboards may want
+    // the scrape. Listeners are already up at this point, so ready = true.
+    if !args.kubernetes {
+        if let Some(metrics_port) = args.metrics_port {
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            tokio::spawn(admin::serve(metrics_port, ready, shutdown_token.clone()));
+        }
     }
 
     // In standalone mode, watch the config file for SIGHUP-triggered reloads
@@ -236,17 +249,12 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
         info!("Validating configuration file: {:?}", config_path);
 
         match PortailConfig::load_from_file(config_path) {
+            // load_from_file parses AND validates; a separate validate()
+            // call here would be redundant.
             Ok(config) => {
-                info!("Configuration file parsed successfully");
+                info!("Configuration file parsed and validated successfully");
 
-                if let Err(e) = config.validate() {
-                    error!("Configuration validation failed: {}", e);
-                    std::process::exit(1);
-                }
-
-                info!("Configuration validation passed");
-
-                match config.to_route_table() {
+                match config.to_route_table_strict() {
                     Ok(_) => info!("Route table conversion successful"),
                     Err(e) => {
                         error!("Route table conversion failed: {}", e);
@@ -335,42 +343,36 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
 
     info!("Generating {} configuration", config_type);
 
-    let config = match config_type.as_str() {
-        "minimal" => PortailConfig::generate_minimal(),
-        "development" => PortailConfig::generate_development(),
-        _ => {
+    // Examples are static YAML committed under examples/standalone/ and
+    // embedded at compile time — --generate-config emits them verbatim.
+    let yaml = match config::examples::example_yaml(config_type) {
+        Some(yaml) => yaml,
+        None => {
             error!("Invalid configuration type: {}", config_type);
             std::process::exit(1);
         }
     };
 
-    let (output_content, format_name) = if let Some(output_path) = &args.output {
-        let (output_content, _format_name) =
-            match output_path.extension().and_then(|ext| ext.to_str()) {
-                Some("json") => {
-                    let content = config.to_json_pretty().map_err(|e| {
-                        anyhow::anyhow!("Failed to serialize config to JSON: {}", e)
-                    })?;
-                    (content, "JSON")
-                }
-                Some("yaml") | Some("yml") => {
-                    let content = config.to_yaml_pretty().map_err(|e| {
-                        anyhow::anyhow!("Failed to serialize config to YAML: {}", e)
-                    })?;
-                    (content, "YAML")
-                }
-                Some(ext) => {
-                    error!(
+    if let Some(output_path) = &args.output {
+        let output_content = match output_path.extension().and_then(|ext| ext.to_str()) {
+            // JSON output re-parses the embedded YAML through the schema —
+            // which also validates the committed example at point of use.
+            Some("json") => serde_yaml::from_str::<PortailConfig>(yaml)
+                .map_err(|e| anyhow::anyhow!("Embedded example failed to parse: {}", e))?
+                .to_json_pretty()?,
+            Some("yaml") | Some("yml") => yaml.to_string(),
+            Some(ext) => {
+                error!(
                     "Unsupported output file extension: .{}. Supported formats: .json, .yaml, .yml",
                     ext
                 );
-                    std::process::exit(1);
-                }
-                None => {
-                    error!("Output file must have an extension (.json, .yaml, .yml)");
-                    std::process::exit(1);
-                }
-            };
+                std::process::exit(1);
+            }
+            None => {
+                error!("Output file must have an extension (.json, .yaml, .yml)");
+                std::process::exit(1);
+            }
+        };
 
         std::fs::write(output_path, &output_content).map_err(|e| {
             anyhow::anyhow!(
@@ -386,20 +388,12 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
             output_path.display()
         );
         return Ok(());
-    } else {
-        let content = config
-            .to_yaml_pretty()
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config to YAML: {}", e))?;
-        (content, "YAML")
-    };
+    }
 
-    println!(
-        "# Generated {} configuration ({})",
-        config_type, format_name
-    );
+    println!("# Generated {} configuration (YAML)", config_type);
     println!("# Use --output <file> to save to a file");
     println!();
-    print!("{}", output_content);
+    print!("{}", yaml);
 
     Ok(())
 }

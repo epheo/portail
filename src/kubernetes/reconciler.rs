@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
@@ -19,32 +20,26 @@ use super::converters::{
 };
 use super::parent_ref::{all_section_names_for_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, route_allowed_for_listener, RouteAllowResult};
+use super::services::ServiceState;
 
 // ---------------------------------------------------------------------------
 // Reconciliation input types — structured parameters for reconcile_to_config
 // ---------------------------------------------------------------------------
 
 /// Snapshot of all cluster resources needed for reconciliation.
-/// Built once per reconcile from reflector stores.
+/// Built once per reconcile from reflector stores. Routes and Services are
+/// held as `Arc`s straight out of the reflector stores — snapshotting is
+/// pointer work, not a deep copy of every object in the cluster. Routes may
+/// additionally be pre-filtered to this Gateway by the snapshot builder;
+/// `collect_routes` re-checks `route_targets_gateway` either way.
 pub(crate) struct ClusterSnapshot {
-    pub http_routes: Vec<HTTPRoute>,
-    pub tcp_routes: Vec<TCPRoute>,
-    pub tls_routes: Vec<TLSRoute>,
-    pub udp_routes: Vec<UDPRoute>,
+    pub http_routes: Vec<Arc<HTTPRoute>>,
+    pub tcp_routes: Vec<Arc<TCPRoute>>,
+    pub tls_routes: Vec<Arc<TLSRoute>>,
+    pub udp_routes: Vec<Arc<UDPRoute>>,
     pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
     pub reference_grants: Vec<ReferenceGrant>,
-    pub services: Vec<Service>,
-}
-
-/// Resolved service metadata needed for route table construction.
-pub(crate) struct ServiceState {
-    pub known_services: HashSet<(String, String)>,
-    pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
-    pub app_protocol_overrides: HashMap<(String, u16), String>,
-    /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
-    /// data plane connects to DNS-resolved pod IPs on the targetPort, not the
-    /// service port (headless has no VIP and DNS carries no port).
-    pub headless_target_ports: HashMap<(String, u16), u16>,
+    pub services: Vec<Arc<Service>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +61,10 @@ pub(crate) trait GatewayRoute: Sized {
     fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>>;
     fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
     fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
+    /// The route's current `status.parents` entries as JSON values — exactly
+    /// what serializing the whole route and reading `/status/parents` yields,
+    /// without serializing the whole route.
+    fn status_parents_json(&self) -> Vec<serde_json::Value>;
 }
 
 /// Implement GatewayRoute for a concrete route type. Only the three type-specific
@@ -122,6 +121,17 @@ macro_rules! impl_gateway_route {
                         .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
                 }
             }
+            fn status_parents_json(&self) -> Vec<serde_json::Value> {
+                self.status
+                    .as_ref()
+                    .map(|s| {
+                        s.parents
+                            .iter()
+                            .filter_map(|p| serde_json::to_value(p).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
         }
     };
 }
@@ -151,6 +161,7 @@ pub struct ReconcileResult {
     pub route_status: Vec<RouteAcceptance>,
 }
 
+#[derive(Debug)]
 pub struct RouteAcceptance {
     pub name: String,
     pub namespace: String,
@@ -258,7 +269,7 @@ pub(crate) fn reconcile_to_config(
 /// targetPorts; in multi-network mode there is no Service and the result is empty
 /// (listeners then bind their published port directly).
 fn resolve_listener_target_ports(
-    services: &[Service],
+    services: &[Arc<Service>],
     gw_ns: &str,
     gw_name: &str,
 ) -> HashMap<u16, u16> {
@@ -313,7 +324,7 @@ fn resolve_listener_target_ports(
 
 /// Generic route collection with namespace scoping and acceptance tracking.
 fn collect_routes<R: GatewayRoute>(
-    routes: &[R],
+    routes: &[Arc<R>],
     gateway_name: &str,
     gateway_ns: &str,
     listeners: &[GatewayListeners],
@@ -552,10 +563,10 @@ mod tests {
         reference_grants: Vec<ReferenceGrant>,
     ) -> ClusterSnapshot {
         ClusterSnapshot {
-            http_routes,
-            tcp_routes,
-            tls_routes,
-            udp_routes,
+            http_routes: http_routes.into_iter().map(Arc::new).collect(),
+            tcp_routes: tcp_routes.into_iter().map(Arc::new).collect(),
+            tls_routes: tls_routes.into_iter().map(Arc::new).collect(),
+            udp_routes: udp_routes.into_iter().map(Arc::new).collect(),
             namespace_labels: ns_labels.clone(),
             reference_grants,
             services: vec![],
@@ -2555,7 +2566,7 @@ mod tests {
                 (8080, Some(IntOrString::Int(8080))),
             ],
         );
-        let map = resolve_listener_target_ports(&[svc], "default", "gw");
+        let map = resolve_listener_target_ports(&[Arc::new(svc)], "default", "gw");
         assert_eq!(map.get(&80), Some(&8000));
         assert_eq!(map.get(&443), Some(&8001));
         assert_eq!(map.get(&8080), Some(&8080));
@@ -2564,10 +2575,10 @@ mod tests {
     #[test]
     fn target_ports_empty_without_matching_service() {
         let wrong_gw = fronting_service("default", "other", &[(80, Some(IntOrString::Int(8000)))]);
-        assert!(resolve_listener_target_ports(&[wrong_gw], "default", "gw").is_empty());
+        assert!(resolve_listener_target_ports(&[Arc::new(wrong_gw)], "default", "gw").is_empty());
 
         let wrong_ns = fronting_service("elsewhere", "gw", &[(80, Some(IntOrString::Int(8000)))]);
-        assert!(resolve_listener_target_ports(&[wrong_ns], "default", "gw").is_empty());
+        assert!(resolve_listener_target_ports(&[Arc::new(wrong_ns)], "default", "gw").is_empty());
 
         assert!(resolve_listener_target_ports(&[], "default", "gw").is_empty());
     }
@@ -2582,7 +2593,7 @@ mod tests {
                 (443, Some(IntOrString::Int(8001))),
             ],
         );
-        let map = resolve_listener_target_ports(&[svc], "default", "gw");
+        let map = resolve_listener_target_ports(&[Arc::new(svc)], "default", "gw");
         assert_eq!(map.get(&80), None);
         assert_eq!(map.get(&443), Some(&8001));
     }
@@ -2597,11 +2608,11 @@ mod tests {
             udp_routes: vec![],
             namespace_labels: default_ns_labels(),
             reference_grants: vec![],
-            services: vec![fronting_service(
+            services: vec![Arc::new(fronting_service(
                 "default",
                 "test-gw",
                 &[(8080, Some(IntOrString::Int(18080)))],
-            )],
+            ))],
         };
         let result =
             reconcile_to_config(&gw, &snapshot, &HashMap::new(), &empty_services()).unwrap();
@@ -2617,5 +2628,36 @@ mod tests {
             Some(18080),
             "listener must carry the fronting Service's targetPort"
         );
+    }
+
+    /// `status_parents_json` must yield exactly what serializing the whole
+    /// route and reading `/status/parents` used to yield — the fingerprint's
+    /// clobber detection depends on that equivalence.
+    #[test]
+    fn status_parents_json_matches_full_route_serialization() {
+        let mut route = test_http_route();
+        assert!(
+            route.status_parents_json().is_empty(),
+            "no status -> no parents"
+        );
+
+        route.status = Some(HTTPRouteStatus {
+            parents: vec![HTTPRouteStatusParents {
+                controller_name: "epheo.eu/portail".to_string(),
+                parent_ref: HTTPRouteStatusParentsParentRef {
+                    name: "test-gw".to_string(),
+                    section_name: Some("http".to_string()),
+                    ..Default::default()
+                },
+                conditions: vec![],
+            }],
+        });
+
+        let via_full = serde_json::to_value(&route)
+            .unwrap()
+            .pointer("/status/parents")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap();
+        assert_eq!(route.status_parents_json(), via_full);
     }
 }

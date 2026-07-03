@@ -18,6 +18,7 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificateRef;
+use crate::logging::warn;
 
 pin_project! {
     /// Unified connection type — avoids making every handler function generic.
@@ -232,6 +233,17 @@ fn build_certified_key(
     Ok(CertifiedKey::new(certs, signing_key))
 }
 
+/// Validate a PEM cert/key pair end-to-end: parse both and load the key
+/// through the CryptoProvider — exactly the steps `build_server_config`
+/// performs per ref. Single source of truth for "is this PEM pair usable":
+/// the controller runs this at cert-resolution time so Gateway status
+/// (ResolvedRefs) reflects what the data plane will actually serve.
+pub fn validate_cert_key_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
+    let (certs, key) = parse_pem_cert_and_key(cert_pem, key_pem)?;
+    build_certified_key(certs, key)?;
+    Ok(())
+}
+
 /// Build a `ServerConfig` from certificate references.
 /// This is the reusable core — called by both standalone and K8s modes.
 /// Individual cert refs that fail to load are skipped (with a warning)
@@ -255,14 +267,14 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
         let (certs, key) = match load_cert_and_key(cert_ref, cert_dir) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[WARN] Skipping cert ref '{}': {}", cert_ref.name, e);
+                warn!("Skipping cert ref '{}': {}", cert_ref.name, e);
                 continue;
             }
         };
         let certified_key = match build_certified_key(certs, key) {
             Ok(v) => Arc::new(v),
             Err(e) => {
-                eprintln!("[WARN] Skipping cert ref '{}': {}", cert_ref.name, e);
+                warn!("Skipping cert ref '{}': {}", cert_ref.name, e);
                 continue;
             }
         };
@@ -418,6 +430,43 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+/// Test-only helpers shared with other modules' tests (controller/validate.rs
+/// exercises the same real-parse path against openssl-generated certs).
+#[cfg(test)]
+pub(crate) mod test_util {
+    /// Generate a self-signed cert+key via openssl, returning (cert_pem, key_pem).
+    /// `None` when openssl is unavailable — callers skip their test.
+    pub(crate) fn generate_test_cert(cn: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        use std::process::Command;
+        let dir = tempfile::tempdir().ok()?;
+        let key_path = dir.path().join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let output = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-keyout",
+            ])
+            .arg(&key_path)
+            .args(["-out"])
+            .arg(&cert_path)
+            .args(["-days", "1", "-subj", &format!("/CN={}", cn)])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cert_pem = std::fs::read(&cert_path).ok()?;
+        let key_pem = std::fs::read(&key_path).ok()?;
+        Some((cert_pem, key_pem))
+    }
 }
 
 #[cfg(test)]
@@ -597,36 +646,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Helper: generate a self-signed cert+key via openssl, returning (cert_pem, key_pem).
-    fn generate_test_cert(cn: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-        use std::process::Command;
-        let dir = tempfile::tempdir().ok()?;
-        let key_path = dir.path().join("key.pem");
-        let cert_path = dir.path().join("cert.pem");
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:prime256v1",
-                "-nodes",
-                "-keyout",
-            ])
-            .arg(&key_path)
-            .args(["-out"])
-            .arg(&cert_path)
-            .args(["-days", "1", "-subj", &format!("/CN={}", cn)])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let cert_pem = std::fs::read(&cert_path).ok()?;
-        let key_pem = std::fs::read(&key_path).ok()?;
-        Some((cert_pem, key_pem))
-    }
+    use super::test_util::generate_test_cert;
 
     #[test]
     fn test_dynamic_tls_acceptor_hot_reload() {
@@ -738,5 +758,27 @@ mod tests {
         // means the SniCertResolver is embedded. We test indirectly via build_server_config.
         let config = build_server_config(&[cert_ref], std::path::Path::new("/unused"));
         assert!(config.is_ok(), "single cert config should succeed");
+    }
+
+    #[test]
+    fn validate_cert_key_pair_accepts_real_pair_rejects_garbage() {
+        let Some((cert_pem, key_pem)) = generate_test_cert("valid.example.com") else {
+            return; // openssl unavailable
+        };
+        assert!(validate_cert_key_pair(&cert_pem, &key_pem).is_ok());
+
+        // Garbage bytes: no certificate parses out.
+        assert!(validate_cert_key_pair(b"not a pem", b"not a pem").is_err());
+        // Empty cert list (valid PEM framing absent entirely).
+        assert!(validate_cert_key_pair(b"", &key_pem).is_err());
+
+        // PEM that passes the old substring test but fails a real parse:
+        // headers present, body truncated/corrupt.
+        let fake_cert = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let fake_key = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        assert!(
+            validate_cert_key_pair(fake_cert, fake_key).is_err(),
+            "substring-passing but unparseable PEM must be rejected"
+        );
     }
 }

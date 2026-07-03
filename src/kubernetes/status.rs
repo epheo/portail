@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use gateway_api::gateways::Gateway;
 
-use crate::kubernetes::controller::{UsableAddresses, NETWORK_ADDRESS_TYPE};
+use crate::kubernetes::addresses::{UsableAddresses, NETWORK_ADDRESS_TYPE};
 
 use crate::logging::{debug, warn};
 
@@ -94,6 +94,28 @@ fn transition_time(
 }
 
 /// Look up a condition's lastTransitionTime from a JSON array of conditions.
+/// Build one JSON status condition, preserving `lastTransitionTime` from
+/// `existing` when (status, reason) are unchanged.
+fn condition_json(
+    cond_type: &str,
+    ok: bool,
+    reason: &str,
+    message: &str,
+    existing: &[serde_json::Value],
+    now: &str,
+    generation: Option<i64>,
+) -> serde_json::Value {
+    let status = if ok { "True" } else { "False" };
+    serde_json::json!({
+        "type": cond_type,
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": transition_time_json(existing, cond_type, status, reason, now),
+        "observedGeneration": generation,
+    })
+}
+
 fn transition_time_json(
     existing: &[serde_json::Value],
     type_: &str,
@@ -132,7 +154,7 @@ pub(crate) async fn update_gateway_status(
     listener_statuses: &HashMap<String, ListenerStatus>,
     usable: &UsableAddresses,
     manage_conditions: bool,
-) {
+) -> bool {
     let name = gateway.name_any();
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<Gateway> = Api::namespaced(client.clone(), &ns);
@@ -229,11 +251,6 @@ pub(crate) async fn update_gateway_status(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
-            let accepted_status = if ls.accepted { "True" } else { "False" };
-            let prog_status = if ls.programmed { "True" } else { "False" };
-            let resolved_status = if ls.resolved_refs { "True" } else { "False" };
-            let conflict_status = if ls.conflicted { "True" } else { "False" };
-
             serde_json::json!({
                 "name": l.name,
                 "attachedRoutes": attached,
@@ -243,38 +260,10 @@ pub(crate) async fn update_gateway_status(
                     ls.supported_kinds.clone()
                 },
                 "conditions": [
-                    {
-                        "type": "Accepted",
-                        "status": accepted_status,
-                        "reason": ls.accepted_reason,
-                        "message": ls.accepted_message,
-                        "lastTransitionTime": transition_time_json(existing_lconds, "Accepted", accepted_status, &ls.accepted_reason, &now_str),
-                        "observedGeneration": generation,
-                    },
-                    {
-                        "type": "Programmed",
-                        "status": prog_status,
-                        "reason": ls.programmed_reason,
-                        "message": ls.programmed_message,
-                        "lastTransitionTime": transition_time_json(existing_lconds, "Programmed", prog_status, &ls.programmed_reason, &now_str),
-                        "observedGeneration": generation,
-                    },
-                    {
-                        "type": "ResolvedRefs",
-                        "status": resolved_status,
-                        "reason": ls.resolved_refs_reason,
-                        "message": ls.resolved_refs_message,
-                        "lastTransitionTime": transition_time_json(existing_lconds, "ResolvedRefs", resolved_status, &ls.resolved_refs_reason, &now_str),
-                        "observedGeneration": generation,
-                    },
-                    {
-                        "type": "Conflicted",
-                        "status": conflict_status,
-                        "reason": ls.conflicted_reason,
-                        "message": ls.conflicted_message,
-                        "lastTransitionTime": transition_time_json(existing_lconds, "Conflicted", conflict_status, &ls.conflicted_reason, &now_str),
-                        "observedGeneration": generation,
-                    },
+                    condition_json("Accepted", ls.accepted, &ls.accepted_reason, &ls.accepted_message, existing_lconds, &now_str, generation),
+                    condition_json("Programmed", ls.programmed, &ls.programmed_reason, &ls.programmed_message, existing_lconds, &now_str, generation),
+                    condition_json("ResolvedRefs", ls.resolved_refs, &ls.resolved_refs_reason, &ls.resolved_refs_message, existing_lconds, &now_str, generation),
+                    condition_json("Conflicted", ls.conflicted, &ls.conflicted_reason, &ls.conflicted_message, existing_lconds, &now_str, generation),
                 ],
             })
         })
@@ -360,8 +349,14 @@ pub(crate) async fn update_gateway_status(
         )
         .await
     {
-        Ok(_) => debug!("Updated Gateway {}/{} status", ns, name),
-        Err(e) => warn!("Failed to update Gateway {}/{} status: {}", ns, name, e),
+        Ok(_) => {
+            debug!("Updated Gateway {}/{} status", ns, name);
+            true
+        }
+        Err(e) => {
+            warn!("Failed to update Gateway {}/{} status: {}", ns, name, e);
+            false
+        }
     }
 }
 
@@ -383,8 +378,17 @@ pub struct RouteParentStatus {
 }
 
 /// Update the status of a route resource with all parent statuses in a single patch.
-/// This prevents SSA from overwriting previous parent entries when a route
-/// references multiple listeners or gateways.
+///
+/// `status.parents` is `listType=atomic` in the Gateway API CRDs, so a
+/// server-side apply containing only our entries would wipe every entry
+/// written by anyone else — with per-Gateway data planes (one portail process
+/// per Gateway) two pods sharing a route would flip-flop each other's status
+/// forever. Instead this composes the full list read-modify-write style:
+/// entries belonging to other controllers or other Gateways are preserved
+/// verbatim from the observed status, our entries (this controller + this
+/// Gateway) are replaced wholesale, and the result is written with a merge
+/// patch. The reconcile fingerprint includes the observed parents, so a
+/// concurrent writer clobbering our entry is detected and re-applied.
 pub async fn update_route_status<K>(
     client: &Client,
     route_name: &str,
@@ -392,7 +396,8 @@ pub async fn update_route_status<K>(
     parents: &[RouteParentStatus],
     field_manager: &str,
     existing_parents_json: &[serde_json::Value],
-) where
+) -> bool
+where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
         + Serialize
         + DeserializeOwned
@@ -426,81 +431,81 @@ pub async fn update_route_status<K>(
             p.section_name.as_deref(),
         );
 
-        let accepted_status = if p.accepted { "True" } else { "False" };
-        let resolved_status = if p.refs_resolved { "True" } else { "False" };
-        let programmed_status = if p.programmed { "True" } else { "False" };
         let programmed_reason = if p.programmed { "Programmed" } else { "Invalid" };
+        let programmed_message = if p.programmed {
+            "Route programmed into data plane"
+        } else {
+            "Route not yet programmed"
+        };
 
         serde_json::json!({
             "controllerName": p.controller_name,
             "parentRef": parent_ref,
             "conditions": [
-                {
-                    "type": "Accepted",
-                    "status": accepted_status,
-                    "reason": p.accepted_reason,
-                    "message": p.message,
-                    "lastTransitionTime": transition_time_json(&existing_conds, "Accepted", accepted_status, &p.accepted_reason, &now),
-                    "observedGeneration": p.generation,
-                },
-                {
-                    "type": "ResolvedRefs",
-                    "status": resolved_status,
-                    "reason": p.refs_reason,
-                    "message": p.refs_message,
-                    "lastTransitionTime": transition_time_json(&existing_conds, "ResolvedRefs", resolved_status, &p.refs_reason, &now),
-                    "observedGeneration": p.generation,
-                },
-                {
-                    "type": "Programmed",
-                    "status": programmed_status,
-                    "reason": programmed_reason,
-                    "message": if p.programmed { "Route programmed into data plane" } else { "Route not yet programmed" },
-                    "lastTransitionTime": transition_time_json(&existing_conds, "Programmed", programmed_status, programmed_reason, &now),
-                    "observedGeneration": p.generation,
-                },
+                condition_json("Accepted", p.accepted, &p.accepted_reason, &p.message, &existing_conds, &now, p.generation),
+                condition_json("ResolvedRefs", p.refs_resolved, &p.refs_reason, &p.refs_message, &existing_conds, &now, p.generation),
+                condition_json("Programmed", p.programmed, programmed_reason, programmed_message, &existing_conds, &now, p.generation),
             ],
         })
     }).collect();
 
-    // Derive apiVersion and kind from the concrete K type
-    let api_version = <K as kube::Resource>::api_version(&Default::default()).to_string();
-    let kind = <K as kube::Resource>::kind(&Default::default()).to_string();
+    // Preserve foreign entries: anything not written by this controller for
+    // this Gateway. Our own stale entries (e.g. a sectionName the route no
+    // longer attaches to) are dropped and replaced by `parent_entries`.
+    let ours = |entry: &serde_json::Value| -> bool {
+        let controller = entry.get("controllerName").and_then(|v| v.as_str());
+        let pref = entry.get("parentRef");
+        let name = pref.and_then(|p| p.get("name")).and_then(|v| v.as_str());
+        let ns = pref
+            .and_then(|p| p.get("namespace"))
+            .and_then(|v| v.as_str());
+        parents.iter().any(|p| {
+            controller == Some(p.controller_name.as_str())
+                && name == Some(p.gateway_name.as_str())
+                && ns == Some(p.gateway_namespace.as_str())
+        })
+    };
+    let merged_parents: Vec<serde_json::Value> = existing_parents_json
+        .iter()
+        .filter(|e| !ours(e))
+        .cloned()
+        .chain(parent_entries)
+        .collect();
 
     let status = serde_json::json!({
-        "apiVersion": api_version,
-        "kind": kind,
-        "metadata": {
-            "name": route_name,
-            "namespace": route_namespace,
-        },
         "status": {
-            "parents": parent_entries,
+            "parents": merged_parents,
         }
     });
 
     match api
         .patch_status(
             route_name,
-            &PatchParams::apply(field_manager).force(),
-            &Patch::Apply(status),
+            &PatchParams::apply(field_manager),
+            &Patch::Merge(status),
         )
         .await
     {
-        Ok(_) => debug!(
-            "Updated {} {}/{} status ({} parents)",
-            std::any::type_name::<K>()
-                .rsplit("::")
-                .next()
-                .unwrap_or("Route"),
-            route_namespace,
-            route_name,
-            parents.len()
-        ),
-        Err(e) => warn!(
-            "Failed to update route {}/{} status: {}",
-            route_namespace, route_name, e
-        ),
+        Ok(_) => {
+            debug!(
+                "Updated {} {}/{} status ({} parents)",
+                std::any::type_name::<K>()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("Route"),
+                route_namespace,
+                route_name,
+                parents.len()
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Failed to update route {}/{} status: {}",
+                route_namespace, route_name, e
+            );
+            false
+        }
     }
 }
 

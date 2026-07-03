@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::PortailConfig;
-use crate::health::HealthRegistry;
 use crate::logging::{error, info, warn};
+use crate::proxy::health::HealthRegistry;
 use crate::routing::RouteTable;
 
 /// Spawn a background task that listens for SIGHUP and reloads routes.
@@ -65,9 +65,12 @@ pub async fn watch_config(
 }
 
 /// Re-read the config file, validate it, convert to RouteTable, and swap atomically.
+/// Strict conversion: a backendRef that fails DNS resolution rejects the whole
+/// reload (existing routes stay live) rather than silently swapping in a route
+/// with zero backends and degrading live traffic to 5xx.
 fn reload_routes(config_path: &PathBuf, routes: &Arc<ArcSwap<RouteTable>>) -> Result<()> {
     let config = PortailConfig::load_from_file(config_path)?;
-    let route_table = config.to_route_table()?;
+    let route_table = config.to_route_table_strict()?;
 
     let http_count: usize = route_table.listener_scopes.values().map(|v| v.len()).sum();
     let tcp_count = route_table.tcp_routes.len();

@@ -80,13 +80,19 @@ pub struct Args {
     )]
     pub manage_gateway_status: bool,
 
-    /// Port for the readiness endpoint (/readyz) served in Kubernetes mode.
-    /// Default 19099: in the conventional proxy-management range, well clear of
-    /// common Gateway listener ports (80, 443, 8080, 8081, 8443, …) so it does
-    /// not collide with the data plane within the same pod.
+    /// Port for the admin endpoint (/readyz + /metrics) served in Kubernetes
+    /// mode. Default 19099: in the conventional proxy-management range, well
+    /// clear of common Gateway listener ports (80, 443, 8080, 8081, 8443, …)
+    /// so it does not collide with the data plane within the same pod.
     #[arg(long, default_value_t = 19099)]
-    #[arg(help = "Port for the /readyz readiness endpoint (Kubernetes mode)")]
+    #[arg(help = "Port for the /readyz + /metrics admin endpoint (Kubernetes mode)")]
     pub readiness_port: u16,
+
+    /// Opt-in admin endpoint (/readyz + /metrics) in standalone mode, where no
+    /// readinessProbe needs one. Readiness reports ready once listeners are up.
+    #[arg(long, value_name = "PORT")]
+    #[arg(help = "Serve /metrics + /readyz on this port in standalone mode (off by default)")]
+    pub metrics_port: Option<u16>,
 
     /// Restrict the K8s controller to a single Gateway (`namespace/name`).
     /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
@@ -114,33 +120,11 @@ pub struct Args {
 }
 
 impl Args {
-    /// Validate argument combinations and requirements
+    /// Validate argument combinations and requirements.
+    /// Config file extension/format checking lives in
+    /// `PortailConfig::load_from_file` — the single source of truth for
+    /// supported formats.
     pub fn validate(&self) -> Result<(), String> {
-        // Validate config file extension if provided
-        if let Some(config_path) = &self.config {
-            if let Some(extension) = config_path.extension() {
-                match extension.to_str() {
-                    Some("json") | Some("yaml") | Some("yml") => {}
-                    Some(ext) => {
-                        return Err(format!(
-                            "Unsupported configuration file extension: .{}. Supported formats: .json, .yaml, .yml",
-                            ext
-                        ));
-                    }
-                    None => {
-                        return Err(
-                            "Configuration file must have a valid extension (.json, .yaml, .yml)"
-                                .to_string(),
-                        );
-                    }
-                }
-            } else {
-                return Err(
-                    "Configuration file must have an extension (.json, .yaml, .yml)".to_string(),
-                );
-            }
-        }
-
         // Validate that check-config and validate-only require config file
         if (self.check_config || self.validate_only) && self.config.is_none() {
             return Err(
@@ -210,6 +194,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -229,11 +214,14 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
         assert!(args.validate().is_ok());
 
+        // Extension/format validation is owned by PortailConfig::load_from_file,
+        // so an odd extension passes ARGUMENT validation and fails at load time.
         let args = Args {
             config: Some(PathBuf::from("config.txt")),
             validate_only: false,
@@ -248,10 +236,11 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
-        assert!(args.validate().is_err());
+        assert!(args.validate().is_ok());
     }
 
     #[test]
@@ -270,6 +259,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -289,6 +279,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -311,6 +302,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };

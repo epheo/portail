@@ -49,7 +49,7 @@ pub fn raise_net_bind_service() {
                 "CAP_NET_BIND_SERVICE not permitted; direct privileged binds unavailable \
                  (service-mode: listeners use the Service's unprivileged target port)"
             ),
-            Err(e) => debug!("Could not query process capabilities: {e}"),
+            Err(_e) => debug!("Could not query process capabilities: {_e}"),
         }
     }
 }

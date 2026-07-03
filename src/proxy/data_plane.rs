@@ -16,12 +16,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
-use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
+use crate::proxy::health::HealthRegistry;
+use crate::proxy::tls::{self, DynamicTlsAcceptor};
+use crate::proxy::udp_worker;
+use crate::proxy::worker;
 use crate::routing::{BackendSelector, RouteTable};
-use crate::tls::{self, DynamicTlsAcceptor};
-use crate::udp_worker;
-use crate::worker;
 
 struct TcpListenerEntry {
     port: u16,
@@ -39,8 +39,7 @@ pub struct DataPlane {
     tcp_listeners: Vec<TcpListenerEntry>,
     udp_listeners: Vec<UdpListenerEntry>,
     task_handles: Vec<JoinHandle<()>>,
-    max_idle_per_backend: usize,
-    connect_timeout: Duration,
+    worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
@@ -52,6 +51,9 @@ pub struct DataPlane {
     tls_cert_hashes: std::collections::HashMap<u16, u64>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
+    /// Process-wide backend pool when `performance.backendPoolScope: process`;
+    /// `None` keeps the default per-connection pools.
+    shared_pool: Option<Arc<crate::proxy::backend_pool::SharedBackendPool>>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
@@ -193,8 +195,11 @@ impl DataPlane {
             tcp_listeners,
             udp_listeners,
             task_handles: Vec::new(),
-            max_idle_per_backend: 64,
-            connect_timeout: performance_config.backend_timeout,
+            worker_config: worker::WorkerConfig {
+                max_idle_per_backend: 64,
+                connect_timeout: performance_config.backend_timeout,
+                client_header_timeout: performance_config.client_header_timeout,
+            },
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
@@ -203,6 +208,15 @@ impl DataPlane {
             tls_configs: std::collections::HashMap::new(),
             tls_cert_hashes: std::collections::HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
+            shared_pool: match performance_config.backend_pool_scope {
+                crate::config::PoolScope::Process => Some(Arc::new(
+                    crate::proxy::backend_pool::SharedBackendPool::new(
+                        64,
+                        performance_config.backend_timeout,
+                    ),
+                )),
+                crate::config::PoolScope::Connection => None,
+            },
         })
     }
 
@@ -230,9 +244,33 @@ impl DataPlane {
             addresses.iter().map(|a| Some(a.as_str())).collect()
         };
 
-        // Merge TLS cert refs across all Terminate listeners on the same port
-        // (see `merge_cert_refs_by_port`).
+        // Reconcile per-port TLS state FIRST, gated by the cheap fingerprint:
+        // build_server_config (full PEM parse + key load for every ref) runs
+        // only when the port's merged cert bytes actually changed, and once
+        // per port — not once per listener sharing it. The bind loop below
+        // always runs, so a newly appeared bind address still gets bound even
+        // when the certs are unchanged.
         let merged_cert_refs = merge_cert_refs_by_port(listener_configs);
+        for (&port, port_refs) in &merged_cert_refs {
+            let fingerprint = compute_cert_fingerprint(port_refs);
+            if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
+                continue; // Certs unchanged — the existing acceptor keeps serving
+            }
+            match tls::build_server_config(port_refs, std::path::Path::new("/unused")) {
+                Ok(config) => {
+                    if let Some(existing) = self.tls_configs.get(&port) {
+                        existing.update(config);
+                        info!("Hot-reloaded TLS config for port {}", port);
+                    } else {
+                        self.tls_configs
+                            .insert(port, Arc::new(DynamicTlsAcceptor::new(config)));
+                    }
+                    self.tls_cert_hashes.insert(port, fingerprint);
+                }
+                // No fingerprint recorded on failure: the next pass retries.
+                Err(e) => errors.push((port, format!("TLS config build failed: {}", e))),
+            }
+        }
 
         for listener_cfg in listener_configs {
             // `port` is the published identity (routing/TLS key); `bound_port` is
@@ -240,41 +278,17 @@ impl DataPlane {
             let port = listener_cfg.port;
             let bound_port = listener_cfg.target_port.unwrap_or(port);
 
-            // Build DynamicTlsAcceptor if this listener needs TLS termination.
-            // Uses the per-port merged cert refs so multi-listener ports get
-            // every hostname's cert in one ServerConfig (see merge above).
+            // TLS-terminate listeners take the per-port acceptor prepared above.
             let (tls_acceptor, tls_passthrough) = match (&listener_cfg.protocol, &listener_cfg.tls)
             {
                 (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
                     if tls_cfg.mode == TlsMode::Terminate =>
                 {
-                    let port_refs = merged_cert_refs
-                        .get(&port)
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&tls_cfg.certificate_refs);
-                    match tls::build_server_config(port_refs, std::path::Path::new("/unused")) {
-                        Ok(config) => {
-                            // If port is already bound, hot-reload the TLS config only if certs changed
-                            if let Some(existing) = self.tls_configs.get(&port) {
-                                let fingerprint = compute_cert_fingerprint(port_refs);
-                                if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
-                                    continue; // Certs unchanged — skip hot-reload
-                                }
-                                existing.update(config);
-                                self.tls_cert_hashes.insert(port, fingerprint);
-                                info!("Hot-reloaded TLS config for port {}", port);
-                                continue; // Port already has a listener, just update TLS
-                            }
-                            self.tls_cert_hashes
-                                .insert(port, compute_cert_fingerprint(port_refs));
-                            let dyn_acceptor = Arc::new(DynamicTlsAcceptor::new(config));
-                            self.tls_configs.insert(port, dyn_acceptor.clone());
-                            (Some(dyn_acceptor), false)
-                        }
-                        Err(e) => {
-                            errors.push((port, format!("TLS config build failed: {}", e)));
-                            continue;
-                        }
+                    match self.tls_configs.get(&port) {
+                        Some(acceptor) => (Some(acceptor.clone()), false),
+                        // Config build failed (error already recorded): don't
+                        // open a listener that could never handshake.
+                        None => continue,
                     }
                 }
                 (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
@@ -339,24 +353,32 @@ impl DataPlane {
                                 let routes = routes.clone();
                                 let health = self.health.clone();
                                 let shutdown = self.shutdown.clone();
-                                let max_idle = self.max_idle_per_backend;
-                                let connect_timeout = performance_config.backend_timeout;
+                                // The controller's perf config takes precedence
+                                // over the startup one for dynamic listeners.
+                                let cfg = worker::WorkerConfig {
+                                    max_idle_per_backend: self.worker_config.max_idle_per_backend,
+                                    connect_timeout: performance_config.backend_timeout,
+                                    client_header_timeout: performance_config.client_header_timeout,
+                                };
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;
 
                                 let selector = self.selector.clone();
+                                let active = self.active_connections.clone();
+                                let shared_pool = self.shared_pool.clone();
                                 let handle = tokio::spawn(async move {
                                     worker::run_worker(
                                         tokio_listener,
                                         port,
                                         routes,
-                                        max_idle,
-                                        connect_timeout,
+                                        cfg,
                                         shutdown,
                                         acceptor,
                                         passthrough,
                                         health,
                                         selector,
+                                        active,
+                                        shared_pool,
                                     )
                                     .await;
                                 });
@@ -387,26 +409,29 @@ impl DataPlane {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();
 
-        for entry in self.tcp_listeners.drain(..) {
+        let tcp_entries: Vec<_> = self.tcp_listeners.drain(..).collect();
+        for entry in tcp_entries {
             let routes = routes.clone();
             let health = self.health.clone();
             let shutdown = self.shutdown.clone();
-            let max_idle = self.max_idle_per_backend;
-            let connect_timeout = self.connect_timeout;
+            let cfg = self.worker_config;
             let selector = self.selector.clone();
+            let active = self.active_connections.clone();
+            let shared_pool = self.shared_pool.clone();
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
                     entry.listener,
                     entry.port,
                     routes,
-                    max_idle,
-                    connect_timeout,
+                    cfg,
                     shutdown,
                     entry.tls_acceptor,
                     entry.tls_passthrough,
                     health,
                     selector,
+                    active,
+                    shared_pool,
                 )
                 .await;
             });
@@ -684,11 +709,7 @@ mod tests {
             interface: None,
             tls: None,
         }];
-        let perf = crate::config::PerformanceConfig {
-            backend_timeout: std::time::Duration::from_secs(1),
-            udp_session_timeout: std::time::Duration::from_secs(1),
-            dns_refresh_interval: std::time::Duration::from_secs(1),
-        };
+        let perf = test_perf();
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
 
         // Readiness keys on the bound (target) port, not the published port.
@@ -707,5 +728,80 @@ mod tests {
         );
 
         drop(dp);
+    }
+
+    fn test_perf() -> crate::config::PerformanceConfig {
+        crate::config::PerformanceConfig {
+            backend_timeout: std::time::Duration::from_secs(1),
+            udp_session_timeout: std::time::Duration::from_secs(1),
+            dns_refresh_interval: std::time::Duration::from_secs(1),
+            client_header_timeout: std::time::Duration::from_secs(1),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: with unchanged certs, a reconcile that brings a NEW bind
+    /// address must still bind it. The old flow `continue`d out of the whole
+    /// listener iteration on a fingerprint match, silently skipping the
+    /// bind loop for addresses that appeared after the first pass.
+    #[tokio::test]
+    async fn new_bind_address_with_unchanged_certs_still_binds() {
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("a.example.org")
+        else {
+            return; // openssl unavailable
+        };
+        let mut listener = https_listener("https", 23443, Some("a.example.org"), "cert");
+        listener.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(cert);
+        listener.tls.as_mut().unwrap().certificate_refs[0].key_pem = Some(key);
+
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        let (opened, errors) = dp.add_tcp_listeners(
+            std::slice::from_ref(&listener),
+            &["127.0.0.1".to_string()],
+            routes.clone(),
+            &perf,
+        );
+        assert_eq!((opened, errors.len()), (1, 0));
+        let hash_after_first = dp.tls_cert_hashes.get(&23443).copied();
+        assert!(
+            hash_after_first.is_some(),
+            "TLS state prepared for the port"
+        );
+
+        // Same certs, one more address: the new endpoint must be bound and
+        // the TLS state must not churn.
+        let (opened, errors) = dp.add_tcp_listeners(
+            std::slice::from_ref(&listener),
+            &["127.0.0.1".to_string(), "127.0.0.2".to_string()],
+            routes,
+            &perf,
+        );
+        assert_eq!(errors, vec![]);
+        assert_eq!(opened, 1, "the address that appeared later must be bound");
+        assert_eq!(dp.tls_cert_hashes.get(&23443).copied(), hash_after_first);
+    }
+
+    /// Unparseable certs on a port shared by several Terminate listeners:
+    /// one build attempt, one error, no listener bound on that port.
+    #[tokio::test]
+    async fn invalid_certs_error_once_per_port_and_skip_binding() {
+        let listeners = vec![
+            https_listener("a", 23444, None, "bad"),
+            https_listener("b", 23444, Some("b.example.org"), "bad"),
+        ];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes, &perf);
+        assert_eq!(opened, 0, "a port that cannot handshake must not bind");
+        assert_eq!(errors.len(), 1, "one error per port, not per listener");
+        assert!(
+            !dp.tls_cert_hashes.contains_key(&23444),
+            "failed build must retry next pass"
+        );
     }
 }

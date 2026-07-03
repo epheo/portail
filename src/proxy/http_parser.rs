@@ -62,8 +62,12 @@ pub struct HttpRequestInfo<'a> {
     pub is_upgrade: bool,
     /// Set when the request carries headers that constitute a smuggling vector
     /// per RFC 7230 §3.3.3:
-    /// - both `Content-Length` and `Transfer-Encoding: chunked` present, or
-    /// - multiple `Content-Length` lines with conflicting values.
+    /// - both `Content-Length` and `Transfer-Encoding: chunked` present,
+    /// - multiple `Content-Length` lines with conflicting values, or
+    /// - a `Transfer-Encoding` value other than a single, exact `chunked`
+    ///   (e.g. `gzip, chunked`, `identity`, repeated TE lines): the proxy
+    ///   would forward the TE header verbatim while framing the body
+    ///   differently than the backend — the classic TE.CL desync.
     ///
     /// The caller MUST reject such requests with `400`.
     pub header_violation: bool,
@@ -91,6 +95,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     // RFC 7230 §3.3.3 smuggling guards. We flag (but keep parsing) so the
     // request_processor can reject with a clean 400.
     let mut duplicate_content_length_conflict = false;
+    let mut transfer_encoding_violation = false;
 
     // Parse first line (method, path, version)
     let mut line_end = pos;
@@ -168,27 +173,14 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                     .map_or(value_end, |pos| value_start + pos);
 
                 host = std::str::from_utf8(&line[value_start..normalized_end]).ok();
-            } else if line.len() >= 16 && line[..16].eq_ignore_ascii_case(b"Content-Length: ") {
-                if let Ok(val) = std::str::from_utf8(&line[16..])
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .ok_or(())
-                {
-                    record_content_length(
-                        val,
-                        &mut content_length,
-                        &mut duplicate_content_length_conflict,
-                    );
-                }
             } else if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
                 let mut vs = 15;
                 while vs < line.len() && line[vs] == b' ' {
                     vs += 1;
                 }
-                if let Ok(val) = std::str::from_utf8(&line[vs..])
+                if let Some(val) = std::str::from_utf8(&line[vs..])
                     .ok()
                     .and_then(|s| s.trim().parse::<usize>().ok())
-                    .ok_or(())
                 {
                     record_content_length(
                         val,
@@ -201,10 +193,16 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                 while vs < line.len() && line[vs] == b' ' {
                     vs += 1;
                 }
-                if let Ok(val) = std::str::from_utf8(&line[vs..]) {
-                    if val.trim().eq_ignore_ascii_case("chunked") {
+                // The only transfer coding this proxy understands is a single,
+                // exact `chunked`. Anything else — `gzip, chunked`, `identity`,
+                // a repeated TE line, a non-UTF8 value — is flagged: we cannot
+                // frame such a body ourselves, so forwarding it would desync
+                // our framing from the backend's.
+                match std::str::from_utf8(&line[vs..]) {
+                    Ok(val) if val.trim().eq_ignore_ascii_case("chunked") && !is_chunked => {
                         is_chunked = true;
                     }
+                    _ => transfer_encoding_violation = true,
                 }
             } else if line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Upgrade:") {
                 is_upgrade = true;
@@ -286,10 +284,12 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         None => "",
     };
 
-    // RFC 7230 §3.3.3: reject both TE+CL coexistence and conflicting duplicate
-    // Content-Length values — both are classic request-smuggling vectors.
-    let header_violation =
-        duplicate_content_length_conflict || (content_length.is_some() && is_chunked);
+    // RFC 7230 §3.3.3: reject TE+CL coexistence, conflicting duplicate
+    // Content-Length values, and unsupported Transfer-Encoding values — all
+    // classic request-smuggling vectors.
+    let header_violation = duplicate_content_length_conflict
+        || transfer_encoding_violation
+        || (content_length.is_some() && is_chunked);
 
     Ok(HttpRequestInfo {
         method: method.unwrap_or("GET"),

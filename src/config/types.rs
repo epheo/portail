@@ -59,6 +59,7 @@ pub struct ListenerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub mode: TlsMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -181,6 +182,7 @@ pub struct ParentRef {
 /// HTTP route rule with matches and backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HttpRouteRule {
     #[serde(default)]
     pub matches: Vec<HttpRouteMatch>,
@@ -194,6 +196,7 @@ pub struct HttpRouteRule {
 /// Per-rule timeout configuration following Gateway API HTTPRouteTimeouts
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HttpRouteTimeouts {
     #[serde(
         default,
@@ -214,6 +217,7 @@ pub struct HttpRouteTimeouts {
 /// HTTP route match conditions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct HttpRouteMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -227,6 +231,7 @@ pub struct HttpRouteMatch {
 
 /// HTTP query parameter match condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpQueryParamMatch {
     pub name: String,
     pub value: String,
@@ -263,6 +268,7 @@ pub enum StringMatchType {
 
 /// HTTP header match condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpHeaderMatch {
     pub name: String,
     pub value: String,
@@ -272,6 +278,7 @@ pub struct HttpHeaderMatch {
 
 /// Header modification config shared by request/response header modifiers
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderModifierConfig {
     #[serde(default)]
     pub add: Vec<HttpHeader>,
@@ -284,6 +291,7 @@ pub struct HeaderModifierConfig {
 /// RequestRedirect config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct RequestRedirectConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
@@ -299,6 +307,7 @@ pub struct RequestRedirectConfig {
 
 /// URLRewrite config
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct URLRewriteConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -309,6 +318,7 @@ pub struct URLRewriteConfig {
 /// RequestMirror config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct RequestMirrorConfig {
     pub backend_ref: BackendRef,
     /// Percentage of requests to mirror (0–100). If neither percent nor fraction
@@ -389,6 +399,7 @@ pub use crate::routing::HttpHeader;
 
 /// Backend reference for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendRef {
     pub name: String,
     pub port: u16,
@@ -454,13 +465,17 @@ pub struct TcpRouteConfig {
     pub rules: Vec<TcpRouteRule>,
 }
 
-/// TCP route rule with backend references
+/// L4 route rule: backend references only. TCP, UDP, and TLS route rules
+/// share this exact shape, so they are aliases of one type (their wire format
+/// is identical).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct TcpRouteRule {
+pub struct L4RouteRule {
     pub backend_refs: Vec<BackendRef>,
 }
+
+pub type TcpRouteRule = L4RouteRule;
 
 /// UDP route configuration following Kubernetes Gateway API UDPRoute specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,13 +487,7 @@ pub struct UdpRouteConfig {
     pub rules: Vec<UdpRouteRule>,
 }
 
-/// UDP route rule with backend references
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct UdpRouteRule {
-    pub backend_refs: Vec<BackendRef>,
-}
+pub type UdpRouteRule = L4RouteRule;
 
 /// TLS route configuration following Kubernetes Gateway API TLSRoute specification
 /// Routes TLS connections based on SNI hostname
@@ -493,13 +502,7 @@ pub struct TlsRouteConfig {
     pub rules: Vec<TlsRouteRule>,
 }
 
-/// TLS route rule with backend references
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct TlsRouteRule {
-    pub backend_refs: Vec<BackendRef>,
-}
+pub type TlsRouteRule = L4RouteRule;
 
 /// Observability configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -590,6 +593,38 @@ pub struct PerformanceConfig {
         serialize_with = "serialize_duration"
     )]
     pub dns_refresh_interval: Duration,
+
+    /// Maximum time a client may take to complete its TLS handshake, or to
+    /// finish a request's header block once its first bytes have arrived
+    /// (slow-loris guard). Deliberately does NOT bound the idle wait between
+    /// keepalive requests. Defaults to 30s — the same order as nginx
+    /// `client_header_timeout` (60s) and typical haproxy
+    /// `timeout http-request` settings (5–30s).
+    #[serde(
+        default = "default_client_header_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub client_header_timeout: Duration,
+
+    /// Scope of the idle backend-connection pool. `connection` (default)
+    /// pools per accepted client connection — lock-free, but reuse happens
+    /// only across keepalive requests on that same client. `process` shares
+    /// one pool across all client connections — cross-client reuse under
+    /// client-connection churn, at the cost of a sharded lock. Measurement
+    /// flag: the default stays `connection` until bench data justifies more.
+    #[serde(default)]
+    pub backend_pool_scope: PoolScope,
+}
+
+/// Scope of the idle backend-connection pool (see
+/// [`PerformanceConfig::backend_pool_scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolScope {
+    #[default]
+    Connection,
+    Process,
 }
 
 fn default_backend_timeout() -> Duration {
@@ -604,12 +639,18 @@ fn default_dns_refresh_interval() -> Duration {
     Duration::from_secs(5)
 }
 
+fn default_client_header_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             backend_timeout: default_backend_timeout(),
             udp_session_timeout: default_udp_session_timeout(),
             dns_refresh_interval: default_dns_refresh_interval(),
+            client_header_timeout: default_client_header_timeout(),
+            backend_pool_scope: PoolScope::default(),
         }
     }
 }

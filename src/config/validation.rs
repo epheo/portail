@@ -33,27 +33,80 @@ impl PortailConfig {
         }
 
         self.validate_port_conflicts()?;
+        self.validate_parent_refs_resolve()?;
 
         Ok(())
     }
 
     fn validate_port_conflicts(&self) -> Result<()> {
-        // Track (port, is_udp) — TCP and UDP can legally share the same port number
-        // since they use different socket families. HTTP/HTTPS/TLS/TCP all bind TCP sockets.
-        let mut used_ports = std::collections::HashSet::new();
+        // A conflict is two listeners binding the same SOCKET, so key on what
+        // the data plane actually binds: (bind address, bound port, socket
+        // family). `target_port` overrides `port` when set, and listeners on
+        // different addresses may legally share a port number. TCP and UDP can
+        // also share a port number (different socket families);
+        // HTTP/HTTPS/TLS/TCP all bind TCP sockets.
+        let mut used_sockets = std::collections::HashSet::new();
 
         for listener in &self.gateway.listeners {
             let is_udp = matches!(listener.protocol, Protocol::UDP);
-            if !used_ports.insert((listener.port, is_udp)) {
+            let bound_port = listener.target_port.unwrap_or(listener.port);
+            if !used_sockets.insert((listener.address.clone(), bound_port, is_udp)) {
                 let proto_family = if is_udp { "UDP" } else { "TCP" };
                 return Err(anyhow!(
-                    "Port conflict: {} port {} is already in use by another listener",
+                    "Port conflict: {} port {} on {} is already bound by another listener",
                     proto_family,
-                    listener.port
+                    bound_port,
+                    listener.address.as_deref().unwrap_or("0.0.0.0"),
                 ));
             }
         }
 
+        Ok(())
+    }
+
+    /// Every route parentRef must resolve to at least one Gateway listener.
+    /// Without this, a mistyped `sectionName` silently produced a config that
+    /// "succeeds" but routes nothing (HTTP routes even fell into the any-port
+    /// scope). Only enforced on the file-config path — in Kubernetes mode
+    /// route attachment failures are reported via route status instead.
+    fn validate_parent_refs_resolve(&self) -> Result<()> {
+        fn check(
+            parent_refs: &[ParentRef],
+            listeners: &[ListenerConfig],
+            proto: &str,
+            idx: usize,
+        ) -> Result<()> {
+            for pr in parent_refs {
+                let resolves = listeners.iter().any(|l| {
+                    pr.section_name.as_ref().is_none_or(|s| &l.name == s)
+                        && pr.port.is_none_or(|p| l.port == p as u16)
+                });
+                if !resolves {
+                    return Err(anyhow!(
+                        "{} route {}: parentRef (sectionName: {:?}, port: {:?}) does not match any Gateway listener",
+                        proto,
+                        idx,
+                        pr.section_name,
+                        pr.port,
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        let listeners = &self.gateway.listeners;
+        for (i, r) in self.http_routes.iter().enumerate() {
+            check(&r.parent_refs, listeners, "HTTP", i)?;
+        }
+        for (i, r) in self.tcp_routes.iter().enumerate() {
+            check(&r.parent_refs, listeners, "TCP", i)?;
+        }
+        for (i, r) in self.tls_routes.iter().enumerate() {
+            check(&r.parent_refs, listeners, "TLS", i)?;
+        }
+        for (i, r) in self.udp_routes.iter().enumerate() {
+            check(&r.parent_refs, listeners, "UDP", i)?;
+        }
         Ok(())
     }
 }
@@ -344,10 +397,12 @@ impl TlsRouteConfig {
     }
 }
 
-impl TlsRouteRule {
+/// Shared by TCP/UDP/TLS route rules (they alias `L4RouteRule`). The
+/// `validate_route` wrapper prefixes errors with the protocol name.
+impl L4RouteRule {
     fn validate(&self) -> Result<()> {
         if self.backend_refs.is_empty() {
-            return Err(anyhow!("TLS route rule must have at least one backend_ref"));
+            return Err(anyhow!("route rule must have at least one backend_ref"));
         }
 
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
@@ -363,38 +418,6 @@ impl TlsRouteRule {
 impl UdpRouteConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_route(&self.parent_refs, &self.rules, "UDP", |r| r.validate())
-    }
-}
-
-impl UdpRouteRule {
-    fn validate(&self) -> Result<()> {
-        if self.backend_refs.is_empty() {
-            return Err(anyhow!("UDP route rule must have at least one backend_ref"));
-        }
-
-        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref
-                .validate()
-                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
-        }
-
-        Ok(())
-    }
-}
-
-impl TcpRouteRule {
-    fn validate(&self) -> Result<()> {
-        if self.backend_refs.is_empty() {
-            return Err(anyhow!("TCP route rule must have at least one backend_ref"));
-        }
-
-        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
-            backend_ref
-                .validate()
-                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -822,5 +845,169 @@ mod tests {
             }),
         );
         assert!(listener.validate().is_err());
+    }
+
+    // --- Port-conflict validation keys on the actually-bound socket ---------
+
+    fn listener_on(
+        name: &str,
+        port: u16,
+        target_port: Option<u16>,
+        address: Option<&str>,
+    ) -> ListenerConfig {
+        ListenerConfig {
+            name: name.to_string(),
+            protocol: Protocol::HTTP,
+            port,
+            target_port,
+            hostname: None,
+            address: address.map(str::to_string),
+            interface: None,
+            tls: None,
+        }
+    }
+
+    fn config_with_listeners(listeners: Vec<ListenerConfig>) -> PortailConfig {
+        PortailConfig {
+            gateway: GatewayConfig {
+                name: "gw".to_string(),
+                listeners,
+                addresses: vec![],
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Two listeners with distinct published ports whose targetPorts collide
+    /// bind the same socket — must be rejected.
+    #[test]
+    fn test_target_port_collision_detected() {
+        let cfg = config_with_listeners(vec![
+            listener_on("a", 80, Some(8080), None),
+            listener_on("b", 8081, Some(8080), None),
+        ]);
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Same port number on different bind addresses is legal (distinct sockets).
+    #[test]
+    fn test_same_port_different_addresses_allowed() {
+        let cfg = config_with_listeners(vec![
+            listener_on("a", 8080, None, Some("127.0.0.1")),
+            listener_on("b", 8080, None, Some("127.0.0.2")),
+        ]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Published-port collision resolved by distinct targetPorts is legal.
+    #[test]
+    fn test_same_published_port_distinct_target_ports_allowed() {
+        let cfg = config_with_listeners(vec![
+            listener_on("a", 80, Some(8080), None),
+            listener_on("b", 80, Some(8081), Some("127.0.0.1")),
+        ]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // --- parentRef must resolve to a real listener ---------------------------
+
+    #[test]
+    fn test_parent_ref_with_unknown_section_name_rejected() {
+        let mut cfg = config_with_listeners(vec![listener_on("http", 8080, None, None)]);
+        cfg.http_routes.push(HttpRouteConfig {
+            parent_refs: vec![ParentRef {
+                name: "gw".to_string(),
+                section_name: Some("no-such-listener".to_string()),
+                port: None,
+            }],
+            hostnames: vec!["example.com".to_string()],
+            rules: vec![HttpRouteRule {
+                matches: vec![HttpRouteMatch::path_prefix("/")],
+                filters: vec![],
+                backend_refs: vec![BackendRef {
+                    name: "127.0.0.1".to_string(),
+                    port: 9000,
+                    weight: 1,
+                    group: String::new(),
+                    kind: "Service".to_string(),
+                    filters: vec![],
+                    app_protocol: None,
+                }],
+                timeouts: None,
+            }],
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("does not match any Gateway listener"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parent_ref_matching_section_name_accepted() {
+        let mut cfg = config_with_listeners(vec![listener_on("http", 8080, None, None)]);
+        cfg.http_routes.push(HttpRouteConfig {
+            parent_refs: vec![ParentRef {
+                name: "gw".to_string(),
+                section_name: Some("http".to_string()),
+                port: None,
+            }],
+            hostnames: vec!["example.com".to_string()],
+            rules: vec![HttpRouteRule {
+                matches: vec![HttpRouteMatch::path_prefix("/")],
+                filters: vec![],
+                backend_refs: vec![BackendRef {
+                    name: "127.0.0.1".to_string(),
+                    port: 9000,
+                    weight: 1,
+                    group: String::new(),
+                    kind: "Service".to_string(),
+                    filters: vec![],
+                    app_protocol: None,
+                }],
+                timeouts: None,
+            }],
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    // --- Unknown fields in rule-level config are rejected at parse time ------
+
+    /// A typo inside an HTTP rule (`weght`) must fail parsing, not be
+    /// silently ignored while the route serves with a default value.
+    #[test]
+    fn test_unknown_field_in_backend_ref_rejected() {
+        let json = r#"{
+          "gateway": {"name": "gw", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+          "httpRoutes": [{
+            "parentRefs": [{"name": "gw", "sectionName": "http"}],
+            "hostnames": ["example.com"],
+            "rules": [{
+              "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+              "backendRefs": [{"name": "127.0.0.1", "port": 9000, "weght": 5}]
+            }]
+          }]
+        }"#;
+        let err = serde_json::from_str::<PortailConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("weght"), "{}", err);
+    }
+
+    #[test]
+    fn test_unknown_field_in_rule_rejected() {
+        let json = r#"{
+          "gateway": {"name": "gw", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+          "httpRoutes": [{
+            "parentRefs": [{"name": "gw", "sectionName": "http"}],
+            "hostnames": ["example.com"],
+            "rules": [{
+              "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+              "backendRef": [{"name": "127.0.0.1", "port": 9000}],
+              "backendRefs": [{"name": "127.0.0.1", "port": 9000}]
+            }]
+          }]
+        }"#;
+        let err = serde_json::from_str::<PortailConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("backendRef"), "{}", err);
     }
 }

@@ -164,14 +164,18 @@ pub(crate) fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpR
         .map(|m| m.iter().map(convert_http_match).collect::<Vec<_>>())
         .unwrap_or_default();
 
+    // Filter conversion errors propagate: a filter this proxy cannot apply
+    // must fail the route (Accepted=False via collect_routes' Err arm), not
+    // be silently dropped while the route keeps serving without it.
     let filters = rule
         .filters
         .as_ref()
         .map(|f| {
             f.iter()
-                .filter_map(|f| convert_http_filter(f, ns).ok())
-                .collect::<Vec<_>>()
+                .map(|f| convert_http_filter(f, ns))
+                .collect::<Result<Vec<_>>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     let backend_refs = rule
@@ -464,74 +468,20 @@ pub(crate) fn convert_backend_ref_filters(
     };
     filters
         .iter()
-        .filter_map(|f| {
-            match f.r#type {
-                HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
-                    let hm = f.request_header_modifier.as_ref()?;
-                    Some(HttpRouteFilter::RequestHeaderModifier {
-                        config: HeaderModifierConfig {
-                            add: hm
-                                .add
-                                .as_ref()
-                                .map(|v| {
-                                    v.iter()
-                                        .map(|h| HttpHeader {
-                                            name: h.name.clone(),
-                                            value: h.value.clone(),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            set: hm
-                                .set
-                                .as_ref()
-                                .map(|v| {
-                                    v.iter()
-                                        .map(|h| HttpHeader {
-                                            name: h.name.clone(),
-                                            value: h.value.clone(),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            remove: hm.remove.clone().unwrap_or_default(),
-                        },
-                    })
-                }
-                HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
-                    let hm = f.response_header_modifier.as_ref()?;
-                    Some(HttpRouteFilter::ResponseHeaderModifier {
-                        config: HeaderModifierConfig {
-                            add: hm
-                                .add
-                                .as_ref()
-                                .map(|v| {
-                                    v.iter()
-                                        .map(|h| HttpHeader {
-                                            name: h.name.clone(),
-                                            value: h.value.clone(),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            set: hm
-                                .set
-                                .as_ref()
-                                .map(|v| {
-                                    v.iter()
-                                        .map(|h| HttpHeader {
-                                            name: h.name.clone(),
-                                            value: h.value.clone(),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            remove: hm.remove.clone().unwrap_or_default(),
-                        },
-                    })
-                }
-                _ => None, // Other filter types not valid at backend level
+        .filter_map(|f| match f.r#type {
+            HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+                let hm = f.request_header_modifier.as_ref()?;
+                Some(HttpRouteFilter::RequestHeaderModifier {
+                    config: convert_header_mod!(hm),
+                })
             }
+            HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+                let hm = f.response_header_modifier.as_ref()?;
+                Some(HttpRouteFilter::ResponseHeaderModifier {
+                    config: convert_header_mod!(hm),
+                })
+            }
+            _ => None, // Other filter types not valid at backend level
         })
         .collect()
 }

@@ -1166,3 +1166,237 @@ fn test_duplicate_content_length_conflict_rejected() {
         status
     );
 }
+
+/// Backend that answers every request with the same fixed raw bytes —
+/// including deliberately malformed ones (e.g. bytes past the declared
+/// Content-Length) that the framed TestBackend cannot produce.
+fn spawn_raw_response_backend(
+    raw_response: &'static [u8],
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    listener.set_nonblocking(true).unwrap();
+
+    thread::spawn(move || {
+        while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buf = [0u8; 4096];
+                    let mut accum = Vec::new();
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        accum.extend_from_slice(&buf[..n]);
+                        if accum.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(raw_response);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (addr, shutdown)
+}
+
+#[test]
+fn test_backend_content_length_overshoot_truncated() {
+    // Backend declares Content-Length: 5 but appends extra garbage after the
+    // body. The proxy must forward exactly 5 body bytes and drop the excess —
+    // never leak it into the client's stream.
+    let (backend_addr, shutdown) = spawn_raw_response_backend(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhelloSMUGGLED-GARBAGE",
+    );
+    let port = proxy_port(50);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend_addr)], port);
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request_timeout(proxy.proxy_addr, request, Duration::from_secs(3))
+        .expect("proxy should return the truncated response");
+
+    assert_eq!(extract_status(&response), Some(200));
+    let body = extract_body(&response);
+    assert_eq!(
+        body,
+        b"hello",
+        "body must stop at Content-Length; got {:?}",
+        std::str::from_utf8(body).unwrap_or("<binary>")
+    );
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn test_backend_chunked_overshoot_truncated() {
+    // Chunked response with bytes after the 0\r\n\r\n terminator. The excess
+    // must be dropped, not forwarded as part of the chunked stream.
+    let (backend_addr, shutdown) = spawn_raw_response_backend(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\n\r\nSMUGGLED",
+    );
+    let port = proxy_port(51);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend_addr)], port);
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http_request_timeout(proxy.proxy_addr, request, Duration::from_secs(3))
+        .expect("proxy should return the truncated response");
+
+    assert_eq!(extract_status(&response), Some(200));
+    let body = extract_body(&response);
+    assert_eq!(
+        body,
+        b"5\r\nhello\r\n0\r\n\r\n",
+        "chunked body must stop at the terminator; got {:?}",
+        std::str::from_utf8(body).unwrap_or("<binary>")
+    );
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read from `stream` until `count` complete HTTP responses (headers +
+/// Content-Length body each) have arrived, or time out.
+fn read_n_responses(
+    stream: &mut std::net::TcpStream,
+    count: usize,
+    timeout: Duration,
+) -> Vec<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut accum: Vec<u8> = Vec::new();
+    let mut responses = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    while responses.len() < count && std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => accum.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+        // Split complete responses off the front of the accumulator.
+        while let Some(pos) = accum.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = std::str::from_utf8(&accum[..header_end]).unwrap_or("");
+            let cl: usize = headers
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let total = header_end + cl;
+            if accum.len() < total {
+                break;
+            }
+            responses.push(accum[..total].to_vec());
+            accum.drain(..total);
+        }
+    }
+    responses
+}
+
+#[test]
+fn test_pipelined_get_not_leaked_to_backend() {
+    // Two GETs written in a single TCP segment. The proxy must send the
+    // backend request 1 ONLY (the tail is the pipelined request 2, not body),
+    // answer it, then replay request 2 — the backend must see two separate,
+    // well-formed requests and the client must get two responses.
+    let backend = InspectingBackend::spawn("pipelined-ok");
+    let port = proxy_port(52);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let mut stream = std::net::TcpStream::connect(proxy.proxy_addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /a HTTP/1.1\r\nHost: localhost\r\n\r\nGET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+
+    let responses = read_n_responses(&mut stream, 2, Duration::from_secs(3));
+    assert_eq!(responses.len(), 2, "client must receive both responses");
+    for resp in &responses {
+        assert_eq!(extract_status(resp), Some(200));
+    }
+
+    let received = backend.received_requests();
+    assert_eq!(
+        received.len(),
+        2,
+        "backend must see two separate requests, got {}",
+        received.len()
+    );
+    let first = String::from_utf8_lossy(&received[0]);
+    assert!(first.starts_with("GET /a"), "first request: {}", first);
+    assert!(
+        !first.contains("GET /b"),
+        "pipelined request 2 leaked into request 1's bytes: {}",
+        first
+    );
+    let second = String::from_utf8_lossy(&received[1]);
+    assert!(second.starts_with("GET /b"), "second request: {}", second);
+}
+
+#[test]
+fn test_pipelined_post_body_boundary_respected() {
+    // POST with Content-Length: 5 plus a pipelined GET in the same segment.
+    // The proxy must cut the POST at its body boundary — the GET must not be
+    // forwarded as POST body bytes — and then serve the GET.
+    let backend = InspectingBackend::spawn("boundary-ok");
+    let port = proxy_port(53);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let mut stream = std::net::TcpStream::connect(proxy.proxy_addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+
+    let responses = read_n_responses(&mut stream, 2, Duration::from_secs(3));
+    assert_eq!(responses.len(), 2, "client must receive both responses");
+
+    let received = backend.received_requests();
+    assert_eq!(received.len(), 2, "backend must see two separate requests");
+    let first = String::from_utf8_lossy(&received[0]);
+    assert!(
+        first.starts_with("POST /upload"),
+        "first request: {}",
+        first
+    );
+    assert!(
+        first.ends_with("hello"),
+        "POST body must be exactly its Content-Length: {}",
+        first
+    );
+    assert!(
+        !first.contains("GET /next"),
+        "pipelined GET leaked into POST body: {}",
+        first
+    );
+    let second = String::from_utf8_lossy(&received[1]);
+    assert!(
+        second.starts_with("GET /next"),
+        "second request: {}",
+        second
+    );
+}
