@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::{debug, info, warn};
+use crate::metrics::METRICS;
 use crate::proxy::backend_pool::BackendPool;
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
@@ -73,6 +74,8 @@ struct ConnGuard(Arc<AtomicUsize>);
 impl ConnGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
+        METRICS.connections_accepted_total.inc();
+        METRICS.active_connections.inc();
         Self(counter)
     }
 }
@@ -81,6 +84,7 @@ impl Drop for ConnGuard {
     fn drop(&mut self) {
         // Release pairs with the Acquire load in the shutdown drain loop.
         self.0.fetch_sub(1, Ordering::Release);
+        METRICS.active_connections.dec();
     }
 }
 
@@ -194,9 +198,11 @@ pub async fn run_worker(
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
                                         Ok(Err(_e)) => {
+                                            METRICS.tls_handshake_failures_total.inc();
                                             debug!("TLS handshake failed from {}: {}", peer, _e);
                                         }
                                         Err(_) => {
+                                            METRICS.tls_handshake_failures_total.inc();
                                             debug!("TLS handshake from {} timed out", peer);
                                         }
                                     }
@@ -284,6 +290,7 @@ async fn handle_connection(
                 rule,
                 meta,
             } => {
+                METRICS.http_requests_total.inc();
                 // proxy_http_request owns all timing for the request lifecycle —
                 // backend_request_timeout (connect + TTFB) and request_timeout
                 // (total deadline) are applied phase-aware inside.
@@ -476,6 +483,7 @@ async fn proxy_http_request(
             // Pool entry died between probe and write. Reconnect once and
             // replay. Do NOT record_failure here: a stale pool entry is
             // expected churn, not a backend problem.
+            METRICS.pool_stale_retries_total.inc();
             debug!(
                 "Backend {} pool conn died on send ({}); retrying with fresh conn",
                 backend_addr, _e
@@ -704,6 +712,10 @@ async fn fail_backend(
     addr: std::net::SocketAddr,
     code: u16,
 ) -> Result<(bool, Option<Vec<u8>>)> {
+    match code {
+        504 => METRICS.upstream_connect_timeouts_total.inc(),
+        _ => METRICS.upstream_connect_errors_total.inc(),
+    }
     if health.record_failure(addr) {
         HealthRegistry::spawn_probe(Arc::clone(health), addr);
     }
@@ -745,6 +757,7 @@ async fn connect_to_backend(
             Ok(Some(result))
         }
         Ok(Err(e)) => {
+            METRICS.upstream_connect_errors_total.inc();
             warn!("Backend {} connect failed: {}", backend_addr, e);
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
@@ -753,6 +766,7 @@ async fn connect_to_backend(
             Ok(None)
         }
         Err(_) => {
+            METRICS.upstream_connect_timeouts_total.inc();
             warn!("Backend {} connect timeout", backend_addr);
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);

@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::PortailConfig;
 use crate::logging::{debug, info, warn};
+use crate::metrics::METRICS;
 use crate::routing::RouteTable;
 
 /// Spawn the background DNS-refresh task.
@@ -101,14 +102,16 @@ pub fn spawn_dns_refresh(
 
             match apply_refresh(&routes, &current, built) {
                 SwapOutcome::Swapped => {
+                    METRICS.dns_refresh_swaps_total.inc();
                     info!("DNS refresh: resolved backend set changed; route table swapped")
                 }
                 SwapOutcome::Superseded => {
+                    METRICS.dns_refresh_superseded_total.inc();
                     debug!(
                         "DNS refresh: reconcile swapped concurrently; dropping re-resolved table"
                     )
                 }
-                SwapOutcome::Unchanged => {}
+                SwapOutcome::Unchanged => METRICS.dns_refresh_unchanged_total.inc(),
             }
         }
     });

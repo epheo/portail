@@ -563,6 +563,7 @@ pub(super) async fn reconcile(
         .map(|last| *last == Some(fingerprint))
         .unwrap_or(false);
     if unchanged && dp_ready_initial {
+        crate::metrics::METRICS.reconcile_skips_total.inc();
         debug!(
             "Gateway {}/{} unchanged since last applied reconcile; skipping rebuild and status writes",
             gw_ns, gw_name
@@ -590,6 +591,7 @@ pub(super) async fn reconcile(
     // (Unchanged with readiness flipped false→true falls through: Programmed
     // changes, so the apply path must run.)
     if unchanged && !dp_ready {
+        crate::metrics::METRICS.reconcile_skips_total.inc();
         debug!(
             "Gateway {}/{} unchanged and still unready after bind retry; skipping rebuild",
             gw_ns, gw_name
@@ -599,6 +601,8 @@ pub(super) async fn reconcile(
             all_routes_accepted,
         ))));
     }
+
+    crate::metrics::METRICS.reconcile_runs_total.inc();
 
     // Fingerprint recorded on success — same inputs, with the post-ensure
     // readiness when it moved.

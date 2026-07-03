@@ -80,13 +80,19 @@ pub struct Args {
     )]
     pub manage_gateway_status: bool,
 
-    /// Port for the readiness endpoint (/readyz) served in Kubernetes mode.
-    /// Default 19099: in the conventional proxy-management range, well clear of
-    /// common Gateway listener ports (80, 443, 8080, 8081, 8443, …) so it does
-    /// not collide with the data plane within the same pod.
+    /// Port for the admin endpoint (/readyz + /metrics) served in Kubernetes
+    /// mode. Default 19099: in the conventional proxy-management range, well
+    /// clear of common Gateway listener ports (80, 443, 8080, 8081, 8443, …)
+    /// so it does not collide with the data plane within the same pod.
     #[arg(long, default_value_t = 19099)]
-    #[arg(help = "Port for the /readyz readiness endpoint (Kubernetes mode)")]
+    #[arg(help = "Port for the /readyz + /metrics admin endpoint (Kubernetes mode)")]
     pub readiness_port: u16,
+
+    /// Opt-in admin endpoint (/readyz + /metrics) in standalone mode, where no
+    /// readinessProbe needs one. Readiness reports ready once listeners are up.
+    #[arg(long, value_name = "PORT")]
+    #[arg(help = "Serve /metrics + /readyz on this port in standalone mode (off by default)")]
+    pub metrics_port: Option<u16>,
 
     /// Restrict the K8s controller to a single Gateway (`namespace/name`).
     /// Set by portail-operator (per-Gateway data-plane Deployments); absent =

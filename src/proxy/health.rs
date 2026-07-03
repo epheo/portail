@@ -107,8 +107,12 @@ impl HealthRegistry {
             if entry.consecutive_failures.load(Ordering::Relaxed) > 0
                 || entry.status.load(Ordering::Acquire) != STATUS_HEALTHY
             {
+                let was_unhealthy = entry.status.load(Ordering::Acquire) != STATUS_HEALTHY;
                 entry.consecutive_failures.store(0, Ordering::Relaxed);
                 entry.status.store(STATUS_HEALTHY, Ordering::Release);
+                if was_unhealthy {
+                    crate::metrics::METRICS.backends_recovered_total.inc();
+                }
                 info!("Backend {} recovered (passive success)", addr);
             }
         }
@@ -144,6 +148,9 @@ impl HealthRegistry {
                 )
                 .is_ok()
             {
+                crate::metrics::METRICS
+                    .backends_marked_unhealthy_total
+                    .inc();
                 warn!(
                     "Backend {} marked UNHEALTHY after {} consecutive failures",
                     addr, new_count
@@ -201,6 +208,7 @@ impl HealthRegistry {
                     // Release: subsequent Acquire reads of STATUS_HEALTHY will see
                     // all prior stores (including the failure counter reset).
                     entry.status.store(STATUS_HEALTHY, Ordering::Release);
+                    crate::metrics::METRICS.backends_recovered_total.inc();
                 }
                 return;
             }

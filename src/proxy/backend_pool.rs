@@ -13,6 +13,7 @@
 //! half-closed by the time we write to it (`acquire_fresh`).
 
 use crate::logging::debug;
+use crate::metrics::METRICS;
 use crate::proxy::tls::Connection;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -75,14 +76,19 @@ impl BackendPool {
                 let mut probe = [0u8; 1];
                 match conn.try_read(&mut probe) {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        METRICS.pool_hits_total.inc();
                         debug!("Pool hit: reusing connection to {}", addr);
                         return Ok((conn, true));
                     }
-                    _ => continue,
+                    _ => {
+                        METRICS.pool_stale_discards_total.inc();
+                        continue;
+                    }
                 }
             }
         }
 
+        METRICS.pool_misses_total.inc();
         let conn = self.connect_new(addr, use_tls, server_name).await?;
         Ok((conn, false))
     }
@@ -111,6 +117,7 @@ impl BackendPool {
             .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
 
         tcp.set_nodelay(true)?;
+        METRICS.upstream_connects_total.inc();
 
         if use_tls {
             let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
@@ -132,8 +139,10 @@ impl BackendPool {
         let conns = self.pools.entry(addr).or_default();
         if conns.len() < self.max_idle_per_backend {
             conns.push(conn);
+        } else {
+            // Drop closes the fd.
+            METRICS.pool_overflow_drops_total.inc();
         }
-        // else: drop closes the fd
     }
 }
 

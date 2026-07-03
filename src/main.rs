@@ -170,7 +170,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         // has bound its listener ports. Served on the readiness endpoint so the
         // operator's readinessProbe gates LB traffic and the Programmed status.
         let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(admin::serve_readiness(
+        tokio::spawn(admin::serve(
             args.readiness_port,
             ready_flag.clone(),
             shutdown_token.clone(),
@@ -194,6 +194,16 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
             }
         });
         info!("Kubernetes Gateway API controller started");
+    }
+
+    // In standalone mode, the admin endpoint (/metrics + /readyz) is opt-in —
+    // there is no readinessProbe to feed, but benches and dashboards may want
+    // the scrape. Listeners are already up at this point, so ready = true.
+    if !args.kubernetes {
+        if let Some(metrics_port) = args.metrics_port {
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            tokio::spawn(admin::serve(metrics_port, ready, shutdown_token.clone()));
+        }
     }
 
     // In standalone mode, watch the config file for SIGHUP-triggered reloads
