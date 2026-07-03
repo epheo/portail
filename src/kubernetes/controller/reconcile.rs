@@ -4,7 +4,7 @@
 //! multi-Gateway merge) live here beside the orchestrator that calls them.
 
 use kube::runtime::controller::Action;
-use kube::runtime::reflector::{ObjectRef, Store};
+use kube::runtime::reflector::Store;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,17 +24,67 @@ use super::{skip_requeue_secs, success_requeue_secs, ControllerCtx, ReconcileErr
 use crate::kubernetes::addresses::{
     compute_bind_addresses, discover_usable_addresses, resolve_network_addresses, UsableAddresses,
 };
-use crate::kubernetes::reconciler::{reconcile_to_config, ClusterSnapshot, RouteAcceptance};
+use crate::kubernetes::parent_ref::route_targets_gateway;
+use crate::kubernetes::reconciler::{
+    reconcile_to_config, ClusterSnapshot, GatewayRoute, RouteAcceptance,
+};
 use crate::kubernetes::services::{resolve_named_target_ports, resolve_services};
 use crate::kubernetes::status;
 
-/// Read all objects from a reflector store, cloning each.
+/// Read all objects from a reflector store, cloning each. Only used for
+/// ReferenceGrants — small and few; routes and Services stay behind `Arc`.
 fn snapshot<K>(store: &Store<K>) -> Vec<K>
 where
     K: kube::Resource + Clone,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
     store.state().iter().map(|arc| (**arc).clone()).collect()
+}
+
+/// Routes from a reflector store that target this Gateway, as `Arc`s straight
+/// out of the store — the per-Gateway filter runs before anything is copied,
+/// so a cluster full of other Gateways' routes costs pointer moves only.
+fn gateway_routes<R>(store: &Store<R>, gw_name: &str, gw_ns: &str) -> Vec<Arc<R>>
+where
+    R: GatewayRoute + kube::Resource + Clone,
+    R::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    store
+        .state()
+        .into_iter()
+        .filter(|r| route_targets_gateway(r.parent_refs(), gw_name, gw_ns))
+        .collect()
+}
+
+/// `(kind, namespace, name)` → current `status.parents` for every route this
+/// pass emits status for. Built once per pass from the snapshot and reused by
+/// both the fingerprint and the status-write loop (which previously serialized
+/// each full route to JSON twice per pass just to read its parents).
+fn observed_parents_map(
+    snapshot: &ClusterSnapshot,
+) -> HashMap<(String, String, String), Vec<serde_json::Value>> {
+    fn insert<R: GatewayRoute>(
+        map: &mut HashMap<(String, String, String), Vec<serde_json::Value>>,
+        routes: &[Arc<R>],
+    ) {
+        for r in routes {
+            let (name, _) = r.identity();
+            map.insert(
+                (
+                    R::KIND.to_string(),
+                    r.route_namespace().to_string(),
+                    name.to_string(),
+                ),
+                r.status_parents_json(),
+            );
+        }
+    }
+    let mut map = HashMap::new();
+    insert(&mut map, &snapshot.http_routes);
+    insert(&mut map, &snapshot.tcp_routes);
+    insert(&mut map, &snapshot.tls_routes);
+    insert(&mut map, &snapshot.udp_routes);
+    map
 }
 
 /// Open data-plane TCP listeners for this Gateway's ports. Called after the
@@ -315,12 +365,14 @@ pub(super) async fn reconcile(
     // portail Deployment for Gateways whose class references this controller, so
     // we can trust the scope and skip an in-process class check here.
 
-    // Snapshot reflector caches in one shot — no API server calls.
+    // Snapshot reflector caches in one shot — no API server calls, and no deep
+    // copies: routes are filtered to this Gateway before anything is cloned,
+    // and Services ride along as `Arc`s.
     let snapshot = ClusterSnapshot {
-        http_routes: snapshot(&ctx.cache.http_routes),
-        tcp_routes: snapshot(&ctx.cache.tcp_routes),
-        tls_routes: snapshot(&ctx.cache.tls_routes),
-        udp_routes: snapshot(&ctx.cache.udp_routes),
+        http_routes: gateway_routes(&ctx.cache.http_routes, &gw_name, &gw_ns),
+        tcp_routes: gateway_routes(&ctx.cache.tcp_routes, &gw_name, &gw_ns),
+        tls_routes: gateway_routes(&ctx.cache.tls_routes, &gw_name, &gw_ns),
+        udp_routes: gateway_routes(&ctx.cache.udp_routes, &gw_name, &gw_ns),
         namespace_labels: ctx
             .cache
             .namespaces
@@ -333,7 +385,7 @@ pub(super) async fn reconcile(
             })
             .collect(),
         reference_grants: snapshot(&ctx.cache.reference_grants),
-        services: snapshot(&ctx.cache.services),
+        services: ctx.cache.services.state(),
     };
 
     let cert_data = resolve_gateway_certs(
@@ -459,34 +511,20 @@ pub(super) async fn reconcile(
 
     // Observed route status parents feed the fingerprint (see
     // `reconcile_fingerprint`) so external clobbers of the atomic
-    // `status.parents` list are detected and re-applied.
+    // `status.parents` list are detected and re-applied. Built once from the
+    // snapshot; the status-write loop below reads the same map.
+    let parents_by_route = observed_parents_map(&snapshot);
+    let existing_parents = |kind: &str, ns: &str, name: &str| -> Vec<serde_json::Value> {
+        parents_by_route
+            .get(&(kind.to_string(), ns.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    };
     let observed_route_parents: Vec<String> = result
         .route_status
         .iter()
         .map(|ra| {
-            let parents = match ra.kind {
-                "HTTPRoute" => get_existing_route_parents_from_store(
-                    &ctx.cache.http_routes,
-                    &ra.namespace,
-                    &ra.name,
-                ),
-                "TCPRoute" => get_existing_route_parents_from_store(
-                    &ctx.cache.tcp_routes,
-                    &ra.namespace,
-                    &ra.name,
-                ),
-                "TLSRoute" => get_existing_route_parents_from_store(
-                    &ctx.cache.tls_routes,
-                    &ra.namespace,
-                    &ra.name,
-                ),
-                "UDPRoute" => get_existing_route_parents_from_store(
-                    &ctx.cache.udp_routes,
-                    &ra.namespace,
-                    &ra.name,
-                ),
-                _ => Vec::new(),
-            };
+            let parents = existing_parents(ra.kind, &ra.namespace, &ra.name);
             format!("{}/{}/{}:{:?}", ra.kind, ra.namespace, ra.name, parents)
         })
         .collect();
@@ -619,9 +657,9 @@ pub(super) async fn reconcile(
         }
 
         for ((kind, ns, name), parents) in &grouped {
+            let existing = existing_parents(kind, ns, name);
             macro_rules! patch_route_status {
-                ($store:expr, $ty:ty) => {{
-                    let existing = get_existing_route_parents_from_store(&$store, ns, name);
+                ($ty:ty) => {{
                     statuses_ok &= status::update_route_status::<$ty>(
                         &ctx.client,
                         name,
@@ -634,10 +672,10 @@ pub(super) async fn reconcile(
                 }};
             }
             match *kind {
-                "HTTPRoute" => patch_route_status!(ctx.cache.http_routes, HTTPRoute),
-                "TCPRoute" => patch_route_status!(ctx.cache.tcp_routes, TCPRoute),
-                "TLSRoute" => patch_route_status!(ctx.cache.tls_routes, TLSRoute),
-                "UDPRoute" => patch_route_status!(ctx.cache.udp_routes, UDPRoute),
+                "HTTPRoute" => patch_route_status!(HTTPRoute),
+                "TCPRoute" => patch_route_status!(TCPRoute),
+                "TLSRoute" => patch_route_status!(TLSRoute),
+                "UDPRoute" => patch_route_status!(UDPRoute),
                 _ => {}
             }
         }
@@ -665,32 +703,6 @@ pub(super) async fn reconcile(
         programmed,
         all_routes_accepted,
     ))))
-}
-
-/// Read existing parent status conditions from a route's reflector store entry.
-fn get_existing_route_parents_from_store<K>(
-    store: &Store<K>,
-    ns: &str,
-    name: &str,
-) -> Vec<serde_json::Value>
-where
-    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
-        + serde::Serialize
-        + Clone
-        + std::fmt::Debug,
-    <K as kube::Resource>::DynamicType: Default + Eq + std::hash::Hash + Clone,
-{
-    let obj_ref = ObjectRef::<K>::new(name).within(ns);
-    match store.get(&obj_ref) {
-        Some(route) => {
-            let val = serde_json::to_value(route.as_ref()).unwrap_or_default();
-            val.pointer("/status/parents")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-        }
-        None => vec![],
-    }
 }
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ pub(crate) struct NamedTargetPortReq {
 /// the caller to resolve with a one-shot EndpointSlice list (see
 /// [`resolve_named_target_ports`]) — a targeted read, still no watch.
 pub(crate) fn resolve_services(
-    all_services: &[Service],
+    all_services: &[std::sync::Arc<Service>],
 ) -> (ServiceState, Vec<NamedTargetPortReq>) {
     let known_services: HashSet<(String, String)> = all_services
         .iter()
@@ -322,7 +322,7 @@ mod tests {
         // Named targetPort: emit a resolve request AND seed the service-port
         // fallback, so an absent/failed EndpointSlice list degrades to prior behavior.
         let named = headless("db", "prod", 5432, IntOrString::String("pg".to_string()));
-        let (state, reqs) = resolve_services(&[named]);
+        let (state, reqs) = resolve_services(&[std::sync::Arc::new(named)]);
         assert_eq!(reqs.len(), 1);
         assert_eq!(
             (
@@ -343,7 +343,7 @@ mod tests {
 
         // Numeric targetPort: resolved directly from the spec, no request emitted.
         let numeric = headless("cache", "prod", 6379, IntOrString::Int(6380));
-        let (state, reqs) = resolve_services(&[numeric]);
+        let (state, reqs) = resolve_services(&[std::sync::Arc::new(numeric)]);
         assert!(reqs.is_empty());
         assert_eq!(
             state
