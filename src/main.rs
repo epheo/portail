@@ -333,42 +333,36 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
 
     info!("Generating {} configuration", config_type);
 
-    let config = match config_type.as_str() {
-        "minimal" => PortailConfig::generate_minimal(),
-        "development" => PortailConfig::generate_development(),
-        _ => {
+    // Examples are static YAML committed under examples/standalone/ and
+    // embedded at compile time — --generate-config emits them verbatim.
+    let yaml = match config::examples::example_yaml(config_type) {
+        Some(yaml) => yaml,
+        None => {
             error!("Invalid configuration type: {}", config_type);
             std::process::exit(1);
         }
     };
 
-    let (output_content, format_name) = if let Some(output_path) = &args.output {
-        let (output_content, _format_name) =
-            match output_path.extension().and_then(|ext| ext.to_str()) {
-                Some("json") => {
-                    let content = config.to_json_pretty().map_err(|e| {
-                        anyhow::anyhow!("Failed to serialize config to JSON: {}", e)
-                    })?;
-                    (content, "JSON")
-                }
-                Some("yaml") | Some("yml") => {
-                    let content = config.to_yaml_pretty().map_err(|e| {
-                        anyhow::anyhow!("Failed to serialize config to YAML: {}", e)
-                    })?;
-                    (content, "YAML")
-                }
-                Some(ext) => {
-                    error!(
+    if let Some(output_path) = &args.output {
+        let output_content = match output_path.extension().and_then(|ext| ext.to_str()) {
+            // JSON output re-parses the embedded YAML through the schema —
+            // which also validates the committed example at point of use.
+            Some("json") => serde_yaml::from_str::<PortailConfig>(yaml)
+                .map_err(|e| anyhow::anyhow!("Embedded example failed to parse: {}", e))?
+                .to_json_pretty()?,
+            Some("yaml") | Some("yml") => yaml.to_string(),
+            Some(ext) => {
+                error!(
                     "Unsupported output file extension: .{}. Supported formats: .json, .yaml, .yml",
                     ext
                 );
-                    std::process::exit(1);
-                }
-                None => {
-                    error!("Output file must have an extension (.json, .yaml, .yml)");
-                    std::process::exit(1);
-                }
-            };
+                std::process::exit(1);
+            }
+            None => {
+                error!("Output file must have an extension (.json, .yaml, .yml)");
+                std::process::exit(1);
+            }
+        };
 
         std::fs::write(output_path, &output_content).map_err(|e| {
             anyhow::anyhow!(
@@ -384,20 +378,12 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
             output_path.display()
         );
         return Ok(());
-    } else {
-        let content = config
-            .to_yaml_pretty()
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config to YAML: {}", e))?;
-        (content, "YAML")
-    };
+    }
 
-    println!(
-        "# Generated {} configuration ({})",
-        config_type, format_name
-    );
+    println!("# Generated {} configuration (YAML)", config_type);
     println!("# Use --output <file> to save to a file");
     println!();
-    print!("{}", output_content);
+    print!("{}", yaml);
 
     Ok(())
 }

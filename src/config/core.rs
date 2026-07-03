@@ -51,6 +51,16 @@ impl PortailConfig {
 
         Ok(config)
     }
+
+    pub fn to_json_pretty(&self) -> Result<String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("Failed to serialize config to JSON: {}", e))
+    }
+
+    pub fn to_yaml_pretty(&self) -> Result<String> {
+        serde_yaml::to_string(self)
+            .map_err(|e| anyhow!("Failed to serialize config to YAML: {}", e))
+    }
 }
 
 impl PortailConfig {
@@ -995,14 +1005,19 @@ mod tests {
         );
     }
 
+    /// The committed example YAML files are embedded via include_str! and
+    /// parsed here — schema drift in examples/standalone/ fails this test
+    /// instead of silently rotting the documented examples.
     #[test]
-    fn test_example_generation_functions() {
-        let minimal = PortailConfig::generate_minimal();
+    fn test_embedded_examples_parse_and_validate() {
+        let minimal: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::MINIMAL_YAML).unwrap();
         assert!(minimal.validate().is_ok());
         assert_eq!(minimal.http_routes.len(), 1);
         assert_eq!(minimal.tcp_routes.len(), 0);
 
-        let development = PortailConfig::generate_development();
+        let development: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::DEVELOPMENT_YAML).unwrap();
         assert!(development.validate().is_ok());
         assert_eq!(development.http_routes.len(), 8);
         assert_eq!(development.tcp_routes.len(), 1);
@@ -1010,7 +1025,8 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let config = PortailConfig::generate_minimal();
+        let config: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::MINIMAL_YAML).unwrap();
 
         let json = config.to_json_pretty().unwrap();
         let parsed_json: PortailConfig = serde_json::from_str(&json).unwrap();
@@ -1048,7 +1064,8 @@ mod tests {
 
     #[test]
     fn test_url_rewrite_yaml_roundtrip() {
-        let config = PortailConfig::generate_development();
+        let config: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::DEVELOPMENT_YAML).unwrap();
         let yaml = config.to_yaml_pretty().unwrap();
         let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.validate().is_ok());
@@ -1200,7 +1217,8 @@ mod tests {
 
     #[test]
     fn test_tls_config_yaml_roundtrip() {
-        let config = PortailConfig::generate_development();
+        let config: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::DEVELOPMENT_YAML).unwrap();
         let yaml = config.to_yaml_pretty().unwrap();
         let parsed: PortailConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.validate().is_ok());
@@ -1219,7 +1237,8 @@ mod tests {
 
     #[test]
     fn test_tls_config_json_roundtrip() {
-        let config = PortailConfig::generate_development();
+        let config: PortailConfig =
+            serde_yaml::from_str(crate::config::examples::DEVELOPMENT_YAML).unwrap();
         let json = config.to_json_pretty().unwrap();
         let parsed: PortailConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.validate().is_ok());

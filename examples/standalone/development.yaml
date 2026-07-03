@@ -149,6 +149,7 @@ tcpRoutes:
   - backendRefs:
     - name: ssh-service
       port: 22
+tlsRoutes: []
 udpRoutes: []
 observability:
   logging:
@@ -158,3 +159,5 @@ observability:
 performance:
   backendTimeout: 30s
   udpSessionTimeout: 30s
+  dnsRefreshInterval: 5s
+  clientHeaderTimeout: 30s
