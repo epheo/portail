@@ -7,7 +7,7 @@ use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
-use kube::runtime::{predicates, reflector, Controller, WatchStreamExt};
+use kube::runtime::{reflector, Controller, WatchStreamExt};
 use kube::Client;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
@@ -26,33 +26,21 @@ use crate::logging::{debug, error, info, warn};
 use crate::routing::RouteTable;
 
 use super::parent_ref::ParentRefAccess;
-use super::reconciler::{reconcile_to_config, ClusterSnapshot, ServiceState};
+use super::reconciler::{reconcile_to_config, ClusterSnapshot, RouteAcceptance, ServiceState};
 use super::reference_grants::is_reference_allowed;
 use super::status;
 
+/// A reconcile pass failed; the controller runtime retries via `error_policy`.
 #[derive(Debug)]
-#[allow(dead_code)]
-enum ReconcileError {
-    Kube(kube::Error),
-    Reconcile(String),
-}
+struct ReconcileError(String);
 
 impl std::fmt::Display for ReconcileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Kube(e) => write!(f, "Kubernetes API error: {}", e),
-            Self::Reconcile(msg) => write!(f, "Reconciliation error: {}", msg),
-        }
+        write!(f, "Reconciliation error: {}", self.0)
     }
 }
 
 impl std::error::Error for ReconcileError {}
-
-impl From<kube::Error> for ReconcileError {
-    fn from(e: kube::Error) -> Self {
-        Self::Kube(e)
-    }
-}
 
 /// Semantic grouping of reflector stores — cached local copies of cluster resources.
 #[derive(Clone)]
@@ -84,6 +72,7 @@ pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
 /// Addresses available to this gateway instance for binding / reporting.
 /// `status.addresses` (LB VIP / cloud-assigned IPs) is owned by the operator,
 /// so portail only needs locally-bindable IPs.
+#[derive(Debug)]
 pub(crate) struct UsableAddresses {
     /// IPs from local network interfaces (includes secondary/UDN interfaces).
     pub interface_ips: Vec<String>,
@@ -247,6 +236,19 @@ struct ControllerCtx {
     /// Flipped to true once the data plane has bound this instance's listener
     /// ports. Surfaced via the readiness endpoint for the pod's readinessProbe.
     ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Fingerprint of the last reconcile pass that was fully applied — config
+    /// built + route table swapped + every status PATCH accepted. When a new
+    /// pass computes the same fingerprint, the rebuild and all status writes
+    /// are skipped: this is what keeps a permanently-unaccepted route (or our
+    /// own status-write watch echoes) from re-running regex compilation, DNS
+    /// resolution, and N apiserver PATCHes on every requeue.
+    last_applied: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Last built config per Gateway. In scoped mode this holds exactly one
+    /// entry; in legacy unscoped mode (one process watching every Gateway)
+    /// the entries are merged before each route-table build so reconciling
+    /// Gateway A cannot clobber Gateway B's routes in the shared table.
+    gateway_configs:
+        Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
 }
 
 /// Create a reflector for a resource type, returning the store and a stream.
@@ -489,8 +491,12 @@ pub async fn run_controller(
     info!("Kubernetes client connected, starting Gateway API controller");
 
     // --- Primary resource: Gateway ---
-    // predicate_filter(predicates::generation) filters status-only changes,
-    // breaking the reconcile → status patch → watch event feedback loop.
+    // No `predicate_filter(predicates::generation)` here: it caches generation
+    // per key and never clears on delete, so deleting and recreating a Gateway
+    // with the same name (recreates restart at generation 1) would be
+    // suppressed and the recreated Gateway never reconciled. Status-only watch
+    // echoes of our own writes are instead absorbed by the reconcile
+    // fingerprint short-circuit, which skips the rebuild and all PATCHes.
     //
     // When `gateway_scope` is set (operator-managed Deployments), narrow the
     // watch to that single Gateway via namespace + `metadata.name` field
@@ -515,8 +521,7 @@ pub async fn run_controller(
     };
     let gw_stream = reflector::reflector(gw_writer, watcher::watcher(gw_api, gw_watcher_config))
         .default_backoff()
-        .applied_objects()
-        .predicate_filter(predicates::generation);
+        .applied_objects();
 
     // --- Secondary resources ---
     // Each resource gets a reflector (store + stream). The stream feeds into
@@ -592,6 +597,8 @@ pub async fn run_controller(
         performance_config,
         manage_gateway_status,
         ready,
+        last_applied: Arc::new(std::sync::Mutex::new(None)),
+        gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
 
     // STRICT_DNS freshness: re-resolve headless/Service FQDNs on an interval and
@@ -1336,6 +1343,186 @@ async fn build_route_table(
         .map_err(|e| anyhow::anyhow!("route table build panicked: {}", e))?
 }
 
+/// Fingerprint of everything a reconcile pass would apply: the built config
+/// (its JSON plus the cert/key bytes and k8s override maps that serde skips),
+/// the status conditions about to be written, and the data-plane readiness
+/// that feeds Programmed. Hash inputs with non-deterministic iteration order
+/// (HashMaps, store-ordered route lists) are canonicalized by sorting.
+fn reconcile_fingerprint(
+    config: &crate::config::PortailConfig,
+    accepted_cond: &status::GatewayCondition,
+    listener_statuses: &HashMap<String, status::ListenerStatus>,
+    usable: &UsableAddresses,
+    route_status: &[RouteAcceptance],
+    observed_route_parents: Vec<String>,
+    dp_ready: bool,
+) -> u64 {
+    use std::hash::Hasher;
+
+    fn write_sorted(h: &mut fnv::FnvHasher, mut items: Vec<String>) {
+        items.sort_unstable();
+        for item in &items {
+            h.write(item.as_bytes());
+            h.write(&[0]);
+        }
+    }
+
+    let mut h = fnv::FnvHasher::default();
+    if let Ok(bytes) = serde_json::to_vec(config) {
+        h.write(&bytes);
+    }
+    // Fields the JSON serialization skips but a reconcile still applies:
+    // cert/key PEM bytes and the k8s side-channel override maps.
+    for l in &config.gateway.listeners {
+        if let Some(tls) = &l.tls {
+            for cr in &tls.certificate_refs {
+                h.write(cr.name.as_bytes());
+                if let Some(pem) = &cr.cert_pem {
+                    h.write(pem);
+                }
+                if let Some(pem) = &cr.key_pem {
+                    h.write(pem);
+                }
+            }
+        }
+    }
+    write_sorted(
+        &mut h,
+        config
+            .endpoint_overrides
+            .iter()
+            .map(|(k, v)| format!("ep{:?}={:?}", k, v))
+            .chain(
+                config
+                    .app_protocol_overrides
+                    .iter()
+                    .map(|(k, v)| format!("ap{:?}={}", k, v)),
+            )
+            .chain(
+                config
+                    .headless_target_ports
+                    .iter()
+                    .map(|(k, v)| format!("ht{:?}={}", k, v)),
+            )
+            .collect(),
+    );
+    h.write(format!("{:?}", accepted_cond).as_bytes());
+    write_sorted(
+        &mut h,
+        listener_statuses
+            .iter()
+            .map(|(name, ls)| format!("{}{:?}", name, ls))
+            .collect(),
+    );
+    write_sorted(&mut h, usable.interface_ips.clone());
+    write_sorted(
+        &mut h,
+        usable
+            .network_ips
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect(),
+    );
+    write_sorted(
+        &mut h,
+        route_status.iter().map(|ra| format!("{:?}", ra)).collect(),
+    );
+    // Observed route status: `status.parents` is an atomic list written
+    // read-modify-write, so a concurrent writer clobbering our entry must
+    // change the fingerprint — otherwise the skip path would leave the
+    // clobbered status in place until the slow safety-net requeue.
+    write_sorted(&mut h, observed_route_parents);
+    h.write(&[dp_ready as u8]);
+    h.finish()
+}
+
+/// Merge per-Gateway configs into one data-plane config (legacy unscoped
+/// mode, where a single process serves every Gateway).
+///
+/// Listener names and route parentRef sectionNames are prefixed with their
+/// Gateway's identity so a route can never cross-match a same-named listener
+/// on another Gateway; parentRefs without a sectionName are expanded to one
+/// ref per listener of *their own* Gateway for the same reason (an unscoped
+/// ref would attach to every merged listener).
+fn merge_gateway_configs(
+    configs: &HashMap<(String, String), Arc<crate::config::PortailConfig>>,
+) -> crate::config::PortailConfig {
+    use crate::config::{ParentRef, PortailConfig};
+
+    let mut ordered: Vec<_> = configs.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut merged = PortailConfig::default();
+    merged.gateway.name = "portail-merged".to_string();
+    merged.gateway.listeners.clear();
+
+    for ((ns, name), cfg) in ordered {
+        let prefix = format!("{}/{}/", ns, name);
+        let mut c: PortailConfig = (**cfg).clone();
+
+        for l in &mut c.gateway.listeners {
+            l.name = format!("{}{}", prefix, l.name);
+        }
+        // (name, port) pairs of this Gateway's listeners, post-prefixing,
+        // used to expand sectionName-less parentRefs.
+        let listener_names: Vec<(String, u16)> = c
+            .gateway
+            .listeners
+            .iter()
+            .map(|l| (l.name.clone(), l.port))
+            .collect();
+        let expand = |refs: &mut Vec<ParentRef>| {
+            let mut out = Vec::with_capacity(refs.len());
+            for pr in refs.drain(..) {
+                match &pr.section_name {
+                    Some(section) => out.push(ParentRef {
+                        section_name: Some(format!("{}{}", prefix, section)),
+                        ..pr
+                    }),
+                    None => {
+                        for (lname, lport) in &listener_names {
+                            if pr.port.is_none_or(|p| *lport == p as u16) {
+                                out.push(ParentRef {
+                                    name: pr.name.clone(),
+                                    section_name: Some(lname.clone()),
+                                    port: pr.port,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            *refs = out;
+        };
+        for r in &mut c.http_routes {
+            expand(&mut r.parent_refs);
+        }
+        for r in &mut c.tcp_routes {
+            expand(&mut r.parent_refs);
+        }
+        for r in &mut c.udp_routes {
+            expand(&mut r.parent_refs);
+        }
+        for r in &mut c.tls_routes {
+            expand(&mut r.parent_refs);
+        }
+
+        merged.gateway.listeners.extend(c.gateway.listeners);
+        merged.gateway.addresses.extend(c.gateway.addresses);
+        merged.http_routes.extend(c.http_routes);
+        merged.tcp_routes.extend(c.tcp_routes);
+        merged.udp_routes.extend(c.udp_routes);
+        merged.tls_routes.extend(c.tls_routes);
+        merged.endpoint_overrides.extend(c.endpoint_overrides);
+        merged
+            .app_protocol_overrides
+            .extend(c.app_protocol_overrides);
+        merged.headless_target_ports.extend(c.headless_target_ports);
+    }
+    merged.gateway.addresses.dedup();
+    merged
+}
+
 async fn reconcile(
     gateway: Arc<Gateway>,
     ctx: Arc<ControllerCtx>,
@@ -1414,7 +1601,7 @@ async fn reconcile(
                 ctx.manage_gateway_status,
             )
             .await;
-            return Err(ReconcileError::Reconcile(e.to_string()));
+            return Err(ReconcileError(e.to_string()));
         }
     };
 
@@ -1447,6 +1634,115 @@ async fn reconcile(
     // readiness stays down until the Service (and its targetPort) appear.
     let required = required_endpoints(&result.config.gateway.listeners, &bind_addresses);
 
+    // Data-plane readiness is computed before the (expensive) route-table
+    // build: it depends only on bound ports, and it feeds both the readiness
+    // latch and the reconcile fingerprint below.
+    let dp_ready = ctx
+        .data_plane
+        .lock()
+        .map(|dp| dp.is_ready_for_endpoints(&required))
+        .unwrap_or(false);
+    // Once the data plane has bound this gateway's listener ports, the
+    // pod is serving — latch readiness on (never flips back).
+    if dp_ready {
+        ctx.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    // Track this Gateway's config and derive the config the data plane
+    // should actually run. In scoped mode (operator-managed, one Gateway per
+    // process) that is simply this Gateway's config; in legacy unscoped mode
+    // one process serves EVERY Gateway, so publishing only this Gateway's
+    // config would clobber the others' routes in the shared table.
+    let config = Arc::new(std::mem::take(&mut result.config));
+    let effective_config = {
+        let mut map = match ctx.gateway_configs.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.insert((gw_ns.clone(), gw_name.clone()), config.clone());
+        // Prune Gateways that no longer exist — deletions don't run this
+        // reconciler, so stale entries are collected on any later pass.
+        let live: HashSet<(String, String)> = ctx
+            .cache
+            .gateways
+            .state()
+            .iter()
+            .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
+            .collect();
+        map.retain(|k, _| live.contains(k));
+        if map.len() <= 1 {
+            config.clone()
+        } else {
+            Arc::new(merge_gateway_configs(&map))
+        }
+    };
+
+    // Observed route status parents feed the fingerprint (see
+    // `reconcile_fingerprint`) so external clobbers of the atomic
+    // `status.parents` list are detected and re-applied.
+    let observed_route_parents: Vec<String> = result
+        .route_status
+        .iter()
+        .map(|ra| {
+            let parents = match ra.kind {
+                "HTTPRoute" => get_existing_route_parents_from_store(
+                    &ctx.cache.http_routes,
+                    &ra.namespace,
+                    &ra.name,
+                ),
+                "TCPRoute" => get_existing_route_parents_from_store(
+                    &ctx.cache.tcp_routes,
+                    &ra.namespace,
+                    &ra.name,
+                ),
+                "TLSRoute" => get_existing_route_parents_from_store(
+                    &ctx.cache.tls_routes,
+                    &ra.namespace,
+                    &ra.name,
+                ),
+                "UDPRoute" => get_existing_route_parents_from_store(
+                    &ctx.cache.udp_routes,
+                    &ra.namespace,
+                    &ra.name,
+                ),
+                _ => Vec::new(),
+            };
+            format!("{}/{}/{}:{:?}", ra.kind, ra.namespace, ra.name, parents)
+        })
+        .collect();
+
+    // Short-circuit: when this pass would apply exactly what the last fully
+    // successful pass already applied — same config (certs and override maps
+    // included), same status conditions, same readiness — skip the route-table
+    // rebuild and every status PATCH. This is what makes the watch echo of our
+    // own status writes cheap, and turns the permanently-unaccepted-route case
+    // from a 5s rebuild/PATCH loop into a slow safety-net re-check.
+    let fingerprint = reconcile_fingerprint(
+        &effective_config,
+        &accepted_cond,
+        &listener_statuses,
+        &usable,
+        &result.route_status,
+        observed_route_parents,
+        dp_ready,
+    );
+    if ctx
+        .last_applied
+        .lock()
+        .map(|last| *last == Some(fingerprint))
+        .unwrap_or(false)
+    {
+        let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
+        debug!(
+            "Gateway {}/{} unchanged since last applied reconcile; skipping rebuild and status writes",
+            gw_ns, gw_name
+        );
+        return Ok(Action::requeue(Duration::from_secs(skip_requeue_secs(
+            dp_ready,
+            all_routes_accepted,
+        ))));
+    }
+
     // Per-listener attached-route counts, restricted to this Gateway's routes.
     let mut listener_route_counts: HashMap<String, i32> = gateway
         .spec
@@ -1465,36 +1761,25 @@ async fn reconcile(
     }
 
     // Build + swap the RouteTable; on failure produce a failing Programmed
-    // condition (route table build is the last step that can fail). Counts
-    // are captured before the config is moved into the blocking build.
-    let http_count = result.config.http_routes.len();
-    let tcp_count = result.config.tcp_routes.len();
-    let tls_count = result.config.tls_routes.len();
-    let udp_count = result.config.udp_routes.len();
+    // condition (route table build is the last step that can fail).
+    let http_count = config.http_routes.len();
+    let tcp_count = config.tcp_routes.len();
+    let tls_count = config.tls_routes.len();
+    let udp_count = config.udp_routes.len();
 
-    // Publish the built config so the background DNS-refresh task can re-resolve
-    // backend FQDNs without an apiserver round-trip, then move it into the
-    // (blocking) route-table build.
-    let config = Arc::new(result.config);
-    ctx.config_cell.store(Some(config.clone()));
-    let programmed_cond = match build_route_table(config).await {
+    let programmed_cond = match build_route_table(effective_config.clone()).await {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
+            // Publish the config only after the table it produced is live:
+            // the background DNS-refresh task re-resolves from this cell, and
+            // must never pick up a config whose build failed — nor one whose
+            // table hasn't been swapped in yet (the refresh CAS compares
+            // against the live table).
+            ctx.config_cell.store(Some(effective_config));
             info!(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
                 gw_ns, gw_name, http_count, tcp_count, tls_count, udp_count,
             );
-
-            let dp_ready = ctx
-                .data_plane
-                .lock()
-                .map(|dp| dp.is_ready_for_endpoints(&required))
-                .unwrap_or(false);
-            // Once the data plane has bound this gateway's listener ports, the
-            // pod is serving — latch readiness on (never flips back).
-            if dp_ready {
-                ctx.ready.store(true, std::sync::atomic::Ordering::Release);
-            }
             compute_programmed_condition(dp_ready)
         }
         Err(e) => {
@@ -1511,7 +1796,7 @@ async fn reconcile(
     };
     let programmed = programmed_cond.ok;
 
-    status::update_gateway_status(
+    let mut statuses_ok = status::update_gateway_status(
         &ctx.client,
         &gateway,
         &accepted_cond,
@@ -1557,7 +1842,7 @@ async fn reconcile(
             macro_rules! patch_route_status {
                 ($store:expr, $ty:ty) => {{
                     let existing = get_existing_route_parents_from_store(&$store, ns, name);
-                    status::update_route_status::<$ty>(
+                    statuses_ok &= status::update_route_status::<$ty>(
                         &ctx.client,
                         name,
                         ns,
@@ -1578,6 +1863,22 @@ async fn reconcile(
         }
     }
 
+    if !statuses_ok {
+        // A status PATCH failed (apiserver blip). Without a fast retry the
+        // wrong status would sit in the cluster until the slow safety-net
+        // requeue. Leave `last_applied` unset so the next pass re-applies.
+        if let Ok(mut last) = ctx.last_applied.lock() {
+            *last = None;
+        }
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+
+    // Everything applied: record the fingerprint so identical future passes
+    // (watch echoes, unconverged requeues with unchanged inputs) short-circuit.
+    if let Ok(mut last) = ctx.last_applied.lock() {
+        *last = Some(fingerprint);
+    }
+
     // Requeue cadence is convergence-driven — see `success_requeue_secs`.
     let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
     Ok(Action::requeue(Duration::from_secs(success_requeue_secs(
@@ -1586,21 +1887,30 @@ async fn reconcile(
     ))))
 }
 
-/// Requeue cadence after a successful reconcile. A *converged* Gateway — its
-/// data plane Programmed and every attached route Accepted — only needs a slow
-/// safety-net re-check (600s). An unconverged one re-runs in 5s so a status
-/// write that raced an unsynced reflector cache (or a missed watch event) heals
-/// well inside the conformance 60s accept-gate — without an unconditional fast
-/// loop that would re-PATCH status, re-resolve backend DNS, and re-GET NADs on
-/// every pod each cycle (the steady-state apiserver load we are cutting). A
-/// route held permanently not-Accepted keeps the fast cadence, but that is
-/// bounded to one Gateway and the reconcile is a cheap cache read + idempotent
-/// SSA, so it is acceptable.
+/// Requeue cadence after a reconcile that APPLIED changes. A *converged*
+/// Gateway — its data plane Programmed and every attached route Accepted —
+/// only needs a slow safety-net re-check (600s). An unconverged one re-runs
+/// in 5s so a status write that raced an unsynced reflector cache (or a
+/// missed watch event) heals well inside the conformance 60s accept-gate.
+/// A route held permanently not-Accepted only pays this fast cadence once:
+/// the next pass sees an unchanged fingerprint, skips the rebuild and status
+/// writes, and drops to the `skip_requeue_secs` cadence.
 fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
         600
     } else {
         5
+    }
+}
+
+/// Requeue cadence after a short-circuited reconcile (fingerprint unchanged):
+/// nothing was rebuilt or written, so the fast heal cadence has nothing to
+/// heal — back off to a periodic re-check instead.
+fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
+    if programmed && all_routes_accepted {
+        600
+    } else {
+        60
     }
 }
 
@@ -1813,6 +2123,92 @@ mod tests {
                 .headless_target_ports
                 .get(&("cache.prod.svc".to_string(), 6379)),
             Some(&6380)
+        );
+    }
+
+    /// Unscoped mode: merging two Gateways' configs must keep every route,
+    /// prefix listener names per Gateway, and expand sectionName-less
+    /// parentRefs to their own Gateway's listeners only — never the other's.
+    #[test]
+    fn merge_gateway_configs_isolates_gateways() {
+        use crate::config::{
+            GatewayConfig, HttpRouteConfig, ListenerConfig, ParentRef, PortailConfig,
+            Protocol as CfgProtocol,
+        };
+
+        fn gw_config(gw: &str, listener: &str, port: u16, host: &str) -> PortailConfig {
+            PortailConfig {
+                gateway: GatewayConfig {
+                    name: gw.to_string(),
+                    listeners: vec![ListenerConfig {
+                        name: listener.to_string(),
+                        protocol: CfgProtocol::HTTP,
+                        port,
+                        target_port: None,
+                        hostname: None,
+                        address: None,
+                        interface: None,
+                        tls: None,
+                    }],
+                    addresses: vec![],
+                },
+                http_routes: vec![HttpRouteConfig {
+                    // No sectionName: attaches to all of THIS gateway's listeners.
+                    parent_refs: vec![ParentRef {
+                        name: gw.to_string(),
+                        section_name: None,
+                        port: None,
+                    }],
+                    hostnames: vec![host.to_string()],
+                    rules: vec![],
+                }],
+                ..Default::default()
+            }
+        }
+
+        let mut map = HashMap::new();
+        // Both Gateways use the SAME listener name "http" — the cross-match trap.
+        map.insert(
+            ("ns-a".to_string(), "gw-a".to_string()),
+            Arc::new(gw_config("gw-a", "http", 8080, "a.example.com")),
+        );
+        map.insert(
+            ("ns-b".to_string(), "gw-b".to_string()),
+            Arc::new(gw_config("gw-b", "http", 9090, "b.example.com")),
+        );
+
+        let merged = merge_gateway_configs(&map);
+
+        // Both Gateways' listeners survive, disambiguated by prefix.
+        let names: Vec<&str> = merged
+            .gateway
+            .listeners
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["ns-a/gw-a/http", "ns-b/gw-b/http"]);
+
+        // Both routes survive; each parentRef was expanded to exactly its own
+        // Gateway's (prefixed) listener.
+        assert_eq!(merged.http_routes.len(), 2);
+        let route_a = merged
+            .http_routes
+            .iter()
+            .find(|r| r.hostnames == ["a.example.com"])
+            .unwrap();
+        assert_eq!(route_a.parent_refs.len(), 1);
+        assert_eq!(
+            route_a.parent_refs[0].section_name.as_deref(),
+            Some("ns-a/gw-a/http"),
+        );
+        let route_b = merged
+            .http_routes
+            .iter()
+            .find(|r| r.hostnames == ["b.example.com"])
+            .unwrap();
+        assert_eq!(
+            route_b.parent_refs[0].section_name.as_deref(),
+            Some("ns-b/gw-b/http"),
         );
     }
 }

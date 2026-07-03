@@ -151,6 +151,7 @@ pub struct ReconcileResult {
     pub route_status: Vec<RouteAcceptance>,
 }
 
+#[derive(Debug)]
 pub struct RouteAcceptance {
     pub name: String,
     pub namespace: String,
