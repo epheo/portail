@@ -114,33 +114,11 @@ pub struct Args {
 }
 
 impl Args {
-    /// Validate argument combinations and requirements
+    /// Validate argument combinations and requirements.
+    /// Config file extension/format checking lives in
+    /// `PortailConfig::load_from_file` — the single source of truth for
+    /// supported formats.
     pub fn validate(&self) -> Result<(), String> {
-        // Validate config file extension if provided
-        if let Some(config_path) = &self.config {
-            if let Some(extension) = config_path.extension() {
-                match extension.to_str() {
-                    Some("json") | Some("yaml") | Some("yml") => {}
-                    Some(ext) => {
-                        return Err(format!(
-                            "Unsupported configuration file extension: .{}. Supported formats: .json, .yaml, .yml",
-                            ext
-                        ));
-                    }
-                    None => {
-                        return Err(
-                            "Configuration file must have a valid extension (.json, .yaml, .yml)"
-                                .to_string(),
-                        );
-                    }
-                }
-            } else {
-                return Err(
-                    "Configuration file must have an extension (.json, .yaml, .yml)".to_string(),
-                );
-            }
-        }
-
         // Validate that check-config and validate-only require config file
         if (self.check_config || self.validate_only) && self.config.is_none() {
             return Err(
@@ -234,6 +212,8 @@ mod tests {
         };
         assert!(args.validate().is_ok());
 
+        // Extension/format validation is owned by PortailConfig::load_from_file,
+        // so an odd extension passes ARGUMENT validation and fails at load time.
         let args = Args {
             config: Some(PathBuf::from("config.txt")),
             validate_only: false,
@@ -251,7 +231,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
         };
-        assert!(args.validate().is_err());
+        assert!(args.validate().is_ok());
     }
 
     #[test]

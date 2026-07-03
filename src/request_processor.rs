@@ -5,7 +5,6 @@
 //! Works on byte slices — no I/O runtime dependency.
 
 use anyhow::Result;
-use std::hash::Hasher;
 use std::net::SocketAddr;
 
 use crate::health::HealthRegistry;
@@ -99,13 +98,6 @@ pub(crate) fn is_http_request(data: &[u8]) -> bool {
     matches!(tag, GET | POST | PUT | DELE | HEAD | OPTI | PATC)
 }
 
-#[inline(always)]
-fn compute_route_hash(path: &str) -> u64 {
-    let mut hasher = fnv::FnvHasher::default();
-    hasher.write(path.as_bytes());
-    hasher.finish()
-}
-
 fn analyze_http_request<'a>(
     routes: &'a RouteTable,
     backend_selector: &BackendSelector,
@@ -117,13 +109,14 @@ fn analyze_http_request<'a>(
     let request_info = extract_routing_info(request_data)?;
     let keepalive = request_info.connection_type != ConnectionType::Close;
 
-    // RFC 7230 §3.3.3: reject smuggling vectors at the front door — both
-    // TE+CL coexistence and conflicting duplicate Content-Length values.
-    // Industry consensus (haproxy / envoy / nginx) is to refuse rather than
-    // try to interpret; the message ambiguity itself is the attack surface.
+    // RFC 7230 §3.3.3: reject smuggling vectors at the front door — TE+CL
+    // coexistence, conflicting duplicate Content-Length values, and any
+    // Transfer-Encoding other than a lone `chunked`. Industry consensus
+    // (haproxy / envoy / nginx) is to refuse rather than try to interpret;
+    // the message ambiguity itself is the attack surface.
     if request_info.header_violation {
         crate::logging::warn!(
-            "Rejecting request with conflicting framing headers (TE+CL or duplicate CL) on port {}",
+            "Rejecting request with conflicting framing headers (TE+CL, duplicate CL, or unsupported TE) on port {}",
             server_port
         );
         return Ok(RoutingResult::SendHttpError {
@@ -196,17 +189,15 @@ fn analyze_http_request<'a>(
         });
     }
 
-    let route_hash = compute_route_hash(request_info.path);
-    let backend_index =
-        match backend_selector.select_healthy_weighted_backend(route_hash, rule, health) {
-            Some(idx) => idx,
-            None => {
-                return Ok(RoutingResult::SendHttpError {
-                    error_code: 503,
-                    close_connection: !keepalive,
-                });
-            }
-        };
+    let backend_index = match backend_selector.select_healthy_weighted_backend(rule, health) {
+        Some(idx) => idx,
+        None => {
+            return Ok(RoutingResult::SendHttpError {
+                error_code: 503,
+                close_connection: !keepalive,
+            });
+        }
+    };
     let selected_backend = &rule.backends[backend_index];
 
     Ok(RoutingResult::HttpForward {
@@ -313,30 +304,19 @@ fn analyze_l4_request<'a>(
         return Ok(RoutingResult::CloseConnection);
     }
 
-    let route_hash = server_port as u64;
-    let n = backend_list.len();
-    // Use round-robin as a base index, then scan forward for the first healthy backend.
-    let base = backend_selector.select_backend(route_hash, n);
-
-    let selected = (0..n).map(|offset| (base + offset) % n).find_map(|i| {
-        let b = &backend_list[i];
-        if health.is_healthy(&b.socket_addr) {
-            Some(b)
-        } else {
-            None
-        }
-    });
-
-    let selected_backend = match selected {
-        Some(b) => b,
-        None => {
-            error!(
-                "{} routing: all backends unhealthy for port {}",
-                proto, server_port
-            );
-            return Ok(RoutingResult::CloseConnection);
-        }
-    };
+    // Weighted round-robin among healthy backends, honoring per-backendRef
+    // weights (weight 0 = no traffic, per Gateway API semantics).
+    let selected_backend =
+        match backend_selector.select_l4_backend(server_port as u64, backend_list, health) {
+            Some(b) => b,
+            None => {
+                error!(
+                    "{} routing: no healthy backend with positive weight for port {}",
+                    proto, server_port
+                );
+                return Ok(RoutingResult::CloseConnection);
+            }
+        };
 
     debug!(
         "{} route found: port {} -> backend {}",

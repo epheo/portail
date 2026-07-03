@@ -79,12 +79,17 @@ pub async fn run_udp_worker(
                     Ok((n, client_addr)) => {
                         let now_secs = epoch.elapsed().as_secs();
 
-                        // Update last_active or create new session
+                        // Update last_active or create new session. Clone the
+                        // socket and drop the DashMap guard BEFORE awaiting:
+                        // holding a shard guard across an await can block the
+                        // reaper's `retain` on that shard — and with it the
+                        // executor thread the reaper runs on.
                         if let Some(session) = sessions.get(&client_addr) {
                             session.last_active.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(_e) = session.backend_socket.send(&buf[..n]).await {
+                            let backend_socket = session.backend_socket.clone();
+                            drop(session);
+                            if let Err(_e) = backend_socket.send(&buf[..n]).await {
                                 debug!("UDP send to backend failed for {}: {}", client_addr, _e);
-                                drop(session);
                                 sessions.remove(&client_addr);
                             }
                             continue;
@@ -137,13 +142,32 @@ pub async fn run_udp_worker(
                         let task_timeout = session_timeout;
                         let backend_task = tokio::spawn(async move {
                             let mut reply_buf = vec![0u8; 65536];
-                            while let Ok(Ok(n)) = tokio::time::timeout(task_timeout, backend_rx.recv(&mut reply_buf)).await {
-                                task_last_active.store(
-                                    epoch.elapsed().as_secs(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                if listener_socket.send_to(&reply_buf[..n], client_addr).await.is_err() {
-                                    break;
+                            loop {
+                                match tokio::time::timeout(task_timeout, backend_rx.recv(&mut reply_buf)).await {
+                                    Ok(Ok(n)) => {
+                                        task_last_active.store(
+                                            epoch.elapsed().as_secs(),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if listener_socket.send_to(&reply_buf[..n], client_addr).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        // No backend reply within a window. Exit
+                                        // only if the client has gone quiet too —
+                                        // a silent backend must not kill the reply
+                                        // path of a session the client is still
+                                        // actively using (the reaper collects the
+                                        // session once both sides idle out).
+                                        let last = task_last_active
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let idle = epoch.elapsed().as_secs().saturating_sub(last);
+                                        if idle > task_timeout.as_secs() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         });

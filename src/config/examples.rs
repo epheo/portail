@@ -1,6 +1,5 @@
 use super::types::*;
 use anyhow::{anyhow, Result};
-use std::time::Duration;
 
 impl PortailConfig {
     /// Generate a minimal configuration example
@@ -52,11 +51,7 @@ impl PortailConfig {
                     output: LogOutput::Stdout,
                 },
             },
-            performance: PerformanceConfig {
-                backend_timeout: Duration::from_secs(30),
-                udp_session_timeout: Duration::from_secs(30),
-                dns_refresh_interval: Duration::from_secs(5),
-            },
+            performance: PerformanceConfig::default(),
             endpoint_overrides: std::collections::HashMap::new(),
             app_protocol_overrides: std::collections::HashMap::new(),
             headless_target_ports: std::collections::HashMap::new(),
@@ -355,11 +350,7 @@ impl PortailConfig {
                     output: LogOutput::Stdout,
                 },
             },
-            performance: PerformanceConfig {
-                backend_timeout: Duration::from_secs(30),
-                udp_session_timeout: Duration::from_secs(30),
-                dns_refresh_interval: Duration::from_secs(5),
-            },
+            performance: PerformanceConfig::default(),
             endpoint_overrides: std::collections::HashMap::new(),
             app_protocol_overrides: std::collections::HashMap::new(),
             headless_target_ports: std::collections::HashMap::new(),

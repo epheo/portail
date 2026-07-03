@@ -203,3 +203,60 @@ fn test_apachebench_scenario() {
     assert_eq!(result.host, "localhost");
     assert_eq!(result.path, "/index.html");
 }
+
+// --- RFC 7230 §3.3.3 framing-header smuggling guards ------------------------
+
+#[test]
+fn te_chunked_alone_is_accepted() {
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.is_chunked);
+    assert!(!result.header_violation);
+}
+
+#[test]
+fn te_with_cl_is_a_violation() {
+    let request =
+        b"POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.header_violation);
+}
+
+#[test]
+fn te_gzip_chunked_is_a_violation() {
+    // `gzip, chunked` used to slip past the exact-match check, leaving the
+    // body framed by CL here while a TE-aware backend frames it chunked
+    // (TE.CL desync).
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: gzip, chunked\r\n\r\nabcd";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.header_violation);
+}
+
+#[test]
+fn te_identity_is_a_violation() {
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: identity\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.header_violation);
+}
+
+#[test]
+fn te_repeated_chunked_is_a_violation() {
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.header_violation);
+}
+
+#[test]
+fn duplicate_conflicting_cl_is_a_violation() {
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.header_violation);
+}
+
+#[test]
+fn duplicate_equal_cl_is_benign() {
+    let request = b"POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(!result.header_violation);
+    assert_eq!(result.content_length, Some(4));
+}

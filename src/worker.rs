@@ -6,6 +6,7 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,6 +49,39 @@ async fn read_remaining_headers(
     }
 }
 
+/// Per-listener worker tunables, threaded from `PerformanceConfig` by the
+/// data plane.
+#[derive(Clone, Copy)]
+pub struct WorkerConfig {
+    /// Idle backend connections retained per backend in each connection's pool.
+    pub max_idle_per_backend: usize,
+    /// Default backend connect budget (rule-level timeouts override per request).
+    pub connect_timeout: Duration,
+    /// Client TLS-handshake / request-header-completion budget (slow-loris
+    /// guard). Does not bound the idle wait between keepalive requests.
+    pub client_header_timeout: Duration,
+}
+
+/// RAII in-flight-connection counter. One guard lives inside each spawned
+/// per-connection task; `DataPlane::shutdown` polls the shared count and
+/// drains until it reaches zero (or the drain timeout expires). Drop-based so
+/// the count stays correct on every exit path, including panics and aborts.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        // Release pairs with the Acquire load in the shutdown drain loop.
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -56,6 +90,11 @@ struct ConnectionState {
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
+    /// Budget for completing a request's header block once bytes arrive.
+    client_header_timeout: Duration,
+    /// Backend connect budget for raw TCP forwarding (HTTP connects go
+    /// through the pool, which carries its own copy).
+    connect_timeout: Duration,
     /// Reused across keepalive responses to avoid per-response heap allocation.
     header_buf: Vec<u8>,
 }
@@ -65,13 +104,13 @@ pub async fn run_worker(
     listener: TcpListener,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    max_idle_per_backend: usize,
-    connect_timeout: Duration,
+    cfg: WorkerConfig,
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
     tls_passthrough: bool,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
+    active_connections: Arc<AtomicUsize>,
 ) {
     // Selector is shared across all listeners so weighted round-robin counters
     // produce the correct distribution globally.
@@ -89,11 +128,13 @@ pub async fn run_worker(
                         let routes = routes.clone();
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();
+                        let conn_guard = ConnGuard::new(active_connections.clone());
 
                         if tls_passthrough && acceptor.is_none() {
                             // Pure passthrough mode (no TLS termination cert available)
                             tokio::spawn(async move {
-                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health).await;
+                                let _guard = conn_guard;
+                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, cfg.client_header_timeout, cfg.connect_timeout).await;
                             });
                         } else if let Some(acceptor) = acceptor {
                             // TLS termination mode — but first check if this SNI
@@ -102,11 +143,12 @@ pub async fn run_worker(
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
                             tokio::spawn(async move {
+                                let _guard = conn_guard;
                                 // Peek ClientHello for SNI to decide dispatch mode
                                 let should_passthrough = {
                                     let mut peek_buf = [0u8; 16384];
                                     match tokio::time::timeout(
-                                        Duration::from_secs(5),
+                                        cfg.client_header_timeout,
                                         tcp_stream.peek(&mut peek_buf),
                                     ).await {
                                         Ok(Ok(n)) if n > 0 => {
@@ -123,24 +165,37 @@ pub async fn run_worker(
                                 };
 
                                 if should_passthrough {
-                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health).await;
+                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, cfg.client_header_timeout, cfg.connect_timeout).await;
                                 } else {
-                                    match acceptor.acceptor().accept(tcp_stream).await {
-                                        Ok(tls_stream) => {
+                                    // Bound the handshake: a client that stalls
+                                    // mid-handshake would otherwise pin this task
+                                    // (and its buffers) forever.
+                                    match tokio::time::timeout(
+                                        cfg.client_header_timeout,
+                                        acceptor.acceptor().accept(tcp_stream),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(tls_stream)) => {
                                             let conn = Connection::Tls { inner: tls_stream };
                                             let state = ConnectionState {
                                                 server_port,
                                                 routes,
-                                                pool: BackendPool::new(max_idle_per_backend, connect_timeout),
+                                                pool: BackendPool::new(cfg.max_idle_per_backend, cfg.connect_timeout),
                                                 selector,
                                                 health,
                                                 is_tls: true,
+                                                client_header_timeout: cfg.client_header_timeout,
+                                                connect_timeout: cfg.connect_timeout,
                                                 header_buf: Vec::with_capacity(1024),
                                             };
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
-                                        Err(_e) => {
+                                        Ok(Err(_e)) => {
                                             debug!("TLS handshake failed from {}: {}", peer, _e);
+                                        }
+                                        Err(_) => {
+                                            debug!("TLS handshake from {} timed out", peer);
                                         }
                                     }
                                 }
@@ -150,13 +205,16 @@ pub async fn run_worker(
                             let state = ConnectionState {
                                 server_port,
                                 routes,
-                                pool: BackendPool::new(max_idle_per_backend, connect_timeout),
+                                pool: BackendPool::new(cfg.max_idle_per_backend, cfg.connect_timeout),
                                 selector,
                                 health,
                                 is_tls: false,
+                                client_header_timeout: cfg.client_header_timeout,
+                                connect_timeout: cfg.connect_timeout,
                                 header_buf: Vec::with_capacity(1024),
                             };
                             tokio::spawn(async move {
+                                let _guard = conn_guard;
                                 let conn = Connection::Plain { inner: tcp_stream };
                                 let _ = handle_connection(conn, peer, state).await;
                             });
@@ -189,14 +247,13 @@ async fn handle_connection(
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
     if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
-        match read_remaining_headers(&mut client, &mut buf, n).await {
-            Ok(total) => n = total,
-            Err(e) => {
-                let _ = send_error_response(&mut client, 431).await;
-                return Err(e);
-            }
-        }
+        n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
     }
+
+    // Bytes read past a request's body (a pipelined next request) are carried
+    // over here and replayed as the next iteration's input instead of being
+    // sent to the backend or lost.
+    let mut pending: Option<Vec<u8>> = None;
 
     loop {
         let route_table = state.routes.load();
@@ -216,6 +273,7 @@ async fn handle_connection(
                     backend_addr,
                     &buf[..n],
                     Arc::clone(&state.health),
+                    state.connect_timeout,
                 )
                 .await;
             }
@@ -227,12 +285,13 @@ async fn handle_connection(
                 // proxy_http_request owns all timing for the request lifecycle —
                 // backend_request_timeout (connect + TTFB) and request_timeout
                 // (total deadline) are applied phase-aware inside.
-                let ka =
+                let (ka, leftover) =
                     proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state)
                         .await?;
                 if !ka || !meta.keepalive {
                     return Ok(());
                 }
+                pending = leftover;
             }
             RoutingResult::HttpRedirect {
                 status_code,
@@ -262,15 +321,16 @@ async fn handle_connection(
         // This allows old route tables to be freed between keepalive iterations.
         drop(route_table);
 
-        n = client.read(&mut buf).await?;
+        if let Some(bytes) = pending.take() {
+            // Replay pipelined bytes as the start of the next request. They
+            // came out of `buf` via a single read, so they always fit.
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            n = bytes.len();
+        } else {
+            n = client.read(&mut buf).await?;
+        }
         if n > 0 && find_header_end(&buf[..n]).is_none() {
-            match read_remaining_headers(&mut client, &mut buf, n).await {
-                Ok(total) => n = total,
-                Err(e) => {
-                    let _ = send_error_response(&mut client, 431).await;
-                    return Err(e);
-                }
-            }
+            n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
         }
         if n == 0 {
             return Ok(());
@@ -278,8 +338,35 @@ async fn handle_connection(
     }
 }
 
+/// Complete a partially-read request header block within the slow-loris
+/// budget. The budget starts once a request's first bytes have arrived — the
+/// idle wait between keepalive requests is intentionally unbounded. Sends
+/// `431` when the block outgrows the buffer and `408` when the client is too
+/// slow, then errors out to close the connection.
+async fn complete_headers(
+    client: &mut Connection,
+    buf: &mut [u8],
+    already_read: usize,
+    budget: Duration,
+) -> Result<usize> {
+    match tokio::time::timeout(budget, read_remaining_headers(client, buf, already_read)).await {
+        Ok(Ok(total)) => Ok(total),
+        Ok(Err(e)) => {
+            let _ = send_error_response(client, 431).await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = send_error_response(client, 408).await;
+            Err(anyhow::anyhow!("client header read timed out"))
+        }
+    }
+}
+
 /// Proxy a single HTTP request to a backend and forward the response.
-/// Returns true if the response was fully received (connection reusable for keepalive).
+/// Returns `(reusable, leftover)`: `reusable` is true if the response was
+/// fully received (connection reusable for keepalive); `leftover` holds any
+/// bytes read past this request's body — a pipelined next request — which the
+/// keepalive loop replays instead of reading from the socket again.
 ///
 /// Owns all timing for the request lifecycle. Two timeouts come in from the rule:
 ///
@@ -302,7 +389,7 @@ async fn proxy_http_request(
     rule: &HttpRouteRule,
     meta: &RequestMeta,
     state: &mut ConnectionState,
-) -> Result<bool> {
+) -> Result<(bool, Option<Vec<u8>>)> {
     use std::time::Instant;
 
     let backend_addr = backend_ref.socket_addr;
@@ -324,19 +411,48 @@ async fn proxy_http_request(
         match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
         {
             Some(b) => b,
-            None => return Ok(false),
+            None => return Ok((false, None)),
         };
+
+    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+
+    // Determine where THIS request ends within the bytes already read. Bytes
+    // past that boundary are a pipelined next request: they must never reach
+    // the backend as body (a desync/smuggling vector — the backend would
+    // parse them as a second request and answer it, poisoning the pooled
+    // connection), and are instead handed back to the keepalive loop.
+    // Upgrade requests are exempt: after the 101 the connection is a raw
+    // tunnel and the tail belongs to it.
+    let tail_len = request_bytes - req_header_end;
+    let (request_end, req_chunked) = if meta.is_upgrade {
+        (request_bytes, None)
+    } else if let Some(cl) = meta.content_length {
+        (req_header_end + tail_len.min(cl), None)
+    } else if meta.is_chunked {
+        let mut stream = ChunkedStream::new();
+        let consumed = stream.observe(&buf[req_header_end..request_bytes]);
+        (req_header_end + consumed, Some(stream))
+    } else {
+        // No declared body: the entire tail is the next pipelined request.
+        (req_header_end, None)
+    };
+    // Capture the pipelined tail now — the response phase reuses `buf` as
+    // scratch for backend reads and would overwrite it.
+    let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
+        Some(buf[request_end..request_bytes].to_vec())
+    } else {
+        None
+    };
 
     // Send request to backend, optionally applying filter modifications.
     //
     // Retry contract: if the conn came from the pool AND the send errors, we
     // retry once on a fresh conn. SAFE — `relay_request_body` hasn't been
     // called, so no client body bytes have been consumed yet, and no client
-    // write has happened either. `buf[..request_bytes]` still holds exactly
+    // write has happened either. `buf[..request_end]` still holds exactly
     // what arrived; the original send's bytes went into a dead pipe, so no
     // backend observed them. The retry is unconditionally safe regardless of
     // HTTP method.
-    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
     let has_mirrors = (rule.has_filters || !backend_ref.filters.is_empty())
         && rule
             .filters
@@ -346,7 +462,7 @@ async fn proxy_http_request(
         &mut backend,
         buf,
         req_header_end,
-        request_bytes,
+        request_end,
         rule,
         backend_ref,
         has_mirrors,
@@ -377,7 +493,10 @@ async fn proxy_http_request(
             )
             .await
             {
-                Ok(Ok(c)) => c,
+                Ok(Ok(c)) => {
+                    state.health.record_success(backend_addr);
+                    c
+                }
                 Ok(Err(e2)) => {
                     warn!(
                         "Backend {} fresh-conn acquire failed after pool retry: {}",
@@ -397,7 +516,7 @@ async fn proxy_http_request(
                 &mut backend,
                 buf,
                 req_header_end,
-                request_bytes,
+                request_end,
                 rule,
                 backend_ref,
                 has_mirrors,
@@ -417,18 +536,42 @@ async fn proxy_http_request(
         Err(e) => return Err(e),
     };
 
-    // Relay remaining request body + optional mirror tee.
-    let mirror_body = relay_request_body(
+    // Relay remaining request body + optional mirror tee, clamped to the
+    // rule's total deadline — `request_timeout` covers the request-body phase
+    // too, so a slow client body cannot hold the backend conn open past it.
+    // Expiry is SAFE for the client wire (no response bytes yet) → 408.
+    // Any bytes read past the body end (pipelined next request) come back as
+    // leftover; mutually exclusive with the initial-read leftover above.
+    let relay_fut = relay_request_body(
         client,
         &mut backend,
         buf,
         req_header_end,
-        request_bytes,
+        request_end,
         meta.content_length,
-        meta.is_chunked,
+        req_chunked,
         has_mirrors,
-    )
-    .await?;
+    );
+    let (mirror_body, relay_leftover) = match total_deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, relay_fut).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    warn!(
+                        "Request body relay to backend {} exceeded request timeout",
+                        backend_addr
+                    );
+                    send_error_response(client, 408).await?;
+                    return Ok((false, None));
+                }
+            }
+        }
+        None => relay_fut.await?,
+    };
+    if relay_leftover.is_some() {
+        leftover = relay_leftover;
+    }
 
     if let Some(ref body) = mirror_body {
         let header_bytes = mirror_header_data
@@ -459,14 +602,14 @@ async fn proxy_http_request(
     .await?
     {
         Some(f) => f,
-        None => return Ok(false),
+        None => return Ok((false, None)),
     };
 
     // WebSocket / protocol upgrade: switch to raw bidi after headers.
     if meta.is_upgrade {
         client.flush().await?;
         let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
-        return Ok(false);
+        return Ok((false, None));
     }
 
     // Stream response body (UNSAFE: headers on wire; expiry → encoding-aware
@@ -483,7 +626,7 @@ async fn proxy_http_request(
                 Ok(r) => r,
                 Err(_) => {
                     terminate_stream_gracefully(client, &framing).await;
-                    return Ok(false);
+                    return Ok((false, None));
                 }
             }
         }
@@ -494,7 +637,7 @@ async fn proxy_http_request(
         Ok(c) => c,
         Err(_) => {
             terminate_stream_gracefully(client, &framing).await;
-            return Ok(false);
+            return Ok((false, None));
         }
     };
 
@@ -503,8 +646,18 @@ async fn proxy_http_request(
     // Pool only if framing terminated cleanly. The chunked observer signals
     // termination at a true chunk boundary; content-length matches are exact.
     // A Broken state means stale bytes could remain on the wire — don't reuse.
-    let framing_clean = framing.chunked.as_ref().is_none_or(|s| !s.is_broken());
-    if !framing_clean {
+    // Overshoot (bytes past the framing end) likewise poisons the conn: the
+    // excess was dropped here but whatever else follows would desync the next
+    // response.
+    if framing.overshoot {
+        warn!(
+            "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
+            backend_addr
+        );
+    }
+    let framing_clean =
+        framing.chunked.as_ref().is_none_or(|s| !s.is_broken()) && !framing.overshoot;
+    if !framing_clean && !framing.overshoot {
         warn!(
             "Backend {} response framing broken; not pooling connection",
             backend_addr
@@ -523,7 +676,7 @@ async fn proxy_http_request(
         );
     }
 
-    Ok(reusable)
+    Ok((reusable, leftover))
 }
 
 /// Whether a backend connection may be returned to the idle pool after a response.
@@ -540,20 +693,20 @@ fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: 
 }
 
 /// Record a backend failure (spawning a health probe if this newly trips the
-/// backend unhealthy) and send `code` to the client. Returns `Ok(false)` — the
-/// client connection is not reusable. Centralizes the failure boilerplate the
-/// backend-send retry path would otherwise repeat per error arm.
+/// backend unhealthy) and send `code` to the client. Returns `Ok((false, None))`
+/// — the client connection is not reusable. Centralizes the failure boilerplate
+/// the backend-send retry path would otherwise repeat per error arm.
 async fn fail_backend(
     health: &Arc<HealthRegistry>,
     client: &mut Connection,
     addr: std::net::SocketAddr,
     code: u16,
-) -> Result<bool> {
+) -> Result<(bool, Option<Vec<u8>>)> {
     if health.record_failure(addr) {
         HealthRegistry::spawn_probe(Arc::clone(health), addr);
     }
     send_error_response(client, code).await?;
-    Ok(false)
+    Ok((false, None))
 }
 
 /// Acquire a backend connection within `backend_budget` (clamped by `total_deadline`).
@@ -581,7 +734,14 @@ async fn connect_to_backend(
     )
     .await
     {
-        Ok(Ok(result)) => Ok(Some(result)),
+        Ok(Ok(result)) => {
+            // Reset passive-failure state: without this, transient failures
+            // accumulate over the process lifetime and eventually trip the
+            // "consecutive"-failure threshold (the L4 paths already record
+            // success on connect).
+            state.health.record_success(backend_addr);
+            Ok(Some(result))
+        }
         Ok(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
             if state.health.record_failure(backend_addr) {
@@ -602,21 +762,23 @@ async fn connect_to_backend(
 }
 
 /// Send request headers (with optional filter modifications) and the same-read
-/// body tail to the backend. Returns the buffer captured for mirroring, if any.
+/// body tail (up to `request_end`, the request's framing boundary — bytes
+/// beyond it belong to a pipelined next request and never reach the backend)
+/// to the backend. Returns the buffer captured for mirroring, if any.
 ///
 /// Fast path (no filters/mods): one `write_all` covering headers + tail.
 async fn send_request_to_backend(
     backend: &mut Connection,
     buf: &[u8],
     req_header_end: usize,
-    request_bytes: usize,
+    request_end: usize,
     rule: &HttpRouteRule,
     backend_ref: &crate::routing::Backend,
     has_mirrors: bool,
 ) -> Result<Option<Vec<u8>>> {
     let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
     if !has_filters {
-        backend.write_all(&buf[..request_bytes]).await?;
+        backend.write_all(&buf[..request_end]).await?;
         return Ok(None);
     }
 
@@ -628,7 +790,7 @@ async fn send_request_to_backend(
 
     if !has_mods {
         let mirror = has_mirrors.then(|| buf[..req_header_end].to_vec());
-        backend.write_all(&buf[..request_bytes]).await?;
+        backend.write_all(&buf[..request_end]).await?;
         return Ok(mirror);
     }
 
@@ -644,7 +806,7 @@ async fn send_request_to_backend(
     };
     let mirror = has_mirrors.then(|| final_headers.clone());
     backend.write_all(&final_headers).await?;
-    let body = &buf[req_header_end..request_bytes];
+    let body = &buf[req_header_end..request_end];
     if !body.is_empty() {
         backend.write_all(body).await?;
     }
@@ -682,22 +844,23 @@ async fn forward_response_headers(
 
     // SAFE → UNSAFE: first client write happens here.
     //
-    // For HEAD requests, only the response headers are forwarded — any body
-    // bytes the backend (incorrectly, per RFC 7230 §3.3) sent are dropped here
-    // rather than leaking to the HEAD client. Such a backend may also leave
-    // unconsumed body bytes on the wire, so the caller never returns a post-HEAD
-    // conn to the pool (`backend_conn_poolable`) — it is closed instead, which
-    // shuts the desync window without a blocking drain.
+    // Only tail bytes within the declared framing are forwarded
+    // (`body_bytes_already_forwarded`): for HEAD and no-body statuses that is
+    // zero — body bytes a non-compliant backend sent are dropped rather than
+    // leaking to the client — and for CL/chunked responses it stops at the
+    // framing boundary so backend overshoot never reaches the client.
+    let tail_end = resp_header_end + framing.body_bytes_already_forwarded;
     if let Some(mods) = resp_mods {
         let modified = apply_response_header_mods(&header_buf[..resp_header_end], mods);
         client.write_all(&modified).await?;
-        if !is_head_request && header_buf.len() > resp_header_end {
-            client.write_all(&header_buf[resp_header_end..]).await?;
+        if tail_end > resp_header_end {
+            client
+                .write_all(&header_buf[resp_header_end..tail_end])
+                .await?;
         }
-    } else if is_head_request {
-        client.write_all(&header_buf[..resp_header_end]).await?;
     } else {
-        client.write_all(header_buf).await?;
+        // Hot path: headers + in-framing tail in a single write.
+        client.write_all(&header_buf[..tail_end]).await?;
     }
     Ok(Some(framing))
 }
@@ -720,20 +883,26 @@ fn extract_request_path(header_bytes: &[u8]) -> Option<&str> {
 }
 
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.
-/// Returns `Some(body_bytes)` if mirrors are active and body fits within MIRROR_BODY_MAX,
-/// `None` if no mirrors or body exceeded the cap.
+///
+/// `chunked` is the observer pre-seeded with the initial-read body tail (built
+/// by the caller when the request is chunk-framed).
+///
+/// Returns `(mirror_body, leftover)`: `mirror_body` is `Some(bytes)` if
+/// mirrors are active and the body fit within `MIRROR_BODY_MAX`; `leftover`
+/// holds any bytes read past the body's framing end — a pipelined next
+/// request — which must go back to the keepalive loop, never to the backend.
 async fn relay_request_body(
     client: &mut Connection,
     backend: &mut Connection,
     buf: &mut [u8],
     header_end: usize,
-    request_bytes: usize,
+    request_end: usize,
     content_length: Option<usize>,
-    is_chunked: bool,
+    chunked: Option<ChunkedStream>,
     has_mirrors: bool,
-) -> Result<Option<Vec<u8>>> {
-    let body_in_initial = request_bytes.saturating_sub(header_end);
-    let initial_body = &buf[header_end..request_bytes];
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let body_in_initial = request_end.saturating_sub(header_end);
+    let initial_body = &buf[header_end..request_end];
 
     // Mirror body buffer: only allocated when mirrors need body data.
     let mut mirror_body: Option<Vec<u8>> = if has_mirrors {
@@ -745,6 +914,7 @@ async fn relay_request_body(
         None
     };
     let mut overflow = has_mirrors && body_in_initial > MIRROR_BODY_MAX;
+    let mut leftover: Option<Vec<u8>> = None;
 
     if let Some(cl) = content_length {
         let mut remaining = cl.saturating_sub(body_in_initial);
@@ -757,28 +927,30 @@ async fn relay_request_body(
             backend.write_all(&buf[..to_send]).await?;
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..to_send]);
             remaining -= to_send;
+            if to_send < n {
+                // The read ran past the body end: pipelined next request.
+                leftover = Some(buf[to_send..n].to_vec());
+            }
         }
-    } else if is_chunked {
-        let mut stream = ChunkedStream::new();
-        if body_in_initial > 0 {
-            stream.observe(&buf[header_end..request_bytes]);
-        }
-        while !stream.is_terminated() {
+    } else if let Some(mut stream) = chunked {
+        // Broken framing exits too: there is no boundary left to find, and
+        // the backend cannot parse the body either — the exchange is doomed
+        // and the response phase will surface the failure.
+        while !stream.is_terminated() && !stream.is_broken() {
             let n = client.read(&mut buf[..]).await?;
             if n == 0 {
                 break;
             }
-            backend.write_all(&buf[..n]).await?;
-            stream.observe(&buf[..n]);
-            tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..n]);
+            let consumed = stream.observe(&buf[..n]);
+            backend.write_all(&buf[..consumed]).await?;
+            tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..consumed]);
+            if consumed < n {
+                leftover = Some(buf[consumed..n].to_vec());
+            }
         }
     }
 
-    if overflow {
-        Ok(None)
-    } else {
-        Ok(mirror_body)
-    }
+    Ok((if overflow { None } else { mirror_body }, leftover))
 }
 
 /// Tee a chunk into the mirror body buffer, tracking overflow.
@@ -806,14 +978,22 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 struct ResponseFraming {
     content_length: Option<usize>,
     no_body: bool,
-    /// Body bytes already forwarded to the client from the same backend read that
-    /// completed the response headers. Seeds the body-phase byte counter.
+    /// Body bytes (within the declared framing) that arrived in the same
+    /// backend read that completed the response headers. The header-forwarding
+    /// phase writes exactly this many tail bytes to the client, and it seeds
+    /// the body-phase byte counter.
     body_bytes_already_forwarded: usize,
     /// `Some` iff the response uses `Transfer-Encoding: chunked`. Pre-seeded
     /// with any chunked body bytes that arrived in the same read as the
     /// response headers, so the observer is already at the correct framing
     /// position when `forward_response_body` starts looping.
     chunked: Option<ChunkedStream>,
+    /// The backend sent bytes past the end of the declared framing
+    /// (Content-Length reached, chunked terminator passed, or a body on a
+    /// no-body status). The excess is dropped — never forwarded to the
+    /// client — and the connection must not be pooled: whatever follows the
+    /// boundary would desync the next response.
+    overshoot: bool,
 }
 
 /// Cap of bytes accumulated while waiting for backend response headers. Protects
@@ -844,22 +1024,38 @@ async fn read_response_headers(
         if let Some(header_end) = find_header_end(header_buf) {
             let headers = &header_buf[..header_end];
             let content_length = parse_content_length(headers);
-            let chunked = is_chunked_transfer(headers);
+            let is_chunked = is_chunked_transfer(headers);
             // RFC 7230 §3.3: responses to HEAD have no message body regardless
             // of the response's Content-Length / Transfer-Encoding. Forcing
             // no_body here keeps `forward_response_body` from blocking on
             // bytes the backend correctly never sends.
             let no_body = is_head_request || is_no_body_status(headers);
 
-            let body_bytes_already_forwarded = header_buf.len() - header_end;
-            let chunked = if chunked && !is_head_request {
+            // Decide how many of the tail bytes (same read as the headers)
+            // belong to THIS response's body. Anything beyond the declared
+            // framing is overshoot: dropped, and the conn is not poolable.
+            let tail_len = header_buf.len() - header_end;
+            let (tail_forward, chunked, overshoot) = if is_head_request {
+                // HEAD: any body bytes a non-compliant backend sent are
+                // dropped (never forwarded per RFC 7230 §3.3); the conn is
+                // already never pooled after HEAD.
+                (0, None, false)
+            } else if no_body {
+                // 204/304/1xx: no body allowed; any tail is overshoot.
+                (0, None, tail_len > 0)
+            } else if is_chunked {
                 let mut stream = ChunkedStream::new();
-                if body_bytes_already_forwarded > 0 {
-                    stream.observe(&header_buf[header_end..]);
-                }
-                Some(stream)
+                let consumed = if tail_len > 0 {
+                    stream.observe(&header_buf[header_end..])
+                } else {
+                    0
+                };
+                (consumed, Some(stream), consumed < tail_len)
+            } else if let Some(cl) = content_length {
+                (tail_len.min(cl), None, tail_len > cl)
             } else {
-                None
+                // EOF-framed: everything until close is body.
+                (tail_len, None, false)
             };
 
             return Ok((
@@ -871,15 +1067,9 @@ async fn read_response_headers(
                         content_length
                     },
                     no_body,
-                    // For HEAD, the header-tail body bytes are dropped (not
-                    // forwarded to the client per RFC 7230 §3.3), so the
-                    // body-byte counter for the response-body phase is zero.
-                    body_bytes_already_forwarded: if is_head_request {
-                        0
-                    } else {
-                        body_bytes_already_forwarded
-                    },
+                    body_bytes_already_forwarded: tail_forward,
                     chunked,
+                    overshoot,
                 },
             ));
         }
@@ -920,19 +1110,28 @@ async fn forward_response_body(
         if n == 0 {
             return Ok(false);
         }
-        client.write_all(&buf[..n]).await?;
-        body_bytes_forwarded += n;
 
-        if let Some(cl) = framing.content_length {
-            if body_bytes_forwarded >= cl {
-                return Ok(true);
-            }
-        }
+        // Forward only bytes within the declared framing; anything past the
+        // boundary is backend overshoot — dropped, and flagged so the caller
+        // never pools the connection.
         if let Some(stream) = &mut framing.chunked {
-            stream.observe(&buf[..n]);
+            let consumed = stream.observe(&buf[..n]);
+            client.write_all(&buf[..consumed]).await?;
             if stream.is_terminated() {
+                framing.overshoot |= consumed < n;
                 return Ok(true);
             }
+        } else if let Some(cl) = framing.content_length {
+            let to_write = n.min(cl - body_bytes_forwarded);
+            client.write_all(&buf[..to_write]).await?;
+            body_bytes_forwarded += to_write;
+            if body_bytes_forwarded >= cl {
+                framing.overshoot |= to_write < n;
+                return Ok(true);
+            }
+        } else {
+            // EOF-framed: everything until close is body.
+            client.write_all(&buf[..n]).await?;
         }
     }
 }
@@ -973,14 +1172,17 @@ async fn handle_tls_passthrough(
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
+    peek_timeout: Duration,
+    connect_timeout: Duration,
 ) -> Result<()> {
     let mut peek_buf = [0u8; 16384];
-    let n = match tokio::time::timeout(Duration::from_secs(5), client.peek(&mut peek_buf)).await {
+    let n = match tokio::time::timeout(peek_timeout, client.peek(&mut peek_buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "TLS passthrough: client sent no data within 5s"
+                "TLS passthrough: client sent no ClientHello within {:?}",
+                peek_timeout
             ))
         }
     };
@@ -1003,14 +1205,23 @@ async fn handle_tls_passthrough(
         .resolve_tls_passthrough(hostname, server_port)
         .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
 
-    match TcpStream::connect(backend_addr).await {
-        Ok(mut backend) => {
+    match tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await {
+        Err(_) => {
+            if health.record_failure(backend_addr) {
+                HealthRegistry::spawn_probe(health, backend_addr);
+            }
+            return Err(anyhow::anyhow!(
+                "TLS passthrough connect to {} timed out",
+                backend_addr
+            ));
+        }
+        Ok(Ok(mut backend)) => {
             health.record_success(backend_addr);
             backend.set_nodelay(true)?;
             client.set_nodelay(true)?;
             tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
@@ -1030,9 +1241,10 @@ async fn handle_tcp_connection(
     backend_addr: SocketAddr,
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
+    connect_timeout: Duration,
 ) -> Result<()> {
     let connect_result =
-        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(backend_addr)).await;
+        tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await;
 
     match connect_result {
         Ok(Ok(mut backend)) => {
@@ -1102,6 +1314,8 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
     static RESP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\nConnection: close\r\n\r\n400 Bad Request";
     static RESP_404: &[u8] =
         b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
+    static RESP_408: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n408 Request Timeout";
+    static RESP_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 35\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
     static RESP_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
     static RESP_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable";
     static RESP_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n504 Gateway Timeout";
@@ -1110,6 +1324,8 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
     let response = match error_code {
         400 => RESP_400,
         404 => RESP_404,
+        408 => RESP_408,
+        431 => RESP_431,
         502 => RESP_502,
         503 => RESP_503,
         504 => RESP_504,

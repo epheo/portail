@@ -54,6 +54,71 @@ impl PortailConfig {
 }
 
 impl PortailConfig {
+    /// Like [`Self::to_route_table`], but fails when any configured backendRef
+    /// cannot be DNS-resolved — instead of silently building the route with
+    /// fewer (possibly zero) backends. Used on the standalone path (startup
+    /// and SIGHUP reload) where a valid config with a transient DNS blip must
+    /// not degrade live routes to 5xx while reporting success. The Kubernetes
+    /// path stays lenient by design: a route whose backends don't resolve is
+    /// conformance-required to serve 500, and the DNS-refresh task picks the
+    /// backends up as their records appear.
+    pub fn to_route_table_strict(&self) -> Result<crate::routing::RouteTable> {
+        self.check_backend_resolution()?;
+        self.to_route_table()
+    }
+
+    /// Resolve every referenced (backend name, port) once, erroring on the
+    /// first failure. Deduplicated, so the double resolution cost of the
+    /// strict path stays bounded by the number of distinct backends.
+    fn check_backend_resolution(&self) -> Result<()> {
+        fn check_refs(
+            seen: &mut std::collections::HashSet<(String, u16)>,
+            refs: &[BackendRef],
+            proto: &str,
+        ) -> Result<()> {
+            for br in refs {
+                if !seen.insert((br.name.clone(), br.port)) {
+                    continue;
+                }
+                crate::routing::Backend::all_with_weight(br.name.clone(), br.port, 1).map_err(
+                    |e| {
+                        anyhow!(
+                            "{} backend {}:{} failed to resolve: {}",
+                            proto,
+                            br.name,
+                            br.port,
+                            e
+                        )
+                    },
+                )?;
+            }
+            Ok(())
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for route in &self.http_routes {
+            for rule in &route.rules {
+                check_refs(&mut seen, &rule.backend_refs, "HTTP")?;
+            }
+        }
+        for route in &self.tcp_routes {
+            for rule in &route.rules {
+                check_refs(&mut seen, &rule.backend_refs, "TCP")?;
+            }
+        }
+        for route in &self.udp_routes {
+            for rule in &route.rules {
+                check_refs(&mut seen, &rule.backend_refs, "UDP")?;
+            }
+        }
+        for route in &self.tls_routes {
+            for rule in &route.rules {
+                check_refs(&mut seen, &rule.backend_refs, "TLS")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convert configuration to RouteTable for runtime use
     /// All route processing happens once at startup - zero runtime overhead
     pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
@@ -89,11 +154,9 @@ impl PortailConfig {
                 };
 
                 for hostname in &effective_hostnames {
-                    for (rule_idx, rule) in http_route.rules.iter().enumerate() {
+                    for rule in &http_route.rules {
                         let (backends, filters) = build_rule_components(
                             rule,
-                            rule_idx,
-                            hostname,
                             &self.endpoint_overrides,
                             &self.app_protocol_overrides,
                             &self.headless_target_ports,
@@ -153,8 +216,6 @@ impl PortailConfig {
 
                         let (backends, filters) = build_rule_components(
                             rule,
-                            rule_idx,
-                            hostname,
                             &self.endpoint_overrides,
                             &self.app_protocol_overrides,
                             &self.headless_target_ports,
@@ -186,14 +247,28 @@ impl PortailConfig {
         self.convert_l4_routes(&mut route_table, &self.tcp_routes, Protocol::TCP)?;
         self.convert_l4_routes(&mut route_table, &self.udp_routes, Protocol::UDP)?;
 
-        // Convert TLS routes (SNI-based)
+        // Convert TLS routes (SNI-based), scoped to the ports of the TLS
+        // listeners their parentRefs attach to. Without gateway context
+        // (file-based configs) they land in the any-port (0) scope.
         for tls_route in &self.tls_routes {
+            let matched_listeners = find_listeners_for_route(&tls_route.parent_refs, &self.gateway);
+            let mut ports: Vec<u16> = matched_listeners
+                .iter()
+                .filter(|l| l.protocol == Protocol::TLS)
+                .map(|l| l.port)
+                .collect();
+            ports.sort_unstable();
+            ports.dedup();
+            if ports.is_empty() {
+                ports.push(0);
+            }
+
             for rule in &tls_route.rules {
                 let backends: Vec<routing::Backend> = rule
                     .backend_refs
                     .iter()
                     .flat_map(|br| {
-                        routing::Backend::all_with_weight(br.name.clone(), br.port, 1)
+                        routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
                             .map_err(|e| {
                                 tracing::warn!(
                                     "Skipping TLS backend {}:{} - DNS resolution failed: {}",
@@ -207,7 +282,9 @@ impl PortailConfig {
                     .collect();
 
                 for hostname in &tls_route.hostnames {
-                    route_table.add_tls_route(hostname, backends.clone());
+                    for &port in &ports {
+                        route_table.add_tls_route(port, hostname, backends.clone());
+                    }
                 }
             }
         }
@@ -271,11 +348,23 @@ impl PortailConfig {
                         .find(|l| l.name == *section_name && protocol_matches(l))
                     {
                         for backend_refs in route.backend_refs_per_rule() {
-                            let backends: Vec<routing::Backend> = backend_refs.iter()
+                            let backends: Vec<routing::Backend> = backend_refs
+                                .iter()
                                 .flat_map(|br| {
-                                    routing::Backend::all_with_weight(br.name.clone(), br.port, 1)
-                                        .map_err(|e| tracing::warn!("Skipping L4 backend {}:{} - DNS resolution failed: {}", br.name, br.port, e))
-                                        .unwrap_or_default()
+                                    routing::Backend::all_with_weight(
+                                        br.name.clone(),
+                                        br.port,
+                                        br.weight,
+                                    )
+                                    .map_err(|e| {
+                                        tracing::warn!(
+                                            "Skipping L4 backend {}:{} - DNS resolution failed: {}",
+                                            br.name,
+                                            br.port,
+                                            e
+                                        )
+                                    })
+                                    .unwrap_or_default()
                                 })
                                 .collect();
 
@@ -346,8 +435,6 @@ fn find_listeners_for_route<'a>(
 /// Build backends and filters from a route rule. Extracts common logic from the route loop.
 fn build_rule_components(
     rule: &HttpRouteRule,
-    _rule_idx: usize,
-    _hostname: &str,
     endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
     app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
     headless_target_ports: &std::collections::HashMap<(String, u16), u16>,
@@ -488,10 +575,26 @@ fn build_routing_rule(
         ("/", routing::PathMatchType::Prefix, None)
     };
 
-    let header_matches: Vec<routing::HeaderMatch> =
-        route_match.headers.iter().map(Into::into).collect();
-    let query_param_matches: Vec<routing::QueryParamMatch> =
-        route_match.query_params.iter().map(Into::into).collect();
+    let header_matches: Vec<routing::HeaderMatch> = route_match
+        .headers
+        .iter()
+        .map(|hm| {
+            Ok(routing::HeaderMatch {
+                name: hm.name.to_ascii_lowercase(),
+                matcher: build_value_matcher(&hm.value, &hm.match_type)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let query_param_matches: Vec<routing::QueryParamMatch> = route_match
+        .query_params
+        .iter()
+        .map(|qm| {
+            Ok(routing::QueryParamMatch {
+                name: qm.name.clone(),
+                matcher: build_value_matcher(&qm.value, &qm.match_type)?,
+            })
+        })
+        .collect::<Result<_>>()?;
 
     let mut routing_rule = routing::HttpRouteRule::new(
         path_match_type,
@@ -662,36 +765,22 @@ impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
     }
 }
 
+/// Build a value matcher, propagating invalid-regex errors. `validate()` also
+/// checks these regexes, but nothing forces every caller of `to_route_table`
+/// through `validate()` first (the reconciler and DNS-refresh call it
+/// directly), so this must not panic on an unvalidated config.
 fn build_value_matcher(
     value: &str,
     match_type: &super::types::StringMatchType,
-) -> crate::routing::ValueMatcher {
+) -> Result<crate::routing::ValueMatcher> {
     match match_type {
         super::types::StringMatchType::Exact => {
-            crate::routing::ValueMatcher::Exact(value.to_string())
+            Ok(crate::routing::ValueMatcher::Exact(value.to_string()))
         }
         super::types::StringMatchType::RegularExpression => {
-            // Validation ensures regex is valid before we get here
-            let re = regex::Regex::new(value).expect("regex validated at config load time");
-            crate::routing::ValueMatcher::Regex(re)
-        }
-    }
-}
-
-impl From<&super::types::HttpHeaderMatch> for crate::routing::HeaderMatch {
-    fn from(hm: &super::types::HttpHeaderMatch) -> Self {
-        Self {
-            name: hm.name.to_ascii_lowercase(),
-            matcher: build_value_matcher(&hm.value, &hm.match_type),
-        }
-    }
-}
-
-impl From<&super::types::HttpQueryParamMatch> for crate::routing::QueryParamMatch {
-    fn from(qm: &super::types::HttpQueryParamMatch) -> Self {
-        Self {
-            name: qm.name.clone(),
-            matcher: build_value_matcher(&qm.value, &qm.match_type),
+            let re = regex::Regex::new(value)
+                .map_err(|e| anyhow!("Invalid match regex '{}': {}", value, e))?;
+            Ok(crate::routing::ValueMatcher::Regex(re))
         }
     }
 }

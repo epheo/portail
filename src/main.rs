@@ -128,9 +128,12 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         portail_config.udp_routes.len()
     );
 
-    // Build initial route table from configuration
+    // Build initial route table from configuration. Strict: in standalone
+    // mode a backend that fails DNS resolution should fail startup loudly,
+    // not silently serve 5xx. (Kubernetes mode starts from an empty default
+    // config, so strictness costs nothing there.)
     let route_table = portail_config
-        .to_route_table()
+        .to_route_table_strict()
         .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
     let routes = Arc::new(ArcSwap::from_pointee(route_table));
     info!(
@@ -236,17 +239,12 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
         info!("Validating configuration file: {:?}", config_path);
 
         match PortailConfig::load_from_file(config_path) {
+            // load_from_file parses AND validates; a separate validate()
+            // call here would be redundant.
             Ok(config) => {
-                info!("Configuration file parsed successfully");
+                info!("Configuration file parsed and validated successfully");
 
-                if let Err(e) = config.validate() {
-                    error!("Configuration validation failed: {}", e);
-                    std::process::exit(1);
-                }
-
-                info!("Configuration validation passed");
-
-                match config.to_route_table() {
+                match config.to_route_table_strict() {
                     Ok(_) => info!("Route table conversion successful"),
                     Err(e) => {
                         error!("Route table conversion failed: {}", e);

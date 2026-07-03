@@ -101,12 +101,19 @@ pub fn extract_url_rewrite(
 /// Matches Envoy's default `per_connection_buffer_limit_bytes`.
 pub(crate) const MIRROR_BODY_MAX: usize = 1024 * 1024; // 1 MB
 
+/// Bound on concurrently in-flight mirror tasks across the process. Mirroring
+/// is best-effort by contract, so when a slow/dead mirror backend makes tasks
+/// pile up (each holding up to `MIRROR_BODY_MAX` of copied request), excess
+/// mirrors are shed instead of accumulating 5s × RPS tasks of buffered bodies.
+static MIRROR_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+
 /// Fire-and-forget mirror dispatch with percentage-based filtering and timeout.
 ///
 /// Iterates rule filters looking for `RequestMirror` variants.
 /// For each target, rolls a random number to decide whether to mirror based on
 /// the configured percentage. Spawned tasks are bounded by a total 5s timeout
-/// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends.
+/// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends,
+/// and by `MIRROR_PERMITS` in flight.
 pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
     for filter in filters {
         let (addr, percent) = match filter {
@@ -125,8 +132,17 @@ pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
             continue;
         }
 
+        let permit = match MIRROR_PERMITS.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("mirror capacity exhausted, shedding mirror to {}", addr);
+                continue;
+            }
+        };
+
         let data = data.to_vec();
         tokio::spawn(async move {
+            let _permit = permit;
             // Total timeout: 5s covers connect + write. Prevents leaked tasks
             // when the mirror backend is slow or unreachable.
             let result = tokio::time::timeout(Duration::from_secs(5), async {

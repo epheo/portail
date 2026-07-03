@@ -39,8 +39,7 @@ pub struct DataPlane {
     tcp_listeners: Vec<TcpListenerEntry>,
     udp_listeners: Vec<UdpListenerEntry>,
     task_handles: Vec<JoinHandle<()>>,
-    max_idle_per_backend: usize,
-    connect_timeout: Duration,
+    worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
@@ -193,8 +192,11 @@ impl DataPlane {
             tcp_listeners,
             udp_listeners,
             task_handles: Vec::new(),
-            max_idle_per_backend: 64,
-            connect_timeout: performance_config.backend_timeout,
+            worker_config: worker::WorkerConfig {
+                max_idle_per_backend: 64,
+                connect_timeout: performance_config.backend_timeout,
+                client_header_timeout: performance_config.client_header_timeout,
+            },
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
@@ -339,24 +341,30 @@ impl DataPlane {
                                 let routes = routes.clone();
                                 let health = self.health.clone();
                                 let shutdown = self.shutdown.clone();
-                                let max_idle = self.max_idle_per_backend;
-                                let connect_timeout = performance_config.backend_timeout;
+                                // The controller's perf config takes precedence
+                                // over the startup one for dynamic listeners.
+                                let cfg = worker::WorkerConfig {
+                                    max_idle_per_backend: self.worker_config.max_idle_per_backend,
+                                    connect_timeout: performance_config.backend_timeout,
+                                    client_header_timeout: performance_config.client_header_timeout,
+                                };
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;
 
                                 let selector = self.selector.clone();
+                                let active = self.active_connections.clone();
                                 let handle = tokio::spawn(async move {
                                     worker::run_worker(
                                         tokio_listener,
                                         port,
                                         routes,
-                                        max_idle,
-                                        connect_timeout,
+                                        cfg,
                                         shutdown,
                                         acceptor,
                                         passthrough,
                                         health,
                                         selector,
+                                        active,
                                     )
                                     .await;
                                 });
@@ -391,22 +399,22 @@ impl DataPlane {
             let routes = routes.clone();
             let health = self.health.clone();
             let shutdown = self.shutdown.clone();
-            let max_idle = self.max_idle_per_backend;
-            let connect_timeout = self.connect_timeout;
+            let cfg = self.worker_config;
             let selector = self.selector.clone();
+            let active = self.active_connections.clone();
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
                     entry.listener,
                     entry.port,
                     routes,
-                    max_idle,
-                    connect_timeout,
+                    cfg,
                     shutdown,
                     entry.tls_acceptor,
                     entry.tls_passthrough,
                     health,
                     selector,
+                    active,
                 )
                 .await;
             });
@@ -688,6 +696,7 @@ mod tests {
             backend_timeout: std::time::Duration::from_secs(1),
             udp_session_timeout: std::time::Duration::from_secs(1),
             dns_refresh_interval: std::time::Duration::from_secs(1),
+            client_header_timeout: std::time::Duration::from_secs(1),
         };
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
 

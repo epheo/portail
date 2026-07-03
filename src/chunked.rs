@@ -7,9 +7,11 @@
 //!
 //! The observer is purely passive: it never copies, modifies, or retains
 //! references to bytes. Callers are responsible for writing bytes to the
-//! wire; this type only answers "is the stream over yet?". That separation
-//! lets the proxy keep forwarding chunked bytes verbatim while still
-//! knowing precisely when to stop reading from the upstream.
+//! wire; this type answers "is the stream over yet?" and "how many of these
+//! bytes belong to it?" ([`observe`](ChunkedStream::observe) returns the
+//! consumed count). That separation lets the proxy forward chunked bytes
+//! verbatim, stop reading from the upstream at the right moment, and keep
+//! bytes past the terminator (a pipelined next message) out of the body.
 //!
 //! ### Why not a pattern match on `0\r\n\r\n`?
 //!
@@ -82,18 +84,22 @@ impl ChunkedStream {
         }
     }
 
-    /// Feed a slice of bytes that just passed through the proxy. Updates
-    /// position; cheap to call with any chunk size. Bytes received after
-    /// the stream has terminated are silently ignored — the caller is
-    /// expected to stop reading from upstream once `is_terminated()`.
-    pub fn observe(&mut self, bytes: &[u8]) {
+    /// Feed a slice of bytes flowing through the proxy. Returns how many of
+    /// them belong to this chunked stream — once the terminator is reached,
+    /// the remaining bytes (e.g. a pipelined next message on the same
+    /// connection) are NOT consumed, and the caller must not forward them as
+    /// body. While the framing is `Broken` every byte is reported consumed:
+    /// there is no boundary left to respect and the connection is already
+    /// unusable for reuse.
+    pub fn observe(&mut self, bytes: &[u8]) -> usize {
         let mut i = 0;
         while i < bytes.len() {
-            // Terminal phases: stop processing. Further bytes (e.g. a
-            // pipelined next response on the same backend connection)
-            // are not our concern.
-            if matches!(self.phase, Phase::Done | Phase::Broken) {
-                return;
+            // Terminal phases: Done stops consuming at the boundary; Broken
+            // swallows the rest (see doc above).
+            match self.phase {
+                Phase::Done => return i,
+                Phase::Broken => return bytes.len(),
+                _ => {}
             }
             // Fast-path: skip the whole chunk-data run in one shot
             // instead of stepping byte by byte. This is the hot path
@@ -110,6 +116,7 @@ impl ChunkedStream {
             self.step(bytes[i]);
             i += 1;
         }
+        i
     }
 
     /// `true` once the final CRLF has passed; the stream is complete.
@@ -372,14 +379,37 @@ mod tests {
     }
 
     #[test]
-    fn bytes_after_terminator_are_ignored() {
+    fn bytes_after_terminator_are_not_consumed() {
         let mut s = ChunkedStream::new();
-        s.observe(b"0\r\n\r\n");
+        assert_eq!(s.observe(b"0\r\n\r\n"), 5);
         assert!(s.is_terminated());
-        // A pipelined next response on the same backend connection
-        // should not flip us back to non-terminated or cause a panic.
-        s.observe(b"HTTP/1.1 200 OK\r\n\r\n");
+        // A pipelined next response on the same connection must not be
+        // consumed (the caller forwards only consumed bytes as body) nor
+        // flip us back to non-terminated.
+        assert_eq!(s.observe(b"HTTP/1.1 200 OK\r\n\r\n"), 0);
         assert!(s.is_terminated());
+    }
+
+    /// The terminator and the start of a pipelined next message arriving in
+    /// one read: `observe` must report exactly the stream's own bytes.
+    #[test]
+    fn consumed_count_stops_at_terminator_mid_buffer() {
+        let mut s = ChunkedStream::new();
+        let wire = b"5\r\nhello\r\n0\r\n\r\nGET / HTTP/1.1\r\n";
+        let body_len = b"5\r\nhello\r\n0\r\n\r\n".len();
+        assert_eq!(s.observe(wire), body_len);
+        assert!(s.is_terminated());
+    }
+
+    /// Broken framing consumes everything — there is no boundary left, and
+    /// the caller keeps forwarding until EOF on a connection that will never
+    /// be reused.
+    #[test]
+    fn broken_framing_consumes_all_bytes() {
+        let mut s = ChunkedStream::new();
+        assert_eq!(s.observe(b"Z\r\ngarbage"), 10);
+        assert!(s.is_broken());
+        assert_eq!(s.observe(b"more"), 4);
     }
 
     #[test]

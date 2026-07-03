@@ -21,10 +21,12 @@ pub struct ListenerScope {
 }
 
 impl ListenerScope {
+    /// `listener_hostname` is normalized to lowercase at construction so the
+    /// per-request match never allocates.
     pub fn new(port: u16, listener_hostname: Option<String>) -> Self {
         Self {
             port,
-            listener_hostname,
+            listener_hostname: listener_hostname.map(|h| h.to_ascii_lowercase()),
             http_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             wildcard_http_routes: FnvHashMap::with_capacity_and_hasher(8, Default::default()),
             catch_all_http_routes: None,
@@ -34,31 +36,31 @@ impl ListenerScope {
     /// Check if a request Host header matches this listener's hostname constraint.
     /// Returns a match priority: higher = better match.
     /// Returns None if the host doesn't match this listener.
+    ///
+    /// Zero-allocation hot path: `request_host` is already lowercased by
+    /// `find_http_route`, and `listener_hostname` was lowercased at
+    /// construction.
     fn hostname_match_priority(&self, request_host: &str) -> Option<u32> {
         match &self.listener_hostname {
             None => Some(0), // Catch-all listener: lowest priority
             Some(lh) => {
-                let lh_lower = lh.to_ascii_lowercase();
-                if let Some(parent) = lh_lower.strip_prefix("*.") {
+                if let Some(parent) = lh.strip_prefix("*.") {
                     // Wildcard listener (e.g., *.example.com)
                     // More specific wildcards get higher priority:
                     // *.foo.example.com (len 15) > *.example.com (len 11)
-                    let rh = request_host.to_ascii_lowercase();
-                    if rh.ends_with(parent)
-                        && rh.len() > parent.len()
-                        && rh.as_bytes()[rh.len() - parent.len() - 1] == b'.'
+                    if request_host.ends_with(parent)
+                        && request_host.len() > parent.len()
+                        && request_host.as_bytes()[request_host.len() - parent.len() - 1] == b'.'
                     {
                         Some(1 + parent.len() as u32) // Longer suffix = more specific = higher priority
                     } else {
                         None
                     }
+                } else if request_host == lh {
+                    // Exact listener hostname: highest priority
+                    Some(u32::MAX)
                 } else {
-                    // Exact listener hostname
-                    if request_host.eq_ignore_ascii_case(&lh_lower) {
-                        Some(u32::MAX) // Exact match: highest priority
-                    } else {
-                        None
-                    }
+                    None
                 }
             }
         }
@@ -173,8 +175,14 @@ pub struct RouteTable {
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
-    pub tls_routes: FnvHashMap<String, Vec<Backend>>,
-    pub wildcard_tls_routes: FnvHashMap<String, Vec<Backend>>,
+    /// TLS passthrough routes, scoped by listener port then SNI hostname.
+    /// Port 0 is the any-port scope (file-based configs without gateway
+    /// context). Without the port dimension, a TLSRoute attached to one
+    /// listener would hijack matching SNI on every other port.
+    pub tls_routes: FnvHashMap<u16, FnvHashMap<String, Vec<Backend>>>,
+    /// Wildcard TLS passthrough routes, keyed by (port, parent domain):
+    /// `*.example.com` is stored under "example.com".
+    pub wildcard_tls_routes: FnvHashMap<u16, FnvHashMap<String, Vec<Backend>>>,
 }
 
 impl RouteTable {
@@ -209,8 +217,16 @@ impl RouteTable {
             .tcp_routes
             .values()
             .chain(self.udp_routes.values())
-            .chain(self.tls_routes.values())
-            .chain(self.wildcard_tls_routes.values())
+            .chain(
+                self.tls_routes
+                    .values()
+                    .flat_map(|by_host| by_host.values()),
+            )
+            .chain(
+                self.wildcard_tls_routes
+                    .values()
+                    .flat_map(|by_host| by_host.values()),
+            )
             .flatten();
         http_backends
             .chain(l4_backends)
@@ -322,18 +338,17 @@ impl RouteTable {
         route_host: &str,
         rule: HttpRouteRule,
     ) {
-        // Find or create the listener scope within the port bucket
+        // Scopes store lowercase hostnames (see ListenerScope::new), so
+        // normalize before matching an existing scope.
+        let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
         let scopes = self.listener_scopes.entry(listener_port).or_default();
         let scope = match scopes
             .iter_mut()
-            .find(|s| s.listener_hostname.as_deref() == listener_hostname)
+            .find(|s| s.listener_hostname == normalized)
         {
             Some(s) => s,
             None => {
-                scopes.push(ListenerScope::new(
-                    listener_port,
-                    listener_hostname.map(|s| s.to_string()),
-                ));
+                scopes.push(ListenerScope::new(listener_port, normalized));
                 scopes.last_mut().unwrap()
             }
         };
@@ -489,14 +504,53 @@ impl RouteTable {
         self.udp_routes.insert(port, backends);
     }
 
-    pub fn add_tls_route(&mut self, hostname: &str, backends: Vec<Backend>) {
+    /// Register a TLS passthrough route on a listener port. Port 0 means
+    /// any-port (file-based configs without gateway context).
+    pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) {
         let host_lower = hostname.to_ascii_lowercase();
         if let Some(stripped) = host_lower.strip_prefix("*.") {
             self.wildcard_tls_routes
+                .entry(port)
+                .or_default()
                 .insert(stripped.to_string(), backends);
         } else {
-            self.tls_routes.insert(host_lower, backends);
+            self.tls_routes
+                .entry(port)
+                .or_default()
+                .insert(host_lower, backends);
         }
+    }
+
+    /// Look up the TLS-route backends for an SNI hostname on a port: exact
+    /// hostname first, then wildcard walking up domain labels (matching the
+    /// HTTP wildcard semantics — `*.example.com` also covers
+    /// `a.b.example.com`), each within the connection's port scope and then
+    /// the any-port (0) scope.
+    fn tls_route_backends(&self, sni: &str, server_port: u16) -> Option<&Vec<Backend>> {
+        let sni_lower = sni.to_ascii_lowercase();
+        let ports: &[u16] = if server_port == 0 {
+            &[0]
+        } else {
+            &[server_port, 0]
+        };
+        for port in ports {
+            if let Some(by_host) = self.tls_routes.get(port) {
+                if let Some(backends) = by_host.get(&sni_lower) {
+                    return Some(backends);
+                }
+            }
+            if let Some(by_host) = self.wildcard_tls_routes.get(port) {
+                let mut remainder = sni_lower.as_str();
+                while let Some(dot_pos) = remainder.find('.') {
+                    let parent = &remainder[dot_pos + 1..];
+                    if let Some(backends) = by_host.get(parent) {
+                        return Some(backends);
+                    }
+                    remainder = parent;
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a TLS passthrough connection to a backend address.
@@ -507,19 +561,8 @@ impl RouteTable {
         sni: &str,
         server_port: u16,
     ) -> Option<std::net::SocketAddr> {
-        let sni_lower = sni.to_ascii_lowercase();
-
-        // Exact SNI match
-        if let Some(backends) = self.tls_routes.get(&sni_lower) {
+        if let Some(backends) = self.tls_route_backends(sni, server_port) {
             return backends.first().map(|b| b.socket_addr);
-        }
-
-        // Wildcard SNI match: "foo.example.com" -> check "example.com"
-        if let Some(dot_pos) = sni_lower.find('.') {
-            let parent = &sni_lower[dot_pos + 1..];
-            if let Some(backends) = self.wildcard_tls_routes.get(parent) {
-                return backends.first().map(|b| b.socket_addr);
-            }
         }
 
         // Fall back to port-based TCP routes
@@ -529,20 +572,11 @@ impl RouteTable {
             .map(|b| b.socket_addr)
     }
 
-    /// Check if a TLS passthrough route exists for this SNI hostname.
-    /// Used by the worker to dynamically decide between passthrough and termination.
-    pub fn has_tls_passthrough_route(&self, sni: &str, _server_port: u16) -> bool {
-        let sni_lower = sni.to_ascii_lowercase();
-        if self.tls_routes.contains_key(&sni_lower) {
-            return true;
-        }
-        if let Some(dot_pos) = sni_lower.find('.') {
-            let parent = &sni_lower[dot_pos + 1..];
-            if self.wildcard_tls_routes.contains_key(parent) {
-                return true;
-            }
-        }
-        false
+    /// Check if a TLS passthrough route exists for this SNI hostname on this
+    /// port. Used by the worker to dynamically decide between passthrough and
+    /// termination when both share a port.
+    pub fn has_tls_passthrough_route(&self, sni: &str, server_port: u16) -> bool {
+        self.tls_route_backends(sni, server_port).is_some()
     }
 }
 
@@ -582,6 +616,13 @@ pub struct HttpRouteRule {
     pub total_weight: u64,
     /// Pre-computed prefix sums for O(log n) binary search in select_weighted_backend
     pub cumulative_weights: Vec<u64>,
+    /// Weighted round-robin position for this rule, shared by all clones
+    /// (`Clone` shares the `Arc`). Keying the counter to the rule itself —
+    /// rather than a map keyed by request-path hash — bounds counter storage
+    /// to the number of rules: high-cardinality paths (`/users/12345`, …)
+    /// previously inserted one never-evicted map entry per distinct path.
+    /// A table rebuild creates fresh rules and restarts the rotation.
+    pub counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpRouteRule {
@@ -607,6 +648,7 @@ impl HttpRouteRule {
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -958,7 +1000,7 @@ mod tests {
         assert_ne!(tcp_a.dns_signature(), tcp_b.dns_signature());
 
         let mut tls = RouteTable::new();
-        tls.add_tls_route("svc.example.com", vec![backend(1)]);
+        tls.add_tls_route(0, "svc.example.com", vec![backend(1)]);
         assert_ne!(RouteTable::new().dns_signature(), tls.dns_signature());
     }
 
@@ -1152,7 +1194,7 @@ mod tests {
         let mut counts = [0u32; 2];
         for _ in 0..400 {
             let idx = selector
-                .select_healthy_weighted_backend(42, r, &health)
+                .select_healthy_weighted_backend(r, &health)
                 .unwrap();
             counts[idx] += 1;
         }
@@ -1482,7 +1524,7 @@ mod tests {
     #[test]
     fn test_tls_route_sni_exact_match() {
         let mut rt = RouteTable::new();
-        rt.add_tls_route("secure.example.com", vec![backend(9001)]);
+        rt.add_tls_route(0, "secure.example.com", vec![backend(9001)]);
         rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
 
         let addr = rt.resolve_tls_passthrough("secure.example.com", 8443);
@@ -1492,7 +1534,7 @@ mod tests {
     #[test]
     fn test_tls_route_sni_wildcard_match() {
         let mut rt = RouteTable::new();
-        rt.add_tls_route("*.example.com", vec![backend(9002)]);
+        rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
         rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
 
         let addr = rt.resolve_tls_passthrough("foo.example.com", 8443);
@@ -1502,12 +1544,78 @@ mod tests {
     #[test]
     fn test_tls_route_sni_fallback_to_tcp() {
         let mut rt = RouteTable::new();
-        rt.add_tls_route("secure.example.com", vec![backend(9001)]);
+        rt.add_tls_route(0, "secure.example.com", vec![backend(9001)]);
         rt.add_tcp_route(8443, vec![backend(9999)]);
 
         // No SNI match -> falls back to TCP port route
         let addr = rt.resolve_tls_passthrough("other.example.org", 8443);
         assert_eq!(addr, Some("127.0.0.1:9999".parse().unwrap()));
+    }
+
+    /// A TLSRoute attached to a listener on one port must not hijack matching
+    /// SNI on other ports — the original bug ignored the port entirely, so an
+    /// HTTPS-terminate connection on 443 would get passed through whenever any
+    /// TLSRoute elsewhere claimed its hostname.
+    #[test]
+    fn test_tls_route_scoped_to_listener_port() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(9443, "svc.example.com", vec![backend(9001)]);
+
+        assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+        assert_eq!(
+            rt.resolve_tls_passthrough("svc.example.com", 9443),
+            Some("127.0.0.1:9001".parse().unwrap())
+        );
+
+        // Same SNI on a different port: no passthrough.
+        assert!(!rt.has_tls_passthrough_route("svc.example.com", 443));
+        assert_eq!(rt.resolve_tls_passthrough("svc.example.com", 443), None);
+    }
+
+    /// Any-port (0) TLS routes still match every port — the file-config path.
+    #[test]
+    fn test_tls_route_any_port_scope_matches_all_ports() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "svc.example.com", vec![backend(9001)]);
+        assert!(rt.has_tls_passthrough_route("svc.example.com", 443));
+        assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+    }
+
+    /// Wildcard TLS matching walks up domain labels like the HTTP wildcard
+    /// path — `*.example.com` also covers `a.b.example.com` (previously only
+    /// one label was stripped).
+    #[test]
+    fn test_tls_wildcard_matches_multi_label_subdomain() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
+        assert!(rt.has_tls_passthrough_route("a.b.example.com", 8443));
+        assert_eq!(
+            rt.resolve_tls_passthrough("a.b.example.com", 8443),
+            Some("127.0.0.1:9002".parse().unwrap())
+        );
+    }
+
+    /// L4 selection honors backendRef weights: 3:1 over 400 picks gives
+    /// exactly 300:100, and weight-0 backends receive no traffic.
+    #[test]
+    fn test_l4_weighted_selection() {
+        let mut b1 = backend(8001);
+        b1.weight = 3;
+        let b2 = backend(8002); // weight 1
+        let mut b0 = backend(8003);
+        b0.weight = 0;
+        let backends = vec![b1, b2, b0];
+
+        let health = crate::health::HealthRegistry::new();
+        let selector = BackendSelector::new();
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..400 {
+            let b = selector.select_l4_backend(7000, &backends, &health).unwrap();
+            *counts.entry(b.socket_addr.port()).or_insert(0u32) += 1;
+        }
+        assert_eq!(counts.get(&8001), Some(&300));
+        assert_eq!(counts.get(&8002), Some(&100));
+        assert_eq!(counts.get(&8003), None, "weight-0 backend must get no traffic");
     }
 
     #[test]
@@ -1548,7 +1656,7 @@ mod tests {
         let mut counts = [0u32; 2];
         for _ in 0..100 {
             let idx = selector
-                .select_healthy_weighted_backend(42, r, &health)
+                .select_healthy_weighted_backend(r, &health)
                 .unwrap();
             counts[idx] += 1;
         }
@@ -1593,7 +1701,7 @@ mod tests {
         let selector = BackendSelector::new();
         for _ in 0..100 {
             let idx = selector
-                .select_healthy_weighted_backend(42, r, &health)
+                .select_healthy_weighted_backend(r, &health)
                 .unwrap();
             assert_eq!(idx, 0, "zero-weight backend should never be selected");
         }
@@ -1636,10 +1744,13 @@ mod tests {
     }
 }
 
-/// Weighted round-robin backend selector.
+/// Round-robin backend selector for L4 (TCP/UDP) routes.
 ///
-/// Uses DashMap for lock-free per-route counters, allowing `&self` access
-/// without an outer Mutex. Each route hash gets its own atomic counter.
+/// Uses DashMap for lock-free per-port counters, allowing `&self` access
+/// without an outer Mutex. Bounded: keys are listener ports. HTTP rules carry
+/// their own counter (`HttpRouteRule::counter`) instead — keying HTTP
+/// selection by request-path hash grew this map without bound on
+/// high-cardinality paths.
 #[derive(Debug, Default)]
 pub struct BackendSelector {
     route_counters: dashmap::DashMap<u64, std::sync::atomic::AtomicU64, fnv::FnvBuildHasher>,
@@ -1677,7 +1788,6 @@ impl BackendSelector {
     /// n is typically 2–5 and this path is only taken during partial failures.
     pub fn select_healthy_weighted_backend(
         &self,
-        route_hash: u64,
         rule: &HttpRouteRule,
         health: &crate::health::HealthRegistry,
     ) -> Option<usize> {
@@ -1704,7 +1814,9 @@ impl BackendSelector {
             return None;
         }
 
-        let counter = self.next_counter(route_hash);
+        let counter = rule
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if healthy_count == backends.len() {
             if rule.total_weight == 0 {
@@ -1742,5 +1854,35 @@ impl BackendSelector {
         } else {
             count % backend_count
         }
+    }
+
+    /// Health-aware weighted round-robin over an L4 backend list, keyed by
+    /// listener port. Weight-0 backends receive no traffic (Gateway API
+    /// semantics). Returns `None` when no healthy backend with positive
+    /// weight exists.
+    pub fn select_l4_backend<'a>(
+        &self,
+        key: u64,
+        backends: &'a [Backend],
+        health: &crate::health::HealthRegistry,
+    ) -> Option<&'a Backend> {
+        let mut healthy_weight: u64 = 0;
+        for b in backends {
+            if health.is_healthy(&b.socket_addr) {
+                healthy_weight += b.weight as u64;
+            }
+        }
+        if healthy_weight == 0 {
+            return None;
+        }
+        let slot = self.next_counter(key) % healthy_weight;
+        let mut cumulative = 0u64;
+        backends
+            .iter()
+            .filter(|b| health.is_healthy(&b.socket_addr))
+            .find(|b| {
+                cumulative += b.weight as u64;
+                cumulative > slot
+            })
     }
 }
