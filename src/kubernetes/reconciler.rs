@@ -19,6 +19,7 @@ use super::converters::{
 };
 use super::parent_ref::{all_section_names_for_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, route_allowed_for_listener, RouteAllowResult};
+use super::services::ServiceState;
 
 // ---------------------------------------------------------------------------
 // Reconciliation input types — structured parameters for reconcile_to_config
@@ -34,17 +35,6 @@ pub(crate) struct ClusterSnapshot {
     pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
     pub reference_grants: Vec<ReferenceGrant>,
     pub services: Vec<Service>,
-}
-
-/// Resolved service metadata needed for route table construction.
-pub(crate) struct ServiceState {
-    pub known_services: HashSet<(String, String)>,
-    pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
-    pub app_protocol_overrides: HashMap<(String, u16), String>,
-    /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
-    /// data plane connects to DNS-resolved pod IPs on the targetPort, not the
-    /// service port (headless has no VIP and DNS carries no port).
-    pub headless_target_ports: HashMap<(String, u16), u16>,
 }
 
 // ---------------------------------------------------------------------------

@@ -6,4 +6,5 @@ pub mod hostname;
 pub mod parent_ref;
 pub mod reconciler;
 pub mod reference_grants;
+pub mod services;
 pub mod status;
