@@ -849,7 +849,12 @@ mod tests {
 
     // --- Port-conflict validation keys on the actually-bound socket ---------
 
-    fn listener_on(name: &str, port: u16, target_port: Option<u16>, address: Option<&str>) -> ListenerConfig {
+    fn listener_on(
+        name: &str,
+        port: u16,
+        target_port: Option<u16>,
+        address: Option<&str>,
+    ) -> ListenerConfig {
         ListenerConfig {
             name: name.to_string(),
             protocol: Protocol::HTTP,
@@ -932,7 +937,11 @@ mod tests {
             }],
         });
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("does not match any Gateway listener"), "{}", err);
+        assert!(
+            err.contains("does not match any Gateway listener"),
+            "{}",
+            err
+        );
     }
 
     #[test]

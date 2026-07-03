@@ -1610,12 +1610,18 @@ mod tests {
         let selector = BackendSelector::new();
         let mut counts = std::collections::HashMap::new();
         for _ in 0..400 {
-            let b = selector.select_l4_backend(7000, &backends, &health).unwrap();
+            let b = selector
+                .select_l4_backend(7000, &backends, &health)
+                .unwrap();
             *counts.entry(b.socket_addr.port()).or_insert(0u32) += 1;
         }
         assert_eq!(counts.get(&8001), Some(&300));
         assert_eq!(counts.get(&8002), Some(&100));
-        assert_eq!(counts.get(&8003), None, "weight-0 backend must get no traffic");
+        assert_eq!(
+            counts.get(&8003),
+            None,
+            "weight-0 backend must get no traffic"
+        );
     }
 
     #[test]
