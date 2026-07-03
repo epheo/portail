@@ -194,6 +194,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -213,6 +214,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -234,6 +236,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -256,6 +259,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -275,6 +279,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };
@@ -297,6 +302,7 @@ mod tests {
             supported_features: false,
             manage_gateway_status: true,
             readiness_port: 19099,
+            metrics_port: None,
             gateway: None,
             watch_shape: None,
         };

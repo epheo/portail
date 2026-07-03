@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::{debug, info, warn};
 use crate::metrics::METRICS;
-use crate::proxy::backend_pool::BackendPool;
+use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
@@ -91,7 +91,7 @@ impl Drop for ConnGuard {
 struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    pool: BackendPool,
+    pool: PoolHandle,
     selector: Arc<BackendSelector>,
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
@@ -117,9 +117,21 @@ pub async fn run_worker(
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
     active_connections: Arc<AtomicUsize>,
+    shared_pool: Option<Arc<SharedBackendPool>>,
 ) {
     // Selector is shared across all listeners so weighted round-robin counters
     // produce the correct distribution globally.
+
+    // Per-connection pool handle: the process-wide shared pool when
+    // `performance.backendPoolScope: process` is set, else a fresh
+    // per-connection pool (the default).
+    let make_pool = move |shared: &Option<Arc<SharedBackendPool>>| match shared {
+        Some(p) => PoolHandle::Shared(p.clone()),
+        None => PoolHandle::PerConn(BackendPool::new(
+            cfg.max_idle_per_backend,
+            cfg.connect_timeout,
+        )),
+    };
 
     loop {
         tokio::select! {
@@ -148,6 +160,7 @@ pub async fn run_worker(
                             // This handles the case where both HTTPS/Terminate and
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
+                            let pool = make_pool(&shared_pool);
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
                                 // Peek ClientHello for SNI to decide dispatch mode
@@ -187,7 +200,7 @@ pub async fn run_worker(
                                             let state = ConnectionState {
                                                 server_port,
                                                 routes,
-                                                pool: BackendPool::new(cfg.max_idle_per_backend, cfg.connect_timeout),
+                                                pool,
                                                 selector,
                                                 health,
                                                 is_tls: true,
@@ -213,7 +226,7 @@ pub async fn run_worker(
                             let state = ConnectionState {
                                 server_port,
                                 routes,
-                                pool: BackendPool::new(cfg.max_idle_per_backend, cfg.connect_timeout),
+                                pool: make_pool(&shared_pool),
                                 selector,
                                 health,
                                 is_tls: false,
@@ -678,7 +691,12 @@ async fn proxy_http_request(
     // The client got a clean response, but the backend conn returns to the pool
     // only when `backend_conn_poolable` allows — notably never after HEAD.
     if backend_conn_poolable(response_complete, framing_clean, meta.is_head) {
-        state.pool.release(backend_addr, backend);
+        state.pool.release(
+            backend_addr,
+            backend_ref.use_tls,
+            &backend_ref.server_name,
+            backend,
+        );
     } else if reusable {
         debug!(
             "Backend {} conn not pooled after HEAD (avoids body-desync on reuse)",

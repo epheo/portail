@@ -606,6 +606,25 @@ pub struct PerformanceConfig {
         serialize_with = "serialize_duration"
     )]
     pub client_header_timeout: Duration,
+
+    /// Scope of the idle backend-connection pool. `connection` (default)
+    /// pools per accepted client connection — lock-free, but reuse happens
+    /// only across keepalive requests on that same client. `process` shares
+    /// one pool across all client connections — cross-client reuse under
+    /// client-connection churn, at the cost of a sharded lock. Measurement
+    /// flag: the default stays `connection` until bench data justifies more.
+    #[serde(default)]
+    pub backend_pool_scope: PoolScope,
+}
+
+/// Scope of the idle backend-connection pool (see
+/// [`PerformanceConfig::backend_pool_scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolScope {
+    #[default]
+    Connection,
+    Process,
 }
 
 fn default_backend_timeout() -> Duration {
@@ -631,6 +650,7 @@ impl Default for PerformanceConfig {
             udp_session_timeout: default_udp_session_timeout(),
             dns_refresh_interval: default_dns_refresh_interval(),
             client_header_timeout: default_client_header_timeout(),
+            backend_pool_scope: PoolScope::default(),
         }
     }
 }

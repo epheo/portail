@@ -51,6 +51,9 @@ pub struct DataPlane {
     tls_cert_hashes: std::collections::HashMap<u16, u64>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
+    /// Process-wide backend pool when `performance.backendPoolScope: process`;
+    /// `None` keeps the default per-connection pools.
+    shared_pool: Option<Arc<crate::proxy::backend_pool::SharedBackendPool>>,
 }
 
 /// Maximum time to wait for in-flight connections on shutdown.
@@ -205,6 +208,15 @@ impl DataPlane {
             tls_configs: std::collections::HashMap::new(),
             tls_cert_hashes: std::collections::HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
+            shared_pool: match performance_config.backend_pool_scope {
+                crate::config::PoolScope::Process => Some(Arc::new(
+                    crate::proxy::backend_pool::SharedBackendPool::new(
+                        64,
+                        performance_config.backend_timeout,
+                    ),
+                )),
+                crate::config::PoolScope::Connection => None,
+            },
         })
     }
 
@@ -353,6 +365,7 @@ impl DataPlane {
 
                                 let selector = self.selector.clone();
                                 let active = self.active_connections.clone();
+                                let shared_pool = self.shared_pool.clone();
                                 let handle = tokio::spawn(async move {
                                     worker::run_worker(
                                         tokio_listener,
@@ -365,6 +378,7 @@ impl DataPlane {
                                         health,
                                         selector,
                                         active,
+                                        shared_pool,
                                     )
                                     .await;
                                 });
@@ -395,13 +409,15 @@ impl DataPlane {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();
 
-        for entry in self.tcp_listeners.drain(..) {
+        let tcp_entries: Vec<_> = self.tcp_listeners.drain(..).collect();
+        for entry in tcp_entries {
             let routes = routes.clone();
             let health = self.health.clone();
             let shutdown = self.shutdown.clone();
             let cfg = self.worker_config;
             let selector = self.selector.clone();
             let active = self.active_connections.clone();
+            let shared_pool = self.shared_pool.clone();
 
             let handle = tokio::spawn(async move {
                 worker::run_worker(
@@ -415,6 +431,7 @@ impl DataPlane {
                     health,
                     selector,
                     active,
+                    shared_pool,
                 )
                 .await;
             });
@@ -692,12 +709,7 @@ mod tests {
             interface: None,
             tls: None,
         }];
-        let perf = crate::config::PerformanceConfig {
-            backend_timeout: std::time::Duration::from_secs(1),
-            udp_session_timeout: std::time::Duration::from_secs(1),
-            dns_refresh_interval: std::time::Duration::from_secs(1),
-            client_header_timeout: std::time::Duration::from_secs(1),
-        };
+        let perf = test_perf();
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
 
         // Readiness keys on the bound (target) port, not the published port.
@@ -724,6 +736,7 @@ mod tests {
             udp_session_timeout: std::time::Duration::from_secs(1),
             dns_refresh_interval: std::time::Duration::from_secs(1),
             client_header_timeout: std::time::Duration::from_secs(1),
+            ..Default::default()
         }
     }
 
