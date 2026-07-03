@@ -1189,7 +1189,7 @@ mod tests {
             .find_http_route("test.com", "GET", "/", &[], "", 0)
             .unwrap();
 
-        let health = crate::health::HealthRegistry::new();
+        let health = crate::proxy::health::HealthRegistry::new();
         let selector = BackendSelector::new();
         let mut counts = [0u32; 2];
         for _ in 0..400 {
@@ -1606,7 +1606,7 @@ mod tests {
         b0.weight = 0;
         let backends = vec![b1, b2, b0];
 
-        let health = crate::health::HealthRegistry::new();
+        let health = crate::proxy::health::HealthRegistry::new();
         let selector = BackendSelector::new();
         let mut counts = std::collections::HashMap::new();
         for _ in 0..400 {
@@ -1657,7 +1657,7 @@ mod tests {
             .find_http_route("test.com", "GET", "/", &[], "", 0)
             .unwrap();
 
-        let health = crate::health::HealthRegistry::new();
+        let health = crate::proxy::health::HealthRegistry::new();
         let selector = BackendSelector::new();
         let mut counts = [0u32; 2];
         for _ in 0..100 {
@@ -1703,7 +1703,7 @@ mod tests {
             .find_http_route("test.com", "GET", "/", &[], "", 0)
             .unwrap();
 
-        let health = crate::health::HealthRegistry::new();
+        let health = crate::proxy::health::HealthRegistry::new();
         let selector = BackendSelector::new();
         for _ in 0..100 {
             let idx = selector
@@ -1795,7 +1795,7 @@ impl BackendSelector {
     pub fn select_healthy_weighted_backend(
         &self,
         rule: &HttpRouteRule,
-        health: &crate::health::HealthRegistry,
+        health: &crate::proxy::health::HealthRegistry,
     ) -> Option<usize> {
         let backends = &rule.backends;
 
@@ -1870,7 +1870,7 @@ impl BackendSelector {
         &self,
         key: u64,
         backends: &'a [Backend],
-        health: &crate::health::HealthRegistry,
+        health: &crate::proxy::health::HealthRegistry,
     ) -> Option<&'a Backend> {
         let mut healthy_weight: u64 = 0;
         for b in backends {

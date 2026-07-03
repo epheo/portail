@@ -11,9 +11,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::health::HealthRegistry;
 use crate::logging::{debug, info, warn};
-use crate::request_processor::{analyze_udp_request, RoutingResult};
+use crate::proxy::health::HealthRegistry;
+use crate::proxy::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
 
 struct UdpSession {

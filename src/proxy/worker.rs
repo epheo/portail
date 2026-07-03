@@ -13,18 +13,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::backend_pool::BackendPool;
-use crate::chunked::ChunkedStream;
-use crate::health::HealthRegistry;
-use crate::http_filters::{
+use crate::logging::{debug, info, warn};
+use crate::proxy::backend_pool::BackendPool;
+use crate::proxy::chunked::ChunkedStream;
+use crate::proxy::health::HealthRegistry;
+use crate::proxy::http_filters::{
     apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
     extract_header_mods, extract_url_rewrite, HeaderModifications, MIRROR_BODY_MAX,
 };
-use crate::http_parser::find_header_end;
-use crate::logging::{debug, info, warn};
-use crate::request_processor::{analyze_request, is_http_request, RequestMeta, RoutingResult};
+use crate::proxy::http_parser::find_header_end;
+use crate::proxy::request_processor::{
+    analyze_request, is_http_request, RequestMeta, RoutingResult,
+};
+use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
-use crate::tls::{self, Connection, DynamicTlsAcceptor};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
 /// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
@@ -152,7 +154,7 @@ pub async fn run_worker(
                                         tcp_stream.peek(&mut peek_buf),
                                     ).await {
                                         Ok(Ok(n)) if n > 0 => {
-                                            let sni = crate::tls::extract_sni(&peek_buf[..n]);
+                                            let sni = crate::proxy::tls::extract_sni(&peek_buf[..n]);
                                             if let Some(ref hostname) = sni {
                                                 let rt = routes.load();
                                                 rt.has_tls_passthrough_route(hostname, server_port)

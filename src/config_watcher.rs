@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::PortailConfig;
-use crate::health::HealthRegistry;
 use crate::logging::{error, info, warn};
+use crate::proxy::health::HealthRegistry;
 use crate::routing::RouteTable;
 
 /// Spawn a background task that listens for SIGHUP and reloads routes.

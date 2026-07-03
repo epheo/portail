@@ -88,7 +88,7 @@ pub(super) fn resolve_cert_ref(
                 secret_ns, name
             ))
         })?;
-    crate::tls::validate_cert_key_pair(&cert, &key)
+    crate::proxy::tls::validate_cert_key_pair(&cert, &key)
         .map_err(|e| CertRefError::Invalid(format!("Secret {}/{}: {}", secret_ns, name, e)))?;
     Ok((cert, key))
 }
@@ -361,7 +361,7 @@ pub(super) fn validate_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::test_util::generate_test_cert;
+    use crate::proxy::tls::test_util::generate_test_cert;
     use gateway_api::gateways::{
         GatewayListeners, GatewayListenersTls, GatewayListenersTlsCertificateRefs,
         GatewayListenersTlsMode, GatewaySpec,

@@ -76,7 +76,7 @@ struct ControllerCtx {
     /// task to re-resolve without an apiserver round-trip. `None` until the first
     /// successful reconcile.
     config_cell: Arc<ArcSwapOption<crate::config::PortailConfig>>,
-    data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
+    data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
     /// When false, the operator owns Gateway/GatewayClass lifecycle status
     /// (Accepted/Programmed/addresses); portail reports only listener + route status.
@@ -103,7 +103,7 @@ pub async fn run_controller(
     routes: Arc<ArcSwap<RouteTable>>,
     controller_name: String,
     shutdown: CancellationToken,
-    data_plane: Arc<std::sync::Mutex<crate::data_plane::DataPlane>>,
+    data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
     manage_gateway_status: bool,
     ready: Arc<std::sync::atomic::AtomicBool>,
@@ -228,7 +228,7 @@ pub async fn run_controller(
     // swap the route table only when the resolved set changes. This is why the
     // cluster-wide EndpointSlice watch is unnecessary — DNS already publishes the
     // per-pod A-records, so pod churn is picked up here without an apiserver watch.
-    crate::dns_refresh::spawn_dns_refresh(
+    crate::kubernetes::dns_refresh::spawn_dns_refresh(
         config_cell,
         ctx.routes.clone(),
         ctx.performance_config.dns_refresh_interval,

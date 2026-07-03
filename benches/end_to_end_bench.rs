@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use portail::http_parser::extract_routing_info;
+use portail::proxy::http_parser::extract_routing_info;
 use portail::routing::{Backend, HttpRouteRule, PathMatchType, RouteTable};
 use std::time::Duration;
 

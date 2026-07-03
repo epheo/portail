@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
-use data_plane::DataPlane;
+use proxy::data_plane::DataPlane;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -170,7 +170,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         // has bound its listener ports. Served on the readiness endpoint so the
         // operator's readinessProbe gates LB traffic and the Programmed status.
         let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(readiness::serve_readiness(
+        tokio::spawn(admin::serve_readiness(
             args.readiness_port,
             ready_flag.clone(),
             shutdown_token.clone(),

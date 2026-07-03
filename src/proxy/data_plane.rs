@@ -16,12 +16,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
-use crate::health::HealthRegistry;
 use crate::logging::{info, warn};
+use crate::proxy::health::HealthRegistry;
+use crate::proxy::tls::{self, DynamicTlsAcceptor};
+use crate::proxy::udp_worker;
+use crate::proxy::worker;
 use crate::routing::{BackendSelector, RouteTable};
-use crate::tls::{self, DynamicTlsAcceptor};
-use crate::udp_worker;
-use crate::worker;
 
 struct TcpListenerEntry {
     port: u16,
@@ -733,7 +733,8 @@ mod tests {
     /// bind loop for addresses that appeared after the first pass.
     #[tokio::test]
     async fn new_bind_address_with_unchanged_certs_still_binds() {
-        let Some((cert, key)) = crate::tls::test_util::generate_test_cert("a.example.org") else {
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("a.example.org")
+        else {
             return; // openssl unavailable
         };
         let mut listener = https_listener("https", 23443, Some("a.example.org"), "cert");

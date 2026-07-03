@@ -13,7 +13,7 @@
 //! half-closed by the time we write to it (`acquire_fresh`).
 
 use crate::logging::debug;
-use crate::tls::Connection;
+use crate::proxy::tls::Connection;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
