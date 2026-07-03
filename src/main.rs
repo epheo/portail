@@ -224,8 +224,18 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         }
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // Wait for shutdown: SIGINT (^C) or SIGTERM. Handling SIGTERM is not
+    // optional here — portail runs as PID 1 in its container, and the kernel
+    // applies NO default action to signals PID 1 has no handler for. With
+    // only the ctrl_c (SIGINT) handler, kubelet's graceful stop was silently
+    // ignored: every pod sat out its full terminationGracePeriod and died by
+    // SIGKILL, holding its (host-network) ports for those 30s and stalling
+    // every rollout behind EADDRINUSE retries.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
     info!("Received shutdown signal");
     shutdown_token.cancel();
 
