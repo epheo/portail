@@ -67,7 +67,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `example.org` via a catch-all listener gets dropped when a sibling
 /// `https-with-hostname` listener is processed last, hanging its TLS handshake
 /// until the client times out.
-fn merge_cert_refs_by_port(
+pub(crate) fn merge_cert_refs_by_port(
     listener_configs: &[ListenerConfig],
 ) -> std::collections::HashMap<u16, Vec<CertificateRef>> {
     let mut merged: std::collections::HashMap<u16, Vec<CertificateRef>> =
@@ -303,6 +303,14 @@ impl DataPlane {
                 if self.bound_endpoints.contains(&endpoint) {
                     continue; // Endpoint already bound
                 }
+                // A wildcard socket we already hold serves every address on
+                // the port (routing is port-keyed); an additional
+                // address-specific bind adds nothing and, depending on the
+                // platform's overlap rules, can fail EADDRINUSE against our
+                // own wildcard socket.
+                if endpoint.0.is_some() && self.bound_endpoints.contains(&(None, bound_port)) {
+                    continue;
+                }
 
                 let mut port_ok = true;
                 if listener_cfg.protocol == Protocol::UDP {
@@ -506,7 +514,14 @@ impl DataPlane {
 
     /// Check if all the specified (address, port) endpoints are bound and ready to serve traffic.
     pub fn is_ready_for_endpoints(&self, required: &[(Option<String>, u16)]) -> bool {
-        required.iter().all(|ep| self.bound_endpoints.contains(ep))
+        required.iter().all(|ep| {
+            self.bound_endpoints.contains(ep)
+                // A wildcard socket on the port already accepts traffic for
+                // any specific address; routing is keyed on the port. The
+                // reverse does NOT hold: a required wildcard bind is not
+                // satisfied by an address-specific one.
+                || (ep.0.is_some() && self.bound_endpoints.contains(&(None, ep.1)))
+        })
     }
 
     /// Get a reference to the shared health registry.
@@ -803,5 +818,37 @@ mod tests {
             !dp.tls_cert_hashes.contains_key(&23444),
             "failed build must retry next pass"
         );
+    }
+
+    /// A wildcard bind on a port covers every specific address: readiness
+    /// treats (Some(addr), port) as served by (None, port), and the bind loop
+    /// must not attempt an address-specific re-bind (which can EADDRINUSE
+    /// against our own wildcard socket, keeping Programmed=False forever).
+    #[tokio::test]
+    async fn wildcard_bind_covers_specific_addresses() {
+        let listeners = vec![ListenerConfig {
+            name: "http".into(),
+            protocol: P::HTTP,
+            port: 23445,
+            target_port: None,
+            hostname: None,
+            address: None, // wildcard
+            interface: None,
+            tls: None,
+        }];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        // Same port, now with a concrete bind address (e.g. a Gateway
+        // spec.addresses entry): the wildcard already serves it.
+        let (opened, errors) =
+            dp.add_tcp_listeners(&listeners, &["127.0.0.1".to_string()], routes, &perf);
+        assert_eq!((opened, errors.len()), (0, 0), "no re-bind, no error");
+
+        assert!(dp.is_ready_for_endpoints(&[(Some("127.0.0.1".to_string()), 23445)]));
+        assert!(dp.is_ready_for_endpoints(&[(None, 23445)]));
+        // The reverse is not satisfied: specific never covers wildcard.
+        assert!(!dp.is_ready_for_endpoints(&[(None, 23446)]));
     }
 }
