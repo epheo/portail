@@ -184,7 +184,7 @@ fn reconcile_fingerprint(
     listener_statuses: &HashMap<String, status::ListenerStatus>,
     usable: &UsableAddresses,
     route_status: &[RouteAcceptance],
-    observed_route_parents: Vec<String>,
+    observed_route_parents: &[String],
     dp_ready: bool,
 ) -> u64 {
     use std::hash::Hasher;
@@ -261,7 +261,7 @@ fn reconcile_fingerprint(
     // read-modify-write, so a concurrent writer clobbering our entry must
     // change the fingerprint — otherwise the skip path would leave the
     // clobbered status in place until the slow safety-net requeue.
-    write_sorted(&mut h, observed_route_parents);
+    write_sorted(&mut h, observed_route_parents.to_vec());
     h.write(&[dp_ready as u8]);
     h.finish()
 }
@@ -456,7 +456,6 @@ pub(super) async fn reconcile(
     }
 
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
-    ensure_data_plane_listeners(&ctx, &result.config.gateway.listeners, &bind_addresses);
 
     // Readiness keys on each listener's bound port (`target_port` when the
     // fronting Service decouples it, else the published port). Captured before
@@ -464,19 +463,20 @@ pub(super) async fn reconcile(
     // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service is
     // not yet observed, a privileged published bind fails harmlessly and
     // readiness stays down until the Service (and its targetPort) appear.
-    let required = required_endpoints(&result.config.gateway.listeners, &bind_addresses);
+    let listeners = result.config.gateway.listeners.clone();
+    let required = required_endpoints(&listeners, &bind_addresses);
 
-    // Data-plane readiness is computed before the (expensive) route-table
-    // build: it depends only on bound ports, and it feeds both the readiness
-    // latch and the reconcile fingerprint below.
-    let dp_ready = ctx
+    // Read-only readiness probe — no listener work yet. Feeds the fingerprint
+    // gate below, which decides whether ensure_data_plane_listeners (bind
+    // retries, TLS reload checks) needs to run at all this pass.
+    let dp_ready_initial = ctx
         .data_plane
         .lock()
         .map(|dp| dp.is_ready_for_endpoints(&required))
         .unwrap_or(false);
     // Once the data plane has bound this gateway's listener ports, the
     // pod is serving — latch readiness on (never flips back).
-    if dp_ready {
+    if dp_ready_initial {
         ctx.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -529,37 +529,92 @@ pub(super) async fn reconcile(
         })
         .collect();
 
+    let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
+
     // Short-circuit: when this pass would apply exactly what the last fully
     // successful pass already applied — same config (certs and override maps
     // included), same status conditions, same readiness — skip the route-table
     // rebuild and every status PATCH. This is what makes the watch echo of our
     // own status writes cheap, and turns the permanently-unaccepted-route case
     // from a 5s rebuild/PATCH loop into a slow safety-net re-check.
+    //
+    // The gate is three-way:
+    //   unchanged && ready      → skip everything, ensure() included. Sound:
+    //                             the fingerprint covers the cert bytes (no
+    //                             hot-reload can be pending) and readiness
+    //                             means no bind can be pending — the bound-
+    //                             endpoint set only grows.
+    //   unchanged && !ready     → the one thing an unchanged pass can still
+    //                             owe is a bind retry: run ensure(), and only
+    //                             a readiness flip falls through to apply.
+    //   changed                 → full apply path.
     let fingerprint = reconcile_fingerprint(
         &effective_config,
         &accepted_cond,
         &listener_statuses,
         &usable,
         &result.route_status,
-        observed_route_parents,
-        dp_ready,
+        &observed_route_parents,
+        dp_ready_initial,
     );
-    if ctx
+    let unchanged = ctx
         .last_applied
         .lock()
         .map(|last| *last == Some(fingerprint))
-        .unwrap_or(false)
-    {
-        let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
+        .unwrap_or(false);
+    if unchanged && dp_ready_initial {
         debug!(
             "Gateway {}/{} unchanged since last applied reconcile; skipping rebuild and status writes",
             gw_ns, gw_name
         );
         return Ok(Action::requeue(Duration::from_secs(skip_requeue_secs(
-            dp_ready,
+            true,
             all_routes_accepted,
         ))));
     }
+
+    // Inputs changed, or unchanged-but-unready: bring the data plane in line
+    // (open new listeners, retry failed binds, hot-reload changed certs).
+    ensure_data_plane_listeners(&ctx, &listeners, &bind_addresses);
+    let dp_ready = ctx
+        .data_plane
+        .lock()
+        .map(|dp| dp.is_ready_for_endpoints(&required))
+        .unwrap_or(false);
+    if dp_ready {
+        ctx.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    // Unchanged and still unready after the bind retry: nothing else differs
+    // from the last applied pass — back off without rebuild or PATCHes.
+    // (Unchanged with readiness flipped false→true falls through: Programmed
+    // changes, so the apply path must run.)
+    if unchanged && !dp_ready {
+        debug!(
+            "Gateway {}/{} unchanged and still unready after bind retry; skipping rebuild",
+            gw_ns, gw_name
+        );
+        return Ok(Action::requeue(Duration::from_secs(skip_requeue_secs(
+            false,
+            all_routes_accepted,
+        ))));
+    }
+
+    // Fingerprint recorded on success — same inputs, with the post-ensure
+    // readiness when it moved.
+    let fingerprint = if dp_ready == dp_ready_initial {
+        fingerprint
+    } else {
+        reconcile_fingerprint(
+            &effective_config,
+            &accepted_cond,
+            &listener_statuses,
+            &usable,
+            &result.route_status,
+            &observed_route_parents,
+            dp_ready,
+        )
+    };
 
     // Per-listener attached-route counts, restricted to this Gateway's routes.
     let mut listener_route_counts: HashMap<String, i32> = gateway
@@ -698,7 +753,6 @@ pub(super) async fn reconcile(
     }
 
     // Requeue cadence is convergence-driven — see `success_requeue_secs`.
-    let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
     Ok(Action::requeue(Duration::from_secs(success_requeue_secs(
         programmed,
         all_routes_accepted,
@@ -745,6 +799,70 @@ mod tests {
         assert_eq!(eps.len(), 2);
         assert!(eps.contains(&(Some("10.0.0.1".to_string()), 8001)));
         assert!(eps.contains(&(Some("10.0.0.2".to_string()), 8001)));
+    }
+
+    /// The early-skip gate is only sound if the fingerprint is deterministic
+    /// for identical inputs and moves when any status-bearing input moves —
+    /// dp_ready in particular, since the three-way gate keys on it.
+    #[test]
+    fn fingerprint_deterministic_and_sensitive() {
+        let config = crate::config::PortailConfig::default();
+        let cond = status::GatewayCondition {
+            ok: true,
+            reason: "Accepted".into(),
+            message: "ok".into(),
+        };
+        let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
+        listener_statuses.insert("http".into(), status::ListenerStatus::default());
+        let usable = UsableAddresses {
+            interface_ips: vec!["10.0.0.1".into()],
+            network_ips: HashMap::new(),
+        };
+        let parents = vec!["HTTPRoute/default/r:[]".to_string()];
+
+        let fp = |ls: &HashMap<String, status::ListenerStatus>, ready: bool| {
+            reconcile_fingerprint(&config, &cond, ls, &usable, &[], &parents, ready)
+        };
+
+        // Deterministic: same inputs, same hash — twice.
+        assert_eq!(fp(&listener_statuses, true), fp(&listener_statuses, true));
+
+        // dp_ready flips the hash (the gate's fall-through depends on this).
+        assert_ne!(fp(&listener_statuses, true), fp(&listener_statuses, false));
+
+        // A listener condition change flips the hash.
+        let mut changed = HashMap::new();
+        changed.insert(
+            "http".to_string(),
+            status::ListenerStatus {
+                resolved_refs_reason: "InvalidCertificateRef".into(),
+                ..Default::default()
+            },
+        );
+        assert_ne!(fp(&listener_statuses, true), fp(&changed, true));
+
+        // Observed status.parents clobber flips the hash.
+        let clobbered = vec!["HTTPRoute/default/r:[{\"other\":true}]".to_string()];
+        assert_ne!(
+            reconcile_fingerprint(
+                &config,
+                &cond,
+                &listener_statuses,
+                &usable,
+                &[],
+                &parents,
+                true
+            ),
+            reconcile_fingerprint(
+                &config,
+                &cond,
+                &listener_statuses,
+                &usable,
+                &[],
+                &clobbered,
+                true
+            ),
+        );
     }
 
     /// Unscoped mode: merging two Gateways' configs must keep every route,
