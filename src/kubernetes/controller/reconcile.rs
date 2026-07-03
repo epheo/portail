@@ -576,7 +576,26 @@ pub(super) async fn reconcile(
 
     // Inputs changed, or unchanged-but-unready: bring the data plane in line
     // (open new listeners, retry failed binds, hot-reload changed certs).
-    ensure_data_plane_listeners(&ctx, &listeners, &bind_addresses);
+    //
+    // The data plane gets the EFFECTIVE (merged) listeners, not this
+    // Gateway's: in legacy unscoped mode several Gateways may share a port,
+    // and merge_cert_refs_by_port can only merge cert refs it can see.
+    // Passing one Gateway's listeners at a time made alternating reconciles
+    // rebuild the port's ServerConfig with only that Gateway's certs — each
+    // Gateway clobbered the other's SNI entries, and the fingerprint gate
+    // then froze whichever wrote last (v0.1.13 regression, hit on a
+    // two-Gateway single-node host-network deployment). In scoped mode the
+    // effective config IS this Gateway's config, so nothing changes there.
+    // Readiness (`required`) deliberately stays keyed on THIS Gateway's own
+    // listeners: its Programmed condition should not depend on sibling
+    // Gateways' ports.
+    let ensure_bind_addresses =
+        compute_bind_addresses(&effective_config.gateway.addresses, &usable);
+    ensure_data_plane_listeners(
+        &ctx,
+        &effective_config.gateway.listeners,
+        &ensure_bind_addresses,
+    );
     let dp_ready = ctx
         .data_plane
         .lock()
@@ -952,6 +971,69 @@ mod tests {
         assert_eq!(
             route_b.parent_refs[0].section_name.as_deref(),
             Some("ns-b/gw-b/http"),
+        );
+    }
+
+    /// Unscoped mode, two Gateways sharing port 443: the data plane must be
+    /// ensured with the MERGED listeners so the per-port cert merge sees both
+    /// Gateways' refs. Passing one Gateway's listeners at a time let each
+    /// reconcile rebuild the port's ServerConfig with only its own certs,
+    /// clobbering the sibling's SNI entries — and the fingerprint gate then
+    /// froze whichever wrote last (v0.1.13 regression, two host-network
+    /// Gateways on one node).
+    #[test]
+    fn merged_listeners_carry_every_gateways_certs_per_port() {
+        use crate::config::{
+            CertificateRef, GatewayConfig, ListenerConfig, PortailConfig, Protocol as CfgProtocol,
+            TlsConfig, TlsMode,
+        };
+
+        fn tls_gw(gw: &str, cert: &str, host: &str) -> PortailConfig {
+            PortailConfig {
+                gateway: GatewayConfig {
+                    name: gw.to_string(),
+                    listeners: vec![ListenerConfig {
+                        name: "https".to_string(),
+                        protocol: CfgProtocol::HTTPS,
+                        port: 443,
+                        target_port: None,
+                        hostname: Some(host.to_string()),
+                        address: None,
+                        interface: None,
+                        tls: Some(TlsConfig {
+                            mode: TlsMode::Terminate,
+                            certificate_refs: vec![CertificateRef {
+                                name: cert.to_string(),
+                                hostname: Some(host.to_string()),
+                                cert_pem: Some(b"C".to_vec()),
+                                key_pem: Some(b"K".to_vec()),
+                            }],
+                        }),
+                    }],
+                    addresses: vec![],
+                },
+                ..Default::default()
+            }
+        }
+
+        let mut map = HashMap::new();
+        map.insert(
+            ("ns-a".to_string(), "gw-a".to_string()),
+            Arc::new(tls_gw("gw-a", "cert-a", "a.example.com")),
+        );
+        map.insert(
+            ("ns-b".to_string(), "gw-b".to_string()),
+            Arc::new(tls_gw("gw-b", "cert-b", "b.example.com")),
+        );
+
+        let merged = merge_gateway_configs(&map);
+        let by_port = crate::proxy::data_plane::merge_cert_refs_by_port(&merged.gateway.listeners);
+        let mut names: Vec<&str> = by_port[&443].iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["cert-a", "cert-b"],
+            "the shared port's ServerConfig inputs must include every Gateway's refs"
         );
     }
 }
