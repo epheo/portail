@@ -114,7 +114,15 @@ fn main() -> Result<()> {
 
 async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     let performance_config = portail_config.performance.clone();
-    let listeners = portail_config.gateway.listeners.clone();
+    // Kubernetes mode binds nothing up front: every listener comes from a
+    // reconciled Gateway. The default config's example :8080 listener is a
+    // standalone-only convenience — binding it here made k8s-mode startup
+    // fail outright whenever anything else on the host held that port.
+    let listeners = if args.kubernetes {
+        Vec::new()
+    } else {
+        portail_config.gateway.listeners.clone()
+    };
     let cert_dir = args
         .cert_dir
         .clone()
