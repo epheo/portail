@@ -96,6 +96,58 @@ fn main() {
             drop(proxy);
         }
 
+        println!();
+
+        // Scenario 5: keepalive load with the process-wide pool — the
+        // contention guard. Compare against scenario 2: same load, pool
+        // scope is the only variable.
+        {
+            let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "process");
+            println!(
+                "--- No-filter path ({} backends), process-wide pool ---",
+                NUM_BACKENDS
+            );
+            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        println!();
+
+        // Churn scenarios: one request per connection, then close. rewrk-core
+        // holds keepalive client connections — the best case for the
+        // per-connection pool — so pool-scope differences only show here:
+        // with churn, a per-connection pool gets zero backend reuse (every
+        // request pays a fresh backend connect), while the process-wide pool
+        // still reuses idle backend conns across client connections.
+        {
+            println!("--- Churn: direct to kiss (baseline) ---");
+            run_churn_bench(KISS_BASE_PORT, "/bench.txt").await;
+        }
+
+        println!();
+
+        {
+            let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "connection");
+            println!(
+                "--- Churn: proxy, per-connection pool ({} backends) ---",
+                NUM_BACKENDS
+            );
+            run_churn_bench(PORTAIL_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
+        println!();
+
+        {
+            let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "process");
+            println!(
+                "--- Churn: proxy, process-wide pool ({} backends) ---",
+                NUM_BACKENDS
+            );
+            run_churn_bench(PORTAIL_PORT, "/bench.txt").await;
+            drop(proxy);
+        }
+
         drop(kiss_handles);
         println!("\n=== Benchmark complete ===");
     });
@@ -125,6 +177,95 @@ async fn run_bench(port: u16, path: &str) {
 
     let collector = benchmarker.consume_collector().await;
     collector.print_results(wall_elapsed);
+}
+
+/// Connection-churn load: N tasks each looping connect → one GET → read the
+/// full response (Content-Length-framed) → close silently, for
+/// BENCH_DURATION. Hand-rolled because rewrk-core keeps its client
+/// connections alive.
+///
+/// Deliberately does NOT send `Connection: close`: the proxy forwards the
+/// client's header block to the backend, so an announced close makes the
+/// BACKEND close after every response too — no backend conn survives to be
+/// pooled, and pool scope can't matter. A silent close after the response is
+/// the churn shape cross-client pooling actually targets.
+async fn run_churn_bench(port: u16, path: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CHURN_CONCURRENCY: usize = 64;
+    let deadline = Instant::now() + BENCH_DURATION;
+    let request = std::sync::Arc::new(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path));
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn content_length(headers: &[u8]) -> Option<usize> {
+        for line in headers.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+                return std::str::from_utf8(&line[15..]).ok()?.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    async fn one(port: u16, request: &str) -> Result<()> {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        s.set_nodelay(true)?;
+        s.write_all(request.as_bytes()).await?;
+        let mut buf = Vec::with_capacity(1024);
+        let mut tmp = [0u8; 4096];
+        let total = loop {
+            let n = s.read(&mut tmp).await?;
+            anyhow::ensure!(n > 0, "connection closed mid-response");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = find_subslice(&buf, b"\r\n\r\n") {
+                let cl = content_length(&buf[..header_end])
+                    .ok_or_else(|| anyhow::anyhow!("no Content-Length"))?;
+                break header_end + 4 + cl;
+            }
+        };
+        while buf.len() < total {
+            let n = s.read(&mut tmp).await?;
+            anyhow::ensure!(n > 0, "connection closed mid-body");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        Ok(()) // drop closes the client conn without announcing it
+    }
+
+    let wall_start = Instant::now();
+    let mut handles = Vec::with_capacity(CHURN_CONCURRENCY);
+    for _ in 0..CHURN_CONCURRENCY {
+        let request = request.clone();
+        handles.push(tokio::spawn(async move {
+            let (mut ok, mut errs) = (0u64, 0u64);
+            while Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_secs(5), one(port, &request)).await {
+                    Ok(Ok(())) => ok += 1,
+                    _ => errs += 1,
+                }
+            }
+            (ok, errs)
+        }));
+    }
+
+    let (mut ok, mut errs) = (0u64, 0u64);
+    for h in handles {
+        let (o, e) = h.await.unwrap();
+        ok += o;
+        errs += e;
+    }
+    let wall = wall_start.elapsed();
+    println!(
+        "  Requests:    {} ({:.0} conn+req/s)",
+        ok,
+        ok as f64 / wall.as_secs_f64()
+    );
+    println!("  Duration:    {:.2}s", wall.as_secs_f64());
+    if errs > 0 {
+        println!("  Errors:      {}", errs);
+    }
 }
 
 // --- Producer: generates request batches for a fixed duration ---
@@ -272,15 +413,20 @@ fn backend_refs_json(ports: &[u16]) -> String {
 }
 
 fn spawn_portail_no_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
+    spawn_portail_pool(backend_ports, port, "connection")
+}
+
+fn spawn_portail_pool(backend_ports: &[u16], port: u16, pool_scope: &str) -> ProcessHandle {
     let config = format!(
         r#"{{
   "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}]}},
   "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"http"}}],"hostnames":["127.0.0.1"],"rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],"backendRefs":[{}]}}]}}],
   "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
-  "performance": {{}}
+  "performance": {{"backendPoolScope":"{}"}}
 }}"#,
         port,
         backend_refs_json(backend_ports),
+        pool_scope,
     );
 
     spawn_portail_with_config(&config, port)
