@@ -1,6 +1,11 @@
 //! Gateway validation: TLS certificateRef resolution against the Secret
 //! reflector store, and the listener/Gateway condition computation that
 //! feeds status (Accepted / ResolvedRefs / Programmed reasons).
+//!
+//! Certificates are REALLY parsed here (`tls::validate_cert_key_pair` — the
+//! same rustls path the data plane uses), so a Secret whose PEM cannot be
+//! served never reaches `ResolvedRefs=True`. Resolution happens once; both
+//! the config build and the status conditions consume its result.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,20 +15,97 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
+use crate::kubernetes::converters::CertData;
 use crate::kubernetes::reference_grants::is_reference_allowed;
 use crate::kubernetes::status;
-use crate::logging::{debug, warn};
+use crate::logging::warn;
+
+/// Why a certificateRef could not be resolved. Maps 1:1 to the listener
+/// `ResolvedRefs` condition reason.
+#[derive(Debug)]
+pub(super) enum CertRefError {
+    /// Cross-namespace ref without a ReferenceGrant → `RefNotPermitted`.
+    NotPermitted(String),
+    /// Missing Secret, missing tls.crt/tls.key, or PEM the real rustls
+    /// parse/key-load rejects → `InvalidCertificateRef`.
+    Invalid(String),
+}
+
+impl CertRefError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            CertRefError::NotPermitted(_) => "RefNotPermitted",
+            CertRefError::Invalid(_) => "InvalidCertificateRef",
+        }
+    }
+    pub fn message(&self) -> &str {
+        match self {
+            CertRefError::NotPermitted(m) | CertRefError::Invalid(m) => m,
+        }
+    }
+}
+
+/// Outcome of resolving every certificateRef on a Gateway: PEM bytes for the
+/// refs that validated, the first error for each ref that did not.
+pub(super) struct ResolvedCerts {
+    pub valid: CertData,
+    pub errors: HashMap<(String, String), CertRefError>,
+}
+
+/// Resolve one certificateRef to its PEM bytes. Pure — the Secret lookup and
+/// the ReferenceGrant decision happen at the caller; this validates what was
+/// found, including the full rustls parse + key load.
+pub(super) fn resolve_cert_ref(
+    secret: Option<&Secret>,
+    cross_ns_allowed: bool,
+    secret_ns: &str,
+    name: &str,
+) -> Result<(Vec<u8>, Vec<u8>), CertRefError> {
+    if !cross_ns_allowed {
+        return Err(CertRefError::NotPermitted(format!(
+            "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
+            secret_ns, name
+        )));
+    }
+    let Some(secret) = secret else {
+        return Err(CertRefError::Invalid(format!(
+            "Secret {}/{} not found or missing tls.crt/tls.key",
+            secret_ns, name
+        )));
+    };
+    let (cert, key) = secret
+        .data
+        .as_ref()
+        .and_then(|data| {
+            Some((
+                data.get("tls.crt")?.0.clone(),
+                data.get("tls.key")?.0.clone(),
+            ))
+        })
+        .ok_or_else(|| {
+            CertRefError::Invalid(format!(
+                "Secret {}/{} not found or missing tls.crt/tls.key",
+                secret_ns, name
+            ))
+        })?;
+    crate::tls::validate_cert_key_pair(&cert, &key)
+        .map_err(|e| CertRefError::Invalid(format!("Secret {}/{}: {}", secret_ns, name, e)))?;
+    Ok((cert, key))
+}
 
 /// Resolve TLS certificates for a Gateway from the reflector Secret store.
 /// Iterates all listeners, checks cross-namespace ReferenceGrant permissions,
-/// looks up Secrets, and validates PEM format.
+/// looks up Secrets, and validates each pair with the real rustls parse.
 pub(super) fn resolve_gateway_certs(
     gateway: &Gateway,
     gw_ns: &str,
     reference_grants: &[ReferenceGrant],
     store_secrets: &Store<Secret>,
-) -> HashMap<(String, String), (Vec<u8>, Vec<u8>)> {
-    let mut cert_data: HashMap<(String, String), (Vec<u8>, Vec<u8>)> = HashMap::new();
+) -> ResolvedCerts {
+    let mut resolved = ResolvedCerts {
+        valid: CertData::new(),
+        errors: HashMap::new(),
+    };
     for listener in &gateway.spec.listeners {
         let Some(tls) = &listener.tls else { continue };
         let Some(cert_refs) = &tls.certificate_refs else {
@@ -31,10 +113,13 @@ pub(super) fn resolve_gateway_certs(
         };
         for cert_ref in cert_refs {
             let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+            let key = (cert_ref.name.clone(), secret_ns.to_string());
+            if resolved.valid.contains_key(&key) || resolved.errors.contains_key(&key) {
+                continue; // same Secret referenced by several listeners
+            }
 
-            // Cross-namespace cert ref requires a ReferenceGrant
-            if secret_ns != gw_ns
-                && !is_reference_allowed(
+            let cross_ns_allowed = secret_ns == gw_ns
+                || is_reference_allowed(
                     reference_grants,
                     "gateway.networking.k8s.io",
                     "Gateway",
@@ -43,63 +128,39 @@ pub(super) fn resolve_gateway_certs(
                     "Secret",
                     secret_ns,
                     &cert_ref.name,
-                )
-            {
-                warn!(
-                    "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                    secret_ns, cert_ref.name
                 );
-                continue;
-            }
-
-            // Look up secret from reflector cache
             let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
-            match store_secrets.get(&secret_ref) {
-                Some(secret) => {
-                    if let Some(data) = &secret.data {
-                        let cert_pem = data.get("tls.crt").map(|b| b.0.clone());
-                        let key_pem = data.get("tls.key").map(|b| b.0.clone());
-                        if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
-                            let cert_str = String::from_utf8_lossy(&cert);
-                            let key_str = String::from_utf8_lossy(&key);
-                            if cert_str.contains("BEGIN CERTIFICATE")
-                                && (key_str.contains("BEGIN PRIVATE KEY")
-                                    || key_str.contains("BEGIN RSA PRIVATE KEY")
-                                    || key_str.contains("BEGIN EC PRIVATE KEY"))
-                            {
-                                cert_data.insert(
-                                    (cert_ref.name.clone(), secret_ns.to_string()),
-                                    (cert, key),
-                                );
-                            } else {
-                                warn!(
-                                    "Secret {}/{} has malformed PEM data",
-                                    secret_ns, cert_ref.name
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "Secret {}/{} missing tls.crt or tls.key",
-                                secret_ns, cert_ref.name
-                            );
-                        }
-                    }
+            let secret = store_secrets.get(&secret_ref);
+
+            match resolve_cert_ref(
+                secret.as_deref(),
+                cross_ns_allowed,
+                secret_ns,
+                &cert_ref.name,
+            ) {
+                Ok(pair) => {
+                    resolved.valid.insert(key, pair);
                 }
-                None => {
-                    debug!("Secret {}/{} not found in cache", secret_ns, cert_ref.name);
+                Err(e) => {
+                    warn!(
+                        "Certificate ref {}/{}: {}",
+                        secret_ns,
+                        cert_ref.name,
+                        e.message()
+                    );
+                    resolved.errors.insert(key, e);
                 }
             }
         }
     }
-    cert_data
+    resolved
 }
 
 /// Validate Gateway listeners and compute gateway-level acceptance.
 pub(super) fn validate_gateway(
     gateway: &Gateway,
     gw_ns: &str,
-    cert_data: &HashMap<(String, String), (Vec<u8>, Vec<u8>)>,
-    reference_grants: &[ReferenceGrant],
+    certs: &ResolvedCerts,
 ) -> (
     HashMap<String, status::ListenerStatus>,
     status::GatewayCondition,
@@ -157,30 +218,18 @@ pub(super) fn validate_gateway(
                     }
 
                     let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+                    let key = (cert_ref.name.clone(), secret_ns.to_string());
 
-                    // Cross-namespace cert ref requires ReferenceGrant
-                    if secret_ns != gw_ns
-                        && !is_reference_allowed(
-                            reference_grants,
-                            "gateway.networking.k8s.io",
-                            "Gateway",
-                            gw_ns,
-                            "",
-                            "Secret",
-                            secret_ns,
-                            &cert_ref.name,
-                        )
-                    {
+                    // Resolution (ReferenceGrant check + Secret lookup + real
+                    // rustls parse) ran once in resolve_gateway_certs; the
+                    // condition just reports its outcome.
+                    if let Some(err) = certs.errors.get(&key) {
                         refs_failed = true;
-                        ls.resolved_refs_reason = "RefNotPermitted".into();
-                        ls.resolved_refs_message = format!(
-                            "Cross-namespace certificate ref {}/{} not allowed by ReferenceGrant",
-                            secret_ns, cert_ref.name
-                        );
-                        continue;
-                    }
-
-                    if !cert_data.contains_key(&(cert_ref.name.clone(), secret_ns.to_string())) {
+                        ls.resolved_refs_reason = err.reason().into();
+                        ls.resolved_refs_message = err.message().to_string();
+                    } else if !certs.valid.contains_key(&key) {
+                        // Not resolved at all — e.g. the Secret watch is gated
+                        // off by --watch-shape. Same condition as "not found".
                         refs_failed = true;
                         ls.resolved_refs_reason = "InvalidCertificateRef".into();
                         ls.resolved_refs_message = format!(
@@ -307,4 +356,184 @@ pub(super) fn validate_gateway(
             message,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tls::test_util::generate_test_cert;
+    use gateway_api::gateways::{
+        GatewayListeners, GatewayListenersTls, GatewayListenersTlsCertificateRefs,
+        GatewayListenersTlsMode, GatewaySpec,
+    };
+    use k8s_openapi::ByteString;
+    use kube::core::ObjectMeta;
+    use std::collections::BTreeMap;
+
+    fn tls_secret(name: &str, ns: &str, cert: &[u8], key: &[u8]) -> Secret {
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                namespace: Some(ns.into()),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([
+                ("tls.crt".to_string(), ByteString(cert.to_vec())),
+                ("tls.key".to_string(), ByteString(key.to_vec())),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    fn https_gateway(cert_name: &str) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "portail".into(),
+                listeners: vec![GatewayListeners {
+                    name: "https".into(),
+                    port: 443,
+                    protocol: "HTTPS".into(),
+                    hostname: None,
+                    tls: Some(GatewayListenersTls {
+                        mode: Some(GatewayListenersTlsMode::Terminate),
+                        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                            name: cert_name.into(),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    allowed_routes: None,
+                }],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn resolve_cert_ref_missing_secret_is_invalid() {
+        let err = resolve_cert_ref(None, true, "default", "no-such").unwrap_err();
+        assert_eq!(err.reason(), "InvalidCertificateRef");
+        assert!(err.message().contains("not found"));
+    }
+
+    #[test]
+    fn resolve_cert_ref_cross_ns_without_grant_is_not_permitted() {
+        let err = resolve_cert_ref(None, false, "other", "cert").unwrap_err();
+        assert_eq!(err.reason(), "RefNotPermitted");
+    }
+
+    #[test]
+    fn resolve_cert_ref_missing_key_is_invalid() {
+        let mut secret = tls_secret("cert", "default", b"x", b"y");
+        secret.data.as_mut().unwrap().remove("tls.key");
+        let err = resolve_cert_ref(Some(&secret), true, "default", "cert").unwrap_err();
+        assert_eq!(err.reason(), "InvalidCertificateRef");
+    }
+
+    /// Regression for the closed status gap: PEM that passes the old
+    /// substring check ("BEGIN CERTIFICATE" present) but fails the real
+    /// rustls parse must be Invalid — it previously reached
+    /// ResolvedRefs=True while the data plane silently skipped the cert.
+    #[test]
+    fn resolve_cert_ref_substring_passing_garbage_is_invalid() {
+        let fake_cert = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let fake_key = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let secret = tls_secret("fake", "default", fake_cert, fake_key);
+        let err = resolve_cert_ref(Some(&secret), true, "default", "fake").unwrap_err();
+        assert_eq!(err.reason(), "InvalidCertificateRef");
+    }
+
+    #[test]
+    fn resolve_cert_ref_valid_pair_ok() {
+        let Some((cert, key)) = generate_test_cert("ok.example.com") else {
+            return; // openssl unavailable
+        };
+        let secret = tls_secret("ok", "default", &cert, &key);
+        let (c, k) = resolve_cert_ref(Some(&secret), true, "default", "ok").unwrap();
+        assert_eq!((c, k), (cert, key));
+    }
+
+    #[test]
+    fn validate_gateway_propagates_cert_error_into_resolved_refs() {
+        let gw = https_gateway("bad-cert");
+        let mut certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        certs.errors.insert(
+            ("bad-cert".into(), "default".into()),
+            CertRefError::Invalid(
+                "Secret default/bad-cert: Failed to parse certificate PEM".into(),
+            ),
+        );
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        let ls = &listeners["https"];
+        assert!(!ls.resolved_refs);
+        assert_eq!(ls.resolved_refs_reason, "InvalidCertificateRef");
+        assert!(!ls.programmed, "unresolved refs must block Programmed");
+        assert!(
+            gw_cond.ok,
+            "listener-level failure keeps the Gateway Accepted"
+        );
+    }
+
+    #[test]
+    fn validate_gateway_valid_cert_resolves() {
+        let gw = https_gateway("good");
+        let mut certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        certs
+            .valid
+            .insert(("good".into(), "default".into()), (vec![1], vec![2]));
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        let ls = &listeners["https"];
+        assert!(ls.resolved_refs && ls.programmed);
+    }
+
+    #[test]
+    fn validate_gateway_https_without_tls_config() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners[0].tls = None;
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        let ls = &listeners["https"];
+        assert!(!ls.resolved_refs);
+        assert_eq!(ls.resolved_refs_reason, "InvalidCertificateRef");
+    }
+
+    #[test]
+    fn validate_gateway_protocol_conflict() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners[0].tls = None;
+        gw.spec.listeners[0].protocol = "HTTP".into();
+        gw.spec.listeners.push(GatewayListeners {
+            name: "tcp".into(),
+            port: 443,
+            protocol: "TCP".into(),
+            hostname: None,
+            tls: None,
+            allowed_routes: None,
+        });
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        assert!(listeners.values().all(|ls| ls.conflicted && !ls.accepted));
+        assert!(
+            !gw_cond.ok,
+            "all listeners rejected -> Gateway not accepted"
+        );
+    }
 }

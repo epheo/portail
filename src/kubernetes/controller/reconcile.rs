@@ -388,7 +388,7 @@ pub(super) async fn reconcile(
         services: ctx.cache.services.state(),
     };
 
-    let cert_data = resolve_gateway_certs(
+    let resolved_certs = resolve_gateway_certs(
         &gateway,
         &gw_ns,
         &snapshot.reference_grants,
@@ -406,36 +406,36 @@ pub(super) async fn reconcile(
         .await;
     }
 
-    let (listener_statuses, accepted_cond) =
-        validate_gateway(&gateway, &gw_ns, &cert_data, &snapshot.reference_grants);
+    let (listener_statuses, accepted_cond) = validate_gateway(&gateway, &gw_ns, &resolved_certs);
 
     let mut usable = discover_usable_addresses();
     resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
 
     // Build per-Gateway config; bail out with a failing Programmed condition on error.
-    let mut result = match reconcile_to_config(&gateway, &snapshot, &cert_data, &services) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
-            let failure = status::GatewayCondition {
-                ok: false,
-                reason: "Invalid".into(),
-                message: format!("Reconciliation failed: {}", e),
-            };
-            status::update_gateway_status(
-                &ctx.client,
-                &gateway,
-                &accepted_cond,
-                &failure,
-                &HashMap::new(),
-                &listener_statuses,
-                &usable,
-                ctx.manage_gateway_status,
-            )
-            .await;
-            return Err(ReconcileError(e.to_string()));
-        }
-    };
+    let mut result =
+        match reconcile_to_config(&gateway, &snapshot, &resolved_certs.valid, &services) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
+                let failure = status::GatewayCondition {
+                    ok: false,
+                    reason: "Invalid".into(),
+                    message: format!("Reconciliation failed: {}", e),
+                };
+                status::update_gateway_status(
+                    &ctx.client,
+                    &gateway,
+                    &accepted_cond,
+                    &failure,
+                    &HashMap::new(),
+                    &listener_statuses,
+                    &usable,
+                    ctx.manage_gateway_status,
+                )
+                .await;
+                return Err(ReconcileError(e.to_string()));
+            }
+        };
 
     // Substitute resolved IPs for portail.epheo.eu/Network entries (reconcile_to_config
     // copies spec.addresses values as-is).
