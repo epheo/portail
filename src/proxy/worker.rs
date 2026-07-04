@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::{debug, info, warn};
-use crate::metrics::METRICS;
+use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
@@ -69,22 +69,31 @@ pub struct WorkerConfig {
 /// per-connection task; `DataPlane::shutdown` polls the shared count and
 /// drains until it reaches zero (or the drain timeout expires). Drop-based so
 /// the count stays correct on every exit path, including panics and aborts.
-struct ConnGuard(Arc<AtomicUsize>);
+struct ConnGuard {
+    active: Arc<AtomicUsize>,
+    stats: Arc<ListenerStats>,
+}
 
 impl ConnGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
+    fn new(counter: Arc<AtomicUsize>, stats: Arc<ListenerStats>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         METRICS.connections_accepted_total.inc();
         METRICS.active_connections.inc();
-        Self(counter)
+        stats.accepted.fetch_add(1, Ordering::Relaxed);
+        stats.active.fetch_add(1, Ordering::Relaxed);
+        Self {
+            active: counter,
+            stats,
+        }
     }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         // Release pairs with the Acquire load in the shutdown drain loop.
-        self.0.fetch_sub(1, Ordering::Release);
+        self.active.fetch_sub(1, Ordering::Release);
         METRICS.active_connections.dec();
+        self.stats.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -103,6 +112,9 @@ struct ConnectionState {
     connect_timeout: Duration,
     /// Reused across keepalive responses to avoid per-response heap allocation.
     header_buf: Vec<u8>,
+    /// Per-listener stats slot (shared with the accept loop) for per-port
+    /// request/error accounting.
+    listener_stats: Arc<ListenerStats>,
 }
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -148,13 +160,11 @@ pub async fn run_worker(
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, peer)) => {
-                        listener_stats
-                            .accepted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let routes = routes.clone();
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();
-                        let conn_guard = ConnGuard::new(active_connections.clone());
+                        let conn_guard =
+                            ConnGuard::new(active_connections.clone(), listener_stats.clone());
 
                         if tls_passthrough && acceptor.is_none() {
                             // Pure passthrough mode (no TLS termination cert available)
@@ -169,6 +179,7 @@ pub async fn run_worker(
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
                             let pool = make_pool(&shared_pool);
+                            let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
                                 // Peek ClientHello for SNI to decide dispatch mode
@@ -215,15 +226,22 @@ pub async fn run_worker(
                                                 client_header_timeout: cfg.client_header_timeout,
                                                 connect_timeout: cfg.connect_timeout,
                                                 header_buf: Vec::with_capacity(1024),
+                                                listener_stats: listener_stats.clone(),
                                             };
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
                                         Ok(Err(_e)) => {
                                             METRICS.tls_handshake_failures_total.inc();
+                                            listener_stats
+                                                .tls_handshake_failures
+                                                .fetch_add(1, Ordering::Relaxed);
                                             debug!("TLS handshake failed from {}: {}", peer, _e);
                                         }
                                         Err(_) => {
                                             METRICS.tls_handshake_failures_total.inc();
+                                            listener_stats
+                                                .tls_handshake_failures
+                                                .fetch_add(1, Ordering::Relaxed);
                                             debug!("TLS handshake from {} timed out", peer);
                                         }
                                     }
@@ -241,6 +259,7 @@ pub async fn run_worker(
                                 client_header_timeout: cfg.client_header_timeout,
                                 connect_timeout: cfg.connect_timeout,
                                 header_buf: Vec::with_capacity(1024),
+                                listener_stats: listener_stats.clone(),
                             };
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -312,6 +331,10 @@ async fn handle_connection(
                 meta,
             } => {
                 METRICS.http_requests_total.inc();
+                state
+                    .listener_stats
+                    .http_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 // proxy_http_request owns all timing for the request lifecycle —
                 // backend_request_timeout (connect + TTFB) and request_timeout
                 // (total deadline) are applied phase-aware inside.
@@ -533,14 +556,28 @@ async fn proxy_http_request(
                         "Backend {} fresh-conn acquire failed after pool retry: {}",
                         backend_addr, e2
                     );
-                    return fail_backend(&state.health, client, backend_addr, 502).await;
+                    return fail_backend(
+                        &state.health,
+                        &state.listener_stats,
+                        client,
+                        backend_addr,
+                        502,
+                    )
+                    .await;
                 }
                 Err(_) => {
                     warn!(
                         "Backend {} fresh-conn acquire timeout after pool retry",
                         backend_addr
                     );
-                    return fail_backend(&state.health, client, backend_addr, 504).await;
+                    return fail_backend(
+                        &state.health,
+                        &state.listener_stats,
+                        client,
+                        backend_addr,
+                        504,
+                    )
+                    .await;
                 }
             };
             match send_request_to_backend(
@@ -560,7 +597,14 @@ async fn proxy_http_request(
                         "Backend {} send failed on fresh conn after pool retry: {}",
                         backend_addr, e2
                     );
-                    return fail_backend(&state.health, client, backend_addr, 502).await;
+                    return fail_backend(
+                        &state.health,
+                        &state.listener_stats,
+                        client,
+                        backend_addr,
+                        502,
+                    )
+                    .await;
                 }
             }
         }
@@ -734,13 +778,24 @@ fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: 
 /// the backend-send retry path would otherwise repeat per error arm.
 async fn fail_backend(
     health: &Arc<HealthRegistry>,
+    stats: &ListenerStats,
     client: &mut Connection,
     addr: std::net::SocketAddr,
     code: u16,
 ) -> Result<(bool, Option<Vec<u8>>)> {
     match code {
-        504 => METRICS.upstream_connect_timeouts_total.inc(),
-        _ => METRICS.upstream_connect_errors_total.inc(),
+        504 => {
+            METRICS.upstream_connect_timeouts_total.inc();
+            stats
+                .upstream_connect_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            METRICS.upstream_connect_errors_total.inc();
+            stats
+                .upstream_connect_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     if health.record_failure(addr) {
         HealthRegistry::spawn_probe(Arc::clone(health), addr);
@@ -784,6 +839,10 @@ async fn connect_to_backend(
         }
         Ok(Err(e)) => {
             METRICS.upstream_connect_errors_total.inc();
+            state
+                .listener_stats
+                .upstream_connect_errors
+                .fetch_add(1, Ordering::Relaxed);
             warn!("Backend {} connect failed: {}", backend_addr, e);
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
@@ -793,6 +852,10 @@ async fn connect_to_backend(
         }
         Err(_) => {
             METRICS.upstream_connect_timeouts_total.inc();
+            state
+                .listener_stats
+                .upstream_connect_timeouts
+                .fetch_add(1, Ordering::Relaxed);
             warn!("Backend {} connect timeout", backend_addr);
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);

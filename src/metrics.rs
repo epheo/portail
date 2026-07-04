@@ -92,11 +92,30 @@ metrics! {
 
 /// Per-listener stats, registered by each accept loop when it starts and kept
 /// forever (counters must stay monotonic across a rebind of the same port).
-/// The hot path touches only its own pre-registered atomics; the registry
-/// Mutex is taken at spawn and scrape time only.
+/// The hot path touches only its own pre-registered atomics — one relaxed
+/// add per event, the same cost class as the global counters that already
+/// fire alongside; the registry Mutex is taken at spawn and scrape time only.
+///
+/// Keyed on (proto, published port): the data plane's real identity. On a
+/// shared port (several SNI-scoped listeners on :443) the samples are the
+/// port's aggregate — per-hostname attribution would cost a lookup per
+/// request and unbounded label cardinality. Pool metrics stay global only:
+/// a process-scoped pool serves every listener, so per-port pool numbers
+/// would lie.
+#[derive(Default)]
 pub struct ListenerStats {
     /// TCP connections accepted / UDP datagrams received on this listener.
     pub accepted: AtomicU64,
+    /// Client connections currently open on this listener.
+    pub active: AtomicU64,
+    /// HTTP requests dispatched to a backend from this listener.
+    pub http_requests: AtomicU64,
+    /// Client TLS handshakes that failed or timed out on this listener.
+    pub tls_handshake_failures: AtomicU64,
+    /// Backend connects that failed (client saw 502) for this listener's requests.
+    pub upstream_connect_errors: AtomicU64,
+    /// Backend connects that timed out (client saw 504) for this listener's requests.
+    pub upstream_connect_timeouts: AtomicU64,
     /// 1 while the accept loop is alive, 0 once it has exited. This is the
     /// outside-observable answer to "is anything listening on this port" —
     /// the signal that was missing every time a gateway VIP refused while
@@ -134,12 +153,7 @@ pub fn register_listener(proto: &'static str, port: u16) -> (Arc<ListenerStats>,
     };
     let stats = map
         .entry((proto, port))
-        .or_insert_with(|| {
-            Arc::new(ListenerStats {
-                accepted: AtomicU64::new(0),
-                up: AtomicU64::new(0),
-            })
-        })
+        .or_insert_with(|| Arc::new(ListenerStats::default()))
         .clone();
     stats.up.store(1, Relaxed);
     (stats.clone(), ListenerUpGuard(stats))
@@ -154,31 +168,67 @@ fn render_listeners(out: &mut String) {
     if map.is_empty() {
         return;
     }
-    out.push_str(
-        "# HELP portail_listener_accepted_total Connections accepted (TCP) or datagrams received (UDP) per listener\n\
-         # TYPE portail_listener_accepted_total counter\n",
-    );
-    for ((proto, port), stats) in map.iter() {
-        let _ = writeln!(
-            out,
-            "portail_listener_accepted_total{{proto=\"{}\",port=\"{}\"}} {}",
-            proto,
-            port,
-            stats.accepted.load(Relaxed),
-        );
-    }
-    out.push_str(
-        "# HELP portail_listener_up Listener accept-loop liveness (1 = accepting)\n\
-         # TYPE portail_listener_up gauge\n",
-    );
-    for ((proto, port), stats) in map.iter() {
-        let _ = writeln!(
-            out,
-            "portail_listener_up{{proto=\"{}\",port=\"{}\"}} {}",
-            proto,
-            port,
-            stats.up.load(Relaxed),
-        );
+    // One HELP/TYPE block per series, one sample per registered listener.
+    // UDP listeners render zeros for the TCP-only series; a constant zero
+    // costs nothing and keeps the schema uniform across protos.
+    type Get = fn(&ListenerStats) -> u64;
+    let series: [(&str, &str, &str, Get); 7] = [
+        (
+            "listener_accepted_total",
+            "Connections accepted (TCP) or datagrams received (UDP) per listener",
+            "counter",
+            |s| s.accepted.load(Relaxed),
+        ),
+        (
+            "listener_active_connections",
+            "Client connections currently open per listener",
+            "gauge",
+            |s| s.active.load(Relaxed),
+        ),
+        (
+            "listener_http_requests_total",
+            "HTTP requests dispatched to a backend per listener",
+            "counter",
+            |s| s.http_requests.load(Relaxed),
+        ),
+        (
+            "listener_tls_handshake_failures_total",
+            "Client TLS handshakes that failed or timed out per listener",
+            "counter",
+            |s| s.tls_handshake_failures.load(Relaxed),
+        ),
+        (
+            "listener_upstream_connect_errors_total",
+            "Backend connects that failed (client saw 502) per listener",
+            "counter",
+            |s| s.upstream_connect_errors.load(Relaxed),
+        ),
+        (
+            "listener_upstream_connect_timeouts_total",
+            "Backend connects that timed out (client saw 504) per listener",
+            "counter",
+            |s| s.upstream_connect_timeouts.load(Relaxed),
+        ),
+        (
+            "listener_up",
+            "Listener accept-loop liveness (1 = accepting)",
+            "gauge",
+            |s| s.up.load(Relaxed),
+        ),
+    ];
+    for (name, help, kind, get) in series {
+        let _ = writeln!(out, "# HELP portail_{} {}", name, help);
+        let _ = writeln!(out, "# TYPE portail_{} {}", name, kind);
+        for ((proto, port), stats) in map.iter() {
+            let _ = writeln!(
+                out,
+                "portail_{}{{proto=\"{}\",port=\"{}\"}} {}",
+                name,
+                proto,
+                port,
+                get(stats),
+            );
+        }
     }
 }
 
@@ -237,9 +287,18 @@ mod tests {
     fn listener_registry_renders_and_flips_up() {
         let (stats, guard) = register_listener("tcp", 8123);
         stats.accepted.fetch_add(3, Relaxed);
+        stats.http_requests.fetch_add(2, Relaxed);
+        stats.upstream_connect_errors.fetch_add(1, Relaxed);
         let text = render(true);
         assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
         assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));
+        assert!(
+            text.contains("portail_listener_http_requests_total{proto=\"tcp\",port=\"8123\"} 2")
+        );
+        assert!(text.contains(
+            "portail_listener_upstream_connect_errors_total{proto=\"tcp\",port=\"8123\"} 1"
+        ));
+        assert!(text.contains("portail_listener_active_connections{proto=\"tcp\",port=\"8123\"} 0"));
 
         drop(guard);
         let text = render(true);
