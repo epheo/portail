@@ -119,6 +119,11 @@ pub async fn run_worker(
     active_connections: Arc<AtomicUsize>,
     shared_pool: Option<Arc<SharedBackendPool>>,
 ) {
+    // Per-port scrape identity: lets an operator answer "is anything accepting
+    // on this port" from /metrics alone, without exec'ing into the pod. The
+    // guard flips `portail_listener_up` to 0 when this loop exits.
+    let (listener_stats, _up_guard) = crate::metrics::register_listener("tcp", server_port);
+
     // Selector is shared across all listeners so weighted round-robin counters
     // produce the correct distribution globally.
 
@@ -143,6 +148,9 @@ pub async fn run_worker(
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, peer)) => {
+                        listener_stats
+                            .accepted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let routes = routes.clone();
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();

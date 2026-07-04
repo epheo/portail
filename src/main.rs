@@ -67,6 +67,27 @@ fn main() -> Result<()> {
 
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
 
+    // Panics abort the process (`panic = "abort"` in release) — fail-fast is
+    // the right policy for a data plane, but the default hook only writes to
+    // stderr, which log pipelines can drop or mangle. Log through tracing
+    // first so the last words land in the structured pod log stream, then
+    // hand off to the default hook (stderr print, then the abort proceeds).
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let msg = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        error!("PANIC at {}: {}", location, msg);
+        default_panic_hook(panic_info);
+    }));
+
     // Size the Tokio runtime to the POD, not the NODE. The default multi-thread
     // runtime eagerly spawns one worker per `available_parallelism()` (the node's
     // CPU count), but each operator-provisioned data plane serves a single

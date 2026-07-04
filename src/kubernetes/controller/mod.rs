@@ -97,6 +97,9 @@ struct ControllerCtx {
     /// Gateway A cannot clobber Gateway B's routes in the shared table.
     gateway_configs:
         Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
+    /// When the controller came up — cold-start latency context for the
+    /// "Data plane ready" log line and the not-ready watchdog.
+    started: std::time::Instant,
 }
 
 pub async fn run_controller(
@@ -112,6 +115,13 @@ pub async fn run_controller(
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
+
+    // Let the data plane flip /readyz false itself the instant an accept
+    // loop dies, instead of waiting for the next reconcile pass to notice.
+    match data_plane.lock() {
+        Ok(mut dp) => dp.set_ready_flag(ready.clone()),
+        Err(poisoned) => poisoned.into_inner().set_ready_flag(ready.clone()),
+    }
 
     // --- Primary resource: Gateway ---
     // No `predicate_filter(predicates::generation)` here: it caches generation
@@ -222,7 +232,30 @@ pub async fn run_controller(
         ready,
         last_applied: Arc::new(std::sync::Mutex::new(None)),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        started: std::time::Instant::now(),
     });
+
+    // Cold-start visibility: a pod sitting NotReady because the apiserver is
+    // slow to deliver the first Gateway (or because binds keep failing) used
+    // to do so in total silence — post-mortems burned hours on exactly that
+    // gap. Diagnostic only: nothing gates on this timer.
+    {
+        let watchdog_ready = ctx.ready.clone();
+        let watchdog_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = watchdog_shutdown.cancelled() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    if !watchdog_ready.load(std::sync::atomic::Ordering::Acquire) {
+                        warn!(
+                            "Not ready 30s after controller start: no listener bound yet — \
+                             apiserver slow, Gateway missing, or binds failing (see errors above)"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // STRICT_DNS freshness: re-resolve headless/Service FQDNs on an interval and
     // swap the route table only when the resolved set changes. This is why the

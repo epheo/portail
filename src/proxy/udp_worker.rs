@@ -33,6 +33,10 @@ pub async fn run_udp_worker(
 ) {
     info!("UDP listener on :{} started", server_port);
 
+    // Same per-port scrape identity as the TCP accept loops; `accepted`
+    // counts datagrams here since UDP has no connections.
+    let (listener_stats, _up_guard) = crate::metrics::register_listener("udp", server_port);
+
     let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
     let selector = BackendSelector::new();
     let mut buf = vec![0u8; 65536];
@@ -77,6 +81,9 @@ pub async fn run_udp_worker(
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, client_addr)) => {
+                        listener_stats
+                            .accepted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let now_secs = epoch.elapsed().as_secs();
 
                         // Update last_active or create new session. Clone the

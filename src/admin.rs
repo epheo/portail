@@ -1,15 +1,20 @@
-//! Management endpoint: readiness probe + metrics scrape.
+//! Management endpoint: liveness + readiness probes + metrics scrape.
 //!
 //! Serves a tiny HTTP/1.1 responder on a dedicated management port.
-//! `GET /metrics` returns the process metrics in Prometheus text format;
-//! any other path returns the readiness state — `200` once the data plane
-//! has bound this instance's listener ports (the reconciler flips the shared
-//! flag after a successful bind), `503` otherwise.
+//! `GET /metrics` returns the process metrics in Prometheus text format.
+//! `GET /livez` is always `200` once the process is up: it answers "should
+//! kubelet restart this process", nothing more. A livenessProbe must point
+//! here — never at a data-plane port or Gateway VIP: kubelet dials those
+//! from the host netns, the one path with no delivery guarantee to a
+//! localnet/UDN VIP, and a restart cannot fix fabric conditions anyway
+//! (VIP reachability belongs to blackbox monitoring, from a client vantage).
+//! Any other path returns the readiness state — `200` while the data plane
+//! has live accept loops on this instance's listener ports, `503` otherwise.
 //!
-//! Wired by the operator as the data-plane pod's `readinessProbe`, so the
-//! LoadBalancer Service only routes to pods that are actually serving — and
-//! the Gateway `Programmed` condition (owned by the operator, derived from
-//! AvailableReplicas) becomes meaningful.
+//! Wired by the operator as the data-plane pod's `readinessProbe` (default
+//! path) and `livenessProbe` (`/livez`), so traffic gates on real binds while
+//! restarts only trigger on a genuinely dead process — and the Gateway
+//! `Programmed` condition (derived from readiness) stays meaningful.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,19 +29,26 @@ use crate::logging::{info, warn};
 const READY_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
 const NOT_READY_503: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot ready";
+const LIVE_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlive";
 
-/// Whether the request in `buf` targets `/metrics`. Only the request line is
-/// inspected — this is a dedicated management port, not a router.
-fn is_metrics_request(buf: &[u8]) -> bool {
-    // "GET /metrics HTTP/1.1" — accept any method and any sub-path fragment
-    // boundary (exact path or "/metrics?..." / "/metrics HTTP/...").
+/// Extract the request-target from the request line. Only the request line is
+/// inspected — this is a dedicated management port, not a router. Accepts any
+/// method and any sub-path fragment boundary ("/metrics?..." etc.).
+fn request_path(buf: &[u8]) -> &[u8] {
     let line = buf.split(|&b| b == b'\r').next().unwrap_or(buf);
     let mut parts = line.split(|&b| b == b' ');
     let _method = parts.next();
-    match parts.next() {
-        Some(path) => path == b"/metrics" || path.starts_with(b"/metrics?"),
-        None => false,
-    }
+    parts.next().unwrap_or(b"")
+}
+
+fn is_metrics_request(buf: &[u8]) -> bool {
+    let path = request_path(buf);
+    path == b"/metrics" || path.starts_with(b"/metrics?")
+}
+
+fn is_livez_request(buf: &[u8]) -> bool {
+    let path = request_path(buf);
+    path == b"/livez" || path.starts_with(b"/livez?")
 }
 
 fn metrics_response(ready: bool) -> Vec<u8> {
@@ -60,7 +72,10 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, shutdown: CancellationToke
             return;
         }
     };
-    info!("Admin endpoint listening on :{} (/readyz, /metrics)", port);
+    info!(
+        "Admin endpoint listening on :{} (/livez, /readyz, /metrics)",
+        port
+    );
 
     loop {
         tokio::select! {
@@ -84,6 +99,9 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, shutdown: CancellationToke
                         .unwrap_or(0);
                     let resp: Vec<u8> = if is_metrics_request(&buf[..n]) {
                         metrics_response(is_ready)
+                    } else if is_livez_request(&buf[..n]) {
+                        // Liveness: the fact this handler ran IS the answer.
+                        LIVE_200.to_vec()
                     } else if is_ready {
                         READY_200.to_vec()
                     } else {
@@ -112,5 +130,16 @@ mod tests {
         assert!(!is_metrics_request(b"GET / HTTP/1.1\r\n\r\n"));
         assert!(!is_metrics_request(b"GET /metricsx HTTP/1.1\r\n\r\n"));
         assert!(!is_metrics_request(b""));
+    }
+
+    #[test]
+    fn livez_path_dispatch() {
+        assert!(is_livez_request(b"GET /livez HTTP/1.1\r\n\r\n"));
+        assert!(is_livez_request(b"GET /livez?verbose HTTP/1.1\r\n\r\n"));
+        // Liveness must not swallow readiness or metrics paths.
+        assert!(!is_livez_request(b"GET /readyz HTTP/1.1\r\n\r\n"));
+        assert!(!is_livez_request(b"GET /livezz HTTP/1.1\r\n\r\n"));
+        assert!(!is_livez_request(b"GET /metrics HTTP/1.1\r\n\r\n"));
+        assert!(!is_livez_request(b""));
     }
 }

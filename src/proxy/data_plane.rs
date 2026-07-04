@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
@@ -25,6 +25,9 @@ use crate::routing::{BackendSelector, RouteTable};
 
 struct TcpListenerEntry {
     port: u16,
+    /// Socket actually bound (the Service targetPort when decoupled from `port`).
+    bound_port: u16,
+    address: Option<String>,
     listener: TcpListener,
     tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
     tls_passthrough: bool,
@@ -32,19 +35,48 @@ struct TcpListenerEntry {
 
 struct UdpListenerEntry {
     port: u16,
+    bound_port: u16,
+    address: Option<String>,
     socket: UdpSocket,
+}
+
+/// State of one bound (address, port) endpoint.
+enum ListenerSlot {
+    /// Socket bound at construction, accept loop not yet spawned — the
+    /// standalone-mode window between `new()` and `start()`. Counts as
+    /// bound: the kernel is already queueing connections on the socket.
+    Pending,
+    Running(JoinHandle<()>),
+}
+
+impl ListenerSlot {
+    fn alive(&self) -> bool {
+        match self {
+            ListenerSlot::Pending => true,
+            ListenerSlot::Running(handle) => !handle.is_finished(),
+        }
+    }
 }
 
 pub struct DataPlane {
     tcp_listeners: Vec<TcpListenerEntry>,
     udp_listeners: Vec<UdpListenerEntry>,
-    task_handles: Vec<JoinHandle<()>>,
+    /// One accept-loop slot per bound (address, bound-port) endpoint.
+    /// Readiness reads LIVE task state from this map — a finished task no
+    /// longer counts as bound, which keeps /readyz and Programmed truthful
+    /// when an accept loop dies. (Its add-only predecessor had no way back:
+    /// a dead listener stayed "bound" until pod restart, refusing every
+    /// connection while readiness stayed green.)
+    listener_tasks: std::collections::HashMap<(Option<String>, u16), ListenerSlot>,
+    /// Pod readiness flag shared with the admin endpoint (`/readyz`), flipped
+    /// false the moment an accept loop exits outside shutdown — no waiting
+    /// for the next reconcile pass to notice. `None` in standalone mode.
+    ready_flag: Option<Arc<AtomicBool>>,
     worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
     udp_session_timeout: Duration,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
-    bound_endpoints: std::collections::HashSet<(Option<String>, u16)>,
     /// Per-port dynamic TLS acceptors for hot-reload support.
     tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
     /// Per-port cert fingerprint to skip no-op TLS reloads.
@@ -164,6 +196,8 @@ impl DataPlane {
 
                     tcp_listeners.push(TcpListenerEntry {
                         port,
+                        bound_port,
+                        address: listener_cfg.address.clone(),
                         listener: tokio_listener,
                         tls_acceptor: tls_acceptors[i].clone(),
                         tls_passthrough: tls_passthrough_flags[i],
@@ -179,22 +213,32 @@ impl DataPlane {
 
                     udp_listeners.push(UdpListenerEntry {
                         port,
+                        bound_port,
+                        address: listener_cfg.address.clone(),
                         socket: tokio_socket,
                     });
                 }
             }
         }
 
-        // Readiness tracks the bound socket, so key endpoints on the bound port.
-        let bound_endpoints: std::collections::HashSet<(Option<String>, u16)> = listeners
-            .iter()
-            .map(|l| (l.address.clone(), l.target_port.unwrap_or(l.port)))
-            .collect();
+        // Readiness tracks the bound socket, so key endpoints on the bound
+        // port. Sockets exist from here on; `start()` attaches accept loops.
+        let listener_tasks: std::collections::HashMap<(Option<String>, u16), ListenerSlot> =
+            listeners
+                .iter()
+                .map(|l| {
+                    (
+                        (l.address.clone(), l.target_port.unwrap_or(l.port)),
+                        ListenerSlot::Pending,
+                    )
+                })
+                .collect();
 
         Ok(Self {
             tcp_listeners,
             udp_listeners,
-            task_handles: Vec::new(),
+            listener_tasks,
+            ready_flag: None,
             worker_config: worker::WorkerConfig {
                 max_idle_per_backend: 64,
                 connect_timeout: performance_config.backend_timeout,
@@ -204,7 +248,6 @@ impl DataPlane {
             udp_session_timeout: performance_config.udp_session_timeout,
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            bound_endpoints,
             tls_configs: std::collections::HashMap::new(),
             tls_cert_hashes: std::collections::HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
@@ -218,6 +261,48 @@ impl DataPlane {
                 crate::config::PoolScope::Connection => None,
             },
         })
+    }
+
+    /// Share the pod readiness flag so a dying accept loop can flip it
+    /// immediately (the admin endpoint serves it as `/readyz`). Wired by the
+    /// Kubernetes controller at startup; standalone mode has no probe to feed.
+    pub fn set_ready_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.ready_flag = Some(flag);
+    }
+
+    fn endpoint_alive(&self, endpoint: &(Option<String>, u16)) -> bool {
+        self.listener_tasks
+            .get(endpoint)
+            .is_some_and(ListenerSlot::alive)
+    }
+
+    /// Spawn an accept loop and record it under its endpoint. The wrapper is
+    /// the death-watch: an accept loop returns exactly once, on shutdown, so
+    /// any other exit means its socket is gone — flip readiness right away
+    /// instead of letting `/readyz` vouch for a port nothing is bound to.
+    /// The finished handle stays in the map until the next ensure pass reaps
+    /// and rebinds it. (A panic bypasses the wrapper body: under
+    /// `panic = "abort"` the whole process dies with it — its own honest
+    /// signal — and `JoinHandle::is_finished` covers the unwind case.)
+    fn spawn_listener_task(
+        &mut self,
+        endpoint: (Option<String>, u16),
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let shutdown = self.shutdown.clone();
+        let ready_flag = self.ready_flag.clone();
+        let desc = format!("{}:{}", endpoint.0.as_deref().unwrap_or("*"), endpoint.1);
+        let handle = tokio::spawn(async move {
+            task.await;
+            if !shutdown.is_cancelled() {
+                warn!("Accept loop for {} exited unexpectedly", desc);
+                if let Some(flag) = ready_flag {
+                    flag.store(false, Ordering::Release);
+                }
+            }
+        });
+        self.listener_tasks
+            .insert(endpoint, ListenerSlot::Running(handle));
     }
 
     /// Dynamically add TCP/UDP listeners for new ports. Called by the K8s
@@ -235,6 +320,23 @@ impl DataPlane {
     ) -> (usize, Vec<(u16, String)>) {
         let mut opened = 0usize;
         let mut errors = Vec::new();
+
+        // Reap finished accept loops before anything else: a finished task
+        // means its socket is gone (the listener lives inside the task), so
+        // the endpoint must stop counting as bound — the bind loop below
+        // then re-opens it this same pass.
+        self.listener_tasks.retain(|(addr, bound_port), slot| {
+            if slot.alive() {
+                true
+            } else {
+                warn!(
+                    "Listener {}:{} accept loop is dead; rebinding this pass",
+                    addr.as_deref().unwrap_or("*"),
+                    bound_port
+                );
+                false
+            }
+        });
 
         // If addresses are specified, bind each listener to each address.
         // Otherwise, bind to the listener's own address (or 0.0.0.0).
@@ -300,19 +402,18 @@ impl DataPlane {
             for &bind_addr in &bind_addrs {
                 let effective_addr = bind_addr.or(listener_cfg.address.as_deref());
                 let endpoint = (effective_addr.map(String::from), bound_port);
-                if self.bound_endpoints.contains(&endpoint) {
-                    continue; // Endpoint already bound
+                if self.endpoint_alive(&endpoint) {
+                    continue; // Endpoint already bound with a live accept loop
                 }
                 // A wildcard socket we already hold serves every address on
                 // the port (routing is port-keyed); an additional
                 // address-specific bind adds nothing and, depending on the
                 // platform's overlap rules, can fail EADDRINUSE against our
                 // own wildcard socket.
-                if endpoint.0.is_some() && self.bound_endpoints.contains(&(None, bound_port)) {
+                if endpoint.0.is_some() && self.endpoint_alive(&(None, bound_port)) {
                     continue;
                 }
 
-                let mut port_ok = true;
                 if listener_cfg.protocol == Protocol::UDP {
                     match create_udp_socket(
                         bound_port,
@@ -327,7 +428,7 @@ impl DataPlane {
                                 let session_timeout = self.udp_session_timeout;
                                 let socket = Arc::new(tokio_socket);
 
-                                let handle = tokio::spawn(async move {
+                                self.spawn_listener_task(endpoint, async move {
                                     udp_worker::run_udp_worker(
                                         socket,
                                         port,
@@ -338,17 +439,11 @@ impl DataPlane {
                                     )
                                     .await;
                                 });
-                                self.task_handles.push(handle);
+                                opened += 1;
                             }
-                            Err(e) => {
-                                errors.push((port, format!("UDP from_std: {}", e)));
-                                port_ok = false;
-                            }
+                            Err(e) => errors.push((port, format!("UDP from_std: {}", e))),
                         },
-                        Err(e) => {
-                            errors.push((port, format!("UDP bind: {}", e)));
-                            port_ok = false;
-                        }
+                        Err(e) => errors.push((port, format!("UDP bind: {}", e))),
                     }
                 } else {
                     match create_tcp_listener(
@@ -374,7 +469,7 @@ impl DataPlane {
                                 let selector = self.selector.clone();
                                 let active = self.active_connections.clone();
                                 let shared_pool = self.shared_pool.clone();
-                                let handle = tokio::spawn(async move {
+                                self.spawn_listener_task(endpoint, async move {
                                     worker::run_worker(
                                         tokio_listener,
                                         port,
@@ -390,22 +485,12 @@ impl DataPlane {
                                     )
                                     .await;
                                 });
-                                self.task_handles.push(handle);
+                                opened += 1;
                             }
-                            Err(e) => {
-                                errors.push((port, format!("TCP from_std: {}", e)));
-                                port_ok = false;
-                            }
+                            Err(e) => errors.push((port, format!("TCP from_std: {}", e))),
                         },
-                        Err(e) => {
-                            errors.push((port, format!("TCP bind: {}", e)));
-                            port_ok = false;
-                        }
+                        Err(e) => errors.push((port, format!("TCP bind: {}", e))),
                     }
-                }
-                if port_ok {
-                    self.bound_endpoints.insert(endpoint);
-                    opened += 1;
                 }
             } // end for bind_addr
         }
@@ -413,6 +498,7 @@ impl DataPlane {
     }
 
     /// Start async listener tasks (one accept loop per TCP listener / UDP socket).
+    /// Upgrades each construction-time `Pending` slot to `Running`.
     pub fn start(&mut self, routes: Arc<ArcSwap<RouteTable>>) {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();
@@ -427,15 +513,23 @@ impl DataPlane {
             let active = self.active_connections.clone();
             let shared_pool = self.shared_pool.clone();
 
-            let handle = tokio::spawn(async move {
+            let TcpListenerEntry {
+                port,
+                bound_port,
+                address,
+                listener,
+                tls_acceptor,
+                tls_passthrough,
+            } = entry;
+            self.spawn_listener_task((address, bound_port), async move {
                 worker::run_worker(
-                    entry.listener,
-                    entry.port,
+                    listener,
+                    port,
                     routes,
                     cfg,
                     shutdown,
-                    entry.tls_acceptor,
-                    entry.tls_passthrough,
+                    tls_acceptor,
+                    tls_passthrough,
                     health,
                     selector,
                     active,
@@ -443,30 +537,21 @@ impl DataPlane {
                 )
                 .await;
             });
-
-            self.task_handles.push(handle);
         }
 
-        for entry in self.udp_listeners.drain(..) {
+        let udp_entries: Vec<_> = self.udp_listeners.drain(..).collect();
+        for entry in udp_entries {
             let socket = Arc::new(entry.socket);
             let routes = routes.clone();
             let health = self.health.clone();
             let shutdown = self.shutdown.clone();
             let session_timeout = self.udp_session_timeout;
+            let port = entry.port;
 
-            let handle = tokio::spawn(async move {
-                udp_worker::run_udp_worker(
-                    socket,
-                    entry.port,
-                    routes,
-                    session_timeout,
-                    shutdown,
-                    health,
-                )
-                .await;
+            self.spawn_listener_task((entry.address, entry.bound_port), async move {
+                udp_worker::run_udp_worker(socket, port, routes, session_timeout, shutdown, health)
+                    .await;
             });
-
-            self.task_handles.push(handle);
         }
 
         info!(
@@ -505,22 +590,28 @@ impl DataPlane {
             }
         }
 
-        for handle in self.task_handles {
-            let _ = handle.await;
+        for (_endpoint, slot) in self.listener_tasks {
+            if let ListenerSlot::Running(handle) = slot {
+                let _ = handle.await;
+            }
         }
 
         info!("Data plane shutdown complete");
     }
 
-    /// Check if all the specified (address, port) endpoints are bound and ready to serve traffic.
+    /// Check if all the specified (address, port) endpoints are bound with a
+    /// LIVE accept loop (or a construction-time socket awaiting `start()`).
+    /// A dead accept loop does NOT count: readiness and Programmed must go
+    /// false the moment a listener can no longer accept, so the reconcile
+    /// safety net rebinds instead of trusting stale bookkeeping.
     pub fn is_ready_for_endpoints(&self, required: &[(Option<String>, u16)]) -> bool {
         required.iter().all(|ep| {
-            self.bound_endpoints.contains(ep)
+            self.endpoint_alive(ep)
                 // A wildcard socket on the port already accepts traffic for
                 // any specific address; routing is keyed on the port. The
                 // reverse does NOT hold: a required wildcard bind is not
                 // satisfied by an address-specific one.
-                || (ep.0.is_some() && self.bound_endpoints.contains(&(None, ep.1)))
+                || (ep.0.is_some() && self.endpoint_alive(&(None, ep.1)))
         })
     }
 
@@ -850,5 +941,53 @@ mod tests {
         assert!(dp.is_ready_for_endpoints(&[(None, 23445)]));
         // The reverse is not satisfied: specific never covers wildcard.
         assert!(!dp.is_ready_for_endpoints(&[(None, 23446)]));
+    }
+
+    /// A dead accept loop must drop out of readiness and be rebound by the
+    /// next ensure pass. This is the ".21 outage" shape: the old add-only
+    /// bookkeeping kept reporting bound (readiness green, Programmed=True)
+    /// while the kernel refused every connection, until pod restart.
+    #[tokio::test]
+    async fn dead_accept_loop_unreadies_then_rebinds() {
+        let listeners = vec![ListenerConfig {
+            name: "http".into(),
+            protocol: P::HTTP,
+            port: 23447,
+            target_port: None,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: None,
+        }];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes.clone(), &perf);
+        assert_eq!((opened, errors.len()), (1, 0));
+        assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
+
+        // Kill the accept loop out-of-band — stands in for any task death.
+        if let Some(ListenerSlot::Running(handle)) = dp.listener_tasks.get(&(None, 23447)) {
+            handle.abort();
+        } else {
+            panic!("expected a running listener slot");
+        }
+        // Bounded wait for the abort to land (is_finished flips async).
+        for _ in 0..200 {
+            if !dp.endpoint_alive(&(None, 23447)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !dp.is_ready_for_endpoints(&[(None, 23447)]),
+            "a dead accept loop must not count as bound"
+        );
+
+        // The next ensure pass reaps the corpse and rebinds the endpoint.
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes, &perf);
+        assert_eq!((opened, errors.len()), (1, 0), "dead endpoint must rebind");
+        assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
     }
 }

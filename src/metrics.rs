@@ -6,7 +6,9 @@
 //! is a few hundred bytes of formatting. Histograms are deliberately out of
 //! scope for now.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct Counter(AtomicU64);
 
@@ -88,12 +90,105 @@ metrics! {
     reconcile_skips_total: "Gateway reconcile passes short-circuited by the fingerprint gate",
 }
 
+/// Per-listener stats, registered by each accept loop when it starts and kept
+/// forever (counters must stay monotonic across a rebind of the same port).
+/// The hot path touches only its own pre-registered atomics; the registry
+/// Mutex is taken at spawn and scrape time only.
+pub struct ListenerStats {
+    /// TCP connections accepted / UDP datagrams received on this listener.
+    pub accepted: AtomicU64,
+    /// 1 while the accept loop is alive, 0 once it has exited. This is the
+    /// outside-observable answer to "is anything listening on this port" —
+    /// the signal that was missing every time a gateway VIP refused while
+    /// the process looked healthy.
+    up: AtomicU64,
+}
+
+/// Flips the listener's `up` gauge to 0 when the accept loop exits, on every
+/// exit path (shutdown, error, cancellation). A panic skips the Drop only
+/// under `panic = "abort"`, where the whole scrape endpoint dies with it.
+pub struct ListenerUpGuard(Arc<ListenerStats>);
+
+impl Drop for ListenerUpGuard {
+    fn drop(&mut self) {
+        self.0.up.store(0, Relaxed);
+    }
+}
+
+type ListenerRegistry = Mutex<BTreeMap<(&'static str, u16), Arc<ListenerStats>>>;
+
+static LISTENERS: OnceLock<ListenerRegistry> = OnceLock::new();
+
+fn listeners() -> &'static ListenerRegistry {
+    LISTENERS.get_or_init(Default::default)
+}
+
+/// Register (or re-activate after a rebind) the stats slot for a listener,
+/// keyed on the PUBLISHED port — the Gateway listener identity, not the bound
+/// targetPort. Returns the stats handle plus the RAII guard that marks the
+/// listener down when the accept loop exits.
+pub fn register_listener(proto: &'static str, port: u16) -> (Arc<ListenerStats>, ListenerUpGuard) {
+    let mut map = match listeners().lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stats = map
+        .entry((proto, port))
+        .or_insert_with(|| {
+            Arc::new(ListenerStats {
+                accepted: AtomicU64::new(0),
+                up: AtomicU64::new(0),
+            })
+        })
+        .clone();
+    stats.up.store(1, Relaxed);
+    (stats.clone(), ListenerUpGuard(stats))
+}
+
+fn render_listeners(out: &mut String) {
+    use std::fmt::Write;
+    let map = match listeners().lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if map.is_empty() {
+        return;
+    }
+    out.push_str(
+        "# HELP portail_listener_accepted_total Connections accepted (TCP) or datagrams received (UDP) per listener\n\
+         # TYPE portail_listener_accepted_total counter\n",
+    );
+    for ((proto, port), stats) in map.iter() {
+        let _ = writeln!(
+            out,
+            "portail_listener_accepted_total{{proto=\"{}\",port=\"{}\"}} {}",
+            proto,
+            port,
+            stats.accepted.load(Relaxed),
+        );
+    }
+    out.push_str(
+        "# HELP portail_listener_up Listener accept-loop liveness (1 = accepting)\n\
+         # TYPE portail_listener_up gauge\n",
+    );
+    for ((proto, port), stats) in map.iter() {
+        let _ = writeln!(
+            out,
+            "portail_listener_up{{proto=\"{}\",port=\"{}\"}} {}",
+            proto,
+            port,
+            stats.up.load(Relaxed),
+        );
+    }
+}
+
 /// Render everything in Prometheus text exposition format. `ready` is served
 /// as a gauge so dashboards can overlay readiness flaps on traffic.
 pub fn render(ready: bool) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(4096);
     render_counters(&mut out);
+    render_listeners(&mut out);
     let _ = write!(
         out,
         "# HELP portail_active_connections Client connections currently open\n\
@@ -136,5 +231,24 @@ mod tests {
             }
         }
         METRICS.active_connections.dec();
+    }
+
+    #[test]
+    fn listener_registry_renders_and_flips_up() {
+        let (stats, guard) = register_listener("tcp", 8123);
+        stats.accepted.fetch_add(3, Relaxed);
+        let text = render(true);
+        assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
+        assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));
+
+        drop(guard);
+        let text = render(true);
+        assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 0"));
+
+        // A rebind re-activates the same slot; the counter stays monotonic.
+        let (_stats2, _guard2) = register_listener("tcp", 8123);
+        let text = render(true);
+        assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));
+        assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
     }
 }

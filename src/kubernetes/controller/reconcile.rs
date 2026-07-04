@@ -468,14 +468,16 @@ pub(super) async fn reconcile(
 
     // Read-only readiness probe — no listener work yet. Feeds the fingerprint
     // gate below, which decides whether ensure_data_plane_listeners (bind
-    // retries, TLS reload checks) needs to run at all this pass.
+    // retries, TLS reload checks) needs to run at all this pass. Readiness is
+    // computed from LIVE accept-loop state, so a listener that died since the
+    // last pass reads unready here and falls through to the rebind path.
     let dp_ready_initial = ctx
         .data_plane
         .lock()
         .map(|dp| dp.is_ready_for_endpoints(&required))
         .unwrap_or(false);
-    // Once the data plane has bound this gateway's listener ports, the
-    // pod is serving — latch readiness on (never flips back).
+    // Re-assert the flag on passes that will short-circuit below; the
+    // authoritative both-directions store happens after ensure().
     if dp_ready_initial {
         ctx.ready.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -542,8 +544,10 @@ pub(super) async fn reconcile(
     //   unchanged && ready      → skip everything, ensure() included. Sound:
     //                             the fingerprint covers the cert bytes (no
     //                             hot-reload can be pending) and readiness
-    //                             means no bind can be pending — the bound-
-    //                             endpoint set only grows.
+    //                             means no bind can be pending — it is
+    //                             computed from live accept loops each pass,
+    //                             so a dead listener reads unready and takes
+    //                             the ensure() path instead of skipping.
     //   unchanged && !ready     → the one thing an unchanged pass can still
     //                             owe is a bind retry: run ensure(), and only
     //                             a readiness flip falls through to apply.
@@ -601,8 +605,18 @@ pub(super) async fn reconcile(
         .lock()
         .map(|dp| dp.is_ready_for_endpoints(&required))
         .unwrap_or(false);
-    if dp_ready {
-        ctx.ready.store(true, std::sync::atomic::Ordering::Release);
+    // Store the truth in BOTH directions: readiness must also drop when a
+    // required endpoint has no live accept loop and the rebind above failed,
+    // not only rise on success.
+    let was_ready = ctx
+        .ready
+        .swap(dp_ready, std::sync::atomic::Ordering::AcqRel);
+    if dp_ready && !was_ready {
+        info!(
+            "Data plane ready: {} listener endpoint(s) live, {:.1}s after controller start",
+            required.len(),
+            ctx.started.elapsed().as_secs_f32()
+        );
     }
 
     // Unchanged and still unready after the bind retry: nothing else differs
