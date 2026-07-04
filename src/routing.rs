@@ -141,6 +141,10 @@ impl ListenerScope {
 
         let host_lower = route_host.to_ascii_lowercase();
 
+        // Bind the per-hostname request counter (the route's CONFIGURED
+        // hostname — bounded label cardinality — never the request's Host).
+        rule.requests = crate::metrics::host_requests_counter(&host_lower);
+
         // Catch-all hostname "*" matches any host (stored separately)
         if host_lower == "*" {
             let host_entry = self.catch_all_http_routes.get_or_insert_with(|| HostEntry {
@@ -623,6 +627,12 @@ pub struct HttpRouteRule {
     /// previously inserted one never-evicted map entry per distinct path.
     /// A table rebuild creates fresh rules and restarts the rotation.
     pub counter: Arc<std::sync::atomic::AtomicU64>,
+    /// `portail_http_requests_total{host=...}` slot for this rule's route
+    /// hostname, fetched from the metrics registry at insertion
+    /// (`ListenerScope::add_route`) so the per-request cost is one relaxed
+    /// add. Registry-backed: table swaps re-attach the SAME counter, so the
+    /// series stays monotonic across reconciles and DNS refreshes.
+    pub requests: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpRouteRule {
@@ -649,6 +659,10 @@ impl HttpRouteRule {
             total_weight: 0,
             cumulative_weights: vec![],
             counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Placeholder until `add_route` binds the registry slot for the
+            // route's hostname; a rule that never enters a table (tests)
+            // counts into this unrendered cell.
+            requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

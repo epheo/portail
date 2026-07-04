@@ -72,10 +72,7 @@ macro_rules! metrics {
 metrics! {
     connections_accepted_total: "Client connections accepted across all listeners",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
-    http_requests_total: "HTTP requests dispatched to a backend",
     upstream_connects_total: "Backend connections established",
-    upstream_connect_errors_total: "Backend connects that failed (client saw 502)",
-    upstream_connect_timeouts_total: "Backend connects that timed out (client saw 504)",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
     pool_misses_total: "Backend pool checkouts that had to open a new connection",
     pool_stale_discards_total: "Idle pool connections found dead at checkout and discarded",
@@ -88,6 +85,99 @@ metrics! {
     backends_recovered_total: "Backend health recoveries (probe or passive)",
     reconcile_runs_total: "Gateway reconcile passes that ran the apply path",
     reconcile_skips_total: "Gateway reconcile passes short-circuited by the fingerprint gate",
+}
+
+// --- Labeled counter families ---------------------------------------------
+//
+// `portail_http_requests_total{host=...}` and the `upstream_connect_*`
+// families replace their former unlabeled process-global counters: every
+// one of those events has exactly one owner (the matched route's hostname,
+// the configured backend), so the labeled series partition the old totals
+// and `sum()` reproduces them. Label values come from CONFIG, never from
+// client input: the matched route's configured hostname — not the raw Host
+// header, which is attacker-controlled and unbounded — and the configured
+// backend name:port — not the resolved pod IP, which churns with every DNS
+// refresh. Entries live for the process lifetime, bounded by the set of
+// hostnames/backends ever configured.
+
+type LabeledFamily = Mutex<BTreeMap<String, Arc<AtomicU64>>>;
+
+static HOST_REQUESTS: OnceLock<LabeledFamily> = OnceLock::new();
+static BACKEND_CONNECT_ERRORS: OnceLock<LabeledFamily> = OnceLock::new();
+static BACKEND_CONNECT_TIMEOUTS: OnceLock<LabeledFamily> = OnceLock::new();
+
+fn family_counter(family: &'static OnceLock<LabeledFamily>, key: &str) -> Arc<AtomicU64> {
+    let mut map = match family.get_or_init(Default::default).lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match map.get(key) {
+        Some(counter) => counter.clone(),
+        None => {
+            let counter = Arc::new(AtomicU64::new(0));
+            map.insert(key.to_string(), counter.clone());
+            counter
+        }
+    }
+}
+
+/// Request counter for a route's configured hostname ("*" for catch-all
+/// routes). Fetched once at route-table build and attached to each rule —
+/// the per-request cost stays one relaxed add, no lookup, and the counter
+/// survives table swaps (reconciles, DNS refreshes) monotonically.
+pub fn host_requests_counter(host: &str) -> Arc<AtomicU64> {
+    family_counter(&HOST_REQUESTS, host)
+}
+
+/// Attribute a backend connect failure (client saw 502) to the configured
+/// backend. A registry lookup per call is fine on this path: connect
+/// errors are rare by definition and already cost a log line + health hit.
+pub fn record_backend_connect_error(backend: &str) {
+    family_counter(&BACKEND_CONNECT_ERRORS, backend).fetch_add(1, Relaxed);
+}
+
+/// Attribute a backend connect timeout (client saw 504) to the configured
+/// backend.
+pub fn record_backend_connect_timeout(backend: &str) {
+    family_counter(&BACKEND_CONNECT_TIMEOUTS, backend).fetch_add(1, Relaxed);
+}
+
+/// Prometheus label values must escape backslash, double-quote and newline.
+/// Config-sourced hostnames and backend names never contain them in
+/// practice, but a malformed config must corrupt one label, not the scrape.
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn render_labeled_family(
+    out: &mut String,
+    family: &'static OnceLock<LabeledFamily>,
+    name: &str,
+    label: &str,
+    help: &str,
+) {
+    use std::fmt::Write;
+    let map = match family.get_or_init(Default::default).lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if map.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "# HELP portail_{} {}", name, help);
+    let _ = writeln!(out, "# TYPE portail_{} counter", name);
+    for (key, counter) in map.iter() {
+        let _ = writeln!(
+            out,
+            "portail_{}{{{}=\"{}\"}} {}",
+            name,
+            label,
+            escape_label(key),
+            counter.load(Relaxed),
+        );
+    }
 }
 
 /// Per-listener stats, registered by each accept loop when it starts and kept
@@ -238,6 +328,27 @@ pub fn render(ready: bool) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(4096);
     render_counters(&mut out);
+    render_labeled_family(
+        &mut out,
+        &HOST_REQUESTS,
+        "http_requests_total",
+        "host",
+        "HTTP requests dispatched to a backend, by the matched route's configured hostname",
+    );
+    render_labeled_family(
+        &mut out,
+        &BACKEND_CONNECT_ERRORS,
+        "upstream_connect_errors_total",
+        "backend",
+        "Backend connects that failed (client saw 502), by configured backend",
+    );
+    render_labeled_family(
+        &mut out,
+        &BACKEND_CONNECT_TIMEOUTS,
+        "upstream_connect_timeouts_total",
+        "backend",
+        "Backend connects that timed out (client saw 504), by configured backend",
+    );
     render_listeners(&mut out);
     let _ = write!(
         out,

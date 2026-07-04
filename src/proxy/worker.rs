@@ -330,7 +330,9 @@ async fn handle_connection(
                 rule,
                 meta,
             } => {
-                METRICS.http_requests_total.inc();
+                // Per-vhost sample (rule carries its route hostname's registry
+                // slot) + the per-listener aggregate.
+                rule.requests.fetch_add(1, Ordering::Relaxed);
                 state
                     .listener_stats
                     .http_requests
@@ -559,6 +561,7 @@ async fn proxy_http_request(
                     return fail_backend(
                         &state.health,
                         &state.listener_stats,
+                        &backend_metric_label(backend_ref),
                         client,
                         backend_addr,
                         502,
@@ -573,6 +576,7 @@ async fn proxy_http_request(
                     return fail_backend(
                         &state.health,
                         &state.listener_stats,
+                        &backend_metric_label(backend_ref),
                         client,
                         backend_addr,
                         504,
@@ -600,6 +604,7 @@ async fn proxy_http_request(
                     return fail_backend(
                         &state.health,
                         &state.listener_stats,
+                        &backend_metric_label(backend_ref),
                         client,
                         backend_addr,
                         502,
@@ -772,6 +777,18 @@ fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: 
     response_complete && framing_clean && !is_head
 }
 
+/// Metrics label for a backend: the CONFIGURED name and target port
+/// ("jellyfin.jellyfin:8096") — stable while STRICT_DNS re-resolution churns
+/// the pod IPs behind it. Falls back to the socket address when a backend
+/// was built without a name (tests, manual construction).
+fn backend_metric_label(backend: &crate::routing::Backend) -> String {
+    if backend.server_name.is_empty() {
+        backend.socket_addr.to_string()
+    } else {
+        format!("{}:{}", backend.server_name, backend.socket_addr.port())
+    }
+}
+
 /// Record a backend failure (spawning a health probe if this newly trips the
 /// backend unhealthy) and send `code` to the client. Returns `Ok((false, None))`
 /// — the client connection is not reusable. Centralizes the failure boilerplate
@@ -779,19 +796,20 @@ fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: 
 async fn fail_backend(
     health: &Arc<HealthRegistry>,
     stats: &ListenerStats,
+    backend_label: &str,
     client: &mut Connection,
     addr: std::net::SocketAddr,
     code: u16,
 ) -> Result<(bool, Option<Vec<u8>>)> {
     match code {
         504 => {
-            METRICS.upstream_connect_timeouts_total.inc();
+            crate::metrics::record_backend_connect_timeout(backend_label);
             stats
                 .upstream_connect_timeouts
                 .fetch_add(1, Ordering::Relaxed);
         }
         _ => {
-            METRICS.upstream_connect_errors_total.inc();
+            crate::metrics::record_backend_connect_error(backend_label);
             stats
                 .upstream_connect_errors
                 .fetch_add(1, Ordering::Relaxed);
@@ -838,7 +856,7 @@ async fn connect_to_backend(
             Ok(Some(result))
         }
         Ok(Err(e)) => {
-            METRICS.upstream_connect_errors_total.inc();
+            crate::metrics::record_backend_connect_error(&backend_metric_label(backend_ref));
             state
                 .listener_stats
                 .upstream_connect_errors
@@ -851,7 +869,7 @@ async fn connect_to_backend(
             Ok(None)
         }
         Err(_) => {
-            METRICS.upstream_connect_timeouts_total.inc();
+            crate::metrics::record_backend_connect_timeout(&backend_metric_label(backend_ref));
             state
                 .listener_stats
                 .upstream_connect_timeouts
