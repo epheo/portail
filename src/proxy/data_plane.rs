@@ -243,6 +243,7 @@ impl DataPlane {
                 max_idle_per_backend: 64,
                 connect_timeout: performance_config.backend_timeout,
                 client_header_timeout: performance_config.client_header_timeout,
+                tcp_keepalive_time: performance_config.tcp_keepalive_time,
             },
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
@@ -462,6 +463,7 @@ impl DataPlane {
                                     max_idle_per_backend: self.worker_config.max_idle_per_backend,
                                     connect_timeout: performance_config.backend_timeout,
                                     client_header_timeout: performance_config.client_header_timeout,
+                                    tcp_keepalive_time: performance_config.tcp_keepalive_time,
                                 };
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;

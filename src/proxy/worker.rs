@@ -63,7 +63,20 @@ pub struct WorkerConfig {
     /// Client TLS-handshake / request-header-completion budget (slow-loris
     /// guard). Does not bound the idle wait between keepalive requests.
     pub client_header_timeout: Duration,
+    /// Idle time before the kernel's first TCP keepalive probe on accepted
+    /// sockets (see [`crate::config::PerformanceConfig::tcp_keepalive_time`]).
+    pub tcp_keepalive_time: Duration,
 }
+
+/// Probe cadence once `tcp_keepalive_time` idle has elapsed: a peer that
+/// answers none of `TCP_KEEPALIVE_RETRIES` probes spaced
+/// `TCP_KEEPALIVE_INTERVAL` apart is reaped by the kernel (the parked read
+/// returns ETIMEDOUT, dropping the task, its pooled backend connection, and
+/// both fds). Fixed rather than configurable: reap latency is dominated by
+/// the configurable idle threshold, and 10s x 5 keeps the tail short (~50s)
+/// without being trigger-happy over one dropped ACK.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const TCP_KEEPALIVE_RETRIES: u32 = 5;
 
 /// RAII in-flight-connection counter. One guard lives inside each spawned
 /// per-connection task; `DataPlane::shutdown` polls the shared count and
@@ -150,6 +163,14 @@ pub async fn run_worker(
         )),
     };
 
+    // Dead-peer detection: a client that vanishes without FIN/RST would
+    // otherwise park its connection task forever, since the idle wait
+    // between keepalive requests is intentionally unbounded.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(cfg.tcp_keepalive_time)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+
     loop {
         tokio::select! {
             biased;
@@ -160,6 +181,11 @@ pub async fn run_worker(
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, peer)) => {
+                        if let Err(e) =
+                            socket2::SockRef::from(&tcp_stream).set_tcp_keepalive(&keepalive)
+                        {
+                            debug!("TCP keepalive setup failed for {}: {}", peer, e);
+                        }
                         let routes = routes.clone();
                         let acceptor = tls_acceptor.clone();
                         let health = health.clone();

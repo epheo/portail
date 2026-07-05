@@ -607,6 +607,25 @@ pub struct PerformanceConfig {
     )]
     pub client_header_timeout: Duration,
 
+    /// Idle time before the kernel sends the first TCP keepalive probe on an
+    /// accepted client socket. Probes are empty ACKs — invisible to the
+    /// application protocol and harmless to genuinely idle-but-alive
+    /// connections — so this does NOT bound the (intentionally unbounded)
+    /// idle wait between keepalive requests; it only detects peers that
+    /// vanished without a FIN/RST (NAT/conntrack expiry, hard power-off).
+    /// Without it a half-dead connection parks its task, its paired backend
+    /// connection, and two fds forever; enough of them exhaust RLIMIT_NOFILE
+    /// and take down every accept loop, health listener included. Defaults
+    /// to 60s — same order as Go's net/http server default (15s); the probe
+    /// cadence after this idle threshold is fixed (see
+    /// `worker::TCP_KEEPALIVE_INTERVAL`), giving ~2min total reap latency.
+    #[serde(
+        default = "default_tcp_keepalive_time",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub tcp_keepalive_time: Duration,
+
     /// Scope of the idle backend-connection pool. `connection` (default)
     /// pools per accepted client connection — lock-free, but reuse happens
     /// only across keepalive requests on that same client. `process` shares
@@ -643,6 +662,10 @@ fn default_client_header_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_tcp_keepalive_time() -> Duration {
+    Duration::from_secs(60)
+}
+
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
@@ -650,6 +673,7 @@ impl Default for PerformanceConfig {
             udp_session_timeout: default_udp_session_timeout(),
             dns_refresh_interval: default_dns_refresh_interval(),
             client_header_timeout: default_client_header_timeout(),
+            tcp_keepalive_time: default_tcp_keepalive_time(),
             backend_pool_scope: PoolScope::default(),
         }
     }

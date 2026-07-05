@@ -123,6 +123,12 @@ fn main() -> Result<()> {
     // src/privileges.rs.
     privileges::raise_net_bind_service();
 
+    // Raise the soft fd limit to the hard ceiling: two fds per proxied
+    // connection makes the common 1024 container soft limit a ~500-connection
+    // cap, and hitting EMFILE breaks every accept loop at once. See
+    // src/privileges.rs.
+    privileges::raise_nofile_limit();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .max_blocking_threads(max_blocking_threads)

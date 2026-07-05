@@ -1,4 +1,6 @@
-//! Linux capability handling for direct privileged-port binds.
+//! Linux process setup that must run in `main` before the Tokio runtime:
+//! capability handling for direct privileged-port binds, and resource-limit
+//! raises.
 //!
 //! In multi-network/UDN mode and the host-networked DaemonSet the data plane
 //! binds the published port (e.g. 80/443) directly — there is no fronting
@@ -51,5 +53,67 @@ pub fn raise_net_bind_service() {
             ),
             Err(_e) => debug!("Could not query process capabilities: {_e}"),
         }
+    }
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard ceiling. Call once in `main`.
+///
+/// Container runtimes commonly hand processes a 1024 soft limit against a
+/// six-figure hard limit — and a proxy spends two fds per proxied connection,
+/// so 1024 caps it at roughly 500 concurrent connections. Worse, once
+/// `accept()` hits EMFILE *every* listener breaks, including the admin
+/// listener, turning fd pressure into a liveness-probe restart loop (observed
+/// on MicroShift: leaked half-dead connections exhausted the soft limit in
+/// ~16h, /livez timed out, kubelet restarted the pod). Raising soft to hard
+/// needs no capability, and operators still bound the process via the
+/// container's hard limit.
+pub fn raise_nofile_limit() {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::logging::{info, warn};
+
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit fills the struct we own; setrlimit only reads it.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            warn!(
+                "Could not query RLIMIT_NOFILE: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        if lim.rlim_cur >= lim.rlim_max {
+            return;
+        }
+        let soft = lim.rlim_cur;
+        lim.rlim_cur = lim.rlim_max;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            warn!(
+                "Could not raise RLIMIT_NOFILE {} -> {}: {}",
+                soft,
+                lim.rlim_max,
+                std::io::Error::last_os_error()
+            );
+        } else {
+            info!("Raised RLIMIT_NOFILE: {} -> {}", soft, lim.rlim_max);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// The raise must leave soft == hard; a second call is a clean no-op.
+    #[test]
+    fn nofile_soft_raised_to_hard() {
+        super::raise_nofile_limit();
+        super::raise_nofile_limit();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        assert_eq!(lim.rlim_cur, lim.rlim_max);
     }
 }
