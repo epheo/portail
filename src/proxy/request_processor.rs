@@ -159,7 +159,10 @@ fn analyze_http_request<'a>(
                     Some(URLRewritePath::ReplacePrefixMatch(value)) => {
                         crate::proxy::http_filters::join_prefix_path(
                             value,
-                            &request_info.path[rule.path.len()..],
+                            crate::proxy::http_filters::prefix_remainder(
+                                &rule.path,
+                                request_info.path,
+                            ),
                         )
                     }
                     None => request_info.path.to_string(),
@@ -370,6 +373,47 @@ mod tests {
 
     fn health() -> HealthRegistry {
         HealthRegistry::new()
+    }
+
+    #[test]
+    fn test_redirect_prefix_replace_on_regex_rule_no_panic() {
+        // Regression: the redirect arm sliced the request path by pattern
+        // length; a pattern longer than the matched path aborted the process.
+        let pattern = r"^/a$|^/much-longer-alternative$";
+        let mut rule = HttpRouteRule::new(
+            PathMatchType::RegularExpression,
+            pattern.to_string(),
+            vec![],
+            vec![],
+            vec![HttpFilter::RequestRedirect {
+                scheme: None,
+                hostname: None,
+                port: None,
+                path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+                status_code: 302,
+            }],
+            vec![Backend {
+                socket_addr: "127.0.0.1:8001".parse().unwrap(),
+                weight: 1,
+                filters: vec![],
+                use_tls: false,
+                server_name: String::new(),
+            }],
+        );
+        rule.path_regex = Some(regex::Regex::new(pattern).unwrap());
+        let mut rt = RouteTable::new();
+        rt.add_http_route("example.com", rule);
+
+        let sel = BackendSelector::new();
+        let req = make_request("GET", "/a", "example.com");
+        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+
+        match result {
+            RoutingResult::HttpRedirect { location, .. } => {
+                assert!(location.ends_with("/new"), "location: {}", location);
+            }
+            _ => panic!("expected HttpRedirect"),
+        }
     }
 
     #[test]

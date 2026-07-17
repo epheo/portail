@@ -31,6 +31,15 @@ pub enum RewrittenPath {
     PrefixReplaced(String),
 }
 
+/// Remainder of the request path after the matched prefix.
+/// ReplacePrefixMatch is only defined for PathPrefix rules; on a rule whose
+/// path is not a literal byte prefix of the request (regex patterns), slicing
+/// by length would panic (abort) or split UTF-8, so treat the path as fully
+/// consumed instead.
+pub(crate) fn prefix_remainder<'a>(rule_path: &str, request_path: &'a str) -> &'a str {
+    request_path.strip_prefix(rule_path).unwrap_or("")
+}
+
 /// Join a prefix replacement with the remaining suffix from the original path.
 /// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
 pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
@@ -84,7 +93,7 @@ pub fn extract_url_rewrite(
             let rewritten_path = path.as_ref().map(|p| match p {
                 URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
                 URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
-                    join_prefix_path(value, &request_path[rule_path.len()..]),
+                    join_prefix_path(value, prefix_remainder(rule_path, request_path)),
                 ),
             });
             return Some(URLRewrite {
@@ -355,6 +364,28 @@ pub(crate) fn apply_response_header_mods(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prefix_remainder_regex_rule_no_panic() {
+        // Regression: slicing by rule.path.len() aborted when the rule path
+        // was a regex pattern longer than the matched request path.
+        assert_eq!(prefix_remainder("/v1", "/v1/users"), "/users");
+        assert_eq!(prefix_remainder("/", "/three"), "three");
+        assert_eq!(
+            prefix_remainder(r"^/a$|^/much-longer-alternative$", "/a"),
+            ""
+        );
+        let rewrite = extract_url_rewrite(
+            &[HttpFilter::URLRewrite {
+                hostname: None,
+                path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+            }],
+            r"^/a$|^/much-longer-alternative$",
+            "/a",
+        )
+        .unwrap();
+        assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/new"));
+    }
 
     #[test]
     fn test_apply_modifications_path_rewrite() {
