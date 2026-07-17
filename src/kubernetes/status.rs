@@ -429,6 +429,7 @@ where
             &p.gateway_name,
             &p.gateway_namespace,
             p.section_name.as_deref(),
+            p.port,
         );
 
         let programmed_reason = if p.programmed { "Programmed" } else { "Invalid" };
@@ -510,11 +511,13 @@ where
 }
 
 /// Find existing conditions for a specific parent entry in the route status.
+/// Matches the full parentRef identity — two refs may differ only by port.
 fn find_existing_parent_conditions(
     existing_parents: &[serde_json::Value],
     gateway_name: &str,
     gateway_namespace: &str,
     section_name: Option<&str>,
+    port: Option<i32>,
 ) -> Vec<serde_json::Value> {
     for parent in existing_parents {
         let pref = match parent.get("parentRef") {
@@ -527,7 +530,11 @@ fn find_existing_parent_conditions(
             Some(sn) => pref.get("sectionName").and_then(|v| v.as_str()) == Some(sn),
             None => pref.get("sectionName").is_none(),
         };
-        if name_match && ns_match && section_match {
+        let port_match = match port {
+            Some(p) => pref.get("port").and_then(|v| v.as_i64()) == Some(p as i64),
+            None => pref.get("port").is_none(),
+        };
+        if name_match && ns_match && section_match && port_match {
             return parent
                 .get("conditions")
                 .and_then(|v| v.as_array())

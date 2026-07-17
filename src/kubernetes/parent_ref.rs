@@ -163,20 +163,3 @@ pub(crate) fn extract_parent_refs<T: ParentRefAccess>(
         })
         .unwrap_or_default()
 }
-
-/// Collect all sectionNames that target a specific gateway from parentRefs.
-pub(crate) fn all_section_names_for_gateway<T: ParentRefAccess>(
-    parent_refs: &Option<Vec<T>>,
-    gateway_name: &str,
-    gateway_ns: &str,
-) -> Vec<Option<String>> {
-    parent_refs
-        .as_ref()
-        .map(|refs| {
-            refs.iter()
-                .filter(|pr| parent_ref_matches_gateway(*pr, gateway_name, gateway_ns))
-                .map(|pr| pr.ref_section_name().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| vec![None])
-}

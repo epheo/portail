@@ -18,8 +18,8 @@ use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
     parse_backend_dns_name, route_namespace, CertData,
 };
-use super::parent_ref::{all_section_names_for_gateway, route_targets_gateway, ParentRefAccess};
-use super::reference_grants::{is_reference_allowed, route_allowed_for_listener, RouteAllowResult};
+use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
+use super::reference_grants::{is_reference_allowed, listeners_for_parent_ref};
 use super::services::ServiceState;
 
 // ---------------------------------------------------------------------------
@@ -58,7 +58,6 @@ pub(crate) trait GatewayRoute: Sized {
     fn identity(&self) -> (&str, Option<i64>);
     fn hostnames(&self) -> Vec<String>;
     fn convert(&self, gateway_name: &str) -> Result<Self::Config>;
-    fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>>;
     fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
     fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
     /// Mirror-filter backend refs (HTTPRoute only). Validated like forward
@@ -116,9 +115,6 @@ macro_rules! impl_gateway_route {
             }
             fn convert(&self, gw: &str) -> Result<Self::Config> {
                 $cv(self, gw)
-            }
-            fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>> {
-                all_section_names_for_gateway(&self.spec.$pr, gw_name, gw_ns)
             }
             fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
                 config
@@ -224,7 +220,9 @@ pub struct RouteAcceptance {
     pub generation: Option<i64>,
     /// The parentRef sectionName (for route status reporting)
     pub section_name: Option<String>,
-    /// The actual listener names this route was accepted by (for attached route counting)
+    /// The parentRef port (status parentRef must mirror the spec's ref exactly)
+    pub port: Option<i32>,
+    /// The listener names this parentRef was accepted by (for attached route counting)
     pub listener_names: Vec<String>,
 }
 
@@ -391,63 +389,71 @@ fn collect_routes<R: GatewayRoute>(
 
         let route_ns = route.route_namespace();
         let (name, generation) = route.identity();
-        let section_names = route.section_names_for_gateway(gateway_name, gateway_ns);
 
-        // Check namespace + hostname scoping against each listener.
-        // Track which listeners accept this route (for attached route counting).
+        // Evaluate each Gateway-matching parentRef independently: which
+        // listeners it selects and whether they admit the route. One status
+        // entry per parentRef — a ref pinned to a rejecting section must not
+        // inherit Accepted from a sibling ref (previously every ref got the
+        // route-wide verdict, and every entry claimed every listener).
         let route_hostnames = route.hostnames();
-        let mut accepted_listener_names: Vec<String> = Vec::new();
-        let mut rejection_reason = "NoMatchingParent";
-        for l in listeners {
-            match route_allowed_for_listener(
-                route.parent_refs(),
-                gateway_name,
-                l,
-                gateway_ns,
-                route_ns,
-                kind,
-                &route_hostnames,
-                namespace_labels,
-            ) {
-                RouteAllowResult::Allowed => {
-                    accepted_listener_names.push(l.name.clone());
-                }
-                RouteAllowResult::Rejected(reason) => {
-                    let priority = |r: &str| match r {
-                        "NotAllowedByListeners" => 2,
-                        "NoMatchingListenerHostname" => 1,
-                        _ => 0,
-                    };
-                    if priority(reason) > priority(rejection_reason) {
-                        rejection_reason = reason;
-                    }
-                }
-            }
-        }
+        let per_parent: Vec<(
+            Option<String>,
+            Option<i32>,
+            Result<Vec<String>, &'static str>,
+        )> = route
+            .parent_refs()
+            .as_ref()
+            .map(|refs| {
+                refs.iter()
+                    .filter(|pr| parent_ref_matches_gateway(*pr, gateway_name, gateway_ns))
+                    .map(|pr| {
+                        (
+                            pr.ref_section_name().map(String::from),
+                            pr.ref_port(),
+                            listeners_for_parent_ref(
+                                pr,
+                                listeners,
+                                gateway_ns,
+                                route_ns,
+                                kind,
+                                &route_hostnames,
+                                namespace_labels,
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if accepted_listener_names.is_empty() {
-            let message = match rejection_reason {
+        let rejection = |section_name: &Option<String>, port, reason: &'static str| {
+            let message = match reason {
                 "NoMatchingListenerHostname" => {
                     "Route hostnames do not intersect with any listener hostname"
                 }
                 "NoMatchingParent" => "No matching listener found for route parentRef",
                 _ => "Route not allowed by any listener policy (namespace/hostname/kind)",
             };
-            for section_name in &section_names {
-                route_status.push(RouteAcceptance {
-                    name: name.to_string(),
-                    namespace: route_ns.to_string(),
-                    kind,
-                    accepted: false,
-                    accepted_reason: rejection_reason.to_string(),
-                    message: message.to_string(),
-                    refs_resolved: true,
-                    refs_reason: "ResolvedRefs".to_string(),
-                    refs_message: "All references resolved".to_string(),
-                    generation,
-                    section_name: section_name.clone(),
-                    listener_names: vec![],
-                });
+            RouteAcceptance {
+                name: name.to_string(),
+                namespace: route_ns.to_string(),
+                kind,
+                accepted: false,
+                accepted_reason: reason.to_string(),
+                message: message.to_string(),
+                refs_resolved: true,
+                refs_reason: "ResolvedRefs".to_string(),
+                refs_message: "All references resolved".to_string(),
+                generation,
+                section_name: section_name.clone(),
+                port,
+                listener_names: vec![],
+            }
+        };
+
+        if per_parent.iter().all(|(_, _, r)| r.is_err()) {
+            for (section_name, port, result) in &per_parent {
+                let reason = result.as_ref().err().copied().unwrap_or("NoMatchingParent");
+                route_status.push(rejection(section_name, *port, reason));
             }
             continue;
         }
@@ -537,40 +543,51 @@ fn collect_routes<R: GatewayRoute>(
                     refs_messages.join("; ")
                 };
 
-                for section_name in &section_names {
-                    route_status.push(RouteAcceptance {
-                        name: name.to_string(),
-                        namespace: route_ns.to_string(),
-                        kind,
-                        accepted: true,
-                        accepted_reason: "Accepted".to_string(),
-                        message: "Accepted".to_string(),
-                        refs_resolved,
-                        refs_reason: refs_reason.clone(),
-                        refs_message: refs_message.clone(),
-                        generation,
-                        section_name: section_name.clone(),
-                        listener_names: accepted_listener_names.clone(),
-                    });
+                for (section_name, port, result) in &per_parent {
+                    match result {
+                        Ok(listener_names) => route_status.push(RouteAcceptance {
+                            name: name.to_string(),
+                            namespace: route_ns.to_string(),
+                            kind,
+                            accepted: true,
+                            accepted_reason: "Accepted".to_string(),
+                            message: "Accepted".to_string(),
+                            refs_resolved,
+                            refs_reason: refs_reason.clone(),
+                            refs_message: refs_message.clone(),
+                            generation,
+                            section_name: section_name.clone(),
+                            port: *port,
+                            listener_names: listener_names.clone(),
+                        }),
+                        Err(reason) => route_status.push(rejection(section_name, *port, reason)),
+                    }
                 }
                 configs.push(config);
             }
             Err(e) => {
-                for section_name in &section_names {
-                    route_status.push(RouteAcceptance {
-                        name: name.to_string(),
-                        namespace: route_ns.to_string(),
-                        kind,
-                        accepted: false,
-                        accepted_reason: "InvalidRoute".to_string(),
-                        message: format!("Conversion failed: {}", e),
-                        refs_resolved: false,
-                        refs_reason: "InvalidKind".to_string(),
-                        refs_message: format!("Conversion failed: {}", e),
-                        generation,
-                        section_name: section_name.clone(),
-                        listener_names: vec![],
-                    });
+                for (section_name, port, result) in &per_parent {
+                    match result {
+                        // A parentRef the listeners would admit: report the
+                        // conversion failure. A ref rejected before conversion
+                        // keeps its own rejection reason.
+                        Ok(_) => route_status.push(RouteAcceptance {
+                            name: name.to_string(),
+                            namespace: route_ns.to_string(),
+                            kind,
+                            accepted: false,
+                            accepted_reason: "InvalidRoute".to_string(),
+                            message: format!("Conversion failed: {}", e),
+                            refs_resolved: false,
+                            refs_reason: "InvalidKind".to_string(),
+                            refs_message: format!("Conversion failed: {}", e),
+                            generation,
+                            section_name: section_name.clone(),
+                            port: *port,
+                            listener_names: vec![],
+                        }),
+                        Err(reason) => route_status.push(rejection(section_name, *port, reason)),
+                    }
                 }
             }
         }
@@ -2089,6 +2106,55 @@ mod tests {
             }
             _ => panic!("expected RequestMirror"),
         }
+    }
+
+    /// A route with one matching and one dangling parentRef must get one
+    /// Accepted and one rejected status entry — previously every parentRef
+    /// inherited the route-wide verdict, so the dangling ref read Accepted.
+    #[test]
+    fn test_multi_parentref_mixed_acceptance() {
+        let gw = test_gateway();
+        let ns_labels = default_ns_labels();
+        let mut route = test_http_route();
+        route
+            .spec
+            .parent_refs
+            .as_mut()
+            .unwrap()
+            .push(HTTPRouteParentRefs {
+                name: "test-gw".to_string(),
+                section_name: Some("nonexistent".to_string()),
+                ..Default::default()
+            });
+
+        let result = reconcile_to_config(
+            &gw,
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
+            &HashMap::new(),
+            &empty_services(),
+        )
+        .unwrap();
+
+        assert_eq!(result.route_status.len(), 2);
+        let ok = result
+            .route_status
+            .iter()
+            .find(|ra| ra.section_name.as_deref() == Some("http"))
+            .unwrap();
+        assert!(ok.accepted);
+        assert_eq!(ok.listener_names, vec!["http".to_string()]);
+
+        let dangling = result
+            .route_status
+            .iter()
+            .find(|ra| ra.section_name.as_deref() == Some("nonexistent"))
+            .unwrap();
+        assert!(!dangling.accepted);
+        assert_eq!(dangling.accepted_reason, "NoMatchingParent");
+        assert!(dangling.listener_names.is_empty());
+
+        // The route still serves via its valid parentRef.
+        assert_eq!(result.config.http_routes.len(), 1);
     }
 
     /// Cross-namespace mirror ref helper: HTTPRoute in default mirroring to
