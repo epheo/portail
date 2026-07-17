@@ -647,10 +647,22 @@ async fn proxy_http_request(
         Err(e) => return Err(e),
     };
 
+    // Expect: 100-continue — the proxy answers on the backend's behalf. The
+    // Expect header was stripped from the forwarded request (a compliant
+    // backend then never sends its own 100, and a stray one is swallowed by
+    // the response reader), so the client's wait for the interim response
+    // must be satisfied here or uploads deadlock: the client waits for 100,
+    // the proxy waits for body, the backend waits for the request.
+    if meta.expect_continue {
+        client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        client.flush().await?;
+    }
+
     // Relay remaining request body + optional mirror tee, clamped to the
     // rule's total deadline — `request_timeout` covers the request-body phase
     // too, so a slow client body cannot hold the backend conn open past it.
-    // Expiry is SAFE for the client wire (no response bytes yet) → 408.
+    // Expiry is SAFE for the client wire (no response bytes yet) → 408; the
+    // interim 100 above does not spoil that (interim-then-final is legal).
     // Any bytes read past the body end (pipelined next request) come back as
     // leftover; mutually exclusive with the initial-read leftover above.
     let relay_fut = relay_request_body(
@@ -1251,6 +1263,11 @@ const RESPONSE_HEADER_CAP: usize = 65536;
 /// NO writes to the client; aborting/timeout/error before this returns leaves the
 /// client wire untouched, so the caller can still emit a clean `504`.
 /// On return, `header_buf` holds `[headers..header_end][same-read body tail...]`.
+/// Interim (1xx) responses tolerated per exchange before the backend is
+/// declared broken. Generous: a compliant exchange has at most a couple
+/// (100, 103), the cap only stops an infinite interim stream.
+const MAX_INTERIM_RESPONSES: u32 = 8;
+
 async fn read_response_headers(
     backend: &mut Connection,
     buf: &mut [u8],
@@ -1259,19 +1276,33 @@ async fn read_response_headers(
     expect_upgrade: bool,
 ) -> Result<(usize, ResponseFraming)> {
     header_buf.clear();
+    let mut interim_seen = 0u32;
 
     loop {
-        let n = backend.read(buf).await?;
-        if n == 0 {
-            return Err(anyhow::anyhow!(
-                "backend closed before sending response headers"
-            ));
-        }
-        header_buf.extend_from_slice(&buf[..n]);
-
+        // Check before reading: a swallowed interim response leaves the next
+        // response's bytes already buffered.
         if let Some(header_end) = find_header_end(header_buf) {
             let headers = &header_buf[..header_end];
             let status = parse_response_status(headers);
+
+            // Interim responses are proxy-consumed: the proxy answers
+            // 100-continue itself (Expect never reaches the backend), and
+            // relaying other 1xx mid-exchange would confuse clients that
+            // already got a 100. 1xx has no body, so everything past the
+            // block belongs to the next response. 101 is not interim here —
+            // it is dispatched below (upgrade accept or reject).
+            if (100..200).contains(&status) && status != 101 {
+                interim_seen += 1;
+                if interim_seen > MAX_INTERIM_RESPONSES {
+                    return Err(anyhow::anyhow!(
+                        "backend sent more than {} interim 1xx responses",
+                        MAX_INTERIM_RESPONSES
+                    ));
+                }
+                debug!("Swallowing backend interim {} response", status);
+                header_buf.drain(..header_end);
+                continue;
+            }
             let backend_close = response_wants_close(headers);
             let content_length = parse_content_length(headers);
             let is_chunked = is_chunked_transfer(headers);
@@ -1335,6 +1366,14 @@ async fn read_response_headers(
         if header_buf.len() > RESPONSE_HEADER_CAP {
             return Err(anyhow::anyhow!("response headers exceed buffer size"));
         }
+
+        let n = backend.read(buf).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "backend closed before sending response headers"
+            ));
+        }
+        header_buf.extend_from_slice(&buf[..n]);
     }
 }
 
