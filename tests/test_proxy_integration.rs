@@ -1400,3 +1400,95 @@ fn test_pipelined_post_body_boundary_respected() {
         second
     );
 }
+
+/// A refused upgrade (backend answers non-101) must keep the connection on
+/// normal routed HTTP framing. Before the 101 gate, the mere presence of an
+/// Upgrade request switched to a raw tunnel regardless of the response, so
+/// every subsequent request bypassed routing and went to the first backend.
+#[test]
+fn test_refused_upgrade_stays_http() {
+    let ws_backend = TestBackend::spawn("ws denied");
+    let other_backend = TestBackend::spawn("plain response");
+    let port = proxy_port(54);
+    let proxy = PortailProcess::spawn(
+        &[
+            ("localhost", "/ws", ws_backend.addr),
+            ("localhost", "/", other_backend.addr),
+        ],
+        port,
+    );
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&proxy.proxy_addr, Duration::from_secs(5))
+            .expect("connect to proxy");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    // TestBackend answers this with a plain 200 — an upgrade refusal.
+    let upgrade_request = "GET /ws HTTP/1.1\r\n\
+                           Host: localhost\r\n\
+                           Upgrade: websocket\r\n\
+                           Connection: Upgrade\r\n\
+                           Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    stream
+        .write_all(upgrade_request.as_bytes())
+        .expect("send upgrade request");
+
+    let first = read_complete_response(&mut stream);
+    assert_eq!(extract_status(&first), Some(200));
+    assert_eq!(
+        std::str::from_utf8(extract_body(&first)).unwrap().trim(),
+        "ws denied"
+    );
+
+    // Still a routed HTTP connection: this must reach the OTHER backend.
+    // Over a blind tunnel it would go raw to the ws backend instead.
+    stream
+        .write_all(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("send second request");
+    let second = read_complete_response(&mut stream);
+    assert_eq!(extract_status(&second), Some(200));
+    assert_eq!(
+        std::str::from_utf8(extract_body(&second)).unwrap().trim(),
+        "plain response"
+    );
+}
+
+/// Read one HTTP response: headers plus a Content-Length-framed body.
+fn read_complete_response(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "timeout reading response, got {} bytes: {:?}",
+                response.len(),
+                String::from_utf8_lossy(&response)
+            );
+        }
+        if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&response[..header_end]);
+            let content_length: usize = headers
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if response.len() >= header_end + 4 + content_length {
+                return response;
+            }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return response,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(e) => panic!("read error: {}", e),
+        }
+    }
+}

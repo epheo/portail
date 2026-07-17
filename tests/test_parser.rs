@@ -260,3 +260,31 @@ fn duplicate_equal_cl_is_benign() {
     assert!(!result.header_violation);
     assert_eq!(result.content_length, Some(4));
 }
+
+#[test]
+fn upgrade_requires_connection_token() {
+    // Bare Upgrade header without Connection: upgrade must not switch protocols.
+    let request = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(!result.is_upgrade);
+
+    let request =
+        b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.is_upgrade);
+}
+
+#[test]
+fn connection_token_list_parsed() {
+    // Token list form used by browsers.
+    let request =
+        b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert!(result.is_upgrade);
+    assert_eq!(result.connection_type, ConnectionType::KeepAlive);
+
+    // close token still wins inside a list.
+    let request = b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n";
+    let result = extract_routing_info(request).unwrap();
+    assert_eq!(result.connection_type, ConnectionType::Close);
+}
