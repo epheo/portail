@@ -266,6 +266,28 @@ fn reconcile_fingerprint(
     h.finish()
 }
 
+/// Per-listener attachedRoutes. The spec counts ROUTES attached to a
+/// listener, so a route whose several parentRefs land on the same listener
+/// still counts once — status entries are per parentRef, hence the dedupe.
+fn count_attached_routes(
+    listeners: &[gateway_api::gateways::GatewayListeners],
+    route_status: &[RouteAcceptance],
+) -> HashMap<String, i32> {
+    let mut counts: HashMap<String, i32> = listeners.iter().map(|l| (l.name.clone(), 0)).collect();
+    let mut counted: HashSet<(&str, &str, &str, &str)> = HashSet::new();
+    for ra in route_status {
+        if !ra.accepted {
+            continue;
+        }
+        for listener_name in &ra.listener_names {
+            if counted.insert((ra.kind, &ra.namespace, &ra.name, listener_name)) {
+                *counts.entry(listener_name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Merge per-Gateway configs into one data-plane config (legacy unscoped
 /// mode, where a single process serves every Gateway).
 ///
@@ -654,21 +676,8 @@ pub(super) async fn reconcile(
     };
 
     // Per-listener attached-route counts, restricted to this Gateway's routes.
-    let mut listener_route_counts: HashMap<String, i32> = gateway
-        .spec
-        .listeners
-        .iter()
-        .map(|l| (l.name.clone(), 0))
-        .collect();
-    for ra in &result.route_status {
-        if ra.accepted {
-            for listener_name in &ra.listener_names {
-                *listener_route_counts
-                    .entry(listener_name.clone())
-                    .or_insert(0) += 1;
-            }
-        }
-    }
+    let listener_route_counts =
+        count_attached_routes(&gateway.spec.listeners, &result.route_status);
 
     // Build + swap the RouteTable; on failure produce a failing Programmed
     // condition (route table build is the last step that can fail).
@@ -736,7 +745,7 @@ pub(super) async fn reconcile(
                     gateway_name: gw_name.clone(),
                     gateway_namespace: gw_ns.clone(),
                     section_name: ra.section_name.clone(),
-                    port: None,
+                    port: ra.port,
                     accepted: ra.accepted,
                     accepted_reason: ra.accepted_reason.clone(),
                     message: ra.message.clone(),
@@ -812,6 +821,56 @@ mod tests {
             interface: None,
             tls: None,
         }
+    }
+
+    fn gwl(name: &str) -> gateway_api::gateways::GatewayListeners {
+        gateway_api::gateways::GatewayListeners {
+            name: name.to_string(),
+            port: 80,
+            protocol: "HTTP".to_string(),
+            hostname: None,
+            tls: None,
+            allowed_routes: None,
+        }
+    }
+
+    fn accepted_ra(name: &str, section: Option<&str>, listeners: &[&str]) -> RouteAcceptance {
+        RouteAcceptance {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            kind: "HTTPRoute",
+            accepted: true,
+            accepted_reason: "Accepted".to_string(),
+            message: "Accepted".to_string(),
+            refs_resolved: true,
+            refs_reason: "ResolvedRefs".to_string(),
+            refs_message: "ok".to_string(),
+            generation: None,
+            section_name: section.map(String::from),
+            port: None,
+            listener_names: listeners.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// attachedRoutes counts routes, not parentRefs: two refs of one route
+    /// landing on the same listener count once (the old per-entry sum
+    /// double-counted every multi-parentRef route).
+    #[test]
+    fn attached_routes_dedupes_parent_refs_per_route() {
+        let listeners = [gwl("http"), gwl("https")];
+        let status = [
+            accepted_ra("a", Some("http"), &["http"]),
+            accepted_ra("a", None, &["http", "https"]),
+            accepted_ra("b", None, &["https"]),
+            {
+                let mut rejected = accepted_ra("c", None, &[]);
+                rejected.accepted = false;
+                rejected
+            },
+        ];
+        let counts = count_attached_routes(&listeners, &status);
+        assert_eq!(counts["http"], 1, "route a counted once on http");
+        assert_eq!(counts["https"], 2, "routes a and b");
     }
 
     #[test]

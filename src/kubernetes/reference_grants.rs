@@ -9,14 +9,7 @@ use gateway_api::gateways::{GatewayListeners, GatewayListenersAllowedRoutesNames
 use gateway_api::referencegrants::ReferenceGrant;
 
 use super::hostname::hostnames_intersect;
-use super::parent_ref::{parent_ref_matches_gateway, ParentRefAccess};
-
-/// Result of checking whether a route is allowed to attach to a listener.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum RouteAllowResult {
-    Allowed,
-    Rejected(&'static str),
-}
+use super::parent_ref::ParentRefAccess;
 
 /// Check if a route in `route_ns` is allowed by the listener's allowedRoutes policy.
 pub(crate) fn is_route_allowed_by_listener(
@@ -112,27 +105,31 @@ pub(crate) fn is_route_allowed_by_listener(
     }
 }
 
-/// Check if a route targets a specific listener by sectionName, and if so, whether
-/// the listener's namespace/hostname/kind policy allows the route.
-pub(crate) fn route_allowed_for_listener<T: ParentRefAccess>(
-    parent_refs: &Option<Vec<T>>,
-    gateway_name: &str,
-    listener: &GatewayListeners,
+/// Listeners one parentRef selects (sectionName/port) and is allowed to
+/// attach to (hostname intersection + allowedRoutes policy). Acceptance is a
+/// property of a single parentRef, not the whole route: a ref pinned to a
+/// section that rejects it must not inherit Accepted from a sibling ref.
+///
+/// The caller has already matched the ref against the Gateway. `Err` carries
+/// the most specific rejection across the selected listeners
+/// (NotAllowedByListeners > NoMatchingListenerHostname > NoMatchingParent).
+pub(crate) fn listeners_for_parent_ref<T: ParentRefAccess>(
+    pr: &T,
+    listeners: &[GatewayListeners],
     gateway_ns: &str,
     route_ns: &str,
     route_kind: &str,
     route_hostnames: &[String],
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
-) -> RouteAllowResult {
-    let refs = match parent_refs.as_ref() {
-        Some(r) => r,
-        None => return RouteAllowResult::Rejected("NoMatchingParent"),
+) -> Result<Vec<String>, &'static str> {
+    let priority = |r: &str| match r {
+        "NotAllowedByListeners" => 2,
+        "NoMatchingListenerHostname" => 1,
+        _ => 0,
     };
-    let mut best_reason: &str = "NoMatchingParent";
-    for pr in refs {
-        if !parent_ref_matches_gateway(pr, gateway_name, gateway_ns) {
-            continue;
-        }
+    let mut allowed = Vec::new();
+    let mut best_reason: &'static str = "NoMatchingParent";
+    for listener in listeners {
         if let Some(section) = pr.ref_section_name() {
             if section != listener.name {
                 continue;
@@ -144,7 +141,9 @@ pub(crate) fn route_allowed_for_listener<T: ParentRefAccess>(
             }
         }
         if !hostnames_intersect(listener.hostname.as_deref(), route_hostnames) {
-            best_reason = "NoMatchingListenerHostname";
+            if priority("NoMatchingListenerHostname") > priority(best_reason) {
+                best_reason = "NoMatchingListenerHostname";
+            }
             continue;
         }
         if is_route_allowed_by_listener(
@@ -154,11 +153,16 @@ pub(crate) fn route_allowed_for_listener<T: ParentRefAccess>(
             route_kind,
             namespace_labels,
         ) {
-            return RouteAllowResult::Allowed;
+            allowed.push(listener.name.clone());
+        } else if priority("NotAllowedByListeners") > priority(best_reason) {
+            best_reason = "NotAllowedByListeners";
         }
-        best_reason = "NotAllowedByListeners";
     }
-    RouteAllowResult::Rejected(best_reason)
+    if allowed.is_empty() {
+        Err(best_reason)
+    } else {
+        Ok(allowed)
+    }
 }
 
 /// Check if a cross-namespace reference is allowed by a ReferenceGrant.
