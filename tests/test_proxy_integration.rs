@@ -1606,3 +1606,113 @@ fn test_backend_connection_header_not_relayed_to_client() {
         headers
     );
 }
+
+/// Expect: 100-continue uploads: the proxy answers the interim 100 itself
+/// (the Expect header never reaches the backend), then relays the body.
+/// Regression: a backend 100 was previously treated as the final response —
+/// forwarded as the answer while the real one poisoned the pooled conn.
+#[test]
+fn test_expect_100_continue_upload() {
+    let backend = InspectingBackend::spawn("uploaded");
+    let port = proxy_port(58);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&proxy.proxy_addr, Duration::from_secs(5))
+            .expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+
+    let body = "hello=world";
+    let headers = format!(
+        "POST /up HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).expect("send headers");
+
+    // Wait for the interim 100 before sending the body, as curl does.
+    let mut interim = Vec::new();
+    let mut buf = [0u8; 1024];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !interim.windows(4).any(|w| w == b"\r\n\r\n") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no 100 Continue within 5s; got: {:?}",
+            String::from_utf8_lossy(&interim)
+        );
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("closed before 100 Continue"),
+            Ok(n) => interim.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(e) => panic!("read error waiting for 100: {}", e),
+        }
+    }
+    assert!(
+        interim.starts_with(b"HTTP/1.1 100"),
+        "expected interim 100, got: {}",
+        String::from_utf8_lossy(&interim)
+    );
+
+    stream.write_all(body.as_bytes()).expect("send body");
+    let response = read_complete_response(&mut stream);
+    assert_eq!(extract_status(&response), Some(200));
+    assert_eq!(
+        std::str::from_utf8(extract_body(&response)).unwrap().trim(),
+        "uploaded"
+    );
+
+    let received = backend.received_requests();
+    assert_eq!(received.len(), 1);
+    let req = String::from_utf8_lossy(&received[0]).to_ascii_lowercase();
+    assert!(!req.contains("expect:"), "Expect reached backend: {}", req);
+    assert!(req.ends_with("hello=world"), "body lost: {}", req);
+}
+
+/// A stray interim 100 from the backend (no Expect involved) is swallowed;
+/// the client sees only the final response.
+#[test]
+fn test_backend_stray_100_swallowed() {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let backend_addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+                Err(_) => return,
+            }
+        }
+        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal")
+            .unwrap();
+    });
+
+    let port = proxy_port(59);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend_addr)], port);
+
+    let response = http_request(
+        proxy.proxy_addr,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("response");
+    assert_eq!(extract_status(&response), Some(200));
+    assert!(
+        !response.windows(7).any(|w| w == b"100 Con"),
+        "interim 100 leaked to client: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        std::str::from_utf8(extract_body(&response)).unwrap(),
+        "final"
+    );
+    handle.join().unwrap();
+}
