@@ -1716,3 +1716,84 @@ fn test_backend_stray_100_swallowed() {
     );
     handle.join().unwrap();
 }
+
+/// A backend that stalls mid-response-body must be reaped by the idle-body
+/// timeout instead of pinning the task, both fds, and the backend conn
+/// forever (routes have no request_timeout by default).
+#[test]
+fn test_stalled_backend_body_reaped_by_idle_timeout() {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let backend_addr = listener.local_addr().unwrap();
+    let unstall = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unstall_b = unstall.clone();
+    let handle = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+                Err(_) => return,
+            }
+        }
+        // Headers + partial body, then stall until told otherwise.
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+            .unwrap();
+        while !unstall_b.load(std::sync::atomic::Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let port = proxy_port(60);
+    let proxy = PortailProcess::spawn_with_performance(
+        &[("localhost", "/", backend_addr)],
+        port,
+        r#"{"idleBodyTimeout": "1s"}"#,
+    );
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&proxy.proxy_addr, Duration::from_secs(5))
+            .expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("send");
+
+    let start = std::time::Instant::now();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break, // proxy reaped the exchange
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                assert!(
+                    start.elapsed() < Duration::from_secs(8),
+                    "connection not closed after idle timeout"
+                );
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    // Reaped within the 1s idle budget (plus scheduling slack), far below
+    // the 30s backend budget that would otherwise apply.
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "idle timeout did not fire: waited {:?}",
+        start.elapsed()
+    );
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "headers should have been forwarded before the stall"
+    );
+
+    unstall.store(true, std::sync::atomic::Ordering::Relaxed);
+    handle.join().unwrap();
+}
