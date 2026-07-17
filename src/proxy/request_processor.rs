@@ -25,6 +25,12 @@ pub struct RequestMeta {
     /// the backend (correctly) never sends.
     pub is_head: bool,
     pub keepalive: bool,
+    /// Hop-by-hop header spans recorded by the parser, skipped at forwarding.
+    pub strip_spans: crate::proxy::http_parser::StripSpans,
+    /// Upgrade header line span; kept only when `is_upgrade`.
+    pub upgrade_span: Option<(u32, u32)>,
+    /// Request carried `Expect: 100-continue`.
+    pub expect_continue: bool,
 }
 
 /// Routing result that borrows from the RouteTable — zero per-request allocations.
@@ -212,6 +218,9 @@ fn analyze_http_request<'a>(
             is_upgrade: request_info.is_upgrade,
             is_head: request_info.method.eq_ignore_ascii_case("HEAD"),
             keepalive,
+            strip_spans: request_info.strip_spans,
+            upgrade_span: request_info.upgrade_span,
+            expect_continue: request_info.expect_continue,
         },
     })
 }

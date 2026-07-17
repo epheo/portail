@@ -43,6 +43,46 @@ pub enum HttpVersion {
     Http11,
 }
 
+pub const MAX_STRIP_SPANS: usize = 8;
+
+/// Byte spans (start..end, CRLF inclusive) of hop-by-hop header lines,
+/// recorded during the parser's existing single pass so forwarding can skip
+/// them by bulk gap-copy — no second scan, no allocation. Overflow or
+/// Connection-nominated extra headers divert to the thorough slow path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StripSpans {
+    spans: [(u32, u32); MAX_STRIP_SPANS],
+    len: u8,
+    pub needs_slow_path: bool,
+}
+
+impl StripSpans {
+    #[inline]
+    fn push(&mut self, start: usize, end: usize) {
+        if (self.len as usize) < MAX_STRIP_SPANS {
+            self.spans[self.len as usize] = (start as u32, end as u32);
+            self.len += 1;
+        } else {
+            self.needs_slow_path = true;
+        }
+    }
+
+    /// Spans in ascending byte order (parse order).
+    pub fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.spans[..self.len as usize]
+            .iter()
+            .map(|&(s, e)| (s as usize, e as usize))
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// HTTP request information extracted by unified parser (zero-copy)
 /// Contains all fields needed for routing decisions and execution
 #[derive(Debug, Clone)]
@@ -71,6 +111,12 @@ pub struct HttpRequestInfo<'a> {
     ///
     /// The caller MUST reject such requests with `400`.
     pub header_violation: bool,
+    /// Hop-by-hop header lines to strip when forwarding (RFC 7230 §6.1).
+    pub strip_spans: StripSpans,
+    /// Span of the Upgrade header line; kept only for real upgrade requests.
+    pub upgrade_span: Option<(u32, u32)>,
+    /// Request carried `Expect: 100-continue`.
+    pub expect_continue: bool,
 }
 
 /// Extract complete HTTP routing information with zero-copy parsing
@@ -97,6 +143,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     // request_processor can reject with a clean 400.
     let mut duplicate_content_length_conflict = false;
     let mut transfer_encoding_violation = false;
+    let mut strip_spans = StripSpans::default();
+    let mut upgrade_span: Option<(u32, u32)> = None;
+    let mut expect_continue = false;
 
     // Parse first line (method, path, version)
     let mut line_end = pos;
@@ -149,6 +198,15 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         {
             line_end += 1;
         }
+
+        // Header-line disposition, applied after the CRLF advance below
+        // (spans must include the terminator).
+        enum LineKind {
+            Keep,
+            Strip,
+            Upgrade,
+        }
+        let mut line_kind = LineKind::Keep;
 
         if line_end > line_start {
             let line = &request_data[line_start..line_end];
@@ -207,7 +265,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                 }
             } else if line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Upgrade:") {
                 has_upgrade_header = true;
+                line_kind = LineKind::Upgrade;
             } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
+                line_kind = LineKind::Strip;
                 let mut value_start = 11;
                 while value_start < line.len() && line[value_start] == b' ' {
                     value_start += 1;
@@ -231,7 +291,27 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                             raw_connection_type = ConnectionType::KeepAlive;
                         } else if token.eq_ignore_ascii_case("upgrade") {
                             connection_has_upgrade = true;
+                        } else if !token.is_empty() {
+                            // Connection nominated an extra header to strip;
+                            // the span fast path cannot honor that.
+                            strip_spans.needs_slow_path = true;
                         }
+                    }
+                }
+            } else if (line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Keep-Alive:"))
+                || (line.len() >= 17 && line[..17].eq_ignore_ascii_case(b"Proxy-Connection:"))
+                || (line.len() >= 3 && line[..3].eq_ignore_ascii_case(b"TE:"))
+                || (line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Trailer:"))
+            {
+                line_kind = LineKind::Strip;
+            } else if line.len() >= 7 && line[..7].eq_ignore_ascii_case(b"Expect:") {
+                // The proxy answers 100-continue itself and strips the header;
+                // other expectations are stripped and ignored (RFC 9110 lets
+                // an intermediary absorb expectations it handles).
+                line_kind = LineKind::Strip;
+                if let Ok(value) = std::str::from_utf8(&line[7..]) {
+                    if value.trim().eq_ignore_ascii_case("100-continue") {
+                        expect_continue = true;
                     }
                 }
             }
@@ -244,6 +324,11 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         }
         if pos < request_data.len() && request_data[pos] == b'\n' {
             pos += 1;
+        }
+        match line_kind {
+            LineKind::Keep => {}
+            LineKind::Strip => strip_spans.push(line_start, pos),
+            LineKind::Upgrade => upgrade_span = Some((line_start as u32, pos as u32)),
         }
     }
 
@@ -312,6 +397,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         // nominates it. A bare Upgrade header must not switch protocols.
         is_upgrade: has_upgrade_header && connection_has_upgrade,
         header_violation,
+        strip_spans,
+        upgrade_span,
+        expect_continue,
     })
 }
 

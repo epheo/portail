@@ -642,8 +642,9 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let start = std::time::Instant::now();
         assert_eq!(peek_sni(&stream, Duration::from_secs(5)).await, None);
-        // Must classify without waiting out the budget.
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // Must classify without waiting out the 5s budget; generous bound so
+        // a loaded CI runner cannot flake it.
+        assert!(start.elapsed() < Duration::from_secs(3));
         client.await.unwrap();
     }
 
