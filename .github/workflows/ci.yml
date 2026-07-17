@@ -1,10 +1,11 @@
 name: CI
 
+# No push trigger: on main, publish.yml calls this workflow and gates the
+# release on it, so a separate push run would only duplicate work.
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

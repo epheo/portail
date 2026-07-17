@@ -1,0 +1,55 @@
+name: Bench
+
+# Gate PRs on CPU micro-benchmark regressions in the parse/route hot path.
+#
+# Only the deterministic, in-process criterion benches run here — they are stable
+# enough on shared GitHub runners to compare run-to-run. The real-socket
+# throughput bench (benches/proxy_throughput.rs) is deliberately NOT run in CI:
+# it spawns processes, needs the `kiss` backend, and its req/s figure is too
+# noisy on shared runners to gate on. Run that one locally for absolute numbers:
+#   cargo build --release && cargo bench --bench proxy_throughput
+
+on:
+  push:
+    branches: [ main ]        # refresh the stored baseline
+  pull_request:
+    branches: [ main ]        # compare against it; alert on regression
+
+permissions:
+  contents: write             # github-action-benchmark pushes history to gh-pages
+  pull-requests: write        # and comments on a regressing PR
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  micro-bench:
+    name: Micro-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # criterion's `--output-format bencher` emits libtest-style lines
+      # (`test <name> ... bench: <ns> ns/iter (+/- <mad>)`), which
+      # github-action-benchmark parses with `tool: cargo`.
+      - name: Run criterion micro-benches
+        run: |
+          cargo bench --bench parsing_bench --bench routing_bench --bench end_to_end_bench \
+            -- --output-format bencher | tee bench-output.txt
+
+      - name: Track results + alert on regression
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench-output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # On push to main: store the new baseline. On PRs: compare only.
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          # Flag any bench that regresses past 1.5x its baseline.
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: ${{ github.event_name == 'pull_request' }}
+          summary-always: true

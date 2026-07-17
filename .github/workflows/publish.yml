@@ -9,13 +9,17 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  check:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   conformance:
     name: Gateway API Conformance
     uses: ./.github/workflows/conformance.yml
 
   release:
     name: Release
-    needs: [conformance]
+    needs: [check, conformance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -41,6 +45,25 @@ jobs:
           echo "version_bare=$BARE" >> "$GITHUB_OUTPUT"
           echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
           echo "Next release: $NEXT (bare: $BARE, minor: $MINOR)"
+
+      # Keep the in-tree versions matching the tag so `portail --version` and
+      # the conformance report agree with the published image. The bump commit
+      # is what gets tagged and built; GITHUB_TOKEN pushes do not retrigger
+      # workflows, so this cannot loop.
+      - name: Sync versions with tag
+        run: |
+          BARE="${{ steps.version.outputs.version_bare }}"
+          NEXT="${{ steps.version.outputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"${BARE}\"/" Cargo.toml
+          sed -i "/^name = \"portail\"$/{n;s/^version = \".*\"/version = \"${BARE}\"/}" Cargo.lock
+          sed -i "s/\(portailVersion *= *\)\"v[^\"]*\"/\1\"${NEXT}\"/" conformance/conformance_test.go
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock conformance/conformance_test.go
+            git commit -m "Release ${NEXT}"
+            git push origin main
+          fi
 
       - name: Create tag and GitHub Release
         run: |
