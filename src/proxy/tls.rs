@@ -4,6 +4,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
@@ -332,6 +333,79 @@ pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Resu
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Classification of peeked bytes for SNI-based connection dispatch.
+pub enum ClientHelloPeek {
+    /// First TLS record fully present; SNI value (None = hello without SNI).
+    Complete(Option<String>),
+    /// A TLS handshake record is still arriving; peek again with more bytes.
+    Partial,
+    /// Not a TLS handshake at all.
+    NotTls,
+}
+
+/// Classify peeked bytes without consuming them. Distinguishes "record still
+/// in flight" from "no SNI" so dispatch can wait for fragmented ClientHellos
+/// (post-quantum key shares push hellos past one TCP segment) instead of
+/// misrouting them.
+pub fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
+    match buf.first() {
+        Some(&0x16) => {}
+        Some(_) => return ClientHelloPeek::NotTls,
+        None => return ClientHelloPeek::Partial,
+    }
+    if buf.len() < 5 {
+        return ClientHelloPeek::Partial;
+    }
+    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if buf.len() < 5 + record_len {
+        return ClientHelloPeek::Partial;
+    }
+    ClientHelloPeek::Complete(extract_sni(buf))
+}
+
+/// Peek the client's first TLS record and extract SNI, waiting within
+/// `budget` for a fragmented ClientHello to finish arriving. Runs once per
+/// TLS connection before dispatch — never on the per-request path.
+///
+/// Returns None on timeout, non-TLS bytes, a hello without SNI, or a hello
+/// whose ClientHello spans multiple records (cannot be peeked whole).
+pub async fn peek_sni(stream: &tokio::net::TcpStream, budget: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut buf = [0u8; 16384];
+    let mut last_n = 0usize;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return None;
+        }
+        let n = match tokio::time::timeout(remaining, stream.peek(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            _ => return None,
+        };
+        if n == 0 {
+            return None;
+        }
+        match classify_client_hello(&buf[..n]) {
+            ClientHelloPeek::Complete(sni) => return sni,
+            ClientHelloPeek::NotTls => return None,
+            ClientHelloPeek::Partial => {
+                if n == buf.len() {
+                    // Record larger than the peek window; cannot complete.
+                    return None;
+                }
+                if n == last_n {
+                    // peek() returns instantly while the tail is in flight;
+                    // yield briefly instead of spinning on identical bytes.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                last_n = n;
+            }
+        }
+    }
+}
+
 /// Extract SNI hostname from a TLS ClientHello message.
 ///
 /// Parses just enough of the TLS record layer and handshake to find the
@@ -499,6 +573,78 @@ mod tests {
     #[test]
     fn test_extract_sni_truncated() {
         assert_eq!(extract_sni(&[0x16, 0x03, 0x01]), None);
+    }
+
+    #[test]
+    fn test_classify_client_hello() {
+        let record = build_tls_record(&build_client_hello(&build_sni_extension(b"example.com")));
+
+        // Complete record: SNI extracted.
+        assert!(matches!(
+            classify_client_hello(&record),
+            ClientHelloPeek::Complete(Some(ref h)) if h == "example.com"
+        ));
+        // Any truncation of the record: still arriving.
+        for cut in [1usize, 4, 5, record.len() - 1] {
+            assert!(
+                matches!(
+                    classify_client_hello(&record[..cut]),
+                    ClientHelloPeek::Partial
+                ),
+                "cut at {} should be Partial",
+                cut
+            );
+        }
+        // Non-TLS first byte: classified immediately, no waiting.
+        assert!(matches!(
+            classify_client_hello(b"GET / HTTP/1.1\r\n"),
+            ClientHelloPeek::NotTls
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_peek_sni_fragmented_hello() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let record = build_tls_record(&build_client_hello(&build_sni_extension(b"frag.test")));
+
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.set_nodelay(true).unwrap();
+            // Split mid-record: a single peek sees an incomplete record.
+            sock.write_all(&record[..40]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            sock.write_all(&record[40..]).await.unwrap();
+            // Keep the socket open until the server side has peeked.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let sni = peek_sni(&stream, Duration::from_secs(2)).await;
+        assert_eq!(sni.as_deref(), Some("frag.test"));
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_peek_sni_rejects_non_tls_immediately() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(peek_sni(&stream, Duration::from_secs(5)).await, None);
+        // Must classify without waiting out the budget.
+        assert!(start.elapsed() < Duration::from_secs(1));
+        client.await.unwrap();
     }
 
     // Test helpers to build minimal TLS structures
