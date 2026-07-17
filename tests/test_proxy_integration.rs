@@ -46,7 +46,6 @@ fn test_http_proxy_roundtrip() {
 }
 
 #[test]
-#[ignore]
 fn test_http_keepalive_reuse() {
     let backend = TestBackend::spawn("keepalive-response");
     let port = proxy_port(2);
