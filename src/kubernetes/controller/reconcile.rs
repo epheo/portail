@@ -375,6 +375,19 @@ fn merge_gateway_configs(
     merged
 }
 
+/// Whether `class_name` resolves to a GatewayClass whose controllerName is
+/// ours. Pure — the unscoped-mode ownership filter.
+fn gateway_class_is_ours(
+    classes: &[Arc<gateway_api::gatewayclasses::GatewayClass>],
+    class_name: &str,
+    controller_name: &str,
+) -> bool {
+    classes.iter().any(|gc| {
+        gc.metadata.name.as_deref() == Some(class_name)
+            && gc.spec.controller_name == controller_name
+    })
+}
+
 pub(super) async fn reconcile(
     gateway: Arc<Gateway>,
     ctx: Arc<ControllerCtx>,
@@ -383,9 +396,27 @@ pub(super) async fn reconcile(
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
 
-    // GatewayClass acceptance is owned by portail-operator; it only provisions a
-    // portail Deployment for Gateways whose class references this controller, so
-    // we can trust the scope and skip an in-process class check here.
+    // Scoped mode trusts portail-operator: it only provisions a Deployment for
+    // Gateways whose class references this controller. Unscoped mode watches
+    // EVERY Gateway in the cluster, so claiming one whose GatewayClass names a
+    // different controller would hijack it — status writes fighting the real
+    // owner, ports bound for traffic we were never asked to serve. Ignore
+    // those entirely (no status, no binds); a class watch re-triggers us if
+    // ownership changes. A class not in the store yet is also not ours to
+    // claim.
+    if let Some(classes) = &ctx.cache.gateway_classes {
+        if !gateway_class_is_ours(
+            &classes.state(),
+            &gateway.spec.gateway_class_name,
+            &ctx.controller_name,
+        ) {
+            debug!(
+                "Gateway {}/{} class '{}' does not name this controller; ignoring",
+                gw_ns, gw_name, gateway.spec.gateway_class_name
+            );
+            return Ok(Action::await_change());
+        }
+    }
 
     // Snapshot reflector caches in one shot — no API server calls, and no deep
     // copies: routes are filtered to this Gateway before anything is cloned,
@@ -504,6 +535,17 @@ pub(super) async fn reconcile(
         ctx.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    // Serialize the apply section: from here on the pass reads and writes
+    // SHARED state (gateway_configs, the data plane's listener set, the live
+    // route table, the config cell). kube-rs reconciles different Gateways
+    // concurrently in unscoped mode, and two interleaved passes could store a
+    // table built from a stale merge over a newer one, or tear down a
+    // just-added sibling listener. Holding the lock to the end of the pass
+    // makes each apply atomic; the later pass re-merges from the map already
+    // holding the earlier insert. Uncontended in scoped mode.
+    let _apply_guard = ctx.apply_lock.lock().await;
+    let gw_key = (gw_ns.clone(), gw_name.clone());
+
     // Track this Gateway's config and derive the config the data plane
     // should actually run. In scoped mode (operator-managed, one Gateway per
     // process) that is simply this Gateway's config; in legacy unscoped mode
@@ -515,7 +557,7 @@ pub(super) async fn reconcile(
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        map.insert((gw_ns.clone(), gw_name.clone()), config.clone());
+        map.insert(gw_key.clone(), config.clone());
         // Prune Gateways that no longer exist — deletions don't run this
         // reconciler, so stale entries are collected on any later pass.
         let live: HashSet<(String, String)> = ctx
@@ -526,6 +568,9 @@ pub(super) async fn reconcile(
             .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
             .collect();
         map.retain(|k, _| live.contains(k));
+        if let Ok(mut last) = ctx.last_applied.lock() {
+            last.retain(|k, _| live.contains(k));
+        }
         if map.len() <= 1 {
             config.clone()
         } else {
@@ -586,7 +631,7 @@ pub(super) async fn reconcile(
     let unchanged = ctx
         .last_applied
         .lock()
-        .map(|last| *last == Some(fingerprint))
+        .map(|last| last.get(&gw_key) == Some(&fingerprint))
         .unwrap_or(false);
     if unchanged && dp_ready_initial {
         crate::metrics::METRICS.reconcile_skips_total.inc();
@@ -797,7 +842,7 @@ pub(super) async fn reconcile(
         // wrong status would sit in the cluster until the slow safety-net
         // requeue. Leave `last_applied` unset so the next pass re-applies.
         if let Ok(mut last) = ctx.last_applied.lock() {
-            *last = None;
+            last.remove(&gw_key);
         }
         return Ok(Action::requeue(Duration::from_secs(10)));
     }
@@ -805,7 +850,7 @@ pub(super) async fn reconcile(
     // Everything applied: record the fingerprint so identical future passes
     // (watch echoes, unconverged requeues with unchanged inputs) short-circuit.
     if let Ok(mut last) = ctx.last_applied.lock() {
-        *last = Some(fingerprint);
+        last.insert(gw_key, fingerprint);
     }
 
     // Requeue cadence is convergence-driven — see `success_requeue_secs`.
@@ -831,6 +876,45 @@ mod tests {
             interface: None,
             tls: None,
         }
+    }
+
+    /// Unscoped mode must only claim Gateways whose class names this
+    /// controller; an absent class is not ours to claim either.
+    #[test]
+    fn gateway_class_ownership_filter() {
+        use gateway_api::gatewayclasses::{GatewayClass, GatewayClassSpec};
+        let gc = |name: &str, controller: &str| {
+            Arc::new(GatewayClass {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+                spec: GatewayClassSpec {
+                    controller_name: controller.into(),
+                    ..Default::default()
+                },
+                status: None,
+            })
+        };
+        let classes = vec![
+            gc("portail", "epheo.eu/portail"),
+            gc("other", "example.com/other"),
+        ];
+        assert!(gateway_class_is_ours(
+            &classes,
+            "portail",
+            "epheo.eu/portail"
+        ));
+        assert!(!gateway_class_is_ours(
+            &classes,
+            "other",
+            "epheo.eu/portail"
+        ));
+        assert!(!gateway_class_is_ours(
+            &classes,
+            "missing",
+            "epheo.eu/portail"
+        ));
     }
 
     fn gwl(name: &str) -> gateway_api::gateways::GatewayListeners {

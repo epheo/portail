@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use gateway_api::experimental::tcproutes::TCPRoute;
 use gateway_api::experimental::tlsroutes::TLSRoute;
 use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
@@ -64,6 +65,10 @@ struct ResourceCache {
     services: Store<Service>,
     secrets: Store<Secret>,
     reference_grants: Store<ReferenceGrant>,
+    /// `Some` only in legacy unscoped mode, where portail sees every Gateway
+    /// in the cluster and must filter by GatewayClass controllerName itself.
+    /// Scoped mode trusts the operator's scoping and opens no class watch.
+    gateway_classes: Option<Store<GatewayClass>>,
 }
 
 #[derive(Clone)]
@@ -89,8 +94,16 @@ struct ControllerCtx {
     /// pass computes the same fingerprint, the rebuild and all status writes
     /// are skipped: this is what keeps a permanently-unaccepted route (or our
     /// own status-write watch echoes) from re-running regex compilation, DNS
-    /// resolution, and N apiserver PATCHes on every requeue.
-    last_applied: Arc<std::sync::Mutex<Option<u64>>>,
+    /// resolution, and N apiserver PATCHes on every requeue. Keyed per
+    /// Gateway: a single shared slot meant that in unscoped mode two
+    /// Gateways' alternating passes never matched and re-applied forever.
+    last_applied: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
+    /// Serializes the apply section of reconcile (merge → ensure → table
+    /// build → swap → status). kube-rs reconciles different Gateways
+    /// concurrently in unscoped mode, and interleaved passes could publish a
+    /// table built from a stale merge over the shared data plane. Uncontended
+    /// in scoped mode (one Gateway per process).
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// Last built config per Gateway. In scoped mode this holds exactly one
     /// entry; in legacy unscoped mode (one process watching every Gateway)
     /// the entries are merged before each route-table build so reconciling
@@ -194,6 +207,14 @@ pub async fn run_controller(
     let (store_reference_grants, reference_grant_stream) =
         create_reflector(Api::<ReferenceGrant>::all(client.clone()));
 
+    // GatewayClass — unscoped mode only. Watching every Gateway cluster-wide
+    // means Gateways owned by OTHER controllers land in the store too; the
+    // reconciler filters them by class controllerName, which needs the
+    // classes themselves. Scoped mode is pre-filtered by the operator.
+    let unscoped = gateway_scope.is_none();
+    let (store_gateway_classes, gateway_class_stream) =
+        create_reflector_gated(unscoped, Api::<GatewayClass>::all(client.clone()));
+
     // TLS secrets — field-filtered to type=kubernetes.io/tls, and opened only
     // when the Gateway has a TLS-terminate listener (watch shape).
     let (store_secrets, secret_stream) = create_reflector_gated_with_config(
@@ -223,6 +244,7 @@ pub async fn run_controller(
             services: store_services,
             secrets: store_secrets,
             reference_grants: store_reference_grants,
+            gateway_classes: unscoped.then_some(store_gateway_classes),
         },
         routes,
         config_cell: config_cell.clone(),
@@ -230,7 +252,8 @@ pub async fn run_controller(
         performance_config,
         manage_gateway_status,
         ready,
-        last_applied: Arc::new(std::sync::Mutex::new(None)),
+        last_applied: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         started: std::time::Instant::now(),
     });
@@ -332,6 +355,13 @@ pub async fn run_controller(
         .watches_stream(reference_grant_stream, {
             let gw = ctx.cache.gateways.clone();
             move |_: ReferenceGrant| all_gateway_refs(&gw)
+        })
+        // GatewayClass (unscoped only; pending stream when scoped): a class
+        // appearing or changing controllerName flips which Gateways are ours,
+        // so re-evaluate all of them.
+        .watches_stream(gateway_class_stream, {
+            let gw = ctx.cache.gateways.clone();
+            move |_: GatewayClass| all_gateway_refs(&gw)
         })
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
