@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -194,6 +194,89 @@ impl Drop for TcpEchoBackend {
     }
 }
 
+/// UDP backend that echoes each datagram back as "echo[{peer_port}]:{payload}".
+/// The embedded port is the proxy's per-session backend socket: equal ports
+/// prove session reuse, distinct ports prove session isolation.
+pub struct UdpEchoBackend {
+    pub addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl UdpEchoBackend {
+    pub fn spawn() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind udp echo backend");
+        let addr = socket.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        // Timeout so the loop notices shutdown without a wake-up packet.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, peer)) => {
+                        let mut reply = format!("echo[{}]:", peer.port()).into_bytes();
+                        reply.extend_from_slice(&buf[..n]);
+                        let _ = socket.send_to(&reply, peer);
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for UdpEchoBackend {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Send one datagram and wait for the reply, resending on timeout.
+/// Retries because UDP gives no signal while the proxy's socket is
+/// still binding: early datagrams are silently dropped.
+pub fn udp_send_recv(
+    socket: &UdpSocket,
+    proxy: SocketAddr,
+    payload: &[u8],
+    attempts: u32,
+) -> std::io::Result<Vec<u8>> {
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut buf = [0u8; 65536];
+    let mut last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply");
+    for _ in 0..attempts {
+        socket.send_to(payload, proxy)?;
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => return Ok(buf[..n].to_vec()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                last_err = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
+}
+
 /// Send raw TCP data and read back the response.
 pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::io::Result<Vec<u8>> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
@@ -302,6 +385,23 @@ impl PortailProcess {
             _cert_dir: None,
             proxy_addr,
         }
+    }
+
+    /// Build a test config with HTTP and UDP routes, then spawn Portail.
+    /// `udp_routes` maps (listener_name, proxy_port) to backend SocketAddr.
+    /// Readiness is probed on the HTTP port only: UDP gives no connect signal,
+    /// so callers must retry their first datagram (udp_send_recv does).
+    pub fn spawn_with_udp(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        udp_routes: &[(&str, u16, SocketAddr)],
+        performance_json: &str,
+    ) -> Self {
+        let config = build_test_config_l4(routes, proxy_port, &[], udp_routes).replace(
+            r#""performance": {}"#,
+            &format!(r#""performance": {}"#, performance_json),
+        );
+        Self::spawn_config(config, proxy_port)
     }
 
     /// Spawn with filtered routes (hostname, path, backend, filters_json).
@@ -694,6 +794,15 @@ fn build_test_config_with_tcp(
     proxy_port: u16,
     tcp_routes: &[(&str, u16, SocketAddr)],
 ) -> String {
+    build_test_config_l4(routes, proxy_port, tcp_routes, &[])
+}
+
+fn build_test_config_l4(
+    routes: &[(&str, &str, SocketAddr)],
+    proxy_port: u16,
+    tcp_routes: &[(&str, u16, SocketAddr)],
+    udp_routes: &[(&str, u16, SocketAddr)],
+) -> String {
     let mut backend_refs = Vec::new();
     let mut hostnames: Vec<String> = Vec::new();
 
@@ -733,11 +842,29 @@ fn build_test_config_with_tcp(
         ));
     }
 
+    let mut udp_listener_entries = Vec::new();
+    let mut udp_route_entries = Vec::new();
+    for (name, port, backend_addr) in udp_routes {
+        udp_listener_entries.push(format!(
+            r#"{{"name": "{}", "protocol": "UDP", "port": {}}}"#,
+            name, port
+        ));
+        udp_route_entries.push(format!(
+            r#"{{
+      "parentRefs": [{{"name": "test-gateway", "sectionName": "{}"}}],
+      "rules": [{{"backendRefs": [{{"name": "{}", "port": {}}}]}}]
+    }}"#,
+            name,
+            backend_addr.ip(),
+            backend_addr.port()
+        ));
+    }
+
     let mut listeners = format!(
         r#"{{"name": "http", "protocol": "HTTP", "port": {}}}"#,
         proxy_port
     );
-    for entry in &tcp_listener_entries {
+    for entry in tcp_listener_entries.iter().chain(&udp_listener_entries) {
         listeners.push_str(", ");
         listeners.push_str(entry);
     }
@@ -764,6 +891,7 @@ fn build_test_config_with_tcp(
   }},
   "httpRoutes": {},
   "tcpRoutes": [{}],
+  "udpRoutes": [{}],
   "observability": {{
     "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
   }},
@@ -771,7 +899,8 @@ fn build_test_config_with_tcp(
 }}"#,
         listeners,
         http_routes_section,
-        tcp_route_entries.join(", ")
+        tcp_route_entries.join(", "),
+        udp_route_entries.join(", ")
     )
 }
 
