@@ -181,10 +181,11 @@ pub async fn run_worker(
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, peer)) => {
-                        if let Err(e) =
+                        // _-prefixed: debug! compiles out in release builds.
+                        if let Err(_e) =
                             socket2::SockRef::from(&tcp_stream).set_tcp_keepalive(&keepalive)
                         {
-                            debug!("TCP keepalive setup failed for {}: {}", peer, e);
+                            debug!("TCP keepalive setup failed for {}: {}", peer, _e);
                         }
                         let routes = routes.clone();
                         let acceptor = tls_acceptor.clone();
