@@ -61,6 +61,13 @@ pub(crate) trait GatewayRoute: Sized {
     fn section_names_for_gateway(&self, gw_name: &str, gw_ns: &str) -> Vec<Option<String>>;
     fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
     fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
+    /// Mirror-filter backend refs (HTTPRoute only). Validated like forward
+    /// refs, but an invalid mirror drops the filter instead of the backends:
+    /// a mirror the route may not reference must not break primary traffic.
+    fn mirror_backend_refs(_config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+        vec![]
+    }
+    fn remove_invalid_mirrors(_config: &mut Self::Config, _invalid: &HashSet<(String, u16)>) {}
     /// The route's current `status.parents` entries as JSON values — exactly
     /// what serializing the whole route and reading `/status/parents` yields,
     /// without serializing the whole route.
@@ -69,12 +76,24 @@ pub(crate) trait GatewayRoute: Sized {
 
 /// Implement GatewayRoute for a concrete route type. Only the three type-specific
 /// expressions (parent_refs field path, hostnames body, convert function) differ;
-/// the remaining five methods are identical across HTTP/TCP/TLS/UDP.
+/// the remaining five methods are identical across HTTP/TCP/TLS/UDP. `extras`
+/// splices type-specific overrides of the defaulted trait methods into the impl.
 macro_rules! impl_gateway_route {
     ($ty:ty, $parent:ty, $config:ty, $kind:literal,
      parent_refs: self.spec.$pr:ident,
      hostnames: $hn:expr,
      convert: $cv:path) => {
+        impl_gateway_route!($ty, $parent, $config, $kind,
+            parent_refs: self.spec.$pr,
+            hostnames: $hn,
+            convert: $cv,
+            extras: {});
+    };
+    ($ty:ty, $parent:ty, $config:ty, $kind:literal,
+     parent_refs: self.spec.$pr:ident,
+     hostnames: $hn:expr,
+     convert: $cv:path,
+     extras: { $($extra:item)* }) => {
         impl GatewayRoute for $ty {
             type ParentRef = $parent;
             type Config = $config;
@@ -132,14 +151,44 @@ macro_rules! impl_gateway_route {
                     })
                     .unwrap_or_default()
             }
+            $($extra)*
         }
     };
 }
 
 impl_gateway_route!(HTTPRoute, HTTPRouteParentRefs, HttpRouteConfig, "HTTPRoute",
-    parent_refs: self.spec.parent_refs,
-    hostnames:   |s: &HTTPRoute| s.spec.hostnames.clone().unwrap_or_default(),
-    convert:     convert_http_route);
+parent_refs: self.spec.parent_refs,
+hostnames:   |s: &HTTPRoute| s.spec.hostnames.clone().unwrap_or_default(),
+convert:     convert_http_route,
+extras: {
+    fn mirror_backend_refs(config: &HttpRouteConfig) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config: mc } => Some((
+                        mc.backend_ref.name.as_str(),
+                        mc.backend_ref.port,
+                        mc.backend_ref.group.as_str(),
+                        mc.backend_ref.kind.as_str(),
+                    )),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+    fn remove_invalid_mirrors(config: &mut HttpRouteConfig, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.filters.retain(|f| match f {
+                HttpRouteFilter::RequestMirror { config: mc } => {
+                    !invalid.contains(&(mc.backend_ref.name.clone(), mc.backend_ref.port))
+                }
+                _ => true,
+            });
+        }
+    }
+});
 
 impl_gateway_route!(TCPRoute, TCPRouteParentRefs, TcpRouteConfig, "TCPRoute",
     parent_refs: self.spec.parent_refs,
@@ -409,61 +458,77 @@ fn collect_routes<R: GatewayRoute>(
                 let mut refs_messages = Vec::new();
                 let mut refs_reason = "ResolvedRefs".to_string();
                 let mut invalid_backends: HashSet<(String, u16)> = HashSet::new();
+                let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
-                // Validate backend refs: check group/kind, cross-namespace grants, and service existence
-                for (backend_name, port, group, ref_kind) in R::backend_refs(&config) {
-                    // Check group/kind — must be core ("") group and "Service" kind (or defaults)
+                // Group/kind (core Service only), cross-namespace ReferenceGrant,
+                // and service existence — one checker for forward and mirror refs.
+                let check_ref = |backend_name: &str,
+                                 group: &str,
+                                 ref_kind: &str|
+                 -> Option<(&'static str, String)> {
                     if (!group.is_empty() && group != "core")
                         || (ref_kind != "Service" && !ref_kind.is_empty())
                     {
-                        refs_resolved = false;
-                        refs_reason = "InvalidKind".to_string();
-                        refs_messages.push(format!(
-                            "Unsupported backend ref group/kind: {}/{}",
-                            group, ref_kind
+                        return Some((
+                            "InvalidKind",
+                            format!("Unsupported backend ref group/kind: {}/{}", group, ref_kind),
                         ));
-                        invalid_backends.insert((backend_name.to_string(), port));
-                        continue;
                     }
-
-                    // backend_name is "{svc}.{ns}.svc"
-                    if let Some((svc_name, svc_ns)) = parse_backend_dns_name(backend_name) {
-                        // Cross-namespace check
-                        if svc_ns != route_ns
-                            && !is_reference_allowed(
-                                reference_grants,
-                                "gateway.networking.k8s.io",
-                                kind,
-                                route_ns,
-                                "",
-                                "Service",
-                                &svc_ns,
-                                &svc_name,
-                            )
-                        {
-                            refs_resolved = false;
-                            refs_reason = "RefNotPermitted".to_string();
-                            refs_messages.push(format!(
+                    // backend_name is "{svc}.{ns}.svc"; unparseable names get no
+                    // further checks (None here means "no error", not failure)
+                    let (svc_name, svc_ns) = parse_backend_dns_name(backend_name)?;
+                    if svc_ns != route_ns
+                        && !is_reference_allowed(
+                            reference_grants,
+                            "gateway.networking.k8s.io",
+                            kind,
+                            route_ns,
+                            "",
+                            "Service",
+                            &svc_ns,
+                            &svc_name,
+                        )
+                    {
+                        return Some((
+                            "RefNotPermitted",
+                            format!(
                                 "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
                                 svc_name, svc_ns
-                            ));
-                            invalid_backends.insert((backend_name.to_string(), port));
-                            continue;
-                        }
-                        // Service existence check
-                        if !known_services.contains(&(svc_name.clone(), svc_ns.clone())) {
-                            refs_resolved = false;
-                            refs_reason = "BackendNotFound".to_string();
-                            refs_messages
-                                .push(format!("Backend service {}.{} not found", svc_name, svc_ns));
-                            invalid_backends.insert((backend_name.to_string(), port));
-                        }
+                            ),
+                        ));
+                    }
+                    if !known_services.contains(&(svc_name.clone(), svc_ns.clone())) {
+                        return Some((
+                            "BackendNotFound",
+                            format!("Backend service {}.{} not found", svc_name, svc_ns),
+                        ));
+                    }
+                    None
+                };
+
+                for (backend_name, port, group, ref_kind) in R::backend_refs(&config) {
+                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+                        refs_resolved = false;
+                        refs_reason = reason.to_string();
+                        refs_messages.push(message);
+                        invalid_backends.insert((backend_name.to_string(), port));
+                    }
+                }
+                for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
+                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+                        refs_resolved = false;
+                        refs_reason = reason.to_string();
+                        refs_messages.push(message);
+                        invalid_mirrors.insert((backend_name.to_string(), port));
                     }
                 }
 
                 // Remove invalid backends so the data plane returns 500 for them
                 if !invalid_backends.is_empty() {
                     R::remove_invalid_backends(&mut config, &invalid_backends);
+                }
+                if !invalid_mirrors.is_empty() {
+                    R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
                 }
 
                 let refs_message = if refs_resolved {
@@ -1991,9 +2056,8 @@ mod tests {
                         r#type: HTTPRouteRulesFiltersType::RequestMirror,
                         request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
                             backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
-                                name: "shadow-svc".to_string(),
+                                name: "mirror-svc".to_string(),
                                 port: Some(9090),
-                                namespace: Some("staging".to_string()),
                                 ..Default::default()
                             },
                             ..Default::default()
@@ -2001,7 +2065,7 @@ mod tests {
                         ..Default::default()
                     }]),
                     backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
-                        name: "prod-svc".to_string(),
+                        name: "api-svc".to_string(),
                         port: Some(80),
                         ..Default::default()
                     }]),
@@ -2020,11 +2084,157 @@ mod tests {
         .unwrap();
         match &result.config.http_routes[0].rules[0].filters[0] {
             HttpRouteFilter::RequestMirror { config } => {
-                assert_eq!(config.backend_ref.name, "shadow-svc.staging.svc");
+                assert_eq!(config.backend_ref.name, "mirror-svc.default.svc");
                 assert_eq!(config.backend_ref.port, 9090);
             }
             _ => panic!("expected RequestMirror"),
         }
+    }
+
+    /// Cross-namespace mirror ref helper: HTTPRoute in default mirroring to
+    /// postgres-replica in db (a known service).
+    fn mirror_route_to_db() -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("mirror-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: Some(vec![HTTPRouteParentRefs {
+                    name: "test-gw".to_string(),
+                    ..Default::default()
+                }]),
+                hostnames: Some(vec!["api.example.com".to_string()]),
+                rules: Some(vec![HTTPRouteRules {
+                    filters: Some(vec![HTTPRouteRulesFilters {
+                        r#type: HTTPRouteRulesFiltersType::RequestMirror,
+                        request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
+                            backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
+                                name: "postgres-replica".to_string(),
+                                port: Some(9090),
+                                namespace: Some("db".to_string()),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                        name: "api-svc".to_string(),
+                        port: Some(80),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+            },
+            status: None,
+        }
+    }
+
+    fn http_mirror_grant() -> ReferenceGrant {
+        ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("allow-mirror".to_string()),
+                namespace: Some("db".to_string()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "HTTPRoute".to_string(),
+                    namespace: "default".to_string(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: "".to_string(),
+                    kind: "Service".to_string(),
+                    name: None,
+                }],
+            },
+        }
+    }
+
+    /// A cross-namespace mirror without a ReferenceGrant previously bypassed
+    /// grant validation entirely — any route could shadow traffic into any
+    /// namespace. The mirror must be dropped (primary traffic unaffected)
+    /// and reported as RefNotPermitted.
+    #[test]
+    fn test_mirror_cross_ns_without_grant_dropped() {
+        let gw = test_gateway();
+        let ns_labels = default_ns_labels();
+        let result = reconcile_to_config(
+            &gw,
+            &test_snapshot(
+                vec![mirror_route_to_db()],
+                vec![],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![],
+            ),
+            &HashMap::new(),
+            &empty_services(),
+        )
+        .unwrap();
+
+        let rule = &result.config.http_routes[0].rules[0];
+        assert!(rule.filters.is_empty(), "ungranted mirror must be dropped");
+        assert_eq!(rule.backend_refs.len(), 1, "primary backends untouched");
+
+        let ra = &result.route_status[0];
+        assert!(ra.accepted, "route itself stays accepted");
+        assert!(!ra.refs_resolved);
+        assert_eq!(ra.refs_reason, "RefNotPermitted");
+    }
+
+    #[test]
+    fn test_mirror_cross_ns_with_grant_kept() {
+        let gw = test_gateway();
+        let ns_labels = default_ns_labels();
+        let result = reconcile_to_config(
+            &gw,
+            &test_snapshot(
+                vec![mirror_route_to_db()],
+                vec![],
+                vec![],
+                vec![],
+                &ns_labels,
+                vec![http_mirror_grant()],
+            ),
+            &HashMap::new(),
+            &empty_services(),
+        )
+        .unwrap();
+
+        let rule = &result.config.http_routes[0].rules[0];
+        assert_eq!(rule.filters.len(), 1, "granted mirror is kept");
+        assert!(result.route_status[0].refs_resolved);
+    }
+
+    #[test]
+    fn test_mirror_to_unknown_service_dropped() {
+        let gw = test_gateway();
+        let ns_labels = default_ns_labels();
+        let mut route = mirror_route_to_db();
+        if let Some(rules) = route.spec.rules.as_mut() {
+            let f = rules[0].filters.as_mut().unwrap();
+            let rm = f[0].request_mirror.as_mut().unwrap();
+            rm.backend_ref.name = "ghost-svc".to_string();
+            rm.backend_ref.namespace = None;
+        }
+        let result = reconcile_to_config(
+            &gw,
+            &test_snapshot(vec![route], vec![], vec![], vec![], &ns_labels, vec![]),
+            &HashMap::new(),
+            &empty_services(),
+        )
+        .unwrap();
+
+        let rule = &result.config.http_routes[0].rules[0];
+        assert!(rule.filters.is_empty());
+        let ra = &result.route_status[0];
+        assert!(!ra.refs_resolved);
+        assert_eq!(ra.refs_reason, "BackendNotFound");
     }
 
     // ---- Timeouts ----
