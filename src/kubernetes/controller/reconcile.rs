@@ -699,7 +699,17 @@ pub(super) async fn reconcile(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
                 gw_ns, gw_name, http_count, tcp_count, tls_count, udp_count,
             );
-            compute_programmed_condition(dp_ready)
+            // Every listener skipped as unconvertible: zero required
+            // endpoints makes dp_ready vacuously true, but nothing serves.
+            if listeners.is_empty() && !gateway.spec.listeners.is_empty() {
+                status::GatewayCondition {
+                    ok: false,
+                    reason: "Invalid".into(),
+                    message: "No listener could be programmed".into(),
+                }
+            } else {
+                compute_programmed_condition(dp_ready)
+            }
         }
         Err(e) => {
             error!(

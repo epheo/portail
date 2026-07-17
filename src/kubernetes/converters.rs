@@ -55,12 +55,21 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
         })
         .unwrap_or_default();
 
+    // One bad listener must not take down its siblings: skip it here and let
+    // validate_gateway report it (Accepted=False/UnsupportedProtocol) while
+    // the rest of the Gateway keeps serving.
     let listeners = gw
         .spec
         .listeners
         .iter()
-        .map(|l| convert_listener(l, gw_ns, cert_data))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|l| match convert_listener(l, gw_ns, cert_data) {
+            Ok(lc) => Some(lc),
+            Err(e) => {
+                warn!("Skipping listener '{}': {}", l.name, e);
+                None
+            }
+        })
+        .collect();
 
     Ok(GatewayConfig {
         name,

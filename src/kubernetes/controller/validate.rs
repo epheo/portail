@@ -182,11 +182,17 @@ pub(super) fn validate_gateway(
         }
     }
 
+    let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
+
     for listener in &gateway.spec.listeners {
         let mut ls = status::ListenerStatus::default();
         let mut refs_failed = false;
 
-        if conflicted_ports.contains(&listener.port) {
+        if !supported_protocols.contains(&listener.protocol.as_str()) {
+            ls.accepted = false;
+            ls.accepted_reason = "UnsupportedProtocol".into();
+            ls.accepted_message = format!("Protocol '{}' is not supported", listener.protocol);
+        } else if conflicted_ports.contains(&listener.port) {
             ls.accepted = false;
             ls.accepted_reason = "ProtocolConflict".into();
             ls.accepted_message =
@@ -304,38 +310,24 @@ pub(super) fn validate_gateway(
         listener_statuses.insert(listener.name.clone(), ls);
     }
 
-    // Gateway-level acceptance
-    let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
+    // Gateway-level acceptance. An invalid listener stays a LISTENER
+    // condition — its siblings keep serving and the Gateway stays Accepted
+    // unless every listener is rejected.
     let mut accepted = true;
     let mut reason = "Accepted".to_string();
     let mut message = "Gateway accepted by portail controller".to_string();
 
-    for listener in &gateway.spec.listeners {
-        if !supported_protocols.contains(&listener.protocol.as_str()) {
-            accepted = false;
-            reason = "InvalidParameters".to_string();
-            message = format!(
-                "Listener '{}' uses unsupported protocol '{}'",
-                listener.name, listener.protocol
-            );
-            break;
-        }
-    }
-
-    if accepted {
-        if let Some(addresses) = &gateway.spec.addresses {
-            for addr in addresses {
-                let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
-                match addr_type {
-                    "IPAddress" | "Hostname" => {}
-                    t if t == NETWORK_ADDRESS_TYPE => {}
-                    _ => {
-                        accepted = false;
-                        reason = "UnsupportedAddress".to_string();
-                        message =
-                            format!("Unsupported address type '{}' in spec.addresses", addr_type);
-                        break;
-                    }
+    if let Some(addresses) = &gateway.spec.addresses {
+        for addr in addresses {
+            let addr_type = addr.r#type.as_deref().unwrap_or("IPAddress");
+            match addr_type {
+                "IPAddress" | "Hostname" => {}
+                t if t == NETWORK_ADDRESS_TYPE => {}
+                _ => {
+                    accepted = false;
+                    reason = "UnsupportedAddress".to_string();
+                    message = format!("Unsupported address type '{}' in spec.addresses", addr_type);
+                    break;
                 }
             }
         }
@@ -345,7 +337,7 @@ pub(super) fn validate_gateway(
         let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
         if all_rejected {
             accepted = false;
-            reason = "InvalidListeners".to_string();
+            reason = "ListenersNotValid".to_string();
             message = "All listeners are rejected due to conflicts or errors".to_string();
         }
     }
@@ -545,6 +537,39 @@ mod tests {
         assert_eq!(ls.resolved_refs_reason, "InvalidRouteKinds");
         assert_eq!(ls.supported_kinds.len(), 1);
         assert_eq!(ls.supported_kinds[0]["kind"], "HTTPRoute");
+    }
+
+    /// Listener isolation: an unsupported-protocol listener gets its own
+    /// UnsupportedProtocol condition; a valid sibling keeps the Gateway
+    /// Accepted. All-invalid downgrades the Gateway with ListenersNotValid.
+    #[test]
+    fn validate_gateway_unsupported_protocol_isolated_per_listener() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners[0].tls = None;
+        gw.spec.listeners[0].protocol = "HTTP".into();
+        gw.spec.listeners.push(GatewayListeners {
+            name: "grpc".into(),
+            port: 9090,
+            protocol: "GRPC".into(),
+            hostname: None,
+            tls: None,
+            allowed_routes: None,
+        });
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        let bad = &listeners["grpc"];
+        assert!(!bad.accepted && !bad.programmed);
+        assert_eq!(bad.accepted_reason, "UnsupportedProtocol");
+        assert!(listeners["https"].accepted);
+        assert!(gw_cond.ok, "valid sibling keeps the Gateway Accepted");
+
+        gw.spec.listeners.remove(0);
+        let (_, gw_cond) = validate_gateway(&gw, "default", &certs);
+        assert!(!gw_cond.ok);
+        assert_eq!(gw_cond.reason, "ListenersNotValid");
     }
 
     #[test]

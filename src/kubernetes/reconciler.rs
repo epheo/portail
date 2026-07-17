@@ -1192,34 +1192,28 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_protocol_rejected() {
-        let gw = Gateway {
-            metadata: ObjectMeta {
-                name: Some("bad-gw".to_string()),
-                ..Default::default()
-            },
-            spec: GatewaySpec {
-                gateway_class_name: "portail".to_string(),
-                listeners: vec![GatewayListeners {
-                    name: "grpc".to_string(),
-                    port: 9090,
-                    protocol: "GRPC".to_string(),
-                    hostname: None,
-                    tls: None,
-                    allowed_routes: None,
-                }],
-                ..Default::default()
-            },
-            status: None,
-        };
+    fn test_unsupported_protocol_listener_isolated() {
+        // A GRPC listener must not take down the HTTP listener beside it —
+        // previously one bad listener failed conversion of the whole Gateway.
+        let mut gw = test_gateway();
+        gw.spec.listeners.push(GatewayListeners {
+            name: "grpc".to_string(),
+            port: 9090,
+            protocol: "GRPC".to_string(),
+            hostname: None,
+            tls: None,
+            allowed_routes: None,
+        });
         let ns_labels = default_ns_labels();
-        assert!(reconcile_to_config(
+        let result = reconcile_to_config(
             &gw,
             &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
             &HashMap::new(),
             &empty_services(),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(result.config.gateway.listeners.len(), 1);
+        assert_eq!(result.config.gateway.listeners[0].name, "http");
     }
 
     // ---- TCP route conversion ----
