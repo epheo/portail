@@ -90,7 +90,8 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     let mut raw_connection_type = ConnectionType::Default;
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
-    let mut is_upgrade = false;
+    let mut has_upgrade_header = false;
+    let mut connection_has_upgrade = false;
     let mut http_version = HttpVersion::Http11;
     // RFC 7230 §3.3.3 smuggling guards. We flag (but keep parsing) so the
     // request_processor can reject with a clean 400.
@@ -205,7 +206,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                     _ => transfer_encoding_violation = true,
                 }
             } else if line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Upgrade:") {
-                is_upgrade = true;
+                has_upgrade_header = true;
             } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
                 let mut value_start = 11;
                 while value_start < line.len() && line[value_start] == b' ' {
@@ -220,10 +221,17 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                 }
 
                 if let Ok(value) = std::str::from_utf8(&line[value_start..value_end]) {
-                    if value.eq_ignore_ascii_case("close") {
-                        raw_connection_type = ConnectionType::Close;
-                    } else if value.eq_ignore_ascii_case("keep-alive") {
-                        raw_connection_type = ConnectionType::KeepAlive;
+                    // Token list ("keep-alive, upgrade"): scan each. Only runs
+                    // when a Connection header is present, on a short value.
+                    for token in value.split(',') {
+                        let token = token.trim();
+                        if token.eq_ignore_ascii_case("close") {
+                            raw_connection_type = ConnectionType::Close;
+                        } else if token.eq_ignore_ascii_case("keep-alive") {
+                            raw_connection_type = ConnectionType::KeepAlive;
+                        } else if token.eq_ignore_ascii_case("upgrade") {
+                            connection_has_upgrade = true;
+                        }
                     }
                 }
             }
@@ -300,7 +308,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         header_data,
         content_length,
         is_chunked,
-        is_upgrade,
+        // RFC 7230 6.7: an upgrade is only requested when Connection also
+        // nominates it. A bare Upgrade header must not switch protocols.
+        is_upgrade: has_upgrade_header && connection_has_upgrade,
         header_violation,
     })
 }

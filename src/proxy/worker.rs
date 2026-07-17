@@ -209,24 +209,19 @@ pub async fn run_worker(
                             let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
-                                // Peek ClientHello for SNI to decide dispatch mode
-                                let should_passthrough = {
-                                    let mut peek_buf = [0u8; 16384];
-                                    match tokio::time::timeout(
-                                        cfg.client_header_timeout,
-                                        tcp_stream.peek(&mut peek_buf),
-                                    ).await {
-                                        Ok(Ok(n)) if n > 0 => {
-                                            let sni = crate::proxy::tls::extract_sni(&peek_buf[..n]);
-                                            if let Some(ref hostname) = sni {
-                                                let rt = routes.load();
-                                                rt.has_tls_passthrough_route(hostname, server_port)
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        _ => false,
+                                // Peek ClientHello for SNI to decide dispatch
+                                // mode, waiting out fragmented hellos.
+                                let should_passthrough = match crate::proxy::tls::peek_sni(
+                                    &tcp_stream,
+                                    cfg.client_header_timeout,
+                                )
+                                .await
+                                {
+                                    Some(hostname) => {
+                                        let rt = routes.load();
+                                        rt.has_tls_passthrough_route(&hostname, server_port)
                                     }
+                                    None => false,
                                 };
 
                                 if should_passthrough {
@@ -705,6 +700,7 @@ async fn proxy_http_request(
         resp_mods.as_ref(),
         header_budget,
         meta.is_head,
+        meta.is_upgrade,
     )
     .await?
     {
@@ -712,8 +708,11 @@ async fn proxy_http_request(
         None => return Ok((false, None)),
     };
 
-    // WebSocket / protocol upgrade: switch to raw bidi after headers.
-    if meta.is_upgrade {
+    // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
+    // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP
+    // framing — tunneling it would let the client's next requests bypass
+    // routing, filters, and timeouts entirely.
+    if meta.is_upgrade && framing.status == 101 {
         client.flush().await?;
         let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
         return Ok((false, None));
@@ -773,8 +772,14 @@ async fn proxy_http_request(
     let reusable = response_complete && framing_clean;
 
     // The client got a clean response, but the backend conn returns to the pool
-    // only when `backend_conn_poolable` allows — notably never after HEAD.
-    if backend_conn_poolable(response_complete, framing_clean, meta.is_head) {
+    // only when `backend_conn_poolable` allows — notably never after HEAD or a
+    // refused upgrade.
+    if backend_conn_poolable(
+        response_complete,
+        framing_clean,
+        meta.is_head,
+        meta.is_upgrade,
+    ) {
         state.pool.release(
             backend_addr,
             backend_ref.use_tls,
@@ -800,8 +805,16 @@ async fn proxy_http_request(
 /// `Content-Length` with no body, so the declared framing is no signal. Reusing
 /// such a conn would bleed leftover body bytes into the next request's response;
 /// HEAD is rare and bodyless, so dropping the conn instead costs almost nothing.
-fn backend_conn_poolable(response_complete: bool, framing_clean: bool, is_head: bool) -> bool {
-    response_complete && framing_clean && !is_head
+/// A refused upgrade is likewise never pooled: the client may have sent
+/// speculative tunnel bytes with the request (forwarded as-is, exempt from
+/// body framing), which the backend would parse as a next request.
+fn backend_conn_poolable(
+    response_complete: bool,
+    framing_clean: bool,
+    is_head: bool,
+    was_upgrade: bool,
+) -> bool {
+    response_complete && framing_clean && !is_head && !was_upgrade
 }
 
 /// Metrics label for a backend: the CONFIGURED name and target port
@@ -977,10 +990,11 @@ async fn forward_response_headers(
     resp_mods: Option<&HeaderModifications<'_>>,
     header_budget: Duration,
     is_head_request: bool,
+    expect_upgrade: bool,
 ) -> Result<Option<ResponseFraming>> {
     let (resp_header_end, framing) = match tokio::time::timeout(
         header_budget,
-        read_response_headers(backend, buf, header_buf, is_head_request),
+        read_response_headers(backend, buf, header_buf, is_head_request, expect_upgrade),
     )
     .await
     {
@@ -991,6 +1005,14 @@ async fn forward_response_headers(
             return Ok(None);
         }
     };
+
+    // A 101 nobody asked for would turn the client connection into an
+    // unframed tunnel; refuse it while the client wire is still clean.
+    if framing.status == 101 && !expect_upgrade {
+        warn!("Backend sent 101 without an upgrade request; rejecting");
+        send_error_response(client, 502).await?;
+        return Ok(None);
+    }
 
     // SAFE → UNSAFE: first client write happens here.
     //
@@ -1126,6 +1148,8 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 /// when to stop reading from the backend, and how to terminate the client stream
 /// gracefully on a mid-body timeout.
 struct ResponseFraming {
+    /// Response status code (0 when the status line is unparseable).
+    status: u16,
     content_length: Option<usize>,
     no_body: bool,
     /// Body bytes (within the declared framing) that arrived in the same
@@ -1159,6 +1183,7 @@ async fn read_response_headers(
     buf: &mut [u8],
     header_buf: &mut Vec<u8>,
     is_head_request: bool,
+    expect_upgrade: bool,
 ) -> Result<(usize, ResponseFraming)> {
     header_buf.clear();
 
@@ -1173,13 +1198,15 @@ async fn read_response_headers(
 
         if let Some(header_end) = find_header_end(header_buf) {
             let headers = &header_buf[..header_end];
+            let status = parse_response_status(headers);
             let content_length = parse_content_length(headers);
             let is_chunked = is_chunked_transfer(headers);
             // RFC 7230 §3.3: responses to HEAD have no message body regardless
             // of the response's Content-Length / Transfer-Encoding. Forcing
             // no_body here keeps `forward_response_body` from blocking on
             // bytes the backend correctly never sends.
-            let no_body = is_head_request || is_no_body_status(headers);
+            let no_body =
+                is_head_request || status == 204 || status == 304 || (100..200).contains(&status);
 
             // Decide how many of the tail bytes (same read as the headers)
             // belong to THIS response's body. Anything beyond the declared
@@ -1190,6 +1217,11 @@ async fn read_response_headers(
                 // dropped (never forwarded per RFC 7230 §3.3); the conn is
                 // already never pooled after HEAD.
                 (0, None, false)
+            } else if status == 101 && expect_upgrade {
+                // Accepted upgrade: bytes after the 101 header block are
+                // tunnel payload that arrived early — they must reach the
+                // client, not be dropped as no-body overshoot.
+                (tail_len, None, false)
             } else if no_body {
                 // 204/304/1xx: no body allowed; any tail is overshoot.
                 (0, None, tail_len > 0)
@@ -1211,6 +1243,7 @@ async fn read_response_headers(
             return Ok((
                 header_end,
                 ResponseFraming {
+                    status,
                     content_length: if is_head_request {
                         None
                     } else {
@@ -1325,34 +1358,19 @@ async fn handle_tls_passthrough(
     peek_timeout: Duration,
     connect_timeout: Duration,
 ) -> Result<()> {
-    let mut peek_buf = [0u8; 16384];
-    let n = match tokio::time::timeout(peek_timeout, client.peek(&mut peek_buf)).await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "TLS passthrough: client sent no ClientHello within {:?}",
-                peek_timeout
-            ))
-        }
-    };
-    if n == 0 {
-        return Ok(());
-    }
-
-    let sni = tls::extract_sni(&peek_buf[..n]);
-    let hostname = match sni.as_deref() {
+    let hostname = match tls::peek_sni(&client, peek_timeout).await {
         Some(h) => h,
         None => {
             return Err(anyhow::anyhow!(
-                "TLS passthrough: no SNI in ClientHello, cannot route"
+                "TLS passthrough: no complete ClientHello with SNI within {:?}, cannot route",
+                peek_timeout
             ))
         }
     };
 
     let route_table = routes.load();
     let backend_addr = route_table
-        .resolve_tls_passthrough(hostname, server_port)
+        .resolve_tls_passthrough(&hostname, server_port)
         .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
 
     match tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await {
@@ -1499,12 +1517,18 @@ fn is_chunked_transfer(headers: &[u8]) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
 }
 
-fn is_no_body_status(headers: &[u8]) -> bool {
+/// Parse the 3-digit status code from a response status line
+/// ("HTTP/1.1 200 ..."). Returns 0 when unparseable.
+fn parse_response_status(headers: &[u8]) -> u16 {
     if headers.len() < 12 {
-        return false;
+        return 0;
     }
-    let status = &headers[9..12];
-    status == b"204" || status == b"304" || status[0] == b'1'
+    let s = &headers[9..12];
+    if s.iter().all(|b| b.is_ascii_digit()) {
+        (s[0] - b'0') as u16 * 100 + (s[1] - b'0') as u16 * 10 + (s[2] - b'0') as u16
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -1514,14 +1538,29 @@ mod tests {
     #[test]
     fn backend_conn_pooling_policy() {
         // A complete, cleanly-framed non-HEAD response is poolable.
-        assert!(backend_conn_poolable(true, true, false));
+        assert!(backend_conn_poolable(true, true, false, false));
         // HEAD is never pooled: a non-compliant backend body would desync the
         // conn, and we can't tell that apart from a compliant Content-Length at
         // header time without blocking.
-        assert!(!backend_conn_poolable(true, true, true));
+        assert!(!backend_conn_poolable(true, true, true, false));
+        // A refused upgrade is never pooled: speculative tunnel bytes may have
+        // been forwarded outside body framing.
+        assert!(!backend_conn_poolable(true, true, false, true));
         // Incomplete or broken-framing responses are never pooled, HEAD or not.
-        assert!(!backend_conn_poolable(false, true, false));
-        assert!(!backend_conn_poolable(true, false, false));
-        assert!(!backend_conn_poolable(false, false, true));
+        assert!(!backend_conn_poolable(false, true, false, false));
+        assert!(!backend_conn_poolable(true, false, false, false));
+        assert!(!backend_conn_poolable(false, false, true, false));
+    }
+
+    #[test]
+    fn response_status_parsing() {
+        assert_eq!(parse_response_status(b"HTTP/1.1 200 OK\r\n\r\n"), 200);
+        assert_eq!(
+            parse_response_status(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+            101
+        );
+        assert_eq!(parse_response_status(b"HTTP/1.0 304 Not Modified\r\n"), 304);
+        assert_eq!(parse_response_status(b"HTTP/1.1 abc\r\n"), 0);
+        assert_eq!(parse_response_status(b"short"), 0);
     }
 }
