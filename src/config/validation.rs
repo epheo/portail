@@ -323,6 +323,31 @@ impl HttpRouteRule {
             validate_filter(filter).map_err(|e| anyhow!("Filter {}: {}", i, e))?;
         }
 
+        // Gateway API restricts ReplacePrefixMatch to PathPrefix matches (CEL
+        // enforces this in-cluster; file mode must reject it here). The data
+        // plane would otherwise splice the request path by pattern length.
+        let uses_prefix_replace = self.filters.iter().any(|f| {
+            let path = match f {
+                HttpRouteFilter::RequestRedirect { config } => config.path.as_ref(),
+                HttpRouteFilter::URLRewrite { config } => config.path.as_ref(),
+                _ => None,
+            };
+            matches!(path, Some(HttpURLRewritePath::ReplacePrefixMatch { .. }))
+        });
+        if uses_prefix_replace {
+            for (i, match_rule) in self.matches.iter().enumerate() {
+                if let Some(p) = &match_rule.path {
+                    if p.match_type != HttpPathMatchType::PathPrefix {
+                        return Err(anyhow!(
+                            "Match rule {}: ReplacePrefixMatch requires a PathPrefix path match, got {:?}",
+                            i,
+                            p.match_type
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -565,6 +590,35 @@ mod tests {
             filters: vec![],
             app_protocol: None,
         }
+    }
+
+    #[test]
+    fn test_replace_prefix_match_requires_path_prefix() {
+        let mut rule = make_rule(
+            vec![HttpRouteFilter::URLRewrite {
+                config: URLRewriteConfig {
+                    hostname: None,
+                    path: Some(HttpURLRewritePath::ReplacePrefixMatch {
+                        value: "/new".to_string(),
+                    }),
+                },
+            }],
+            vec![default_backend()],
+        );
+        rule.matches = vec![HttpRouteMatch {
+            method: None,
+            path: Some(HttpPathMatch {
+                match_type: HttpPathMatchType::RegularExpression,
+                value: "^/api/.*$".to_string(),
+            }),
+            headers: vec![],
+            query_params: vec![],
+        }];
+        let err = rule.validate().unwrap_err().to_string();
+        assert!(err.contains("ReplacePrefixMatch requires a PathPrefix"));
+
+        rule.matches = vec![HttpRouteMatch::path_prefix("/api")];
+        assert!(rule.validate().is_ok());
     }
 
     #[test]
