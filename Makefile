@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration bench fmt clippy conformance conformance-kind
+.PHONY: build test test-all test-integration bench fmt clippy conformance
 
 build:
 	cargo build --release
@@ -21,8 +21,6 @@ fmt:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
+# Creates its own kind cluster; needs the operator checkout (OPERATOR_DIR, default ../portail-operator).
 conformance:
-	./conformance-tests.sh --no-kind
-
-conformance-kind:
-	./conformance-tests.sh
+	cd conformance && go test -v -timeout 45m -run TestConformance -count=1
