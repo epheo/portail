@@ -505,7 +505,7 @@ impl DataPlane {
         let tcp_count = self.tcp_listeners.len();
         let udp_count = self.udp_listeners.len();
 
-        let tcp_entries: Vec<_> = self.tcp_listeners.drain(..).collect();
+        let tcp_entries = std::mem::take(&mut self.tcp_listeners);
         for entry in tcp_entries {
             let routes = routes.clone();
             let health = self.health.clone();
@@ -541,7 +541,7 @@ impl DataPlane {
             });
         }
 
-        let udp_entries: Vec<_> = self.udp_listeners.drain(..).collect();
+        let udp_entries = std::mem::take(&mut self.udp_listeners);
         for entry in udp_entries {
             let socket = Arc::new(entry.socket);
             let routes = routes.clone();
