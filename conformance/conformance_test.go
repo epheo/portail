@@ -23,9 +23,10 @@ import (
 const (
 	clusterName       = "portail"
 	gatewayAPIVersion = "v1.4.1"
-	portailVersion    = "v0.1.0"
-	portailImage      = "ghcr.io/epheo/portail:latest"
-	operatorImage     = "quay.io/epheo/portail-operator:latest"
+	// Kept current by the release workflow's version-sync step.
+	portailVersion = "v0.1.16"
+	portailImage   = "ghcr.io/epheo/portail:latest"
+	operatorImage  = "quay.io/epheo/portail-operator:latest"
 )
 
 var kubeconfigPath string
