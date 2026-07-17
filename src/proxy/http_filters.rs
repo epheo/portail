@@ -31,6 +31,218 @@ pub enum RewrittenPath {
     PrefixReplaced(String),
 }
 
+/// Assemble the outgoing request header block into `out` (reused scratch):
+/// copies `raw` minus the parser-recorded hop-by-hop spans via bulk gap
+/// copies, then appends X-Forwarded-For / X-Forwarded-Proto and, for upgrade
+/// requests, the Connection: upgrade the stripped original carried.
+/// One pass, no allocation after scratch warmup.
+///
+/// `raw` is the full header block ending with the blank-line CRLF.
+pub(crate) fn assemble_forward_headers(
+    raw: &[u8],
+    spans: &crate::proxy::http_parser::StripSpans,
+    upgrade_span: Option<(u32, u32)>,
+    keep_upgrade: bool,
+    client_ip: std::net::IpAddr,
+    is_tls: bool,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(raw.len() + 64);
+    let terminator_start = raw.len().saturating_sub(2);
+    let strip_upgrade = match upgrade_span {
+        Some((s, e)) if !keep_upgrade => Some((s as usize, e as usize)),
+        _ => None,
+    };
+
+    // Both sources are in ascending parse order; merge while copying gaps.
+    let mut cursor = 0usize;
+    let mut upgrade_pending = strip_upgrade;
+    for (s, e) in spans.iter() {
+        if let Some((us, ue)) = upgrade_pending {
+            if us < s {
+                out.extend_from_slice(&raw[cursor..us]);
+                cursor = ue;
+                upgrade_pending = None;
+            }
+        }
+        out.extend_from_slice(&raw[cursor..s]);
+        cursor = e;
+    }
+    if let Some((us, ue)) = upgrade_pending {
+        out.extend_from_slice(&raw[cursor..us]);
+        cursor = ue;
+    }
+    out.extend_from_slice(&raw[cursor..terminator_start]);
+    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Thorough per-line rewrite for the rare requests the span fast path cannot
+/// handle: span overflow or Connection-nominated extra headers (RFC 7230
+/// §6.1 requires stripping every header the Connection field names).
+pub(crate) fn assemble_forward_headers_slow(
+    raw: &[u8],
+    keep_upgrade: bool,
+    client_ip: std::net::IpAddr,
+    is_tls: bool,
+    out: &mut Vec<u8>,
+) {
+    // Pass 1: collect nominated tokens from every Connection header.
+    let mut nominated: Vec<String> = Vec::new();
+    for line in header_lines(raw) {
+        if let Some(value) = header_value_if(line, b"connection") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    nominated.push(token.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    // Pass 2: copy lines except hop-by-hop and nominated ones.
+    out.clear();
+    out.reserve(raw.len() + 64);
+    let mut first = true;
+    for line in header_lines(raw) {
+        if first {
+            // Request line is never a header.
+            first = false;
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            continue;
+        }
+        let name_end = match memchr::memchr(b':', line) {
+            Some(p) => p,
+            None => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
+        };
+        let name = &line[..name_end];
+        let is_hop = is_hop_by_hop_request_header(name)
+            || (name.eq_ignore_ascii_case(b"upgrade") && !keep_upgrade)
+            || nominated
+                .iter()
+                .any(|n| name.eq_ignore_ascii_case(n.as_bytes()));
+        if !is_hop {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    out.extend_from_slice(b"\r\n");
+}
+
+fn append_forward_headers(
+    out: &mut Vec<u8>,
+    client_ip: std::net::IpAddr,
+    is_tls: bool,
+    keep_upgrade: bool,
+) {
+    use std::io::Write;
+    // A fresh X-Forwarded-For line: multiple XFF headers concatenate as one
+    // list, which avoids locating and splicing an existing header.
+    out.extend_from_slice(b"X-Forwarded-For: ");
+    let _ = write!(out, "{}", client_ip);
+    out.extend_from_slice(b"\r\nX-Forwarded-Proto: ");
+    out.extend_from_slice(if is_tls { b"https" } else { b"http" });
+    out.extend_from_slice(b"\r\n");
+    if keep_upgrade {
+        out.extend_from_slice(b"Connection: upgrade\r\n");
+    }
+}
+
+/// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 §6.1).
+/// The proxy owns the client-side Connection header: `client_close` appends
+/// its own close announcement. The status line is copied untouched.
+pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(raw.len() + 24);
+    let mut first = true;
+    for line in header_lines(raw) {
+        if first {
+            first = false;
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            continue;
+        }
+        let keep = match memchr::memchr(b':', line) {
+            Some(p) => !is_hop_by_hop_response_header(&line[..p]),
+            None => true,
+        };
+        if keep {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    if client_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+/// First-byte dispatch keeps the per-line cost to one comparison for the
+/// overwhelmingly common non-hop-by-hop headers.
+#[inline]
+fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
+    match name.first().map(|b| b.to_ascii_lowercase()) {
+        Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
+        Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
+        Some(b'p') => name.eq_ignore_ascii_case(b"proxy-connection"),
+        Some(b't') => name.eq_ignore_ascii_case(b"te") || name.eq_ignore_ascii_case(b"trailer"),
+        Some(b'e') => name.eq_ignore_ascii_case(b"expect"),
+        _ => false,
+    }
+}
+
+#[inline]
+fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
+    match name.first().map(|b| b.to_ascii_lowercase()) {
+        Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
+        Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
+        Some(b'p') => name.eq_ignore_ascii_case(b"proxy-connection"),
+        Some(b't') => name.eq_ignore_ascii_case(b"te") || name.eq_ignore_ascii_case(b"trailer"),
+        Some(b'u') => name.eq_ignore_ascii_case(b"upgrade"),
+        _ => false,
+    }
+}
+
+/// Iterate CRLF-separated lines of a header block, excluding the final blank
+/// line. Tolerates a bare-LF separator the way the parsers upstream do.
+fn header_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        while pos < raw.len() {
+            let start = pos;
+            let end = memchr::memchr(b'\n', &raw[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(raw.len());
+            pos = end + 1;
+            let line = if end > start && raw[end - 1] == b'\r' {
+                &raw[start..end - 1]
+            } else {
+                &raw[start..end]
+            };
+            if !line.is_empty() {
+                return Some(line);
+            }
+        }
+        None
+    })
+}
+
+/// Case-insensitive header-name match returning the value as &str.
+fn header_value_if<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a str> {
+    let p = memchr::memchr(b':', line)?;
+    if !line[..p].eq_ignore_ascii_case(name) {
+        return None;
+    }
+    std::str::from_utf8(&line[p + 1..]).ok().map(|v| v.trim())
+}
+
 /// Remainder of the request path after the matched prefix.
 /// ReplacePrefixMatch is only defined for PathPrefix rules; on a rule whose
 /// path is not a literal byte prefix of the request (regex patterns), slicing
@@ -364,6 +576,111 @@ pub(crate) fn apply_response_header_mods(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parsed_spans(req: &[u8]) -> crate::proxy::http_parser::HttpRequestInfo<'_> {
+        crate::proxy::http_parser::extract_routing_info(req).unwrap()
+    }
+
+    #[test]
+    fn test_assemble_strips_hop_by_hop_and_appends_forwarding() {
+        let req = b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\nTE: trailers\r\nAccept: */*\r\n\r\n";
+        let info = parsed_spans(req);
+        assert!(!info.strip_spans.needs_slow_path);
+        assert_eq!(info.strip_spans.len(), 4);
+
+        let mut out = Vec::new();
+        assemble_forward_headers(
+            req,
+            &info.strip_spans,
+            info.upgrade_span,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.starts_with("GET /a HTTP/1.1\r\nHost: h\r\n"));
+        assert!(!s.to_ascii_lowercase().contains("connection:"));
+        assert!(!s.to_ascii_lowercase().contains("keep-alive:"));
+        assert!(!s.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(!s.to_ascii_lowercase().contains("te:"));
+        assert!(s.contains("Accept: */*\r\n"));
+        assert!(s.contains("X-Forwarded-For: 10.1.2.3\r\n"));
+        assert!(s.contains("X-Forwarded-Proto: http\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_assemble_keeps_upgrade_for_upgrade_requests() {
+        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n\r\n";
+        let info = parsed_spans(req);
+        assert!(info.is_upgrade);
+
+        let mut out = Vec::new();
+        assemble_forward_headers(
+            req,
+            &info.strip_spans,
+            info.upgrade_span,
+            true,
+            "10.1.2.3".parse().unwrap(),
+            true,
+            &mut out,
+        );
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("Upgrade: websocket\r\n"));
+        assert!(s.contains("Connection: upgrade\r\n"));
+        assert!(s.contains("X-Forwarded-Proto: https\r\n"));
+
+        // Non-upgrade request: a bare Upgrade header is stripped.
+        let req = b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n";
+        let info = parsed_spans(req);
+        assert!(!info.is_upgrade);
+        assemble_forward_headers(
+            req,
+            &info.strip_spans,
+            info.upgrade_span,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.to_ascii_lowercase().contains("upgrade"));
+    }
+
+    #[test]
+    fn test_assemble_slow_path_strips_nominated_headers() {
+        let req = b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close, X-Internal\r\nX-Internal: secret\r\nAccept: */*\r\n\r\n";
+        let info = parsed_spans(req);
+        assert!(info.strip_spans.needs_slow_path);
+
+        let mut out = Vec::new();
+        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.to_ascii_lowercase().contains("x-internal"));
+        assert!(!s.to_ascii_lowercase().contains("connection:"));
+        assert!(s.contains("Accept: */*\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_sanitize_response_headers() {
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nServer: x\r\n\r\n";
+        let mut out = Vec::new();
+        sanitize_response_headers(resp, false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("Content-Length: 2\r\n"));
+        assert!(s.contains("Server: x\r\n"));
+        assert!(!s.to_ascii_lowercase().contains("connection:"));
+        assert!(!s.to_ascii_lowercase().contains("keep-alive"));
+        assert!(s.ends_with("\r\n\r\n"));
+
+        sanitize_response_headers(resp, true, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.ends_with("Connection: close\r\n\r\n"));
+    }
 
     #[test]
     fn test_prefix_remainder_regex_rule_no_panic() {

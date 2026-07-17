@@ -19,8 +19,9 @@ use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
-    apply_request_header_modifications, apply_response_header_mods, dispatch_mirrors,
-    extract_header_mods, extract_url_rewrite, HeaderModifications, MIRROR_BODY_MAX,
+    apply_request_header_modifications, apply_response_header_mods, assemble_forward_headers,
+    assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods, extract_url_rewrite,
+    sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::find_header_end;
 use crate::proxy::request_processor::{
@@ -118,6 +119,8 @@ struct ConnectionState {
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
+    /// Client address for X-Forwarded-For.
+    peer_ip: std::net::IpAddr,
     /// Budget for completing a request's header block once bytes arrive.
     client_header_timeout: Duration,
     /// Backend connect budget for raw TCP forwarding (HTTP connects go
@@ -125,6 +128,9 @@ struct ConnectionState {
     connect_timeout: Duration,
     /// Reused across keepalive responses to avoid per-response heap allocation.
     header_buf: Vec<u8>,
+    /// Reused header-assembly scratch: outgoing request block during the send
+    /// phase, sanitized response block during the response phase.
+    scratch_buf: Vec<u8>,
     /// Per-listener stats slot (shared with the accept loop) for per-port
     /// request/error accounting.
     listener_stats: Arc<ListenerStats>,
@@ -245,9 +251,11 @@ pub async fn run_worker(
                                                 selector,
                                                 health,
                                                 is_tls: true,
+                                                peer_ip: peer.ip(),
                                                 client_header_timeout: cfg.client_header_timeout,
                                                 connect_timeout: cfg.connect_timeout,
                                                 header_buf: Vec::with_capacity(1024),
+                                                scratch_buf: Vec::with_capacity(1024),
                                                 listener_stats: listener_stats.clone(),
                                             };
                                             let _ = handle_connection(conn, peer, state).await;
@@ -278,9 +286,11 @@ pub async fn run_worker(
                                 selector,
                                 health,
                                 is_tls: false,
+                                peer_ip: peer.ip(),
                                 client_header_timeout: cfg.client_header_timeout,
                                 connect_timeout: cfg.connect_timeout,
                                 header_buf: Vec::with_capacity(1024),
+                                scratch_buf: Vec::with_capacity(1024),
                                 listener_stats: listener_stats.clone(),
                             };
                             tokio::spawn(async move {
@@ -535,18 +545,23 @@ async fn proxy_http_request(
             .filters
             .iter()
             .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
-    let mirror_header_data = match send_request_to_backend(
+
+    // Assemble the outgoing header block once — hop-by-hop stripped,
+    // X-Forwarded-* appended, filter modifications applied. The pool-retry
+    // resend and the mirror capture reuse it verbatim.
+    build_outgoing_headers(buf, req_header_end, rule, backend_ref, meta, state);
+    let headers_len = state.scratch_buf.len();
+    let mirror_header_data: Option<Vec<u8>> = has_mirrors.then(|| state.scratch_buf.clone());
+
+    let send_result = send_assembled_request(
         &mut backend,
-        buf,
-        req_header_end,
-        request_end,
-        rule,
-        backend_ref,
-        has_mirrors,
+        &mut state.scratch_buf,
+        headers_len,
+        &buf[req_header_end..request_end],
     )
-    .await
-    {
-        Ok(m) => m,
+    .await;
+    match send_result {
+        Ok(()) => {}
         Err(_e) if from_pool => {
             // Pool entry died between probe and write. Reconnect once and
             // replay. Do NOT record_failure here: a stale pool entry is
@@ -606,33 +621,27 @@ async fn proxy_http_request(
                     .await;
                 }
             };
-            match send_request_to_backend(
+            if let Err(e2) = send_assembled_request(
                 &mut backend,
-                buf,
-                req_header_end,
-                request_end,
-                rule,
-                backend_ref,
-                has_mirrors,
+                &mut state.scratch_buf,
+                headers_len,
+                &buf[req_header_end..request_end],
             )
             .await
             {
-                Ok(m) => m,
-                Err(e2) => {
-                    warn!(
-                        "Backend {} send failed on fresh conn after pool retry: {}",
-                        backend_addr, e2
-                    );
-                    return fail_backend(
-                        &state.health,
-                        &state.listener_stats,
-                        &backend_metric_label(backend_ref),
-                        client,
-                        backend_addr,
-                        502,
-                    )
-                    .await;
-                }
+                warn!(
+                    "Backend {} send failed on fresh conn after pool retry: {}",
+                    backend_addr, e2
+                );
+                return fail_backend(
+                    &state.health,
+                    &state.listener_stats,
+                    &backend_metric_label(backend_ref),
+                    client,
+                    backend_addr,
+                    502,
+                )
+                .await;
             }
         }
         Err(e) => return Err(e),
@@ -697,10 +706,12 @@ async fn proxy_http_request(
         &mut backend,
         buf,
         &mut state.header_buf,
+        &mut state.scratch_buf,
         resp_mods.as_ref(),
         header_budget,
         meta.is_head,
         meta.is_upgrade,
+        !meta.keepalive,
     )
     .await?
     {
@@ -773,13 +784,14 @@ async fn proxy_http_request(
 
     // The client got a clean response, but the backend conn returns to the pool
     // only when `backend_conn_poolable` allows — notably never after HEAD or a
-    // refused upgrade.
+    // refused upgrade — and never when the backend announced Connection: close.
     if backend_conn_poolable(
         response_complete,
         framing_clean,
         meta.is_head,
         meta.is_upgrade,
-    ) {
+    ) && !framing.backend_close
+    {
         state.pool.release(
             backend_addr,
             backend_ref.use_tls,
@@ -924,56 +936,86 @@ async fn connect_to_backend(
     }
 }
 
-/// Send request headers (with optional filter modifications) and the same-read
-/// body tail (up to `request_end`, the request's framing boundary — bytes
-/// beyond it belong to a pipelined next request and never reach the backend)
-/// to the backend. Returns the buffer captured for mirroring, if any.
-///
-/// Fast path (no filters/mods): one `write_all` covering headers + tail.
-async fn send_request_to_backend(
-    backend: &mut Connection,
+/// Assemble the outgoing request header block into `state.scratch_buf`:
+/// hop-by-hop stripping + X-Forwarded-* (always, via parser-recorded spans),
+/// then filter header modifications (when configured).
+fn build_outgoing_headers(
     buf: &[u8],
     req_header_end: usize,
-    request_end: usize,
     rule: &HttpRouteRule,
     backend_ref: &crate::routing::Backend,
-    has_mirrors: bool,
-) -> Result<Option<Vec<u8>>> {
-    let has_filters = rule.has_filters || !backend_ref.filters.is_empty();
-    if !has_filters {
-        backend.write_all(&buf[..request_end]).await?;
-        return Ok(None);
-    }
-
-    let rule_mods = extract_header_mods(&rule.filters, false);
-    let request_path = extract_request_path(&buf[..req_header_end]);
-    let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
-    let backend_mods = extract_header_mods(&backend_ref.filters, false);
-    let has_mods = rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some();
-
-    if !has_mods {
-        let mirror = has_mirrors.then(|| buf[..req_header_end].to_vec());
-        backend.write_all(&buf[..request_end]).await?;
-        return Ok(mirror);
-    }
-
-    let modified_headers = apply_request_header_modifications(
-        &buf[..req_header_end],
-        rule_mods.as_ref(),
-        url_rewrite.as_ref(),
-    );
-    let final_headers = if let Some(bm) = backend_mods {
-        apply_request_header_modifications(&modified_headers, Some(&bm), None)
+    meta: &RequestMeta,
+    state: &mut ConnectionState,
+) {
+    let raw = &buf[..req_header_end];
+    if meta.strip_spans.needs_slow_path {
+        assemble_forward_headers_slow(
+            raw,
+            meta.is_upgrade,
+            state.peer_ip,
+            state.is_tls,
+            &mut state.scratch_buf,
+        );
     } else {
-        modified_headers
-    };
-    let mirror = has_mirrors.then(|| final_headers.clone());
-    backend.write_all(&final_headers).await?;
-    let body = &buf[req_header_end..request_end];
-    if !body.is_empty() {
+        assemble_forward_headers(
+            raw,
+            &meta.strip_spans,
+            meta.upgrade_span,
+            meta.is_upgrade,
+            state.peer_ip,
+            state.is_tls,
+            &mut state.scratch_buf,
+        );
+    }
+
+    if rule.has_filters || !backend_ref.filters.is_empty() {
+        let rule_mods = extract_header_mods(&rule.filters, false);
+        let request_path = extract_request_path(raw);
+        let url_rewrite =
+            extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
+        let backend_mods = extract_header_mods(&backend_ref.filters, false);
+        if rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some() {
+            let modified = apply_request_header_modifications(
+                &state.scratch_buf,
+                rule_mods.as_ref(),
+                url_rewrite.as_ref(),
+            );
+            let final_headers = if let Some(bm) = backend_mods {
+                apply_request_header_modifications(&modified, Some(&bm), None)
+            } else {
+                modified
+            };
+            state.scratch_buf.clear();
+            state.scratch_buf.extend_from_slice(&final_headers);
+        }
+    }
+}
+
+/// Send the assembled headers plus the same-read body tail (up to the
+/// request's framing boundary — bytes beyond it belong to a pipelined next
+/// request and never reach the backend). Small tails are appended to the
+/// scratch so the common case stays one write; the scratch is truncated back
+/// to the headers afterwards, keeping the pool-retry resend valid.
+async fn send_assembled_request(
+    backend: &mut Connection,
+    scratch: &mut Vec<u8>,
+    headers_len: usize,
+    body: &[u8],
+) -> Result<()> {
+    const COMBINE_MAX: usize = 16 * 1024;
+    if body.is_empty() {
+        backend.write_all(&scratch[..headers_len]).await?;
+    } else if body.len() <= COMBINE_MAX {
+        scratch.truncate(headers_len);
+        scratch.extend_from_slice(body);
+        let res = backend.write_all(scratch).await;
+        scratch.truncate(headers_len);
+        res?;
+    } else {
+        backend.write_all(&scratch[..headers_len]).await?;
         backend.write_all(body).await?;
     }
-    Ok(mirror)
+    Ok(())
 }
 
 /// Read response headers from the backend within `header_budget` and forward
@@ -982,15 +1024,18 @@ async fn send_request_to_backend(
 /// headers and the caller must use encoding-aware termination on later expiry.
 ///
 /// Returns `Ok(None)` when the caller should bail out (`return Ok(false)`).
+#[allow(clippy::too_many_arguments)]
 async fn forward_response_headers(
     client: &mut Connection,
     backend: &mut Connection,
     buf: &mut [u8],
     header_buf: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
     header_budget: Duration,
     is_head_request: bool,
     expect_upgrade: bool,
+    client_close: bool,
 ) -> Result<Option<ResponseFraming>> {
     let (resp_header_end, framing) = match tokio::time::timeout(
         header_budget,
@@ -1022,17 +1067,41 @@ async fn forward_response_headers(
     // leaking to the client — and for CL/chunked responses it stops at the
     // framing boundary so backend overshoot never reaches the client.
     let tail_end = resp_header_end + framing.body_bytes_already_forwarded;
+
+    // Accepted upgrade: forwarded verbatim — the client needs the backend's
+    // Connection/Upgrade headers intact, and the connection leaves HTTP.
+    if framing.status == 101 {
+        client.write_all(&header_buf[..tail_end]).await?;
+        return Ok(Some(framing));
+    }
+
+    // Hop-by-hop response headers never reach the client (RFC 7230 §6.1);
+    // the proxy owns the client-side Connection header.
+    sanitize_response_headers(&header_buf[..resp_header_end], client_close, scratch);
     if let Some(mods) = resp_mods {
-        let modified = apply_response_header_mods(&header_buf[..resp_header_end], mods);
+        let modified = apply_response_header_mods(scratch, mods);
         client.write_all(&modified).await?;
         if tail_end > resp_header_end {
             client
                 .write_all(&header_buf[resp_header_end..tail_end])
                 .await?;
         }
+    } else if tail_end > resp_header_end {
+        let tail = &header_buf[resp_header_end..tail_end];
+        // Hot path: sanitized headers + in-framing tail in a single write
+        // when the tail is small enough to append to the scratch.
+        if tail.len() <= 16 * 1024 {
+            let sanitized_len = scratch.len();
+            scratch.extend_from_slice(tail);
+            let res = client.write_all(scratch).await;
+            scratch.truncate(sanitized_len);
+            res?;
+        } else {
+            client.write_all(scratch).await?;
+            client.write_all(tail).await?;
+        }
     } else {
-        // Hot path: headers + in-framing tail in a single write.
-        client.write_all(&header_buf[..tail_end]).await?;
+        client.write_all(scratch).await?;
     }
     Ok(Some(framing))
 }
@@ -1150,6 +1219,10 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 struct ResponseFraming {
     /// Response status code (0 when the status line is unparseable).
     status: u16,
+    /// The backend announced it will close this connection (Connection:
+    /// close, or an HTTP/1.0 response without keep-alive). Such a conn must
+    /// not return to the pool: the next write would fail and burn the retry.
+    backend_close: bool,
     content_length: Option<usize>,
     no_body: bool,
     /// Body bytes (within the declared framing) that arrived in the same
@@ -1199,6 +1272,7 @@ async fn read_response_headers(
         if let Some(header_end) = find_header_end(header_buf) {
             let headers = &header_buf[..header_end];
             let status = parse_response_status(headers);
+            let backend_close = response_wants_close(headers);
             let content_length = parse_content_length(headers);
             let is_chunked = is_chunked_transfer(headers);
             // RFC 7230 §3.3: responses to HEAD have no message body regardless
@@ -1244,6 +1318,7 @@ async fn read_response_headers(
                 header_end,
                 ResponseFraming {
                     status,
+                    backend_close,
                     content_length: if is_head_request {
                         None
                     } else {
@@ -1515,6 +1590,23 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 fn is_chunked_transfer(headers: &[u8]) -> bool {
     crate::routing::find_header_value(headers, "transfer-encoding")
         .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
+}
+
+/// Whether the backend announced closing this connection: an explicit
+/// Connection: close token, or an HTTP/1.0 response without keep-alive.
+fn response_wants_close(headers: &[u8]) -> bool {
+    if let Some(v) = crate::routing::find_header_value(headers, "connection") {
+        for token in v.split(',') {
+            let t = token.trim();
+            if t.eq_ignore_ascii_case("close") {
+                return true;
+            }
+            if t.eq_ignore_ascii_case("keep-alive") {
+                return false;
+            }
+        }
+    }
+    headers.starts_with(b"HTTP/1.0")
 }
 
 /// Parse the 3-digit status code from a response status line

@@ -1492,3 +1492,117 @@ fn read_complete_response(stream: &mut std::net::TcpStream) -> Vec<u8> {
         }
     }
 }
+
+/// Hop-by-hop request headers must not reach the backend (RFC 7230 6.1);
+/// X-Forwarded-For / X-Forwarded-Proto must be appended.
+#[test]
+fn test_hop_by_hop_stripped_and_forwarded_headers_added() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(55);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let request = "GET / HTTP/1.1\r\n\
+                   Host: localhost\r\n\
+                   Connection: keep-alive\r\n\
+                   Keep-Alive: timeout=5\r\n\
+                   Proxy-Connection: keep-alive\r\n\
+                   TE: trailers\r\n\
+                   X-App: kept\r\n\
+                   Connection: close\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request.as_bytes()).expect("response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    let received = backend.received_requests();
+    assert_eq!(received.len(), 1);
+    let req = String::from_utf8_lossy(&received[0]).to_ascii_lowercase();
+    assert!(
+        !req.contains("connection:"),
+        "Connection forwarded: {}",
+        req
+    );
+    assert!(
+        !req.contains("keep-alive:"),
+        "Keep-Alive forwarded: {}",
+        req
+    );
+    assert!(
+        !req.contains("proxy-connection:"),
+        "Proxy-Connection forwarded: {}",
+        req
+    );
+    assert!(!req.contains("te:"), "TE forwarded: {}", req);
+    assert!(req.contains("x-app: kept"), "app header lost: {}", req);
+    assert!(
+        req.contains("x-forwarded-for: 127.0.0.1"),
+        "XFF missing: {}",
+        req
+    );
+    assert!(
+        req.contains("x-forwarded-proto: http"),
+        "XFP missing: {}",
+        req
+    );
+}
+
+/// Connection-nominated headers are stripped too (slow path).
+#[test]
+fn test_connection_nominated_header_stripped() {
+    let backend = InspectingBackend::spawn("ok");
+    let port = proxy_port(56);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let request = "GET / HTTP/1.1\r\n\
+                   Host: localhost\r\n\
+                   Connection: close, X-Internal\r\n\
+                   X-Internal: secret\r\n\r\n";
+    let response = http_request(proxy.proxy_addr, request.as_bytes()).expect("response");
+    assert_eq!(extract_status(&response), Some(200));
+
+    let received = backend.received_requests();
+    let req = String::from_utf8_lossy(&received[0]).to_ascii_lowercase();
+    assert!(
+        !req.contains("x-internal"),
+        "nominated header forwarded: {}",
+        req
+    );
+}
+
+/// The backend's hop-by-hop response headers must not reach the client; the
+/// proxy owns the client-side Connection header.
+#[test]
+fn test_backend_connection_header_not_relayed_to_client() {
+    let backend = TestBackend::spawn("hello");
+    let port = proxy_port(57);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    // Keepalive request: TestBackend answers "Connection: keep-alive", which
+    // must be stripped from what the client sees.
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&proxy.proxy_addr, Duration::from_secs(5))
+            .expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send");
+    let response = read_complete_response(&mut stream);
+    assert_eq!(extract_status(&response), Some(200));
+    let headers = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(
+        !headers.contains("keep-alive"),
+        "backend hop-by-hop header reached client: {}",
+        headers
+    );
+
+    // The connection must still be reusable for a second request.
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("send second");
+    let second = read_complete_response(&mut stream);
+    assert_eq!(extract_status(&second), Some(200));
+    let headers = String::from_utf8_lossy(&second).to_ascii_lowercase();
+    assert!(
+        headers.contains("connection: close"),
+        "proxy must announce close on the final response: {}",
+        headers
+    );
+}
