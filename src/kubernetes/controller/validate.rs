@@ -248,7 +248,9 @@ pub(super) fn validate_gateway(
         // Check allowedRoutes.kinds validity and compute supportedKinds
         if let Some(allowed_routes) = &listener.allowed_routes {
             if let Some(kinds) = &allowed_routes.kinds {
-                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute", "GRPCRoute"];
+                // No GRPCRoute: the data plane cannot serve gRPC, so advertising
+                // it would claim attachment for routes that can never work.
+                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute"];
                 let mut supported = Vec::new();
                 let mut has_invalid = false;
                 for k in kinds {
@@ -510,6 +512,39 @@ mod tests {
         let ls = &listeners["https"];
         assert!(!ls.resolved_refs);
         assert_eq!(ls.resolved_refs_reason, "InvalidCertificateRef");
+    }
+
+    #[test]
+    fn validate_gateway_grpcroute_kind_not_supported() {
+        use gateway_api::gateways::{
+            GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        };
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners[0].tls = None;
+        gw.spec.listeners[0].protocol = "HTTP".into();
+        gw.spec.listeners[0].allowed_routes = Some(GatewayListenersAllowedRoutes {
+            kinds: Some(vec![
+                GatewayListenersAllowedRoutesKinds {
+                    group: None,
+                    kind: "HTTPRoute".into(),
+                },
+                GatewayListenersAllowedRoutesKinds {
+                    group: None,
+                    kind: "GRPCRoute".into(),
+                },
+            ]),
+            namespaces: None,
+        });
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        let ls = &listeners["https"];
+        assert!(!ls.resolved_refs);
+        assert_eq!(ls.resolved_refs_reason, "InvalidRouteKinds");
+        assert_eq!(ls.supported_kinds.len(), 1);
+        assert_eq!(ls.supported_kinds[0]["kind"], "HTTPRoute");
     }
 
     #[test]
