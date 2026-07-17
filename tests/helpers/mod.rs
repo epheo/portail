@@ -1,3 +1,6 @@
+// Compiled once per test binary; each binary uses a different subset.
+#![allow(dead_code)]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
@@ -220,6 +223,8 @@ pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::i
 pub struct PortailProcess {
     child: Child,
     _config_file: tempfile::NamedTempFile,
+    // Held so the --cert-dir outlives the process (TLS tests only).
+    _cert_dir: Option<tempfile::TempDir>,
     pub proxy_addr: SocketAddr,
 }
 
@@ -294,6 +299,7 @@ impl PortailProcess {
         Self {
             child,
             _config_file: config_file,
+            _cert_dir: None,
             proxy_addr,
         }
     }
@@ -338,9 +344,150 @@ impl PortailProcess {
         Self {
             child,
             _config_file: config_file,
+            _cert_dir: None,
             proxy_addr,
         }
     }
+
+    /// Spawn with one HTTPS Terminate listener on `proxy_port`.
+    /// `certs`: (ref_name, sni_hostname, cert_pem, key_pem), written into a
+    /// temp --cert-dir as {ref_name}.crt/.key. `routes`: (hostname, backend).
+    pub fn spawn_with_tls(
+        certs: &[(&str, &str, &[u8], &[u8])],
+        routes: &[(&str, SocketAddr)],
+        proxy_port: u16,
+    ) -> Self {
+        let cert_dir = tempfile::tempdir().expect("create cert dir");
+        for (name, _, cert_pem, key_pem) in certs {
+            std::fs::write(cert_dir.path().join(format!("{}.crt", name)), cert_pem)
+                .expect("write cert");
+            std::fs::write(cert_dir.path().join(format!("{}.key", name)), key_pem)
+                .expect("write key");
+        }
+
+        let cert_refs: Vec<String> = certs
+            .iter()
+            .map(|(name, host, _, _)| format!(r#"{{"name": "{}", "hostname": "{}"}}"#, name, host))
+            .collect();
+        let route_objs: Vec<String> = routes
+            .iter()
+            .map(|(host, addr)| {
+                format!(
+                    r#"{{
+        "parentRefs": [{{"name": "test-gateway", "sectionName": "https"}}],
+        "hostnames": ["{}"],
+        "rules": [{{
+            "matches": [{{"path": {{"type": "PathPrefix", "value": "/"}}}}],
+            "backendRefs": [{{"name": "{}", "port": {}}}]
+        }}]
+    }}"#,
+                    host,
+                    addr.ip(),
+                    addr.port()
+                )
+            })
+            .collect();
+        let config = format!(
+            r#"{{
+  "gateway": {{
+    "name": "test-gateway",
+    "listeners": [{{
+      "name": "https", "protocol": "HTTPS", "port": {},
+      "tls": {{"mode": "Terminate", "certificateRefs": [{}]}}
+    }}]
+  }},
+  "httpRoutes": [{}],
+  "observability": {{
+    "logging": {{"level": "debug", "format": "pretty", "output": "stderr"}}
+  }},
+  "performance": {{}}
+}}"#,
+            proxy_port,
+            cert_refs.join(", "),
+            route_objs.join(", ")
+        );
+
+        let config_file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("create temp config");
+        std::fs::write(config_file.path(), config).expect("write temp config");
+
+        let binary = cargo_bin_path();
+        let mut child = unsafe {
+            Command::new(&binary)
+                .arg("--config")
+                .arg(config_file.path())
+                .arg("--cert-dir")
+                .arg(cert_dir.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
+        };
+
+        let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!(
+                        "Portail exited with {} before accepting connections.",
+                        status
+                    );
+                }
+                panic!("Portail did not start accepting TLS connections within 5s");
+            }
+            if TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Self {
+            child,
+            _config_file: config_file,
+            _cert_dir: Some(cert_dir),
+            proxy_addr,
+        }
+    }
+}
+
+/// Generate a self-signed cert+key via the openssl CLI (mirrors the lib's
+/// test_util, which integration tests cannot reach across the crate boundary).
+/// `None` when openssl is unavailable — callers skip their test.
+pub fn generate_test_cert(cn: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let dir = tempfile::tempdir().ok()?;
+    let key_path = dir.path().join("key.pem");
+    let cert_path = dir.path().join("cert.pem");
+    let output = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+        ])
+        .arg(&key_path)
+        .args(["-out"])
+        .arg(&cert_path)
+        .args(["-days", "1", "-subj", &format!("/CN={}", cn)])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cert_pem = std::fs::read(&cert_path).ok()?;
+    let key_pem = std::fs::read(&key_path).ok()?;
+    Some((cert_pem, key_pem))
 }
 
 impl Drop for PortailProcess {
