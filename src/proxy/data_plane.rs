@@ -244,6 +244,7 @@ impl DataPlane {
                 connect_timeout: performance_config.backend_timeout,
                 client_header_timeout: performance_config.client_header_timeout,
                 tcp_keepalive_time: performance_config.tcp_keepalive_time,
+                idle_body_timeout: performance_config.idle_body_timeout,
             },
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
@@ -464,6 +465,7 @@ impl DataPlane {
                                     connect_timeout: performance_config.backend_timeout,
                                     client_header_timeout: performance_config.client_header_timeout,
                                     tcp_keepalive_time: performance_config.tcp_keepalive_time,
+                                    idle_body_timeout: performance_config.idle_body_timeout,
                                 };
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;

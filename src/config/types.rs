@@ -626,6 +626,22 @@ pub struct PerformanceConfig {
     )]
     pub tcp_keepalive_time: Duration,
 
+    /// Per-step progress budget on HTTP body streaming: each read or write
+    /// during request-body relay and response-body forwarding must complete
+    /// within this. Bounds peers that stay connected but stop making
+    /// progress (stalled backend mid-response, trickling client body) —
+    /// without it, an unset route `request_timeout` (the default) lets such
+    /// a peer pin the task, both fds, and a backend connection forever.
+    /// Does not apply to upgraded tunnels, L4 forwarding, or the idle wait
+    /// between keepalive requests (long idle is legitimate there). Defaults
+    /// to 300s — Envoy's stream_idle_timeout default; `0s` disables.
+    #[serde(
+        default = "default_idle_body_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub idle_body_timeout: Duration,
+
     /// Scope of the idle backend-connection pool. `connection` (default)
     /// pools per accepted client connection — lock-free, but reuse happens
     /// only across keepalive requests on that same client. `process` shares
@@ -658,6 +674,10 @@ fn default_dns_refresh_interval() -> Duration {
     Duration::from_secs(5)
 }
 
+fn default_idle_body_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
 fn default_client_header_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -674,6 +694,7 @@ impl Default for PerformanceConfig {
             dns_refresh_interval: default_dns_refresh_interval(),
             client_header_timeout: default_client_header_timeout(),
             tcp_keepalive_time: default_tcp_keepalive_time(),
+            idle_body_timeout: default_idle_body_timeout(),
             backend_pool_scope: PoolScope::default(),
         }
     }

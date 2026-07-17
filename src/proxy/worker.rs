@@ -67,6 +67,9 @@ pub struct WorkerConfig {
     /// Idle time before the kernel's first TCP keepalive probe on accepted
     /// sockets (see [`crate::config::PerformanceConfig::tcp_keepalive_time`]).
     pub tcp_keepalive_time: Duration,
+    /// Per-step progress budget on body streaming (see
+    /// [`crate::config::PerformanceConfig::idle_body_timeout`]); zero disables.
+    pub idle_body_timeout: Duration,
 }
 
 /// Probe cadence once `tcp_keepalive_time` idle has elapsed: a peer that
@@ -131,6 +134,8 @@ struct ConnectionState {
     /// Reused header-assembly scratch: outgoing request block during the send
     /// phase, sanitized response block during the response phase.
     scratch_buf: Vec<u8>,
+    /// Per-step body-streaming progress budget; None = disabled.
+    idle_body_timeout: Option<Duration>,
     /// Per-listener stats slot (shared with the accept loop) for per-port
     /// request/error accounting.
     listener_stats: Arc<ListenerStats>,
@@ -256,6 +261,9 @@ pub async fn run_worker(
                                                 connect_timeout: cfg.connect_timeout,
                                                 header_buf: Vec::with_capacity(1024),
                                                 scratch_buf: Vec::with_capacity(1024),
+                                                idle_body_timeout: idle_opt(
+                                                    cfg.idle_body_timeout,
+                                                ),
                                                 listener_stats: listener_stats.clone(),
                                             };
                                             let _ = handle_connection(conn, peer, state).await;
@@ -291,6 +299,7 @@ pub async fn run_worker(
                                 connect_timeout: cfg.connect_timeout,
                                 header_buf: Vec::with_capacity(1024),
                                 scratch_buf: Vec::with_capacity(1024),
+                                idle_body_timeout: idle_opt(cfg.idle_body_timeout),
                                 listener_stats: listener_stats.clone(),
                             };
                             tokio::spawn(async move {
@@ -674,6 +683,7 @@ async fn proxy_http_request(
         meta.content_length,
         req_chunked,
         has_mirrors,
+        state.idle_body_timeout,
     );
     let (mirror_body, relay_leftover) = match total_deadline {
         Some(deadline) => {
@@ -748,7 +758,13 @@ async fn proxy_http_request(
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(
                 remaining,
-                forward_response_body(&mut backend, client, buf, &mut framing),
+                forward_response_body(
+                    &mut backend,
+                    client,
+                    buf,
+                    &mut framing,
+                    state.idle_body_timeout,
+                ),
             )
             .await
             {
@@ -759,7 +775,16 @@ async fn proxy_http_request(
                 }
             }
         }
-        None => forward_response_body(&mut backend, client, buf, &mut framing).await,
+        None => {
+            forward_response_body(
+                &mut backend,
+                client,
+                buf,
+                &mut framing,
+                state.idle_body_timeout,
+            )
+            .await
+        }
     };
 
     let response_complete = match body_result {
@@ -1144,6 +1169,7 @@ fn extract_request_path(header_bytes: &[u8]) -> Option<&str> {
 /// mirrors are active and the body fit within `MIRROR_BODY_MAX`; `leftover`
 /// holds any bytes read past the body's framing end — a pipelined next
 /// request — which must go back to the keepalive loop, never to the backend.
+#[allow(clippy::too_many_arguments)]
 async fn relay_request_body(
     client: &mut Connection,
     backend: &mut Connection,
@@ -1153,6 +1179,7 @@ async fn relay_request_body(
     content_length: Option<usize>,
     chunked: Option<ChunkedStream>,
     has_mirrors: bool,
+    idle: Option<Duration>,
 ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     let body_in_initial = request_end.saturating_sub(header_end);
     let initial_body = &buf[header_end..request_end];
@@ -1172,12 +1199,12 @@ async fn relay_request_body(
     if let Some(cl) = content_length {
         let mut remaining = cl.saturating_sub(body_in_initial);
         while remaining > 0 {
-            let n = client.read(&mut buf[..]).await?;
+            let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
             if n == 0 {
                 break;
             }
             let to_send = n.min(remaining);
-            backend.write_all(&buf[..to_send]).await?;
+            idle_guarded(idle, backend.write_all(&buf[..to_send])).await?;
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..to_send]);
             remaining -= to_send;
             if to_send < n {
@@ -1190,12 +1217,12 @@ async fn relay_request_body(
         // the backend cannot parse the body either — the exchange is doomed
         // and the response phase will surface the failure.
         while !stream.is_terminated() && !stream.is_broken() {
-            let n = client.read(&mut buf[..]).await?;
+            let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
             if n == 0 {
                 break;
             }
             let consumed = stream.observe(&buf[..n]);
-            backend.write_all(&buf[..consumed]).await?;
+            idle_guarded(idle, backend.write_all(&buf[..consumed])).await?;
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..consumed]);
             if consumed < n {
                 leftover = Some(buf[consumed..n].to_vec());
@@ -1386,6 +1413,7 @@ async fn forward_response_body(
     client: &mut Connection,
     buf: &mut [u8],
     framing: &mut ResponseFraming,
+    idle: Option<Duration>,
 ) -> Result<bool> {
     if framing.no_body {
         return Ok(true);
@@ -1403,7 +1431,7 @@ async fn forward_response_body(
 
     let mut body_bytes_forwarded = framing.body_bytes_already_forwarded;
     loop {
-        let n = backend.read(buf).await?;
+        let n = idle_guarded(idle, backend.read(buf)).await?;
         if n == 0 {
             return Ok(false);
         }
@@ -1413,14 +1441,14 @@ async fn forward_response_body(
         // never pools the connection.
         if let Some(stream) = &mut framing.chunked {
             let consumed = stream.observe(&buf[..n]);
-            client.write_all(&buf[..consumed]).await?;
+            idle_guarded(idle, client.write_all(&buf[..consumed])).await?;
             if stream.is_terminated() {
                 framing.overshoot |= consumed < n;
                 return Ok(true);
             }
         } else if let Some(cl) = framing.content_length {
             let to_write = n.min(cl - body_bytes_forwarded);
-            client.write_all(&buf[..to_write]).await?;
+            idle_guarded(idle, client.write_all(&buf[..to_write])).await?;
             body_bytes_forwarded += to_write;
             if body_bytes_forwarded >= cl {
                 framing.overshoot |= to_write < n;
@@ -1428,7 +1456,7 @@ async fn forward_response_body(
             }
         } else {
             // EOF-framed: everything until close is body.
-            client.write_all(&buf[..n]).await?;
+            idle_guarded(idle, client.write_all(&buf[..n])).await?;
         }
     }
 }
@@ -1450,6 +1478,32 @@ async fn terminate_stream_gracefully(client: &mut Connection, framing: &Response
     if framing.chunked.is_some() {
         let _ = client.write_all(b"0\r\n\r\n").await;
         let _ = client.flush().await;
+    }
+}
+
+/// Zero means disabled in the config; the streaming loops branch on Option.
+#[inline]
+fn idle_opt(d: Duration) -> Option<Duration> {
+    (!d.is_zero()).then_some(d)
+}
+
+/// Await one body-streaming I/O step under the optional progress budget.
+/// Only wraps the multi-read/write streaming loops — the common single-read
+/// response never reaches these, so no timer is created on that path.
+#[inline]
+async fn idle_guarded<T, F>(idle: Option<Duration>, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match idle {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => Ok(r?),
+            Err(_) => Err(anyhow::anyhow!(
+                "body stream stalled: no progress within {:?}",
+                d
+            )),
+        },
+        None => Ok(fut.await?),
     }
 }
 

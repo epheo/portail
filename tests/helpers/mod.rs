@@ -349,6 +349,68 @@ impl PortailProcess {
         }
     }
 
+    /// Spawn with a custom `performance` JSON object (e.g. tight timeouts).
+    pub fn spawn_with_performance(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        performance_json: &str,
+    ) -> Self {
+        let config = build_test_config_with_tcp(routes, proxy_port, &[]).replace(
+            r#""performance": {}"#,
+            &format!(r#""performance": {}"#, performance_json),
+        );
+        Self::spawn_config(config, proxy_port)
+    }
+
+    /// Spawn from a ready config string and wait for the proxy port.
+    fn spawn_config(config: String, proxy_port: u16) -> Self {
+        let config_file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("create temp config");
+        std::fs::write(config_file.path(), config).expect("write temp config");
+
+        let binary = cargo_bin_path();
+        let mut child = unsafe {
+            Command::new(&binary)
+                .arg("--config")
+                .arg(config_file.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
+        };
+
+        let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!(
+                        "Portail exited with {} before accepting connections.",
+                        status
+                    );
+                }
+                panic!("Portail did not start accepting connections within 5s");
+            }
+            if TcpStream::connect_timeout(&proxy_addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Self {
+            child,
+            _config_file: config_file,
+            _cert_dir: None,
+            proxy_addr,
+        }
+    }
+
     /// Spawn with one HTTPS Terminate listener on `proxy_port`.
     /// `certs`: (ref_name, sni_hostname, cert_pem, key_pem), written into a
     /// temp --cert-dir as {ref_name}.crt/.key. `routes`: (hostname, backend).
