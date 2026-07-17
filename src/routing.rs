@@ -1727,6 +1727,124 @@ mod tests {
         }
     }
 
+    fn weighted(port: u16, weight: u32) -> Backend {
+        Backend {
+            weight,
+            ..backend(port)
+        }
+    }
+
+    fn mark_unhealthy(health: &crate::proxy::health::HealthRegistry, port: u16) {
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        for _ in 0..crate::proxy::health::FAILURE_THRESHOLD {
+            health.record_failure(addr);
+        }
+    }
+
+    #[test]
+    fn test_zero_weight_canary_with_unhealthy_primary_no_panic() {
+        // Regression: healthy_count > 0 but healthy_weight == 0 hit `% 0`,
+        // aborting the process. Weight-0 canary alive, primary down.
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "test.com",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![weighted(8001, 0), weighted(8002, 1)],
+            ),
+        );
+        let r = rt
+            .find_http_route("test.com", "GET", "/", &[], "", 0)
+            .unwrap();
+
+        let health = crate::proxy::health::HealthRegistry::new();
+        mark_unhealthy(&health, 8002);
+        let selector = BackendSelector::new();
+        assert_eq!(selector.select_healthy_weighted_backend(r, &health), None);
+    }
+
+    #[test]
+    fn test_single_backend_weight_and_health_respected() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "zero.com",
+            rule(PathMatchType::Prefix, "/", vec![weighted(8001, 0)]),
+        );
+        rt.add_http_route(
+            "one.com",
+            rule(PathMatchType::Prefix, "/", vec![weighted(8002, 1)]),
+        );
+        let health = crate::proxy::health::HealthRegistry::new();
+        let selector = BackendSelector::new();
+
+        let zero = rt
+            .find_http_route("zero.com", "GET", "/", &[], "", 0)
+            .unwrap();
+        assert_eq!(
+            selector.select_healthy_weighted_backend(zero, &health),
+            None
+        );
+
+        let one = rt
+            .find_http_route("one.com", "GET", "/", &[], "", 0)
+            .unwrap();
+        assert_eq!(
+            selector.select_healthy_weighted_backend(one, &health),
+            Some(0)
+        );
+        mark_unhealthy(&health, 8002);
+        assert_eq!(selector.select_healthy_weighted_backend(one, &health), None);
+    }
+
+    #[test]
+    fn test_all_zero_weight_backends_return_none() {
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "test.com",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![weighted(8001, 0), weighted(8002, 0)],
+            ),
+        );
+        let r = rt
+            .find_http_route("test.com", "GET", "/", &[], "", 0)
+            .unwrap();
+
+        let health = crate::proxy::health::HealthRegistry::new();
+        let selector = BackendSelector::new();
+        assert_eq!(selector.select_healthy_weighted_backend(r, &health), None);
+    }
+
+    #[test]
+    fn test_zero_weight_backend_skipped_on_slow_path() {
+        // Slow path (one unhealthy sibling): weight-0 backend must be skipped
+        // by the walk, not just by the fast-path prefix sums.
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "test.com",
+            rule(
+                PathMatchType::Prefix,
+                "/",
+                vec![weighted(8001, 0), weighted(8002, 1), weighted(8003, 1)],
+            ),
+        );
+        let r = rt
+            .find_http_route("test.com", "GET", "/", &[], "", 0)
+            .unwrap();
+
+        let health = crate::proxy::health::HealthRegistry::new();
+        mark_unhealthy(&health, 8003);
+        let selector = BackendSelector::new();
+        for _ in 0..10 {
+            assert_eq!(
+                selector.select_healthy_weighted_backend(r, &health),
+                Some(1)
+            );
+        }
+    }
+
     #[test]
     fn test_cumulative_weights_precomputed() {
         let mut rt = RouteTable::new();
@@ -1797,15 +1915,14 @@ impl BackendSelector {
 
     /// Health-aware weighted backend selection.
     ///
-    /// Returns `None` when all backends are unhealthy (caller should send 503).
+    /// Weight-0 backends receive no traffic (Gateway API semantics), matching
+    /// `select_l4_backend`. Returns `None` when no healthy backend with
+    /// positive weight exists (caller should send 503).
     ///
-    /// Three-branch logic:
-    /// - **All healthy** → fast path: reuse pre-computed `cumulative_weights` (zero overhead)
-    /// - **Some unhealthy** → slow path: filter + linear walk with manual weight sum
-    /// - **All unhealthy** → `None`
-    ///
-    /// The slow path is O(n) on backend count which is acceptable because
-    /// n is typically 2–5 and this path is only taken during partial failures.
+    /// Fast path: every positive-weight backend healthy, reuse pre-computed
+    /// `cumulative_weights` (a weight-0 backend's prefix sum equals its
+    /// predecessor's, so `partition_point` can never land on it).
+    /// Slow path: O(n) filter + walk, taken only during partial failures.
     pub fn select_healthy_weighted_backend(
         &self,
         rule: &HttpRouteRule,
@@ -1813,24 +1930,21 @@ impl BackendSelector {
     ) -> Option<usize> {
         let backends = &rule.backends;
 
-        if backends.is_empty() {
-            return None;
-        }
-
         if backends.len() == 1 {
-            return Some(0);
+            let b = &backends[0];
+            return (b.weight > 0 && health.is_healthy(&b.socket_addr)).then_some(0);
         }
 
         let mut healthy_weight: u64 = 0;
-        let mut healthy_count: usize = 0;
         for b in backends {
-            if health.is_healthy(&b.socket_addr) {
+            if b.weight > 0 && health.is_healthy(&b.socket_addr) {
                 healthy_weight += b.weight as u64;
-                healthy_count += 1;
             }
         }
 
-        if healthy_count == 0 {
+        // Covers empty, all-unhealthy, and all-weight-zero: modulo below must
+        // never see a zero divisor (panic = abort kills the data plane).
+        if healthy_weight == 0 {
             return None;
         }
 
@@ -1838,20 +1952,17 @@ impl BackendSelector {
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if healthy_count == backends.len() {
-            if rule.total_weight == 0 {
-                return Some(0);
-            }
+        if healthy_weight == rule.total_weight {
             let slot = counter % rule.total_weight;
             return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
         }
 
-        // Slow path — some backends are unhealthy
+        // Slow path — some positive-weight backends are unhealthy
         let slot = counter % healthy_weight;
 
         let mut cumulative: u64 = 0;
         for (i, b) in backends.iter().enumerate() {
-            if !health.is_healthy(&b.socket_addr) {
+            if b.weight == 0 || !health.is_healthy(&b.socket_addr) {
                 continue;
             }
             cumulative += b.weight as u64;
@@ -1860,9 +1971,10 @@ impl BackendSelector {
             }
         }
 
+        // Only reachable if health flipped between the sum and the walk.
         backends
             .iter()
-            .position(|b| health.is_healthy(&b.socket_addr))
+            .position(|b| b.weight > 0 && health.is_healthy(&b.socket_addr))
     }
 
     /// Simple round-robin (for equal-weight backends or non-HTTP routes)
