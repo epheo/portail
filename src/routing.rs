@@ -559,21 +559,37 @@ impl RouteTable {
 
     /// Resolve a TLS passthrough connection to a backend address.
     /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
-    /// back to port-based TCP routes.
+    /// back to port-based TCP routes. Selection is healthy weighted
+    /// round-robin, same as the L4 path; `None` also covers the
+    /// all-backends-unhealthy case (caller drops the connection).
     pub fn resolve_tls_passthrough(
         &self,
         sni: &str,
         server_port: u16,
+        selector: &BackendSelector,
+        health: &crate::proxy::health::HealthRegistry,
     ) -> Option<std::net::SocketAddr> {
         if let Some(backends) = self.tls_route_backends(sni, server_port) {
-            return backends.first().map(|b| b.socket_addr);
+            // Counter keyed per (port, SNI) so each route rotates
+            // independently; a collision only shares a counter.
+            let key = {
+                use std::hash::Hasher;
+                let mut h = fnv::FnvHasher::default();
+                h.write(sni.as_bytes());
+                h.write_u16(server_port);
+                h.finish()
+            };
+            return selector
+                .select_l4_backend(key, backends, health)
+                .map(|b| b.socket_addr);
         }
 
-        // Fall back to port-based TCP routes
-        self.tcp_routes
-            .get(&server_port)
-            .and_then(|backends| backends.first())
-            .map(|b| b.socket_addr)
+        // Fall back to port-based TCP routes, sharing the TCP path's counter.
+        self.tcp_routes.get(&server_port).and_then(|backends| {
+            selector
+                .select_l4_backend(server_port as u64, backends, health)
+                .map(|b| b.socket_addr)
+        })
     }
 
     /// Check if a TLS passthrough route exists for this SNI hostname on this
@@ -1520,19 +1536,25 @@ mod tests {
         assert_eq!(r.backends[0].socket_addr, "127.0.0.1:8002".parse().unwrap());
     }
 
+    fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketAddr> {
+        let selector = BackendSelector::new();
+        let health = crate::proxy::health::HealthRegistry::new();
+        rt.resolve_tls_passthrough(sni, port, &selector, &health)
+    }
+
     #[test]
     fn test_resolve_tls_passthrough_found() {
         let mut rt = RouteTable::new();
         rt.add_tcp_route(8443, vec![backend(9001)]);
 
-        let addr = rt.resolve_tls_passthrough("example.com", 8443);
+        let addr = resolve_pt(&rt, "example.com", 8443);
         assert_eq!(addr, Some("127.0.0.1:9001".parse().unwrap()));
     }
 
     #[test]
     fn test_resolve_tls_passthrough_no_route() {
         let rt = RouteTable::new();
-        assert!(rt.resolve_tls_passthrough("example.com", 8443).is_none());
+        assert!(resolve_pt(&rt, "example.com", 8443).is_none());
     }
 
     #[test]
@@ -1541,7 +1563,7 @@ mod tests {
         rt.add_tls_route(0, "secure.example.com", vec![backend(9001)]);
         rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
 
-        let addr = rt.resolve_tls_passthrough("secure.example.com", 8443);
+        let addr = resolve_pt(&rt, "secure.example.com", 8443);
         assert_eq!(addr, Some("127.0.0.1:9001".parse().unwrap()));
     }
 
@@ -1551,7 +1573,7 @@ mod tests {
         rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
         rt.add_tcp_route(8443, vec![backend(9999)]); // fallback
 
-        let addr = rt.resolve_tls_passthrough("foo.example.com", 8443);
+        let addr = resolve_pt(&rt, "foo.example.com", 8443);
         assert_eq!(addr, Some("127.0.0.1:9002".parse().unwrap()));
     }
 
@@ -1562,7 +1584,7 @@ mod tests {
         rt.add_tcp_route(8443, vec![backend(9999)]);
 
         // No SNI match -> falls back to TCP port route
-        let addr = rt.resolve_tls_passthrough("other.example.org", 8443);
+        let addr = resolve_pt(&rt, "other.example.org", 8443);
         assert_eq!(addr, Some("127.0.0.1:9999".parse().unwrap()));
     }
 
@@ -1577,13 +1599,13 @@ mod tests {
 
         assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
         assert_eq!(
-            rt.resolve_tls_passthrough("svc.example.com", 9443),
+            resolve_pt(&rt, "svc.example.com", 9443),
             Some("127.0.0.1:9001".parse().unwrap())
         );
 
         // Same SNI on a different port: no passthrough.
         assert!(!rt.has_tls_passthrough_route("svc.example.com", 443));
-        assert_eq!(rt.resolve_tls_passthrough("svc.example.com", 443), None);
+        assert_eq!(resolve_pt(&rt, "svc.example.com", 443), None);
     }
 
     /// Any-port (0) TLS routes still match every port — the file-config path.
@@ -1604,9 +1626,51 @@ mod tests {
         rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
         assert!(rt.has_tls_passthrough_route("a.b.example.com", 8443));
         assert_eq!(
-            rt.resolve_tls_passthrough("a.b.example.com", 8443),
+            resolve_pt(&rt, "a.b.example.com", 8443),
             Some("127.0.0.1:9002".parse().unwrap())
         );
+    }
+
+    /// Passthrough rotates across backends instead of pinning the first.
+    #[test]
+    fn test_tls_passthrough_round_robins_backends() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "svc.example.com", vec![backend(9001), backend(9002)]);
+
+        let selector = BackendSelector::new();
+        let health = crate::proxy::health::HealthRegistry::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            seen.insert(
+                rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+                    .unwrap()
+                    .port(),
+            );
+        }
+        assert_eq!(seen, [9001, 9002].into_iter().collect());
+    }
+
+    /// Passthrough fails over: an unhealthy backend gets no connections,
+    /// and with every backend down the connection is refused (None).
+    #[test]
+    fn test_tls_passthrough_skips_unhealthy_backend() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "svc.example.com", vec![backend(9001), backend(9002)]);
+
+        let selector = BackendSelector::new();
+        let health = crate::proxy::health::HealthRegistry::new();
+        mark_unhealthy(&health, 9001);
+        for _ in 0..4 {
+            let addr = rt
+                .resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+                .unwrap();
+            assert_eq!(addr.port(), 9002);
+        }
+
+        mark_unhealthy(&health, 9002);
+        assert!(rt
+            .resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            .is_none());
     }
 
     /// L4 selection honors backendRef weights: 3:1 over 400 picks gives

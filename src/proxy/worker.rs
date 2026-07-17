@@ -206,9 +206,10 @@ pub async fn run_worker(
 
                         if tls_passthrough && acceptor.is_none() {
                             // Pure passthrough mode (no TLS termination cert available)
+                            let selector = selector.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
-                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, cfg.client_header_timeout, cfg.connect_timeout).await;
+                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, cfg.client_header_timeout, cfg.connect_timeout).await;
                             });
                         } else if let Some(acceptor) = acceptor {
                             // TLS termination mode — but first check if this SNI
@@ -236,7 +237,7 @@ pub async fn run_worker(
                                 };
 
                                 if should_passthrough {
-                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, cfg.client_header_timeout, cfg.connect_timeout).await;
+                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, cfg.client_header_timeout, cfg.connect_timeout).await;
                                 } else {
                                     // Bound the handshake: a client that stalls
                                     // mid-handshake would otherwise pin this task
@@ -1523,6 +1524,7 @@ async fn handle_tls_passthrough(
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
+    selector: Arc<BackendSelector>,
     peek_timeout: Duration,
     connect_timeout: Duration,
 ) -> Result<()> {
@@ -1538,8 +1540,13 @@ async fn handle_tls_passthrough(
 
     let route_table = routes.load();
     let backend_addr = route_table
-        .resolve_tls_passthrough(&hostname, server_port)
-        .ok_or_else(|| anyhow::anyhow!("No TLS passthrough route for SNI '{}'", hostname))?;
+        .resolve_tls_passthrough(&hostname, server_port, &selector, &health)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "TLS passthrough: no route or no healthy backend for SNI '{}'",
+                hostname
+            )
+        })?;
 
     match tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await {
         Err(_) => {
