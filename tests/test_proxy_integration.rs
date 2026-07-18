@@ -1453,6 +1453,57 @@ fn test_refused_upgrade_stays_http() {
     );
 }
 
+#[test]
+fn test_latency_histograms_exposed_on_metrics() {
+    let backend = TestBackend::spawn("timed response");
+    let port = proxy_port(61);
+    let metrics_port = proxy_port(62);
+    let proxy =
+        PortailProcess::spawn_with_metrics(&[("localhost", "/", backend.addr)], port, metrics_port);
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    for _ in 0..3 {
+        let response = http_request(proxy.proxy_addr, request).expect("proxied request");
+        assert_eq!(extract_status(&response), Some(200));
+    }
+
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{}", metrics_port).parse().unwrap();
+    let scrape = http_request(
+        metrics_addr,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .expect("metrics scrape");
+    let text = String::from_utf8_lossy(&scrape);
+
+    for family in ["request_duration_seconds", "upstream_ttfb_seconds"] {
+        assert!(
+            text.contains(&format!("# TYPE portail_{} histogram", family)),
+            "missing histogram family {}",
+            family
+        );
+        let count: u64 = text
+            .lines()
+            .find(|l| l.starts_with(&format!("portail_{}_count ", family)))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no count line for {}", family));
+        assert!(count >= 3, "{} count {} < 3", family, count);
+        // A local echo round trip must land under the 1s bound; a sample
+        // there proves observe() ran with a sane clock, not just count.
+        let sub_second: u64 = text
+            .lines()
+            .find(|l| l.starts_with(&format!("portail_{}_bucket{{le=\"1\"}} ", family)))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            count >= 3 && sub_second >= 3,
+            "{} samples not sub-second",
+            family
+        );
+    }
+}
+
 /// Read one HTTP response: headers plus a Content-Length-framed body.
 fn read_complete_response(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut response = Vec::new();

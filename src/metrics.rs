@@ -3,8 +3,9 @@
 //! One static of relaxed `AtomicU64`s, rendered in Prometheus text exposition
 //! format by the admin endpoint (`GET /metrics`). No labels, no registry, no
 //! crates: a hot-path increment is a single relaxed atomic add, and a scrape
-//! is a few hundred bytes of formatting. Histograms are deliberately out of
-//! scope for now.
+//! is a few hundred bytes of formatting. Histograms are fixed-bucket atomic
+//! arrays: an observe is one clock read plus three relaxed adds; cumulation
+//! and float formatting happen only at scrape time.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -85,6 +86,106 @@ metrics! {
     backends_recovered_total: "Backend health recoveries (probe or passive)",
     reconcile_runs_total: "Gateway reconcile passes that ran the apply path",
     reconcile_skips_total: "Gateway reconcile passes short-circuited by the fingerprint gate",
+}
+
+// --- Latency histograms ----------------------------------------------------
+
+/// Bucket bounds shared by every histogram. Log-scale from 10us (a pooled
+/// local-backend hop) to 60s (past every default timeout: backendTimeout 30s,
+/// so a timed-out request lands in a finite bucket, not just +Inf). Nanos for
+/// the hot-path compare, the label strings precomputed for the scrape.
+const LE_NANOS: [u64; 21] = [
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_500_000_000,
+    5_000_000_000,
+    10_000_000_000,
+    30_000_000_000,
+    60_000_000_000,
+];
+const LE_LABELS: [&str; 21] = [
+    "0.00001", "0.000025", "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.0025", "0.005",
+    "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60",
+];
+
+/// Fixed-bucket latency histogram. Buckets store per-bucket (non-cumulative)
+/// counts; the Prometheus cumulative form is computed at scrape time so the
+/// hot path never touches more than one bucket. Samples above the last bound
+/// exist only in `count` (rendered as the +Inf bucket). Sum is kept in nanos:
+/// u64 overflows after ~584 years of accumulated latency.
+pub struct Histogram {
+    buckets: [AtomicU64; LE_NANOS.len()],
+    sum_nanos: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; LE_NANOS.len()],
+            sum_nanos: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn observe(&self, d: std::time::Duration) {
+        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        // Count before bucket: relaxed ordering gives a concurrent scrape no
+        // cross-variable guarantee, but keeping the count add first makes the
+        // common interleaving land the sample in +Inf rather than rendering a
+        // cumulative bucket above the count (render clamps the rest).
+        self.count.fetch_add(1, Relaxed);
+        self.sum_nanos.fetch_add(nanos, Relaxed);
+        if let Some(idx) = LE_NANOS.iter().position(|&le| nanos <= le) {
+            self.buckets[idx].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Request-headers-complete to response flushed to the client, for proxied
+/// HTTP requests. Upgrade tunnels are excluded: a WebSocket's lifetime is a
+/// connection duration, not a request latency, and one long tunnel would
+/// dominate the sum forever.
+pub static REQUEST_DURATION: Histogram = Histogram::new();
+
+/// Route match to backend response headers received: pool acquire, connect,
+/// request forward (including the client's body), and backend processing.
+pub static UPSTREAM_TTFB: Histogram = Histogram::new();
+
+fn render_histogram(out: &mut String, name: &str, help: &str, h: &Histogram) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP portail_{} {}", name, help);
+    let _ = writeln!(out, "# TYPE portail_{} histogram", name);
+    let mut cum = 0u64;
+    for (label, bucket) in LE_LABELS.iter().zip(&h.buckets) {
+        cum += bucket.load(Relaxed);
+        let _ = writeln!(out, "portail_{}_bucket{{le=\"{}\"}} {}", name, label, cum);
+    }
+    // Clamp: a scrape racing an observe can see a bucket add whose count add
+    // is not yet visible; +Inf (== count) must stay >= the last finite bucket.
+    let count = h.count.load(Relaxed).max(cum);
+    let _ = writeln!(out, "portail_{}_bucket{{le=\"+Inf\"}} {}", name, count);
+    let _ = writeln!(
+        out,
+        "portail_{}_sum {}",
+        name,
+        h.sum_nanos.load(Relaxed) as f64 / 1e9
+    );
+    let _ = writeln!(out, "portail_{}_count {}", name, count);
 }
 
 // --- Labeled counter families ---------------------------------------------
@@ -350,6 +451,18 @@ pub fn render(ready: bool) -> String {
         "Backend connects that timed out (client saw 504), by configured backend",
     );
     render_listeners(&mut out);
+    render_histogram(
+        &mut out,
+        "request_duration_seconds",
+        "Proxied HTTP request duration, headers-complete to response flushed (upgrade tunnels excluded)",
+        &REQUEST_DURATION,
+    );
+    render_histogram(
+        &mut out,
+        "upstream_ttfb_seconds",
+        "Route match to backend response headers received (pool acquire, connect, request forward, backend processing)",
+        &UPSTREAM_TTFB,
+    );
     let _ = write!(
         out,
         "# HELP portail_active_connections Client connections currently open\n\
@@ -392,6 +505,52 @@ mod tests {
             }
         }
         METRICS.active_connections.dec();
+    }
+
+    #[test]
+    fn histogram_buckets_cumulate_and_sum() {
+        use std::time::Duration;
+        let h = Histogram::new();
+        h.observe(Duration::from_micros(5)); // below first bound -> le=0.00001
+        h.observe(Duration::from_micros(300)); // -> le=0.0005
+        h.observe(Duration::from_millis(40)); // -> le=0.05
+        h.observe(Duration::from_secs(120)); // above last bound -> +Inf only
+
+        let mut out = String::new();
+        render_histogram(&mut out, "test_seconds", "help", &h);
+
+        assert!(out.contains("# TYPE portail_test_seconds histogram"));
+        assert!(out.contains("portail_test_seconds_bucket{le=\"0.00001\"} 1"));
+        // Cumulative: the 300us sample joins the 5us one at le=0.0005.
+        assert!(out.contains("portail_test_seconds_bucket{le=\"0.0005\"} 2"));
+        assert!(out.contains("portail_test_seconds_bucket{le=\"0.05\"} 3"));
+        assert!(out.contains("portail_test_seconds_bucket{le=\"60\"} 3"));
+        assert!(out.contains("portail_test_seconds_bucket{le=\"+Inf\"} 4"));
+        assert!(out.contains("portail_test_seconds_count 4"));
+        let sum: f64 = out
+            .lines()
+            .find(|l| l.starts_with("portail_test_seconds_sum "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!((sum - 120.040305).abs() < 1e-6, "sum was {sum}");
+        // Buckets never decrease and never exceed +Inf.
+        let mut prev = 0u64;
+        for line in out.lines().filter(|l| l.contains("_bucket")) {
+            let v: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+            assert!(v >= prev, "non-monotonic bucket line: {line}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn request_histograms_render_in_scrape() {
+        REQUEST_DURATION.observe(std::time::Duration::from_millis(2));
+        UPSTREAM_TTFB.observe(std::time::Duration::from_millis(1));
+        let text = render(true);
+        assert!(text.contains("# TYPE portail_request_duration_seconds histogram"));
+        assert!(text.contains("# TYPE portail_upstream_ttfb_seconds histogram"));
+        assert!(text.contains("portail_request_duration_seconds_bucket{le=\"+Inf\"}"));
     }
 
     #[test]
