@@ -71,6 +71,7 @@ macro_rules! metrics {
 }
 
 metrics! {
+    access_log_dropped_total: "Access log lines dropped because the writer lagged or its sink failed",
     connections_accepted_total: "Client connections accepted across all listeners",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
     upstream_connects_total: "Backend connections established",

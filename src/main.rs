@@ -140,6 +140,10 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
+    // Before listeners: a request must never race the writer task's spawn.
+    if let Some(target) = &args.access_log {
+        portail::access_log::init(target)?;
+    }
     let performance_config = portail_config.performance.clone();
     // Kubernetes mode binds nothing up front: every listener comes from a
     // reconciled Gateway. The default config's example :8080 listener is a

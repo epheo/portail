@@ -139,6 +139,11 @@ struct ConnectionState {
     /// Per-listener stats slot (shared with the accept loop) for per-port
     /// request/error accounting.
     listener_stats: Arc<ListenerStats>,
+    /// Status of the current request's response as written to the client,
+    /// recorded where each response is emitted (fail helpers included) so the
+    /// keepalive loop can access-log it without threading a value through
+    /// every early return. 0 = no response written yet.
+    last_status: u16,
 }
 
 /// Run an accept loop on a single listener, spawning a task per connection.
@@ -266,6 +271,7 @@ pub async fn run_worker(
                                                     cfg.idle_body_timeout,
                                                 ),
                                                 listener_stats: listener_stats.clone(),
+                                                last_status: 0,
                                             };
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
@@ -302,6 +308,7 @@ pub async fn run_worker(
                                 scratch_buf: Vec::with_capacity(1024),
                                 idle_body_timeout: idle_opt(cfg.idle_body_timeout),
                                 listener_stats: listener_stats.clone(),
+                                last_status: 0,
                             };
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -348,6 +355,15 @@ async fn handle_connection(
         // Loop top = this request's bytes are in buf (initial read or the
         // keepalive read at the bottom), so this stamps headers-complete.
         let request_started = std::time::Instant::now();
+        // Copied out now because the response phase reuses buf as scratch;
+        // None whenever access logging is off.
+        let access = crate::access_log::capture(
+            &buf[..n],
+            request_started,
+            state.peer_ip,
+            state.server_port,
+            state.is_tls,
+        );
         let route_table = state.routes.load();
         let result = analyze_request(
             &route_table,
@@ -384,12 +400,14 @@ async fn handle_connection(
                 // proxy_http_request owns all timing for the request lifecycle —
                 // backend_request_timeout (connect + TTFB) and request_timeout
                 // (total deadline) are applied phase-aware inside.
+                let backend_addr = backend.socket_addr;
                 let (ka, leftover) =
                     proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state)
                         .await?;
                 if !meta.is_upgrade {
                     crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                 }
+                crate::access_log::emit(access, state.last_status, Some(backend_addr));
                 if !ka || !meta.keepalive {
                     return Ok(());
                 }
@@ -401,6 +419,7 @@ async fn handle_connection(
                 keepalive,
             } => {
                 send_redirect_response(&mut client, status_code, &location).await?;
+                crate::access_log::emit(access, status_code, None);
                 if !keepalive {
                     return Ok(());
                 }
@@ -410,6 +429,7 @@ async fn handle_connection(
                 close_connection,
             } => {
                 send_error_response(&mut client, error_code).await?;
+                crate::access_log::emit(access, error_code, None);
                 if close_connection {
                     return Ok(());
                 }
@@ -507,6 +527,9 @@ async fn proxy_http_request(
             .map(|d| Instant::now() + d)
     };
     let backend_phase_start = Instant::now();
+    // Cleared per request so an Err exit can never surface the previous
+    // keepalive response's status to the access log.
+    state.last_status = 0;
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (mut backend, from_pool) =
@@ -611,8 +634,7 @@ async fn proxy_http_request(
                         backend_addr, e2
                     );
                     return fail_backend(
-                        &state.health,
-                        &state.listener_stats,
+                        state,
                         &backend_metric_label(backend_ref),
                         client,
                         backend_addr,
@@ -626,8 +648,7 @@ async fn proxy_http_request(
                         backend_addr
                     );
                     return fail_backend(
-                        &state.health,
-                        &state.listener_stats,
+                        state,
                         &backend_metric_label(backend_ref),
                         client,
                         backend_addr,
@@ -649,8 +670,7 @@ async fn proxy_http_request(
                     backend_addr, e2
                 );
                 return fail_backend(
-                    &state.health,
-                    &state.listener_stats,
+                    state,
                     &backend_metric_label(backend_ref),
                     client,
                     backend_addr,
@@ -701,6 +721,7 @@ async fn proxy_http_request(
                         "Request body relay to backend {} exceeded request timeout",
                         backend_addr
                     );
+                    state.last_status = 408;
                     send_error_response(client, 408).await?;
                     return Ok((false, None));
                 }
@@ -743,10 +764,14 @@ async fn proxy_http_request(
     )
     .await?
     {
-        Some(f) => f,
-        None => return Ok((false, None)),
+        HeaderPhase::Proxied(f) => f,
+        HeaderPhase::ErrorSent(code) => {
+            state.last_status = code;
+            return Ok((false, None));
+        }
     };
     crate::metrics::UPSTREAM_TTFB.observe(backend_phase_start.elapsed());
+    state.last_status = framing.status;
 
     // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
     // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP
@@ -890,8 +915,7 @@ fn backend_metric_label(backend: &crate::routing::Backend) -> String {
 /// — the client connection is not reusable. Centralizes the failure boilerplate
 /// the backend-send retry path would otherwise repeat per error arm.
 async fn fail_backend(
-    health: &Arc<HealthRegistry>,
-    stats: &ListenerStats,
+    state: &mut ConnectionState,
     backend_label: &str,
     client: &mut Connection,
     addr: std::net::SocketAddr,
@@ -900,20 +924,23 @@ async fn fail_backend(
     match code {
         504 => {
             crate::metrics::record_backend_connect_timeout(backend_label);
-            stats
+            state
+                .listener_stats
                 .upstream_connect_timeouts
                 .fetch_add(1, Ordering::Relaxed);
         }
         _ => {
             crate::metrics::record_backend_connect_error(backend_label);
-            stats
+            state
+                .listener_stats
                 .upstream_connect_errors
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
-    if health.record_failure(addr) {
-        HealthRegistry::spawn_probe(Arc::clone(health), addr);
+    if state.health.record_failure(addr) {
+        HealthRegistry::spawn_probe(Arc::clone(&state.health), addr);
     }
+    state.last_status = code;
     send_error_response(client, code).await?;
     Ok((false, None))
 }
@@ -961,6 +988,7 @@ async fn connect_to_backend(
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
             }
+            state.last_status = 502;
             send_error_response(client, 502).await?;
             Ok(None)
         }
@@ -974,6 +1002,7 @@ async fn connect_to_backend(
             if state.health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
             }
+            state.last_status = 504;
             send_error_response(client, 504).await?;
             Ok(None)
         }
@@ -1062,12 +1091,19 @@ async fn send_assembled_request(
     Ok(())
 }
 
+/// Outcome of the response-header phase: the framing to stream the body
+/// under, or the error status this helper already wrote to the client.
+enum HeaderPhase {
+    Proxied(ResponseFraming),
+    ErrorSent(u16),
+}
+
 /// Read response headers from the backend within `header_budget` and forward
 /// them to the client. This is the SAFE→UNSAFE transition: on entry no client
 /// bytes have been written and timeout → `504`; on success the client has the
 /// headers and the caller must use encoding-aware termination on later expiry.
 ///
-/// Returns `Ok(None)` when the caller should bail out (`return Ok(false)`).
+/// Returns `ErrorSent` when the caller should bail out (`return Ok(false)`).
 #[allow(clippy::too_many_arguments)]
 async fn forward_response_headers(
     client: &mut Connection,
@@ -1080,7 +1116,7 @@ async fn forward_response_headers(
     is_head_request: bool,
     expect_upgrade: bool,
     client_close: bool,
-) -> Result<Option<ResponseFraming>> {
+) -> Result<HeaderPhase> {
     let (resp_header_end, framing) = match tokio::time::timeout(
         header_budget,
         read_response_headers(backend, buf, header_buf, is_head_request, expect_upgrade),
@@ -1091,7 +1127,7 @@ async fn forward_response_headers(
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             send_error_response(client, 504).await?;
-            return Ok(None);
+            return Ok(HeaderPhase::ErrorSent(504));
         }
     };
 
@@ -1100,7 +1136,7 @@ async fn forward_response_headers(
     if framing.status == 101 && !expect_upgrade {
         warn!("Backend sent 101 without an upgrade request; rejecting");
         send_error_response(client, 502).await?;
-        return Ok(None);
+        return Ok(HeaderPhase::ErrorSent(502));
     }
 
     // SAFE → UNSAFE: first client write happens here.
@@ -1116,7 +1152,7 @@ async fn forward_response_headers(
     // Connection/Upgrade headers intact, and the connection leaves HTTP.
     if framing.status == 101 {
         client.write_all(&header_buf[..tail_end]).await?;
-        return Ok(Some(framing));
+        return Ok(HeaderPhase::Proxied(framing));
     }
 
     // Hop-by-hop response headers never reach the client (RFC 7230 §6.1);
@@ -1147,7 +1183,7 @@ async fn forward_response_headers(
     } else {
         client.write_all(scratch).await?;
     }
-    Ok(Some(framing))
+    Ok(HeaderPhase::Proxied(framing))
 }
 
 /// Extract response header modifications from rule + backend filters (zero-alloc borrows).

@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
+pub mod access_log;
 pub mod admin;
 pub mod config;
 pub mod config_watcher;

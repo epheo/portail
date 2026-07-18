@@ -489,6 +489,20 @@ impl PortailProcess {
         proc
     }
 
+    /// Spawn with `--access-log` writing to `log_path`.
+    pub fn spawn_with_access_log(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        log_path: &std::path::Path,
+    ) -> Self {
+        let config = build_test_config_with_tcp(routes, proxy_port, &[]);
+        Self::spawn_config_args(
+            config,
+            proxy_port,
+            &["--access-log", log_path.to_str().unwrap()],
+        )
+    }
+
     /// Spawn from a ready config string and wait for the proxy port.
     fn spawn_config(config: String, proxy_port: u16) -> Self {
         Self::spawn_config_args(config, proxy_port, &[])
