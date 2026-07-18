@@ -1454,6 +1454,73 @@ fn test_refused_upgrade_stays_http() {
 }
 
 #[test]
+fn test_access_log_lines_written() {
+    let backend = TestBackend::spawn("logged");
+    let port = proxy_port(63);
+    let log_file = tempfile::NamedTempFile::new().expect("temp log file");
+    let proxy = PortailProcess::spawn_with_access_log(
+        &[("localhost", "/", backend.addr)],
+        port,
+        log_file.path(),
+    );
+
+    let ok = http_request(
+        proxy.proxy_addr,
+        b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("proxied request");
+    assert_eq!(extract_status(&ok), Some(200));
+
+    // Unmatched host: the proxy answers this itself; the backend field is null.
+    let miss = http_request(
+        proxy.proxy_addr,
+        b"GET / HTTP/1.1\r\nHost: nosuch.example\r\nConnection: close\r\n\r\n",
+    )
+    .expect("unrouted request");
+    let miss_status = extract_status(&miss).expect("proxy-generated status");
+
+    // The writer flushes as soon as its queue drains; this loop only absorbs
+    // task scheduling delay, bounded hard at 5s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let content = loop {
+        let text = std::fs::read_to_string(log_file.path()).expect("read access log");
+        if text.lines().count() >= 2 {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "access log lines not written, got: {text:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    let first = content.lines().next().unwrap();
+    for field in [
+        "\"method\":\"GET\"".to_string(),
+        "\"path\":\"/hello\"".to_string(),
+        "\"host\":\"localhost\"".to_string(),
+        "\"status\":200".to_string(),
+        "\"tls\":false".to_string(),
+        "\"client\":\"127.0.0.1\"".to_string(),
+        format!("\"listener\":{}", port),
+        format!("\"backend\":\"{}\"", backend.addr),
+    ] {
+        assert!(first.contains(&field), "missing {field} in line: {first}");
+    }
+
+    let second = content.lines().nth(1).unwrap();
+    assert!(
+        second.contains(&format!("\"status\":{}", miss_status)),
+        "line: {second}"
+    );
+    assert!(second.contains("\"backend\":null"), "line: {second}");
+    assert!(
+        second.contains("\"host\":\"nosuch.example\""),
+        "line: {second}"
+    );
+}
+
+#[test]
 fn test_latency_histograms_exposed_on_metrics() {
     let backend = TestBackend::spawn("timed response");
     let port = proxy_port(61);

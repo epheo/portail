@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/epheo/portail"
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util", "io-std"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 dashmap = "6"
 socket2 = { version = "0.6.0", features = ["all"] }

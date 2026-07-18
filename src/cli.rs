@@ -94,6 +94,13 @@ pub struct Args {
     #[arg(help = "Serve /metrics + /readyz on this port in standalone mode (off by default)")]
     pub metrics_port: Option<u16>,
 
+    /// Opt-in structured access log: one JSON line per completed HTTP
+    /// response. A sink slower than the request rate sheds lines (counted in
+    /// portail_access_log_dropped_total) rather than slowing the data path.
+    #[arg(long, value_name = "PATH")]
+    #[arg(help = "Write a JSON access log line per HTTP response to PATH (\"-\" = stdout)")]
+    pub access_log: Option<String>,
+
     /// Restrict the K8s controller to a single Gateway (`namespace/name`).
     /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
     /// legacy unscoped mode that watches all Gateways cluster-wide.
@@ -197,6 +204,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_ok());
 
@@ -217,6 +225,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_ok());
 
@@ -239,6 +248,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_ok());
     }
@@ -262,6 +272,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_err());
 
@@ -282,6 +293,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_err());
     }
@@ -305,6 +317,7 @@ mod tests {
             metrics_port: None,
             gateway: None,
             watch_shape: None,
+            access_log: None,
         };
         assert!(args.validate().is_err());
     }

@@ -11,6 +11,7 @@
 | `--manage-gateway-status <BOOL>` | Manage Gateway lifecycle status (Accepted/Programmed/addresses). Set `false` under portail-operator, which owns those; portail then reports only listener and route status (default: `true`) |
 | `--readiness-port <PORT>` | Port for the `/livez` + `/readyz` + `/metrics` admin endpoint in Kubernetes mode (default: `19099`) |
 | `--metrics-port <PORT>` | Serve the same admin endpoint in standalone mode (off by default) |
+| `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
 | `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
 | `--validate-only` | Validate config file without starting the server (requires `--config`) |
 | `--check-config` | Parse and display config values, then exit (requires `--config`) |
@@ -47,6 +48,24 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   upgrade tunnels excluded) and `portail_upstream_ttfb_seconds` (route match
   to backend response headers: connect, request forward, backend
   processing). Buckets are fixed, 10us to 60s.
+
+## Access Logs
+
+`--access-log <PATH>` (`-` = stdout) writes one JSON line per completed HTTP
+response, in both Kubernetes and standalone mode:
+
+```json
+{"ts":1752822334.123,"client":"192.0.2.7","listener":443,"tls":true,"method":"GET","path":"/api","host":"api.example.com","status":200,"backend":"10.1.2.3:8080","duration_us":1234}
+```
+
+`host` is the request's Host header; `backend` is `null` for responses the
+proxy answered itself (redirects, direct errors); `duration_us` runs from
+headers-complete to the response leaving the proxy. Method, path, and host
+are attacker-controlled and JSON-escaped. The log never slows the data
+path: lines go to a dedicated writer through a bounded queue, and a sink
+slower than the request rate sheds lines, counted in
+`portail_access_log_dropped_total`. Requests aborted mid-response (client
+gone, backend died with headers already sent) produce no line.
 
 ## Performance Options
 
