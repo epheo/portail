@@ -324,7 +324,6 @@ async fn handle_connection(
     _peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
-    let _conn_start = std::time::Instant::now();
     client.set_nodelay(true)?;
 
     let mut buf = vec![0u8; 65536];
@@ -346,6 +345,9 @@ async fn handle_connection(
     let mut pending: Option<Vec<u8>> = None;
 
     loop {
+        // Loop top = this request's bytes are in buf (initial read or the
+        // keepalive read at the bottom), so this stamps headers-complete.
+        let request_started = std::time::Instant::now();
         let route_table = state.routes.load();
         let result = analyze_request(
             &route_table,
@@ -385,6 +387,9 @@ async fn handle_connection(
                 let (ka, leftover) =
                     proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state)
                         .await?;
+                if !meta.is_upgrade {
+                    crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
+                }
                 if !ka || !meta.keepalive {
                     return Ok(());
                 }
@@ -741,6 +746,7 @@ async fn proxy_http_request(
         Some(f) => f,
         None => return Ok((false, None)),
     };
+    crate::metrics::UPSTREAM_TTFB.observe(backend_phase_start.elapsed());
 
     // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
     // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP

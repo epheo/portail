@@ -41,8 +41,12 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   (connections, backend pool, DNS refresh, health transitions, reconciles),
   `portail_http_requests_total{host=...}` and
   `portail_upstream_connect_{errors,timeouts}_total{backend=...}` families,
-  and per-listener `portail_listener_*{proto=...,port=...}` series including
-  `portail_listener_up`.
+  per-listener `portail_listener_*{proto=...,port=...}` series including
+  `portail_listener_up`, and two latency histograms:
+  `portail_request_duration_seconds` (headers-complete to response flushed,
+  upgrade tunnels excluded) and `portail_upstream_ttfb_seconds` (route match
+  to backend response headers: connect, request forward, backend
+  processing). Buckets are fixed, 10us to 60s.
 
 ## Performance Options
 

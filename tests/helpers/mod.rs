@@ -462,8 +462,39 @@ impl PortailProcess {
         Self::spawn_config(config, proxy_port)
     }
 
+    /// Spawn with the standalone admin endpoint enabled on `metrics_port`.
+    /// The admin server is spawned after the listeners bind, so it gets its
+    /// own connect-wait: the proxy port being up does not imply /metrics is.
+    pub fn spawn_with_metrics(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        metrics_port: u16,
+    ) -> Self {
+        let config = build_test_config_with_tcp(routes, proxy_port, &[]);
+        let proc = Self::spawn_config_args(
+            config,
+            proxy_port,
+            &["--metrics-port", &metrics_port.to_string()],
+        );
+        let metrics_addr: SocketAddr = format!("127.0.0.1:{}", metrics_port).parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect_timeout(&metrics_addr, Duration::from_millis(100)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "admin endpoint on {} not up within 5s",
+                metrics_addr
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        proc
+    }
+
     /// Spawn from a ready config string and wait for the proxy port.
     fn spawn_config(config: String, proxy_port: u16) -> Self {
+        Self::spawn_config_args(config, proxy_port, &[])
+    }
+
+    fn spawn_config_args(config: String, proxy_port: u16, extra_args: &[&str]) -> Self {
         let config_file = tempfile::Builder::new()
             .suffix(".json")
             .tempfile()
@@ -475,6 +506,7 @@ impl PortailProcess {
             Command::new(&binary)
                 .arg("--config")
                 .arg(config_file.path())
+                .args(extra_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .pre_exec(|| {
