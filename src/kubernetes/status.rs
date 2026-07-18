@@ -450,28 +450,7 @@ where
         })
     }).collect();
 
-    // Preserve foreign entries: anything not written by this controller for
-    // this Gateway. Our own stale entries (e.g. a sectionName the route no
-    // longer attaches to) are dropped and replaced by `parent_entries`.
-    let ours = |entry: &serde_json::Value| -> bool {
-        let controller = entry.get("controllerName").and_then(|v| v.as_str());
-        let pref = entry.get("parentRef");
-        let name = pref.and_then(|p| p.get("name")).and_then(|v| v.as_str());
-        let ns = pref
-            .and_then(|p| p.get("namespace"))
-            .and_then(|v| v.as_str());
-        parents.iter().any(|p| {
-            controller == Some(p.controller_name.as_str())
-                && name == Some(p.gateway_name.as_str())
-                && ns == Some(p.gateway_namespace.as_str())
-        })
-    };
-    let merged_parents: Vec<serde_json::Value> = existing_parents_json
-        .iter()
-        .filter(|e| !ours(e))
-        .cloned()
-        .chain(parent_entries)
-        .collect();
+    let merged_parents = merge_parent_entries(existing_parents_json, parents, parent_entries);
 
     let status = serde_json::json!({
         "status": {
@@ -510,6 +489,35 @@ where
     }
 }
 
+/// Preserve foreign entries: anything not written by this controller for
+/// this Gateway. Our own stale entries (e.g. a sectionName the route no
+/// longer attaches to) are dropped and replaced by `new_entries`.
+fn merge_parent_entries(
+    existing: &[serde_json::Value],
+    parents: &[RouteParentStatus],
+    new_entries: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let ours = |entry: &serde_json::Value| -> bool {
+        let controller = entry.get("controllerName").and_then(|v| v.as_str());
+        let pref = entry.get("parentRef");
+        let name = pref.and_then(|p| p.get("name")).and_then(|v| v.as_str());
+        let ns = pref
+            .and_then(|p| p.get("namespace"))
+            .and_then(|v| v.as_str());
+        parents.iter().any(|p| {
+            controller == Some(p.controller_name.as_str())
+                && name == Some(p.gateway_name.as_str())
+                && ns == Some(p.gateway_namespace.as_str())
+        })
+    };
+    existing
+        .iter()
+        .filter(|e| !ours(e))
+        .cloned()
+        .chain(new_entries)
+        .collect()
+}
+
 /// Find existing conditions for a specific parent entry in the route status.
 /// Matches the full parentRef identity — two refs may differ only by port.
 fn find_existing_parent_conditions(
@@ -543,4 +551,187 @@ fn find_existing_parent_conditions(
         }
     }
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn kind_of(protocol: &str) -> Option<String> {
+        let kinds = supported_kinds_for_protocol(protocol);
+        kinds
+            .first()
+            .and_then(|k| k.get("kind"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    #[test]
+    fn supported_kinds_map_protocols_to_route_kinds() {
+        assert_eq!(kind_of("HTTP").as_deref(), Some("HTTPRoute"));
+        assert_eq!(kind_of("HTTPS").as_deref(), Some("HTTPRoute"));
+        assert_eq!(kind_of("TLS").as_deref(), Some("TLSRoute"));
+        assert_eq!(kind_of("TCP").as_deref(), Some("TCPRoute"));
+        assert_eq!(kind_of("UDP").as_deref(), Some("UDPRoute"));
+        assert!(supported_kinds_for_protocol("SCTP").is_empty());
+    }
+
+    fn typed_condition(type_: &str, status: &str, reason: &str, time: &str) -> Condition {
+        Condition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: reason.into(),
+            message: String::new(),
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                time.parse().unwrap(),
+            ),
+            observed_generation: None,
+        }
+    }
+
+    #[test]
+    fn transition_time_preserved_when_status_and_reason_unchanged() {
+        let old = "2020-01-01T00:00:00Z";
+        let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now());
+        let existing = vec![typed_condition("Accepted", "True", "Accepted", old)];
+
+        let kept = transition_time(&existing, "Accepted", "True", "Accepted", &now);
+        assert_eq!(kept.0.to_rfc3339(), "2020-01-01T00:00:00+00:00");
+
+        let flipped = transition_time(&existing, "Accepted", "False", "Invalid", &now);
+        assert_eq!(flipped.0, now.0);
+
+        let other_type = transition_time(&existing, "Programmed", "True", "Accepted", &now);
+        assert_eq!(other_type.0, now.0);
+    }
+
+    #[test]
+    fn condition_json_preserves_time_and_sets_generation() {
+        let existing = vec![json!({
+            "type": "Accepted",
+            "status": "True",
+            "reason": "Accepted",
+            "lastTransitionTime": "2020-01-01T00:00:00Z",
+        })];
+
+        let unchanged = condition_json(
+            "Accepted",
+            true,
+            "Accepted",
+            "ok",
+            &existing,
+            "2026-07-18T00:00:00Z",
+            Some(7),
+        );
+        assert_eq!(unchanged["lastTransitionTime"], "2020-01-01T00:00:00Z");
+        assert_eq!(unchanged["status"], "True");
+        assert_eq!(unchanged["observedGeneration"], 7);
+
+        // Same reason but flipped status is a real transition.
+        let flipped = condition_json(
+            "Accepted",
+            false,
+            "Accepted",
+            "broken",
+            &existing,
+            "2026-07-18T00:00:00Z",
+            Some(7),
+        );
+        assert_eq!(flipped["lastTransitionTime"], "2026-07-18T00:00:00Z");
+        assert_eq!(flipped["status"], "False");
+    }
+
+    fn parent_entry(
+        controller: &str,
+        gateway: &str,
+        section: Option<&str>,
+        port: Option<i32>,
+        cond_reason: &str,
+    ) -> serde_json::Value {
+        let mut pref = json!({
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "name": gateway,
+            "namespace": "default",
+        });
+        if let Some(s) = section {
+            pref["sectionName"] = json!(s);
+        }
+        if let Some(p) = port {
+            pref["port"] = json!(p);
+        }
+        json!({
+            "controllerName": controller,
+            "parentRef": pref,
+            "conditions": [{"type": "Accepted", "reason": cond_reason}],
+        })
+    }
+
+    #[test]
+    fn find_parent_conditions_matches_full_identity() {
+        let existing = vec![
+            parent_entry("c", "gw", Some("http"), None, "section-http"),
+            parent_entry("c", "gw", Some("tls"), None, "section-tls"),
+            parent_entry("c", "gw", None, Some(8080), "port-8080"),
+            parent_entry("c", "gw", None, Some(9090), "port-9090"),
+            parent_entry("c", "gw", None, None, "bare"),
+        ];
+
+        let by_section =
+            find_existing_parent_conditions(&existing, "gw", "default", Some("tls"), None);
+        assert_eq!(by_section[0]["reason"], "section-tls");
+
+        // Refs differing only by port must not share conditions.
+        let by_port = find_existing_parent_conditions(&existing, "gw", "default", None, Some(9090));
+        assert_eq!(by_port[0]["reason"], "port-9090");
+
+        let bare = find_existing_parent_conditions(&existing, "gw", "default", None, None);
+        assert_eq!(bare[0]["reason"], "bare");
+
+        let missing = find_existing_parent_conditions(&existing, "other-gw", "default", None, None);
+        assert!(missing.is_empty());
+    }
+
+    fn rps(controller: &str, gateway: &str, section: Option<&str>) -> RouteParentStatus {
+        RouteParentStatus {
+            controller_name: controller.into(),
+            gateway_name: gateway.into(),
+            gateway_namespace: "default".into(),
+            section_name: section.map(String::from),
+            port: None,
+            accepted: true,
+            accepted_reason: "Accepted".into(),
+            message: String::new(),
+            refs_resolved: true,
+            refs_reason: "ResolvedRefs".into(),
+            refs_message: String::new(),
+            programmed: true,
+            generation: None,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_foreign_entries_and_replaces_ours() {
+        let existing = vec![
+            parent_entry("other-controller", "gw", None, None, "foreign-controller"),
+            parent_entry("portail", "other-gw", None, None, "foreign-gateway"),
+            parent_entry("portail", "gw", Some("stale-section"), None, "stale"),
+        ];
+        let parents = vec![rps("portail", "gw", Some("http"))];
+        let new_entries = vec![parent_entry("portail", "gw", Some("http"), None, "fresh")];
+
+        let merged = merge_parent_entries(&existing, &parents, new_entries);
+
+        let reasons: Vec<&str> = merged
+            .iter()
+            .map(|e| e["conditions"][0]["reason"].as_str().unwrap())
+            .collect();
+        // Foreign controller and foreign Gateway survive; our stale
+        // sectionName entry is replaced wholesale by the fresh one.
+        assert_eq!(
+            reasons,
+            vec!["foreign-controller", "foreign-gateway", "fresh"]
+        );
+    }
 }
