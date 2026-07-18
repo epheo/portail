@@ -48,8 +48,13 @@ jobs:
           # On push to main: store the new baseline. On PRs: compare only.
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
-          # Flag any bench that regresses past 1.5x its baseline.
-          alert-threshold: '150%'
+          # Flag any bench that regresses past 2x its baseline. The gate
+          # exists to catch order-of-magnitude mistakes (an alloc or O(n)
+          # slipped into the hot path), and 2x is the observed cross-runner
+          # spread: a docs-only PR measured a uniform 1.5-1.6x on every
+          # suite purely from baseline-vs-PR runner hardware, and the
+          # 1-2 ns benches quantize to a 2.0 ratio from rounding alone.
+          alert-threshold: '200%'
           comment-on-alert: true
           fail-on-alert: ${{ github.event_name == 'pull_request' }}
           summary-always: true
