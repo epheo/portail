@@ -80,6 +80,17 @@ cargo build --release
 podman build -t ghcr.io/epheo/portail:latest -f Containerfile .
 ```
 
+## Probes and Metrics
+
+In Kubernetes mode portail serves a plain-HTTP admin endpoint on
+`--readiness-port` (default `19099`): `/livez` answers "should this process
+be restarted" and is `200` once the process is up; `/readyz` turns `200`
+only when the data plane has bound its listener ports; `/metrics` is
+Prometheus text format. Point `readinessProbe` at `/readyz` and
+`livenessProbe` at `/livez`, always via the pod IP — probing through a
+Gateway VIP has no delivery guarantee to this pod and turns a neighbor's
+outage into your restart loop.
+
 ## Verifying
 
 ```bash
