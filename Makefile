@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration bench fmt clippy conformance
+.PHONY: build test test-all test-integration bench bench-baseline bench-check fmt clippy conformance
 
 build:
 	cargo build --release
@@ -14,6 +14,15 @@ test-integration:
 
 bench:
 	cargo bench
+
+# Record this machine's micro-bench baseline (owned hardware only).
+bench-baseline:
+	scripts/bench-gate.sh baseline
+
+# Enforcing perf gate: fails past 1.15x the local baseline. CI's
+# shared-runner bench is advisory; this is the gate that counts.
+bench-check:
+	scripts/bench-gate.sh check
 
 fmt:
 	cargo fmt

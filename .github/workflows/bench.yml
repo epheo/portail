@@ -1,12 +1,17 @@
 name: Bench
 
-# Gate PRs on CPU micro-benchmark regressions in the parse/route hot path.
+# ADVISORY micro-benchmark tracking — this workflow never blocks a PR.
 #
-# Only the deterministic, in-process criterion benches run here — they are stable
-# enough on shared GitHub runners to compare run-to-run. The real-socket
-# throughput bench (benches/proxy_throughput.rs) is deliberately NOT run in CI:
-# it spawns processes, needs the `kiss` backend, and its req/s figure is too
-# noisy on shared runners to gate on. Run that one locally for absolute numbers:
+# Shared GitHub runners cannot gate perf: a docs-only PR measured a uniform
+# 1.5-1.6x on every suite purely from baseline-vs-PR runner hardware. The
+# enforcing gate runs locally on owned hardware with a strict threshold:
+#   make bench-baseline   # once per machine
+#   make bench-check      # fails past 1.15x the local baseline
+# (Moving CI itself to owned runners may re-enable blocking here later.)
+#
+# The real-socket throughput bench (benches/proxy_throughput.rs) is likewise
+# local-only: it spawns processes, needs the `kiss` backend, and its req/s
+# figure means nothing on borrowed hardware:
 #   cargo build --release && cargo bench --bench proxy_throughput
 
 on:
@@ -48,13 +53,9 @@ jobs:
           # On push to main: store the new baseline. On PRs: compare only.
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
-          # Flag any bench that regresses past 2x its baseline. The gate
-          # exists to catch order-of-magnitude mistakes (an alloc or O(n)
-          # slipped into the hot path), and 2x is the observed cross-runner
-          # spread: a docs-only PR measured a uniform 1.5-1.6x on every
-          # suite purely from baseline-vs-PR runner hardware, and the
-          # 1-2 ns benches quantize to a 2.0 ratio from rounding alone.
-          alert-threshold: '200%'
+          # Alert comments only — cross-runner variance makes any threshold
+          # here noise-bound; the enforcing gate is `make bench-check`.
+          alert-threshold: '150%'
           comment-on-alert: true
-          fail-on-alert: ${{ github.event_name == 'pull_request' }}
+          fail-on-alert: false
           summary-always: true
