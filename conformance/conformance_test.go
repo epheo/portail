@@ -24,7 +24,7 @@ const (
 	clusterName       = "portail"
 	gatewayAPIVersion = "v1.4.1"
 	// Kept current by the release workflow's version-sync step.
-	portailVersion = "v0.1.19"
+	portailVersion = "v0.1.20"
 	portailImage   = "ghcr.io/epheo/portail:latest"
 	operatorImage  = "quay.io/epheo/portail-operator:latest"
 )
