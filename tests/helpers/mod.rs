@@ -11,6 +11,22 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// Piped child output must be drained or a full pipe (64 KiB) blocks the
+/// process: a tokio worker stuck in write(2) on stderr wedged the h2 e2e
+/// tests, because the h2 crate's per-frame debug traces outgrow the buffer.
+fn drain_child_pipes(child: &mut Child) {
+    if let Some(mut out) = child.stdout.take() {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+        });
+    }
+    if let Some(mut err) = child.stderr.take() {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut err, &mut std::io::sink());
+        });
+    }
+}
+
 /// Minimal TCP backend that accepts connections and writes canned HTTP responses.
 pub struct TestBackend {
     pub addr: SocketAddr,
@@ -346,6 +362,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
+        drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -414,7 +431,7 @@ impl PortailProcess {
         std::fs::write(config_file.path(), config).expect("write temp config");
 
         let binary = cargo_bin_path();
-        let child = unsafe {
+        let mut child = unsafe {
             Command::new(&binary)
                 .arg("--config")
                 .arg(config_file.path())
@@ -427,6 +444,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
+        drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -530,6 +548,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
+        drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -564,6 +583,16 @@ impl PortailProcess {
         certs: &[(&str, &str, &[u8], &[u8])],
         routes: &[(&str, SocketAddr)],
         proxy_port: u16,
+    ) -> Self {
+        Self::spawn_with_tls_args(certs, routes, proxy_port, &[])
+    }
+
+    /// [`spawn_with_tls`] plus extra CLI args (e.g. `--http2`).
+    pub fn spawn_with_tls_args(
+        certs: &[(&str, &str, &[u8], &[u8])],
+        routes: &[(&str, SocketAddr)],
+        proxy_port: u16,
+        extra_args: &[&str],
     ) -> Self {
         let cert_dir = tempfile::tempdir().expect("create cert dir");
         for (name, _, cert_pem, key_pem) in certs {
@@ -628,6 +657,7 @@ impl PortailProcess {
                 .arg(config_file.path())
                 .arg("--cert-dir")
                 .arg(cert_dir.path())
+                .args(extra_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .pre_exec(|| {
@@ -637,6 +667,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
+        drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
