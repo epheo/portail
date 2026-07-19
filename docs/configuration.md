@@ -12,6 +12,7 @@
 | `--readiness-port <PORT>` | Port for the `/livez` + `/readyz` + `/metrics` admin endpoint in Kubernetes mode (default: `19099`) |
 | `--metrics-port <PORT>` | Serve the same admin endpoint in standalone mode (off by default) |
 | `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
+| `--http2` | Enable HTTP/2 on TLS-terminate listeners (off by default; see HTTP/2 section) |
 | `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
 | `--validate-only` | Validate config file without starting the server (requires `--config`) |
 | `--check-config` | Parse and display config values, then exit (requires `--config`) |
@@ -81,8 +82,33 @@ values; defaults shown):
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions |
 | `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window) |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
+| `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
 
 In Kubernetes mode these are not read from a file; the defaults apply.
+
+## HTTP/2
+
+Opt-in via `--http2` (Kubernetes mode) or `performance.http2: true`
+(standalone). When enabled, TLS-terminate listeners advertise `h2` ahead of
+`http/1.1` via ALPN; the client's negotiation picks the protocol, so h1 and
+h2 clients share the same port. Plain-HTTP and passthrough listeners are
+unaffected, and with the flag off the data path is byte-for-byte unchanged.
+
+Each h2 stream is bridged through the same HTTP/1.1 engine that serves h1
+clients — routing, filters, timeouts, backend pooling, metrics, and access
+logs behave identically. The bridge costs one in-memory hop per direction,
+paid only by h2 connections. Negotiation volume is visible in
+`portail_http2_connections_total`.
+
+Limits to know about:
+
+- Trailers do not survive the bridge, so gRPC cannot ride it; GRPCRoute
+  support requires the future native h2 path.
+- Each h2 stream is its own engine exchange. With the default
+  `backendPoolScope: connection` there is no backend reuse across streams;
+  set `backendPoolScope: process` alongside `http2` for backend keepalive.
+- WebSocket/CONNECT streams are refused over h2; h2-capable browsers fall
+  back to HTTP/1.1 for WebSocket automatically.
 
 ## Custom Controller Name
 

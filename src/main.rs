@@ -144,7 +144,11 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     if let Some(target) = &args.access_log {
         portail::access_log::init(target)?;
     }
-    let performance_config = portail_config.performance.clone();
+    let mut performance_config = portail_config.performance.clone();
+    // Either source enables h2; the flag is the K8s-mode path (no config file).
+    if args.http2 {
+        performance_config.http2 = true;
+    }
     // Kubernetes mode binds nothing up front: every listener comes from a
     // reconciled Gateway. The default config's example :8080 listener is a
     // standalone-only convenience — binding it here made k8s-mode startup

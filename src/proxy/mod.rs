@@ -6,6 +6,7 @@
 pub mod backend_pool;
 pub mod chunked;
 pub mod data_plane;
+pub(crate) mod h2_bridge;
 pub mod health;
 pub mod http_filters;
 pub mod http_parser;

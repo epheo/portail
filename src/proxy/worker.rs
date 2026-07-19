@@ -70,6 +70,9 @@ pub struct WorkerConfig {
     /// Per-step progress budget on body streaming (see
     /// [`crate::config::PerformanceConfig::idle_body_timeout`]); zero disables.
     pub idle_body_timeout: Duration,
+    /// Advertise h2 via ALPN on TLS-terminate listeners and bridge h2
+    /// streams through this engine (see `h2_bridge`). Off by default.
+    pub http2: bool,
 }
 
 /// Probe cadence once `tcp_keepalive_time` idle has elapsed: a peer that
@@ -114,7 +117,7 @@ impl Drop for ConnGuard {
     }
 }
 
-struct ConnectionState {
+pub(crate) struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: PoolHandle,
@@ -148,7 +151,7 @@ struct ConnectionState {
 
 impl ConnectionState {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         server_port: u16,
         routes: Arc<ArcSwap<RouteTable>>,
         pool: PoolHandle,
@@ -181,7 +184,7 @@ impl ConnectionState {
 /// Pool handle for one client connection: the process-wide shared pool when
 /// `performance.backendPoolScope: process` is set, else a fresh
 /// per-connection pool (the default).
-fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerConfig) -> PoolHandle {
+pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerConfig) -> PoolHandle {
     match shared {
         Some(p) => PoolHandle::Shared(p.clone()),
         None => PoolHandle::PerConn(BackendPool::new(
@@ -256,7 +259,7 @@ pub async fn run_worker(
                             // This handles the case where both HTTPS/Terminate and
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
-                            let pool = make_pool(&shared_pool, &cfg);
+                            let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -288,11 +291,36 @@ pub async fn run_worker(
                                     .await
                                     {
                                         Ok(Ok(tls_stream)) => {
+                                            // ALPN decided the protocol during the
+                                            // handshake; h2 goes to the bridge, all
+                                            // else stays on the h1 path.
+                                            if cfg.http2
+                                                && tls_stream.get_ref().1.alpn_protocol()
+                                                    == Some(b"h2".as_ref())
+                                            {
+                                                METRICS.http2_connections_total.inc();
+                                                crate::proxy::h2_bridge::serve(
+                                                    tls_stream,
+                                                    crate::proxy::h2_bridge::H2Ctx {
+                                                        server_port,
+                                                        routes,
+                                                        selector,
+                                                        health,
+                                                        shared_pool,
+                                                        cfg,
+                                                        listener_stats: listener_stats
+                                                            .clone(),
+                                                        peer,
+                                                    },
+                                                )
+                                                .await;
+                                                return;
+                                            }
                                             let conn = Connection::Tls { inner: tls_stream };
                                             let state = ConnectionState::new(
                                                 server_port,
                                                 routes,
-                                                pool,
+                                                make_pool(&shared_pool, &cfg),
                                                 selector,
                                                 health,
                                                 true,
@@ -347,7 +375,7 @@ pub async fn run_worker(
     }
 }
 
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     mut client: Connection,
     _peer: SocketAddr,
     mut state: ConnectionState,
@@ -1744,13 +1772,13 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
 
 // --- HTTP response parsing helpers ---
 
-fn parse_content_length(headers: &[u8]) -> Option<usize> {
+pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
     crate::routing::find_header_value(headers, "content-length")?
         .parse()
         .ok()
 }
 
-fn is_chunked_transfer(headers: &[u8]) -> bool {
+pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
     crate::routing::find_header_value(headers, "transfer-encoding")
         .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
 }
@@ -1774,7 +1802,7 @@ fn response_wants_close(headers: &[u8]) -> bool {
 
 /// Parse the 3-digit status code from a response status line
 /// ("HTTP/1.1 200 ..."). Returns 0 when unparseable.
-fn parse_response_status(headers: &[u8]) -> u16 {
+pub(crate) fn parse_response_status(headers: &[u8]) -> u16 {
     if headers.len() < 12 {
         return 0;
     }
