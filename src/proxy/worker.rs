@@ -146,6 +146,51 @@ struct ConnectionState {
     last_status: u16,
 }
 
+impl ConnectionState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        server_port: u16,
+        routes: Arc<ArcSwap<RouteTable>>,
+        pool: PoolHandle,
+        selector: Arc<BackendSelector>,
+        health: Arc<HealthRegistry>,
+        is_tls: bool,
+        peer_ip: std::net::IpAddr,
+        cfg: &WorkerConfig,
+        listener_stats: Arc<ListenerStats>,
+    ) -> Self {
+        Self {
+            server_port,
+            routes,
+            pool,
+            selector,
+            health,
+            is_tls,
+            peer_ip,
+            client_header_timeout: cfg.client_header_timeout,
+            connect_timeout: cfg.connect_timeout,
+            header_buf: Vec::with_capacity(1024),
+            scratch_buf: Vec::with_capacity(1024),
+            idle_body_timeout: idle_opt(cfg.idle_body_timeout),
+            listener_stats,
+            last_status: 0,
+        }
+    }
+}
+
+/// Pool handle for one client connection: the process-wide shared pool when
+/// `performance.backendPoolScope: process` is set, else a fresh
+/// per-connection pool (the default).
+fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerConfig) -> PoolHandle {
+    match shared {
+        Some(p) => PoolHandle::Shared(p.clone()),
+        None => PoolHandle::PerConn(BackendPool::new(
+            cfg.max_idle_per_backend,
+            cfg.connect_timeout,
+        )),
+    }
+}
+
 /// Run an accept loop on a single listener, spawning a task per connection.
 pub async fn run_worker(
     listener: TcpListener,
@@ -167,17 +212,6 @@ pub async fn run_worker(
 
     // Selector is shared across all listeners so weighted round-robin counters
     // produce the correct distribution globally.
-
-    // Per-connection pool handle: the process-wide shared pool when
-    // `performance.backendPoolScope: process` is set, else a fresh
-    // per-connection pool (the default).
-    let make_pool = move |shared: &Option<Arc<SharedBackendPool>>| match shared {
-        Some(p) => PoolHandle::Shared(p.clone()),
-        None => PoolHandle::PerConn(BackendPool::new(
-            cfg.max_idle_per_backend,
-            cfg.connect_timeout,
-        )),
-    };
 
     // Dead-peer detection: a client that vanishes without FIN/RST would
     // otherwise park its connection task forever, since the idle wait
@@ -222,7 +256,7 @@ pub async fn run_worker(
                             // This handles the case where both HTTPS/Terminate and
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
-                            let pool = make_pool(&shared_pool);
+                            let pool = make_pool(&shared_pool, &cfg);
                             let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -255,24 +289,17 @@ pub async fn run_worker(
                                     {
                                         Ok(Ok(tls_stream)) => {
                                             let conn = Connection::Tls { inner: tls_stream };
-                                            let state = ConnectionState {
+                                            let state = ConnectionState::new(
                                                 server_port,
                                                 routes,
                                                 pool,
                                                 selector,
                                                 health,
-                                                is_tls: true,
-                                                peer_ip: peer.ip(),
-                                                client_header_timeout: cfg.client_header_timeout,
-                                                connect_timeout: cfg.connect_timeout,
-                                                header_buf: Vec::with_capacity(1024),
-                                                scratch_buf: Vec::with_capacity(1024),
-                                                idle_body_timeout: idle_opt(
-                                                    cfg.idle_body_timeout,
-                                                ),
-                                                listener_stats: listener_stats.clone(),
-                                                last_status: 0,
-                                            };
+                                                true,
+                                                peer.ip(),
+                                                &cfg,
+                                                listener_stats.clone(),
+                                            );
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
                                         Ok(Err(_e)) => {
@@ -293,23 +320,17 @@ pub async fn run_worker(
                                 }
                             });
                         } else {
-                            let selector = selector.clone();
-                            let state = ConnectionState {
+                            let state = ConnectionState::new(
                                 server_port,
                                 routes,
-                                pool: make_pool(&shared_pool),
-                                selector,
+                                make_pool(&shared_pool, &cfg),
+                                selector.clone(),
                                 health,
-                                is_tls: false,
-                                peer_ip: peer.ip(),
-                                client_header_timeout: cfg.client_header_timeout,
-                                connect_timeout: cfg.connect_timeout,
-                                header_buf: Vec::with_capacity(1024),
-                                scratch_buf: Vec::with_capacity(1024),
-                                idle_body_timeout: idle_opt(cfg.idle_body_timeout),
-                                listener_stats: listener_stats.clone(),
-                                last_status: 0,
-                            };
+                                false,
+                                peer.ip(),
+                                &cfg,
+                                listener_stats.clone(),
+                            );
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
                                 let conn = Connection::Plain { inner: tcp_stream };
