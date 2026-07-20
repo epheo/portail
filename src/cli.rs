@@ -10,127 +10,117 @@ use std::path::PathBuf;
     long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying."
 )]
 pub struct Args {
-    /// Configuration file path (JSON or YAML format)
+    /// Specify configuration file path (supports .json, .yaml, .yml extensions)
     #[arg(short, long, value_name = "FILE")]
-    #[arg(help = "Specify configuration file path (supports .json, .yaml, .yml extensions)")]
     pub config: Option<PathBuf>,
 
-    /// Validate configuration file without starting the server
+    /// Parse and validate configuration file, then exit
     #[arg(long)]
-    #[arg(help = "Parse and validate configuration file, then exit")]
     #[arg(conflicts_with_all = ["check_config"])]
     pub validate_only: bool,
 
-    /// Parse and display configuration values, then exit
+    /// Parse configuration file, display values in human-readable format, then exit
     #[arg(long)]
-    #[arg(help = "Parse configuration file, display values in human-readable format, then exit")]
     #[arg(conflicts_with_all = ["validate_only"])]
     pub check_config: bool,
 
-    /// Enable verbose logging
+    /// Enable verbose logging output
     #[arg(short, long)]
-    #[arg(help = "Enable verbose logging output")]
     #[arg(action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// Show example configuration file locations
+    /// Display paths to example configuration files and exit
     #[arg(long)]
-    #[arg(help = "Display paths to example configuration files and exit")]
     pub example_config: bool,
 
     /// Generate example configuration file
     #[arg(long, value_name = "TYPE")]
-    #[arg(help = "Generate example configuration file (minimal, development)")]
-    #[arg(value_parser = ["minimal", "development"])]
+    #[arg(value_parser = clap::builder::PossibleValuesParser::new(
+        portail::config::examples::EXAMPLES.iter().map(|(name, _, _)| *name)
+    ))]
     pub generate_config: Option<String>,
 
-    /// Output file for generated configuration
+    /// Output file path for generated configuration (stdout if not specified)
     #[arg(long, value_name = "FILE")]
-    #[arg(help = "Output file path for generated configuration (stdout if not specified)")]
     #[arg(requires = "generate_config")]
     pub output: Option<PathBuf>,
 
-    /// Directory containing TLS certificate files ({name}.crt / {name}.key)
+    /// Directory for TLS certificate files ({name}.crt / {name}.key pairs)
     #[arg(long, value_name = "DIR")]
-    #[arg(help = "Directory for TLS certificate files (default: /etc/portail/certs)")]
     pub cert_dir: Option<PathBuf>,
 
-    /// Run as Kubernetes Gateway API controller
+    /// Watch Kubernetes Gateway API resources instead of loading a config file
     #[arg(long)]
-    #[arg(help = "Watch Kubernetes Gateway API resources instead of loading a config file")]
     pub kubernetes: bool,
 
-    /// Controller name for GatewayClass matching
+    /// Controller name to match against GatewayClass spec.controllerName
     #[arg(long, default_value = "portail.epheo.eu/gateway-controller")]
-    #[arg(help = "Controller name to match against GatewayClass spec.controllerName")]
     pub controller_name: String,
 
-    /// Print supported Gateway API features as a comma-separated list and exit
+    /// Print supported features (for conformance test integration) and exit
     #[arg(long)]
-    #[arg(help = "Print supported features (for conformance test integration) and exit")]
     pub supported_features: bool,
 
-    /// Whether portail manages Gateway/GatewayClass lifecycle status
-    /// (Accepted/Programmed/addresses). Set false when running under
+    /// Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)
+    ///
+    /// Covers Accepted/Programmed/addresses. Set false when running under
     /// portail-operator, which owns that status; portail then only reports
     /// per-listener status and route status.
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-    #[arg(
-        help = "Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)"
-    )]
     pub manage_gateway_status: bool,
 
-    /// Port for the admin endpoint (/readyz + /metrics) served in Kubernetes
-    /// mode. Default 19099: in the conventional proxy-management range, well
-    /// clear of common Gateway listener ports (80, 443, 8080, 8081, 8443, …)
-    /// so it does not collide with the data plane within the same pod.
+    /// Port for the /readyz + /metrics admin endpoint (Kubernetes mode)
+    ///
+    /// Default 19099: in the conventional proxy-management range, well clear
+    /// of common Gateway listener ports (80, 443, 8080, 8081, 8443, ...) so
+    /// it does not collide with the data plane within the same pod.
     #[arg(long, default_value_t = 19099)]
-    #[arg(help = "Port for the /readyz + /metrics admin endpoint (Kubernetes mode)")]
     pub readiness_port: u16,
 
-    /// Opt-in admin endpoint (/readyz + /metrics) in standalone mode, where no
-    /// readinessProbe needs one. Readiness reports ready once listeners are up.
+    /// Serve /metrics + /readyz on this port in standalone mode (off by default)
+    ///
+    /// Opt-in because standalone mode has no readinessProbe needing one.
+    /// Readiness reports ready once listeners are up.
     #[arg(long, value_name = "PORT")]
-    #[arg(help = "Serve /metrics + /readyz on this port in standalone mode (off by default)")]
     pub metrics_port: Option<u16>,
 
-    /// Opt-in structured access log: one JSON line per completed HTTP
-    /// response. A sink slower than the request rate sheds lines (counted in
+    /// Write a JSON access log line per HTTP response to PATH ("-" = stdout)
+    ///
+    /// A sink slower than the request rate sheds lines (counted in
     /// portail_access_log_dropped_total) rather than slowing the data path.
     #[arg(long, value_name = "PATH")]
-    #[arg(help = "Write a JSON access log line per HTTP response to PATH (\"-\" = stdout)")]
     pub access_log: Option<String>,
 
-    /// Opt-in HTTP/2 front end: TLS-terminate listeners advertise h2 via
-    /// ALPN and bridge each stream through the HTTP/1.1 engine. Equivalent
-    /// to `performance.http2: true`; the flag is the Kubernetes-mode path,
+    /// Enable HTTP/2 on TLS-terminate listeners (ALPN h2 + http/1.1)
+    ///
+    /// Opt-in front end: TLS-terminate listeners advertise h2 via ALPN and
+    /// bridge each stream through the HTTP/1.1 engine. Equivalent to
+    /// `performance.http2: true`; the flag is the Kubernetes-mode path,
     /// where no config file exists.
     #[arg(long)]
-    #[arg(help = "Enable HTTP/2 on TLS-terminate listeners (ALPN h2 + http/1.1)")]
     pub http2: bool,
 
-    /// Restrict the K8s controller to a single Gateway (`namespace/name`).
+    /// Restrict to a single Gateway (format: namespace/name); operator sets this
+    ///
     /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
     /// legacy unscoped mode that watches all Gateways cluster-wide.
     #[arg(long, value_name = "NS/NAME")]
-    #[arg(help = "Restrict to a single Gateway (format: namespace/name); operator sets this")]
     pub gateway: Option<String>,
 
-    /// Operator-supplied watch shape: which *gate-able* secondary resources this
-    /// single-Gateway data plane needs to watch, so it does not open cluster-wide
-    /// watches it will never use. Comma-separated tokens: `tls` (a TLS-terminate
-    /// listener → watch TLS Secrets) and `ns-labels` (an `allowedRoutes: Selector`
-    /// listener → watch Namespace labels). Route watches (HTTP/TCP/TLS/UDP) are
-    /// never gated — any route may parentRef this Gateway and must receive a status
-    /// — so no route token exists; unknown tokens are ignored for operator
-    /// forward/backward-compatibility. Absent = legacy broad mode (watch every
-    /// gate-able resource); present narrows to only the listed extras.
-    /// portail-operator computes it from the Gateway's listeners and re-rolls the
-    /// pod when the shape changes.
+    /// Operator-set watch shape (comma tokens); absent watches all secondary resources
+    ///
+    /// Which *gate-able* secondary resources this single-Gateway data plane
+    /// needs to watch, so it does not open cluster-wide watches it will never
+    /// use. Tokens: `tls` (a TLS-terminate listener means watch TLS Secrets)
+    /// and `ns-labels` (an `allowedRoutes: Selector` listener means watch
+    /// Namespace labels). Route watches (HTTP/TCP/TLS/UDP) are never gated:
+    /// any route may parentRef this Gateway and must receive a status, so no
+    /// route token exists; unknown tokens are ignored for operator
+    /// forward/backward-compatibility. Absent = legacy broad mode (watch
+    /// every gate-able resource); present narrows to only the listed extras.
+    /// portail-operator computes it from the Gateway's listeners and re-rolls
+    /// the pod when the shape changes.
     #[arg(long, value_name = "TOKENS")]
-    #[arg(
-        help = "Operator-set watch shape (comma tokens); absent watches all secondary resources"
-    )]
     pub watch_shape: Option<String>,
 }
 
@@ -192,147 +182,49 @@ impl Args {
 mod tests {
     use super::*;
 
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).unwrap()
+    }
+
     #[test]
     fn test_config_file_validation() {
-        let args = Args {
-            config: Some(PathBuf::from("config.json")),
-            validate_only: false,
-            check_config: false,
-
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: false,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--config", "config.json"]);
         assert!(args.validate().is_ok());
 
-        let args = Args {
-            config: Some(PathBuf::from("config.yaml")),
-            validate_only: false,
-            check_config: false,
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: false,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--config", "config.yaml"]);
         assert!(args.validate().is_ok());
 
         // Extension/format validation is owned by PortailConfig::load_from_file,
         // so an odd extension passes ARGUMENT validation and fails at load time.
-        let args = Args {
-            config: Some(PathBuf::from("config.txt")),
-            validate_only: false,
-            check_config: false,
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: false,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--config", "config.txt"]);
         assert!(args.validate().is_ok());
     }
 
     #[test]
     fn test_validation_mode_requires_config() {
-        let args = Args {
-            config: None,
-            validate_only: true,
-            check_config: false,
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: false,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--validate-only"]);
         assert!(args.validate().is_err());
 
-        let args = Args {
-            config: None,
-            validate_only: false,
-            check_config: true,
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: false,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--check-config"]);
         assert!(args.validate().is_err());
     }
 
     #[test]
     fn test_kubernetes_and_config_mutually_exclusive() {
-        let args = Args {
-            config: Some(PathBuf::from("config.yaml")),
-            validate_only: false,
-            check_config: false,
-            verbose: 0,
-            example_config: false,
-            generate_config: None,
-            output: None,
-            cert_dir: None,
-            kubernetes: true,
-            controller_name: "portail.epheo.eu/gateway-controller".to_string(),
-            supported_features: false,
-            manage_gateway_status: true,
-            readiness_port: 19099,
-            metrics_port: None,
-            gateway: None,
-            watch_shape: None,
-            access_log: None,
-            http2: false,
-        };
+        let args = parse(&["portail", "--kubernetes", "--config", "config.yaml"]);
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_only_conflicts_with_check_config() {
+        assert!(Args::try_parse_from(["portail", "--validate-only", "--check-config"]).is_err());
+    }
+
+    #[test]
+    fn test_generate_config_rejects_unknown_example() {
+        assert!(Args::try_parse_from(["portail", "--generate-config", "nope"]).is_err());
+        for (name, _, _) in portail::config::examples::EXAMPLES {
+            assert!(Args::try_parse_from(["portail", "--generate-config", name]).is_ok());
+        }
     }
 }

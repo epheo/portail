@@ -15,18 +15,32 @@ pub const MINIMAL_YAML: &str = include_str!("../../examples/standalone/minimal.y
 /// filters, weighted backends.
 pub const DEVELOPMENT_YAML: &str = include_str!("../../examples/standalone/development.yaml");
 
+/// Every embedded example as (CLI name, YAML, blurb). Single source for the
+/// clap value_parser, `--generate-config` lookup, and `--example-config`
+/// listing, so adding an example is one entry here.
+pub const EXAMPLES: &[(&str, &str, &str)] = &[
+    (
+        "minimal",
+        MINIMAL_YAML,
+        "Basic single-service setup with default worker configuration",
+    ),
+    (
+        "development",
+        DEVELOPMENT_YAML,
+        "Multi-service development with explicit worker configs (SCP-optimized)",
+    ),
+];
+
 /// Look up an embedded example by its `--generate-config <name>` CLI name.
 pub fn example_yaml(name: &str) -> Option<&'static str> {
-    match name {
-        "minimal" => Some(MINIMAL_YAML),
-        "development" => Some(DEVELOPMENT_YAML),
-        _ => None,
-    }
+    EXAMPLES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, yaml, _)| *yaml)
 }
 
 pub fn print_example_config_info() {
-    println!("minimal       - Basic single-service setup with default worker configuration");
-    println!(
-        "development   - Multi-service development with explicit worker configs (SCP-optimized)"
-    );
+    for (name, _, blurb) in EXAMPLES {
+        println!("{:<14}- {}", name, blurb);
+    }
 }

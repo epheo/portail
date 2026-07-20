@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::parsing::{
-    deserialize_duration, deserialize_duration_opt, serialize_duration, serialize_duration_opt,
-};
+use super::parsing::human_duration;
 
 /// Protocol types following Kubernetes Gateway API specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +177,15 @@ pub struct ParentRef {
     pub port: Option<i32>,
 }
 
+impl ParentRef {
+    /// Gateway API listener selection: an unset sectionName or port matches
+    /// any listener.
+    pub(crate) fn selects(&self, l: &ListenerConfig) -> bool {
+        self.section_name.as_ref().is_none_or(|s| &l.name == s)
+            && self.port.is_none_or(|p| l.port == p as u16)
+    }
+}
+
 /// HTTP route rule with matches and backend references
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,15 +208,13 @@ pub struct HttpRouteTimeouts {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_duration_opt",
-        serialize_with = "serialize_duration_opt"
+        with = "human_duration::opt"
     )]
     pub request: Option<Duration>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_duration_opt",
-        serialize_with = "serialize_duration_opt"
+        with = "human_duration::opt"
     )]
     pub backend_request: Option<Duration>,
 }
@@ -455,7 +460,9 @@ impl HttpRouteMatch {
     }
 }
 
-/// TCP route configuration following Kubernetes Gateway API TCPRoute specification
+/// TCP route configuration following Kubernetes Gateway API TCPRoute
+/// specification. UDPRoute has the identical wire shape, so
+/// [`UdpRouteConfig`] aliases this type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -477,15 +484,7 @@ pub struct L4RouteRule {
 
 pub type TcpRouteRule = L4RouteRule;
 
-/// UDP route configuration following Kubernetes Gateway API UDPRoute specification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct UdpRouteConfig {
-    #[serde(default)]
-    pub parent_refs: Vec<ParentRef>,
-    pub rules: Vec<UdpRouteRule>,
-}
+pub type UdpRouteConfig = TcpRouteConfig;
 
 pub type UdpRouteRule = L4RouteRule;
 
@@ -564,18 +563,10 @@ pub enum LogOutput {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
-    #[serde(
-        default = "default_backend_timeout",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_backend_timeout", with = "human_duration")]
     pub backend_timeout: Duration,
 
-    #[serde(
-        default = "default_udp_session_timeout",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_udp_session_timeout", with = "human_duration")]
     pub udp_session_timeout: Duration,
 
     /// How often the background DNS-refresh task re-resolves backend FQDNs and,
@@ -587,11 +578,7 @@ pub struct PerformanceConfig {
     /// converge within seconds, with no EndpointSlice watch. Re-resolution is
     /// apiserver-free, so this cadence is unaffected by apiserver saturation at
     /// scale (and, unlike a watch, cannot be delayed by it).
-    #[serde(
-        default = "default_dns_refresh_interval",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_dns_refresh_interval", with = "human_duration")]
     pub dns_refresh_interval: Duration,
 
     /// Maximum time a client may take to complete its TLS handshake, or to
@@ -600,11 +587,7 @@ pub struct PerformanceConfig {
     /// keepalive requests. Defaults to 30s — the same order as nginx
     /// `client_header_timeout` (60s) and typical haproxy
     /// `timeout http-request` settings (5–30s).
-    #[serde(
-        default = "default_client_header_timeout",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_client_header_timeout", with = "human_duration")]
     pub client_header_timeout: Duration,
 
     /// Idle time before the kernel sends the first TCP keepalive probe on an
@@ -619,11 +602,7 @@ pub struct PerformanceConfig {
     /// to 60s — same order as Go's net/http server default (15s); the probe
     /// cadence after this idle threshold is fixed (see
     /// `worker::TCP_KEEPALIVE_INTERVAL`), giving ~2min total reap latency.
-    #[serde(
-        default = "default_tcp_keepalive_time",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_tcp_keepalive_time", with = "human_duration")]
     pub tcp_keepalive_time: Duration,
 
     /// Per-step progress budget on HTTP body streaming: each read or write
@@ -635,11 +614,7 @@ pub struct PerformanceConfig {
     /// Does not apply to upgraded tunnels, L4 forwarding, or the idle wait
     /// between keepalive requests (long idle is legitimate there). Defaults
     /// to 300s — Envoy's stream_idle_timeout default; `0s` disables.
-    #[serde(
-        default = "default_idle_body_timeout",
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
+    #[serde(default = "default_idle_body_timeout", with = "human_duration")]
     pub idle_body_timeout: Duration,
 
     /// Scope of the idle backend-connection pool. `connection` (default)

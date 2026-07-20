@@ -81,11 +81,29 @@ impl PortailConfig {
     /// first failure. Deduplicated, so the double resolution cost of the
     /// strict path stays bounded by the number of distinct backends.
     fn check_backend_resolution(&self) -> Result<()> {
-        fn check_refs(
-            seen: &mut std::collections::HashSet<(String, u16)>,
-            refs: &[BackendRef],
-            proto: &str,
-        ) -> Result<()> {
+        let http = self
+            .http_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .map(|rule| (rule.backend_refs.as_slice(), "HTTP"));
+        let tcp = self
+            .tcp_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .map(|rule| (rule.backend_refs.as_slice(), "TCP"));
+        let udp = self
+            .udp_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .map(|rule| (rule.backend_refs.as_slice(), "UDP"));
+        let tls = self
+            .tls_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .map(|rule| (rule.backend_refs.as_slice(), "TLS"));
+
+        let mut seen = std::collections::HashSet::new();
+        for (refs, proto) in http.chain(tcp).chain(udp).chain(tls) {
             for br in refs {
                 if !seen.insert((br.name.clone(), br.port)) {
                     continue;
@@ -101,29 +119,6 @@ impl PortailConfig {
                         )
                     },
                 )?;
-            }
-            Ok(())
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        for route in &self.http_routes {
-            for rule in &route.rules {
-                check_refs(&mut seen, &rule.backend_refs, "HTTP")?;
-            }
-        }
-        for route in &self.tcp_routes {
-            for rule in &route.rules {
-                check_refs(&mut seen, &rule.backend_refs, "TCP")?;
-            }
-        }
-        for route in &self.udp_routes {
-            for rule in &route.rules {
-                check_refs(&mut seen, &rule.backend_refs, "UDP")?;
-            }
-        }
-        for route in &self.tls_routes {
-            for rule in &route.rules {
-                check_refs(&mut seen, &rule.backend_refs, "TLS")?;
             }
         }
         Ok(())
@@ -154,54 +149,31 @@ impl PortailConfig {
             let matched_listeners =
                 find_listeners_for_route(&http_route.parent_refs, &self.gateway);
 
-            if matched_listeners.is_empty() {
-                // No matching listener found — route without gateway context.
-                // Add to a default scope with port 0 (for file-based configs without a gateway).
-                let effective_hostnames = if http_route.hostnames.is_empty() {
-                    vec!["*".to_string()]
-                } else {
-                    http_route.hostnames.clone()
-                };
+            // No matching listener: route without gateway context (file-based
+            // configs). One pseudo-scope on port 0 with no hostname
+            // constraint, so hostname intersection passes routes through.
+            let scopes: Vec<(u16, Option<&str>, &str)> = if matched_listeners.is_empty() {
+                vec![(0, None, "")]
+            } else {
+                matched_listeners
+                    .iter()
+                    .map(|l| (l.port, l.hostname.as_deref(), l.name.as_str()))
+                    .collect()
+            };
 
-                for hostname in &effective_hostnames {
-                    for rule in &http_route.rules {
-                        let (backends, filters) = build_rule_components(
-                            rule,
-                            &self.endpoint_overrides,
-                            &self.app_protocol_overrides,
-                            &self.headless_target_ports,
-                        )?;
-                        for route_match in &rule.matches {
-                            let routing_rule =
-                                build_routing_rule(route_match, &filters, &backends, rule)?;
-                            route_table.add_http_route_for_listener(
-                                0,
-                                None,
-                                hostname,
-                                routing_rule,
-                            );
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // For each matching listener, compute hostname intersection and add routes
-            for listener in &matched_listeners {
+            // For each scope, compute hostname intersection and add routes
+            for (port, listener_hostname, listener_name) in scopes {
                 let effective_hostnames = if http_route.hostnames.is_empty() {
                     // Route has no hostnames = match all.
                     // Use listener hostname if set, otherwise catch-all "*".
-                    match &listener.hostname {
-                        Some(h) => vec![h.clone()],
-                        None => vec!["*".to_string()],
-                    }
+                    vec![listener_hostname.unwrap_or("*").to_string()]
                 } else {
-                    let hostnames = intersect_hostnames(listener, &http_route.hostnames);
+                    let hostnames = intersect_hostnames(listener_hostname, &http_route.hostnames);
                     if hostnames.is_empty() {
                         tracing::warn!(
                             "HTTP route {} has no hostnames matching listener '{}' scope, skipping",
                             route_idx,
-                            listener.name
+                            listener_name
                         );
                         continue;
                     }
@@ -212,9 +184,9 @@ impl PortailConfig {
                     tracing::debug!(
                         "  Processing hostname: {} for listener {}:{} ({:?})",
                         hostname,
-                        listener.name,
-                        listener.port,
-                        listener.hostname
+                        listener_name,
+                        port,
+                        listener_hostname
                     );
                     for (rule_idx, rule) in http_route.rules.iter().enumerate() {
                         tracing::debug!(
@@ -239,12 +211,12 @@ impl PortailConfig {
                                 hostname,
                                 routing_rule.path,
                                 backends.len(),
-                                listener.port,
-                                listener.hostname
+                                port,
+                                listener_hostname
                             );
                             route_table.add_http_route_for_listener(
-                                listener.port,
-                                listener.hostname.as_deref(),
+                                port,
+                                listener_hostname,
                                 hostname,
                                 routing_rule,
                             );
@@ -254,8 +226,8 @@ impl PortailConfig {
             }
         }
 
-        self.convert_l4_routes(&mut route_table, &self.tcp_routes, Protocol::TCP)?;
-        self.convert_l4_routes(&mut route_table, &self.udp_routes, Protocol::UDP)?;
+        self.convert_l4_routes(&mut route_table, &self.tcp_routes, false);
+        self.convert_l4_routes(&mut route_table, &self.udp_routes, true);
 
         // Convert TLS routes (SNI-based), scoped to the ports of the TLS
         // listeners their parentRefs attach to. Without gateway context
@@ -274,22 +246,7 @@ impl PortailConfig {
             }
 
             for rule in &tls_route.rules {
-                let backends: Vec<routing::Backend> = rule
-                    .backend_refs
-                    .iter()
-                    .flat_map(|br| {
-                        routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
-                            .map_err(|e| {
-                                tracing::warn!(
-                                    "Skipping TLS backend {}:{} - DNS resolution failed: {}",
-                                    br.name,
-                                    br.port,
-                                    e
-                                )
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
+                let backends = resolve_backends_lenient(&rule.backend_refs, "TLS");
 
                 for hostname in &tls_route.hostnames {
                     for &port in &ports {
@@ -306,50 +263,25 @@ impl PortailConfig {
     }
 }
 
-trait L4Route {
-    fn parent_refs(&self) -> &[ParentRef];
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]>;
-}
-
-impl L4Route for TcpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] {
-        &self.parent_refs
-    }
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules
-            .iter()
-            .map(|r| r.backend_refs.as_slice())
-            .collect()
-    }
-}
-
-impl L4Route for UdpRouteConfig {
-    fn parent_refs(&self) -> &[ParentRef] {
-        &self.parent_refs
-    }
-    fn backend_refs_per_rule(&self) -> Vec<&[BackendRef]> {
-        self.rules
-            .iter()
-            .map(|r| r.backend_refs.as_slice())
-            .collect()
-    }
-}
-
 impl PortailConfig {
-    fn convert_l4_routes<R: L4Route>(
+    /// `UdpRouteConfig` aliases `TcpRouteConfig`, so one signature serves
+    /// both route lists; `is_udp` picks the socket family.
+    fn convert_l4_routes(
         &self,
         route_table: &mut crate::routing::RouteTable,
-        routes: &[R],
-        protocol: Protocol,
-    ) -> Result<()> {
-        use crate::routing;
-
+        routes: &[TcpRouteConfig],
+        is_udp: bool,
+    ) {
         for route in routes {
-            if let Some(parent_ref) = route.parent_refs().first() {
+            if let Some(parent_ref) = route.parent_refs.first() {
                 if let Some(section_name) = &parent_ref.section_name {
-                    let protocol_matches = |l: &&ListenerConfig| match protocol {
-                        Protocol::TCP => matches!(l.protocol, Protocol::TCP | Protocol::TLS),
-                        _ => l.protocol == protocol,
+                    // TCPRoutes may also attach to TLS(Passthrough) listeners.
+                    let protocol_matches = |l: &&ListenerConfig| {
+                        if is_udp {
+                            l.protocol == Protocol::UDP
+                        } else {
+                            matches!(l.protocol, Protocol::TCP | Protocol::TLS)
+                        }
                     };
                     if let Some(listener) = self
                         .gateway
@@ -357,43 +289,41 @@ impl PortailConfig {
                         .iter()
                         .find(|l| l.name == *section_name && protocol_matches(l))
                     {
-                        for backend_refs in route.backend_refs_per_rule() {
-                            let backends: Vec<routing::Backend> = backend_refs
-                                .iter()
-                                .flat_map(|br| {
-                                    routing::Backend::all_with_weight(
-                                        br.name.clone(),
-                                        br.port,
-                                        br.weight,
-                                    )
-                                    .map_err(|e| {
-                                        tracing::warn!(
-                                            "Skipping L4 backend {}:{} - DNS resolution failed: {}",
-                                            br.name,
-                                            br.port,
-                                            e
-                                        )
-                                    })
-                                    .unwrap_or_default()
-                                })
-                                .collect();
-
-                            match protocol {
-                                Protocol::TCP
-                                | Protocol::TLS
-                                | Protocol::HTTP
-                                | Protocol::HTTPS => {
-                                    route_table.add_tcp_route(listener.port, backends)
-                                }
-                                Protocol::UDP => route_table.add_udp_route(listener.port, backends),
+                        for rule in &route.rules {
+                            let backends = resolve_backends_lenient(&rule.backend_refs, "L4");
+                            if is_udp {
+                                route_table.add_udp_route(listener.port, backends);
+                            } else {
+                                route_table.add_tcp_route(listener.port, backends);
                             }
                         }
                     }
                 }
             }
         }
-        Ok(())
     }
+}
+
+/// Lenient backend resolution: skip (and warn about) refs whose DNS fails,
+/// keeping the rest. The strict startup path pre-checks resolution in
+/// `check_backend_resolution`, so leniency here only affects the Kubernetes
+/// path, where serving with fewer backends is conformance-required.
+fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routing::Backend> {
+    refs.iter()
+        .flat_map(|br| {
+            crate::routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "Skipping {} backend {}:{} - DNS resolution failed: {}",
+                        what,
+                        br.name,
+                        br.port,
+                        e
+                    )
+                })
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Find all listeners that a route attaches to via its parentRefs.
@@ -409,26 +339,7 @@ fn find_listeners_for_route<'a>(
 
     let mut matched = Vec::new();
     for pr in parent_refs {
-        // Filter listeners by sectionName and/or port from the parentRef
-        let candidates: Vec<&ListenerConfig> = gateway
-            .listeners
-            .iter()
-            .filter(|l| {
-                // If sectionName is specified, listener name must match
-                if let Some(section) = &pr.section_name {
-                    if l.name != *section {
-                        return false;
-                    }
-                }
-                // If port is specified, listener port must match
-                if let Some(port) = pr.port {
-                    if l.port != port as u16 {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
+        let candidates = gateway.listeners.iter().filter(|l| pr.selects(l));
 
         for listener in candidates {
             if !matched
@@ -641,18 +552,14 @@ fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
             route_parent == listener_parent
         } else {
             // *.example.com listener, foo.example.com route -> match if parent matches
-            rh.ends_with(listener_parent)
-                && rh.len() > listener_parent.len()
-                && rh.as_bytes()[rh.len() - listener_parent.len() - 1] == b'.'
+            crate::routing::wildcard_covers(listener_parent, &rh)
         }
     } else {
         // Exact listener hostname
         if let Some(route_parent) = rh.strip_prefix("*.") {
             // Exact listener "very.specific.com", wildcard route "*.specific.com"
             // -> match if the listener hostname is under the route's wildcard scope
-            lh.ends_with(route_parent)
-                && lh.len() > route_parent.len()
-                && lh.as_bytes()[lh.len() - route_parent.len() - 1] == b'.'
+            crate::routing::wildcard_covers(route_parent, &lh)
         } else {
             // Both exact -> must match exactly
             rh == lh
@@ -666,8 +573,8 @@ fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
 ///   - listener "very.specific.com" ∩ route "*.specific.com" → "very.specific.com"
 ///   - listener "*.example.com" ∩ route "foo.example.com" → "foo.example.com"
 ///   - listener "*.example.com" ∩ route "*.example.com" → "*.example.com"
-fn intersect_hostnames(listener: &ListenerConfig, route_hostnames: &[String]) -> Vec<String> {
-    match &listener.hostname {
+fn intersect_hostnames(listener_hostname: Option<&str>, route_hostnames: &[String]) -> Vec<String> {
+    match listener_hostname {
         None => {
             // No listener hostname -> all route hostnames are valid
             route_hostnames.to_vec()
@@ -831,7 +738,7 @@ mod tests {
                     .chain(scope.wildcard_http_routes.values())
                     .chain(scope.catch_all_http_routes.iter());
                 for he in entries {
-                    for rule in &he.rules {
+                    for rule in he {
                         for b in &rule.backends {
                             ports.push(b.socket_addr.port());
                         }
@@ -1272,56 +1179,26 @@ mod tests {
 
     #[test]
     fn test_intersect_hostnames_no_listener_hostname() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            target_port: None,
-            hostname: None,
-            address: None,
-            interface: None,
-            tls: None,
-        };
         let route_hostnames = vec!["a.com".to_string(), "b.com".to_string()];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        let result = super::intersect_hostnames(None, &route_hostnames);
         assert_eq!(result, route_hostnames);
     }
 
     #[test]
     fn test_intersect_hostnames_wildcard_listener_filters() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            target_port: None,
-            hostname: Some("*.example.com".to_string()),
-            address: None,
-            interface: None,
-            tls: None,
-        };
         let route_hostnames = vec![
             "foo.example.com".to_string(),
             "bar.example.com".to_string(),
             "other.org".to_string(),
         ];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        let result = super::intersect_hostnames(Some("*.example.com"), &route_hostnames);
         assert_eq!(result, vec!["foo.example.com", "bar.example.com"]);
     }
 
     #[test]
     fn test_intersect_hostnames_exact_listener_restricts() {
-        let listener = ListenerConfig {
-            name: "http".to_string(),
-            protocol: Protocol::HTTP,
-            port: 8080,
-            target_port: None,
-            hostname: Some("api.example.com".to_string()),
-            address: None,
-            interface: None,
-            tls: None,
-        };
         let route_hostnames = vec!["api.example.com".to_string(), "web.example.com".to_string()];
-        let result = super::intersect_hostnames(&listener, &route_hostnames);
+        let result = super::intersect_hostnames(Some("api.example.com"), &route_hostnames);
         assert_eq!(result, vec!["api.example.com"]);
     }
 
