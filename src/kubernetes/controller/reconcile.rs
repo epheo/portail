@@ -56,25 +56,19 @@ where
         .collect()
 }
 
-/// `(kind, namespace, name)` → current `status.parents` for every route this
+/// `"{kind}/{ns}/{name}"` → current `status.parents` for every route this
 /// pass emits status for. Built once per pass from the snapshot and reused by
 /// both the fingerprint and the status-write loop (which previously serialized
 /// each full route to JSON twice per pass just to read its parents).
-fn observed_parents_map(
-    snapshot: &ClusterSnapshot,
-) -> HashMap<(String, String, String), Vec<serde_json::Value>> {
+fn observed_parents_map(snapshot: &ClusterSnapshot) -> HashMap<String, Vec<serde_json::Value>> {
     fn insert<R: GatewayRoute>(
-        map: &mut HashMap<(String, String, String), Vec<serde_json::Value>>,
+        map: &mut HashMap<String, Vec<serde_json::Value>>,
         routes: &[Arc<R>],
     ) {
         for r in routes {
             let (name, _) = r.identity();
             map.insert(
-                (
-                    R::KIND.to_string(),
-                    r.route_namespace().to_string(),
-                    name.to_string(),
-                ),
+                format!("{}/{}/{}", R::KIND, r.route_namespace(), name),
                 r.status_parents_json(),
             );
         }
@@ -148,18 +142,10 @@ fn required_endpoints(
 /// whether the data plane has bound this Gateway's listener ports.
 fn compute_programmed_condition(dp_ready: bool) -> status::GatewayCondition {
     if dp_ready {
-        status::GatewayCondition {
-            ok: true,
-            reason: "Programmed".into(),
-            message: "Programmed".into(),
-        }
+        status::GatewayCondition::ok("Programmed", "Programmed")
     } else {
         warn!("Data plane not ready: not all listener ports are bound");
-        status::GatewayCondition {
-            ok: false,
-            reason: "Invalid".into(),
-            message: "Data plane not ready: not all listener ports are bound".into(),
-        }
+        status::GatewayCondition::invalid("Data plane not ready: not all listener ports are bound")
     }
 }
 
@@ -375,6 +361,72 @@ fn merge_gateway_configs(
     merged
 }
 
+/// Update per-route status — group by (kind, ns, name) so SSA writes all
+/// parent entries together (otherwise multi-listener routes lose previous
+/// entries on each patch). Returns whether every PATCH was accepted.
+async fn write_route_statuses(
+    ctx: &ControllerCtx,
+    gw_name: &str,
+    gw_ns: &str,
+    route_status: &[RouteAcceptance],
+    parents_by_route: &HashMap<String, Vec<serde_json::Value>>,
+    programmed: bool,
+) -> bool {
+    use std::collections::BTreeMap;
+    let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
+    let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> = BTreeMap::new();
+    for ra in route_status {
+        let route_programmed = ra.accepted && programmed;
+        grouped
+            .entry((ra.kind, &ra.namespace, &ra.name))
+            .or_default()
+            .push(status::RouteParentStatus {
+                controller_name: ctx.controller_name.clone(),
+                gateway_name: gw_name.to_string(),
+                gateway_namespace: gw_ns.to_string(),
+                section_name: ra.section_name.clone(),
+                port: ra.port,
+                accepted: ra.accepted,
+                accepted_reason: ra.accepted_reason,
+                message: ra.message.clone(),
+                refs_resolved: ra.refs_resolved,
+                refs_reason: ra.refs_reason,
+                refs_message: ra.refs_message.clone(),
+                programmed: route_programmed,
+                generation: ra.generation,
+            });
+    }
+
+    let mut statuses_ok = true;
+    for ((kind, ns, name), parents) in &grouped {
+        let existing = parents_by_route
+            .get(&format!("{}/{}/{}", kind, ns, name))
+            .cloned()
+            .unwrap_or_default();
+        macro_rules! patch_route_status {
+            ($ty:ty) => {{
+                statuses_ok &= status::update_route_status::<$ty>(
+                    &ctx.client,
+                    name,
+                    ns,
+                    parents,
+                    &field_manager,
+                    &existing,
+                )
+                .await;
+            }};
+        }
+        match *kind {
+            "HTTPRoute" => patch_route_status!(HTTPRoute),
+            "TCPRoute" => patch_route_status!(TCPRoute),
+            "TLSRoute" => patch_route_status!(TLSRoute),
+            "UDPRoute" => patch_route_status!(UDPRoute),
+            _ => {}
+        }
+    }
+    statuses_ok
+}
+
 /// Whether `class_name` resolves to a GatewayClass whose controllerName is
 /// ours. Pure — the unscoped-mode ownership filter.
 fn gateway_class_is_ours(
@@ -470,11 +522,8 @@ pub(super) async fn reconcile(
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
-                let failure = status::GatewayCondition {
-                    ok: false,
-                    reason: "Invalid".into(),
-                    message: format!("Reconciliation failed: {}", e),
-                };
+                let failure =
+                    status::GatewayCondition::invalid(format!("Reconciliation failed: {}", e));
                 status::update_gateway_status(
                     &ctx.client,
                     &gateway,
@@ -511,13 +560,13 @@ pub(super) async fn reconcile(
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
 
     // Readiness keys on each listener's bound port (`target_port` when the
-    // fronting Service decouples it, else the published port). Captured before
+    // fronting Service decouples it, else the published port). Computed before
     // `result.config` is moved into the route-table build below. In the brief
     // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service is
     // not yet observed, a privileged published bind fails harmlessly and
     // readiness stays down until the Service (and its targetPort) appear.
-    let listeners = result.config.gateway.listeners.clone();
-    let required = required_endpoints(&listeners, &bind_addresses);
+    let required = required_endpoints(&result.config.gateway.listeners, &bind_addresses);
+    let listeners_empty = result.config.gateway.listeners.is_empty();
 
     // Read-only readiness probe — no listener work yet. Feeds the fingerprint
     // gate below, which decides whether ensure_data_plane_listeners (bind
@@ -583,18 +632,13 @@ pub(super) async fn reconcile(
     // `status.parents` list are detected and re-applied. Built once from the
     // snapshot; the status-write loop below reads the same map.
     let parents_by_route = observed_parents_map(&snapshot);
-    let existing_parents = |kind: &str, ns: &str, name: &str| -> Vec<serde_json::Value> {
-        parents_by_route
-            .get(&(kind.to_string(), ns.to_string(), name.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    };
     let observed_route_parents: Vec<String> = result
         .route_status
         .iter()
         .map(|ra| {
-            let parents = existing_parents(ra.kind, &ra.namespace, &ra.name);
-            format!("{}/{}/{}:{:?}", ra.kind, ra.namespace, ra.name, parents)
+            let key = format!("{}/{}/{}", ra.kind, ra.namespace, ra.name);
+            let parents = parents_by_route.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            format!("{}:{:?}", key, parents)
         })
         .collect();
 
@@ -746,12 +790,8 @@ pub(super) async fn reconcile(
             );
             // Every listener skipped as unconvertible: zero required
             // endpoints makes dp_ready vacuously true, but nothing serves.
-            if listeners.is_empty() && !gateway.spec.listeners.is_empty() {
-                status::GatewayCondition {
-                    ok: false,
-                    reason: "Invalid".into(),
-                    message: "No listener could be programmed".into(),
-                }
+            if listeners_empty && !gateway.spec.listeners.is_empty() {
+                status::GatewayCondition::invalid("No listener could be programmed")
             } else {
                 compute_programmed_condition(dp_ready)
             }
@@ -761,11 +801,7 @@ pub(super) async fn reconcile(
                 "Failed to build route table for Gateway {}/{}: {}",
                 gw_ns, gw_name, e
             );
-            status::GatewayCondition {
-                ok: false,
-                reason: "Invalid".into(),
-                message: format!("Route table conversion failed: {}", e),
-            }
+            status::GatewayCondition::invalid(format!("Route table conversion failed: {}", e))
         }
     };
     let programmed = programmed_cond.ok;
@@ -782,60 +818,15 @@ pub(super) async fn reconcile(
     )
     .await;
 
-    // Update per-route status — group by (kind, ns, name) so SSA writes all
-    // parent entries together (otherwise multi-listener routes lose previous
-    // entries on each patch).
-    {
-        use std::collections::BTreeMap;
-        let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
-        let mut grouped: BTreeMap<(&str, &str, &str), Vec<status::RouteParentStatus>> =
-            BTreeMap::new();
-        for ra in &result.route_status {
-            let route_programmed = ra.accepted && programmed;
-            grouped
-                .entry((ra.kind, &ra.namespace, &ra.name))
-                .or_default()
-                .push(status::RouteParentStatus {
-                    controller_name: ctx.controller_name.clone(),
-                    gateway_name: gw_name.clone(),
-                    gateway_namespace: gw_ns.clone(),
-                    section_name: ra.section_name.clone(),
-                    port: ra.port,
-                    accepted: ra.accepted,
-                    accepted_reason: ra.accepted_reason.clone(),
-                    message: ra.message.clone(),
-                    refs_resolved: ra.refs_resolved,
-                    refs_reason: ra.refs_reason.clone(),
-                    refs_message: ra.refs_message.clone(),
-                    programmed: route_programmed,
-                    generation: ra.generation,
-                });
-        }
-
-        for ((kind, ns, name), parents) in &grouped {
-            let existing = existing_parents(kind, ns, name);
-            macro_rules! patch_route_status {
-                ($ty:ty) => {{
-                    statuses_ok &= status::update_route_status::<$ty>(
-                        &ctx.client,
-                        name,
-                        ns,
-                        parents,
-                        &field_manager,
-                        &existing,
-                    )
-                    .await;
-                }};
-            }
-            match *kind {
-                "HTTPRoute" => patch_route_status!(HTTPRoute),
-                "TCPRoute" => patch_route_status!(TCPRoute),
-                "TLSRoute" => patch_route_status!(TLSRoute),
-                "UDPRoute" => patch_route_status!(UDPRoute),
-                _ => {}
-            }
-        }
-    }
+    statuses_ok &= write_route_statuses(
+        &ctx,
+        &gw_name,
+        &gw_ns,
+        &result.route_status,
+        &parents_by_route,
+        programmed,
+    )
+    .await;
 
     if !statuses_ok {
         // A status PATCH failed (apiserver blip). Without a fast retry the
@@ -934,10 +925,10 @@ mod tests {
             namespace: "default".to_string(),
             kind: "HTTPRoute",
             accepted: true,
-            accepted_reason: "Accepted".to_string(),
+            accepted_reason: "Accepted",
             message: "Accepted".to_string(),
             refs_resolved: true,
-            refs_reason: "ResolvedRefs".to_string(),
+            refs_reason: "ResolvedRefs",
             refs_message: "ok".to_string(),
             generation: None,
             section_name: section.map(String::from),
@@ -997,11 +988,7 @@ mod tests {
     #[test]
     fn fingerprint_deterministic_and_sensitive() {
         let config = crate::config::PortailConfig::default();
-        let cond = status::GatewayCondition {
-            ok: true,
-            reason: "Accepted".into(),
-            message: "ok".into(),
-        };
+        let cond = status::GatewayCondition::ok("Accepted", "ok");
         let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
         listener_statuses.insert("http".into(), status::ListenerStatus::default());
         let usable = UsableAddresses {

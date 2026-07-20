@@ -52,6 +52,13 @@ pub(super) struct ResolvedCerts {
     pub errors: HashMap<(String, String), CertRefError>,
 }
 
+fn missing_secret(secret_ns: &str, name: &str) -> CertRefError {
+    CertRefError::Invalid(format!(
+        "Secret {}/{} not found or missing tls.crt/tls.key",
+        secret_ns, name
+    ))
+}
+
 /// Resolve one certificateRef to its PEM bytes. Pure — the Secret lookup and
 /// the ReferenceGrant decision happen at the caller; this validates what was
 /// found, including the full rustls parse + key load.
@@ -68,10 +75,7 @@ pub(super) fn resolve_cert_ref(
         )));
     }
     let Some(secret) = secret else {
-        return Err(CertRefError::Invalid(format!(
-            "Secret {}/{} not found or missing tls.crt/tls.key",
-            secret_ns, name
-        )));
+        return Err(missing_secret(secret_ns, name));
     };
     let (cert, key) = secret
         .data
@@ -82,12 +86,7 @@ pub(super) fn resolve_cert_ref(
                 data.get("tls.key")?.0.clone(),
             ))
         })
-        .ok_or_else(|| {
-            CertRefError::Invalid(format!(
-                "Secret {}/{} not found or missing tls.crt/tls.key",
-                secret_ns, name
-            ))
-        })?;
+        .ok_or_else(|| missing_secret(secret_ns, name))?;
     crate::proxy::tls::validate_cert_key_pair(&cert, &key)
         .map_err(|e| CertRefError::Invalid(format!("Secret {}/{}: {}", secret_ns, name, e)))?;
     Ok((cert, key))
@@ -233,15 +232,6 @@ pub(super) fn validate_gateway(
                         refs_failed = true;
                         ls.resolved_refs_reason = err.reason().into();
                         ls.resolved_refs_message = err.message().to_string();
-                    } else if !certs.valid.contains_key(&key) {
-                        // Not resolved at all — e.g. the Secret watch is gated
-                        // off by --watch-shape. Same condition as "not found".
-                        refs_failed = true;
-                        ls.resolved_refs_reason = "InvalidCertificateRef".into();
-                        ls.resolved_refs_message = format!(
-                            "Secret {}/{} not found or missing tls.crt/tls.key",
-                            secret_ns, cert_ref.name
-                        );
                     }
                 }
             }
@@ -313,9 +303,8 @@ pub(super) fn validate_gateway(
     // Gateway-level acceptance. An invalid listener stays a LISTENER
     // condition — its siblings keep serving and the Gateway stays Accepted
     // unless every listener is rejected.
-    let mut accepted = true;
-    let mut reason = "Accepted".to_string();
-    let mut message = "Gateway accepted by portail controller".to_string();
+    let mut cond =
+        status::GatewayCondition::ok("Accepted", "Gateway accepted by portail controller");
 
     if let Some(addresses) = &gateway.spec.addresses {
         for addr in addresses {
@@ -324,32 +313,30 @@ pub(super) fn validate_gateway(
                 "IPAddress" | "Hostname" => {}
                 t if t == NETWORK_ADDRESS_TYPE => {}
                 _ => {
-                    accepted = false;
-                    reason = "UnsupportedAddress".to_string();
-                    message = format!("Unsupported address type '{}' in spec.addresses", addr_type);
+                    cond = status::GatewayCondition {
+                        ok: false,
+                        reason: "UnsupportedAddress".to_string(),
+                        message: format!(
+                            "Unsupported address type '{}' in spec.addresses",
+                            addr_type
+                        ),
+                    };
                     break;
                 }
             }
         }
     }
 
-    if accepted && !listener_statuses.is_empty() {
-        let all_rejected = listener_statuses.values().all(|ls| !ls.accepted);
-        if all_rejected {
-            accepted = false;
-            reason = "ListenersNotValid".to_string();
-            message = "All listeners are rejected due to conflicts or errors".to_string();
-        }
+    if cond.ok && !listener_statuses.is_empty() && listener_statuses.values().all(|ls| !ls.accepted)
+    {
+        cond = status::GatewayCondition {
+            ok: false,
+            reason: "ListenersNotValid".to_string(),
+            message: "All listeners are rejected due to conflicts or errors".to_string(),
+        };
     }
 
-    (
-        listener_statuses,
-        status::GatewayCondition {
-            ok: accepted,
-            reason,
-            message,
-        },
-    )
+    (listener_statuses, cond)
 }
 
 #[cfg(test)]

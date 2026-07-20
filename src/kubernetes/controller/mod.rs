@@ -15,7 +15,7 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::api::Api;
 use kube::runtime::controller::Action;
-use kube::runtime::reflector::{ObjectRef, Store};
+use kube::runtime::reflector::Store;
 use kube::runtime::watcher;
 use kube::runtime::{reflector, Controller, WatchStreamExt};
 use kube::Client;
@@ -38,7 +38,7 @@ use crate::routing::RouteTable;
 use reconcile::reconcile;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
-    create_reflector_gated_with_config, map_route_to_gateways,
+    create_reflector_gated_with_config, map_route_to_gateways, map_secret_to_gateways,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -322,30 +322,9 @@ pub async fn run_controller(
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw4)
         })
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS
-        .watches_stream(
-            secret_stream,
-            move |secret: Secret| -> Vec<ObjectRef<Gateway>> {
-                let secret_name = secret.metadata.name.as_deref().unwrap_or("");
-                let secret_ns = secret.metadata.namespace.as_deref().unwrap_or("default");
-                gw5.state()
-                    .into_iter()
-                    .filter(|g| {
-                        let gw_ns = g.metadata.namespace.as_deref().unwrap_or("default");
-                        g.spec.listeners.iter().any(|l| {
-                            l.tls.as_ref().is_some_and(|tls| {
-                                tls.certificate_refs.as_ref().is_some_and(|refs| {
-                                    refs.iter().any(|cr| {
-                                        cr.name == secret_name
-                                            && cr.namespace.as_deref().unwrap_or(gw_ns) == secret_ns
-                                    })
-                                })
-                            })
-                        })
-                    })
-                    .map(|g| ObjectRef::from_obj(&*g))
-                    .collect()
-            },
-        )
+        .watches_stream(secret_stream, move |secret: Secret| {
+            map_secret_to_gateways(&secret, &gw5)
+        })
         // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
         // These have complex multi-hop mappings; the 1s debounce coalesces bursts.
         // (No EndpointSlice watch: backend pod churn is picked up by the DNS-refresh

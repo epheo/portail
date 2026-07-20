@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use k8s_openapi::chrono::Utc;
 use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
@@ -16,24 +15,14 @@ use crate::kubernetes::addresses::{UsableAddresses, NETWORK_ADDRESS_TYPE};
 use crate::logging::{debug, warn};
 
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
-    match protocol {
-        "HTTP" => {
-            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
-        }
-        "HTTPS" => {
-            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
-        }
-        "TLS" => {
-            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TLSRoute"})]
-        }
-        "TCP" => {
-            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "TCPRoute"})]
-        }
-        "UDP" => {
-            vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": "UDPRoute"})]
-        }
-        _ => vec![],
-    }
+    let kind = match protocol {
+        "HTTP" | "HTTPS" => "HTTPRoute",
+        "TLS" => "TLSRoute",
+        "TCP" => "TCPRoute",
+        "UDP" => "UDPRoute",
+        _ => return vec![],
+    };
+    vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})]
 }
 
 /// Per-listener validation status computed during reconciliation.
@@ -75,25 +64,6 @@ impl Default for ListenerStatus {
     }
 }
 
-/// Look up the lastTransitionTime for a condition from existing conditions.
-/// Returns the existing time if the condition status+reason haven't changed,
-/// otherwise returns `now` (a real transition occurred).
-fn transition_time(
-    existing: &[Condition],
-    type_: &str,
-    new_status: &str,
-    new_reason: &str,
-    now: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
-) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
-    for c in existing {
-        if c.type_ == type_ && c.status == new_status && c.reason == new_reason {
-            return c.last_transition_time.clone();
-        }
-    }
-    now.clone()
-}
-
-/// Look up a condition's lastTransitionTime from a JSON array of conditions.
 /// Build one JSON status condition, preserving `lastTransitionTime` from
 /// `existing` when (status, reason) are unchanged.
 fn condition_json(
@@ -145,6 +115,24 @@ pub(crate) struct GatewayCondition {
     pub message: String,
 }
 
+impl GatewayCondition {
+    pub fn ok(reason: &str, message: &str) -> Self {
+        Self {
+            ok: true,
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            reason: "Invalid".into(),
+            message: message.into(),
+        }
+    }
+}
+
 pub(crate) async fn update_gateway_status(
     client: &Client,
     gateway: &Gateway,
@@ -159,59 +147,48 @@ pub(crate) async fn update_gateway_status(
     let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<Gateway> = Api::namespaced(client.clone(), &ns);
 
-    let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now());
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let generation = gateway.metadata.generation;
 
     // Read existing conditions to preserve lastTransitionTime when status hasn't changed
-    let existing_conditions: Vec<Condition> = gateway
+    let existing_conditions: Vec<serde_json::Value> = gateway
         .status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
-        .cloned()
+        .and_then(|c| serde_json::to_value(c).ok())
+        .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    let accepted_status = if accepted.ok { "True" } else { "False" };
-    let accepted_reason_str = if accepted.ok {
+    let accepted_reason = if accepted.ok {
         "Accepted"
     } else {
         accepted.reason.as_str()
     };
-    let programmed_status = if programmed.ok { "True" } else { "False" };
-    let programmed_reason_str = if programmed.ok {
+    let programmed_reason = if programmed.ok {
         "Programmed"
     } else {
         programmed.reason.as_str()
     };
 
     let conditions = vec![
-        Condition {
-            type_: "Accepted".to_string(),
-            status: accepted_status.to_string(),
-            reason: accepted_reason_str.to_string(),
-            message: accepted.message.clone(),
-            last_transition_time: transition_time(
-                &existing_conditions,
-                "Accepted",
-                accepted_status,
-                accepted_reason_str,
-                &now,
-            ),
-            observed_generation: generation,
-        },
-        Condition {
-            type_: "Programmed".to_string(),
-            status: programmed_status.to_string(),
-            reason: programmed_reason_str.to_string(),
-            message: programmed.message.clone(),
-            last_transition_time: transition_time(
-                &existing_conditions,
-                "Programmed",
-                programmed_status,
-                programmed_reason_str,
-                &now,
-            ),
-            observed_generation: generation,
-        },
+        condition_json(
+            "Accepted",
+            accepted.ok,
+            accepted_reason,
+            &accepted.message,
+            &existing_conditions,
+            &now,
+            generation,
+        ),
+        condition_json(
+            "Programmed",
+            programmed.ok,
+            programmed_reason,
+            &programmed.message,
+            &existing_conditions,
+            &now,
+            generation,
+        ),
     ];
 
     // Read existing listener conditions to preserve their timestamps too
@@ -237,8 +214,6 @@ pub(crate) async fn update_gateway_status(
         })
         .unwrap_or_default();
 
-    let now_str = now.0.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
     let listeners: Vec<serde_json::Value> = gateway
         .spec
         .listeners
@@ -260,10 +235,10 @@ pub(crate) async fn update_gateway_status(
                     ls.supported_kinds.clone()
                 },
                 "conditions": [
-                    condition_json("Accepted", ls.accepted, &ls.accepted_reason, &ls.accepted_message, existing_lconds, &now_str, generation),
-                    condition_json("Programmed", ls.programmed, &ls.programmed_reason, &ls.programmed_message, existing_lconds, &now_str, generation),
-                    condition_json("ResolvedRefs", ls.resolved_refs, &ls.resolved_refs_reason, &ls.resolved_refs_message, existing_lconds, &now_str, generation),
-                    condition_json("Conflicted", ls.conflicted, &ls.conflicted_reason, &ls.conflicted_message, existing_lconds, &now_str, generation),
+                    condition_json("Accepted", ls.accepted, &ls.accepted_reason, &ls.accepted_message, existing_lconds, &now, generation),
+                    condition_json("Programmed", ls.programmed, &ls.programmed_reason, &ls.programmed_message, existing_lconds, &now, generation),
+                    condition_json("ResolvedRefs", ls.resolved_refs, &ls.resolved_refs_reason, &ls.resolved_refs_message, existing_lconds, &now, generation),
+                    condition_json("Conflicted", ls.conflicted, &ls.conflicted_reason, &ls.conflicted_message, existing_lconds, &now, generation),
                 ],
             })
         })
@@ -271,9 +246,9 @@ pub(crate) async fn update_gateway_status(
 
     // Build status.addresses using pre-computed address discovery.
     // LB VIPs are preferred (externally reachable), then local interface IPs.
-    let addresses: Vec<serde_json::Value> = if let Some(spec_addrs) = &gateway.spec.addresses {
-        if !spec_addrs.is_empty() {
-            {
+    let addresses: Vec<serde_json::Value> =
+        match gateway.spec.addresses.as_deref().filter(|a| !a.is_empty()) {
+            Some(spec_addrs) => {
                 let known = usable.all();
                 spec_addrs
                     .iter()
@@ -309,18 +284,11 @@ pub(crate) async fn update_gateway_status(
                     })
                     .collect()
             }
-        } else {
-            vec![serde_json::json!({
+            None => vec![serde_json::json!({
                 "type": "IPAddress",
                 "value": usable.preferred_ip(),
-            })]
-        }
-    } else {
-        vec![serde_json::json!({
-            "type": "IPAddress",
-            "value": usable.preferred_ip(),
-        })]
-    };
+            })],
+        };
 
     // portail always owns per-listener status. When the operator manages
     // lifecycle status, it owns conditions + addresses (written under a
@@ -368,10 +336,10 @@ pub struct RouteParentStatus {
     pub section_name: Option<String>,
     pub port: Option<i32>,
     pub accepted: bool,
-    pub accepted_reason: String,
+    pub accepted_reason: &'static str,
     pub message: String,
     pub refs_resolved: bool,
-    pub refs_reason: String,
+    pub refs_reason: &'static str,
     pub refs_message: String,
     pub programmed: bool,
     pub generation: Option<i64>,
@@ -443,8 +411,8 @@ where
             "controllerName": p.controller_name,
             "parentRef": parent_ref,
             "conditions": [
-                condition_json("Accepted", p.accepted, &p.accepted_reason, &p.message, &existing_conds, &now, p.generation),
-                condition_json("ResolvedRefs", p.refs_resolved, &p.refs_reason, &p.refs_message, &existing_conds, &now, p.generation),
+                condition_json("Accepted", p.accepted, p.accepted_reason, &p.message, &existing_conds, &now, p.generation),
+                condition_json("ResolvedRefs", p.refs_resolved, p.refs_reason, &p.refs_message, &existing_conds, &now, p.generation),
                 condition_json("Programmed", p.programmed, programmed_reason, programmed_message, &existing_conds, &now, p.generation),
             ],
         })
@@ -577,35 +545,6 @@ mod tests {
         assert!(supported_kinds_for_protocol("SCTP").is_empty());
     }
 
-    fn typed_condition(type_: &str, status: &str, reason: &str, time: &str) -> Condition {
-        Condition {
-            type_: type_.into(),
-            status: status.into(),
-            reason: reason.into(),
-            message: String::new(),
-            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-                time.parse().unwrap(),
-            ),
-            observed_generation: None,
-        }
-    }
-
-    #[test]
-    fn transition_time_preserved_when_status_and_reason_unchanged() {
-        let old = "2020-01-01T00:00:00Z";
-        let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now());
-        let existing = vec![typed_condition("Accepted", "True", "Accepted", old)];
-
-        let kept = transition_time(&existing, "Accepted", "True", "Accepted", &now);
-        assert_eq!(kept.0.to_rfc3339(), "2020-01-01T00:00:00+00:00");
-
-        let flipped = transition_time(&existing, "Accepted", "False", "Invalid", &now);
-        assert_eq!(flipped.0, now.0);
-
-        let other_type = transition_time(&existing, "Programmed", "True", "Accepted", &now);
-        assert_eq!(other_type.0, now.0);
-    }
-
     #[test]
     fn condition_json_preserves_time_and_sets_generation() {
         let existing = vec![json!({
@@ -701,10 +640,10 @@ mod tests {
             section_name: section.map(String::from),
             port: None,
             accepted: true,
-            accepted_reason: "Accepted".into(),
+            accepted_reason: "Accepted",
             message: String::new(),
             refs_resolved: true,
-            refs_reason: "ResolvedRefs".into(),
+            refs_reason: "ResolvedRefs",
             refs_message: String::new(),
             programmed: true,
             generation: None,
