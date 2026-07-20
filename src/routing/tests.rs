@@ -1024,3 +1024,22 @@ fn test_cumulative_weights_precomputed() {
     assert_eq!(r.total_weight, 4);
     assert_eq!(r.cumulative_weights, vec![3, 4]);
 }
+
+#[test]
+fn test_hostnames_intersect() {
+    // exact vs exact
+    assert!(hostnames_intersect("example.com", "example.com"));
+    assert!(!hostnames_intersect("example.com", "other.com"));
+    // wildcard vs exact, both directions; never the bare parent
+    assert!(hostnames_intersect("*.example.com", "foo.example.com"));
+    assert!(hostnames_intersect("foo.example.com", "*.example.com"));
+    assert!(!hostnames_intersect("*.example.com", "example.com"));
+    assert!(!hostnames_intersect("*.example.com", "foo.other.com"));
+    assert!(!hostnames_intersect("*.example.com", "badexample.com"));
+    // wildcard vs wildcard: equal or nested, label boundary required
+    assert!(hostnames_intersect("*.example.com", "*.example.com"));
+    assert!(hostnames_intersect("*.example.com", "*.sub.example.com"));
+    assert!(hostnames_intersect("*.sub.example.com", "*.example.com"));
+    assert!(!hostnames_intersect("*.example.com", "*.other.com"));
+    assert!(!hostnames_intersect("*.example.com", "*.badexample.com"));
+}

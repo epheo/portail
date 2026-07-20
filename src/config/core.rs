@@ -535,36 +535,13 @@ fn build_routing_rule(
 }
 
 /// Check if a route hostname is within the scope of a listener hostname.
-/// Rules:
-/// - Listener has no hostname: all route hostnames are valid
-/// - Listener "*.example.com" accepts "foo.example.com" and "*.example.com"
-/// - Listener "example.com" accepts only "example.com"
-/// - Route "*.example.com" is within listener "*.example.com"
-/// - Route "*.specific.com" intersects with listener "very.specific.com"
+/// File-config hostnames are not validated to be lowercase, so normalize
+/// before the shared case-exact predicate.
 fn hostname_matches(listener_hostname: &str, route_hostname: &str) -> bool {
-    let lh = listener_hostname.to_ascii_lowercase();
-    let rh = route_hostname.to_ascii_lowercase();
-
-    if let Some(listener_parent) = lh.strip_prefix("*.") {
-        // Wildcard listener: route hostname must be under the same parent domain
-        if let Some(route_parent) = rh.strip_prefix("*.") {
-            // *.example.com listener, *.example.com route -> match
-            route_parent == listener_parent
-        } else {
-            // *.example.com listener, foo.example.com route -> match if parent matches
-            crate::routing::wildcard_covers(listener_parent, &rh)
-        }
-    } else {
-        // Exact listener hostname
-        if let Some(route_parent) = rh.strip_prefix("*.") {
-            // Exact listener "very.specific.com", wildcard route "*.specific.com"
-            // -> match if the listener hostname is under the route's wildcard scope
-            crate::routing::wildcard_covers(route_parent, &lh)
-        } else {
-            // Both exact -> must match exactly
-            rh == lh
-        }
-    }
+    crate::routing::hostnames_intersect(
+        &listener_hostname.to_ascii_lowercase(),
+        &route_hostname.to_ascii_lowercase(),
+    )
 }
 
 /// Compute the intersection of listener hostname scope with route hostnames.
@@ -588,14 +565,17 @@ fn intersect_hostnames(listener_hostname: Option<&str>, route_hostnames: &[Strin
                     let rh_lower = rh.to_ascii_lowercase();
                     // Return the more specific of the two hostnames
                     if rh_lower.starts_with("*.") && !lh.starts_with("*.") {
-                        // Route is wildcard, listener is exact → use listener (more specific)
+                        // Route is wildcard, listener is exact: use listener (more specific)
                         lh.clone()
                     } else if lh.starts_with("*.") && !rh_lower.starts_with("*.") {
-                        // Listener is wildcard, route is exact → use route (more specific)
+                        // Listener is wildcard, route is exact: use route (more specific)
+                        rh_lower
+                    } else if rh_lower.len() >= lh.len() {
+                        // Same type: nested wildcards intersect, the longer
+                        // pattern is the narrower scope
                         rh_lower
                     } else {
-                        // Both same type → use route hostname
-                        rh_lower
+                        lh.clone()
                     }
                 })
                 .collect()
@@ -1175,6 +1155,27 @@ mod tests {
         assert!(super::hostname_matches("example.com", "example.com"));
         assert!(!super::hostname_matches("example.com", "foo.example.com"));
         assert!(!super::hostname_matches("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_hostname_matches_is_case_insensitive() {
+        assert!(super::hostname_matches("*.Example.COM", "foo.example.com"));
+        assert!(super::hostname_matches(
+            "API.example.com",
+            "api.Example.com"
+        ));
+    }
+
+    #[test]
+    fn test_intersect_hostnames_nested_wildcards() {
+        // Route wildcard inside the listener wildcard: keep the route pattern
+        let result =
+            super::intersect_hostnames(Some("*.example.com"), &["*.sub.example.com".to_string()]);
+        assert_eq!(result, vec!["*.sub.example.com"]);
+        // Listener narrower than the route: keep the listener pattern
+        let result =
+            super::intersect_hostnames(Some("*.sub.example.com"), &["*.example.com".to_string()]);
+        assert_eq!(result, vec!["*.sub.example.com"]);
     }
 
     #[test]

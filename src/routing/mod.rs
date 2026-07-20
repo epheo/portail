@@ -551,6 +551,21 @@ pub fn wildcard_covers(parent: &str, host: &str) -> bool {
         && host.as_bytes()[host.len() - parent.len() - 1] == b'.'
 }
 
+/// True when two (possibly `*.`-wildcard) hostname patterns share at least
+/// one concrete hostname. Inputs must already be lowercase: Gateway API CRD
+/// validation guarantees it for routes, config table build normalizes first.
+/// Per spec `*.example.com` covers subdomains only, never `example.com`.
+pub fn hostnames_intersect(a: &str, b: &str) -> bool {
+    match (a.strip_prefix("*."), b.strip_prefix("*.")) {
+        (None, None) => a == b,
+        (Some(pa), None) => wildcard_covers(pa, b),
+        (None, Some(pb)) => wildcard_covers(pb, a),
+        // Nested wildcards overlap: *.sub.example.com is inside *.example.com,
+        // and the wildcard pattern is itself a valid host under the wider suffix.
+        (Some(pa), Some(pb)) => pa == pb || wildcard_covers(pa, b) || wildcard_covers(pb, a),
+    }
+}
+
 /// Successive parent domains: "a.b.example.com" yields "b.example.com",
 /// "example.com", "com".
 #[inline]
