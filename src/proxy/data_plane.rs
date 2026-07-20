@@ -168,7 +168,11 @@ impl DataPlane {
         for listener_cfg in listeners {
             match (&listener_cfg.protocol, &listener_cfg.tls) {
                 (Protocol::HTTPS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Terminate => {
-                    let config = tls::build_server_config(&tls_cfg.certificate_refs, cert_dir)?;
+                    let config = tls::build_server_config(
+                        &tls_cfg.certificate_refs,
+                        cert_dir,
+                        performance_config.http2,
+                    )?;
                     tls_acceptors.push(Some(Arc::new(DynamicTlsAcceptor::new(config))));
                     tls_passthrough_flags.push(false);
                 }
@@ -248,6 +252,7 @@ impl DataPlane {
                 client_header_timeout: performance_config.client_header_timeout,
                 tcp_keepalive_time: performance_config.tcp_keepalive_time,
                 idle_body_timeout: performance_config.idle_body_timeout,
+                http2: performance_config.http2,
             },
             health,
             udp_session_timeout: performance_config.udp_session_timeout,
@@ -413,7 +418,11 @@ impl DataPlane {
             if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
                 continue; // Certs unchanged — the existing acceptor keeps serving
             }
-            match tls::build_server_config(port_refs, std::path::Path::new("/unused")) {
+            match tls::build_server_config(
+                port_refs,
+                std::path::Path::new("/unused"),
+                performance_config.http2,
+            ) {
                 Ok(config) => {
                     if let Some(existing) = self.tls_configs.get(&port) {
                         existing.update(config);
@@ -517,6 +526,7 @@ impl DataPlane {
                                     client_header_timeout: performance_config.client_header_timeout,
                                     tcp_keepalive_time: performance_config.tcp_keepalive_time,
                                     idle_body_timeout: performance_config.idle_body_timeout,
+                                    http2: performance_config.http2,
                                 };
                                 let acceptor = tls_acceptor.clone();
                                 let passthrough = tls_passthrough;

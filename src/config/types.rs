@@ -650,6 +650,16 @@ pub struct PerformanceConfig {
     /// flag: the default stays `connection` until bench data justifies more.
     #[serde(default)]
     pub backend_pool_scope: PoolScope,
+
+    /// Opt-in HTTP/2 front end on TLS-terminate listeners: ALPN advertises
+    /// h2 and each h2 stream is bridged through the HTTP/1.1 engine (one
+    /// in-memory hop; h1 clients on the same port are unaffected). Trailers
+    /// do not survive the bridge, so gRPC cannot ride it. Each h2 stream is
+    /// its own engine exchange: with the default
+    /// `backendPoolScope: connection` no backend reuse happens across
+    /// streams - prefer `process` scope alongside this.
+    #[serde(default)]
+    pub http2: bool,
 }
 
 /// Scope of the idle backend-connection pool (see
@@ -696,6 +706,7 @@ impl Default for PerformanceConfig {
             tcp_keepalive_time: default_tcp_keepalive_time(),
             idle_body_timeout: default_idle_body_timeout(),
             backend_pool_scope: PoolScope::default(),
+            http2: false,
         }
     }
 }

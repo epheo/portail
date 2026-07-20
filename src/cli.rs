@@ -101,6 +101,14 @@ pub struct Args {
     #[arg(help = "Write a JSON access log line per HTTP response to PATH (\"-\" = stdout)")]
     pub access_log: Option<String>,
 
+    /// Opt-in HTTP/2 front end: TLS-terminate listeners advertise h2 via
+    /// ALPN and bridge each stream through the HTTP/1.1 engine. Equivalent
+    /// to `performance.http2: true`; the flag is the Kubernetes-mode path,
+    /// where no config file exists.
+    #[arg(long)]
+    #[arg(help = "Enable HTTP/2 on TLS-terminate listeners (ALPN h2 + http/1.1)")]
+    pub http2: bool,
+
     /// Restrict the K8s controller to a single Gateway (`namespace/name`).
     /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
     /// legacy unscoped mode that watches all Gateways cluster-wide.
@@ -205,6 +213,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_ok());
 
@@ -226,6 +235,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_ok());
 
@@ -249,6 +259,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_ok());
     }
@@ -273,6 +284,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_err());
 
@@ -294,6 +306,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_err());
     }
@@ -318,6 +331,7 @@ mod tests {
             gateway: None,
             watch_shape: None,
             access_log: None,
+            http2: false,
         };
         assert!(args.validate().is_err());
     }

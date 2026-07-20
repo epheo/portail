@@ -70,6 +70,9 @@ pub struct WorkerConfig {
     /// Per-step progress budget on body streaming (see
     /// [`crate::config::PerformanceConfig::idle_body_timeout`]); zero disables.
     pub idle_body_timeout: Duration,
+    /// Advertise h2 via ALPN on TLS-terminate listeners and bridge h2
+    /// streams through this engine (see `h2_bridge`). Off by default.
+    pub http2: bool,
 }
 
 /// Probe cadence once `tcp_keepalive_time` idle has elapsed: a peer that
@@ -114,7 +117,7 @@ impl Drop for ConnGuard {
     }
 }
 
-struct ConnectionState {
+pub(crate) struct ConnectionState {
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     pool: PoolHandle,
@@ -146,6 +149,51 @@ struct ConnectionState {
     last_status: u16,
 }
 
+impl ConnectionState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        server_port: u16,
+        routes: Arc<ArcSwap<RouteTable>>,
+        pool: PoolHandle,
+        selector: Arc<BackendSelector>,
+        health: Arc<HealthRegistry>,
+        is_tls: bool,
+        peer_ip: std::net::IpAddr,
+        cfg: &WorkerConfig,
+        listener_stats: Arc<ListenerStats>,
+    ) -> Self {
+        Self {
+            server_port,
+            routes,
+            pool,
+            selector,
+            health,
+            is_tls,
+            peer_ip,
+            client_header_timeout: cfg.client_header_timeout,
+            connect_timeout: cfg.connect_timeout,
+            header_buf: Vec::with_capacity(1024),
+            scratch_buf: Vec::with_capacity(1024),
+            idle_body_timeout: idle_opt(cfg.idle_body_timeout),
+            listener_stats,
+            last_status: 0,
+        }
+    }
+}
+
+/// Pool handle for one client connection: the process-wide shared pool when
+/// `performance.backendPoolScope: process` is set, else a fresh
+/// per-connection pool (the default).
+pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerConfig) -> PoolHandle {
+    match shared {
+        Some(p) => PoolHandle::Shared(p.clone()),
+        None => PoolHandle::PerConn(BackendPool::new(
+            cfg.max_idle_per_backend,
+            cfg.connect_timeout,
+        )),
+    }
+}
+
 /// Run an accept loop on a single listener, spawning a task per connection.
 pub async fn run_worker(
     listener: TcpListener,
@@ -167,17 +215,6 @@ pub async fn run_worker(
 
     // Selector is shared across all listeners so weighted round-robin counters
     // produce the correct distribution globally.
-
-    // Per-connection pool handle: the process-wide shared pool when
-    // `performance.backendPoolScope: process` is set, else a fresh
-    // per-connection pool (the default).
-    let make_pool = move |shared: &Option<Arc<SharedBackendPool>>| match shared {
-        Some(p) => PoolHandle::Shared(p.clone()),
-        None => PoolHandle::PerConn(BackendPool::new(
-            cfg.max_idle_per_backend,
-            cfg.connect_timeout,
-        )),
-    };
 
     // Dead-peer detection: a client that vanishes without FIN/RST would
     // otherwise park its connection task forever, since the idle wait
@@ -222,7 +259,7 @@ pub async fn run_worker(
                             // This handles the case where both HTTPS/Terminate and
                             // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
-                            let pool = make_pool(&shared_pool);
+                            let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -254,25 +291,53 @@ pub async fn run_worker(
                                     .await
                                     {
                                         Ok(Ok(tls_stream)) => {
+                                            // ALPN decided the protocol during the
+                                            // handshake; h2 goes to the bridge, all
+                                            // else stays on the h1 path.
+                                            if cfg.http2
+                                                && tls_stream.get_ref().1.alpn_protocol()
+                                                    == Some(b"h2".as_ref())
+                                            {
+                                                METRICS.http2_connections_total.inc();
+                                                // One pool per h2 connection: the
+                                                // process pool when set, else a
+                                                // connection-scoped pool its streams
+                                                // share (h1 keepalive semantics).
+                                                let pool = shared_pool.unwrap_or_else(|| {
+                                                    Arc::new(SharedBackendPool::new(
+                                                        cfg.max_idle_per_backend,
+                                                        cfg.connect_timeout,
+                                                    ))
+                                                });
+                                                crate::proxy::h2_bridge::serve(
+                                                    tls_stream,
+                                                    crate::proxy::h2_bridge::H2Ctx {
+                                                        server_port,
+                                                        routes,
+                                                        selector,
+                                                        health,
+                                                        pool,
+                                                        cfg,
+                                                        listener_stats: listener_stats
+                                                            .clone(),
+                                                        peer,
+                                                    },
+                                                )
+                                                .await;
+                                                return;
+                                            }
                                             let conn = Connection::Tls { inner: tls_stream };
-                                            let state = ConnectionState {
+                                            let state = ConnectionState::new(
                                                 server_port,
                                                 routes,
-                                                pool,
+                                                make_pool(&shared_pool, &cfg),
                                                 selector,
                                                 health,
-                                                is_tls: true,
-                                                peer_ip: peer.ip(),
-                                                client_header_timeout: cfg.client_header_timeout,
-                                                connect_timeout: cfg.connect_timeout,
-                                                header_buf: Vec::with_capacity(1024),
-                                                scratch_buf: Vec::with_capacity(1024),
-                                                idle_body_timeout: idle_opt(
-                                                    cfg.idle_body_timeout,
-                                                ),
-                                                listener_stats: listener_stats.clone(),
-                                                last_status: 0,
-                                            };
+                                                true,
+                                                peer.ip(),
+                                                &cfg,
+                                                listener_stats.clone(),
+                                            );
                                             let _ = handle_connection(conn, peer, state).await;
                                         }
                                         Ok(Err(_e)) => {
@@ -293,23 +358,17 @@ pub async fn run_worker(
                                 }
                             });
                         } else {
-                            let selector = selector.clone();
-                            let state = ConnectionState {
+                            let state = ConnectionState::new(
                                 server_port,
                                 routes,
-                                pool: make_pool(&shared_pool),
-                                selector,
+                                make_pool(&shared_pool, &cfg),
+                                selector.clone(),
                                 health,
-                                is_tls: false,
-                                peer_ip: peer.ip(),
-                                client_header_timeout: cfg.client_header_timeout,
-                                connect_timeout: cfg.connect_timeout,
-                                header_buf: Vec::with_capacity(1024),
-                                scratch_buf: Vec::with_capacity(1024),
-                                idle_body_timeout: idle_opt(cfg.idle_body_timeout),
-                                listener_stats: listener_stats.clone(),
-                                last_status: 0,
-                            };
+                                false,
+                                peer.ip(),
+                                &cfg,
+                                listener_stats.clone(),
+                            );
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
                                 let conn = Connection::Plain { inner: tcp_stream };
@@ -326,7 +385,7 @@ pub async fn run_worker(
     }
 }
 
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     mut client: Connection,
     _peer: SocketAddr,
     mut state: ConnectionState,
@@ -1326,8 +1385,10 @@ struct ResponseFraming {
 }
 
 /// Cap of bytes accumulated while waiting for backend response headers. Protects
-/// against a backend that never finishes its header block.
-const RESPONSE_HEADER_CAP: usize = 65536;
+/// against a backend that never finishes its header block. pub(crate) so the
+/// h2 bridge sizes its own response-head accumulation from the same limit
+/// instead of a copy that could drift below it.
+pub(crate) const RESPONSE_HEADER_CAP: usize = 65536;
 
 /// Phase 1 — read response headers from the backend into `header_buf`. Performs
 /// NO writes to the client; aborting/timeout/error before this returns leaves the
@@ -1380,8 +1441,7 @@ async fn read_response_headers(
             // of the response's Content-Length / Transfer-Encoding. Forcing
             // no_body here keeps `forward_response_body` from blocking on
             // bytes the backend correctly never sends.
-            let no_body =
-                is_head_request || status == 204 || status == 304 || (100..200).contains(&status);
+            let no_body = response_has_no_body(status, is_head_request);
 
             // Decide how many of the tail bytes (same read as the headers)
             // belong to THIS response's body. Anything beyond the declared
@@ -1526,8 +1586,16 @@ async fn terminate_stream_gracefully(client: &mut Connection, framing: &Response
 
 /// Zero means disabled in the config; the streaming loops branch on Option.
 #[inline]
-fn idle_opt(d: Duration) -> Option<Duration> {
+pub(crate) fn idle_opt(d: Duration) -> Option<Duration> {
     (!d.is_zero()).then_some(d)
+}
+
+/// Whether a response of this status carries no body (RFC 7230 3.3): HEAD
+/// requests, 204, 304, and all 1xx. Shared with the h2 bridge so both
+/// framing paths agree on which responses end at their headers.
+#[inline]
+pub(crate) fn response_has_no_body(status: u16, is_head: bool) -> bool {
+    is_head || status == 204 || status == 304 || (100..200).contains(&status)
 }
 
 /// Await one body-streaming I/O step under the optional progress budget.
@@ -1723,13 +1791,13 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
 
 // --- HTTP response parsing helpers ---
 
-fn parse_content_length(headers: &[u8]) -> Option<usize> {
+pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
     crate::routing::find_header_value(headers, "content-length")?
         .parse()
         .ok()
 }
 
-fn is_chunked_transfer(headers: &[u8]) -> bool {
+pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
     crate::routing::find_header_value(headers, "transfer-encoding")
         .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
 }
@@ -1753,7 +1821,7 @@ fn response_wants_close(headers: &[u8]) -> bool {
 
 /// Parse the 3-digit status code from a response status line
 /// ("HTTP/1.1 200 ..."). Returns 0 when unparseable.
-fn parse_response_status(headers: &[u8]) -> u16 {
+pub(crate) fn parse_response_status(headers: &[u8]) -> u16 {
     if headers.len() < 12 {
         return 0;
     }

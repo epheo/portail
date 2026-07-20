@@ -24,12 +24,14 @@ use crate::logging::warn;
 pin_project! {
     /// Unified connection type — avoids making every handler function generic.
     /// Supports plain TCP, server-side TLS (for accepting client connections),
-    /// and client-side TLS (for connecting to HTTPS backends).
+    /// client-side TLS (for connecting to HTTPS backends), and the in-memory
+    /// pipe the h2 bridge uses to replay each h2 stream through the engine.
     #[project = ConnectionProj]
     pub enum Connection {
         Plain { #[pin] inner: TcpStream },
         Tls { #[pin] inner: ServerTlsStream<TcpStream> },
         ClientTls { #[pin] inner: ClientTlsStream<TcpStream> },
+        Mem { #[pin] inner: tokio::io::DuplexStream },
     }
 }
 
@@ -43,6 +45,7 @@ impl AsyncRead for Connection {
             ConnectionProj::Plain { inner } => inner.poll_read(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_read(cx, buf),
             ConnectionProj::ClientTls { inner } => inner.poll_read(cx, buf),
+            ConnectionProj::Mem { inner } => inner.poll_read(cx, buf),
         }
     }
 }
@@ -57,6 +60,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_write(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_write(cx, buf),
             ConnectionProj::ClientTls { inner } => inner.poll_write(cx, buf),
+            ConnectionProj::Mem { inner } => inner.poll_write(cx, buf),
         }
     }
 
@@ -65,6 +69,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_flush(cx),
             ConnectionProj::Tls { inner } => inner.poll_flush(cx),
             ConnectionProj::ClientTls { inner } => inner.poll_flush(cx),
+            ConnectionProj::Mem { inner } => inner.poll_flush(cx),
         }
     }
 
@@ -73,6 +78,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_shutdown(cx),
             ConnectionProj::Tls { inner } => inner.poll_shutdown(cx),
             ConnectionProj::ClientTls { inner } => inner.poll_shutdown(cx),
+            ConnectionProj::Mem { inner } => inner.poll_shutdown(cx),
         }
     }
 }
@@ -83,6 +89,7 @@ impl Connection {
             Connection::Plain { inner } => inner.set_nodelay(nodelay),
             Connection::Tls { inner } => inner.get_ref().0.set_nodelay(nodelay),
             Connection::ClientTls { inner } => inner.get_ref().0.set_nodelay(nodelay),
+            Connection::Mem { .. } => Ok(()),
         }
     }
 
@@ -90,13 +97,13 @@ impl Connection {
     /// For plain TCP, delegates to TcpStream::try_read.
     /// For TLS, returns WouldBlock — TLS connections cannot be probed without
     /// consuming state, so we optimistically treat them as alive.
+    /// Mem never enters the pool; the arm exists for exhaustiveness.
     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Connection::Plain { inner } => inner.try_read(buf),
-            Connection::Tls { .. } | Connection::ClientTls { .. } => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "tls probe skipped",
-            )),
+            Connection::Tls { .. } | Connection::ClientTls { .. } | Connection::Mem { .. } => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "probe skipped"))
+            }
         }
     }
 }
@@ -249,7 +256,12 @@ pub fn validate_cert_key_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
 /// This is the reusable core — called by both standalone and K8s modes.
 /// Individual cert refs that fail to load are skipped (with a warning)
 /// rather than failing the entire config — essential for multi-gateway merging.
-pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<ServerConfig> {
+/// `http2` controls the ALPN advertisement (see below).
+pub fn build_server_config(
+    cert_refs: &[CertificateRef],
+    cert_dir: &Path,
+    http2: bool,
+) -> Result<ServerConfig> {
     if cert_refs.is_empty() {
         return Err(anyhow!(
             "TLS Terminate mode requires at least one certificateRef"
@@ -314,10 +326,15 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
 
-    // Advertise HTTP/1.1 via ALPN. Without this, browsers may negotiate HTTP/2
-    // during the TLS handshake. Portail only speaks HTTP/1.1, and WebSocket
-    // upgrades (Connection: Upgrade) are exclusively HTTP/1.1.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // ALPN doubles as the dispatch signal: h2 is advertised only when the
+    // bridge serves it, else browsers would negotiate a protocol nobody
+    // speaks. WebSocket upgrades (Connection: Upgrade) are h1-only either
+    // way - h2 clients fall back to http/1.1 for them.
+    config.alpn_protocols = if http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
 
     Ok(config)
 }
@@ -329,7 +346,7 @@ pub fn build_server_config(cert_refs: &[CertificateRef], cert_dir: &Path) -> Res
 ///   {cert_dir}/{name}.crt  and  {cert_dir}/{name}.key
 #[cfg(test)]
 pub fn build_tls_acceptor(cert_refs: &[CertificateRef], cert_dir: &Path) -> Result<TlsAcceptor> {
-    let config = build_server_config(cert_refs, cert_dir)?;
+    let config = build_server_config(cert_refs, cert_dir, false)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -808,7 +825,8 @@ mod tests {
             key_pem: Some(key_pem.clone()),
             ..Default::default()
         };
-        let config = build_server_config(&[cert_ref], std::path::Path::new("/unused")).unwrap();
+        let config =
+            build_server_config(&[cert_ref], std::path::Path::new("/unused"), false).unwrap();
         let dynamic = DynamicTlsAcceptor::new(config);
 
         // Can get an acceptor
@@ -826,7 +844,7 @@ mod tests {
             ..Default::default()
         };
         let new_config =
-            build_server_config(&[cert_ref2], std::path::Path::new("/unused")).unwrap();
+            build_server_config(&[cert_ref2], std::path::Path::new("/unused"), false).unwrap();
         dynamic.update(new_config);
 
         // Can still get an acceptor (now using new config)
@@ -858,7 +876,7 @@ mod tests {
         }
 
         // Build a merged ServerConfig with all 3 certs (simulates what controller does)
-        let result = build_server_config(&all_refs, std::path::Path::new("/unused"));
+        let result = build_server_config(&all_refs, std::path::Path::new("/unused"), false);
         assert!(
             result.is_ok(),
             "merged multi-gateway config should succeed: {:?}",
@@ -880,7 +898,8 @@ mod tests {
             key_pem: Some(key4),
             ..Default::default()
         });
-        let new_config = build_server_config(&all_refs, std::path::Path::new("/unused")).unwrap();
+        let new_config =
+            build_server_config(&all_refs, std::path::Path::new("/unused"), false).unwrap();
         dynamic.update(new_config);
 
         // Acceptor should work with the updated merged config
@@ -903,7 +922,7 @@ mod tests {
 
         // Build config with specific cert — accessing it via the ServerConfig
         // means the SniCertResolver is embedded. We test indirectly via build_server_config.
-        let config = build_server_config(&[cert_ref], std::path::Path::new("/unused"));
+        let config = build_server_config(&[cert_ref], std::path::Path::new("/unused"), false);
         assert!(config.is_ok(), "single cert config should succeed");
     }
 
