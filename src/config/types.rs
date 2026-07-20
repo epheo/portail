@@ -657,7 +657,7 @@ pub struct PerformanceConfig {
     /// do not survive the bridge, so gRPC cannot ride it. Each h2 stream is
     /// its own engine exchange: with the default
     /// `backendPoolScope: connection` no backend reuse happens across
-    /// streams — prefer `process` scope alongside this.
+    /// streams - prefer `process` scope alongside this.
     #[serde(default)]
     pub http2: bool,
 }

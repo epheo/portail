@@ -25,6 +25,9 @@ use crate::metrics::ListenerStats;
 use crate::proxy::backend_pool::SharedBackendPool;
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
+use crate::proxy::http_filters::{
+    header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+};
 use crate::proxy::http_parser::find_header_end;
 use crate::proxy::tls::Connection;
 use crate::proxy::worker::{self, WorkerConfig};
@@ -43,16 +46,25 @@ const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
 /// typical exchange crosses in one hop.
 const DUPLEX_BUF: usize = 64 * 1024;
 
-/// Engine responses cap their header block at 64 KiB; the replay inherits it.
-const RESPONSE_HEAD_CAP: usize = 64 * 1024;
+/// Size of each response read from the duplex.
+const RESP_READ: usize = 16 * 1024;
+
+/// Ceiling on response-head bytes accumulated before the terminator is found.
+/// Tied to the engine's own header cap plus one read of body overshoot, so an
+/// engine-legal head is never rejected only on the h2 path.
+const RESPONSE_HEAD_CAP: usize = worker::RESPONSE_HEADER_CAP + RESP_READ;
 
 /// Everything a bridged connection shares with its listener's accept loop.
+/// `pool` is resolved once per h2 connection (the process-wide pool under
+/// `backendPoolScope: process`, else one shared pool for this connection's
+/// streams) so streams reuse backend connections like h1 keepalive requests
+/// instead of each building a fresh pool.
 pub(crate) struct H2Ctx {
     pub(crate) server_port: u16,
     pub(crate) routes: Arc<ArcSwap<RouteTable>>,
     pub(crate) selector: Arc<BackendSelector>,
     pub(crate) health: Arc<HealthRegistry>,
-    pub(crate) shared_pool: Option<Arc<SharedBackendPool>>,
+    pub(crate) pool: Arc<SharedBackendPool>,
     pub(crate) cfg: WorkerConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
@@ -94,26 +106,31 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
 /// Replay one h2 stream as an h1 exchange through the engine.
 async fn serve_stream(
     req: http::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
+    respond: h2::server::SendResponse<Bytes>,
     ctx: &H2Ctx,
 ) -> Result<()> {
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
-    let idle = idle_opt(ctx.cfg.idle_body_timeout);
+    let idle = worker::idle_opt(ctx.cfg.idle_body_timeout);
 
     let Some((head, chunk_body)) = synth_request_head(&parts, body.is_end_stream()) else {
         // CONNECT or no authority: not expressible as an origin-form h1
-        // exchange through the engine.
+        // exchange through the engine. Count it like an engine-answered
+        // error so refusals are not invisible to /metrics.
+        ctx.listener_stats
+            .http_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut respond = respond;
         let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
     };
 
-    let (mut io, engine_io) = tokio::io::duplex(DUPLEX_BUF);
+    let (io, engine_io) = tokio::io::duplex(DUPLEX_BUF);
     let state = worker::ConnectionState::new(
         ctx.server_port,
         ctx.routes.clone(),
-        worker::make_pool(&ctx.shared_pool, &ctx.cfg),
+        crate::proxy::backend_pool::PoolHandle::Shared(ctx.pool.clone()),
         ctx.selector.clone(),
         ctx.health.clone(),
         true,
@@ -123,22 +140,37 @@ async fn serve_stream(
     );
     let engine = worker::handle_connection(Connection::Mem { inner: engine_io }, ctx.peer, state);
 
-    let bridge = async {
-        // The engine half can drop early (its error response is already
-        // written and buffered), so write failures fall through to the
-        // response phase instead of aborting the stream.
-        if io.write_all(&head).await.is_ok() && !body.is_end_stream() {
-            pump_request_body(&mut io, body, chunk_body).await?;
+    // The bridge owns its duplex half and drops it on completion, so the
+    // engine sees EOF and unblocks even when the client aborts the stream;
+    // otherwise the engine would park on the duplex until idle_body_timeout,
+    // pinning a backend connection long after the client gave up.
+    let bridge = async move {
+        let mut io = io;
+        let mut respond = respond;
+        let result = async {
+            // A duplex write failing means the engine already answered and
+            // dropped its half (e.g. a routing 404); fall through to read
+            // that buffered response rather than aborting the stream.
+            if io.write_all(&head).await.is_ok() {
+                // Always pump: for a chunked body this must emit the
+                // terminator even when the body is empty, and for a
+                // content-length/no-body head it returns as soon as the h2
+                // stream ends.
+                pump_request_body(&mut io, body, chunk_body, idle).await?;
+            }
+            forward_response(&mut io, &mut respond, is_head, idle).await
         }
-        forward_response(&mut io, &mut respond, is_head, idle).await
+        .await;
+        drop(io);
+        if result.is_err() {
+            respond.send_reset(h2::Reason::INTERNAL_ERROR);
+        }
+        result
     };
 
     // Engine errors (client-equivalent close, backend failures it already
     // answered) are its own business; the stream outcome is the bridge's.
-    let (_, result) = tokio::join!(engine, bridge);
-    if result.is_err() {
-        respond.send_reset(h2::Reason::INTERNAL_ERROR);
-    }
+    let (_engine, result) = tokio::join!(engine, bridge);
     result
 }
 
@@ -212,20 +244,18 @@ fn synth_request_head(parts: &http::request::Parts, no_body: bool) -> Option<(Ve
 }
 
 /// Connection-scoped headers do not survive protocol translation (RFC 9113
-/// 8.2.2). `host` is re-derived from :authority; `expect` is dropped so the
-/// engine's own 100-continue answer never lands inside an h2 stream;
-/// `content-length` is replaced by an explicit zero on bodyless requests.
+/// 8.2.2). Reuses the engine's request hop-by-hop set (connection, keep-alive,
+/// proxy-connection, te, trailer, expect -- expect so the engine's own
+/// 100-continue never lands inside a stream) and adds the bridge-specific
+/// drops: `host` (re-derived from :authority), `upgrade`, `transfer-encoding`
+/// (we choose the request framing), and `content-length` on a bodyless request
+/// (replaced by an explicit zero).
 fn skip_request_header(name: &http::HeaderName, no_body: bool) -> bool {
     use http::header;
-    name == header::HOST
-        || name == header::CONNECTION
-        || name == header::TRANSFER_ENCODING
+    is_hop_by_hop_request_header(name.as_str().as_bytes())
+        || name == header::HOST
         || name == header::UPGRADE
-        || name == header::TE
-        || name == header::TRAILER
-        || name == header::EXPECT
-        || name == "keep-alive"
-        || name == "proxy-connection"
+        || name == header::TRANSFER_ENCODING
         || (no_body && name == header::CONTENT_LENGTH)
 }
 
@@ -237,23 +267,37 @@ async fn pump_request_body(
     io: &mut DuplexStream,
     mut body: h2::RecvStream,
     chunked: bool,
+    idle: Option<Duration>,
 ) -> Result<()> {
     let mut framed = Vec::new();
-    while let Some(data) = body.data().await {
+    // Bounded like every other bridge await: a client that opens a stream and
+    // then withholds DATA must not park this task past the idle budget
+    // (client_header_timeout only covers the h2 handshake).
+    while let Some(data) = progress(idle, body.data()).await? {
         let data = data.map_err(|e| anyhow!("h2 request body: {}", e))?;
+        let n = data.len();
+        // Release the flow-control window for every received byte, empty
+        // frames included, before deciding whether to forward.
+        let _ = body.flow_control().release_capacity(n);
+        // A zero-length interior DATA frame (legal, END_STREAM unset) carries
+        // no body bytes; re-framed as a chunk it would be "0\r\n\r\n" -- the
+        // chunked terminator -- truncating the body mid-stream. Skip it; the
+        // real terminator is written once below.
+        if n == 0 {
+            continue;
+        }
         let write_ok = if chunked {
             use std::io::Write;
             framed.clear();
-            framed.reserve(data.len() + 16);
-            let _ = write!(framed, "{:x}\r\n", data.len());
+            framed.reserve(n + 16);
+            let _ = write!(framed, "{:x}\r\n", n);
             framed.extend_from_slice(&data);
             framed.extend_from_slice(b"\r\n");
             io.write_all(&framed).await.is_ok()
         } else {
             io.write_all(&data).await.is_ok()
         };
-        // Best-effort: a closed connection ends the stream via data() anyway.
-        let _ = body.flow_control().release_capacity(data.len());
+        // A closed engine half ends the exchange; its response is buffered.
         if !write_ok {
             return Ok(());
         }
@@ -275,7 +319,7 @@ async fn forward_response(
     idle: Option<Duration>,
 ) -> Result<()> {
     let mut head: Vec<u8> = Vec::with_capacity(1024);
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; RESP_READ];
     let header_end = loop {
         if let Some(end) = find_header_end(&head) {
             break end;
@@ -293,10 +337,16 @@ async fn forward_response(
     };
 
     let status = worker::parse_response_status(&head[..header_end]);
-    let resp = build_h2_response(&head[..header_end], status)?;
     let content_length = worker::parse_content_length(&head[..header_end]);
     let chunked = worker::is_chunked_transfer(&head[..header_end]);
-    let no_body = is_head || status == 204 || status == 304 || content_length == Some(0);
+    // Chunked framing wins over content-length (RFC 7230 3.3.3), matching the
+    // engine, so a chunked body is never cut short by a stray Content-Length: 0.
+    let no_body =
+        worker::response_has_no_body(status, is_head) || (!chunked && content_length == Some(0));
+    // We reframe a chunked body into DATA, so the h2 response must not also
+    // carry the backend's content-length: the DATA total need not equal it and
+    // a mismatch is malformed per RFC 9113 8.1.1.
+    let resp = build_h2_response(&head[..header_end], status, chunked)?;
 
     let mut send = respond
         .send_response(resp, no_body)
@@ -353,7 +403,7 @@ async fn forward_response(
         }
         Ok(())
     } else {
-        // EOF-framed: the engine's `connection: close` reply — everything
+        // EOF-framed: the engine's `connection: close` reply - everything
         // until duplex EOF is body.
         if !tail.is_empty() {
             send_data(&mut send, Bytes::copy_from_slice(&tail), false, idle).await?;
@@ -391,48 +441,69 @@ async fn feed_chunked(
     Ok(done)
 }
 
-/// Map the engine's h1 response head onto an h2 response.
-fn build_h2_response(head: &[u8], status: u16) -> Result<http::Response<()>> {
+/// Map the engine's h1 response head onto an h2 response. `drop_content_length`
+/// strips the backend's content-length (set when the body is chunk-decoded, so
+/// the DATA total may differ). A header the http crate rejects is dropped, not
+/// fatal: the h1 client gets it verbatim, so the h2 client must not lose the
+/// whole response to one odd line.
+fn build_h2_response(
+    head: &[u8],
+    status: u16,
+    drop_content_length: bool,
+) -> Result<http::Response<()>> {
+    use http::header::{HeaderName, HeaderValue};
     let mut builder = http::Response::builder()
         .status(http::StatusCode::from_u16(status).map_err(|_| anyhow!("bad engine status"))?);
-    let mut lines = head.split(|&b| b == b'\n');
-    lines.next(); // status line
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            break;
+    let headers = builder
+        .headers_mut()
+        .ok_or_else(|| anyhow!("h2 response builder init failed"))?;
+    for line in header_lines(head) {
+        // Obs-fold continuation (leading OWS, RFC 7230 3.2.4, deprecated) is
+        // not a header on its own; skip it rather than fabricate a bad name.
+        // The status line (no colon) is skipped by the colon check below.
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            continue;
         }
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };
         let name = &line[..colon];
-        if skip_response_header(name) {
+        if skip_response_header(name)
+            || (drop_content_length && name.eq_ignore_ascii_case(b"content-length"))
+        {
             continue;
         }
-        let value = line[colon + 1..]
-            .iter()
-            .position(|&b| b != b' ' && b != b'\t')
-            .map(|s| &line[colon + 1 + s..])
-            .unwrap_or(b"");
-        builder = builder.header(name, value);
+        // Trim leading AND trailing OWS: a trailing space in an h2 field value
+        // is malformed (RFC 9113 8.2.1) and strict clients reject it.
+        let value = trim_ows(&line[colon + 1..]);
+        // Drop a single header the http crate rejects; never fail the whole
+        // response into an INTERNAL_ERROR reset over one bad byte.
+        let (Ok(hn), Ok(hv)) = (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        else {
+            continue;
+        };
+        headers.append(hn, hv);
     }
     builder
         .body(())
         .map_err(|e| anyhow!("h2 response build: {}", e))
 }
 
-/// Hop-by-hop headers stay on the h1 side of the bridge (RFC 9113 8.2.2).
+/// Strip leading and trailing optional whitespace (SP / HTAB) from a value.
+fn trim_ows(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = v {
+        v = rest;
+    }
+    v
+}
+
+/// Response headers that must not cross to the h2 side: the shared hop-by-hop
+/// set plus transfer-encoding (the bridge de-frames the body into DATA).
 fn skip_response_header(name: &[u8]) -> bool {
-    const SKIP: &[&[u8]] = &[
-        b"connection",
-        b"keep-alive",
-        b"proxy-connection",
-        b"transfer-encoding",
-        b"upgrade",
-        b"te",
-        b"trailer",
-    ];
-    SKIP.iter().any(|s| name.eq_ignore_ascii_case(s))
+    is_hop_by_hop_response_header(name) || name.eq_ignore_ascii_case(b"transfer-encoding")
 }
 
 /// Send one payload under h2 flow control, splitting to granted window.
@@ -466,13 +537,9 @@ async fn send_data(
     Ok(())
 }
 
-/// Zero means disabled, mirroring the engine's `idle_body_timeout` handling.
-fn idle_opt(d: Duration) -> Option<Duration> {
-    (!d.is_zero()).then_some(d)
-}
-
 /// Per-step progress budget (None = unbounded), the bridge-side counterpart
-/// of the engine's `idle_guarded`.
+/// of the engine's `idle_guarded` (which is bound to io::Result; this wraps
+/// any future, e.g. h2 body reads and flow-control capacity).
 async fn progress<T, F>(idle: Option<Duration>, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = T>,
@@ -590,19 +657,52 @@ mod tests {
 
     #[test]
     fn response_mapping_strips_hop_by_hop_keeps_the_rest() {
-        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-length: 3\r\nx-custom: v\r\n\r\n";
-        let resp = build_h2_response(head, worker::parse_response_status(head)).unwrap();
+        // Content-Length body (not chunked): the length is preserved.
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 3\r\nx-custom: v\r\n\r\n";
+        let resp = build_h2_response(head, worker::parse_response_status(head), false).unwrap();
         assert_eq!(resp.status(), 200);
         let h = resp.headers();
         assert_eq!(h.get("content-type").unwrap(), "text/plain");
         assert_eq!(h.get("x-custom").unwrap(), "v");
         assert_eq!(h.get("content-length").unwrap(), "3");
         assert!(h.get("connection").is_none());
+    }
+
+    #[test]
+    fn response_mapping_drops_content_length_when_chunked() {
+        // A chunked body is de-framed into DATA; keeping the backend's
+        // content-length would let it contradict the DATA total.
+        let head = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 100\r\nx-k: v\r\n\r\n";
+        let resp = build_h2_response(head, 200, true).unwrap();
+        let h = resp.headers();
+        assert!(h.get("content-length").is_none());
         assert!(h.get("transfer-encoding").is_none());
+        assert_eq!(h.get("x-k").unwrap(), "v");
+    }
+
+    #[test]
+    fn response_mapping_trims_trailing_ows_and_skips_obs_fold() {
+        // Trailing whitespace is illegal in an h2 field value; obs-fold
+        // continuation lines are skipped rather than fabricating a bad name.
+        let head = b"HTTP/1.1 200 OK\r\nx-token: abc \r\n more-of-x-token\r\nx-b: y\r\n\r\n";
+        let resp = build_h2_response(head, 200, false).unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get("x-token").unwrap(), "abc");
+        assert_eq!(h.get("x-b").unwrap(), "y");
+    }
+
+    #[test]
+    fn response_mapping_drops_one_bad_header_not_whole_response() {
+        // A header the http crate rejects must not fail the entire response.
+        let head = b"HTTP/1.1 200 OK\r\nx-good: 1\r\nx-b\x01ad: 2\r\nx-also-good: 3\r\n\r\n";
+        let resp = build_h2_response(head, 200, false).unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get("x-good").unwrap(), "1");
+        assert_eq!(h.get("x-also-good").unwrap(), "3");
     }
 
     #[test]
     fn response_mapping_rejects_unparseable_status() {
-        assert!(build_h2_response(b"garbage\r\n\r\n", 0).is_err());
+        assert!(build_h2_response(b"garbage\r\n\r\n", 0, false).is_err());
     }
 }

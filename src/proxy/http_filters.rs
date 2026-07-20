@@ -187,7 +187,7 @@ pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mu
 /// First-byte dispatch keeps the per-line cost to one comparison for the
 /// overwhelmingly common non-hop-by-hop headers.
 #[inline]
-fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
+pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
         Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
         Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
@@ -199,7 +199,7 @@ fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
 }
 
 #[inline]
-fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
+pub(crate) fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
         Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
         Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
@@ -212,7 +212,7 @@ fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
 
 /// Iterate CRLF-separated lines of a header block, excluding the final blank
 /// line. Tolerates a bare-LF separator the way the parsers upstream do.
-fn header_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn header_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         while pos < raw.len() {

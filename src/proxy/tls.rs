@@ -329,7 +329,7 @@ pub fn build_server_config(
     // ALPN doubles as the dispatch signal: h2 is advertised only when the
     // bridge serves it, else browsers would negotiate a protocol nobody
     // speaks. WebSocket upgrades (Connection: Upgrade) are h1-only either
-    // way — h2 clients fall back to http/1.1 for them.
+    // way - h2 clients fall back to http/1.1 for them.
     config.alpn_protocols = if http2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {

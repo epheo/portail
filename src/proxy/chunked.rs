@@ -92,6 +92,22 @@ impl ChunkedStream {
     /// there is no boundary left to respect and the connection is already
     /// unusable for reuse.
     pub fn observe(&mut self, bytes: &[u8]) -> usize {
+        self.advance(bytes, |_| {})
+    }
+
+    /// Like [`observe`](Self::observe), but appends the chunk payloads
+    /// (framing stripped) to `out`. Exists for the h2 bridge, which must
+    /// re-frame an h1 chunked body as DATA frames; the h1 relay paths keep
+    /// `observe` and forward wire bytes verbatim. Both drive the same state
+    /// machine ([`advance`](Self::advance)); the no-op closure in `observe`
+    /// monomorphizes back to the plain scan.
+    pub fn decode_into(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
+        self.advance(bytes, |d| out.extend_from_slice(d))
+    }
+
+    /// Drive the state machine over `bytes`, handing each run of chunk-data
+    /// payload (framing stripped) to `on_data`. Returns bytes consumed.
+    fn advance(&mut self, bytes: &[u8], mut on_data: impl FnMut(&[u8])) -> usize {
         let mut i = 0;
         while i < bytes.len() {
             // Terminal phases: Done stops consuming at the boundary; Broken
@@ -105,36 +121,8 @@ impl ChunkedStream {
             // instead of stepping byte by byte. This is the hot path
             // for large bodies — most bytes never need inspection.
             if let Phase::Data { remaining } = &mut self.phase {
-                let take = (*remaining).min((bytes.len() - i) as u64);
-                *remaining -= take;
-                i += take as usize;
-                if *remaining == 0 {
-                    self.phase = Phase::DataCrlf { saw_cr: false };
-                }
-                continue;
-            }
-            self.step(bytes[i]);
-            i += 1;
-        }
-        i
-    }
-
-    /// Like [`observe`](Self::observe), but appends the chunk payloads
-    /// (framing stripped) to `out`. Exists for the h2 bridge, which must
-    /// re-frame an h1 chunked body as DATA frames; the h1 relay paths keep
-    /// `observe` and forward wire bytes verbatim, so this stays off their
-    /// hot path.
-    pub fn decode_into(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
-        let mut i = 0;
-        while i < bytes.len() {
-            match self.phase {
-                Phase::Done => return i,
-                Phase::Broken => return bytes.len(),
-                _ => {}
-            }
-            if let Phase::Data { remaining } = &mut self.phase {
                 let take = (*remaining).min((bytes.len() - i) as u64) as usize;
-                out.extend_from_slice(&bytes[i..i + take]);
+                on_data(&bytes[i..i + take]);
                 *remaining -= take as u64;
                 i += take;
                 if *remaining == 0 {

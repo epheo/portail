@@ -95,7 +95,7 @@ h2 clients share the same port. Plain-HTTP and passthrough listeners are
 unaffected, and with the flag off the data path is byte-for-byte unchanged.
 
 Each h2 stream is bridged through the same HTTP/1.1 engine that serves h1
-clients — routing, filters, timeouts, backend pooling, metrics, and access
+clients - routing, filters, timeouts, backend pooling, metrics, and access
 logs behave identically. The bridge costs one in-memory hop per direction,
 paid only by h2 connections. Negotiation volume is visible in
 `portail_http2_connections_total`.

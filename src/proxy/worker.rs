@@ -299,6 +299,16 @@ pub async fn run_worker(
                                                     == Some(b"h2".as_ref())
                                             {
                                                 METRICS.http2_connections_total.inc();
+                                                // One pool per h2 connection: the
+                                                // process pool when set, else a
+                                                // connection-scoped pool its streams
+                                                // share (h1 keepalive semantics).
+                                                let pool = shared_pool.unwrap_or_else(|| {
+                                                    Arc::new(SharedBackendPool::new(
+                                                        cfg.max_idle_per_backend,
+                                                        cfg.connect_timeout,
+                                                    ))
+                                                });
                                                 crate::proxy::h2_bridge::serve(
                                                     tls_stream,
                                                     crate::proxy::h2_bridge::H2Ctx {
@@ -306,7 +316,7 @@ pub async fn run_worker(
                                                         routes,
                                                         selector,
                                                         health,
-                                                        shared_pool,
+                                                        pool,
                                                         cfg,
                                                         listener_stats: listener_stats
                                                             .clone(),
@@ -1375,8 +1385,10 @@ struct ResponseFraming {
 }
 
 /// Cap of bytes accumulated while waiting for backend response headers. Protects
-/// against a backend that never finishes its header block.
-const RESPONSE_HEADER_CAP: usize = 65536;
+/// against a backend that never finishes its header block. pub(crate) so the
+/// h2 bridge sizes its own response-head accumulation from the same limit
+/// instead of a copy that could drift below it.
+pub(crate) const RESPONSE_HEADER_CAP: usize = 65536;
 
 /// Phase 1 — read response headers from the backend into `header_buf`. Performs
 /// NO writes to the client; aborting/timeout/error before this returns leaves the
@@ -1429,8 +1441,7 @@ async fn read_response_headers(
             // of the response's Content-Length / Transfer-Encoding. Forcing
             // no_body here keeps `forward_response_body` from blocking on
             // bytes the backend correctly never sends.
-            let no_body =
-                is_head_request || status == 204 || status == 304 || (100..200).contains(&status);
+            let no_body = response_has_no_body(status, is_head_request);
 
             // Decide how many of the tail bytes (same read as the headers)
             // belong to THIS response's body. Anything beyond the declared
@@ -1575,8 +1586,16 @@ async fn terminate_stream_gracefully(client: &mut Connection, framing: &Response
 
 /// Zero means disabled in the config; the streaming loops branch on Option.
 #[inline]
-fn idle_opt(d: Duration) -> Option<Duration> {
+pub(crate) fn idle_opt(d: Duration) -> Option<Duration> {
     (!d.is_zero()).then_some(d)
+}
+
+/// Whether a response of this status carries no body (RFC 7230 3.3): HEAD
+/// requests, 204, 304, and all 1xx. Shared with the h2 bridge so both
+/// framing paths agree on which responses end at their headers.
+#[inline]
+pub(crate) fn response_has_no_body(status: u16, is_head: bool) -> bool {
+    is_head || status == 204 || status == 304 || (100..200).contains(&status)
 }
 
 /// Await one body-streaming I/O step under the optional progress budget.
