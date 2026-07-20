@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::PortailConfig;
@@ -68,7 +68,7 @@ pub async fn watch_config(
 /// Strict conversion: a backendRef that fails DNS resolution rejects the whole
 /// reload (existing routes stay live) rather than silently swapping in a route
 /// with zero backends and degrading live traffic to 5xx.
-fn reload_routes(config_path: &PathBuf, routes: &Arc<ArcSwap<RouteTable>>) -> Result<()> {
+fn reload_routes(config_path: &Path, routes: &Arc<ArcSwap<RouteTable>>) -> Result<()> {
     let config = PortailConfig::load_from_file(config_path)?;
     let route_table = config.to_route_table_strict()?;
 

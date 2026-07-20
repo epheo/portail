@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -318,27 +318,27 @@ async fn forward_response(
     is_head: bool,
     idle: Option<Duration>,
 ) -> Result<()> {
-    let mut head: Vec<u8> = Vec::with_capacity(1024);
-    let mut buf = vec![0u8; RESP_READ];
+    // After a freeze detaches the accumulator's capacity, an unreserved
+    // read_buf degrades to 64-byte reads; reserve keeps them at RESP_READ.
+    let mut acc = BytesMut::with_capacity(RESP_READ);
     let header_end = loop {
-        if let Some(end) = find_header_end(&head) {
+        if let Some(end) = find_header_end(&acc) {
             break end;
         }
-        if head.len() > RESPONSE_HEAD_CAP {
+        if acc.len() > RESPONSE_HEAD_CAP {
             return Err(anyhow!("engine response headers exceed cap"));
         }
         // The engine's own budgets (backend TTFB, request deadline, idle
         // body) bound how long this read can park; no extra timer needed.
-        let n = io.read(&mut buf).await?;
-        if n == 0 {
+        acc.reserve(RESP_READ);
+        if io.read_buf(&mut acc).await? == 0 {
             return Err(anyhow!("engine closed before response headers"));
         }
-        head.extend_from_slice(&buf[..n]);
     };
 
-    let status = worker::parse_response_status(&head[..header_end]);
-    let content_length = worker::parse_content_length(&head[..header_end]);
-    let chunked = worker::is_chunked_transfer(&head[..header_end]);
+    let status = worker::parse_response_status(&acc[..header_end]);
+    let content_length = worker::parse_content_length(&acc[..header_end]);
+    let chunked = worker::is_chunked_transfer(&acc[..header_end]);
     // Chunked framing wins over content-length (RFC 7230 3.3.3), matching the
     // engine, so a chunked body is never cut short by a stray Content-Length: 0.
     let no_body =
@@ -346,7 +346,7 @@ async fn forward_response(
     // We reframe a chunked body into DATA, so the h2 response must not also
     // carry the backend's content-length: the DATA total need not equal it and
     // a mismatch is malformed per RFC 9113 8.1.1.
-    let resp = build_h2_response(&head[..header_end], status, chunked)?;
+    let resp = build_h2_response(&acc[..header_end], status, chunked)?;
 
     let mut send = respond
         .send_response(resp, no_body)
@@ -356,66 +356,54 @@ async fn forward_response(
     }
 
     // Body bytes that arrived in the same reads as the head.
-    let tail = head.split_off(header_end);
+    acc.advance(header_end);
 
     if chunked {
         let mut dec = ChunkedStream::new();
         let mut scratch = Vec::with_capacity(16 * 1024);
-        if feed_chunked(&mut dec, &tail, &mut scratch, &mut send, idle).await? {
-            return Ok(());
-        }
         loop {
-            let n = progress(idle, io.read(&mut buf)).await??;
+            if feed_chunked(&mut dec, &acc, &mut scratch, &mut send, idle).await? {
+                return Ok(());
+            }
+            acc.clear();
+            acc.reserve(RESP_READ);
+            let n = progress(idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 return Err(anyhow!("truncated chunked response"));
-            }
-            if feed_chunked(&mut dec, &buf[..n], &mut scratch, &mut send, idle).await? {
-                return Ok(());
             }
         }
     } else if let Some(cl) = content_length {
         let mut remaining = cl;
-        let take = tail.len().min(remaining);
-        if take > 0 {
-            send_data(
-                &mut send,
-                Bytes::copy_from_slice(&tail[..take]),
-                take == remaining,
-                idle,
-            )
-            .await?;
-            remaining -= take;
-        }
-        while remaining > 0 {
-            let n = progress(idle, io.read(&mut buf)).await??;
+        loop {
+            let take = acc.len().min(remaining);
+            if take > 0 {
+                let eos = take == remaining;
+                send_data(&mut send, acc.split_to(take).freeze(), eos, idle).await?;
+                remaining -= take;
+            }
+            if remaining == 0 {
+                return Ok(());
+            }
+            acc.reserve(RESP_READ);
+            let n = progress(idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 return Err(anyhow!("truncated response body"));
             }
-            let take = n.min(remaining);
-            send_data(
-                &mut send,
-                Bytes::copy_from_slice(&buf[..take]),
-                take == remaining,
-                idle,
-            )
-            .await?;
-            remaining -= take;
         }
-        Ok(())
     } else {
         // EOF-framed: the engine's `connection: close` reply - everything
         // until duplex EOF is body.
-        if !tail.is_empty() {
-            send_data(&mut send, Bytes::copy_from_slice(&tail), false, idle).await?;
-        }
         loop {
-            let n = progress(idle, io.read(&mut buf)).await??;
+            if !acc.is_empty() {
+                send_data(&mut send, acc.split().freeze(), false, idle).await?;
+            }
+            acc.reserve(RESP_READ);
+            let n = progress(idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 send.send_data(Bytes::new(), true)
                     .map_err(|e| anyhow!("h2 send: {}", e))?;
                 return Ok(());
             }
-            send_data(&mut send, Bytes::copy_from_slice(&buf[..n]), false, idle).await?;
         }
     }
 }

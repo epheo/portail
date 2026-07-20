@@ -377,7 +377,7 @@ pub fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
     if buf.len() < 5 + record_len {
         return ClientHelloPeek::Partial;
     }
-    ClientHelloPeek::Complete(extract_sni(buf))
+    ClientHelloPeek::Complete(extract_sni_handshake(&buf[5..5 + record_len]))
 }
 
 /// Peek the client's first TLS record and extract SNI, waiting within
@@ -438,8 +438,12 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
     if buf.len() < 5 + record_len {
         return None;
     }
-    let hs = &buf[5..5 + record_len];
+    extract_sni_handshake(&buf[5..5 + record_len])
+}
 
+/// Extract SNI from the record's handshake fragment; the record layer has
+/// already been validated by the caller.
+fn extract_sni_handshake(hs: &[u8]) -> Option<String> {
     // Handshake: type(1) + length(3)
     if hs.is_empty() || hs[0] != 0x01 {
         return None; // Not a ClientHello
@@ -742,38 +746,16 @@ mod tests {
 
     #[test]
     fn test_build_tls_acceptor_multiple_certs() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
 
         // Generate two self-signed certs
         for name in &["cert-a", "cert-b"] {
-            let key_path = dir_path.join(format!("{}.key", name));
-            let cert_path = dir_path.join(format!("{}.crt", name));
-            let status = Command::new("openssl")
-                .args([
-                    "req",
-                    "-x509",
-                    "-newkey",
-                    "ec",
-                    "-pkeyopt",
-                    "ec_paramgen_curve:prime256v1",
-                    "-nodes",
-                    "-keyout",
-                ])
-                .arg(&key_path)
-                .args(["-out"])
-                .arg(&cert_path)
-                .args(["-days", "1", "-subj", &format!("/CN={}", name)])
-                .output();
-            match status {
-                Ok(output) if output.status.success() => {}
-                _ => {
-                    // openssl not available, skip test
-                    return;
-                }
-            }
+            let Some((cert_pem, key_pem)) = generate_test_cert(name) else {
+                return; // openssl unavailable
+            };
+            std::fs::write(dir_path.join(format!("{}.crt", name)), cert_pem).unwrap();
+            std::fs::write(dir_path.join(format!("{}.key", name)), key_pem).unwrap();
         }
 
         let cert_refs = vec![

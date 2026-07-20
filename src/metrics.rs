@@ -152,7 +152,8 @@ impl Histogram {
         // cumulative bucket above the count (render clamps the rest).
         self.count.fetch_add(1, Relaxed);
         self.sum_nanos.fetch_add(nanos, Relaxed);
-        if let Some(idx) = LE_NANOS.iter().position(|&le| nanos <= le) {
+        let idx = LE_NANOS.partition_point(|&le| le < nanos);
+        if idx < LE_NANOS.len() {
             self.buckets[idx].fetch_add(1, Relaxed);
         }
     }
@@ -429,29 +430,31 @@ fn render_listeners(out: &mut String) {
 /// as a gauge so dashboards can overlay readiness flaps on traffic.
 pub fn render(ready: bool) -> String {
     use std::fmt::Write;
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(16384);
     render_counters(&mut out);
-    render_labeled_family(
-        &mut out,
-        &HOST_REQUESTS,
-        "http_requests_total",
-        "host",
-        "HTTP requests dispatched to a backend, by the matched route's configured hostname",
-    );
-    render_labeled_family(
-        &mut out,
-        &BACKEND_CONNECT_ERRORS,
-        "upstream_connect_errors_total",
-        "backend",
-        "Backend connects that failed (client saw 502), by configured backend",
-    );
-    render_labeled_family(
-        &mut out,
-        &BACKEND_CONNECT_TIMEOUTS,
-        "upstream_connect_timeouts_total",
-        "backend",
-        "Backend connects that timed out (client saw 504), by configured backend",
-    );
+    let labeled: [(&'static OnceLock<LabeledFamily>, &str, &str, &str); 3] = [
+        (
+            &HOST_REQUESTS,
+            "http_requests_total",
+            "host",
+            "HTTP requests dispatched to a backend, by the matched route's configured hostname",
+        ),
+        (
+            &BACKEND_CONNECT_ERRORS,
+            "upstream_connect_errors_total",
+            "backend",
+            "Backend connects that failed (client saw 502), by configured backend",
+        ),
+        (
+            &BACKEND_CONNECT_TIMEOUTS,
+            "upstream_connect_timeouts_total",
+            "backend",
+            "Backend connects that timed out (client saw 504), by configured backend",
+        ),
+    ];
+    for (family, name, label, help) in labeled {
+        render_labeled_family(&mut out, family, name, label, help);
+    }
     render_listeners(&mut out);
     render_histogram(
         &mut out,
@@ -543,6 +546,23 @@ mod tests {
             assert!(v >= prev, "non-monotonic bucket line: {line}");
             prev = v;
         }
+    }
+
+    #[test]
+    fn histogram_bucket_bounds_are_inclusive() {
+        use std::time::Duration;
+        let h = Histogram::new();
+        // le buckets are inclusive: a sample exactly on a bound lands in that
+        // bound's bucket, one nano past it in the next (past the last: +Inf).
+        for &le in &LE_NANOS {
+            h.observe(Duration::from_nanos(le));
+            h.observe(Duration::from_nanos(le + 1));
+        }
+        assert_eq!(h.buckets[0].load(Relaxed), 1);
+        for (i, b) in h.buckets.iter().enumerate().skip(1) {
+            assert_eq!(b.load(Relaxed), 2, "bucket {}", i);
+        }
+        assert_eq!(h.count.load(Relaxed), 2 * LE_NANOS.len() as u64);
     }
 
     #[test]
