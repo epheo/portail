@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[derive(Default)]
 pub struct Counter(AtomicU64);
 
 impl Counter {
@@ -26,6 +27,7 @@ impl Counter {
 }
 
 /// Live gauge — incremented and decremented as state comes and goes.
+#[derive(Default)]
 pub struct Gauge(AtomicU64);
 
 impl Gauge {
@@ -299,17 +301,17 @@ fn render_labeled_family(
 #[derive(Default)]
 pub struct ListenerStats {
     /// TCP connections accepted / UDP datagrams received on this listener.
-    pub accepted: AtomicU64,
+    pub accepted: Counter,
     /// Client connections currently open on this listener.
-    pub active: AtomicU64,
+    pub active: Gauge,
     /// HTTP requests dispatched to a backend from this listener.
-    pub http_requests: AtomicU64,
+    pub http_requests: Counter,
     /// Client TLS handshakes that failed or timed out on this listener.
-    pub tls_handshake_failures: AtomicU64,
+    pub tls_handshake_failures: Counter,
     /// Backend connects that failed (client saw 502) for this listener's requests.
-    pub upstream_connect_errors: AtomicU64,
+    pub upstream_connect_errors: Counter,
     /// Backend connects that timed out (client saw 504) for this listener's requests.
-    pub upstream_connect_timeouts: AtomicU64,
+    pub upstream_connect_timeouts: Counter,
     /// 1 while the accept loop is alive, 0 once it has exited. This is the
     /// outside-observable answer to "is anything listening on this port" —
     /// the signal that was missing every time a gateway VIP refused while
@@ -371,37 +373,37 @@ fn render_listeners(out: &mut String) {
             "listener_accepted_total",
             "Connections accepted (TCP) or datagrams received (UDP) per listener",
             "counter",
-            |s| s.accepted.load(Relaxed),
+            |s| s.accepted.get(),
         ),
         (
             "listener_active_connections",
             "Client connections currently open per listener",
             "gauge",
-            |s| s.active.load(Relaxed),
+            |s| s.active.get(),
         ),
         (
             "listener_http_requests_total",
             "HTTP requests dispatched to a backend per listener",
             "counter",
-            |s| s.http_requests.load(Relaxed),
+            |s| s.http_requests.get(),
         ),
         (
             "listener_tls_handshake_failures_total",
             "Client TLS handshakes that failed or timed out per listener",
             "counter",
-            |s| s.tls_handshake_failures.load(Relaxed),
+            |s| s.tls_handshake_failures.get(),
         ),
         (
             "listener_upstream_connect_errors_total",
             "Backend connects that failed (client saw 502) per listener",
             "counter",
-            |s| s.upstream_connect_errors.load(Relaxed),
+            |s| s.upstream_connect_errors.get(),
         ),
         (
             "listener_upstream_connect_timeouts_total",
             "Backend connects that timed out (client saw 504) per listener",
             "counter",
-            |s| s.upstream_connect_timeouts.load(Relaxed),
+            |s| s.upstream_connect_timeouts.get(),
         ),
         (
             "listener_up",
@@ -578,9 +580,9 @@ mod tests {
     #[test]
     fn listener_registry_renders_and_flips_up() {
         let (stats, guard) = register_listener("tcp", 8123);
-        stats.accepted.fetch_add(3, Relaxed);
-        stats.http_requests.fetch_add(2, Relaxed);
-        stats.upstream_connect_errors.fetch_add(1, Relaxed);
+        stats.accepted.add(3);
+        stats.http_requests.add(2);
+        stats.upstream_connect_errors.inc();
         let text = render(true);
         assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
         assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));

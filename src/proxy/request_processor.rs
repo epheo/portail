@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use crate::logging::{debug, error};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::http_parser::{extract_routing_info, ConnectionType};
+use crate::proxy::http_parser::extract_routing_info;
 use crate::routing::{
     Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
@@ -25,6 +25,10 @@ pub struct RequestMeta {
     /// the backend (correctly) never sends.
     pub is_head: bool,
     pub keepalive: bool,
+    /// Byte span of the parsed request path (query stripped) within the
+    /// request buffer, so filters need not re-parse the request line. `None`
+    /// when the parser substituted a static default ("/").
+    pub path_span: Option<(u32, u32)>,
     /// Hop-by-hop header spans recorded by the parser, skipped at forwarding.
     pub strip_spans: crate::proxy::http_parser::StripSpans,
     /// Upgrade header line span; kept only when `is_upgrade`.
@@ -113,7 +117,7 @@ fn analyze_http_request<'a>(
     server_port: u16,
 ) -> Result<RoutingResult<'a>> {
     let request_info = extract_routing_info(request_data)?;
-    let keepalive = request_info.connection_type != ConnectionType::Close;
+    let keepalive = request_info.keepalive;
 
     // RFC 7230 §3.3.3: reject smuggling vectors at the front door — TE+CL
     // coexistence, conflicting duplicate Content-Length values, and any
@@ -151,43 +155,18 @@ fn analyze_http_request<'a>(
     // Check for redirect filters FIRST — redirect rules often have no backends,
     // so we must handle them before the empty-backends check.
     if rule.has_filters {
-        for filter in &rule.filters {
-            if let HttpFilter::RequestRedirect {
-                scheme,
-                hostname,
-                port,
-                path,
+        if let Some((status_code, location)) = build_redirect(
+            rule,
+            request_info.host,
+            request_info.path,
+            is_tls,
+            server_port,
+        ) {
+            return Ok(RoutingResult::HttpRedirect {
                 status_code,
-            } = filter
-            {
-                let redirect_path = match path {
-                    Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
-                    Some(URLRewritePath::ReplacePrefixMatch(value)) => {
-                        crate::proxy::http_filters::join_prefix_path(
-                            value,
-                            crate::proxy::http_filters::prefix_remainder(
-                                &rule.path,
-                                request_info.path,
-                            ),
-                        )
-                    }
-                    None => request_info.path.to_string(),
-                };
-                let default_scheme = if is_tls { "https" } else { "http" };
-                let location = build_redirect_location(
-                    scheme.as_deref(),
-                    hostname.as_deref().unwrap_or(request_info.host),
-                    *port,
-                    &redirect_path,
-                    default_scheme,
-                    server_port,
-                );
-                return Ok(RoutingResult::HttpRedirect {
-                    status_code: *status_code,
-                    location,
-                    keepalive,
-                });
-            }
+                location,
+                keepalive,
+            });
         }
     }
 
@@ -218,11 +197,70 @@ fn analyze_http_request<'a>(
             is_upgrade: request_info.is_upgrade,
             is_head: request_info.method.eq_ignore_ascii_case("HEAD"),
             keepalive,
+            path_span: subslice_span(request_data, request_info.path),
             strip_spans: request_info.strip_spans,
             upgrade_span: request_info.upgrade_span,
             expect_continue: request_info.expect_continue,
         },
     })
+}
+
+/// Resolve the rule's first RequestRedirect filter against the request:
+/// `(status_code, Location)`. Sibling of `extract_url_rewrite` on the
+/// forward path; `None` when the rule carries no redirect.
+fn build_redirect(
+    rule: &HttpRouteRule,
+    request_host: &str,
+    request_path: &str,
+    is_tls: bool,
+    server_port: u16,
+) -> Option<(u16, String)> {
+    for filter in &rule.filters {
+        if let HttpFilter::RequestRedirect {
+            scheme,
+            hostname,
+            port,
+            path,
+            status_code,
+        } = filter
+        {
+            let redirect_path = match path {
+                Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
+                Some(URLRewritePath::ReplacePrefixMatch(value)) => {
+                    crate::proxy::http_filters::join_prefix_path(
+                        value,
+                        crate::proxy::http_filters::prefix_remainder(&rule.path, request_path),
+                    )
+                }
+                None => request_path.to_string(),
+            };
+            let default_scheme = if is_tls { "https" } else { "http" };
+            let location = build_redirect_location(
+                scheme.as_deref(),
+                hostname.as_deref().unwrap_or(request_host),
+                *port,
+                &redirect_path,
+                default_scheme,
+                server_port,
+            );
+            return Some((*status_code, location));
+        }
+    }
+    None
+}
+
+/// Byte span of `sub` within `base`, or `None` when `sub` is not a subslice
+/// (the parser falls back to static defaults like "/" for malformed lines).
+/// Pointer compares only — no deref, so this is safe for any pair.
+fn subslice_span(base: &[u8], sub: &str) -> Option<(u32, u32)> {
+    let base_start = base.as_ptr() as usize;
+    let sub_start = sub.as_ptr() as usize;
+    if sub_start >= base_start && sub_start + sub.len() <= base_start + base.len() {
+        let off = sub_start - base_start;
+        Some((off as u32, (off + sub.len()) as u32))
+    } else {
+        None
+    }
 }
 
 fn build_redirect_location(

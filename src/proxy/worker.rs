@@ -75,6 +75,19 @@ pub struct WorkerConfig {
     pub http2: bool,
 }
 
+impl WorkerConfig {
+    pub fn from_perf(perf: &crate::config::PerformanceConfig, max_idle_per_backend: usize) -> Self {
+        Self {
+            max_idle_per_backend,
+            connect_timeout: perf.backend_timeout,
+            client_header_timeout: perf.client_header_timeout,
+            tcp_keepalive_time: perf.tcp_keepalive_time,
+            idle_body_timeout: perf.idle_body_timeout,
+            http2: perf.http2,
+        }
+    }
+}
+
 /// Probe cadence once `tcp_keepalive_time` idle has elapsed: a peer that
 /// answers none of `TCP_KEEPALIVE_RETRIES` probes spaced
 /// `TCP_KEEPALIVE_INTERVAL` apart is reaped by the kernel (the parked read
@@ -99,8 +112,8 @@ impl ConnGuard {
         counter.fetch_add(1, Ordering::Relaxed);
         METRICS.connections_accepted_total.inc();
         METRICS.active_connections.inc();
-        stats.accepted.fetch_add(1, Ordering::Relaxed);
-        stats.active.fetch_add(1, Ordering::Relaxed);
+        stats.accepted.inc();
+        stats.active.inc();
         Self {
             active: counter,
             stats,
@@ -113,7 +126,7 @@ impl Drop for ConnGuard {
         // Release pairs with the Acquire load in the shutdown drain loop.
         self.active.fetch_sub(1, Ordering::Release);
         METRICS.active_connections.dec();
-        self.stats.active.fetch_sub(1, Ordering::Relaxed);
+        self.stats.active.dec();
     }
 }
 
@@ -137,6 +150,10 @@ pub(crate) struct ConnectionState {
     /// Reused header-assembly scratch: outgoing request block during the send
     /// phase, sanitized response block during the response phase.
     scratch_buf: Vec<u8>,
+    /// Second reusable header buffer for filter passes that rewrite the
+    /// scratch (mem::swap partner). Empty until a filtered route is hit, so
+    /// the no-filter path never allocates it.
+    filter_buf: Vec<u8>,
     /// Per-step body-streaming progress budget; None = disabled.
     idle_body_timeout: Option<Duration>,
     /// Per-listener stats slot (shared with the accept loop) for per-port
@@ -174,6 +191,7 @@ impl ConnectionState {
             connect_timeout: cfg.connect_timeout,
             header_buf: Vec::with_capacity(1024),
             scratch_buf: Vec::with_capacity(1024),
+            filter_buf: Vec::new(),
             idle_body_timeout: idle_opt(cfg.idle_body_timeout),
             listener_stats,
             last_status: 0,
@@ -194,20 +212,33 @@ pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerCon
     }
 }
 
+/// Everything an accept loop shares across its connections, bundled so the
+/// data plane's two spawn sites thread one value instead of eleven arguments.
+pub struct ListenerCtx {
+    pub server_port: u16,
+    pub routes: Arc<ArcSwap<RouteTable>>,
+    pub cfg: WorkerConfig,
+    pub tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
+    pub tls_passthrough: bool,
+    pub health: Arc<HealthRegistry>,
+    pub selector: Arc<BackendSelector>,
+    pub active_connections: Arc<AtomicUsize>,
+    pub shared_pool: Option<Arc<SharedBackendPool>>,
+}
+
 /// Run an accept loop on a single listener, spawning a task per connection.
-pub async fn run_worker(
-    listener: TcpListener,
-    server_port: u16,
-    routes: Arc<ArcSwap<RouteTable>>,
-    cfg: WorkerConfig,
-    shutdown: CancellationToken,
-    tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
-    tls_passthrough: bool,
-    health: Arc<HealthRegistry>,
-    selector: Arc<BackendSelector>,
-    active_connections: Arc<AtomicUsize>,
-    shared_pool: Option<Arc<SharedBackendPool>>,
-) {
+pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: CancellationToken) {
+    let ListenerCtx {
+        server_port,
+        routes,
+        cfg,
+        tls_acceptor,
+        tls_passthrough,
+        health,
+        selector,
+        active_connections,
+        shared_pool,
+    } = ctx;
     // Per-port scrape identity: lets an operator answer "is anything accepting
     // on this port" from /metrics alone, without exec'ing into the pod. The
     // guard flips `portail_listener_up` to 0 when this loop exits.
@@ -254,108 +285,24 @@ pub async fn run_worker(
                                 let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, cfg.client_header_timeout, cfg.connect_timeout).await;
                             });
                         } else if let Some(acceptor) = acceptor {
-                            // TLS termination mode — but first check if this SNI
-                            // should be passed through instead of terminated.
-                            // This handles the case where both HTTPS/Terminate and
-                            // TLS/Passthrough listeners share the same port.
                             let selector = selector.clone();
                             let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
-                                // Peek ClientHello for SNI to decide dispatch
-                                // mode, waiting out fragmented hellos.
-                                let should_passthrough = match crate::proxy::tls::peek_sni(
-                                    &tcp_stream,
-                                    cfg.client_header_timeout,
+                                serve_tls_connection(
+                                    tcp_stream,
+                                    peer,
+                                    acceptor,
+                                    server_port,
+                                    routes,
+                                    cfg,
+                                    health,
+                                    selector,
+                                    shared_pool,
+                                    listener_stats,
                                 )
-                                .await
-                                {
-                                    Some(hostname) => {
-                                        let rt = routes.load();
-                                        rt.has_tls_passthrough_route(&hostname, server_port)
-                                    }
-                                    None => false,
-                                };
-
-                                if should_passthrough {
-                                    let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, cfg.client_header_timeout, cfg.connect_timeout).await;
-                                } else {
-                                    // Bound the handshake: a client that stalls
-                                    // mid-handshake would otherwise pin this task
-                                    // (and its buffers) forever.
-                                    match tokio::time::timeout(
-                                        cfg.client_header_timeout,
-                                        acceptor.acceptor().accept(tcp_stream),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(tls_stream)) => {
-                                            // ALPN decided the protocol during the
-                                            // handshake; h2 goes to the bridge, all
-                                            // else stays on the h1 path.
-                                            if cfg.http2
-                                                && tls_stream.get_ref().1.alpn_protocol()
-                                                    == Some(b"h2".as_ref())
-                                            {
-                                                METRICS.http2_connections_total.inc();
-                                                // One pool per h2 connection: the
-                                                // process pool when set, else a
-                                                // connection-scoped pool its streams
-                                                // share (h1 keepalive semantics).
-                                                let pool = shared_pool.unwrap_or_else(|| {
-                                                    Arc::new(SharedBackendPool::new(
-                                                        cfg.max_idle_per_backend,
-                                                        cfg.connect_timeout,
-                                                    ))
-                                                });
-                                                crate::proxy::h2_bridge::serve(
-                                                    tls_stream,
-                                                    crate::proxy::h2_bridge::H2Ctx {
-                                                        server_port,
-                                                        routes,
-                                                        selector,
-                                                        health,
-                                                        pool,
-                                                        cfg,
-                                                        listener_stats: listener_stats
-                                                            .clone(),
-                                                        peer,
-                                                    },
-                                                )
-                                                .await;
-                                                return;
-                                            }
-                                            let conn = Connection::Tls { inner: tls_stream };
-                                            let state = ConnectionState::new(
-                                                server_port,
-                                                routes,
-                                                make_pool(&shared_pool, &cfg),
-                                                selector,
-                                                health,
-                                                true,
-                                                peer.ip(),
-                                                &cfg,
-                                                listener_stats.clone(),
-                                            );
-                                            let _ = handle_connection(conn, peer, state).await;
-                                        }
-                                        Ok(Err(_e)) => {
-                                            METRICS.tls_handshake_failures_total.inc();
-                                            listener_stats
-                                                .tls_handshake_failures
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            debug!("TLS handshake failed from {}: {}", peer, _e);
-                                        }
-                                        Err(_) => {
-                                            METRICS.tls_handshake_failures_total.inc();
-                                            listener_stats
-                                                .tls_handshake_failures
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            debug!("TLS handshake from {} timed out", peer);
-                                        }
-                                    }
-                                }
+                                .await;
                             });
                         } else {
                             let state = ConnectionState::new(
@@ -383,6 +330,112 @@ pub async fn run_worker(
             }
         }
     }
+}
+
+/// One accepted connection on a TLS-terminate listener.
+///
+/// First check whether this SNI should be passed through instead of
+/// terminated — that handles HTTPS/Terminate and TLS/Passthrough listeners
+/// sharing one port. Otherwise handshake, then dispatch by ALPN: h2 goes to
+/// the bridge, all else stays on the h1 path.
+#[allow(clippy::too_many_arguments)]
+async fn serve_tls_connection(
+    tcp_stream: TcpStream,
+    peer: SocketAddr,
+    acceptor: Arc<DynamicTlsAcceptor>,
+    server_port: u16,
+    routes: Arc<ArcSwap<RouteTable>>,
+    cfg: WorkerConfig,
+    health: Arc<HealthRegistry>,
+    selector: Arc<BackendSelector>,
+    shared_pool: Option<Arc<SharedBackendPool>>,
+    listener_stats: Arc<ListenerStats>,
+) {
+    // Peek ClientHello for SNI to decide dispatch mode, waiting out
+    // fragmented hellos.
+    let should_passthrough =
+        match crate::proxy::tls::peek_sni(&tcp_stream, cfg.client_header_timeout).await {
+            Some(hostname) => {
+                let rt = routes.load();
+                rt.has_tls_passthrough_route(&hostname, server_port)
+            }
+            None => false,
+        };
+
+    if should_passthrough {
+        let _ = handle_tls_passthrough(
+            tcp_stream,
+            server_port,
+            routes,
+            health,
+            selector,
+            cfg.client_header_timeout,
+            cfg.connect_timeout,
+        )
+        .await;
+        return;
+    }
+
+    // Bound the handshake: a client that stalls mid-handshake would
+    // otherwise pin this task (and its buffers) forever.
+    let tls_stream = match tokio::time::timeout(
+        cfg.client_header_timeout,
+        acceptor.acceptor().accept(tcp_stream),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        outcome => {
+            METRICS.tls_handshake_failures_total.inc();
+            listener_stats.tls_handshake_failures.inc();
+            match outcome {
+                Ok(Err(_e)) => debug!("TLS handshake failed from {}: {}", peer, _e),
+                _ => debug!("TLS handshake from {} timed out", peer),
+            }
+            return;
+        }
+    };
+
+    // ALPN decided the protocol during the handshake.
+    if cfg.http2 && tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_ref()) {
+        METRICS.http2_connections_total.inc();
+        // One pool per h2 connection: the process pool when set, else a
+        // connection-scoped pool its streams share (h1 keepalive semantics).
+        let pool = shared_pool.unwrap_or_else(|| {
+            Arc::new(SharedBackendPool::new(
+                cfg.max_idle_per_backend,
+                cfg.connect_timeout,
+            ))
+        });
+        crate::proxy::h2_bridge::serve(
+            tls_stream,
+            crate::proxy::h2_bridge::H2Ctx {
+                server_port,
+                routes,
+                selector,
+                health,
+                pool,
+                cfg,
+                listener_stats,
+                peer,
+            },
+        )
+        .await;
+        return;
+    }
+    let conn = Connection::Tls { inner: tls_stream };
+    let state = ConnectionState::new(
+        server_port,
+        routes,
+        make_pool(&shared_pool, &cfg),
+        selector,
+        health,
+        true,
+        peer.ip(),
+        &cfg,
+        listener_stats,
+    );
+    let _ = handle_connection(conn, peer, state).await;
 }
 
 pub(crate) async fn handle_connection(
@@ -441,6 +494,7 @@ pub(crate) async fn handle_connection(
                     &buf[..n],
                     Arc::clone(&state.health),
                     state.connect_timeout,
+                    "TCP",
                 )
                 .await;
             }
@@ -452,10 +506,7 @@ pub(crate) async fn handle_connection(
                 // Per-vhost sample (rule carries its route hostname's registry
                 // slot) + the per-listener aggregate.
                 rule.requests.fetch_add(1, Ordering::Relaxed);
-                state
-                    .listener_stats
-                    .http_requests
-                    .fetch_add(1, Ordering::Relaxed);
+                state.listener_stats.http_requests.inc();
                 // proxy_http_request owns all timing for the request lifecycle —
                 // backend_request_timeout (connect + TTFB) and request_timeout
                 // (total deadline) are applied phase-aware inside.
@@ -591,7 +642,7 @@ async fn proxy_http_request(
     state.last_status = 0;
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
-    let (mut backend, from_pool) =
+    let (backend, from_pool) =
         match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
         {
             Some(b) => b,
@@ -628,20 +679,10 @@ async fn proxy_http_request(
         None
     };
 
-    // Send request to backend, optionally applying filter modifications.
-    //
-    // Retry contract: if the conn came from the pool AND the send errors, we
-    // retry once on a fresh conn. SAFE — `relay_request_body` hasn't been
-    // called, so no client body bytes have been consumed yet, and no client
-    // write has happened either. `buf[..request_end]` still holds exactly
-    // what arrived; the original send's bytes went into a dead pipe, so no
-    // backend observed them. The retry is unconditionally safe regardless of
-    // HTTP method.
-    let has_mirrors = (rule.has_filters || !backend_ref.filters.is_empty())
-        && rule
-            .filters
-            .iter()
-            .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
+    let has_mirrors = rule
+        .filters
+        .iter()
+        .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
 
     // Assemble the outgoing header block once — hop-by-hop stripped,
     // X-Forwarded-* appended, filter modifications applied. The pool-retry
@@ -650,95 +691,22 @@ async fn proxy_http_request(
     let headers_len = state.scratch_buf.len();
     let mirror_header_data: Option<Vec<u8>> = has_mirrors.then(|| state.scratch_buf.clone());
 
-    let send_result = send_assembled_request(
-        &mut backend,
-        &mut state.scratch_buf,
+    let mut backend = match send_request_with_retry(
+        client,
+        state,
+        backend_ref,
+        backend,
+        from_pool,
         headers_len,
         &buf[req_header_end..request_end],
+        backend_budget,
+        backend_phase_start,
+        total_deadline,
     )
-    .await;
-    match send_result {
-        Ok(()) => {}
-        Err(_e) if from_pool => {
-            // Pool entry died between probe and write. Reconnect once and
-            // replay. Do NOT record_failure here: a stale pool entry is
-            // expected churn, not a backend problem.
-            METRICS.pool_stale_retries_total.inc();
-            debug!(
-                "Backend {} pool conn died on send ({}); retrying with fresh conn",
-                backend_addr, _e
-            );
-            drop(backend);
-            let fresh_budget = clamp_to_deadline(
-                backend_budget.saturating_sub(backend_phase_start.elapsed()),
-                total_deadline,
-            );
-            backend = match tokio::time::timeout(
-                fresh_budget,
-                state.pool.acquire_fresh(
-                    backend_addr,
-                    backend_ref.use_tls,
-                    &backend_ref.server_name,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(c)) => {
-                    state.health.record_success(backend_addr);
-                    c
-                }
-                Ok(Err(e2)) => {
-                    warn!(
-                        "Backend {} fresh-conn acquire failed after pool retry: {}",
-                        backend_addr, e2
-                    );
-                    return fail_backend(
-                        state,
-                        &backend_metric_label(backend_ref),
-                        client,
-                        backend_addr,
-                        502,
-                    )
-                    .await;
-                }
-                Err(_) => {
-                    warn!(
-                        "Backend {} fresh-conn acquire timeout after pool retry",
-                        backend_addr
-                    );
-                    return fail_backend(
-                        state,
-                        &backend_metric_label(backend_ref),
-                        client,
-                        backend_addr,
-                        504,
-                    )
-                    .await;
-                }
-            };
-            if let Err(e2) = send_assembled_request(
-                &mut backend,
-                &mut state.scratch_buf,
-                headers_len,
-                &buf[req_header_end..request_end],
-            )
-            .await
-            {
-                warn!(
-                    "Backend {} send failed on fresh conn after pool retry: {}",
-                    backend_addr, e2
-                );
-                return fail_backend(
-                    state,
-                    &backend_metric_label(backend_ref),
-                    client,
-                    backend_addr,
-                    502,
-                )
-                .await;
-            }
-        }
-        Err(e) => return Err(e),
+    .await?
+    {
+        Some(b) => b,
+        None => return Ok((false, None)),
     };
 
     // Expect: 100-continue — the proxy answers on the backend's behalf. The
@@ -792,10 +760,9 @@ async fn proxy_http_request(
         leftover = relay_leftover;
     }
 
-    if let Some(ref body) = mirror_body {
-        let header_bytes = mirror_header_data
-            .as_deref()
-            .unwrap_or(&buf[..req_header_end]);
+    // Both are Some iff has_mirrors: pairing them here keeps any fallback to
+    // the raw (unsanitized) client headers structurally impossible.
+    if let (Some(body), Some(header_bytes)) = (&mirror_body, &mirror_header_data) {
         let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
         full_request.extend_from_slice(header_bytes);
         full_request.extend_from_slice(body);
@@ -812,9 +779,9 @@ async fn proxy_http_request(
     let mut framing = match forward_response_headers(
         client,
         &mut backend,
-        buf,
         &mut state.header_buf,
         &mut state.scratch_buf,
+        &mut state.filter_buf,
         resp_mods.as_ref(),
         header_budget,
         meta.is_head,
@@ -894,20 +861,20 @@ async fn proxy_http_request(
     // Overshoot (bytes past the framing end) likewise poisons the conn: the
     // excess was dropped here but whatever else follows would desync the next
     // response.
+    let broken = framing.chunked.as_ref().is_some_and(|s| s.is_broken());
+    if broken {
+        warn!(
+            "Backend {} response framing broken; not pooling connection",
+            backend_addr
+        );
+    }
     if framing.overshoot {
         warn!(
             "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
             backend_addr
         );
     }
-    let framing_clean =
-        framing.chunked.as_ref().is_none_or(|s| !s.is_broken()) && !framing.overshoot;
-    if !framing_clean && !framing.overshoot {
-        warn!(
-            "Backend {} response framing broken; not pooling connection",
-            backend_addr
-        );
-    }
+    let framing_clean = !broken && !framing.overshoot;
     let reusable = response_complete && framing_clean;
 
     // The client got a clean response, but the backend conn returns to the pool
@@ -928,7 +895,7 @@ async fn proxy_http_request(
         );
     } else if reusable {
         debug!(
-            "Backend {} conn not pooled after HEAD (avoids body-desync on reuse)",
+            "Backend {} conn not pooled (HEAD, refused upgrade, or backend Connection: close)",
             backend_addr
         );
     }
@@ -972,7 +939,8 @@ fn backend_metric_label(backend: &crate::routing::Backend) -> String {
 /// Record a backend failure (spawning a health probe if this newly trips the
 /// backend unhealthy) and send `code` to the client. Returns `Ok((false, None))`
 /// — the client connection is not reusable. Centralizes the failure boilerplate
-/// the backend-send retry path would otherwise repeat per error arm.
+/// the connect and send-retry paths would otherwise repeat per error arm; log
+/// wording stays caller-side.
 async fn fail_backend(
     state: &mut ConnectionState,
     backend_label: &str,
@@ -983,17 +951,11 @@ async fn fail_backend(
     match code {
         504 => {
             crate::metrics::record_backend_connect_timeout(backend_label);
-            state
-                .listener_stats
-                .upstream_connect_timeouts
-                .fetch_add(1, Ordering::Relaxed);
+            state.listener_stats.upstream_connect_timeouts.inc();
         }
         _ => {
             crate::metrics::record_backend_connect_error(backend_label);
-            state
-                .listener_stats
-                .upstream_connect_errors
-                .fetch_add(1, Ordering::Relaxed);
+            state.listener_stats.upstream_connect_errors.inc();
         }
     }
     if state.health.record_failure(addr) {
@@ -1038,31 +1000,27 @@ async fn connect_to_backend(
             Ok(Some(result))
         }
         Ok(Err(e)) => {
-            crate::metrics::record_backend_connect_error(&backend_metric_label(backend_ref));
-            state
-                .listener_stats
-                .upstream_connect_errors
-                .fetch_add(1, Ordering::Relaxed);
             warn!("Backend {} connect failed: {}", backend_addr, e);
-            if state.health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-            }
-            state.last_status = 502;
-            send_error_response(client, 502).await?;
+            fail_backend(
+                state,
+                &backend_metric_label(backend_ref),
+                client,
+                backend_addr,
+                502,
+            )
+            .await?;
             Ok(None)
         }
         Err(_) => {
-            crate::metrics::record_backend_connect_timeout(&backend_metric_label(backend_ref));
-            state
-                .listener_stats
-                .upstream_connect_timeouts
-                .fetch_add(1, Ordering::Relaxed);
             warn!("Backend {} connect timeout", backend_addr);
-            if state.health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(Arc::clone(&state.health), backend_addr);
-            }
-            state.last_status = 504;
-            send_error_response(client, 504).await?;
+            fail_backend(
+                state,
+                &backend_metric_label(backend_ref),
+                client,
+                backend_addr,
+                504,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -1100,54 +1058,173 @@ fn build_outgoing_headers(
         );
     }
 
-    if rule.has_filters || !backend_ref.filters.is_empty() {
+    // has_filters already covers every backend's filters (see routing build).
+    if rule.has_filters {
         let rule_mods = extract_header_mods(&rule.filters, false);
-        let request_path = extract_request_path(raw);
-        let url_rewrite =
-            extract_url_rewrite(&rule.filters, &rule.path, request_path.unwrap_or("/"));
+        let request_path = meta
+            .path_span
+            .and_then(|(s, e)| raw.get(s as usize..e as usize))
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("/");
+        let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, request_path);
         let backend_mods = extract_header_mods(&backend_ref.filters, false);
         if rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some() {
-            let modified = apply_request_header_modifications(
+            apply_request_header_modifications(
                 &state.scratch_buf,
                 rule_mods.as_ref(),
                 url_rewrite.as_ref(),
+                &mut state.filter_buf,
             );
-            let final_headers = if let Some(bm) = backend_mods {
-                apply_request_header_modifications(&modified, Some(&bm), None)
-            } else {
-                modified
-            };
-            state.scratch_buf.clear();
-            state.scratch_buf.extend_from_slice(&final_headers);
+            std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
+            if let Some(bm) = backend_mods {
+                apply_request_header_modifications(
+                    &state.scratch_buf,
+                    Some(&bm),
+                    None,
+                    &mut state.filter_buf,
+                );
+                std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
+            }
         }
     }
 }
 
-/// Send the assembled headers plus the same-read body tail (up to the
-/// request's framing boundary — bytes beyond it belong to a pipelined next
-/// request and never reach the backend). Small tails are appended to the
+/// Tails at or below this ride in the same write as the scratch prefix.
+const COMBINE_MAX: usize = 16 * 1024;
+
+/// Write `scratch[..keep_len]` plus `tail`. Small tails are appended to the
 /// scratch so the common case stays one write; the scratch is truncated back
-/// to the headers afterwards, keeping the pool-retry resend valid.
-async fn send_assembled_request(
-    backend: &mut Connection,
+/// to `keep_len` afterwards — on error too — so callers can reuse the kept
+/// prefix (pool-retry resend, response scratch).
+async fn write_with_tail(
+    conn: &mut Connection,
     scratch: &mut Vec<u8>,
-    headers_len: usize,
-    body: &[u8],
+    keep_len: usize,
+    tail: &[u8],
 ) -> Result<()> {
-    const COMBINE_MAX: usize = 16 * 1024;
-    if body.is_empty() {
-        backend.write_all(&scratch[..headers_len]).await?;
-    } else if body.len() <= COMBINE_MAX {
-        scratch.truncate(headers_len);
-        scratch.extend_from_slice(body);
-        let res = backend.write_all(scratch).await;
-        scratch.truncate(headers_len);
+    if tail.is_empty() {
+        conn.write_all(&scratch[..keep_len]).await?;
+    } else if tail.len() <= COMBINE_MAX {
+        scratch.truncate(keep_len);
+        scratch.extend_from_slice(tail);
+        let res = conn.write_all(scratch).await;
+        scratch.truncate(keep_len);
         res?;
     } else {
-        backend.write_all(&scratch[..headers_len]).await?;
-        backend.write_all(body).await?;
+        conn.write_all(&scratch[..keep_len]).await?;
+        conn.write_all(tail).await?;
     }
     Ok(())
+}
+
+/// Send the assembled request: headers in `state.scratch_buf[..headers_len]`
+/// plus the same-read `body` tail (up to the request's framing boundary —
+/// bytes beyond it belong to a pipelined next request and never reach the
+/// backend).
+///
+/// Retry contract: if the conn came from the pool AND the send errors, we
+/// retry once on a fresh conn. SAFE — `relay_request_body` hasn't been
+/// called, so no client body bytes have been consumed yet, and no client
+/// write has happened either. The scratch and `body` still hold exactly
+/// what must be sent; the original send's bytes went into a dead pipe, so
+/// no backend observed them. The retry is unconditionally safe regardless
+/// of HTTP method.
+///
+/// `Ok(Some(conn))` hands back the connection that accepted the request;
+/// `Ok(None)` means the failure was already answered to the client.
+#[allow(clippy::too_many_arguments)]
+async fn send_request_with_retry(
+    client: &mut Connection,
+    state: &mut ConnectionState,
+    backend_ref: &crate::routing::Backend,
+    mut backend: Connection,
+    from_pool: bool,
+    headers_len: usize,
+    body: &[u8],
+    backend_budget: Duration,
+    backend_phase_start: std::time::Instant,
+    total_deadline: Option<std::time::Instant>,
+) -> Result<Option<Connection>> {
+    let backend_addr = backend_ref.socket_addr;
+    match write_with_tail(&mut backend, &mut state.scratch_buf, headers_len, body).await {
+        Ok(()) => return Ok(Some(backend)),
+        Err(_e) if from_pool => {
+            // Pool entry died between probe and write. Reconnect once and
+            // replay. Do NOT record_failure here: a stale pool entry is
+            // expected churn, not a backend problem.
+            METRICS.pool_stale_retries_total.inc();
+            debug!(
+                "Backend {} pool conn died on send ({}); retrying with fresh conn",
+                backend_addr, _e
+            );
+        }
+        Err(e) => return Err(e),
+    }
+    drop(backend);
+    let fresh_budget = clamp_to_deadline(
+        backend_budget.saturating_sub(backend_phase_start.elapsed()),
+        total_deadline,
+    );
+    let mut backend = match tokio::time::timeout(
+        fresh_budget,
+        state
+            .pool
+            .acquire_fresh(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
+    )
+    .await
+    {
+        Ok(Ok(c)) => {
+            state.health.record_success(backend_addr);
+            c
+        }
+        Ok(Err(e2)) => {
+            warn!(
+                "Backend {} fresh-conn acquire failed after pool retry: {}",
+                backend_addr, e2
+            );
+            fail_backend(
+                state,
+                &backend_metric_label(backend_ref),
+                client,
+                backend_addr,
+                502,
+            )
+            .await?;
+            return Ok(None);
+        }
+        Err(_) => {
+            warn!(
+                "Backend {} fresh-conn acquire timeout after pool retry",
+                backend_addr
+            );
+            fail_backend(
+                state,
+                &backend_metric_label(backend_ref),
+                client,
+                backend_addr,
+                504,
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+    if let Err(e2) = write_with_tail(&mut backend, &mut state.scratch_buf, headers_len, body).await
+    {
+        warn!(
+            "Backend {} send failed on fresh conn after pool retry: {}",
+            backend_addr, e2
+        );
+        fail_backend(
+            state,
+            &backend_metric_label(backend_ref),
+            client,
+            backend_addr,
+            502,
+        )
+        .await?;
+        return Ok(None);
+    }
+    Ok(Some(backend))
 }
 
 /// Outcome of the response-header phase: the framing to stream the body
@@ -1167,9 +1244,9 @@ enum HeaderPhase {
 async fn forward_response_headers(
     client: &mut Connection,
     backend: &mut Connection,
-    buf: &mut [u8],
     header_buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
+    filter_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
     header_budget: Duration,
     is_head_request: bool,
@@ -1178,7 +1255,7 @@ async fn forward_response_headers(
 ) -> Result<HeaderPhase> {
     let (resp_header_end, framing) = match tokio::time::timeout(
         header_budget,
-        read_response_headers(backend, buf, header_buf, is_head_request, expect_upgrade),
+        read_response_headers(backend, header_buf, is_head_request, expect_upgrade),
     )
     .await
     {
@@ -1217,31 +1294,17 @@ async fn forward_response_headers(
     // Hop-by-hop response headers never reach the client (RFC 7230 §6.1);
     // the proxy owns the client-side Connection header.
     sanitize_response_headers(&header_buf[..resp_header_end], client_close, scratch);
-    if let Some(mods) = resp_mods {
-        let modified = apply_response_header_mods(scratch, mods);
-        client.write_all(&modified).await?;
-        if tail_end > resp_header_end {
-            client
-                .write_all(&header_buf[resp_header_end..tail_end])
-                .await?;
-        }
-    } else if tail_end > resp_header_end {
-        let tail = &header_buf[resp_header_end..tail_end];
-        // Hot path: sanitized headers + in-framing tail in a single write
-        // when the tail is small enough to append to the scratch.
-        if tail.len() <= 16 * 1024 {
-            let sanitized_len = scratch.len();
-            scratch.extend_from_slice(tail);
-            let res = client.write_all(scratch).await;
-            scratch.truncate(sanitized_len);
-            res?;
-        } else {
-            client.write_all(scratch).await?;
-            client.write_all(tail).await?;
-        }
+    let headers: &mut Vec<u8> = if let Some(mods) = resp_mods {
+        apply_response_header_mods(scratch, mods, filter_buf);
+        filter_buf
     } else {
-        client.write_all(scratch).await?;
-    }
+        scratch
+    };
+    // Hot path: sanitized headers + in-framing tail in a single write when
+    // the tail is small enough to append to the scratch.
+    let keep_len = headers.len();
+    let tail = &header_buf[resp_header_end..tail_end];
+    write_with_tail(client, headers, keep_len, tail).await?;
     Ok(HeaderPhase::Proxied(framing))
 }
 
@@ -1251,15 +1314,6 @@ fn extract_response_mods<'a>(
     backend: &'a crate::routing::Backend,
 ) -> Option<HeaderModifications<'a>> {
     extract_header_mods(&rule.filters, true).or_else(|| extract_header_mods(&backend.filters, true))
-}
-
-/// Extract the request path from the first line of raw HTTP headers.
-/// Zero-allocation: borrows directly from the buffer.
-fn extract_request_path(header_bytes: &[u8]) -> Option<&str> {
-    let first_line_end = header_bytes.iter().position(|&b| b == b'\r')?;
-    let first_line = std::str::from_utf8(&header_bytes[..first_line_end]).ok()?;
-    let path = first_line.split_whitespace().nth(1)?;
-    Some(path.split('?').next().unwrap_or(path))
 }
 
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.
@@ -1401,7 +1455,6 @@ const MAX_INTERIM_RESPONSES: u32 = 8;
 
 async fn read_response_headers(
     backend: &mut Connection,
-    buf: &mut [u8],
     header_buf: &mut Vec<u8>,
     is_head_request: bool,
     expect_upgrade: bool,
@@ -1497,13 +1550,15 @@ async fn read_response_headers(
             return Err(anyhow::anyhow!("response headers exceed buffer size"));
         }
 
-        let n = backend.read(buf).await?;
+        // read_buf with little spare capacity degrades to tiny reads; keep a
+        // full read's worth reserved (and spare > 0 makes Ok(0) mean EOF).
+        header_buf.reserve(16 * 1024);
+        let n = backend.read_buf(header_buf).await?;
         if n == 0 {
             return Err(anyhow::anyhow!(
                 "backend closed before sending response headers"
             ));
         }
-        header_buf.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -1598,6 +1653,26 @@ pub(crate) fn response_has_no_body(status: u16, is_head: bool) -> bool {
     is_head || status == 204 || status == 304 || (100..200).contains(&status)
 }
 
+/// Await one streaming step under the optional per-step progress budget
+/// (None = unbounded). `context` names the stalled party in the error.
+/// Shared with the h2 bridge, whose steps are not io::Result-shaped.
+#[inline]
+pub(crate) async fn progress<T, F>(
+    context: &'static str,
+    idle: Option<Duration>,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match idle {
+        Some(d) => tokio::time::timeout(d, fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("{} stalled: no progress within {:?}", context, d)),
+        None => Ok(fut.await),
+    }
+}
+
 /// Await one body-streaming I/O step under the optional progress budget.
 /// Only wraps the multi-read/write streaming loops — the common single-read
 /// response never reaches these, so no timer is created on that path.
@@ -1606,16 +1681,7 @@ async fn idle_guarded<T, F>(idle: Option<Duration>, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
-    match idle {
-        Some(d) => match tokio::time::timeout(d, fut).await {
-            Ok(r) => Ok(r?),
-            Err(_) => Err(anyhow::anyhow!(
-                "body stream stalled: no progress within {:?}",
-                d
-            )),
-        },
-        None => Ok(fut.await?),
-    }
+    Ok(progress("body stream", idle, fut).await??)
 }
 
 /// Clamp a phase budget by an optional absolute deadline.
@@ -1630,7 +1696,7 @@ fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> 
 
 /// L4 TLS passthrough: peek ClientHello for SNI, then forward raw TCP to backend.
 async fn handle_tls_passthrough(
-    mut client: TcpStream,
+    client: TcpStream,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
@@ -1658,35 +1724,18 @@ async fn handle_tls_passthrough(
             )
         })?;
 
-    match tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await {
-        Err(_) => {
-            if health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(health, backend_addr);
-            }
-            return Err(anyhow::anyhow!(
-                "TLS passthrough connect to {} timed out",
-                backend_addr
-            ));
-        }
-        Ok(Ok(mut backend)) => {
-            health.record_success(backend_addr);
-            backend.set_nodelay(true)?;
-            client.set_nodelay(true)?;
-            tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
-        }
-        Ok(Err(e)) => {
-            if health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(health, backend_addr);
-            }
-            return Err(anyhow::anyhow!(
-                "TLS passthrough connect to {} failed: {}",
-                backend_addr,
-                e
-            ));
-        }
-    }
-
-    Ok(())
+    // peek_sni consumed nothing, so the ClientHello is still on the socket:
+    // the generic L4 forward replays it to the backend via the normal reads.
+    client.set_nodelay(true)?;
+    handle_tcp_connection(
+        Connection::Plain { inner: client },
+        backend_addr,
+        &[],
+        health,
+        connect_timeout,
+        "TLS passthrough",
+    )
+    .await
 }
 
 async fn handle_tcp_connection(
@@ -1695,6 +1744,7 @@ async fn handle_tcp_connection(
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
+    ctx: &'static str,
 ) -> Result<()> {
     let connect_result =
         tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await;
@@ -1703,7 +1753,9 @@ async fn handle_tcp_connection(
         Ok(Ok(mut backend)) => {
             health.record_success(backend_addr);
             backend.set_nodelay(true)?;
-            backend.write_all(initial_data).await?;
+            if !initial_data.is_empty() {
+                backend.write_all(initial_data).await?;
+            }
             // Errors from copy_bidirectional are expected when either side closes;
             // don't propagate — the data transfer is best-effort once started.
             let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
@@ -1713,7 +1765,8 @@ async fn handle_tcp_connection(
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
             return Err(anyhow::anyhow!(
-                "TCP connect to {} failed: {}",
+                "{} connect to {} failed: {}",
+                ctx,
                 backend_addr,
                 e
             ));
@@ -1722,7 +1775,11 @@ async fn handle_tcp_connection(
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
-            return Err(anyhow::anyhow!("TCP connect to {} timed out", backend_addr));
+            return Err(anyhow::anyhow!(
+                "{} connect to {} timed out",
+                ctx,
+                backend_addr
+            ));
         }
     }
     Ok(())

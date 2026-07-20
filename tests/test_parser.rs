@@ -1,4 +1,4 @@
-use portail::proxy::http_parser::{extract_routing_info, ConnectionType};
+use portail::proxy::http_parser::extract_routing_info;
 
 #[test]
 fn test_parse_http_headers_fast() {
@@ -139,7 +139,7 @@ fn test_connection_close_header() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::Close);
+    assert!(!result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -149,7 +149,7 @@ fn test_connection_close_with_trailing_whitespace() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close \r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::Close);
+    assert!(!result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -159,7 +159,7 @@ fn test_connection_keep_alive_header() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::KeepAlive);
+    assert!(result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -169,7 +169,7 @@ fn test_connection_default_behavior() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::KeepAlive);
+    assert!(result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -179,7 +179,7 @@ fn test_http10_default_close_behavior() {
     let request = b"GET /api HTTP/1.0\r\nHost: example.com\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::Close);
+    assert!(!result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -189,7 +189,7 @@ fn test_http11_default_keepalive_behavior() {
     let request = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::KeepAlive);
+    assert!(result.keepalive);
     assert_eq!(result.host, "example.com");
     assert_eq!(result.path, "/api");
 }
@@ -199,7 +199,7 @@ fn test_apachebench_scenario() {
     let request = b"GET /index.html HTTP/1.0\r\nHost: localhost:8080\r\nUser-Agent: ApacheBench/2.3\r\nAccept: */*\r\n\r\n";
 
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::Close);
+    assert!(!result.keepalive);
     assert_eq!(result.host, "localhost");
     assert_eq!(result.path, "/index.html");
 }
@@ -281,10 +281,10 @@ fn connection_token_list_parsed() {
         b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
     let result = extract_routing_info(request).unwrap();
     assert!(result.is_upgrade);
-    assert_eq!(result.connection_type, ConnectionType::KeepAlive);
+    assert!(result.keepalive);
 
     // close token still wins inside a list.
     let request = b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n";
     let result = extract_routing_info(request).unwrap();
-    assert_eq!(result.connection_type, ConnectionType::Close);
+    assert!(!result.keepalive);
 }

@@ -30,7 +30,7 @@ use crate::proxy::http_filters::{
 };
 use crate::proxy::http_parser::find_header_end;
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{self, WorkerConfig};
+use crate::proxy::worker::{self, progress, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough
@@ -117,9 +117,7 @@ async fn serve_stream(
         // CONNECT or no authority: not expressible as an origin-form h1
         // exchange through the engine. Count it like an engine-answered
         // error so refusals are not invisible to /metrics.
-        ctx.listener_stats
-            .http_requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.listener_stats.http_requests.inc();
         let mut respond = respond;
         let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
@@ -273,7 +271,7 @@ async fn pump_request_body(
     // Bounded like every other bridge await: a client that opens a stream and
     // then withholds DATA must not park this task past the idle budget
     // (client_header_timeout only covers the h2 handshake).
-    while let Some(data) = progress(idle, body.data()).await? {
+    while let Some(data) = progress("h2 bridge", idle, body.data()).await? {
         let data = data.map_err(|e| anyhow!("h2 request body: {}", e))?;
         let n = data.len();
         // Release the flow-control window for every received byte, empty
@@ -367,7 +365,7 @@ async fn forward_response(
             }
             acc.clear();
             acc.reserve(RESP_READ);
-            let n = progress(idle, io.read_buf(&mut acc)).await??;
+            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 return Err(anyhow!("truncated chunked response"));
             }
@@ -385,7 +383,7 @@ async fn forward_response(
                 return Ok(());
             }
             acc.reserve(RESP_READ);
-            let n = progress(idle, io.read_buf(&mut acc)).await??;
+            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 return Err(anyhow!("truncated response body"));
             }
@@ -398,7 +396,7 @@ async fn forward_response(
                 send_data(&mut send, acc.split().freeze(), false, idle).await?;
             }
             acc.reserve(RESP_READ);
-            let n = progress(idle, io.read_buf(&mut acc)).await??;
+            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
             if n == 0 {
                 send.send_data(Bytes::new(), true)
                     .map_err(|e| anyhow!("h2 send: {}", e))?;
@@ -510,10 +508,14 @@ async fn send_data(
         send.reserve_capacity(data.len());
         // A client that stops granting window would park this forever; the
         // same per-step budget that bounds h1 body writes applies.
-        let granted = progress(idle, std::future::poll_fn(|cx| send.poll_capacity(cx)))
-            .await?
-            .ok_or_else(|| anyhow!("h2 stream closed"))?
-            .map_err(|e| anyhow!("h2 capacity: {}", e))?;
+        let granted = progress(
+            "h2 bridge",
+            idle,
+            std::future::poll_fn(|cx| send.poll_capacity(cx)),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("h2 stream closed"))?
+        .map_err(|e| anyhow!("h2 capacity: {}", e))?;
         if granted == 0 {
             continue;
         }
@@ -523,21 +525,6 @@ async fn send_data(
             .map_err(|e| anyhow!("h2 send: {}", e))?;
     }
     Ok(())
-}
-
-/// Per-step progress budget (None = unbounded), the bridge-side counterpart
-/// of the engine's `idle_guarded` (which is bound to io::Result; this wraps
-/// any future, e.g. h2 body reads and flow-control capacity).
-async fn progress<T, F>(idle: Option<Duration>, fut: F) -> Result<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    match idle {
-        Some(d) => tokio::time::timeout(d, fut)
-            .await
-            .map_err(|_| anyhow!("h2 bridge stalled: no progress within {:?}", d)),
-        None => Ok(fut.await),
-    }
 }
 
 #[cfg(test)]

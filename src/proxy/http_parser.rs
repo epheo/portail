@@ -23,26 +23,6 @@ pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
     None
 }
 
-/// HTTP Connection header preference
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ConnectionType {
-    /// Explicit Connection: keep-alive
-    KeepAlive,
-    /// Explicit Connection: close
-    Close,
-    /// No Connection header - use HTTP version default
-    Default,
-}
-
-/// HTTP version detected from request line
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HttpVersion {
-    /// HTTP/1.0 - default connection: close
-    Http10,
-    /// HTTP/1.1 - default connection: keep-alive
-    Http11,
-}
-
 pub const MAX_STRIP_SPANS: usize = 8;
 
 /// Byte spans (start..end, CRLF inclusive) of hop-by-hop header lines,
@@ -73,14 +53,6 @@ impl StripSpans {
             .iter()
             .map(|&(s, e)| (s as usize, e as usize))
     }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 /// HTTP request information extracted by unified parser (zero-copy)
@@ -91,7 +63,9 @@ pub struct HttpRequestInfo<'a> {
     pub host: &'a str,
     pub path: &'a str,
     pub query_string: &'a str,
-    pub connection_type: ConnectionType,
+    /// Version-resolved: an explicit Connection token wins, else HTTP/1.1
+    /// defaults to keep-alive and HTTP/1.0 to close.
+    pub keepalive: bool,
     /// Raw header bytes for lazy header matching (zero-copy)
     pub header_data: &'a [u8],
     /// Content-Length of the request body (None if header absent)
@@ -133,12 +107,12 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     let mut method: Option<&str> = None;
     let mut path: Option<&str> = None;
     let mut host: Option<&str> = None;
-    let mut raw_connection_type = ConnectionType::Default;
+    let mut explicit_keepalive: Option<bool> = None;
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     let mut has_upgrade_header = false;
     let mut connection_has_upgrade = false;
-    let mut http_version = HttpVersion::Http11;
+    let mut is_http10 = false;
     // RFC 7230 §3.3.3 smuggling guards. We flag (but keep parsing) so the
     // request_processor can reject with a clean 400.
     let mut duplicate_content_length_conflict = false;
@@ -165,11 +139,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         method = parts.next();
         path = parts.next();
 
-        if line_end >= 8 && &request_data[line_end - 8..line_end] == b"HTTP/1.0" {
-            http_version = HttpVersion::Http10;
-        } else if line_end >= 8 && &request_data[line_end - 8..line_end] == b"HTTP/1.1" {
-            http_version = HttpVersion::Http11;
-        }
+        is_http10 = line_end >= 8 && &request_data[line_end - 8..line_end] == b"HTTP/1.0";
     }
 
     // Skip to headers (past CRLF)
@@ -286,9 +256,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                     for token in value.split(',') {
                         let token = token.trim();
                         if token.eq_ignore_ascii_case("close") {
-                            raw_connection_type = ConnectionType::Close;
+                            explicit_keepalive = Some(false);
                         } else if token.eq_ignore_ascii_case("keep-alive") {
-                            raw_connection_type = ConnectionType::KeepAlive;
+                            explicit_keepalive = Some(true);
                         } else if token.eq_ignore_ascii_case("upgrade") {
                             connection_has_upgrade = true;
                         } else if !token.is_empty() {
@@ -333,14 +303,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     }
 
     // Apply HTTP version-aware connection defaults
-    let connection_type = match raw_connection_type {
-        ConnectionType::Close => ConnectionType::Close,
-        ConnectionType::KeepAlive => ConnectionType::KeepAlive,
-        ConnectionType::Default => match http_version {
-            HttpVersion::Http10 => ConnectionType::Close,
-            HttpVersion::Http11 => ConnectionType::KeepAlive,
-        },
-    };
+    let keepalive = explicit_keepalive.unwrap_or(!is_http10);
 
     // header_data covers everything from header_start to current pos (end of headers)
     let header_data = &request_data[header_start..pos];
@@ -348,17 +311,15 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     // Handle absolute-form URIs (RFC 7230 §5.3.2):
     // "GET http://host/path HTTP/1.1" → extract "/path"
     let raw_path = path.unwrap_or("/");
-    let raw_path = if raw_path.starts_with("http://") || raw_path.starts_with("https://") {
-        // Find the path after scheme://authority
-        match raw_path.find("://") {
-            Some(scheme_end) => match raw_path[scheme_end + 3..].find('/') {
-                Some(path_start) => &raw_path[scheme_end + 3 + path_start..],
-                None => "/",
-            },
-            None => raw_path,
-        }
-    } else {
-        raw_path
+    let raw_path = match raw_path
+        .strip_prefix("http://")
+        .or_else(|| raw_path.strip_prefix("https://"))
+    {
+        Some(rest) => match rest.find('/') {
+            Some(path_start) => &rest[path_start..],
+            None => "/",
+        },
+        None => raw_path,
     };
     let (clean_path, query_string) = match raw_path.find('?') {
         Some(pos) => (&raw_path[..pos], &raw_path[pos + 1..]),
@@ -369,7 +330,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     // HTTP/1.0 clients may omit it, so use empty string for routing to handle.
     let resolved_host = match host {
         Some(h) => h,
-        None if http_version == HttpVersion::Http11 => {
+        None if !is_http10 => {
             return Err(anyhow::anyhow!(
                 "Missing required Host header in HTTP/1.1 request"
             ));
@@ -389,7 +350,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         host: resolved_host,
         path: clean_path,
         query_string,
-        connection_type,
+        keepalive,
         header_data,
         content_length,
         is_chunked,
