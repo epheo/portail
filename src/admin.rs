@@ -131,7 +131,10 @@ mod tests {
             classify(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"),
             Probe::Metrics
         );
-        assert_eq!(classify(b"GET /metrics?x=1 HTTP/1.1\r\n\r\n"), Probe::Metrics);
+        assert_eq!(
+            classify(b"GET /metrics?x=1 HTTP/1.1\r\n\r\n"),
+            Probe::Metrics
+        );
         // Everything else keeps readiness semantics.
         assert_eq!(classify(b"GET /readyz HTTP/1.1\r\n\r\n"), Probe::Other);
         assert_eq!(classify(b"GET / HTTP/1.1\r\n\r\n"), Probe::Other);
@@ -142,7 +145,10 @@ mod tests {
     #[test]
     fn livez_path_dispatch() {
         assert_eq!(classify(b"GET /livez HTTP/1.1\r\n\r\n"), Probe::Livez);
-        assert_eq!(classify(b"GET /livez?verbose HTTP/1.1\r\n\r\n"), Probe::Livez);
+        assert_eq!(
+            classify(b"GET /livez?verbose HTTP/1.1\r\n\r\n"),
+            Probe::Livez
+        );
         // Liveness must not swallow readiness or metrics paths.
         assert_eq!(classify(b"GET /readyz HTTP/1.1\r\n\r\n"), Probe::Other);
         assert_eq!(classify(b"GET /livezz HTTP/1.1\r\n\r\n"), Probe::Other);
