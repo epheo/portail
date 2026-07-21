@@ -149,14 +149,19 @@ impl RouteTable {
         let host_bytes = host.as_bytes();
         let needs_lowercase = host_bytes.iter().any(|b| b.is_ascii_uppercase());
 
-        let mut buf = [0u8; 256];
+        // The rare mixed-case path allocates so the common path pays nothing:
+        // hoisting a stack buffer out of the branch costs a 256-byte zeroing
+        // on every request (measured +6ns in e2e benches).
+        let host_lower;
         let host_key = if !needs_lowercase {
             host
         } else {
             let len = host_bytes.len().min(256);
+            let mut buf = [0u8; 256];
             buf[..len].copy_from_slice(&host_bytes[..len]);
             buf[..len].make_ascii_lowercase();
-            std::str::from_utf8(&buf[..len]).unwrap_or(host)
+            host_lower = std::str::from_utf8(&buf[..len]).unwrap_or(host).to_string();
+            &host_lower
         };
 
         // O(1) port lookup, then iterate only matching scopes.
@@ -569,11 +574,23 @@ pub fn hostnames_intersect(a: &str, b: &str) -> bool {
 /// Successive parent domains: "a.b.example.com" yields "b.example.com",
 /// "example.com", "com".
 #[inline]
-fn parent_domains(host: &str) -> impl Iterator<Item = &str> {
-    fn strip_label(h: &str) -> Option<&str> {
-        h.find('.').map(|dot| &h[dot + 1..])
+fn parent_domains(host: &str) -> ParentDomains<'_> {
+    ParentDomains(host)
+}
+
+/// Hand-rolled rather than iter::successors: the closure-based adapter did
+/// not inline flat, costing measurable ns on the route-miss path.
+struct ParentDomains<'a>(&'a str);
+
+impl<'a> Iterator for ParentDomains<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a str> {
+        let dot = self.0.find('.')?;
+        self.0 = &self.0[dot + 1..];
+        Some(self.0)
     }
-    std::iter::successors(strip_label(host), |h| strip_label(h))
 }
 
 /// Zero-allocation header value lookup in raw header bytes.
