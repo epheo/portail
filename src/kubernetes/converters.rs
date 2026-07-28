@@ -134,6 +134,9 @@ fn convert_listener(
         address: None,
         interface: None,
         tls,
+        // Populated later from RateLimitPolicy resources targeting this
+        // Gateway (reconcile_to_config), never from the Gateway spec.
+        rate_limit: None,
     })
 }
 

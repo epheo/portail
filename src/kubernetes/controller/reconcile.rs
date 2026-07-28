@@ -24,9 +24,10 @@ use super::{skip_requeue_secs, success_requeue_secs, ControllerCtx, ReconcileErr
 use crate::kubernetes::addresses::{
     compute_bind_addresses, discover_usable_addresses, resolve_network_addresses, UsableAddresses,
 };
+use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
-    reconcile_to_config, ClusterSnapshot, GatewayRoute, RouteAcceptance,
+    reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
 };
 use crate::kubernetes::services::{resolve_named_target_ports, resolve_services};
 use crate::kubernetes::status;
@@ -53,6 +54,46 @@ where
         .state()
         .into_iter()
         .filter(|r| route_targets_gateway(r.parent_refs(), gw_name, gw_ns))
+        .collect()
+}
+
+/// Policies from the reflector store that target this Gateway — `Arc`s
+/// straight out of the store, filtered before anything is cloned, like
+/// `gateway_routes`.
+fn gateway_policies(
+    store: &Store<RateLimitPolicy>,
+    gw_name: &str,
+    gw_ns: &str,
+) -> Vec<Arc<RateLimitPolicy>> {
+    store
+        .state()
+        .into_iter()
+        .filter(|p| p.targets_gateway(gw_ns, gw_name))
+        .collect()
+}
+
+/// `"{ns}/{name}"` → current `status.ancestors` for every policy this pass
+/// evaluates. Feeds the fingerprint (clobber detection) and the status-write
+/// loop, mirroring `observed_parents_map`.
+fn observed_ancestors_map(
+    policies: &[Arc<RateLimitPolicy>],
+) -> HashMap<String, Vec<serde_json::Value>> {
+    policies
+        .iter()
+        .map(|p| {
+            let key = format!("{}/{}", p.namespace().unwrap_or_default(), p.name_any());
+            let ancestors = p
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.ancestors
+                        .iter()
+                        .filter_map(|a| serde_json::to_value(a).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (key, ancestors)
+        })
         .collect()
 }
 
@@ -171,6 +212,8 @@ fn reconcile_fingerprint(
     usable: &UsableAddresses,
     route_status: &[RouteAcceptance],
     observed_route_parents: &[String],
+    policy_status: &[PolicyAcceptance],
+    observed_policy_ancestors: &[String],
     dp_ready: bool,
 ) -> u64 {
     use std::hash::Hasher;
@@ -248,6 +291,14 @@ fn reconcile_fingerprint(
     // change the fingerprint — otherwise the skip path would leave the
     // clobbered status in place until the slow safety-net requeue.
     write_sorted(&mut h, observed_route_parents.to_vec());
+    // Policy acceptance + observed ancestors, for the same two reasons as
+    // routes: computed conditions must re-trigger the apply path when they
+    // change, and RMW-written `status.ancestors` clobbers must be detected.
+    write_sorted(
+        &mut h,
+        policy_status.iter().map(|pa| format!("{:?}", pa)).collect(),
+    );
+    write_sorted(&mut h, observed_policy_ancestors.to_vec());
     h.write(&[dp_ready as u8]);
     h.finish()
 }
@@ -427,6 +478,40 @@ async fn write_route_statuses(
     statuses_ok
 }
 
+/// Ancestor status for every RateLimitPolicy evaluated against this Gateway.
+async fn write_policy_statuses(
+    ctx: &ControllerCtx,
+    gw_name: &str,
+    gw_ns: &str,
+    policy_status: &[PolicyAcceptance],
+    ancestors_by_policy: &HashMap<String, Vec<serde_json::Value>>,
+) -> bool {
+    let field_manager = format!("portail-{}-{}", gw_ns, gw_name);
+    let mut statuses_ok = true;
+    for pa in policy_status {
+        let existing = ancestors_by_policy
+            .get(&format!("{}/{}", pa.namespace, pa.name))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        statuses_ok &= status::update_policy_status(
+            &ctx.client,
+            &pa.name,
+            &pa.namespace,
+            &ctx.controller_name,
+            gw_name,
+            gw_ns,
+            pa.accepted,
+            pa.reason,
+            &pa.message,
+            pa.generation,
+            existing,
+            &field_manager,
+        )
+        .await;
+    }
+    statuses_ok
+}
+
 /// Whether `class_name` resolves to a GatewayClass whose controllerName is
 /// ours. Pure — the unscoped-mode ownership filter.
 fn gateway_class_is_ours(
@@ -491,6 +576,7 @@ pub(super) async fn reconcile(
             .collect(),
         reference_grants: snapshot(&ctx.cache.reference_grants),
         services: ctx.cache.services.state(),
+        rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
     };
 
     let resolved_certs = resolve_gateway_certs(
@@ -641,6 +727,19 @@ pub(super) async fn reconcile(
             format!("{}:{:?}", key, parents)
         })
         .collect();
+    let ancestors_by_policy = observed_ancestors_map(&snapshot.rate_limit_policies);
+    let observed_policy_ancestors: Vec<String> = result
+        .policy_status
+        .iter()
+        .map(|pa| {
+            let key = format!("{}/{}", pa.namespace, pa.name);
+            let ancestors = ancestors_by_policy
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            format!("{}:{:?}", key, ancestors)
+        })
+        .collect();
 
     let all_routes_accepted = result.route_status.iter().all(|ra| ra.accepted);
 
@@ -670,6 +769,8 @@ pub(super) async fn reconcile(
         &usable,
         &result.route_status,
         &observed_route_parents,
+        &result.policy_status,
+        &observed_policy_ancestors,
         dp_ready_initial,
     );
     let unchanged = ctx
@@ -760,6 +861,8 @@ pub(super) async fn reconcile(
             &usable,
             &result.route_status,
             &observed_route_parents,
+            &result.policy_status,
+            &observed_policy_ancestors,
             dp_ready,
         )
     };
@@ -828,6 +931,15 @@ pub(super) async fn reconcile(
     )
     .await;
 
+    statuses_ok &= write_policy_statuses(
+        &ctx,
+        &gw_name,
+        &gw_ns,
+        &result.policy_status,
+        &ancestors_by_policy,
+    )
+    .await;
+
     if !statuses_ok {
         // A status PATCH failed (apiserver blip). Without a fast retry the
         // wrong status would sit in the cluster until the slow safety-net
@@ -866,6 +978,7 @@ mod tests {
             address: None,
             interface: None,
             tls: None,
+            rate_limit: None,
         }
     }
 
@@ -998,7 +1111,7 @@ mod tests {
         let parents = vec!["HTTPRoute/default/r:[]".to_string()];
 
         let fp = |ls: &HashMap<String, status::ListenerStatus>, ready: bool| {
-            reconcile_fingerprint(&config, &cond, ls, &usable, &[], &parents, ready)
+            reconcile_fingerprint(&config, &cond, ls, &usable, &[], &parents, &[], &[], ready)
         };
 
         // Deterministic: same inputs, same hash — twice.
@@ -1028,6 +1141,8 @@ mod tests {
                 &usable,
                 &[],
                 &parents,
+                &[],
+                &[],
                 true
             ),
             reconcile_fingerprint(
@@ -1037,6 +1152,8 @@ mod tests {
                 &usable,
                 &[],
                 &clobbered,
+                &[],
+                &[],
                 true
             ),
         );
@@ -1065,6 +1182,7 @@ mod tests {
                         address: None,
                         interface: None,
                         tls: None,
+                        rate_limit: None,
                     }],
                     addresses: vec![],
                 },
@@ -1163,6 +1281,7 @@ mod tests {
                                 key_pem: Some(b"K".to_vec()),
                             }],
                         }),
+                        rate_limit: None,
                     }],
                     addresses: vec![],
                 },

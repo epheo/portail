@@ -77,6 +77,7 @@ metrics! {
     connections_accepted_total: "Client connections accepted across all listeners",
     http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
+    rate_limited_total: "Requests answered 429 by a per-client rate limit",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
     pool_misses_total: "Backend pool checkouts that had to open a new connection",
@@ -308,6 +309,8 @@ pub struct ListenerStats {
     pub http_requests: Counter,
     /// Client TLS handshakes that failed or timed out on this listener.
     pub tls_handshake_failures: Counter,
+    /// Requests answered 429 by this listener's rate limit.
+    pub rate_limited: Counter,
     /// Backend connects that failed (client saw 502) for this listener's requests.
     pub upstream_connect_errors: Counter,
     /// Backend connects that timed out (client saw 504) for this listener's requests.
@@ -368,7 +371,7 @@ fn render_listeners(out: &mut String) {
     // UDP listeners render zeros for the TCP-only series; a constant zero
     // costs nothing and keeps the schema uniform across protos.
     type Get = fn(&ListenerStats) -> u64;
-    let series: [(&str, &str, &str, Get); 7] = [
+    let series: [(&str, &str, &str, Get); 8] = [
         (
             "listener_accepted_total",
             "Connections accepted (TCP) or datagrams received (UDP) per listener",
@@ -392,6 +395,12 @@ fn render_listeners(out: &mut String) {
             "Client TLS handshakes that failed or timed out per listener",
             "counter",
             |s| s.tls_handshake_failures.get(),
+        ),
+        (
+            "listener_rate_limited_total",
+            "Requests answered 429 by the listener's rate limit",
+            "counter",
+            |s| s.rate_limited.get(),
         ),
         (
             "listener_upstream_connect_errors_total",

@@ -190,6 +190,27 @@ impl GatewayConfig {
     }
 }
 
+impl crate::config::types::RateLimitSpec {
+    fn validate(&self) -> Result<()> {
+        if self.requests_per_second == 0 || self.requests_per_second > 1_000_000 {
+            return Err(anyhow!(
+                "rateLimit requestsPerSecond must be 1..=1000000, got {}",
+                self.requests_per_second
+            ));
+        }
+        if let Some(burst) = self.burst {
+            if burst == 0 || burst > crate::rate_limit::MAX_BURST {
+                return Err(anyhow!(
+                    "rateLimit burst must be 1..={}, got {}",
+                    crate::rate_limit::MAX_BURST,
+                    burst
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ListenerConfig {
     fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
@@ -226,6 +247,10 @@ impl ListenerConfig {
                     addr
                 )
             })?;
+        }
+
+        if let Some(rl) = &self.rate_limit {
+            rl.validate()?;
         }
 
         // TLS config validation per protocol
@@ -767,6 +792,7 @@ mod tests {
             address: None,
             interface: None,
             tls,
+            rate_limit: None,
         }
     }
 
@@ -911,6 +937,7 @@ mod tests {
             address: address.map(str::to_string),
             interface: None,
             tls: None,
+            rate_limit: None,
         }
     }
 

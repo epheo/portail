@@ -44,6 +44,9 @@ kube = { version = "2", features = ["runtime", "client", "derive", "unstable-run
 k8s-openapi = { version = "0.26", features = ["v1_32"] }
 gateway-api = { version = "0.19", features = ["experimental"] }
 futures = "0.3"
+# CRD schema generation for portail's own policy types; already in the tree
+# via gateway-api, this only promotes it to a direct dependency.
+schemars = "1"
 
 
 

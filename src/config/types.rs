@@ -53,6 +53,31 @@ pub struct ListenerConfig {
     pub interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+    /// Per-client-IP rate limit for HTTP requests routed via this listener.
+    /// In Kubernetes mode this is populated from RateLimitPolicy resources,
+    /// never from the Gateway itself. `None` costs the hot path one null
+    /// check per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitSpec>,
+}
+
+/// Token-bucket parameters, per client (IPv4 address / IPv6 /64).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitSpec {
+    /// Sustained budget; the bucket refill rate.
+    pub requests_per_second: u32,
+    /// Bucket capacity: sized to absorb a human burst (a page plus its
+    /// assets), not a crawl. Defaults to `requestsPerSecond`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+impl RateLimitSpec {
+    pub fn effective_burst(&self) -> u32 {
+        self.burst.unwrap_or(self.requests_per_second)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +126,7 @@ impl Default for GatewayConfig {
                 address: None,
                 interface: None,
                 tls: None,
+                rate_limit: None,
             }],
             addresses: vec![],
         }

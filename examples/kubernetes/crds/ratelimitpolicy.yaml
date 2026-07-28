@@ -1,0 +1,157 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ratelimitpolicies.portail.epheo.eu
+spec:
+  group: portail.epheo.eu
+  names:
+    categories: []
+    kind: RateLimitPolicy
+    plural: ratelimitpolicies
+    shortNames:
+    - rlp
+    singular: ratelimitpolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.targetRef.name
+      name: Target
+      type: string
+    - jsonPath: .spec.targetRef.sectionName
+      name: Listener
+      type: string
+    - jsonPath: .spec.requestsPerSecond
+      name: Req/s
+      type: integer
+    - jsonPath: .spec.burst
+      name: Burst
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RateLimitPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Per-client-IP token-bucket rate limit for one Gateway or one listener.
+
+              Clients are keyed by source address (IPv4) or /64 prefix (IPv6). The
+              bucket holds `burst` requests and refills at `requestsPerSecond`; a
+              request finding the bucket empty is answered 429 without touching any
+              backend. Policy edits keep existing per-client state: a throttled
+              crawler stays throttled across a rate change.
+            properties:
+              burst:
+                description: |-
+                  Bucket capacity: how many requests a client may spend at once before
+                  the sustained rate applies. Sized to absorb a human page load (a page
+                  plus its assets), not a crawl. Defaults to `requestsPerSecond`.
+                format: uint32
+                maximum: 4000000.0
+                minimum: 1.0
+                nullable: true
+                type: integer
+              requestsPerSecond:
+                description: Sustained per-client budget. Bucket refill rate.
+                format: uint32
+                maximum: 1000000.0
+                minimum: 1.0
+                type: integer
+              targetRef:
+                description: |-
+                  The Gateway this policy attaches to. Same-namespace only, per
+                  GEP-713 direct attachment.
+                properties:
+                  group:
+                    description: Only "gateway.networking.k8s.io" is meaningful today.
+                    type: string
+                  kind:
+                    description: Only "Gateway" is meaningful today.
+                    type: string
+                  name:
+                    type: string
+                  sectionName:
+                    description: |-
+                      Listener name to narrow the policy to. Absent = whole Gateway.
+                      A listener-scoped policy beats a Gateway-wide one for its listener.
+                    nullable: true
+                    type: string
+                required:
+                - group
+                - kind
+                - name
+                type: object
+            required:
+            - requestsPerSecond
+            - targetRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              ancestors:
+                description: |-
+                  GEP-713 ancestor status: one entry per Gateway this controller
+                  evaluated the policy against.
+                items:
+                  properties:
+                    ancestorRef:
+                      description: ParentReference shape, reduced to what a Gateway ancestor needs.
+                      properties:
+                        group:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - group
+                      - kind
+                      - name
+                      - namespace
+                      type: object
+                    conditions:
+                      items:
+                        description: |-
+                          metav1.Condition shape (typed rather than borrowed from k8s-openapi,
+                          whose types don't derive JsonSchema under our feature set).
+                        properties:
+                          lastTransitionTime:
+                            type: string
+                          message:
+                            type: string
+                          observedGeneration:
+                            format: int64
+                            nullable: true
+                            type: integer
+                          reason:
+                            type: string
+                          status:
+                            description: '"True" | "False" | "Unknown"'
+                            type: string
+                          type:
+                            type: string
+                        required:
+                        - lastTransitionTime
+                        - reason
+                        - status
+                        - type
+                        type: object
+                      type: array
+                    controllerName:
+                      type: string
+                  required:
+                  - ancestorRef
+                  - controllerName
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: RateLimitPolicy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,6 +1,7 @@
 pub mod addresses;
 pub mod controller;
 pub mod converters;
+pub mod crds;
 pub mod dns_refresh;
 pub mod features;
 pub mod hostname;

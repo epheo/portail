@@ -425,6 +425,11 @@ pub struct HttpRouteRule {
     /// add. Registry-backed: table swaps re-attach the SAME counter, so the
     /// series stays monotonic across reconciles and DNS refreshes.
     pub requests: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-client limiter of the listener this rule was added under; `None`
+    /// (the common case) costs the hot path one null check. Registry-backed
+    /// like `requests`: table swaps re-attach the SAME limiter, so a
+    /// throttled client stays throttled across reconciles and DNS refreshes.
+    pub limiter: Option<Arc<crate::rate_limit::Limiter>>,
 }
 
 impl HttpRouteRule {
@@ -455,6 +460,7 @@ impl HttpRouteRule {
             // route's hostname; a rule that never enters a table (tests)
             // counts into this unrendered cell.
             requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            limiter: None,
         }
     }
 

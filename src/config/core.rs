@@ -152,17 +152,37 @@ impl PortailConfig {
             // No matching listener: route without gateway context (file-based
             // configs). One pseudo-scope on port 0 with no hostname
             // constraint, so hostname intersection passes routes through.
-            let scopes: Vec<(u16, Option<&str>, &str)> = if matched_listeners.is_empty() {
-                vec![(0, None, "")]
+            // Rate limiting rides the listener, so the pseudo-scope has none.
+            type Scope<'a> = (
+                u16,
+                Option<&'a str>,
+                &'a str,
+                Option<std::sync::Arc<crate::rate_limit::Limiter>>,
+            );
+            let scopes: Vec<Scope> = if matched_listeners.is_empty() {
+                vec![(0, None, "", None)]
             } else {
                 matched_listeners
                     .iter()
-                    .map(|l| (l.port, l.hostname.as_deref(), l.name.as_str()))
+                    .map(|l| {
+                        // Registry get-or-create, keyed on the listener
+                        // identity: every rebuild re-attaches the same
+                        // limiter, so bucket state survives table swaps.
+                        let limiter = l.rate_limit.as_ref().map(|rl| {
+                            crate::rate_limit::limiter_for(
+                                l.port,
+                                &l.name,
+                                rl.requests_per_second,
+                                rl.effective_burst(),
+                            )
+                        });
+                        (l.port, l.hostname.as_deref(), l.name.as_str(), limiter)
+                    })
                     .collect()
             };
 
             // For each scope, compute hostname intersection and add routes
-            for (port, listener_hostname, listener_name) in scopes {
+            for (port, listener_hostname, listener_name, limiter) in scopes {
                 let effective_hostnames = if http_route.hostnames.is_empty() {
                     // Route has no hostnames = match all.
                     // Use listener hostname if set, otherwise catch-all "*".
@@ -204,8 +224,9 @@ impl PortailConfig {
                         )?;
 
                         for route_match in &rule.matches {
-                            let routing_rule =
+                            let mut routing_rule =
                                 build_routing_rule(route_match, &filters, &backends, rule)?;
+                            routing_rule.limiter = limiter.clone();
                             tracing::debug!(
                                 "      Adding route: {} {} -> {} backends (listener {}:{:?})",
                                 hostname,

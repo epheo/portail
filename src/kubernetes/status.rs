@@ -457,6 +457,93 @@ where
     }
 }
 
+/// GEP-713 ancestor status for a RateLimitPolicy: one entry per (controller,
+/// Gateway ancestor), carrying an Accepted condition. Same discipline as
+/// route status — `status.ancestors` is composed read-modify-write, foreign
+/// controllers' and other Gateways' entries preserved verbatim, ours
+/// replaced wholesale, written with a merge patch. The reconcile
+/// fingerprint includes the observed ancestors, so a concurrent clobber is
+/// detected and re-applied.
+pub(crate) async fn update_policy_status(
+    client: &Client,
+    policy_name: &str,
+    policy_ns: &str,
+    controller_name: &str,
+    gw_name: &str,
+    gw_ns: &str,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+    generation: Option<i64>,
+    existing_ancestors: &[serde_json::Value],
+    field_manager: &str,
+) -> bool {
+    use crate::kubernetes::crds::RateLimitPolicy;
+
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let existing_conds = existing_ancestors
+        .iter()
+        .find(|a| {
+            a.get("controllerName").and_then(|v| v.as_str()) == Some(controller_name)
+                && a.get("ancestorRef")
+                    .and_then(|r| r.get("name"))
+                    .and_then(|v| v.as_str())
+                    == Some(gw_name)
+                && a.get("ancestorRef")
+                    .and_then(|r| r.get("namespace"))
+                    .and_then(|v| v.as_str())
+                    == Some(gw_ns)
+        })
+        .and_then(|a| a.get("conditions").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+
+    let our_entry = serde_json::json!({
+        "ancestorRef": {
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "namespace": gw_ns,
+            "name": gw_name,
+        },
+        "controllerName": controller_name,
+        "conditions": [
+            condition_json("Accepted", accepted, reason, message, &existing_conds, &now, generation),
+        ],
+    });
+
+    let foreign = existing_ancestors.iter().filter(|a| {
+        !(a.get("controllerName").and_then(|v| v.as_str()) == Some(controller_name)
+            && a.get("ancestorRef")
+                .and_then(|r| r.get("name"))
+                .and_then(|v| v.as_str())
+                == Some(gw_name)
+            && a.get("ancestorRef")
+                .and_then(|r| r.get("namespace"))
+                .and_then(|v| v.as_str())
+                == Some(gw_ns))
+    });
+    let merged: Vec<serde_json::Value> = foreign.cloned().chain([our_entry]).collect();
+
+    let api: Api<RateLimitPolicy> = Api::namespaced(client.clone(), policy_ns);
+    match api
+        .patch_status(
+            policy_name,
+            &PatchParams::apply(field_manager),
+            &Patch::Merge(serde_json::json!({ "status": { "ancestors": merged } })),
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(
+                "Failed to update RateLimitPolicy {}/{} status: {}",
+                policy_ns, policy_name, e
+            );
+            false
+        }
+    }
+}
+
 /// Preserve foreign entries: anything not written by this controller for
 /// this Gateway. Our own stale entries (e.g. a sectionName the route no
 /// longer attaches to) are dropped and replaced by `new_entries`.

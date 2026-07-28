@@ -792,6 +792,7 @@ mod tests {
                     key_pem: Some(b"PEM-KEY".to_vec()),
                 }],
             }),
+            rate_limit: None,
         }
     }
 
@@ -848,6 +849,7 @@ mod tests {
                 address: None,
                 interface: None,
                 tls: None,
+                rate_limit: None,
             },
         ];
         let merged = merge_cert_refs_by_port(&listeners);
@@ -894,6 +896,7 @@ mod tests {
             address: None,
             interface: None,
             tls: None,
+            rate_limit: None,
         }];
         let perf = test_perf();
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
@@ -1055,6 +1058,7 @@ mod tests {
             address: None, // wildcard
             interface: None,
             tls: None,
+            rate_limit: None,
         }];
         let perf = test_perf();
         let mut dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
@@ -1087,6 +1091,7 @@ mod tests {
             address: None,
             interface: None,
             tls: None,
+            rate_limit: None,
         }];
         let perf = test_perf();
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
@@ -1133,6 +1138,7 @@ mod tests {
             address: None,
             interface: None,
             tls: None,
+            rate_limit: None,
         };
         let both = vec![mk("a", 23448), mk("b", 23449)];
         let perf = test_perf();

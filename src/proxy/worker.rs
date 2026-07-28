@@ -507,21 +507,54 @@ pub(crate) async fn handle_connection(
                 // slot) + the per-listener aggregate.
                 rule.requests.fetch_add(1, Ordering::Relaxed);
                 state.listener_stats.http_requests.inc();
-                // proxy_http_request owns all timing for the request lifecycle —
-                // backend_request_timeout (connect + TTFB) and request_timeout
-                // (total deadline) are applied phase-aware inside.
-                let backend_addr = backend.socket_addr;
-                let (ka, leftover) =
-                    proxy_http_request(&mut client, &mut buf, n, backend, rule, &meta, &mut state)
-                        .await?;
-                if !meta.is_upgrade {
-                    crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
+                let limited = rule
+                    .limiter
+                    .as_ref()
+                    .is_some_and(|l| !l.check(state.peer_ip));
+                if limited {
+                    crate::metrics::METRICS.rate_limited_total.inc();
+                    state.listener_stats.rate_limited.inc();
+                    state.last_status = 429;
+                    // Reuse the connection only when nothing else is in
+                    // flight on it: no request body to drain, no pipelined
+                    // bytes past the headers, and the client asked for
+                    // keep-alive (the h2 bridge injects `connection: close`,
+                    // so h2 streams always take the close path).
+                    let reusable = meta.keepalive
+                        && !meta.is_upgrade
+                        && !meta.is_chunked
+                        && meta.content_length.unwrap_or(0) == 0
+                        && find_header_end(&buf[..n]) == Some(n);
+                    send_rate_limit_response(&mut client, reusable).await?;
+                    crate::access_log::emit(access, 429, None);
+                    if !reusable {
+                        return Ok(());
+                    }
+                    // Falls through to the shared keepalive read below.
+                } else {
+                    // proxy_http_request owns all timing for the request lifecycle —
+                    // backend_request_timeout (connect + TTFB) and request_timeout
+                    // (total deadline) are applied phase-aware inside.
+                    let backend_addr = backend.socket_addr;
+                    let (ka, leftover) = proxy_http_request(
+                        &mut client,
+                        &mut buf,
+                        n,
+                        backend,
+                        rule,
+                        &meta,
+                        &mut state,
+                    )
+                    .await?;
+                    if !meta.is_upgrade {
+                        crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
+                    }
+                    crate::access_log::emit(access, state.last_status, Some(backend_addr));
+                    if !ka || !meta.keepalive {
+                        return Ok(());
+                    }
+                    pending = leftover;
                 }
-                crate::access_log::emit(access, state.last_status, Some(backend_addr));
-                if !ka || !meta.keepalive {
-                    return Ok(());
-                }
-                pending = leftover;
             }
             RoutingResult::HttpRedirect {
                 status_code,
@@ -1817,6 +1850,20 @@ async fn send_redirect_response(
     );
 
     client.write_all(&resp).await?;
+    Ok(())
+}
+
+/// 429, split from `send_error_response`: the one engine-answered error that
+/// deliberately keeps the connection open when it safely can. Closing would
+/// make the throttled client's next request cost a fresh TLS handshake —
+/// more of OUR cpu than the request being refused, defeating the limiter's
+/// purpose under a sustained crawl.
+async fn send_rate_limit_response(client: &mut Connection, keepalive: bool) -> Result<()> {
+    static RESP: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 21\r\n\r\n429 Too Many Requests";
+    static RESP_CLOSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 21\r\nConnection: close\r\n\r\n429 Too Many Requests";
+    client
+        .write_all(if keepalive { RESP } else { RESP_CLOSE })
+        .await?;
     Ok(())
 }
 

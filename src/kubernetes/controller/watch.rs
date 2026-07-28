@@ -115,6 +115,27 @@ pub(super) fn map_route_to_gateways<
     refs
 }
 
+/// Map a RateLimitPolicy to the Gateway its targetRef names (GEP-713 direct
+/// attachment is same-namespace, so the Gateway namespace is the policy's).
+/// The store-membership check is what makes scoped pods ignore policies for
+/// Gateways they do not serve, exactly like route parentRefs.
+pub(super) fn map_policy_to_gateways(
+    policy: &crate::kubernetes::crds::RateLimitPolicy,
+    store: &Store<Gateway>,
+) -> Vec<ObjectRef<Gateway>> {
+    let ns = policy.namespace().unwrap_or_default();
+    let t = &policy.spec.target_ref;
+    if t.kind != "Gateway" || !(t.group.is_empty() || t.group == "gateway.networking.k8s.io") {
+        return Vec::new();
+    }
+    let obj_ref = ObjectRef::<Gateway>::new(&t.name).within(&ns);
+    if store.get(&obj_ref).is_some() {
+        vec![obj_ref]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Map a Secret to the Gateway(s) whose TLS certificateRefs name it.
 pub(super) fn map_secret_to_gateways(
     secret: &Secret,

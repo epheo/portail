@@ -1,0 +1,19 @@
+# Per-client rate limit on a whole Gateway. Requires the CRD:
+#   kubectl apply -f crds/ratelimitpolicy.yaml
+# Scope with spec.targetRef.sectionName to limit one listener instead;
+# a listener-scoped policy overrides a Gateway-wide one for that listener.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  name: edge-clients
+  namespace: portail-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: portail-gateway
+  # Sustained per-client budget (bucket refill).
+  requestsPerSecond: 2
+  # One-shot budget (bucket size): absorbs a human page load with all its
+  # assets; a crawler exceeding the sustained rate drains it and gets 429.
+  burst: 60

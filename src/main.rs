@@ -29,6 +29,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Print portail's own CRD manifests and exit. The Rust types are the
+    // source of truth; the checked-in copy is regenerated from this output
+    // and a test asserts they never drift.
+    if args.print_crd {
+        print!("{}", kubernetes::crds::crd_yaml()?);
+        return Ok(());
+    }
+
     // Config generation uses minimal runtime
     if args.is_generation_mode() {
         logging::init_logging(args.verbose, None);
@@ -135,6 +143,9 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     if let Some(target) = &args.access_log {
         portail::access_log::init(target)?;
     }
+    // Bucket eviction for per-client rate limits; idle until a listener or
+    // RateLimitPolicy configures one.
+    portail::rate_limit::spawn_sweeper();
     let mut performance_config = portail_config.performance.clone();
     // Either source enables h2; the flag is the K8s-mode path (no config file).
     if args.http2 {

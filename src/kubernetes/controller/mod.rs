@@ -32,13 +32,15 @@ use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
 
+use crate::kubernetes::crds::RateLimitPolicy;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 
 use reconcile::reconcile;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
-    create_reflector_gated_with_config, map_route_to_gateways, map_secret_to_gateways,
+    create_reflector_gated_with_config, map_policy_to_gateways, map_route_to_gateways,
+    map_secret_to_gateways,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -65,6 +67,8 @@ struct ResourceCache {
     services: Store<Service>,
     secrets: Store<Secret>,
     reference_grants: Store<ReferenceGrant>,
+    /// Portail's own policy CRD; empty store when the CRD is not installed.
+    rate_limit_policies: Store<RateLimitPolicy>,
     /// `Some` only in legacy unscoped mode, where portail sees every Gateway
     /// in the cluster and must filter by GatewayClass controllerName itself.
     /// Scoped mode trusts the operator's scoping and opens no class watch.
@@ -185,14 +189,20 @@ pub async fn run_controller(
     // not serialize the cold start.
     let (store_http_routes, http_route_stream) =
         create_reflector(Api::<HTTPRoute>::all(client.clone()));
-    let (tcp_reflector, tls_reflector, udp_reflector) = tokio::join!(
+    // RateLimitPolicy rides the optional-CRD path like the experimental
+    // routes, and stays cluster-wide and ungated for the same reason routes
+    // do: a policy in any namespace may target this Gateway and must get an
+    // ancestor status, which requires observing it.
+    let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector) = tokio::join!(
         create_optional_reflector(Api::<TCPRoute>::all(client.clone())),
         create_optional_reflector(Api::<TLSRoute>::all(client.clone())),
         create_optional_reflector(Api::<UDPRoute>::all(client.clone())),
+        create_optional_reflector(Api::<RateLimitPolicy>::all(client.clone())),
     );
     let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
     let (store_tls_routes, tls_route_stream) = tls_reflector;
     let (store_udp_routes, udp_route_stream) = udp_reflector;
+    let (store_rate_limit_policies, policy_stream) = policy_reflector;
     // GatewayClass status is owned by portail-operator now; portail no longer
     // runs its own GatewayClass controller.
 
@@ -244,6 +254,7 @@ pub async fn run_controller(
             services: store_services,
             secrets: store_secrets,
             reference_grants: store_reference_grants,
+            rate_limit_policies: store_rate_limit_policies,
             gateway_classes: unscoped.then_some(store_gateway_classes),
         },
         routes,
@@ -300,8 +311,8 @@ pub async fn run_controller(
     // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
 
     // Each watches_stream closure captures an owned gateway store clone via move.
-    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7] =
-        std::array::from_fn::<_, 7, _>(|_| store_gateways_for_controller.clone());
+    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
+        std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
         // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
@@ -324,6 +335,10 @@ pub async fn run_controller(
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS
         .watches_stream(secret_stream, move |secret: Secret| {
             map_secret_to_gateways(&secret, &gw5)
+        })
+        // RateLimitPolicy: targeted — the one Gateway its targetRef names.
+        .watches_stream(policy_stream, move |policy: RateLimitPolicy| {
+            map_policy_to_gateways(&policy, &gw8)
         })
         // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
         // These have complex multi-hop mappings; the 1s debounce coalesces bursts.

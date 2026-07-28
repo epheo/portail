@@ -53,6 +53,7 @@ fn test_snapshot(
         namespace_labels: ns_labels.clone(),
         reference_grants,
         services: vec![],
+        rate_limit_policies: vec![],
     }
 }
 
@@ -2262,6 +2263,7 @@ fn reconcile_stamps_listener_target_port_from_fronting_service() {
         udp_routes: vec![],
         namespace_labels: default_ns_labels(),
         reference_grants: vec![],
+        rate_limit_policies: vec![],
         services: vec![Arc::new(fronting_service(
             "default",
             "test-gw",

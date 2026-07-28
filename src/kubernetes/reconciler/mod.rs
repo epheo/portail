@@ -18,6 +18,7 @@ use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
     parse_backend_dns_name, route_namespace, CertData,
 };
+use super::crds::RateLimitPolicy;
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, listeners_for_parent_ref};
 use super::services::ServiceState;
@@ -40,6 +41,8 @@ pub(crate) struct ClusterSnapshot {
     pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
     pub reference_grants: Vec<ReferenceGrant>,
     pub services: Vec<Arc<Service>>,
+    /// Pre-filtered to policies targeting this Gateway, like routes.
+    pub rate_limit_policies: Vec<Arc<RateLimitPolicy>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +208,18 @@ impl_gateway_route!(UDPRoute, UDPRouteParentRefs, UdpRouteConfig, "UDPRoute",
 pub struct ReconcileResult {
     pub config: PortailConfig,
     pub route_status: Vec<RouteAcceptance>,
+    pub policy_status: Vec<PolicyAcceptance>,
+}
+
+/// Computed Accepted condition for one RateLimitPolicy against this Gateway.
+#[derive(Debug)]
+pub struct PolicyAcceptance {
+    pub name: String,
+    pub namespace: String,
+    pub accepted: bool,
+    pub reason: &'static str,
+    pub message: String,
+    pub generation: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -249,6 +264,13 @@ pub(crate) fn reconcile_to_config(
         l.target_port = target_ports.get(&l.port).copied();
     }
 
+    let policy_status = apply_rate_limit_policies(
+        &mut gateway_config.listeners,
+        &snapshot.rate_limit_policies,
+        gateway_ns,
+        gateway_name,
+    );
+
     let mut route_status = Vec::new();
 
     let cx = RouteCollectCtx {
@@ -281,7 +303,188 @@ pub(crate) fn reconcile_to_config(
             ..Default::default()
         },
         route_status,
+        policy_status,
     })
+}
+
+/// Resolve RateLimitPolicies onto this Gateway's listeners (GEP-713 direct
+/// attachment). A `sectionName`-scoped policy beats a Gateway-wide one for
+/// its listener; among equal specificity the OLDEST policy wins
+/// (creationTimestamp, then name — the GEP-713 conflict rule) and later
+/// ones report Conflicted. Runs before the unscoped-mode merge prefixes
+/// listener names, so sectionName matches the Gateway's own listener names.
+pub(crate) fn apply_rate_limit_policies(
+    listeners: &mut [ListenerConfig],
+    policies: &[Arc<RateLimitPolicy>],
+    gw_ns: &str,
+    gw_name: &str,
+) -> Vec<PolicyAcceptance> {
+    use kube::ResourceExt;
+
+    let mut ordered: Vec<&Arc<RateLimitPolicy>> = policies
+        .iter()
+        .filter(|p| p.targets_gateway(gw_ns, gw_name))
+        .collect();
+    ordered.sort_by_key(|p| (p.metadata.creation_timestamp.clone(), p.name_any()));
+
+    // Winner per listener: first (oldest) sectionName match, else first
+    // Gateway-wide policy.
+    let mut applied: HashSet<String> = HashSet::new();
+    for l in listeners.iter_mut() {
+        let winner = ordered
+            .iter()
+            .find(|p| p.spec.target_ref.section_name.as_deref() == Some(l.name.as_str()))
+            .or_else(|| {
+                ordered
+                    .iter()
+                    .find(|p| p.spec.target_ref.section_name.is_none())
+            });
+        if let Some(p) = winner {
+            l.rate_limit = Some(RateLimitSpec {
+                requests_per_second: p.spec.requests_per_second,
+                burst: Some(p.effective_burst()),
+            });
+            applied.insert(p.name_any());
+        }
+    }
+
+    ordered
+        .iter()
+        .map(|p| {
+            let name = p.name_any();
+            let (accepted, reason, message) = match &p.spec.target_ref.section_name {
+                Some(section) if !listeners.iter().any(|l| l.name == *section) => (
+                    false,
+                    "TargetNotFound",
+                    format!("Gateway has no listener named '{}'", section),
+                ),
+                _ if !applied.contains(&name) => (
+                    false,
+                    "Conflicted",
+                    "An older policy already limits every listener this policy targets".to_string(),
+                ),
+                _ => (true, "Accepted", "Rate limit programmed".to_string()),
+            };
+            PolicyAcceptance {
+                name,
+                namespace: p.namespace().unwrap_or_default(),
+                accepted,
+                reason,
+                message,
+                generation: p.metadata.generation,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::kubernetes::crds::{PolicyTargetRef, RateLimitPolicySpec};
+    use kube::ResourceExt;
+
+    fn listener(name: &str, port: u16) -> ListenerConfig {
+        ListenerConfig {
+            name: name.to_string(),
+            protocol: Protocol::HTTP,
+            port,
+            target_port: None,
+            hostname: None,
+            address: None,
+            interface: None,
+            tls: None,
+            rate_limit: None,
+        }
+    }
+
+    fn policy(name: &str, section: Option<&str>, rps: u32, age_secs: i64) -> Arc<RateLimitPolicy> {
+        let mut p = RateLimitPolicy::new(
+            name,
+            RateLimitPolicySpec {
+                target_ref: PolicyTargetRef {
+                    group: "gateway.networking.k8s.io".into(),
+                    kind: "Gateway".into(),
+                    name: "gw".into(),
+                    section_name: section.map(str::to_string),
+                },
+                requests_per_second: rps,
+                burst: None,
+            },
+        );
+        p.metadata.namespace = Some("edge".into());
+        p.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::chrono::DateTime::from_timestamp(age_secs, 0).unwrap(),
+        ));
+        Arc::new(p)
+    }
+
+    #[test]
+    fn section_scoped_beats_gateway_wide() {
+        let mut listeners = vec![listener("web", 443), listener("alt", 8443)];
+        let policies = vec![
+            policy("wide", None, 10, 100),
+            policy("web-only", Some("web"), 2, 200),
+        ];
+        let status = apply_rate_limit_policies(&mut listeners, &policies, "edge", "gw");
+        assert_eq!(
+            listeners[0]
+                .rate_limit
+                .as_ref()
+                .unwrap()
+                .requests_per_second,
+            2
+        );
+        assert_eq!(
+            listeners[1]
+                .rate_limit
+                .as_ref()
+                .unwrap()
+                .requests_per_second,
+            10
+        );
+        assert!(status.iter().all(|pa| pa.accepted));
+    }
+
+    #[test]
+    fn oldest_policy_wins_conflicts() {
+        let mut listeners = vec![listener("web", 443)];
+        let policies = vec![policy("newer", None, 5, 200), policy("older", None, 1, 100)];
+        let status = apply_rate_limit_policies(&mut listeners, &policies, "edge", "gw");
+        assert_eq!(
+            listeners[0]
+                .rate_limit
+                .as_ref()
+                .unwrap()
+                .requests_per_second,
+            1
+        );
+        let by_name = |n: &str| status.iter().find(|pa| pa.name == n).unwrap();
+        assert!(by_name("older").accepted);
+        assert!(!by_name("newer").accepted);
+        assert_eq!(by_name("newer").reason, "Conflicted");
+    }
+
+    #[test]
+    fn unknown_section_reports_target_not_found() {
+        let mut listeners = vec![listener("web", 443)];
+        let policies = vec![policy("typo", Some("wbe"), 2, 100)];
+        let status = apply_rate_limit_policies(&mut listeners, &policies, "edge", "gw");
+        assert!(listeners[0].rate_limit.is_none());
+        assert!(!status[0].accepted);
+        assert_eq!(status[0].reason, "TargetNotFound");
+    }
+
+    #[test]
+    fn wrong_gateway_is_ignored_entirely() {
+        let mut listeners = vec![listener("web", 443)];
+        let policies = vec![policy("other", None, 2, 100)];
+        let status = apply_rate_limit_policies(&mut listeners, &policies, "edge", "not-gw");
+        assert!(listeners[0].rate_limit.is_none());
+        assert!(status.is_empty());
+        // Sanity: the fixture policy does target "gw".
+        assert!(policies[0].targets_gateway("edge", "gw"));
+        assert_eq!(policies[0].name_any(), "other");
+    }
 }
 
 /// published listener port -> Service `targetPort` for the Service fronting this

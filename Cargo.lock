@@ -1819,6 +1819,7 @@ dependencies = [
  "rewrk-core",
  "rustls",
  "rustls-pemfile",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",

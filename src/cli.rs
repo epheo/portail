@@ -61,6 +61,13 @@ pub struct Args {
     #[arg(long)]
     pub supported_features: bool,
 
+    /// Print portail's CRD manifests (RateLimitPolicy) as YAML and exit
+    ///
+    /// The Rust types are the source of truth; pipe this into
+    /// examples/kubernetes/crds/ when they change (a test enforces sync).
+    #[arg(long)]
+    pub print_crd: bool,
+
     /// Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)
     ///
     /// Covers Accepted/Programmed/addresses. Set false when running under
