@@ -78,7 +78,7 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
     })
 }
 
-pub(crate) fn convert_listener(
+fn convert_listener(
     l: &GatewayListeners,
     gw_ns: &str,
     cert_data: &CertData,
@@ -134,6 +134,9 @@ pub(crate) fn convert_listener(
         address: None,
         interface: None,
         tls,
+        // Populated later from RateLimitPolicy resources targeting this
+        // Gateway (reconcile_to_config), never from the Gateway spec.
+        rate_limit: None,
     })
 }
 
@@ -166,7 +169,7 @@ pub(crate) fn convert_http_route(route: &HTTPRoute, gateway_name: &str) -> Resul
     })
 }
 
-pub(crate) fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule> {
+fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule> {
     let matches = rule
         .matches
         .as_ref()
@@ -207,7 +210,7 @@ pub(crate) fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpR
     })
 }
 
-pub(crate) fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
+fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
     let method = m.method.as_ref().map(|m| {
         match m {
             HTTPRouteRulesMatchesMethod::Get => "GET",
@@ -456,7 +459,7 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
 // HTTP backend refs
 // ---------------------------------------------------------------------------
 
-pub(crate) fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> BackendRef {
+fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> BackendRef {
     BackendRef {
         name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
         port: br.port.unwrap_or(80) as u16,
@@ -469,7 +472,7 @@ pub(crate) fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str)
 }
 
 /// Convert per-backend filters (e.g. BackendRequestHeaderModifier).
-pub(crate) fn convert_backend_ref_filters(
+fn convert_backend_ref_filters(
     filters: &Option<Vec<HTTPRouteRulesBackendRefsFilters>>,
 ) -> Vec<HttpRouteFilter> {
     let Some(filters) = filters else {
@@ -499,19 +502,17 @@ pub(crate) fn convert_backend_ref_filters(
 // Timeouts
 // ---------------------------------------------------------------------------
 
-pub(crate) fn convert_timeouts(t: &HTTPRouteRulesTimeouts) -> HttpRouteTimeouts {
+fn convert_timeouts(t: &HTTPRouteRulesTimeouts) -> HttpRouteTimeouts {
     HttpRouteTimeouts {
-        request: t.request.as_ref().and_then(|s| parse_gateway_duration(s)),
+        request: t
+            .request
+            .as_ref()
+            .and_then(|s| crate::config::parsing::parse_duration(s).ok()),
         backend_request: t
             .backend_request
             .as_ref()
-            .and_then(|s| parse_gateway_duration(s)),
+            .and_then(|s| crate::config::parsing::parse_duration(s).ok()),
     }
-}
-
-/// Parse Gateway API duration string (e.g. "10s", "500ms", "1m").
-fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
-    crate::config::parsing::parse_duration(s).ok()
 }
 
 // ---------------------------------------------------------------------------

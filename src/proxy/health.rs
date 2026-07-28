@@ -104,10 +104,8 @@ impl HealthRegistry {
             return;
         }
         if let Some(entry) = self.backends.get(&addr) {
-            if entry.consecutive_failures.load(Ordering::Relaxed) > 0
-                || entry.status.load(Ordering::Acquire) != STATUS_HEALTHY
-            {
-                let was_unhealthy = entry.status.load(Ordering::Acquire) != STATUS_HEALTHY;
+            let was_unhealthy = entry.status.load(Ordering::Acquire) != STATUS_HEALTHY;
+            if was_unhealthy || entry.consecutive_failures.load(Ordering::Relaxed) > 0 {
                 entry.consecutive_failures.store(0, Ordering::Relaxed);
                 entry.status.store(STATUS_HEALTHY, Ordering::Release);
                 if was_unhealthy {

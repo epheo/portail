@@ -92,6 +92,22 @@ impl ChunkedStream {
     /// there is no boundary left to respect and the connection is already
     /// unusable for reuse.
     pub fn observe(&mut self, bytes: &[u8]) -> usize {
+        self.advance(bytes, |_| {})
+    }
+
+    /// Like [`observe`](Self::observe), but appends the chunk payloads
+    /// (framing stripped) to `out`. Exists for the h2 bridge, which must
+    /// re-frame an h1 chunked body as DATA frames; the h1 relay paths keep
+    /// `observe` and forward wire bytes verbatim. Both drive the same state
+    /// machine ([`advance`](Self::advance)); the no-op closure in `observe`
+    /// monomorphizes back to the plain scan.
+    pub fn decode_into(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
+        self.advance(bytes, |d| out.extend_from_slice(d))
+    }
+
+    /// Drive the state machine over `bytes`, handing each run of chunk-data
+    /// payload (framing stripped) to `on_data`. Returns bytes consumed.
+    fn advance(&mut self, bytes: &[u8], mut on_data: impl FnMut(&[u8])) -> usize {
         let mut i = 0;
         while i < bytes.len() {
             // Terminal phases: Done stops consuming at the boundary; Broken
@@ -105,9 +121,10 @@ impl ChunkedStream {
             // instead of stepping byte by byte. This is the hot path
             // for large bodies — most bytes never need inspection.
             if let Phase::Data { remaining } = &mut self.phase {
-                let take = (*remaining).min((bytes.len() - i) as u64);
-                *remaining -= take;
-                i += take as usize;
+                let take = (*remaining).min((bytes.len() - i) as u64) as usize;
+                on_data(&bytes[i..i + take]);
+                *remaining -= take as u64;
+                i += take;
                 if *remaining == 0 {
                     self.phase = Phase::DataCrlf { saw_cr: false };
                 }
@@ -433,5 +450,38 @@ mod tests {
         let mut s = ChunkedStream::new();
         s.observe(b"\r\n");
         assert!(s.is_broken());
+    }
+
+    #[test]
+    fn decode_into_strips_framing() {
+        let mut s = ChunkedStream::new();
+        let mut out = Vec::new();
+        let wire = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(s.decode_into(wire, &mut out), wire.len());
+        assert_eq!(out, b"hello world");
+        assert!(s.is_terminated());
+    }
+
+    #[test]
+    fn decode_into_split_at_every_boundary() {
+        let wire = b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: v\r\n\r\n";
+        for split in 0..=wire.len() {
+            let mut s = ChunkedStream::new();
+            let mut out = Vec::new();
+            s.decode_into(&wire[..split], &mut out);
+            s.decode_into(&wire[split..], &mut out);
+            assert_eq!(out, b"hello world", "split at {}", split);
+            assert!(s.is_terminated(), "split at {}", split);
+        }
+    }
+
+    #[test]
+    fn decode_into_stops_at_terminator() {
+        let mut s = ChunkedStream::new();
+        let mut out = Vec::new();
+        let wire = b"1\r\nx\r\n0\r\n\r\nleftover";
+        let body_len = wire.len() - b"leftover".len();
+        assert_eq!(s.decode_into(wire, &mut out), body_len);
+        assert_eq!(out, b"x");
     }
 }

@@ -22,6 +22,9 @@ memchr = "2"
 regex = "1"
 arc-swap = "1"
 anyhow = "1.0"
+bytes = "1"
+h2 = "0.4"
+http = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
@@ -41,6 +44,9 @@ kube = { version = "2", features = ["runtime", "client", "derive", "unstable-run
 k8s-openapi = { version = "0.26", features = ["v1_32"] }
 gateway-api = { version = "0.19", features = ["experimental"] }
 futures = "0.3"
+# CRD schema generation for portail's own policy types; already in the tree
+# via gateway-api, this only promotes it to a direct dependency.
+schemars = "1"
 
 
 

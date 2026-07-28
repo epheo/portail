@@ -1,50 +1,54 @@
 use anyhow::{anyhow, Result};
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serializer};
 use std::time::Duration;
 
-/// Deserialize human-readable durations like "10s", "500ms", "1m"
-pub(crate) fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    parse_duration(&s).map_err(D::Error::custom)
-}
+/// `#[serde(with = "human_duration")]` adapter for human-readable durations
+/// like "10s", "500ms", "1m30s". `human_duration::opt` handles
+/// `Option<Duration>` fields.
+pub(crate) mod human_duration {
+    use serde::{de::Error as DeError, Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
 
-/// Serialize Duration to human-readable format
-pub(crate) fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let s = format_duration(duration);
-    serializer.serialize_str(&s)
-}
-
-/// Deserialize optional human-readable duration
-pub(crate) fn deserialize_duration_opt<'de, D>(
-    deserializer: D,
-) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    match opt {
-        Some(s) => parse_duration(&s).map(Some).map_err(D::Error::custom),
-        None => Ok(None),
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: String = Deserialize::deserialize(deserializer)?;
+        super::parse_duration(&s).map_err(D::Error::custom)
     }
-}
 
-/// Serialize optional Duration to human-readable format
-pub(crate) fn serialize_duration_opt<S>(
-    duration: &Option<Duration>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match duration {
-        Some(d) => serializer.serialize_some(&format_duration(d)),
-        None => serializer.serialize_none(),
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&super::format_duration(duration))
+    }
+
+    pub mod opt {
+        use serde::{de::Error as DeError, Deserialize, Deserializer, Serializer};
+        use std::time::Duration;
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let opt: Option<String> = Option::deserialize(deserializer)?;
+            match opt {
+                Some(s) => super::super::parse_duration(&s)
+                    .map(Some)
+                    .map_err(D::Error::custom),
+                None => Ok(None),
+            }
+        }
+
+        pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match duration {
+                Some(d) => serializer.serialize_some(&super::super::format_duration(d)),
+                None => serializer.serialize_none(),
+            }
+        }
     }
 }
 

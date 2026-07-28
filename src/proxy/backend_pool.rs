@@ -97,7 +97,11 @@ async fn connect_new(
 }
 
 pub struct BackendPool {
-    pools: HashMap<SocketAddr, Vec<Connection>>,
+    /// Keyed by (addr, use_tls): one addr can be reachable both plain and
+    /// TLS (two routes, different backendRef TLS), and a plain conn handed
+    /// to a TLS request (or vice versa) would speak the wrong protocol.
+    /// SNI stays out of the key to keep checkout allocation-free.
+    pools: HashMap<(SocketAddr, bool), Vec<Connection>>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     tls_connector: Arc<tokio_rustls::TlsConnector>,
@@ -126,7 +130,7 @@ impl BackendPool {
         use_tls: bool,
         server_name: &str,
     ) -> Result<(Connection, bool)> {
-        if let Some(conns) = self.pools.get_mut(&addr) {
+        if let Some(conns) = self.pools.get_mut(&(addr, use_tls)) {
             if let Some(conn) = take_live(conns) {
                 debug!("Pool hit: reusing connection to {}", addr);
                 return Ok((conn, true));
@@ -163,8 +167,8 @@ impl BackendPool {
         .await
     }
 
-    pub fn release(&mut self, addr: SocketAddr, conn: Connection) {
-        let conns = self.pools.entry(addr).or_default();
+    pub fn release(&mut self, addr: SocketAddr, use_tls: bool, conn: Connection) {
+        let conns = self.pools.entry((addr, use_tls)).or_default();
         if conns.len() < self.max_idle_per_backend {
             conns.push(conn);
         } else {
@@ -296,7 +300,7 @@ impl PoolHandle {
         conn: Connection,
     ) {
         match self {
-            PoolHandle::PerConn(p) => p.release(addr, conn),
+            PoolHandle::PerConn(p) => p.release(addr, use_tls, conn),
             PoolHandle::Shared(p) => p.release(addr, use_tls, server_name, conn),
         }
     }
@@ -304,8 +308,9 @@ impl PoolHandle {
 
 /// Certificate verifier that accepts any server certificate.
 /// Used for backend connections where services use self-signed certs.
+/// pub(crate) so TLS tests can build a permissive client without a copy.
 #[derive(Debug)]
-struct NoVerifier;
+pub(crate) struct NoVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[derive(Default)]
 pub struct Counter(AtomicU64);
 
 impl Counter {
@@ -26,6 +27,7 @@ impl Counter {
 }
 
 /// Live gauge — incremented and decremented as state comes and goes.
+#[derive(Default)]
 pub struct Gauge(AtomicU64);
 
 impl Gauge {
@@ -73,7 +75,9 @@ macro_rules! metrics {
 metrics! {
     access_log_dropped_total: "Access log lines dropped because the writer lagged or its sink failed",
     connections_accepted_total: "Client connections accepted across all listeners",
+    http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
+    rate_limited_total: "Requests answered 429 by a per-client rate limit",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
     pool_misses_total: "Backend pool checkouts that had to open a new connection",
@@ -151,7 +155,8 @@ impl Histogram {
         // cumulative bucket above the count (render clamps the rest).
         self.count.fetch_add(1, Relaxed);
         self.sum_nanos.fetch_add(nanos, Relaxed);
-        if let Some(idx) = LE_NANOS.iter().position(|&le| nanos <= le) {
+        let idx = LE_NANOS.partition_point(|&le| le < nanos);
+        if idx < LE_NANOS.len() {
             self.buckets[idx].fetch_add(1, Relaxed);
         }
     }
@@ -297,17 +302,19 @@ fn render_labeled_family(
 #[derive(Default)]
 pub struct ListenerStats {
     /// TCP connections accepted / UDP datagrams received on this listener.
-    pub accepted: AtomicU64,
+    pub accepted: Counter,
     /// Client connections currently open on this listener.
-    pub active: AtomicU64,
+    pub active: Gauge,
     /// HTTP requests dispatched to a backend from this listener.
-    pub http_requests: AtomicU64,
+    pub http_requests: Counter,
     /// Client TLS handshakes that failed or timed out on this listener.
-    pub tls_handshake_failures: AtomicU64,
+    pub tls_handshake_failures: Counter,
+    /// Requests answered 429 by this listener's rate limit.
+    pub rate_limited: Counter,
     /// Backend connects that failed (client saw 502) for this listener's requests.
-    pub upstream_connect_errors: AtomicU64,
+    pub upstream_connect_errors: Counter,
     /// Backend connects that timed out (client saw 504) for this listener's requests.
-    pub upstream_connect_timeouts: AtomicU64,
+    pub upstream_connect_timeouts: Counter,
     /// 1 while the accept loop is alive, 0 once it has exited. This is the
     /// outside-observable answer to "is anything listening on this port" —
     /// the signal that was missing every time a gateway VIP refused while
@@ -364,42 +371,48 @@ fn render_listeners(out: &mut String) {
     // UDP listeners render zeros for the TCP-only series; a constant zero
     // costs nothing and keeps the schema uniform across protos.
     type Get = fn(&ListenerStats) -> u64;
-    let series: [(&str, &str, &str, Get); 7] = [
+    let series: [(&str, &str, &str, Get); 8] = [
         (
             "listener_accepted_total",
             "Connections accepted (TCP) or datagrams received (UDP) per listener",
             "counter",
-            |s| s.accepted.load(Relaxed),
+            |s| s.accepted.get(),
         ),
         (
             "listener_active_connections",
             "Client connections currently open per listener",
             "gauge",
-            |s| s.active.load(Relaxed),
+            |s| s.active.get(),
         ),
         (
             "listener_http_requests_total",
             "HTTP requests dispatched to a backend per listener",
             "counter",
-            |s| s.http_requests.load(Relaxed),
+            |s| s.http_requests.get(),
         ),
         (
             "listener_tls_handshake_failures_total",
             "Client TLS handshakes that failed or timed out per listener",
             "counter",
-            |s| s.tls_handshake_failures.load(Relaxed),
+            |s| s.tls_handshake_failures.get(),
+        ),
+        (
+            "listener_rate_limited_total",
+            "Requests answered 429 by the listener's rate limit",
+            "counter",
+            |s| s.rate_limited.get(),
         ),
         (
             "listener_upstream_connect_errors_total",
             "Backend connects that failed (client saw 502) per listener",
             "counter",
-            |s| s.upstream_connect_errors.load(Relaxed),
+            |s| s.upstream_connect_errors.get(),
         ),
         (
             "listener_upstream_connect_timeouts_total",
             "Backend connects that timed out (client saw 504) per listener",
             "counter",
-            |s| s.upstream_connect_timeouts.load(Relaxed),
+            |s| s.upstream_connect_timeouts.get(),
         ),
         (
             "listener_up",
@@ -428,29 +441,31 @@ fn render_listeners(out: &mut String) {
 /// as a gauge so dashboards can overlay readiness flaps on traffic.
 pub fn render(ready: bool) -> String {
     use std::fmt::Write;
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(16384);
     render_counters(&mut out);
-    render_labeled_family(
-        &mut out,
-        &HOST_REQUESTS,
-        "http_requests_total",
-        "host",
-        "HTTP requests dispatched to a backend, by the matched route's configured hostname",
-    );
-    render_labeled_family(
-        &mut out,
-        &BACKEND_CONNECT_ERRORS,
-        "upstream_connect_errors_total",
-        "backend",
-        "Backend connects that failed (client saw 502), by configured backend",
-    );
-    render_labeled_family(
-        &mut out,
-        &BACKEND_CONNECT_TIMEOUTS,
-        "upstream_connect_timeouts_total",
-        "backend",
-        "Backend connects that timed out (client saw 504), by configured backend",
-    );
+    let labeled: [(&'static OnceLock<LabeledFamily>, &str, &str, &str); 3] = [
+        (
+            &HOST_REQUESTS,
+            "http_requests_total",
+            "host",
+            "HTTP requests dispatched to a backend, by the matched route's configured hostname",
+        ),
+        (
+            &BACKEND_CONNECT_ERRORS,
+            "upstream_connect_errors_total",
+            "backend",
+            "Backend connects that failed (client saw 502), by configured backend",
+        ),
+        (
+            &BACKEND_CONNECT_TIMEOUTS,
+            "upstream_connect_timeouts_total",
+            "backend",
+            "Backend connects that timed out (client saw 504), by configured backend",
+        ),
+    ];
+    for (family, name, label, help) in labeled {
+        render_labeled_family(&mut out, family, name, label, help);
+    }
     render_listeners(&mut out);
     render_histogram(
         &mut out,
@@ -545,6 +560,23 @@ mod tests {
     }
 
     #[test]
+    fn histogram_bucket_bounds_are_inclusive() {
+        use std::time::Duration;
+        let h = Histogram::new();
+        // le buckets are inclusive: a sample exactly on a bound lands in that
+        // bound's bucket, one nano past it in the next (past the last: +Inf).
+        for &le in &LE_NANOS {
+            h.observe(Duration::from_nanos(le));
+            h.observe(Duration::from_nanos(le + 1));
+        }
+        assert_eq!(h.buckets[0].load(Relaxed), 1);
+        for (i, b) in h.buckets.iter().enumerate().skip(1) {
+            assert_eq!(b.load(Relaxed), 2, "bucket {}", i);
+        }
+        assert_eq!(h.count.load(Relaxed), 2 * LE_NANOS.len() as u64);
+    }
+
+    #[test]
     fn request_histograms_render_in_scrape() {
         REQUEST_DURATION.observe(std::time::Duration::from_millis(2));
         UPSTREAM_TTFB.observe(std::time::Duration::from_millis(1));
@@ -557,9 +589,9 @@ mod tests {
     #[test]
     fn listener_registry_renders_and_flips_up() {
         let (stats, guard) = register_listener("tcp", 8123);
-        stats.accepted.fetch_add(3, Relaxed);
-        stats.http_requests.fetch_add(2, Relaxed);
-        stats.upstream_connect_errors.fetch_add(1, Relaxed);
+        stats.accepted.add(3);
+        stats.http_requests.add(2);
+        stats.upstream_connect_errors.inc();
         let text = render(true);
         assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
         assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));

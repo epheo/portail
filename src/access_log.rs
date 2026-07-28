@@ -143,6 +143,7 @@ fn format_line(
 /// JSON string escaping for the attacker-controlled fields (method, path,
 /// Host). Everything else in the line is proxy-generated.
 fn esc(s: &str) -> Cow<'_, str> {
+    use std::fmt::Write;
     if !s
         .bytes()
         .any(|b| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7f)
@@ -155,7 +156,7 @@ fn esc(s: &str) -> Cow<'_, str> {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }

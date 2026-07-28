@@ -16,7 +16,7 @@ impl PortailConfig {
 
         for (i, route) in self.tcp_routes.iter().enumerate() {
             route
-                .validate()
+                .validate("TCP")
                 .map_err(|e| anyhow!("TCP route {}: {}", i, e))?;
         }
 
@@ -28,7 +28,7 @@ impl PortailConfig {
 
         for (i, route) in self.udp_routes.iter().enumerate() {
             route
-                .validate()
+                .validate("UDP")
                 .map_err(|e| anyhow!("UDP route {}: {}", i, e))?;
         }
 
@@ -77,10 +77,7 @@ impl PortailConfig {
             idx: usize,
         ) -> Result<()> {
             for pr in parent_refs {
-                let resolves = listeners.iter().any(|l| {
-                    pr.section_name.as_ref().is_none_or(|s| &l.name == s)
-                        && pr.port.is_none_or(|p| l.port == p as u16)
-                });
+                let resolves = listeners.iter().any(|l| pr.selects(l));
                 if !resolves {
                     return Err(anyhow!(
                         "{} route {}: parentRef (sectionName: {:?}, port: {:?}) does not match any Gateway listener",
@@ -166,8 +163,10 @@ impl HttpRouteConfig {
 }
 
 impl TcpRouteConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        validate_route(&self.parent_refs, &self.rules, "TCP", |r| r.validate())
+    /// Shared by TCPRoute and UDPRoute (`UdpRouteConfig` aliases this type);
+    /// `proto` keeps error messages protocol-accurate.
+    pub(crate) fn validate(&self, proto: &str) -> Result<()> {
+        validate_route(&self.parent_refs, &self.rules, proto, |r| r.validate())
     }
 }
 
@@ -187,6 +186,27 @@ impl GatewayConfig {
                 .map_err(|e| anyhow!("Listener {}: {}", i, e))?;
         }
 
+        Ok(())
+    }
+}
+
+impl crate::config::types::RateLimitSpec {
+    fn validate(&self) -> Result<()> {
+        if self.requests_per_second == 0 || self.requests_per_second > 1_000_000 {
+            return Err(anyhow!(
+                "rateLimit requestsPerSecond must be 1..=1000000, got {}",
+                self.requests_per_second
+            ));
+        }
+        if let Some(burst) = self.burst {
+            if burst == 0 || burst > crate::rate_limit::MAX_BURST {
+                return Err(anyhow!(
+                    "rateLimit burst must be 1..={}, got {}",
+                    crate::rate_limit::MAX_BURST,
+                    burst
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -227,6 +247,10 @@ impl ListenerConfig {
                     addr
                 )
             })?;
+        }
+
+        if let Some(rl) = &self.rate_limit {
+            rl.validate()?;
         }
 
         // TLS config validation per protocol
@@ -437,12 +461,6 @@ impl L4RouteRule {
         }
 
         Ok(())
-    }
-}
-
-impl UdpRouteConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        validate_route(&self.parent_refs, &self.rules, "UDP", |r| r.validate())
     }
 }
 
@@ -774,6 +792,7 @@ mod tests {
             address: None,
             interface: None,
             tls,
+            rate_limit: None,
         }
     }
 
@@ -918,6 +937,7 @@ mod tests {
             address: address.map(str::to_string),
             interface: None,
             tls: None,
+            rate_limit: None,
         }
     }
 

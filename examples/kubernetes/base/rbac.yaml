@@ -31,6 +31,14 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "secrets", "services"]
     verbs: ["get", "list", "watch"]
+  # Portail's own policy CRDs (rate limiting). Optional: without the CRD
+  # installed the watcher is skipped at startup.
+  - apiGroups: ["portail.epheo.eu"]
+    resources: ["ratelimitpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["portail.epheo.eu"]
+    resources: ["ratelimitpolicies/status"]
+    verbs: ["get", "patch", "update"]
   # get/list only (NO watch): a one-shot, label-filtered read to resolve a
   # headless Service's named targetPort to its numeric value. Not a watch —
   # backend pod churn is tracked via DNS (STRICT_DNS), not EndpointSlices.

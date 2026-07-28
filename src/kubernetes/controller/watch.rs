@@ -3,6 +3,7 @@
 //! the operator-provided `WatchShape` that decides which gate-able watches a
 //! scoped data plane opens at all.
 
+use k8s_openapi::api::core::v1::Secret;
 use kube::api::Api;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
@@ -18,12 +19,15 @@ use crate::logging::warn;
 /// The stream is consumed by `Controller::watches_stream()` which both drives
 /// the reflector (keeping the store up to date) and triggers reconciliation
 /// of mapped Gateway(s) when resources change.
-pub(super) fn create_reflector<K>(
-    api: Api<K>,
-) -> (
-    Store<K>,
-    impl futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static,
-)
+///
+/// Streams the initial list via the WatchList API instead of a single blocking
+/// LIST. Each per-Gateway pod cold-starts by listing ~6 cluster-wide resource
+/// types; with N pods watching + route/Service churn, concurrent blocking LISTs
+/// saturate the apiserver and a fresh pod's reflector sync stalls (measured 1s
+/// isolated → 20s+/never under load), which is the cold-start convergence flake.
+/// Streaming lists are far lighter on the apiserver under that load. Requires
+/// server WatchList support (k8s >= 1.27; default-on >= 1.30).
+pub(super) fn create_reflector<K>(api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
         + Clone
@@ -34,33 +38,23 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
+    create_reflector_gated_with_config(true, api, watcher::Config::default().streaming_lists())
+}
+
+/// An empty store and a stream that never yields; no LIST/WATCH is opened.
+fn empty_reflector<K>() -> (Store<K>, BoxedReflectorStream<K>)
+where
+    K: kube::Resource + Clone + Send + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
     let writer = reflector::store::Writer::default();
-    let reader = writer.as_reader();
-    // Stream the initial list via the WatchList API instead of a single blocking
-    // LIST. Each per-Gateway pod cold-starts by listing ~6 cluster-wide resource
-    // types; with N pods watching + route/Service churn, concurrent blocking LISTs
-    // saturate the apiserver and a fresh pod's reflector sync stalls (measured 1s
-    // isolated → 20s+/never under load), which is the cold-start convergence flake.
-    // Streaming lists are far lighter on the apiserver under that load. Requires
-    // server WatchList support (k8s >= 1.27; default-on >= 1.30).
-    let stream = reflector::reflector(
-        writer,
-        watcher::watcher(api, watcher::Config::default().streaming_lists()),
-    )
-    .default_backoff()
-    .touched_objects(); // touched_objects includes deletes; applied_objects drops them
-    (reader, stream)
+    (writer.as_reader(), Box::pin(futures::stream::pending()))
 }
 
 /// Like `create_reflector`, but first probes the API endpoint with a lightweight
 /// list request. If the CRD is not installed (404), returns an empty store and
 /// a stream that never yields, so the controller can still start without it.
-pub(super) async fn create_optional_reflector<K>(
-    api: Api<K>,
-) -> (
-    Store<K>,
-    std::pin::Pin<Box<dyn futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static>>,
-)
+pub(super) async fn create_optional_reflector<K>(api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
         + Clone
@@ -80,14 +74,9 @@ where
                 .next()
                 .unwrap_or("Unknown");
             warn!("CRD not installed, skipping watcher: {kind}");
-            let writer = reflector::store::Writer::default();
-            let reader = writer.as_reader();
-            (reader, Box::pin(futures::stream::pending()))
+            empty_reflector()
         }
-        _ => {
-            let (store, stream) = create_reflector(api);
-            (store, Box::pin(stream))
-        }
+        _ => create_reflector(api),
     }
 }
 
@@ -124,6 +113,54 @@ pub(super) fn map_route_to_gateways<
         }
     }
     refs
+}
+
+/// Map a RateLimitPolicy to the Gateway its targetRef names (GEP-713 direct
+/// attachment is same-namespace, so the Gateway namespace is the policy's).
+/// The store-membership check is what makes scoped pods ignore policies for
+/// Gateways they do not serve, exactly like route parentRefs.
+pub(super) fn map_policy_to_gateways(
+    policy: &crate::kubernetes::crds::RateLimitPolicy,
+    store: &Store<Gateway>,
+) -> Vec<ObjectRef<Gateway>> {
+    let ns = policy.namespace().unwrap_or_default();
+    let t = &policy.spec.target_ref;
+    if t.kind != "Gateway" || !(t.group.is_empty() || t.group == "gateway.networking.k8s.io") {
+        return Vec::new();
+    }
+    let obj_ref = ObjectRef::<Gateway>::new(&t.name).within(&ns);
+    if store.get(&obj_ref).is_some() {
+        vec![obj_ref]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Map a Secret to the Gateway(s) whose TLS certificateRefs name it.
+pub(super) fn map_secret_to_gateways(
+    secret: &Secret,
+    store: &Store<Gateway>,
+) -> Vec<ObjectRef<Gateway>> {
+    let secret_name = secret.metadata.name.as_deref().unwrap_or("");
+    let secret_ns = secret.metadata.namespace.as_deref().unwrap_or("default");
+    store
+        .state()
+        .into_iter()
+        .filter(|g| {
+            let gw_ns = g.metadata.namespace.as_deref().unwrap_or("default");
+            g.spec.listeners.iter().any(|l| {
+                l.tls.as_ref().is_some_and(|tls| {
+                    tls.certificate_refs.as_ref().is_some_and(|refs| {
+                        refs.iter().any(|cr| {
+                            cr.name == secret_name
+                                && cr.namespace.as_deref().unwrap_or(gw_ns) == secret_ns
+                        })
+                    })
+                })
+            })
+        })
+        .map(|g| ObjectRef::from_obj(&*g))
+        .collect()
 }
 
 /// Map any resource to ALL managed gateways (used for infrequently-changing
@@ -214,14 +251,13 @@ where
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
     if !enabled {
-        let writer = reflector::store::Writer::default();
-        return (writer.as_reader(), Box::pin(futures::stream::pending()));
+        return empty_reflector();
     }
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
     let stream = reflector::reflector(writer, watcher::watcher(api, config))
         .default_backoff()
-        .touched_objects();
+        .touched_objects(); // touched_objects includes deletes; applied_objects drops them
     (reader, Box::pin(stream))
 }
 

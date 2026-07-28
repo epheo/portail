@@ -1,7 +1,7 @@
 //! Centralized logging module
 //!
 //! error!, warn!, and info! are always active.
-//! debug!/trace! become no-ops in release builds.
+//! debug! becomes a no-op in release builds.
 
 use anyhow::Result;
 use std::fs::OpenOptions;
@@ -11,9 +11,6 @@ pub use tracing::{error, info, warn};
 
 #[cfg(debug_assertions)]
 pub use tracing::debug;
-#[cfg(debug_assertions)]
-#[allow(unused_imports)]
-pub use tracing::trace;
 
 #[cfg(not(debug_assertions))]
 #[macro_export]
@@ -24,18 +21,7 @@ macro_rules! logging_debug {
 }
 
 #[cfg(not(debug_assertions))]
-#[macro_export]
-macro_rules! logging_trace {
-    ($($arg:tt)*) => {
-        ()
-    };
-}
-
-#[cfg(not(debug_assertions))]
 pub use logging_debug as debug;
-#[cfg(not(debug_assertions))]
-#[allow(unused_imports)]
-pub use logging_trace as trace;
 
 fn create_log_file_writer(path: &str) -> Result<std::fs::File> {
     let log_path = Path::new(path);
@@ -61,39 +47,27 @@ pub fn init_logging(verbose_level: u8, config: Option<&crate::config::LoggingCon
     use crate::config::{LogFormat, LogLevel, LogOutput};
     use tracing_subscriber::{fmt, EnvFilter};
 
-    let level_str = if let Some(logging_config) = config {
-        if verbose_level > 0 {
-            match verbose_level {
-                1 => "debug",
-                _ => "trace",
-            }
-        } else {
-            match logging_config.level {
-                LogLevel::Error => "error",
-                LogLevel::Warn => "warn",
-                LogLevel::Info => "info",
-                LogLevel::Debug => "debug",
-                LogLevel::Trace => "trace",
-            }
-        }
-    } else {
+    let level_str = match (config, verbose_level) {
+        (Some(lc), 0) => match lc.level {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        },
+        (Some(_), 1) => "debug",
+        (Some(_), _) => "trace",
         #[cfg(debug_assertions)]
-        {
-            match verbose_level {
-                0 => "info",
-                1 => "debug",
-                _ => "trace",
-            }
-        }
+        (None, 0) => "info",
+        #[cfg(debug_assertions)]
+        (None, 1) => "debug",
         #[cfg(not(debug_assertions))]
-        {
-            match verbose_level {
-                0 => "warn",
-                1 => "info",
-                2 => "debug",
-                _ => "trace",
-            }
-        }
+        (None, 0) => "warn",
+        #[cfg(not(debug_assertions))]
+        (None, 1) => "info",
+        #[cfg(not(debug_assertions))]
+        (None, 2) => "debug",
+        (None, _) => "trace",
     };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level_str));

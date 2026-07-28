@@ -47,7 +47,6 @@ pub async fn run_udp_worker(
     // Reaper task: periodically remove expired sessions
     let reaper_sessions = sessions.clone();
     let reaper_shutdown = shutdown.clone();
-    let reaper_epoch = epoch;
     let _reaper = tokio::spawn(async move {
         let mut interval = tokio::time::interval(session_timeout / 2);
         loop {
@@ -55,7 +54,7 @@ pub async fn run_udp_worker(
                 biased;
                 _ = reaper_shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let now = reaper_epoch.elapsed().as_secs();
+                    let now = epoch.elapsed().as_secs();
                     let timeout_secs = session_timeout.as_secs();
                     reaper_sessions.retain(|_addr, session: &mut UdpSession| {
                         let last = session.last_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -81,9 +80,7 @@ pub async fn run_udp_worker(
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, client_addr)) => {
-                        listener_stats
-                            .accepted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        listener_stats.accepted.inc();
                         let now_secs = epoch.elapsed().as_secs();
 
                         // Update last_active or create new session. Clone the

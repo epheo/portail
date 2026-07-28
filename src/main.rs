@@ -29,43 +29,42 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Print portail's own CRD manifests and exit. The Rust types are the
+    // source of truth; the checked-in copy is regenerated from this output
+    // and a test asserts they never drift.
+    if args.print_crd {
+        print!("{}", kubernetes::crds::crd_yaml()?);
+        return Ok(());
+    }
+
     // Config generation uses minimal runtime
     if args.is_generation_mode() {
         logging::init_logging(args.verbose, None);
         return handle_generation_mode(&args);
     }
 
-    // Validate and example modes use minimal runtime
-    if args.is_validation_mode() || args.example_config {
-        let portail_config = if let Some(config_path) = &args.config {
-            PortailConfig::load_from_file(config_path)
-                .map_err(|e| {
-                    eprintln!("Failed to load configuration file: {}", e);
-                    std::process::exit(1);
-                })
-                .unwrap()
-        } else {
-            PortailConfig::default()
-        };
-        logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
-        if args.is_validation_mode() {
-            return handle_validation_mode(&args);
-        }
-        return handle_example_config_mode(&args);
-    }
-
-    let portail_config = if let Some(config_path) = &args.config {
-        PortailConfig::load_from_file(config_path)
-            .map_err(|e| {
+    // Single load shared by validation, example, and server modes.
+    // load_from_file parses AND validates, so validation mode needs no
+    // second pass over the file.
+    let portail_config = args
+        .config
+        .as_ref()
+        .map_or_else(PortailConfig::default, |p| {
+            PortailConfig::load_from_file(p).unwrap_or_else(|e| {
                 eprintln!("Failed to load configuration file: {}", e);
                 std::process::exit(1);
             })
-            .unwrap()
-    } else {
-        PortailConfig::default()
-    };
+        });
 
     logging::init_logging(args.verbose, Some(&portail_config.observability.logging));
+
+    // Validate and example modes use minimal runtime
+    if args.is_validation_mode() {
+        return handle_validation_mode(&args, &portail_config);
+    }
+    if args.example_config {
+        return handle_example_config_mode(&args);
+    }
 
     // Panics abort the process (`panic = "abort"` in release) — fail-fast is
     // the right policy for a data plane, but the default hook only writes to
@@ -144,7 +143,14 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     if let Some(target) = &args.access_log {
         portail::access_log::init(target)?;
     }
-    let performance_config = portail_config.performance.clone();
+    // Bucket eviction for per-client rate limits; idle until a listener or
+    // RateLimitPolicy configures one.
+    portail::rate_limit::spawn_sweeper();
+    let mut performance_config = portail_config.performance.clone();
+    // Either source enables h2; the flag is the K8s-mode path (no config file).
+    if args.http2 {
+        performance_config.http2 = true;
+    }
     // Kubernetes mode binds nothing up front: every listener comes from a
     // reconciled Gateway. The default config's example :8080 listener is a
     // standalone-only convenience — binding it here made k8s-mode startup
@@ -233,20 +239,16 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
             }
         });
         info!("Kubernetes Gateway API controller started");
-    }
-
-    // In standalone mode, the admin endpoint (/metrics + /readyz) is opt-in —
-    // there is no readinessProbe to feed, but benches and dashboards may want
-    // the scrape. Listeners are already up at this point, so ready = true.
-    if !args.kubernetes {
+    } else {
+        // Standalone admin endpoint (/metrics + /readyz) is opt-in: there is
+        // no readinessProbe to feed, but benches and dashboards may want the
+        // scrape. Listeners are already up at this point, so ready = true.
         if let Some(metrics_port) = args.metrics_port {
             let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
             tokio::spawn(admin::serve(metrics_port, ready, shutdown_token.clone()));
         }
-    }
 
-    // In standalone mode, watch the config file for SIGHUP-triggered reloads
-    if !args.kubernetes {
+        // Watch the config file for SIGHUP-triggered reloads
         if let Some(config_path) = args.config.clone() {
             let reload_routes = routes;
             let reload_health = data_plane.lock().unwrap().health().clone();
@@ -287,8 +289,9 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     Ok(())
 }
 
-/// Handle validation modes (--validate-only, --check-config)
-fn handle_validation_mode(args: &Args) -> Result<()> {
+/// Handle validation modes (--validate-only, --check-config). `config` is
+/// the already-loaded (and therefore parsed AND validated) file from main.
+fn handle_validation_mode(args: &Args, config: &PortailConfig) -> Result<()> {
     let config_path = args
         .config
         .as_ref()
@@ -296,67 +299,45 @@ fn handle_validation_mode(args: &Args) -> Result<()> {
 
     if args.validate_only {
         info!("Validating configuration file: {:?}", config_path);
+        info!("Configuration file parsed and validated successfully");
 
-        match PortailConfig::load_from_file(config_path) {
-            // load_from_file parses AND validates; a separate validate()
-            // call here would be redundant.
-            Ok(config) => {
-                info!("Configuration file parsed and validated successfully");
-
-                match config.to_route_table_strict() {
-                    Ok(_) => info!("Route table conversion successful"),
-                    Err(e) => {
-                        error!("Route table conversion failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-
-                info!("All validation checks passed");
-            }
+        match config.to_route_table_strict() {
+            Ok(_) => info!("Route table conversion successful"),
             Err(e) => {
-                error!("Failed to parse configuration file: {}", e);
+                error!("Route table conversion failed: {}", e);
                 std::process::exit(1);
             }
         }
+
+        info!("All validation checks passed");
     } else if args.check_config {
         info!("Checking configuration file: {:?}", config_path);
 
-        match PortailConfig::load_from_file(config_path) {
-            Ok(config) => {
-                println!("Parsed configuration:");
-                println!("---");
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&config).expect("Failed to serialize own config")
-                );
-                println!("---");
+        println!("Parsed configuration:");
+        println!("---");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(config).expect("Failed to serialize own config")
+        );
+        println!("---");
 
-                println!();
-                println!("Configuration Summary:");
-                println!("  HTTP Routes: {}", config.http_routes.len());
-                println!("  TCP Routes: {}", config.tcp_routes.len());
+        println!();
+        println!("Configuration Summary:");
+        println!("  HTTP Routes: {}", config.http_routes.len());
+        println!("  TCP Routes: {}", config.tcp_routes.len());
 
-                println!(
-                    "  HTTP Listeners: {:?}",
-                    config
-                        .gateway
-                        .listeners
-                        .iter()
-                        .filter(|l| matches!(
-                            l.protocol,
-                            config::Protocol::HTTP | config::Protocol::HTTPS
-                        ))
-                        .map(|l| l.port)
-                        .collect::<Vec<_>>()
-                );
+        println!(
+            "  HTTP Listeners: {:?}",
+            config
+                .gateway
+                .listeners
+                .iter()
+                .filter(|l| matches!(l.protocol, config::Protocol::HTTP | config::Protocol::HTTPS))
+                .map(|l| l.port)
+                .collect::<Vec<_>>()
+        );
 
-                info!("Configuration check completed");
-            }
-            Err(e) => {
-                error!("Failed to load configuration file: {}", e);
-                std::process::exit(1);
-            }
-        }
+        info!("Configuration check completed");
     }
 
     Ok(())
@@ -394,13 +375,8 @@ fn handle_generation_mode(args: &Args) -> Result<()> {
 
     // Examples are static YAML committed under examples/standalone/ and
     // embedded at compile time — --generate-config emits them verbatim.
-    let yaml = match config::examples::example_yaml(config_type) {
-        Some(yaml) => yaml,
-        None => {
-            error!("Invalid configuration type: {}", config_type);
-            std::process::exit(1);
-        }
-    };
+    let yaml = config::examples::example_yaml(config_type)
+        .expect("clap validates --generate-config against config::examples::EXAMPLES");
 
     if let Some(output_path) = &args.output {
         let output_content = match output_path.extension().and_then(|ext| ext.to_str()) {

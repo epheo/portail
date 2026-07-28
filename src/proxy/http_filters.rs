@@ -88,14 +88,15 @@ pub(crate) fn assemble_forward_headers_slow(
     is_tls: bool,
     out: &mut Vec<u8>,
 ) {
-    // Pass 1: collect nominated tokens from every Connection header.
-    let mut nominated: Vec<String> = Vec::new();
+    // Pass 1: collect nominated tokens from every Connection header,
+    // borrowed from `raw` — the compares below are case-insensitive anyway.
+    let mut nominated: Vec<&[u8]> = Vec::new();
     for line in header_lines(raw) {
         if let Some(value) = header_value_if(line, b"connection") {
             for token in value.split(',') {
                 let token = token.trim();
                 if !token.is_empty() {
-                    nominated.push(token.to_ascii_lowercase());
+                    nominated.push(token.as_bytes());
                 }
             }
         }
@@ -124,9 +125,7 @@ pub(crate) fn assemble_forward_headers_slow(
         let name = &line[..name_end];
         let is_hop = is_hop_by_hop_request_header(name)
             || (name.eq_ignore_ascii_case(b"upgrade") && !keep_upgrade)
-            || nominated
-                .iter()
-                .any(|n| name.eq_ignore_ascii_case(n.as_bytes()));
+            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n));
         if !is_hop {
             out.extend_from_slice(line);
             out.extend_from_slice(b"\r\n");
@@ -187,7 +186,7 @@ pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mu
 /// First-byte dispatch keeps the per-line cost to one comparison for the
 /// overwhelmingly common non-hop-by-hop headers.
 #[inline]
-fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
+pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
         Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
         Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
@@ -199,7 +198,7 @@ fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
 }
 
 #[inline]
-fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
+pub(crate) fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
         Some(b'c') => name.eq_ignore_ascii_case(b"connection"),
         Some(b'k') => name.eq_ignore_ascii_case(b"keep-alive"),
@@ -212,7 +211,7 @@ fn is_hop_by_hop_response_header(name: &[u8]) -> bool {
 
 /// Iterate CRLF-separated lines of a header block, excluding the final blank
 /// line. Tolerates a bare-LF separator the way the parsers upstream do.
-fn header_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn header_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         while pos < raw.len() {
@@ -390,7 +389,7 @@ pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
 ///
 /// `rewrite_hostname`: if Some, replaces the Host header value (request path only).
 fn apply_header_mods_inner(
-    header_lines: &[u8],
+    raw: &[u8],
     mods: Option<&HeaderModifications<'_>>,
     rewrite_hostname: Option<&str>,
     out: &mut Vec<u8>,
@@ -398,28 +397,9 @@ fn apply_header_mods_inner(
     // Track which "set" headers were applied (matched existing headers)
     let mut set_applied: Vec<bool> = mods.map(|m| vec![false; m.set.len()]).unwrap_or_default();
 
-    let mut pos = 0;
-    while pos < header_lines.len() {
-        let line_start = pos;
-        while pos < header_lines.len() && header_lines[pos] != b'\r' && header_lines[pos] != b'\n' {
-            pos += 1;
-        }
-        let line = &header_lines[line_start..pos];
-
-        // Skip past CRLF
-        if pos < header_lines.len() && header_lines[pos] == b'\r' {
-            pos += 1;
-        }
-        if pos < header_lines.len() && header_lines[pos] == b'\n' {
-            pos += 1;
-        }
-
-        if line.is_empty() {
-            continue;
-        }
-
+    for line in header_lines(raw) {
         // Find colon to extract header name
-        let colon_pos = match line.iter().position(|&b| b == b':') {
+        let colon_pos = match memchr::memchr(b':', line) {
             Some(p) => p,
             None => {
                 out.extend_from_slice(line);
@@ -496,31 +476,24 @@ fn apply_header_mods_inner(
 
 /// Split raw header bytes into (first_line, rest) at the first CRLF boundary.
 /// Returns (first_line_bytes, remaining_bytes_after_crlf).
-fn split_first_line(header_region: &[u8]) -> (&[u8], &[u8]) {
-    let mut pos = 0;
-    while pos < header_region.len() && header_region[pos] != b'\r' && header_region[pos] != b'\n' {
-        pos += 1;
-    }
-    let first_line = &header_region[..pos];
-    // Skip CRLF
-    if pos < header_region.len() && header_region[pos] == b'\r' {
-        pos += 1;
-    }
-    if pos < header_region.len() && header_region[pos] == b'\n' {
-        pos += 1;
-    }
-    (first_line, &header_region[pos..])
+fn split_first_line(raw: &[u8]) -> (&[u8], &[u8]) {
+    let nl = memchr::memchr(b'\n', raw).map_or(raw.len(), |p| p + 1);
+    let line = raw[..nl].strip_suffix(b"\n").unwrap_or(&raw[..nl]);
+    (line.strip_suffix(b"\r").unwrap_or(line), &raw[nl..])
 }
 
-/// Apply request header modifications only — returns modified headers (including trailing \r\n\r\n).
-/// Body bytes are NOT included; the caller sends them separately from the original buffer.
-/// This keeps body handling zero-copy on the filter path.
+/// Apply request header modifications into `out` (cleared first), including
+/// the trailing \r\n\r\n. Body bytes are NOT included; the caller sends them
+/// separately from the original buffer. `out` is a caller-owned reusable
+/// buffer so the filter path allocates nothing after warmup.
 pub(crate) fn apply_request_header_modifications(
     header_region: &[u8],
     header_mods: Option<&HeaderModifications<'_>>,
     url_rewrite: Option<&URLRewrite>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(header_region.len() + 256);
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(header_region.len() + 256);
     let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
 
     let (first_line, rest) = split_first_line(header_region);
@@ -539,8 +512,8 @@ pub(crate) fn apply_request_header_modifications(
                     out.extend_from_slice(&first_line[sp1 + 1 + sp2..]);
                     out.extend_from_slice(b"\r\n");
 
-                    apply_header_mods_inner(rest, header_mods, rewrite_hostname, &mut out);
-                    return out;
+                    apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
+                    return;
                 }
             }
         }
@@ -550,18 +523,19 @@ pub(crate) fn apply_request_header_modifications(
     out.extend_from_slice(first_line);
     out.extend_from_slice(b"\r\n");
 
-    apply_header_mods_inner(rest, header_mods, rewrite_hostname, &mut out);
-    out
+    apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
 }
 
-/// Apply response header modifications to buffered response headers.
-/// Returns the modified header region (including trailing \r\n\r\n).
-/// Operates on raw bytes — no intermediate String allocations.
+/// Apply response header modifications into `out` (cleared first), including
+/// the trailing \r\n\r\n. Operates on raw bytes — no intermediate String
+/// allocations.
 pub(crate) fn apply_response_header_mods(
     headers: &[u8],
     mods: &HeaderModifications<'_>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(headers.len() + 256);
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(headers.len() + 256);
 
     let (status_line, rest) = split_first_line(headers);
 
@@ -569,8 +543,7 @@ pub(crate) fn apply_response_header_mods(
     out.extend_from_slice(status_line);
     out.extend_from_slice(b"\r\n");
 
-    apply_header_mods_inner(rest, Some(mods), None, &mut out);
-    out
+    apply_header_mods_inner(rest, Some(mods), None, out);
 }
 
 #[cfg(test)]
@@ -586,7 +559,7 @@ mod tests {
         let req = b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\nTE: trailers\r\nAccept: */*\r\n\r\n";
         let info = parsed_spans(req);
         assert!(!info.strip_spans.needs_slow_path);
-        assert_eq!(info.strip_spans.len(), 4);
+        assert_eq!(info.strip_spans.iter().count(), 4);
 
         let mut out = Vec::new();
         assemble_forward_headers(
@@ -711,7 +684,8 @@ mod tests {
             hostname: None,
             path: Some(RewrittenPath::Full("/new/path".to_string())),
         };
-        let result = apply_request_header_modifications(headers, None, Some(&rewrite));
+        let mut result = Vec::new();
+        apply_request_header_modifications(headers, None, Some(&rewrite), &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.starts_with("GET /new/path HTTP/1.1\r\n"));
@@ -725,7 +699,8 @@ mod tests {
             hostname: Some("rewritten.example.com".to_string()),
             path: None,
         };
-        let result = apply_request_header_modifications(headers, None, Some(&rewrite));
+        let mut result = Vec::new();
+        apply_request_header_modifications(headers, None, Some(&rewrite), &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.contains("Host: rewritten.example.com"));
@@ -747,7 +722,8 @@ mod tests {
             set: &[],
             remove: &["User-Agent".to_string()],
         };
-        let result = apply_request_header_modifications(headers, Some(&mods), Some(&rewrite));
+        let mut result = Vec::new();
+        apply_request_header_modifications(headers, Some(&mods), Some(&rewrite), &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
 
         assert!(result_str.starts_with("GET /new HTTP/1.1\r\n"));
@@ -759,7 +735,8 @@ mod tests {
     #[test]
     fn test_apply_modifications_no_mods_passthrough() {
         let headers = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let result = apply_request_header_modifications(headers, None, None);
+        let mut result = Vec::new();
+        apply_request_header_modifications(headers, None, None, &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.starts_with("GET / HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: example.com"));
@@ -776,7 +753,8 @@ mod tests {
             set: &[],
             remove: &[],
         };
-        let result = apply_response_header_mods(headers, &mods);
+        let mut result = Vec::new();
+        apply_response_header_mods(headers, &mods, &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.contains("X-Custom: added"));
     }
@@ -789,7 +767,8 @@ mod tests {
             set: &[],
             remove: &["X-Internal".to_string()],
         };
-        let result = apply_response_header_mods(headers, &mods);
+        let mut result = Vec::new();
+        apply_response_header_mods(headers, &mods, &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(!result_str.contains("X-Internal"));
         assert!(result_str.contains("Content-Length: 5"));
@@ -806,7 +785,8 @@ mod tests {
             }],
             remove: &[],
         };
-        let result = apply_response_header_mods(headers, &mods);
+        let mut result = Vec::new();
+        apply_response_header_mods(headers, &mods, &mut result);
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.contains("Server: portail"));
         assert!(!result_str.contains("old-server"));

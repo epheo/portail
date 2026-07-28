@@ -12,6 +12,7 @@
 | `--readiness-port <PORT>` | Port for the `/livez` + `/readyz` + `/metrics` admin endpoint in Kubernetes mode (default: `19099`) |
 | `--metrics-port <PORT>` | Serve the same admin endpoint in standalone mode (off by default) |
 | `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
+| `--http2` | Enable HTTP/2 on TLS-terminate listeners (off by default; see HTTP/2 section) |
 | `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
 | `--validate-only` | Validate config file without starting the server (requires `--config`) |
 | `--check-config` | Parse and display config values, then exit (requires `--config`) |
@@ -67,6 +68,60 @@ slower than the request rate sheds lines, counted in
 `portail_access_log_dropped_total`. Requests aborted mid-response (client
 gone, backend died with headers already sent) produce no line.
 
+## Rate Limiting
+
+Per-client token bucket, attached per listener. Clients are keyed by source
+IPv4 address or IPv6 /64. A request finding the bucket empty is answered
+`429` with `Retry-After` before any backend is touched; the connection is
+kept open when safe so a throttled client cannot force TLS re-handshakes.
+An unlimited listener costs the hot path one null check per request.
+
+Kubernetes mode — a `RateLimitPolicy` attached to a Gateway (install the CRD
+from `examples/kubernetes/crds/ratelimitpolicy.yaml`, printable via
+`--print-crd`):
+
+```yaml
+apiVersion: portail.epheo.eu/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  name: edge-clients
+  namespace: portail-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: public
+    # sectionName: https-web   # limit one listener instead of the Gateway
+  requestsPerSecond: 2   # sustained per-client budget (bucket refill)
+  burst: 60              # one-shot budget (bucket size); default = requestsPerSecond
+```
+
+A `sectionName`-scoped policy overrides a Gateway-wide one for its listener;
+among policies of equal scope the oldest wins (GEP-713 conflict rule) and
+later ones report `Conflicted` in `status.ancestors`. The policy must live
+in the Gateway's namespace. Without the CRD installed, the watcher is
+skipped at startup and nothing changes.
+
+Standalone mode — the same parameters on a listener:
+
+```yaml
+gateway:
+  listeners:
+    - name: web
+      protocol: HTTP
+      port: 8080
+      rate_limit:
+        requestsPerSecond: 2
+        burst: 60
+```
+
+Listener rate limits apply to routes bound to that listener via
+`parentRefs` (like hostname scoping); routes without `parentRefs` bypass
+listener scoping and are never limited. Policy edits keep per-client state:
+a throttled crawler stays throttled across a rate change. Observability:
+`portail_rate_limited_total`, `portail_listener_rate_limited_total`, and
+`status: 429` access-log lines.
+
 ## Performance Options
 
 The `performance` block of a config file (all durations accept `"30s"`-style
@@ -81,8 +136,33 @@ values; defaults shown):
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions |
 | `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window) |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
+| `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
 
 In Kubernetes mode these are not read from a file; the defaults apply.
+
+## HTTP/2
+
+Opt-in via `--http2` (Kubernetes mode) or `performance.http2: true`
+(standalone). When enabled, TLS-terminate listeners advertise `h2` ahead of
+`http/1.1` via ALPN; the client's negotiation picks the protocol, so h1 and
+h2 clients share the same port. Plain-HTTP and passthrough listeners are
+unaffected, and with the flag off the data path is byte-for-byte unchanged.
+
+Each h2 stream is bridged through the same HTTP/1.1 engine that serves h1
+clients - routing, filters, timeouts, backend pooling, metrics, and access
+logs behave identically. The bridge costs one in-memory hop per direction,
+paid only by h2 connections. Negotiation volume is visible in
+`portail_http2_connections_total`.
+
+Limits to know about:
+
+- Trailers do not survive the bridge, so gRPC cannot ride it; GRPCRoute
+  support requires the future native h2 path.
+- Each h2 stream is its own engine exchange. With the default
+  `backendPoolScope: connection` there is no backend reuse across streams;
+  set `backendPoolScope: process` alongside `http2` for backend keepalive.
+- WebSocket/CONNECT streams are refused over h2; h2-capable browsers fall
+  back to HTTP/1.1 for WebSocket automatically.
 
 ## Custom Controller Name
 

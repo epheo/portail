@@ -16,6 +16,7 @@
 //! restarts only trigger on a genuinely dead process — and the Gateway
 //! `Programmed` condition (derived from readiness) stays meaningful.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,14 +42,22 @@ fn request_path(buf: &[u8]) -> &[u8] {
     parts.next().unwrap_or(b"")
 }
 
-fn is_metrics_request(buf: &[u8]) -> bool {
-    let path = request_path(buf);
-    path == b"/metrics" || path.starts_with(b"/metrics?")
+#[derive(Debug, PartialEq)]
+enum Probe {
+    Metrics,
+    Livez,
+    Other,
 }
 
-fn is_livez_request(buf: &[u8]) -> bool {
+fn classify(buf: &[u8]) -> Probe {
     let path = request_path(buf);
-    path == b"/livez" || path.starts_with(b"/livez?")
+    if path == b"/metrics" || path.starts_with(b"/metrics?") {
+        Probe::Metrics
+    } else if path == b"/livez" || path.starts_with(b"/livez?") {
+        Probe::Livez
+    } else {
+        Probe::Other
+    }
 }
 
 fn metrics_response(ready: bool) -> Vec<u8> {
@@ -97,15 +106,12 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, shutdown: CancellationToke
                         .ok()
                         .and_then(|r| r.ok())
                         .unwrap_or(0);
-                    let resp: Vec<u8> = if is_metrics_request(&buf[..n]) {
-                        metrics_response(is_ready)
-                    } else if is_livez_request(&buf[..n]) {
+                    let resp: Cow<'static, [u8]> = match classify(&buf[..n]) {
+                        Probe::Metrics => Cow::Owned(metrics_response(is_ready)),
                         // Liveness: the fact this handler ran IS the answer.
-                        LIVE_200.to_vec()
-                    } else if is_ready {
-                        READY_200.to_vec()
-                    } else {
-                        NOT_READY_503.to_vec()
+                        Probe::Livez => Cow::Borrowed(LIVE_200),
+                        Probe::Other if is_ready => Cow::Borrowed(READY_200),
+                        Probe::Other => Cow::Borrowed(NOT_READY_503),
                     };
                     let _ = stream.write_all(&resp).await;
                     let _ = stream.flush().await;
@@ -121,25 +127,31 @@ mod tests {
 
     #[test]
     fn metrics_path_dispatch() {
-        assert!(is_metrics_request(
-            b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"
-        ));
-        assert!(is_metrics_request(b"GET /metrics?x=1 HTTP/1.1\r\n\r\n"));
+        assert_eq!(
+            classify(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Probe::Metrics
+        );
+        assert_eq!(
+            classify(b"GET /metrics?x=1 HTTP/1.1\r\n\r\n"),
+            Probe::Metrics
+        );
         // Everything else keeps readiness semantics.
-        assert!(!is_metrics_request(b"GET /readyz HTTP/1.1\r\n\r\n"));
-        assert!(!is_metrics_request(b"GET / HTTP/1.1\r\n\r\n"));
-        assert!(!is_metrics_request(b"GET /metricsx HTTP/1.1\r\n\r\n"));
-        assert!(!is_metrics_request(b""));
+        assert_eq!(classify(b"GET /readyz HTTP/1.1\r\n\r\n"), Probe::Other);
+        assert_eq!(classify(b"GET / HTTP/1.1\r\n\r\n"), Probe::Other);
+        assert_eq!(classify(b"GET /metricsx HTTP/1.1\r\n\r\n"), Probe::Other);
+        assert_eq!(classify(b""), Probe::Other);
     }
 
     #[test]
     fn livez_path_dispatch() {
-        assert!(is_livez_request(b"GET /livez HTTP/1.1\r\n\r\n"));
-        assert!(is_livez_request(b"GET /livez?verbose HTTP/1.1\r\n\r\n"));
+        assert_eq!(classify(b"GET /livez HTTP/1.1\r\n\r\n"), Probe::Livez);
+        assert_eq!(
+            classify(b"GET /livez?verbose HTTP/1.1\r\n\r\n"),
+            Probe::Livez
+        );
         // Liveness must not swallow readiness or metrics paths.
-        assert!(!is_livez_request(b"GET /readyz HTTP/1.1\r\n\r\n"));
-        assert!(!is_livez_request(b"GET /livezz HTTP/1.1\r\n\r\n"));
-        assert!(!is_livez_request(b"GET /metrics HTTP/1.1\r\n\r\n"));
-        assert!(!is_livez_request(b""));
+        assert_eq!(classify(b"GET /readyz HTTP/1.1\r\n\r\n"), Probe::Other);
+        assert_eq!(classify(b"GET /livezz HTTP/1.1\r\n\r\n"), Probe::Other);
+        assert_eq!(classify(b"GET /metrics HTTP/1.1\r\n\r\n"), Probe::Metrics);
     }
 }
