@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use crate::logging::{debug, error};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::extract_routing_info;
+use crate::proxy::method::method_len;
 use crate::routing::{
     Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
@@ -88,8 +89,11 @@ pub fn analyze_request<'a>(
     }
 }
 
+/// Whether `data` opens like an HTTP/1.x request line. This is the sniff
+/// that splits HTTP from opaque TCP on a shared listener, so it runs on
+/// every request and must never read another protocol's greeting as HTTP.
 #[inline(always)]
-pub(crate) fn is_http_request(data: &[u8]) -> bool {
+pub fn is_http_request(data: &[u8]) -> bool {
     if data.len() < 4 {
         return false;
     }
@@ -102,10 +106,19 @@ pub(crate) fn is_http_request(data: &[u8]) -> bool {
     const OPTI: u32 = u32::from_ne_bytes(*b"OPTI"); // OPTIONS
     const PATC: u32 = u32::from_ne_bytes(*b"PATC"); // PATCH
 
-    // Compare first 4 bytes as a u32 — all standard HTTP methods
-    // are uniquely identified by their first 4 bytes (including space for 3-letter methods).
+    // Seven methods carry nearly all traffic and one u32 compare settles
+    // them (3-letter tags include the SP). This path is unchanged.
     let tag = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-    matches!(tag, GET | POST | PUT | DELE | HEAD | OPTI | PATC)
+    if matches!(tag, GET | POST | PUT | DELE | HEAD | OPTI | PATC) {
+        return true;
+    }
+
+    // CONNECT, TRACE, WebDAV and CalDAV (PROPFIND, REPORT, MKCALENDAR...)
+    // and extension methods take the bounded token scan. Through v0.1.21
+    // they fell to the TCP path, which has no route on an HTTP listener,
+    // and the connection closed without a response: every CalDAV client
+    // behind portail broke on its first request.
+    method_len(data).is_some()
 }
 
 fn analyze_http_request<'a>(
@@ -780,5 +793,68 @@ mod tests {
         } else {
             panic!("expected HttpForward");
         }
+    }
+
+    #[test]
+    fn sniff_accepts_every_method_the_parser_can_forward() {
+        for m in [
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "DELETE",
+            "OPTIONS",
+            "PATCH",
+            "CONNECT",
+            "TRACE",
+            "PROPFIND",
+            "PROPPATCH",
+            "MKCOL",
+            "MKCALENDAR",
+            "REPORT",
+            "COPY",
+            "MOVE",
+            "LOCK",
+            "UNLOCK",
+            "ACL",
+            "SEARCH",
+        ] {
+            assert!(is_http_request(&make_request(m, "/", "example.com")), "{m}");
+        }
+    }
+
+    #[test]
+    fn sniff_keeps_foreign_protocols_on_the_tcp_path() {
+        let tls_client_hello = [0x16u8, 0x03, 0x01, 0x00, 0xf4, 0x01, 0x00, 0x00];
+        assert!(!is_http_request(&tls_client_hello));
+        assert!(!is_http_request(b"SSH-2.0-OpenSSH_9.9 Ubuntu-3\r\n"));
+        assert!(!is_http_request(b"*1\r\n$4\r\nPING\r\n"));
+        assert!(!is_http_request(b"get / HTTP/1.1\r\n"));
+        assert!(!is_http_request(b"GET"));
+    }
+
+    #[test]
+    fn webdav_request_is_routed_like_any_http_request() {
+        let rt = build_route_table("cal.example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let sel = BackendSelector::new();
+        let req = b"PROPFIND /user/ HTTP/1.1\r\nHost: cal.example.com\r\nDepth: 0\r\nContent-Length: 0\r\n\r\n";
+        let result = analyze_request(&rt, &sel, req, 443, &health(), true).unwrap();
+        match result {
+            RoutingResult::HttpForward { meta, .. } => {
+                assert!(!meta.is_head);
+                assert!(meta.keepalive);
+                assert_eq!(meta.content_length, Some(0));
+            }
+            _ => panic!("expected HttpForward"),
+        }
+    }
+
+    #[test]
+    fn non_http_bytes_on_an_http_only_port_close_the_connection() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let sel = BackendSelector::new();
+        let tls_client_hello = [0x16u8, 0x03, 0x01, 0x00, 0xf4, 0x01, 0x00, 0x00];
+        let result = analyze_request(&rt, &sel, &tls_client_hello, 8080, &health(), false).unwrap();
+        assert!(matches!(result, RoutingResult::CloseConnection));
     }
 }

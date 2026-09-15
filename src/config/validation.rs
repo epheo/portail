@@ -376,21 +376,17 @@ impl HttpRouteRule {
     }
 }
 
-const VALID_HTTP_METHODS: &[&str] = &[
-    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE",
-];
-
 impl HttpRouteMatch {
     fn validate(&self) -> Result<()> {
         if let Some(ref method) = self.method {
-            if !VALID_HTTP_METHODS
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(method))
-            {
+            // Same alphabet as the wire sniff: a whitelist here would reject
+            // routes for the WebDAV methods the data plane forwards.
+            if !crate::proxy::method::is_valid_method(method) {
                 return Err(anyhow!(
-                    "Invalid HTTP method '{}'. Must be one of: {}",
+                    "Invalid HTTP method '{}': expected {} to {} letters or '-' as IANA registers them (GET, PROPFIND, MKCALENDAR, ...)",
                     method,
-                    VALID_HTTP_METHODS.join(", ")
+                    crate::proxy::method::MIN_METHOD_LEN,
+                    crate::proxy::method::MAX_METHOD_LEN
                 ));
             }
         }
@@ -607,6 +603,25 @@ mod tests {
             kind: "Service".to_string(),
             filters: vec![],
             app_protocol: None,
+        }
+    }
+
+    #[test]
+    fn test_method_match_accepts_any_registered_method_shape() {
+        for m in ["GET", "get", "PROPFIND", "MKCALENDAR", "BASELINE-CONTROL"] {
+            let mut rule = make_rule(vec![], vec![default_backend()]);
+            let mut m_match = HttpRouteMatch::path_prefix("/");
+            m_match.method = Some(m.to_string());
+            rule.matches = vec![m_match];
+            assert!(rule.validate().is_ok(), "{m}");
+        }
+        for m in ["", "GE", "PRO PFIND", "GET1", "-GET"] {
+            let mut rule = make_rule(vec![], vec![default_backend()]);
+            let mut m_match = HttpRouteMatch::path_prefix("/");
+            m_match.method = Some(m.to_string());
+            rule.matches = vec![m_match];
+            let err = rule.validate().unwrap_err().to_string();
+            assert!(err.contains("Invalid HTTP method"), "{m:?}: {err}");
         }
     }
 

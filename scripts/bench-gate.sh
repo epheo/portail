@@ -21,7 +21,7 @@ THRESHOLD="${BENCH_GATE_THRESHOLD:-1.15}"
 MIN_DELTA_NS="${BENCH_GATE_MIN_DELTA_NS:-2}"
 
 run_benches() {
-    cargo bench --bench parsing_bench --bench routing_bench --bench end_to_end_bench \
+    cargo bench --bench parsing_bench --bench sniff_bench --bench routing_bench --bench end_to_end_bench \
         -- --output-format bencher
 }
 

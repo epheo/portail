@@ -45,6 +45,42 @@ fn test_http_proxy_roundtrip() {
     );
 }
 
+/// CalDAV and WebDAV clients open with PROPFIND. Through v0.1.21 the sniff
+/// took every method outside the seven common ones for raw TCP and closed
+/// the connection without a response.
+#[test]
+fn test_webdav_method_reaches_backend() {
+    let backend = InspectingBackend::spawn("<multistatus/>");
+    let port = proxy_port(79);
+    let proxy = PortailProcess::spawn(&[("localhost", "/", backend.addr)], port);
+
+    let body = r#"<?xml version="1.0"?><propfind xmlns="DAV:"><prop><current-user-principal/></prop></propfind>"#;
+    let request = format!(
+        "PROPFIND /dav/ HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = http_request(proxy.proxy_addr, request.as_bytes())
+        .expect("PROPFIND must get a response, not a closed connection");
+
+    assert_eq!(extract_status(&response), Some(200));
+    assert_eq!(
+        std::str::from_utf8(extract_body(&response)).unwrap().trim(),
+        "<multistatus/>"
+    );
+
+    let received = backend.received_requests();
+    assert_eq!(received.len(), 1, "backend must see exactly one request");
+    assert!(
+        received[0].starts_with(b"PROPFIND /dav/ HTTP/1.1\r\n"),
+        "request line forwarded verbatim"
+    );
+    assert!(
+        received[0].ends_with(body.as_bytes()),
+        "body forwarded intact"
+    );
+}
+
 #[test]
 fn test_http_keepalive_reuse() {
     let backend = TestBackend::spawn("keepalive-response");

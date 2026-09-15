@@ -41,7 +41,7 @@ jobs:
       # github-action-benchmark parses with `tool: cargo`.
       - name: Run criterion micro-benches
         run: |
-          cargo bench --bench parsing_bench --bench routing_bench --bench end_to_end_bench \
+          cargo bench --bench parsing_bench --bench sniff_bench --bench routing_bench --bench end_to_end_bench \
             -- --output-format bencher | tee bench-output.txt
 
       - name: Track results + alert on regression
