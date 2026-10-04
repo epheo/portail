@@ -8,15 +8,20 @@
 //!
 //! State machine:
 //! ```text
-//! HEALTHY ──(≥3 failures)──► UNHEALTHY ──(CAS wins)──► PROBING
-//!    ▲                                                      │
-//!    └──────────────── (probe TCP connect OK) ──────────────┘
-//!                                                      │
-//!          UNHEALTHY ◄────── (probe exhausted) ─────────┘
+//! HEALTHY --(>=3 failures)--> UNHEALTHY --(CAS wins)--> PROBING
+//!    ^                                                     |
+//!    +------ (probe TCP connect OK, or passive success) ---+
 //! ```
 //!
-//! Exactly one probe task runs per unhealthy backend: the `UNHEALTHY→PROBING`
+//! Exactly one probe task runs per unhealthy backend: the `UNHEALTHY->PROBING`
 //! compare_exchange ensures only the winning caller spawns the task.
+//!
+//! A probe never gives up. Unhealthy backends receive no traffic, so no passive
+//! failure can ever restart a probe cycle; a bounded probe that exhausted its
+//! attempts used to park the backend at 503 until the process restarted, even
+//! after it came back (a Service that gained its first endpoints hours later).
+//! The probe instead backs off to `PROBE_MAX_INTERVAL` and keeps going until the
+//! backend answers or `clear()` drops the entry.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -36,13 +41,17 @@ const STATUS_PROBING: u8 = 2;
 
 /// Number of consecutive failures before a backend is marked unhealthy.
 pub const FAILURE_THRESHOLD: u32 = 3;
-/// Time between probe TCP connect attempts.
-const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// Delay before the first probe; doubles after every failed probe.
+const PROBE_INITIAL_INTERVAL: Duration = Duration::from_secs(10);
+/// Backoff ceiling. One TCP connect per backend per five minutes is the cost of
+/// never abandoning a backend, including one that left the config for good.
+const PROBE_MAX_INTERVAL: Duration = Duration::from_secs(300);
 /// Timeout for each individual probe TCP connect.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// After this many failed probe attempts, revert to UNHEALTHY so a future
-/// passive failure can re-trigger a new probe cycle.
-const MAX_PROBE_ATTEMPTS: u32 = 30;
+
+fn next_probe_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(PROBE_MAX_INTERVAL)
+}
 
 struct BackendHealth {
     /// Reset to 0 on any success. Written with Relaxed — the threshold check
@@ -184,51 +193,61 @@ impl HealthRegistry {
     }
 
     async fn run_probe(registry: Arc<Self>, addr: SocketAddr) {
-        for attempt in 1..=MAX_PROBE_ATTEMPTS {
-            tokio::time::sleep(PROBE_INTERVAL).await;
+        let mut interval = PROBE_INITIAL_INTERVAL;
+        let mut attempt: u32 = 0;
+        loop {
+            tokio::time::sleep(interval).await;
+            attempt += 1;
 
-            debug!(
-                "Probe attempt {}/{} for backend {}",
-                attempt, MAX_PROBE_ATTEMPTS, addr
-            );
+            // `clear()` dropped the entry, or an in-flight request already
+            // recorded a passive success: nothing left to probe.
+            let still_probing = registry
+                .backends
+                .get(&addr)
+                .is_some_and(|e| e.status.load(Ordering::Acquire) == STATUS_PROBING);
+            if !still_probing {
+                debug!(
+                    "Probe for backend {} stopped: entry gone or already healthy",
+                    addr
+                );
+                return;
+            }
+
+            debug!("Probe attempt {} for backend {}", attempt, addr);
 
             let connected = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
                 .await
                 .is_ok_and(|r| r.is_ok());
 
             if connected {
-                info!(
-                    "Backend {} recovered after {} probe attempt(s)",
-                    addr, attempt
-                );
                 if let Some(entry) = registry.backends.get(&addr) {
                     entry.consecutive_failures.store(0, Ordering::Relaxed);
-                    // Release: subsequent Acquire reads of STATUS_HEALTHY will see
-                    // all prior stores (including the failure counter reset).
-                    entry.status.store(STATUS_HEALTHY, Ordering::Release);
-                    crate::metrics::METRICS.backends_recovered_total.inc();
+                    // CAS, not store: a passive success may have flipped the
+                    // status already, and the metric must count a recovery once.
+                    if entry
+                        .status
+                        .compare_exchange(
+                            STATUS_PROBING,
+                            STATUS_HEALTHY,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        crate::metrics::METRICS.backends_recovered_total.inc();
+                        info!(
+                            "Backend {} recovered after {} probe attempt(s)",
+                            addr, attempt
+                        );
+                    }
                 }
                 return;
             }
 
+            interval = next_probe_interval(interval);
             warn!(
-                "Probe {}/{} failed for backend {}",
-                attempt, MAX_PROBE_ATTEMPTS, addr
-            );
-        }
-
-        // All attempts exhausted — revert PROBING → UNHEALTHY so a future
-        // passive failure can trigger a fresh probe cycle.
-        warn!(
-            "Backend {} probe exhausted after {} attempts",
-            addr, MAX_PROBE_ATTEMPTS
-        );
-        if let Some(entry) = registry.backends.get(&addr) {
-            let _ = entry.status.compare_exchange(
-                STATUS_PROBING,
-                STATUS_UNHEALTHY,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
+                "Probe {} failed for backend {}; next probe in {:?}",
+                attempt, addr, interval
             );
         }
     }
@@ -312,5 +331,71 @@ mod tests {
             .map(|e| e.consecutive_failures.load(Ordering::Relaxed))
             .unwrap_or(0);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_probe_interval_doubles_then_caps() {
+        assert_eq!(
+            next_probe_interval(PROBE_INITIAL_INTERVAL),
+            PROBE_INITIAL_INTERVAL * 2
+        );
+        let mut d = PROBE_INITIAL_INTERVAL;
+        for _ in 0..16 {
+            d = next_probe_interval(d);
+        }
+        assert_eq!(d, PROBE_MAX_INTERVAL);
+        assert_eq!(next_probe_interval(PROBE_MAX_INTERVAL), PROBE_MAX_INTERVAL);
+    }
+
+    /// Mark `a` unhealthy and win the probe CAS, as a worker would.
+    fn park(r: &HealthRegistry, a: SocketAddr) {
+        for _ in 0..(FAILURE_THRESHOLD - 1) {
+            r.record_failure(a);
+        }
+        assert!(r.record_failure(a));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_stops_when_entry_cleared() {
+        let r = Arc::new(HealthRegistry::new());
+        let a = addr(8085);
+        park(&r, a);
+        r.clear();
+        // Paused time auto-advances through the probe sleeps; the loop must
+        // notice the missing entry and return instead of probing forever.
+        tokio::time::timeout(
+            PROBE_MAX_INTERVAL,
+            HealthRegistry::run_probe(Arc::clone(&r), a),
+        )
+        .await
+        .expect("probe loop must exit once its entry is gone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_recovers_backend_that_came_back_late() {
+        // Nothing listens on this port yet: the first probes fail and back off.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = listener.local_addr().unwrap();
+        drop(listener);
+
+        let r = Arc::new(HealthRegistry::new());
+        park(&r, a);
+        assert!(!r.is_healthy(&a));
+
+        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+
+        // Let more probes fail than the old bounded loop allowed before the
+        // backend finally appears.
+        tokio::time::sleep(PROBE_MAX_INTERVAL * 40).await;
+        assert!(!r.is_healthy(&a));
+        assert!(!probe.is_finished(), "probe must not give up");
+
+        let listener = tokio::net::TcpListener::bind(a).await.unwrap();
+        tokio::time::timeout(PROBE_MAX_INTERVAL * 2, probe)
+            .await
+            .expect("probe must succeed once the backend listens")
+            .unwrap();
+        drop(listener);
+        assert!(r.is_healthy(&a));
     }
 }

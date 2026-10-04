@@ -53,6 +53,7 @@ schemars = "1"
 
 
 [dev-dependencies]
+tokio = { version = "1.40", features = ["test-util"] }
 criterion = "0.7"
 hyper = "0.14"
 libc = "0.2"
