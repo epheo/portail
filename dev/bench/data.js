@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789502940137,
+  "lastUpdate": 1791149851365,
   "repoUrl": "https://github.com/epheo/portail",
   "entries": {
     "Benchmark": [
@@ -1510,6 +1510,324 @@ window.BENCHMARK_DATA = {
           {
             "name": "sniff_extension_method",
             "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_non_http",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "root@epheo.eu",
+            "name": "Thibaut Lapierre",
+            "username": "epheo"
+          },
+          "committer": {
+            "email": "root@epheo.eu",
+            "name": "Thibaut Lapierre",
+            "username": "epheo"
+          },
+          "distinct": true,
+          "id": "2b236fa2cb055dc956d938e3c47cc9dfbf7b3a8f",
+          "message": "Health: never abandon a parked backend; probe with capped backoff\n\nA backend marked unhealthy receives no traffic, so the \"future passive\nfailure\" that was supposed to restart probing after 30 attempts can never\nhappen. A Service that was down longer than five minutes stayed at 503 until\nthe process restarted, even after it came back. def.ms hit this after five\ndays without endpoints.\n\nThe probe now backs off from 10s to 5min and keeps going until the backend\nanswers or clear() drops the entry.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>",
+          "timestamp": "2026-10-04T23:05:31+02:00",
+          "tree_id": "97b66510f848ef47546b985c3dcc7afabb7cf371",
+          "url": "https://github.com/epheo/portail/commit/2b236fa2cb055dc956d938e3c47cc9dfbf7b3a8f"
+        },
+        "date": 1791149850973,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "e2e_http_request_processing",
+            "value": 879,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_auth_request",
+            "value": 169,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_product_search",
+            "value": 235,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_health_check_processing",
+            "value": 98,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_404_route_processing",
+            "value": 236,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "throughput_simulation_1000_requests",
+            "value": 493847,
+            "range": "± 16768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_simple_get",
+            "value": 99,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_auth",
+            "value": 167,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_cookies",
+            "value": 144,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_complex_path",
+            "value": 274,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple",
+            "value": 64,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical",
+            "value": 248,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex",
+            "value": 694,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple_repeated",
+            "value": 64,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical_repeated",
+            "value": 247,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex_repeated",
+            "value": 694,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_malformed_request",
+            "value": 97,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/100",
+            "value": 128,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/500",
+            "value": 759,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/1000",
+            "value": 1533,
+            "range": "± 80",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/2000",
+            "value": 2802,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/4000",
+            "value": 5625,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/GET",
+            "value": 88,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/POST",
+            "value": 90,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PUT",
+            "value": 87,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/DELETE",
+            "value": 96,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PATCH",
+            "value": 92,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/HEAD",
+            "value": 90,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/OPTIONS",
+            "value": 99,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/0",
+            "value": 67,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/1",
+            "value": 80,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/2",
+            "value": 99,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/3",
+            "value": 76,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/4",
+            "value": 82,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation",
+            "value": 94,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation_test",
+            "value": 94,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/100",
+            "value": 59,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/1000",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/10000",
+            "value": 63,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_simple",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_complex",
+            "value": 32,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tcp_route_lookup",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_selection_round_robin",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_table_creation",
+            "value": 170,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_creation",
+            "value": 49,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "add_http_route",
+            "value": 554,
+            "range": "± 87",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_common_method",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_extension_method",
+            "value": 17,
             "range": "± 0",
             "unit": "ns/iter"
           },
