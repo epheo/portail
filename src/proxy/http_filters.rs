@@ -74,7 +74,7 @@ pub(crate) fn assemble_forward_headers(
         cursor = ue;
     }
     out.extend_from_slice(&raw[cursor..terminator_start]);
-    append_forward_headers(out, raw, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -143,23 +143,17 @@ pub(crate) fn assemble_forward_headers_slow(
             out.extend_from_slice(b"\r\n");
         }
     }
-    append_forward_headers(out, raw, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
 fn append_forward_headers(
     out: &mut Vec<u8>,
-    raw: &[u8],
     client_ip: std::net::IpAddr,
     is_tls: bool,
     keep_upgrade: bool,
 ) {
     use std::io::Write;
-    if let Some(authority) = hostless_authority(raw) {
-        out.extend_from_slice(b"Host: ");
-        out.extend_from_slice(authority);
-        out.extend_from_slice(b"\r\n");
-    }
     // A fresh X-Forwarded-For line: multiple XFF headers concatenate as one
     // list, which avoids locating and splicing an existing header.
     out.extend_from_slice(b"X-Forwarded-For: ");
@@ -172,18 +166,22 @@ fn append_forward_headers(
     }
 }
 
-/// Host for a request that has no Host line, which only HTTP/1.0 may send:
-/// its absolute-form target's authority, the host it was routed by (RFC
-/// 9112 3.2.2). Without the line the backend sees no host at all, and a
-/// URLRewrite hostname or `set Host` finds nothing to replace. `None` with
-/// a Host line, or for any other target: routed with the empty host, such a
-/// request gets no Host rather than an empty one.
-fn hostless_authority(raw: &[u8]) -> Option<&[u8]> {
-    let line_end = memchr::memchr(b'\n', raw)?;
-    let line = raw[..line_end]
-        .strip_suffix(b"\r")?
-        .strip_suffix(b" HTTP/1.0")?;
-    let target = &line[memchr::memchr(b' ', line)? + 1..];
+/// The origin-form target and the authority of an absolute-form request
+/// (`raw` is its head, `path_span` the parser's path within it). `None` for
+/// any other form, at one byte compare when the path starts the target, as
+/// it does in the common origin-form request.
+pub(crate) fn absolute_form_target(
+    raw: &[u8],
+    path_span: Option<(u32, u32)>,
+) -> Option<(&[u8], &str)> {
+    if let Some((start, _)) = path_span {
+        if raw.get((start as usize).checked_sub(1)?) == Some(&b' ') {
+            return None;
+        }
+    }
+    let line = &raw[..memchr::memchr(b'\n', raw)?];
+    let (start, end) = target_bounds(line)?;
+    let target = &line[start..end];
     let scheme_len = [&b"http://"[..], b"https://"]
         .into_iter()
         .find(|s| {
@@ -194,10 +192,28 @@ fn hostless_authority(raw: &[u8]) -> Option<&[u8]> {
         .len();
     // The parser held everything up to '/' to host[:port].
     let rest = &target[scheme_len..];
-    let authority = &rest[..memchr::memchr(b'/', rest).unwrap_or(rest.len())];
-    let has_host = header_lines(&raw[line_end + 1..])
-        .any(|l| memchr::memchr(b':', l).is_some_and(|p| l[..p].eq_ignore_ascii_case(b"host")));
-    (!authority.is_empty() && !has_host).then_some(authority)
+    let authority_len = memchr::memchr(b'/', rest).unwrap_or(rest.len());
+    let origin = match &rest[authority_len..] {
+        // RFC 9112 3.2.1: an empty path is sent as "/".
+        b"" => &b"/"[..],
+        path_and_query => path_and_query,
+    };
+    Some((origin, std::str::from_utf8(&rest[..authority_len]).ok()?))
+}
+
+/// Rewrite an absolute-form request head into `out` for an origin server
+/// (RFC 9112 3.2.1): `target` replaces the request-target, and `authority`
+/// replaces the client's Host, or is added where an HTTP/1.0 client sent
+/// none (3.2.2). Filters then act on it as on any origin-form request.
+pub(crate) fn to_origin_form(head: &[u8], target: &[u8], authority: &str, out: &mut Vec<u8>) {
+    rewrite_request_head(head, Some(target), None, Some(authority), out);
+}
+
+/// Request-target bounds within a request line: between its first two SPs.
+fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
+    let start = memchr::memchr(b' ', line)? + 1;
+    let end = start + memchr::memchr(b' ', &line[start..])?;
+    Some((start, end))
 }
 
 /// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 §6.1).
@@ -582,37 +598,35 @@ pub(crate) fn apply_request_header_modifications(
     url_rewrite: Option<&URLRewrite>,
     out: &mut Vec<u8>,
 ) {
+    let path = url_rewrite.and_then(|r| r.path.as_ref()).map(|p| match p {
+        RewrittenPath::Full(p) | RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
+    });
+    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
+    rewrite_request_head(header_region, path, header_mods, rewrite_hostname, out);
+}
+
+/// The request line with `target` in place of its own, then the header
+/// lines through `apply_header_mods_inner`, into `out` (cleared first).
+/// Shared by URLRewrite paths and the origin-form rewrite.
+fn rewrite_request_head(
+    header_region: &[u8],
+    target: Option<&[u8]>,
+    header_mods: Option<&HeaderModifications<'_>>,
+    rewrite_hostname: Option<&str>,
+    out: &mut Vec<u8>,
+) {
     out.clear();
     out.reserve(header_region.len() + 256);
-    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
-
     let (first_line, rest) = split_first_line(header_region);
-
-    // Request line: rewrite path if needed
-    if let Some(rewrite) = url_rewrite {
-        if let Some(ref rewritten) = rewrite.path {
-            let new_path = match rewritten {
-                RewrittenPath::Full(p) => p.as_bytes(),
-                RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
-            };
-            if let Some(sp1) = first_line.iter().position(|&b| b == b' ') {
-                if let Some(sp2) = first_line[sp1 + 1..].iter().position(|&b| b == b' ') {
-                    out.extend_from_slice(&first_line[..sp1 + 1]);
-                    out.extend_from_slice(new_path);
-                    out.extend_from_slice(&first_line[sp1 + 1 + sp2..]);
-                    out.extend_from_slice(b"\r\n");
-
-                    apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
-                    return;
-                }
-            }
+    match target.and_then(|t| Some((t, target_bounds(first_line)?))) {
+        Some((target, (start, end))) => {
+            out.extend_from_slice(&first_line[..start]);
+            out.extend_from_slice(target);
+            out.extend_from_slice(&first_line[end..]);
         }
+        None => out.extend_from_slice(first_line),
     }
-
-    // No path rewrite — pass first line through
-    out.extend_from_slice(first_line);
     out.extend_from_slice(b"\r\n");
-
     apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
 }
 
@@ -756,81 +770,69 @@ mod tests {
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
     }
 
-    /// An HTTP/1.0 request may omit Host and name its host in an
-    /// absolute-form target, which it is then routed by (RFC 9112 3.2.2).
-    #[test]
-    fn test_hostless_absolute_form_is_forwarded_with_its_authority_as_host() {
-        let ip = "10.1.2.3".parse().unwrap();
-        let spans = crate::proxy::http_parser::StripSpans::default();
-        for (req, authority) in [
-            (
-                &b"GET http://example.com:8080/x HTTP/1.0\r\nAccept: */*\r\n\r\n"[..],
-                "example.com:8080",
-            ),
-            (b"GET HTTPS://[::1] HTTP/1.0\r\n\r\n", "[::1]"),
-        ] {
-            let mut out = Vec::new();
-            assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
-            let s = std::str::from_utf8(&out).unwrap();
-            assert_eq!(s.matches("Host:").count(), 1, "{s}");
-            assert!(s.contains(&format!("\r\nHost: {authority}\r\n")), "{s}");
-            let mut slow = Vec::new();
-            assemble_forward_headers_slow(req, false, ip, false, &mut slow);
-            assert_eq!(slow, out);
-        }
+    /// `path_span` as the request processor derives it from the parser:
+    /// `None` where the parser substituted "/".
+    fn path_span(req: &[u8]) -> Option<(u32, u32)> {
+        let path = parsed_spans(req).path.as_bytes();
+        let start = (path.as_ptr() as usize).checked_sub(req.as_ptr() as usize)?;
+        let end = start + path.len();
+        (end <= req.len()).then_some((start as u32, end as u32))
+    }
 
-        // Filters then replace it like any other Host.
-        let req = b"GET http://example.com/x HTTP/1.0\r\n\r\n";
-        let mut out = Vec::new();
-        assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
-        let rewrite = URLRewrite {
-            hostname: Some("internal.example".to_string()),
-            path: None,
-        };
-        let set = [HttpHeader {
-            name: "Host".to_string(),
-            value: "set.example".to_string(),
-        }];
-        let mods = HeaderModifications {
-            add: &[],
-            set: &set,
-            remove: &[],
-        };
-        for (mods, rewrite, host) in [
-            (None, Some(&rewrite), "internal.example"),
-            (Some(&mods), None, "set.example"),
+    #[test]
+    fn test_absolute_form_target_splits_origin_form_from_authority() {
+        for (req, want) in [
+            (
+                &b"GET http://a.test:8080/p?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
+                Some((&b"/p?q=1"[..], "a.test:8080")),
+            ),
+            (
+                b"GET http://a.test/ HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                Some((&b"/"[..], "a.test")),
+            ),
+            (
+                b"GET HTTPS://[::1] HTTP/1.0\r\n\r\n",
+                Some((&b"/"[..], "[::1]")),
+            ),
+            // Origin-form, hostless or not, and asterisk-form stay as sent:
+            // routed by the empty host, the former gets no Host at all.
+            (b"GET /p?q HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
+            (b"GET /x HTTP/1.0\r\n\r\n", None),
+            (b"OPTIONS * HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
         ] {
-            let mut result = Vec::new();
-            apply_request_header_modifications(&out, mods, rewrite, &mut result);
-            let s = std::str::from_utf8(&result).unwrap();
-            assert_eq!(s.matches("Host:").count(), 1, "{s}");
-            assert!(s.contains(&format!("\r\nHost: {host}\r\n")), "{s}");
+            assert_eq!(
+                absolute_form_target(req, path_span(req)),
+                want,
+                "{}",
+                String::from_utf8_lossy(req)
+            );
         }
     }
 
     #[test]
-    fn test_assembly_adds_host_only_where_a_host_is_known_and_missing() {
-        let ip = "10.1.2.3".parse().unwrap();
-        let spans = crate::proxy::http_parser::StripSpans::default();
-        let host_lines = |req: &[u8]| {
-            let mut out = Vec::new();
-            assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
-            String::from_utf8(out)
-                .unwrap()
-                .to_ascii_lowercase()
-                .matches("\r\nhost:")
-                .count()
-        };
-        // Routed with the empty host: an empty Host line would be worse than none.
-        assert_eq!(host_lines(b"GET /x HTTP/1.0\r\n\r\n"), 0);
-        assert_eq!(host_lines(b"OPTIONS * HTTP/1.0\r\n\r\n"), 0);
-        for req in [
-            &b"GET http://example.com/x HTTP/1.0\r\nhost: example.com\r\n\r\n"[..],
-            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n",
-        ] {
-            assert_eq!(host_lines(req), 1, "{}", String::from_utf8_lossy(req));
-        }
+    fn test_to_origin_form_moves_the_authority_to_host() {
+        let mut out = Vec::new();
+        to_origin_form(
+            b"GET http://a.test:8080/p?q HTTP/1.1\r\nhost: a.test\r\nAccept: */*\r\n\r\n",
+            b"/p?q",
+            "a.test:8080",
+            &mut out,
+        );
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "GET /p?q HTTP/1.1\r\nHost: a.test:8080\r\nAccept: */*\r\n\r\n"
+        );
+        // An HTTP/1.0 client may have sent no Host to replace.
+        to_origin_form(
+            b"GET http://a.test HTTP/1.0\r\nAccept: */*\r\n\r\n",
+            b"/",
+            "a.test",
+            &mut out,
+        );
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "GET / HTTP/1.0\r\nAccept: */*\r\nHost: a.test\r\n\r\n"
+        );
     }
 
     /// Like `set`, a URLRewrite hostname adds the Host it finds no line to
