@@ -105,6 +105,13 @@ const VALUE: u8 = 1 << 1;
 const TARGET: u8 = 1 << 2;
 const HOST: u8 = 1 << 3;
 
+/// Bytes at or above a class's `scan` floor that the class still excludes.
+/// The class is built from them, so the word test cannot miss one.
+const VALUE_HOLES: [u8; 1] = [0x7f];
+/// Routing reads `/admin#x` whole while a backend dropping the fragment, or
+/// reading '\' as '/', serves another path: a rule on that path is bypassed.
+const TARGET_HOLES: [u8; 3] = [0x7f, b'#', b'\\'];
+
 /// Byte classes of the request-head grammar (RFC 9110, RFC 9112, RFC 3986).
 /// HOST is reg-name: unreserved, sub-delims and the `%` of pct-encoded; the
 /// structural `:`, `[` and `]` are left to `split_host`.
@@ -126,10 +133,10 @@ static CLASS: [u8; 256] = {
         if b.is_ascii_alphanumeric() || any_of(b, b"!#$%&'*+-.^_`|~") {
             table[i] |= TCHAR;
         }
-        if b == b'\t' || (b >= 0x20 && b != 0x7f) {
+        if b == b'\t' || (b >= 0x20 && !any_of(b, &VALUE_HOLES)) {
             table[i] |= VALUE;
         }
-        if b > 0x20 && b != 0x7f {
+        if b > 0x20 && !any_of(b, &TARGET_HOLES) {
             table[i] |= TARGET;
         }
         if b.is_ascii_alphanumeric() || any_of(b, b"-._~!$&'()*+,;=%") {
@@ -149,16 +156,25 @@ const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
 const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
 
 /// End of the run of `class` bytes starting at `pos`. Every byte at or above
-/// `floor` except DEL must belong to `class`, so whole words of such bytes
+/// `floor` except `holes` must belong to `class`, so whole words of such bytes
 /// skip the per-byte lookup; long values and targets cost a fraction of a
 /// lookup per byte. `floor` must not exceed 0x80 for the word test to be exact.
 #[inline(always)]
-fn scan(data: &[u8], mut pos: usize, class: u8, floor: u8) -> usize {
+fn scan<const N: usize>(
+    data: &[u8],
+    mut pos: usize,
+    class: u8,
+    floor: u8,
+    holes: [u8; N],
+) -> usize {
     while let Some(word) = data[pos..].first_chunk::<8>() {
         let w = u64::from_ne_bytes(*word);
-        let below_floor = w.wrapping_sub(ONES * floor as u64) & !w & HIGHS;
-        let del = w ^ (ONES * 0x7f);
-        if below_floor | (del.wrapping_sub(ONES) & !del & HIGHS) != 0 {
+        let mut stop = w.wrapping_sub(ONES * floor as u64) & !w & HIGHS;
+        for hole in holes {
+            let x = w ^ (ONES * hole as u64);
+            stop |= x.wrapping_sub(ONES) & !x & HIGHS;
+        }
+        if stop != 0 {
             break;
         }
         pos += 8;
@@ -282,7 +298,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         return Err(anyhow!("Malformed HTTP request line"));
     }
     let target_start = pos + 1;
-    let target_end = scan(data, target_start, TARGET, 0x21);
+    let target_end = scan(data, target_start, TARGET, 0x21, TARGET_HOLES);
     if target_end == target_start || data.get(target_end) != Some(&b' ') {
         return Err(anyhow!("Malformed HTTP request line"));
     }
@@ -365,7 +381,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
             break;
         }
         let value_start = pos + 1;
-        let value_end = scan(data, value_start, VALUE, 0x20);
+        let value_end = scan(data, value_start, VALUE, 0x20, VALUE_HOLES);
         if data.get(value_end) != Some(&b'\r') || data.get(value_end + 1) != Some(&b'\n') {
             violation = true;
             break;
@@ -533,20 +549,19 @@ mod tests {
 
     #[test]
     fn word_scan_stops_exactly_where_a_byte_scan_would() {
-        for (class, floor) in [(VALUE, 0x20), (TARGET, 0x21)] {
+        fn check<const N: usize>(class: u8, floor: u8, holes: [u8; N]) {
             for b in 0..=255u8 {
                 for at in 0..20 {
                     let mut buf = [b'a'; 24];
                     buf[at] = b;
                     let want = if is(b, class) { buf.len() } else { at };
-                    assert_eq!(scan(&buf, 0, class, floor), want, "{b:#04x} at {at}");
-                    assert_eq!(
-                        scan(&buf, 1.min(at), class, floor),
-                        want,
-                        "{b:#04x} at {at}"
-                    );
+                    let scan_from = |pos| scan(&buf, pos, class, floor, holes);
+                    assert_eq!(scan_from(0), want, "{b:#04x} at {at}");
+                    assert_eq!(scan_from(1.min(at)), want, "{b:#04x} at {at}");
                 }
             }
         }
+        check(VALUE, 0x20, VALUE_HOLES);
+        check(TARGET, 0x21, TARGET_HOLES);
     }
 }

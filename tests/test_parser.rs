@@ -411,6 +411,35 @@ fn target_rejects_ctl_and_del() {
 }
 
 #[test]
+fn target_rejects_fragment_and_backslash() {
+    // Routing reads `/admin#x` whole, so it misses an /admin prefix rule;
+    // a backend that drops the fragment, or reads '\' as '/', then serves
+    // the path that rule guards.
+    let pad = "a".repeat(32);
+    for target in [
+        "/admin#x".to_string(),
+        "/admin#".to_string(),
+        "#".to_string(),
+        "/a?b=#c".to_string(),
+        "/admin\\x".to_string(),
+        "\\admin".to_string(),
+        "/a?b=\\c".to_string(),
+        format!("/{pad}#"),
+        format!("/{pad}\\"),
+        format!("/{pad}#{pad}"),
+        "http://h/admin#x".to_string(),
+        "http://h\\@evil/".to_string(),
+    ] {
+        assert_rejected(&head(&format!("GET {target} HTTP/1.1"), "Host: h\r\n"));
+    }
+    // Percent-encoded they are data, not delimiters.
+    let req = head("GET /a%23b%5Cc?d=%23 HTTP/1.1", "Host: h\r\n");
+    let info = accepted(&req);
+    assert_eq!(info.path, "/a%23b%5Cc");
+    assert_eq!(info.query_string, "d=%23");
+}
+
+#[test]
 fn non_utf8_target_is_an_error() {
     assert!(extract_routing_info(b"GET /\xff HTTP/1.1\r\nHost: h\r\n\r\n").is_err());
 }
