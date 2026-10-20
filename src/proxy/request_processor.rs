@@ -7,7 +7,8 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 
-use crate::logging::{debug, error, warn};
+use crate::logging::{debug, error};
+use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::{extract_routing_info, HttpRequestInfo};
 use crate::proxy::method::method_len;
@@ -156,16 +157,19 @@ fn analyze_http_request<'a>(
         reusable: false,
         head: false,
     });
+    // Counted, logged at debug only: the client picks how many it sends.
     let request_info = match extract_routing_info(request_data) {
         Ok(info) if !info.header_violation => info,
         Ok(_) => {
-            warn!("Rejecting malformed request head on port {}", server_port);
+            METRICS.http_requests_rejected_total.inc();
+            debug!("Rejecting malformed request head on port {}", server_port);
             return Ok(BAD_REQUEST);
         }
-        Err(e) => {
-            warn!(
+        Err(_e) => {
+            METRICS.http_requests_rejected_total.inc();
+            debug!(
                 "Rejecting unparseable request on port {}: {}",
-                server_port, e
+                server_port, _e
             );
             return Ok(BAD_REQUEST);
         }
@@ -958,6 +962,22 @@ mod tests {
             ),
             (400, false)
         );
+    }
+
+    /// Logged at debug only, so the counter is what shows a client sending
+    /// them. Other tests share the global: only growth is asserted.
+    #[test]
+    fn every_malformed_head_400_is_counted() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let rejected = || METRICS.http_requests_rejected_total.get();
+        for req in [
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n",
+        ] {
+            let before = rejected();
+            assert_eq!(local_reply(&rt, req), (400, false));
+            assert!(rejected() > before);
+        }
     }
 
     /// Sniffed as HTTP so the client gets an answer instead of a silent
