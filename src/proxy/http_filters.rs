@@ -211,11 +211,13 @@ pub(crate) fn sanitize_response_headers(
 /// First-byte dispatch keeps the per-line cost to one comparison for the
 /// overwhelmingly common non-hop-by-hop headers.
 ///
-/// Also two client headers that must never pass even though they are not
-/// hop-by-hop: X-Forwarded-Proto (the proxy appends its own; a client copy
-/// would claim TLS it never had) and HTTP2-Settings (h2c is never offered
-/// to a backend). The parser strips both via spans on the fast path; this
-/// covers the paths that re-derive the set by name.
+/// Also client headers that must never pass even though they are not
+/// hop-by-hop. HTTP2-Settings: h2c is never offered to a backend. Forwarded
+/// and X-Forwarded-Proto, -Host, -Port, -Ssl, -Scheme: a backend trusts them
+/// as the proxy's word on the original request, so a client copy could claim
+/// TLS, a host or a port it never used. X-Forwarded-For is not here: the
+/// proxy appends to the client's list. The parser strips these via spans on
+/// the fast path; this covers the paths that re-derive the set by name.
 #[inline]
 pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
@@ -225,9 +227,21 @@ pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
         Some(b't') => name.eq_ignore_ascii_case(b"te") || name.eq_ignore_ascii_case(b"trailer"),
         Some(b'e') => name.eq_ignore_ascii_case(b"expect"),
         Some(b'h') => name.eq_ignore_ascii_case(b"http2-settings"),
-        Some(b'x') => name.eq_ignore_ascii_case(b"x-forwarded-proto"),
+        Some(b'f') => name.eq_ignore_ascii_case(b"forwarded"),
+        Some(b'x') => is_proxy_asserted_x_forwarded(name),
         _ => false,
     }
+}
+
+fn is_proxy_asserted_x_forwarded(name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"x-forwarded-";
+    if name.len() <= PREFIX.len() || !name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    let suffix = &name[PREFIX.len()..];
+    [&b"proto"[..], b"host", b"port", b"ssl", b"scheme"]
+        .iter()
+        .any(|s| suffix.eq_ignore_ascii_case(s))
 }
 
 #[inline]
@@ -699,6 +713,30 @@ mod tests {
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
     }
 
+    /// The fast path strips these by parser span; a Connection-nominated
+    /// extra header must not let them through the slow path instead.
+    #[test]
+    fn test_assemble_slow_path_drops_client_forwarding_claims() {
+        let req = b"GET / HTTP/1.1\r\nHost: h\r\nForwarded: for=6.6.6.6;proto=https\r\nX-Forwarded-Host: evil\r\nx-forwarded-port: 443\r\nX-Forwarded-Ssl: on\r\nX-FORWARDED-SCHEME: https\r\nX-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Hostname: kept\r\nConnection: X-Internal\r\n\r\n";
+        let mut out = Vec::new();
+        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        let lower = s.to_ascii_lowercase();
+        for name in [
+            "\nforwarded:",
+            "\nx-forwarded-host:",
+            "\nx-forwarded-port:",
+            "\nx-forwarded-ssl:",
+            "\nx-forwarded-scheme:",
+        ] {
+            assert!(!lower.contains(name), "{name:?} forwarded: {s}");
+        }
+        // X-Forwarded-For appends: the client's list, then the proxy's peer.
+        assert!(s.contains("X-Forwarded-For: 6.6.6.6\r\n"), "{s}");
+        assert!(s.contains("X-Forwarded-For: 10.1.2.3\r\n"), "{s}");
+        assert!(s.contains("X-Forwarded-Hostname: kept\r\n"), "{s}");
+    }
+
     #[test]
     fn test_assemble_slow_path_never_strips_framing_or_host() {
         // Stripping Content-Length here would make the backend read the body
@@ -750,11 +788,28 @@ mod tests {
     }
 
     #[test]
-    fn test_request_set_strips_forwarded_proto_and_h2c_settings() {
-        for name in ["X-Forwarded-Proto", "x-forwarded-proto", "HTTP2-Settings"] {
+    fn test_request_set_strips_forwarding_claims_and_h2c_settings() {
+        for name in [
+            "X-Forwarded-Proto",
+            "x-forwarded-proto",
+            "HTTP2-Settings",
+            "Forwarded",
+            "X-Forwarded-Host",
+            "X-FORWARDED-PORT",
+            "x-forwarded-ssl",
+            "X-Forwarded-Scheme",
+        ] {
             assert!(is_hop_by_hop_request_header(name.as_bytes()), "{name}");
         }
-        for name in ["Host", "X-Forwarded-For", "Content-Length"] {
+        for name in [
+            "Host",
+            "X-Forwarded-For",
+            "Content-Length",
+            "X-Forwarded-",
+            "X-Forwarded-Hostname",
+            "Forwarded-For",
+            "From",
+        ] {
             assert!(!is_hop_by_hop_request_header(name.as_bytes()), "{name}");
         }
     }
