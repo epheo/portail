@@ -901,8 +901,9 @@ async fn proxy_http_request(
         Ok(BodyEnd::Complete) => {}
         Ok(BodyEnd::Closed) => {
             // Close-delimited: our clean close is how the client learns the
-            // body ended.
-            client.flush().await?;
+            // body ended. Over TLS that takes close_notify, not just a FIN:
+            // strict clients read a bare FIN as a truncation attack.
+            idle_guarded(state.idle_body_timeout, client.shutdown()).await?;
             return Ok((false, None));
         }
         Ok(BodyEnd::Broken) => {
@@ -2094,7 +2095,7 @@ mod connection_tests {
         rt
     }
 
-    fn serve(rt: RouteTable) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+    fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
         // The pool's TLS client config needs one, even for plain backends.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cfg = WorkerConfig {
@@ -2105,23 +2106,26 @@ mod connection_tests {
             idle_body_timeout: Duration::from_secs(5),
             http2: false,
         };
-        let state = ConnectionState::new(
+        ConnectionState::new(
             8080,
             Arc::new(ArcSwap::from_pointee(rt)),
             make_pool(&None, &cfg),
             Arc::new(BackendSelector::new()),
             Arc::new(HealthRegistry::new()),
-            false,
+            is_tls,
             "127.0.0.1".parse().unwrap(),
             &cfg,
             Arc::new(ListenerStats::default()),
-        );
+        )
+    }
+
+    fn serve(rt: RouteTable) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
         let (client, engine) = tokio::io::duplex(64 * 1024);
         let peer = "127.0.0.1:40000".parse().unwrap();
         let task = tokio::spawn(handle_connection(
             Connection::Mem { inner: engine },
             peer,
-            state,
+            conn_state(rt, false),
         ));
         (client, task)
     }
@@ -2345,6 +2349,57 @@ mod connection_tests {
             );
             task.await.unwrap().unwrap();
         }
+    }
+
+    /// Over TLS only close_notify tells a strict client (OpenSSL 3, rustls)
+    /// that a close-delimited body ended rather than was cut.
+    #[tokio::test]
+    async fn close_delimited_body_over_tls_ends_with_close_notify() {
+        let Some((cert_pem, key_pem)) = crate::proxy::tls::test_util::generate_test_cert("a.test")
+        else {
+            return; // openssl unavailable
+        };
+        let cert = crate::config::CertificateRef {
+            name: "a".to_string(),
+            cert_pem: Some(cert_pem),
+            key_pem: Some(key_pem),
+            ..Default::default()
+        };
+        let server_cfg =
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\n\r\nall of it").await;
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let engine = tokio::spawn(async move {
+            let (tcp, peer) = front.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let state = conn_state(routes(addr), true);
+            handle_connection(Connection::Tls { inner: tls }, peer, state).await
+        });
+
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        let tcp = TcpStream::connect(front_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("a.test").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
+            .connect(sni, tcp)
+            .await
+            .unwrap();
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out))
+            .await
+            .expect("engine never closed the connection");
+        let out = String::from_utf8_lossy(&out);
+        assert!(read.is_ok(), "{read:?} after {out:?}");
+        assert!(out.ends_with("Connection: close\r\n\r\nall of it"), "{out}");
+        engine.await.unwrap().unwrap();
     }
 
     #[tokio::test]
