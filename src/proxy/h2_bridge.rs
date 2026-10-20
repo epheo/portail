@@ -28,7 +28,7 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
-use crate::proxy::http_parser::find_header_end;
+use crate::proxy::http_parser::{find_header_end, trim_ows};
 use crate::proxy::tls::Connection;
 use crate::proxy::worker::{self, progress, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
@@ -477,17 +477,6 @@ fn build_h2_response(
     builder
         .body(())
         .map_err(|e| anyhow!("h2 response build: {}", e))
-}
-
-/// Strip leading and trailing optional whitespace (SP / HTAB) from a value.
-fn trim_ows(mut v: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t', rest @ ..] = v {
-        v = rest;
-    }
-    while let [rest @ .., b' ' | b'\t'] = v {
-        v = rest;
-    }
-    v
 }
 
 /// Response headers that must not cross to the h2 side: the shared hop-by-hop

@@ -161,6 +161,24 @@ fn is(b: u8, class: u8) -> bool {
     CLASS[b as usize] & class != 0
 }
 
+/// RFC 9110 5.6.2 token: what a field name or a method must be.
+pub(crate) fn is_token(s: &[u8]) -> bool {
+    !s.is_empty() && s.iter().all(|&b| is(b, TCHAR))
+}
+
+/// RFC 9110 5.5: any byte but a CTL other than HTAB. obs-text (0x80-0xFF)
+/// passes, which is what lets UTF-8 values through.
+#[inline(always)]
+pub(crate) fn is_field_value_byte(b: u8) -> bool {
+    is(b, VALUE)
+}
+
+/// A byte this parser accepts in a request-target; see `TARGET_HOLES`.
+#[inline(always)]
+pub(crate) fn is_target_byte(b: u8) -> bool {
+    is(b, TARGET)
+}
+
 const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
 const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
 
@@ -194,8 +212,9 @@ fn scan<const N: usize>(
     pos
 }
 
+/// Strip RFC 9110 5.6.3 OWS (SP and HTAB only) from both ends.
 #[inline(always)]
-fn trim_ows(mut v: &[u8]) -> &[u8] {
+pub(crate) fn trim_ows(mut v: &[u8]) -> &[u8] {
     while let [b' ' | b'\t', rest @ ..] = v {
         v = rest;
     }
@@ -584,5 +603,25 @@ mod tests {
         }
         check(VALUE, 0x20, VALUE_HOLES);
         check(TARGET, 0x21, TARGET_HOLES);
+    }
+
+    /// The config validator, the chunked observer and the h2 bridge judge
+    /// bytes through these, so they must spell exactly the RFC alphabets.
+    #[test]
+    fn shared_predicates_follow_the_rfc_alphabets() {
+        for b in 0..=255u8 {
+            let tchar = b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+            let ctl = b < 0x20 || b == 0x7f;
+            assert_eq!(is_token(&[b]), tchar, "{b:#04x}");
+            assert_eq!(is_field_value_byte(b), !ctl || b == b'\t', "{b:#04x}");
+            let target = !ctl && !b" #\\".contains(&b);
+            assert_eq!(is_target_byte(b), target, "{b:#04x}");
+        }
+        assert!(is_token(b"Content-Type"));
+        assert!(!is_token(b""));
+        assert!(!is_token(b"Content Type"));
+        assert_eq!(trim_ows(b" \t a \t b \t "), b"a \t b");
+        assert_eq!(trim_ows(b" \t "), b"");
+        assert_eq!(trim_ows(b"\x0ba\r"), b"\x0ba\r");
     }
 }
