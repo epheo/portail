@@ -28,7 +28,9 @@ pub const MAX_STRIP_SPANS: usize = 8;
 /// Byte spans (start..end, CRLF inclusive) of hop-by-hop header lines,
 /// recorded during the parser's existing single pass so forwarding can skip
 /// them by bulk gap-copy — no second scan, no allocation. Overflow or
-/// Connection-nominated extra headers divert to the thorough slow path.
+/// Connection-nominated extra headers divert to the thorough slow path,
+/// which strips by `is_hop_by_hop_request_header`: a name stripped here but
+/// missing there reaches the backend whenever a client forces that path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StripSpans {
     spans: [(u32, u32); MAX_STRIP_SPANS],
@@ -93,7 +95,9 @@ pub struct HttpRequestInfo<'a> {
     ///
     /// The caller MUST reject such requests with `400` and close.
     pub header_violation: bool,
-    /// Hop-by-hop header lines to strip when forwarding (RFC 7230 §6.1).
+    /// Header lines to strip when forwarding: hop-by-hop ones (RFC 7230
+    /// 6.1) and the client's Forwarded / X-Forwarded-* claims, bar
+    /// X-Forwarded-For.
     pub strip_spans: StripSpans,
     /// Span of the Upgrade header line; kept only for real upgrade requests.
     pub upgrade_span: Option<(u32, u32)>,
@@ -484,9 +488,23 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
             (14, b'h') if name.eq_ignore_ascii_case(b"http2-settings") => {
                 line_kind = LineKind::Strip;
             }
-            // The proxy appends its own; a client copy ahead of it could make
-            // a plaintext request look like TLS to the backend.
+            // The proxy appends its own X-Forwarded-Proto and sets none of the
+            // others: a client's word on the scheme, host or port it used
+            // would reach the backend as if the proxy vouched for it.
+            (9, b'f') if name.eq_ignore_ascii_case(b"forwarded") => line_kind = LineKind::Strip,
+            (15, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-ssl") => {
+                line_kind = LineKind::Strip;
+            }
+            (16, b'x')
+                if name.eq_ignore_ascii_case(b"x-forwarded-host")
+                    || name.eq_ignore_ascii_case(b"x-forwarded-port") =>
+            {
+                line_kind = LineKind::Strip;
+            }
             (17, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-proto") => {
+                line_kind = LineKind::Strip;
+            }
+            (18, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-scheme") => {
                 line_kind = LineKind::Strip;
             }
             _ => {}

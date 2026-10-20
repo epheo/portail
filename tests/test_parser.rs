@@ -748,6 +748,33 @@ fn client_x_forwarded_proto_is_stripped() {
 }
 
 #[test]
+fn client_forwarding_claims_are_stripped() {
+    let req = b"GET / HTTP/1.1\r\nHost: h\r\n\
+        Forwarded: for=192.0.2.1;proto=https;host=evil.example\r\n\
+        X-Forwarded-Host: evil.example\r\n\
+        x-forwarded-port: 443\r\n\
+        X-FORWARDED-SSL: on\r\n\
+        X-Forwarded-Scheme: https\r\n\
+        X-Forwarded-For: 192.0.2.1\r\n\
+        X-Forwarded: x\r\n\
+        X-Forwarded-Hosts: x\r\n\
+        Forwarded-For: x\r\n\r\n";
+    let info = accepted(req);
+    assert!(!info.strip_spans.needs_slow_path);
+    // X-Forwarded-For stays: the proxy appends its own line after it.
+    assert_eq!(
+        stripped(req, &info),
+        [
+            &b"Forwarded: for=192.0.2.1;proto=https;host=evil.example\r\n"[..],
+            b"X-Forwarded-Host: evil.example\r\n",
+            b"x-forwarded-port: 443\r\n",
+            b"X-FORWARDED-SSL: on\r\n",
+            b"X-Forwarded-Scheme: https\r\n",
+        ]
+    );
+}
+
+#[test]
 fn value_edge_cases_are_accepted() {
     let req = b"GET / HTTP/1.1\r\nHost: example.com \t\r\nX-Tab: a\tb\r\nX-Obs: caf\xc3\xa9 \x80\xff\r\nX-Empty:\r\nX-Blank:  \t \r\nX-Long: 0123456789abcdef0123456789abcdef\t0123456789abcdef\r\n\r\n";
     let info = accepted(req);
