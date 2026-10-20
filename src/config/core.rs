@@ -478,6 +478,7 @@ fn build_rule_components(
         }
     }
 
+    super::wire::check_rule_filters(&rule.filters)?;
     let filters = convert_filters(&rule.filters)?;
     Ok((backends, filters))
 }
@@ -615,6 +616,10 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
     type Error = anyhow::Error;
 
     fn try_from(f: &HttpRouteFilter) -> Result<Self> {
+        // The table build is the one funnel every config path shares, and
+        // not every caller runs validate() first (the reconciler, DNS
+        // refresh): this keeps CR/LF off the wire even if one forgets.
+        super::wire::check_filter(f)?;
         Ok(match f {
             HttpRouteFilter::RequestHeaderModifier { config } => Self::RequestHeaderModifier {
                 add: std::sync::Arc::new(config.add.clone()),
@@ -1030,6 +1035,35 @@ mod tests {
         assert_eq!(rule.filters.len(), 1);
         assert!(
             matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com")
+        );
+    }
+
+    /// Callers that skip validate() (reconciler, DNS refresh) still cannot
+    /// build a table whose filters would write CR/LF.
+    #[test]
+    fn test_route_table_build_rejects_injectable_filter() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
+            },
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001, "filters": [
+                        {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"set": [{"name": "X-A", "value": "a\r\nSet-Cookie: s=1"}]}}
+                    ]}]
+                }]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let err = config.to_route_table().unwrap_err().to_string();
+        assert!(
+            err.contains("ResponseHeaderModifier set[0].value"),
+            "{}",
+            err
         );
     }
 

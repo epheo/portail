@@ -1682,6 +1682,334 @@ fn test_mirror_to_unknown_service_dropped() {
     assert_eq!(ra.refs_reason, "BackendNotFound");
 }
 
+// ---- Filter values spliced into HTTP/1 bytes ----
+
+fn route_with_filters(
+    name: &str,
+    filters: Vec<HTTPRouteRulesFilters>,
+    backend_filters: Vec<HTTPRouteRulesBackendRefsFilters>,
+) -> HTTPRoute {
+    HTTPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: HTTPRouteSpec {
+            parent_refs: Some(vec![HTTPRouteParentRefs {
+                name: "test-gw".to_string(),
+                ..Default::default()
+            }]),
+            hostnames: Some(vec!["api.example.com".to_string()]),
+            rules: Some(vec![HTTPRouteRules {
+                filters: Some(filters),
+                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                    name: "svc".to_string(),
+                    port: Some(80),
+                    filters: Some(backend_filters),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+        },
+        status: None,
+    }
+}
+
+fn reconcile_http(routes: Vec<HTTPRoute>) -> ReconcileResult {
+    reconcile_to_config(
+        &test_gateway(),
+        &test_snapshot(routes, vec![], vec![], vec![], &default_ns_labels(), vec![]),
+        &HashMap::new(),
+        &empty_services(),
+    )
+    .unwrap()
+}
+
+/// The CRD patterns header names but not values, and nothing on this path
+/// runs `PortailConfig::validate()`: a CRLF value used to reach the backend
+/// as an injected header. The route must stay out of the data plane and
+/// say why in status, while its siblings keep serving.
+#[test]
+fn test_crlf_header_value_keeps_route_out_and_reports_it() {
+    let crlf_set = HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+            set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                name: "X-Tenant".to_string(),
+                value: "a\r\nX-Injected: 1".to_string(),
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = reconcile_http(vec![
+        route_with_filters("crlf-route", vec![crlf_set], vec![]),
+        test_http_route(),
+    ]);
+
+    assert_eq!(result.config.http_routes.len(), 1, "only the sibling");
+    assert!(result.config.http_routes[0].rules[0].filters.is_empty());
+
+    let ra = result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == "crlf-route")
+        .unwrap();
+    assert!(!ra.accepted);
+    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert!(
+        ra.message.contains(
+            "rule 0: filter 0: RequestHeaderModifier set[0].value (header \"X-Tenant\"): control character 0x0d"
+        ),
+        "{}",
+        ra.message
+    );
+    assert!(!ra.message.contains("X-Injected"), "{}", ra.message);
+    assert!(ra.listener_names.is_empty());
+
+    let sibling = result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == "test-route")
+        .unwrap();
+    assert!(sibling.accepted);
+}
+
+#[test]
+fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
+    let response_add_lf = HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::ResponseHeaderModifier,
+        response_header_modifier: Some(HTTPRouteRulesFiltersResponseHeaderModifier {
+            add: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierAdd {
+                name: "X-A".to_string(),
+                value: "a\nSet-Cookie: s=1".to_string(),
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let remove_crlf = HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+            remove: Some(vec!["X-A\r\nX-B".to_string()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let redirect = |hostname: Option<&str>, full_path: Option<&str>| HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::RequestRedirect,
+        request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+            hostname: hostname.map(str::to_string),
+            path: full_path.map(|p| HTTPRouteRulesFiltersRequestRedirectPath {
+                r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
+                replace_full_path: Some(p.to_string()),
+                replace_prefix_match: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let rewrite = |hostname: Option<&str>, prefix: Option<&str>| HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::UrlRewrite,
+        url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: hostname.map(str::to_string),
+            path: prefix.map(|p| HTTPRouteRulesFiltersUrlRewritePath {
+                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                replace_prefix_match: Some(p.to_string()),
+                replace_full_path: None,
+            }),
+        }),
+        ..Default::default()
+    };
+
+    let cases = [
+        (response_add_lf, "ResponseHeaderModifier add[0].value"),
+        (remove_crlf, "RequestHeaderModifier remove[0]"),
+        (
+            redirect(Some("evil.com\r\nSet-Cookie: s=1"), None),
+            "RequestRedirect hostname",
+        ),
+        (
+            redirect(None, Some("/a\r\nSet-Cookie: s=1")),
+            "RequestRedirect path.replaceFullPath",
+        ),
+        (rewrite(Some("a b"), None), "URLRewrite hostname"),
+        (
+            rewrite(None, Some("/x HTTP/1.1\r\n\r\nGET /admin")),
+            "URLRewrite path.replacePrefixMatch",
+        ),
+    ];
+    for (filter, field) in cases {
+        let result = reconcile_http(vec![route_with_filters("inj", vec![filter], vec![])]);
+        assert!(result.config.http_routes.is_empty(), "{field}");
+        let ra = &result.route_status[0];
+        assert!(!ra.accepted, "{field}");
+        assert!(
+            ra.message.contains(&format!("rule 0: filter 0: {field}")),
+            "{}",
+            ra.message
+        );
+    }
+}
+
+fn backend_set_header(value: &str) -> HTTPRouteRulesBackendRefsFilters {
+    HTTPRouteRulesBackendRefsFilters {
+        r#type: HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+            set: Some(vec![
+                HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                    name: "X-Backend".to_string(),
+                    value: value.to_string(),
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_backend_ref_header_modifier_values_are_checked() {
+    let result = reconcile_http(vec![route_with_filters(
+        "backend-hdr",
+        vec![],
+        vec![backend_set_header("v1")],
+    )]);
+    assert!(result.route_status[0].accepted);
+    let backend = &result.config.http_routes[0].rules[0].backend_refs[0];
+    assert!(matches!(
+        &backend.filters[..],
+        [HttpRouteFilter::RequestHeaderModifier { config }] if config.set[0].value == "v1"
+    ));
+
+    let result = reconcile_http(vec![route_with_filters(
+        "backend-crlf",
+        vec![],
+        vec![backend_set_header("v1\r\nX-Injected: 1")],
+    )]);
+    assert!(result.config.http_routes.is_empty());
+    let ra = &result.route_status[0];
+    assert!(!ra.accepted);
+    assert!(
+        ra.message
+            .contains("rule 0: backendRef 0: filter 0: RequestHeaderModifier set[0].value"),
+        "{}",
+        ra.message
+    );
+}
+
+/// Backend-level filters other than header modifiers used to be dropped
+/// silently: the data plane never runs them, so the route served without.
+#[test]
+fn test_unsupported_backend_ref_filter_rejects_route() {
+    let redirect = HTTPRouteRulesBackendRefsFilters {
+        r#type: HTTPRouteRulesBackendRefsFiltersType::RequestRedirect,
+        request_redirect: Some(HTTPRouteRulesBackendRefsFiltersRequestRedirect {
+            hostname: Some("example.org".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = reconcile_http(vec![route_with_filters(
+        "backend-redirect",
+        vec![],
+        vec![redirect],
+    )]);
+    assert!(result.config.http_routes.is_empty());
+    let ra = &result.route_status[0];
+    assert!(!ra.accepted);
+    assert!(
+        ra.message.contains(
+            "rule 0: backendRef 0: filter 0: RequestRedirect is not supported on a backendRef"
+        ),
+        "{}",
+        ra.message
+    );
+}
+
+fn request_header_modifier(set: Vec<(&str, &str)>, remove: Vec<&str>) -> HTTPRouteRulesFilters {
+    HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+            set: Some(
+                set.into_iter()
+                    .map(
+                        |(name, value)| HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                            name: name.to_string(),
+                            value: value.to_string(),
+                        },
+                    )
+                    .collect(),
+            ),
+            remove: Some(remove.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The proxy relays the body by the client's framing: with Content-Length
+/// removed the backend reads the body as the next request on its connection.
+#[test]
+fn test_removing_content_length_rejects_route() {
+    let result = reconcile_http(vec![route_with_filters(
+        "strip-cl",
+        vec![request_header_modifier(vec![], vec!["Content-Length"])],
+        vec![],
+    )]);
+    assert!(result.config.http_routes.is_empty());
+    let ra = &result.route_status[0];
+    assert!(!ra.accepted);
+    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert!(
+        ra.message.contains(
+            "rule 0: filter 0: RequestHeaderModifier remove[0]: \"Content-Length\": framing header is owned by the proxy"
+        ),
+        "{}",
+        ra.message
+    );
+}
+
+#[test]
+fn test_set_host_converts_unless_url_rewrite_also_sets_it() {
+    let set_host = || request_header_modifier(vec![("Host", "internal.example.com")], vec![]);
+    let result = reconcile_http(vec![route_with_filters(
+        "set-host",
+        vec![set_host()],
+        vec![],
+    )]);
+    assert!(result.route_status[0].accepted);
+    assert!(matches!(
+        &result.config.http_routes[0].rules[0].filters[..],
+        [HttpRouteFilter::RequestHeaderModifier { config }]
+            if config.set[0].name == "Host" && config.set[0].value == "internal.example.com"
+    ));
+
+    let rewrite_host = HTTPRouteRulesFilters {
+        r#type: HTTPRouteRulesFiltersType::UrlRewrite,
+        url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: Some("other.example.com".to_string()),
+            path: None,
+        }),
+        ..Default::default()
+    };
+    let result = reconcile_http(vec![route_with_filters(
+        "two-hosts",
+        vec![set_host(), rewrite_host],
+        vec![],
+    )]);
+    assert!(result.config.http_routes.is_empty());
+    let ra = &result.route_status[0];
+    assert!(!ra.accepted);
+    assert!(
+        ra.message
+            .contains("rule 0: URLRewrite hostname and RequestHeaderModifier set \"Host\""),
+        "{}",
+        ra.message
+    );
+}
+
 // ---- Timeouts ----
 
 #[test]
