@@ -25,13 +25,14 @@ use crate::proxy::http_filters::{
 };
 use crate::proxy::http_parser::find_header_end;
 use crate::proxy::request_processor::{
-    analyze_request, is_http_request, RequestMeta, RoutingResult,
+    analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
 /// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
+/// Returns 0 when the client closes first.
 async fn read_remaining_headers(
     client: &mut Connection,
     buf: &mut [u8],
@@ -39,16 +40,19 @@ async fn read_remaining_headers(
 ) -> Result<usize> {
     let mut total = already_read;
     loop {
+        if total >= buf.len() {
+            return Err(anyhow::anyhow!("Request headers exceed buffer size"));
+        }
         let n = client.read(&mut buf[total..]).await?;
         if n == 0 {
-            return Ok(total); // Client closed mid-headers — use what we have
+            // Never parse a truncated head: the proxy's own headers would be
+            // appended to its unterminated last line, which could hide them
+            // (e.g. inside a client header's value).
+            return Ok(0);
         }
         total += n;
         if find_header_end(&buf[..total]).is_some() {
             return Ok(total);
-        }
-        if total >= buf.len() {
-            return Err(anyhow::anyhow!("Request headers exceed buffer size"));
         }
     }
 }
@@ -448,20 +452,15 @@ pub(crate) async fn handle_connection(
     let mut buf = vec![0u8; 65536];
 
     let mut n = client.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
     if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
         n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
     }
-
-    // Bytes read past a request's body (a pipelined next request) are carried
-    // over here and replayed as the next iteration's input instead of being
-    // sent to the backend or lost.
-    let mut pending: Option<Vec<u8>> = None;
+    if n == 0 {
+        return Ok(());
+    }
 
     loop {
         // Loop top = this request's bytes are in buf (initial read or the
@@ -486,7 +485,10 @@ pub(crate) async fn handle_connection(
             state.is_tls,
         )?;
 
-        match result {
+        // Bytes read past this request (a pipelined next request) are carried
+        // over and replayed as the next iteration's input instead of being
+        // sent to the backend or lost.
+        let pending: Option<Vec<u8>> = match result {
             RoutingResult::TcpForward { backend_addr } => {
                 return handle_tcp_connection(
                     client,
@@ -515,22 +517,16 @@ pub(crate) async fn handle_connection(
                     crate::metrics::METRICS.rate_limited_total.inc();
                     state.listener_stats.rate_limited.inc();
                     state.last_status = 429;
-                    // Reuse the connection only when nothing else is in
-                    // flight on it: no request body to drain, no pipelined
-                    // bytes past the headers, and the client asked for
-                    // keep-alive (the h2 bridge injects `connection: close`,
-                    // so h2 streams always take the close path).
-                    let reusable = meta.keepalive
-                        && !meta.is_upgrade
-                        && !meta.is_chunked
-                        && meta.content_length.unwrap_or(0) == 0
-                        && find_header_end(&buf[..n]) == Some(n);
-                    send_rate_limit_response(&mut client, reusable).await?;
-                    crate::access_log::emit(access, 429, None);
-                    if !reusable {
+                    let reply = LocalReply {
+                        status: 429,
+                        location: None,
+                        reusable: meta.local_reply_reusable,
+                        head: meta.is_head,
+                    };
+                    if !send_local_reply(&mut client, &reply, access).await? {
                         return Ok(());
                     }
-                    // Falls through to the shared keepalive read below.
+                    pipelined_tail(&buf[..n])
                 } else {
                     // proxy_http_request owns all timing for the request lifecycle —
                     // backend_request_timeout (connect + TTFB) and request_timeout
@@ -553,40 +549,25 @@ pub(crate) async fn handle_connection(
                     if !ka || !meta.keepalive {
                         return Ok(());
                     }
-                    pending = leftover;
+                    leftover
                 }
             }
-            RoutingResult::HttpRedirect {
-                status_code,
-                location,
-                keepalive,
-            } => {
-                send_redirect_response(&mut client, status_code, &location).await?;
-                crate::access_log::emit(access, status_code, None);
-                if !keepalive {
+            RoutingResult::LocalReply(reply) => {
+                if !send_local_reply(&mut client, &reply, access).await? {
                     return Ok(());
                 }
-            }
-            RoutingResult::SendHttpError {
-                error_code,
-                close_connection,
-            } => {
-                send_error_response(&mut client, error_code).await?;
-                crate::access_log::emit(access, error_code, None);
-                if close_connection {
-                    return Ok(());
-                }
+                pipelined_tail(&buf[..n])
             }
             RoutingResult::UdpForward { .. } | RoutingResult::CloseConnection => {
                 return Ok(());
             }
-        }
+        };
 
         // Explicitly drop the route table guard before reading the next request.
         // This allows old route tables to be freed between keepalive iterations.
         drop(route_table);
 
-        if let Some(bytes) = pending.take() {
+        if let Some(bytes) = pending {
             // Replay pipelined bytes as the start of the next request. They
             // came out of `buf` via a single read, so they always fit.
             buf[..bytes.len()].copy_from_slice(&bytes);
@@ -607,7 +588,8 @@ pub(crate) async fn handle_connection(
 /// budget. The budget starts once a request's first bytes have arrived — the
 /// idle wait between keepalive requests is intentionally unbounded. Sends
 /// `431` when the block outgrows the buffer and `408` when the client is too
-/// slow, then errors out to close the connection.
+/// slow, then errors out to close the connection. Returns 0 when the client
+/// closed before the head ended: nothing is forwarded or answered.
 async fn complete_headers(
     client: &mut Connection,
     buf: &mut [u8],
@@ -674,6 +656,40 @@ async fn proxy_http_request(
     // keepalive response's status to the access log.
     state.last_status = 0;
 
+    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
+
+    // Determine where THIS request ends within the bytes already read, from
+    // its own framing, upgrade or not. Bytes past that boundary must never
+    // reach the backend as body (a desync/smuggling vector: the backend
+    // would parse them as a second request and answer it, poisoning the
+    // pooled connection). They are held back as `leftover`: the next
+    // pipelined request for the keepalive loop, or early tunnel bytes once
+    // the backend accepts an upgrade. Settled before connecting, so a
+    // malformed body costs no backend connection.
+    let tail_len = request_bytes - req_header_end;
+    let (request_end, req_chunked) = if let Some(cl) = meta.content_length {
+        (req_header_end + tail_len.min(cl), None)
+    } else if meta.is_chunked {
+        let mut stream = ChunkedStream::new();
+        let consumed = stream.observe(&buf[req_header_end..request_bytes]);
+        if stream.is_broken() {
+            state.last_status = 400;
+            send_error_response(client, 400).await?;
+            return Ok((false, None));
+        }
+        (req_header_end + consumed, Some(stream))
+    } else {
+        // No declared body: the entire tail is the next pipelined request.
+        (req_header_end, None)
+    };
+    // Capture the held tail now: the response phase reuses `buf` as scratch
+    // for backend reads and would overwrite it.
+    let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
+        Some(buf[request_end..request_bytes].to_vec())
+    } else {
+        None
+    };
+
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (backend, from_pool) =
         match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
@@ -681,36 +697,6 @@ async fn proxy_http_request(
             Some(b) => b,
             None => return Ok((false, None)),
         };
-
-    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-
-    // Determine where THIS request ends within the bytes already read. Bytes
-    // past that boundary are a pipelined next request: they must never reach
-    // the backend as body (a desync/smuggling vector — the backend would
-    // parse them as a second request and answer it, poisoning the pooled
-    // connection), and are instead handed back to the keepalive loop.
-    // Upgrade requests are exempt: after the 101 the connection is a raw
-    // tunnel and the tail belongs to it.
-    let tail_len = request_bytes - req_header_end;
-    let (request_end, req_chunked) = if meta.is_upgrade {
-        (request_bytes, None)
-    } else if let Some(cl) = meta.content_length {
-        (req_header_end + tail_len.min(cl), None)
-    } else if meta.is_chunked {
-        let mut stream = ChunkedStream::new();
-        let consumed = stream.observe(&buf[req_header_end..request_bytes]);
-        (req_header_end + consumed, Some(stream))
-    } else {
-        // No declared body: the entire tail is the next pipelined request.
-        (req_header_end, None)
-    };
-    // Capture the pipelined tail now — the response phase reuses `buf` as
-    // scratch for backend reads and would overwrite it.
-    let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
-        Some(buf[request_end..request_bytes].to_vec())
-    } else {
-        None
-    };
 
     let has_mirrors = rule
         .filters
@@ -856,8 +842,15 @@ async fn proxy_http_request(
     // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
     // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP
     // framing — tunneling it would let the client's next requests bypass
-    // routing, filters, and timeouts entirely.
+    // routing, filters, and timeouts entirely. Only now do the held bytes
+    // become tunnel payload, ahead of anything the tunnel copies; on a
+    // refusal they are returned below as the next request instead.
     if meta.is_upgrade && framing.status == 101 {
+        if let Some(held) = leftover.take() {
+            if backend.write_all(&held).await.is_err() || backend.flush().await.is_err() {
+                return Ok((false, None));
+            }
+        }
         client.flush().await?;
         let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
         return Ok((false, None));
@@ -977,9 +970,9 @@ async fn proxy_http_request(
 /// `Content-Length` with no body, so the declared framing is no signal. Reusing
 /// such a conn would bleed leftover body bytes into the next request's response;
 /// HEAD is rare and bodyless, so dropping the conn instead costs almost nothing.
-/// A refused upgrade is likewise never pooled: the client may have sent
-/// speculative tunnel bytes with the request (forwarded as-is, exempt from
-/// body framing), which the backend would parse as a next request.
+/// A refused upgrade is likewise never pooled: a backend may have detached
+/// the socket from its HTTP parser on seeing the upgrade request (Node's
+/// 'upgrade' event), so a refusal does not prove it still reads HTTP.
 fn backend_conn_poolable(framing_clean: bool, is_head: bool, was_upgrade: bool) -> bool {
     framing_clean && !is_head && !was_upgrade
 }
@@ -1893,79 +1886,385 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-async fn send_redirect_response(
+/// Answer a request the proxy handles itself (redirect, 404, 429, 500, 503)
+/// and access-log it. Returns whether the connection stays open; the reply
+/// announces `Connection: close` exactly when it does not. Staying open
+/// matters most for 429: a throttled client's next request would otherwise
+/// cost a fresh TLS handshake, more of our CPU than the refused request.
+async fn send_local_reply(
     client: &mut Connection,
-    status_code: u16,
-    location: &str,
-) -> Result<()> {
-    use std::io::Write;
-
-    let status_text = match status_code {
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        _ => "Found",
-    };
-
-    // Pre-compute body once, then build the entire response in one write! call
-    // into a stack-estimated Vec. Avoids two separate format! heap allocations.
-    let mut resp = Vec::with_capacity(128 + location.len());
-    let _ = write!(
-        resp,
-        "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: {}\r\n\r\n{} {}",
-        status_code,
-        status_text,
-        location,
-        // body length: digits of status_code (always 3) + 1 space + status_text length
-        3 + 1 + status_text.len(),
-        status_code,
-        status_text,
-    );
-
-    client.write_all(&resp).await?;
-    Ok(())
+    reply: &LocalReply,
+    access: Option<Box<crate::access_log::AccessCapture>>,
+) -> Result<bool> {
+    let location = reply.location.as_deref();
+    let bytes = local_reply_bytes(reply.status, location, !reply.reusable, reply.head);
+    client.write_all(&bytes).await?;
+    client.flush().await?;
+    crate::access_log::emit(access, reply.status, None);
+    Ok(reply.reusable)
 }
 
-/// 429, split from `send_error_response`: the one engine-answered error that
-/// deliberately keeps the connection open when it safely can. Closing would
-/// make the throttled client's next request cost a fresh TLS handshake —
-/// more of OUR cpu than the request being refused, defeating the limiter's
-/// purpose under a sustained crawl.
-async fn send_rate_limit_response(client: &mut Connection, keepalive: bool) -> Result<()> {
-    static RESP: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 21\r\n\r\n429 Too Many Requests";
-    static RESP_CLOSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 21\r\nConnection: close\r\n\r\n429 Too Many Requests";
+/// Bytes past a bodyless request's head: the next pipelined request, which
+/// the keepalive loop replays after a local reply.
+fn pipelined_tail(request: &[u8]) -> Option<Vec<u8>> {
+    let head_end = find_header_end(request)?;
+    (head_end < request.len()).then(|| request[head_end..].to_vec())
+}
+
+/// Error reply after which the connection always closes (400, 408, 431,
+/// 502, 504): what remains of the request on the wire is unknown or unread.
+async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
     client
-        .write_all(if keepalive { RESP } else { RESP_CLOSE })
+        .write_all(&local_reply_bytes(error_code, None, true, false))
         .await?;
     Ok(())
 }
 
-async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
-    static RESP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\nConnection: close\r\n\r\n400 Bad Request";
-    static RESP_404: &[u8] =
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
-    static RESP_408: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n408 Request Timeout";
-    static RESP_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 35\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
-    static RESP_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
-    static RESP_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable";
-    static RESP_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\nConnection: close\r\n\r\n504 Gateway Timeout";
-    static RESP_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 25\r\nConnection: close\r\n\r\n500 Internal Server Error";
+/// Serialize a response the proxy writes itself; the body repeats the
+/// status line ("404 Not Found") and is left out for HEAD.
+fn local_reply_bytes(status: u16, location: Option<&str>, close: bool, head: bool) -> Vec<u8> {
+    use std::io::Write;
 
-    let response = match error_code {
-        400 => RESP_400,
-        404 => RESP_404,
-        408 => RESP_408,
-        431 => RESP_431,
-        502 => RESP_502,
-        503 => RESP_503,
-        504 => RESP_504,
-        _ => RESP_500,
+    let (status, reason) = match status {
+        301 => (301, "Moved Permanently"),
+        302 => (302, "Found"),
+        303 => (303, "See Other"),
+        307 => (307, "Temporary Redirect"),
+        308 => (308, "Permanent Redirect"),
+        400 => (400, "Bad Request"),
+        404 => (404, "Not Found"),
+        408 => (408, "Request Timeout"),
+        429 => (429, "Too Many Requests"),
+        431 => (431, "Request Header Fields Too Large"),
+        502 => (502, "Bad Gateway"),
+        503 => (503, "Service Unavailable"),
+        504 => (504, "Gateway Timeout"),
+        other if location.is_some() => (other, "Found"),
+        _ => (500, "Internal Server Error"),
     };
+    let body = format!("{} {}", status, reason);
+    let mut resp = Vec::with_capacity(128 + location.map_or(0, str::len));
+    let _ = write!(resp, "HTTP/1.1 {} {}\r\n", status, reason);
+    if let Some(location) = location {
+        let _ = write!(resp, "Location: {}\r\n", location);
+    }
+    if status == 429 {
+        resp.extend_from_slice(b"Retry-After: 1\r\n");
+    }
+    let _ = write!(resp, "Content-Length: {}\r\n", body.len());
+    if close {
+        resp.extend_from_slice(b"Connection: close\r\n");
+    }
+    resp.extend_from_slice(b"\r\n");
+    if !head {
+        resp.extend_from_slice(body.as_bytes());
+    }
+    resp
+}
 
-    client.write_all(response).await?;
-    Ok(())
+/// One client connection driven through `handle_connection` over an
+/// in-memory duplex, against real loopback backends.
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::routing::{Backend, PathMatchType};
+    use tokio::io::DuplexStream;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    const REFUSED: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno";
+    const SWITCHED: &[u8] =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const UPGRADE: &[u8] =
+        b"GET /ws HTTP/1.1\r\nHost: a.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+    /// Backend answering the first request head of each connection with
+    /// `reply`; yields all bytes a connection delivered once it closes.
+    async fn backend(reply: &'static [u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (mut seen, mut chunk, mut replied) = (Vec::new(), [0u8; 4096], false);
+                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
+                        seen.extend_from_slice(&chunk[..n]);
+                        if !replied && find_header_end(&seen).is_some() {
+                            replied = true;
+                            if sock.write_all(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tx.send(seen);
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    /// a.test proxies to `backend`; r.test redirects to https.
+    fn routes(backend: SocketAddr) -> RouteTable {
+        let rule = |filters, backends| {
+            HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                filters,
+                backends,
+            )
+        };
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "a.test",
+            rule(
+                vec![],
+                vec![Backend {
+                    socket_addr: backend,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                }],
+            ),
+        );
+        rt.add_http_route(
+            "r.test",
+            rule(
+                vec![HttpFilter::RequestRedirect {
+                    scheme: Some("https".to_string()),
+                    hostname: None,
+                    port: None,
+                    path: None,
+                    status_code: 301,
+                }],
+                vec![],
+            ),
+        );
+        rt
+    }
+
+    fn serve(rt: RouteTable) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        // The pool's TLS client config needs one, even for plain backends.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        let state = ConnectionState::new(
+            8080,
+            Arc::new(ArcSwap::from_pointee(rt)),
+            make_pool(&None, &cfg),
+            Arc::new(BackendSelector::new()),
+            Arc::new(HealthRegistry::new()),
+            false,
+            "127.0.0.1".parse().unwrap(),
+            &cfg,
+            Arc::new(ListenerStats::default()),
+        );
+        let (client, engine) = tokio::io::duplex(64 * 1024);
+        let peer = "127.0.0.1:40000".parse().unwrap();
+        let task = tokio::spawn(handle_connection(
+            Connection::Mem { inner: engine },
+            peer,
+            state,
+        ));
+        (client, task)
+    }
+
+    /// Send `input`, half-close, and collect everything until the engine
+    /// closes the connection.
+    async fn exchange(client: &mut DuplexStream, input: &[u8]) -> String {
+        client.write_all(input).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("engine never closed the connection")
+            .unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    async fn delivered(rx: &mut UnboundedReceiver<Vec<u8>>) -> String {
+        let seen = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("backend connection never closed")
+            .unwrap();
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    #[tokio::test]
+    async fn refused_upgrade_routes_the_held_tail_as_a_new_request() {
+        let (addr, mut rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let mut input = UPGRADE.to_vec();
+        input.extend_from_slice(
+            b"POST /admin/delete HTTP/1.1\r\nHost: internal.only\r\nContent-Length: 0\r\n\r\n",
+        );
+        let out = exchange(&mut client, &input).await;
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        assert!(out.contains("HTTP/1.1 404 Not Found\r\n"), "{out}");
+        let seen = delivered(&mut rx).await;
+        assert!(seen.starts_with("GET /ws HTTP/1.1\r\n"), "{seen}");
+        assert!(
+            !seen.contains("admin"),
+            "held tail reached the backend: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_upgrade_sends_held_bytes_before_tunnel_data() {
+        let (addr, mut rx) = backend(SWITCHED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let mut input = UPGRADE.to_vec();
+        input.extend_from_slice(b"HELD");
+        client.write_all(&input).await.unwrap();
+        let mut head = vec![0u8; SWITCHED.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, SWITCHED);
+        let out = exchange(&mut client, b"TUNNEL").await;
+        assert!(out.is_empty(), "{out}");
+        let seen = delivered(&mut rx).await;
+        assert!(seen.starts_with("GET /ws HTTP/1.1\r\n"), "{seen}");
+        assert!(seen.ends_with("\r\n\r\nHELDTUNNEL"), "{seen}");
+    }
+
+    /// A backend nothing should reach: the test holds the listener.
+    async fn idle_backend() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    /// Call once the engine task has finished: any connect it made is
+    /// already in the accept queue.
+    async fn assert_never_connected(listener: &TcpListener) {
+        let accepted = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+        assert!(accepted.is_err(), "the proxy connected to the backend");
+    }
+
+    #[tokio::test]
+    async fn redirect_with_a_body_closes_without_reading_it() {
+        let idle = idle_backend().await;
+        let (mut client, task) = serve(routes(idle.local_addr().unwrap()));
+        client
+            .write_all(b"POST /x HTTP/1.1\r\nHost: r.test\r\nContent-Length: 40\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("connection left open after the redirect")
+            .unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.starts_with("HTTP/1.1 301 Moved Permanently\r\n"),
+            "{out}"
+        );
+        assert!(out.contains("Connection: close\r\n"), "{out}");
+        // The body, sent after the reply like a slow client's second
+        // segment, finds the connection gone instead of being parsed.
+        let body = b"GET /fromBody HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert!(client.write_all(body).await.is_err());
+        task.await.unwrap().unwrap();
+        assert_never_connected(&idle).await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_request_after_a_404_is_answered() {
+        let (addr, mut rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(
+            &mut client,
+            b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\nGET /second HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        )
+        .await;
+        let (first, second) = out.split_at(out.find("HTTP/1.1 200").expect(&out));
+        assert!(first.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+        assert!(!first.contains("Connection: close"), "{out}");
+        assert!(second.ends_with("no"), "{out}");
+        assert!(delivered(&mut rx).await.starts_with("GET /second "));
+    }
+
+    #[tokio::test]
+    async fn head_cut_short_by_eof_is_dropped() {
+        let idle = idle_backend().await;
+        let (mut client, task) = serve(routes(idle.local_addr().unwrap()));
+        let out = exchange(
+            &mut client,
+            b"GET /t HTTP/1.1\r\nHost: a.test\r\nX-Forwarded-For: 6.6.6.6\r\nX-Ignore: zz",
+        )
+        .await;
+        assert!(out.is_empty(), "{out}");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&idle).await;
+    }
+
+    #[tokio::test]
+    async fn missing_host_gets_a_400_on_the_wire() {
+        let (mut client, _task) = serve(RouteTable::new());
+        let out = exchange(&mut client, b"GET / HTTP/1.1\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
+        assert!(out.contains("Connection: close\r\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn malformed_buffered_chunked_body_gets_a_400_without_a_backend() {
+        let idle = idle_backend().await;
+        let (mut client, task) = serve(routes(idle.local_addr().unwrap()));
+        let out = exchange(
+            &mut client,
+            b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\nzz\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&idle).await;
+    }
+
+    #[tokio::test]
+    async fn local_reply_to_head_leaves_no_body_on_a_kept_connection() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(
+            &mut client,
+            b"HEAD / HTTP/1.1\r\nHost: nope.test\r\n\r\nGET / HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            out,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno"
+        );
+    }
+
+    #[test]
+    fn local_reply_announces_close_exactly_when_closing() {
+        let bytes = |status, location, close, head| {
+            String::from_utf8(local_reply_bytes(status, location, close, head)).unwrap()
+        };
+        let keep = bytes(429, None, false, false);
+        assert!(keep.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+        assert!(keep.contains("Retry-After: 1\r\n"));
+        assert!(!keep.contains("Connection:"));
+        assert!(keep.ends_with("\r\nContent-Length: 21\r\n\r\n429 Too Many Requests"));
+
+        let close = bytes(404, None, true, false);
+        assert!(close.ends_with("Connection: close\r\n\r\n404 Not Found"));
+
+        let redirect = bytes(308, Some("https://a/"), false, false);
+        assert!(redirect.contains("Location: https://a/\r\n"));
+        assert!(redirect.ends_with("\r\n\r\n308 Permanent Redirect"));
+
+        let head = bytes(301, Some("https://a/"), false, true);
+        assert!(head.ends_with("Content-Length: 21\r\n\r\n"), "{head}");
+
+        let unknown = bytes(418, None, true, false);
+        assert!(unknown.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+    }
 }
 
 // --- HTTP response parsing helpers ---
@@ -2024,8 +2323,7 @@ mod tests {
         // conn, and we can't tell that apart from a compliant Content-Length at
         // header time without blocking.
         assert!(!backend_conn_poolable(true, true, false));
-        // A refused upgrade is never pooled: speculative tunnel bytes may have
-        // been forwarded outside body framing.
+        // A refused upgrade is never pooled: the backend may have left HTTP.
         assert!(!backend_conn_poolable(true, false, true));
         // Overshoot is never pooled, HEAD or not.
         assert!(!backend_conn_poolable(false, false, false));

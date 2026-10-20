@@ -95,7 +95,13 @@ pub(crate) fn assemble_forward_headers_slow(
         if let Some(value) = header_value_if(line, b"connection") {
             for token in value.split(',') {
                 let token = token.trim();
-                if !token.is_empty() {
+                // Never honored for framing or routing headers: the proxy has
+                // already framed and routed by them, and a backend that never
+                // sees them would read the body as further requests.
+                let pinned = ["content-length", "transfer-encoding", "host"]
+                    .iter()
+                    .any(|h| token.eq_ignore_ascii_case(h));
+                if !token.is_empty() && !pinned {
                     nominated.push(token.as_bytes());
                 }
             }
@@ -123,10 +129,16 @@ pub(crate) fn assemble_forward_headers_slow(
             }
         };
         let name = &line[..name_end];
-        let is_hop = is_hop_by_hop_request_header(name)
-            || (name.eq_ignore_ascii_case(b"upgrade") && !keep_upgrade)
-            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n));
-        if !is_hop {
+        // A real upgrade nominates Upgrade in its own Connection header;
+        // stripping it as nominated would break every WebSocket that also
+        // carries an extra token or many hop-by-hop lines.
+        let strip = if name.eq_ignore_ascii_case(b"upgrade") {
+            !keep_upgrade
+        } else {
+            is_hop_by_hop_request_header(name)
+                || nominated.iter().any(|n| name.eq_ignore_ascii_case(n))
+        };
+        if !strip {
             out.extend_from_slice(line);
             out.extend_from_slice(b"\r\n");
         }
@@ -158,8 +170,26 @@ fn append_forward_headers(
 /// The proxy owns the client-side Connection header: `client_close` appends
 /// its own close announcement. The status line is copied untouched.
 pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mut Vec<u8>) {
+    let (has_te, has_cl) = copy_response_lines(raw, false, out);
+    // RFC 9112 6.3: Transfer-Encoding overrides Content-Length, and an
+    // intermediary must drop the latter before forwarding: a client that
+    // framed by it would read past this body into the next response. Rare
+    // enough to redo the copy instead of tracking line spans.
+    if has_te && has_cl {
+        copy_response_lines(raw, true, out);
+    }
+    if client_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Status line plus every end-to-end header line into `out` (cleared
+/// first). Returns whether Transfer-Encoding and Content-Length were seen.
+fn copy_response_lines(raw: &[u8], drop_content_length: bool, out: &mut Vec<u8>) -> (bool, bool) {
     out.clear();
     out.reserve(raw.len() + 24);
+    let (mut has_te, mut has_cl) = (false, false);
     let mut first = true;
     for line in header_lines(raw) {
         if first {
@@ -169,7 +199,13 @@ pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mu
             continue;
         }
         let keep = match memchr::memchr(b':', line) {
-            Some(p) => !is_hop_by_hop_response_header(&line[..p]),
+            Some(p) => {
+                let name = &line[..p];
+                let is_cl = name.eq_ignore_ascii_case(b"content-length");
+                has_cl |= is_cl;
+                has_te |= name.eq_ignore_ascii_case(b"transfer-encoding");
+                !(is_hop_by_hop_response_header(name) || (is_cl && drop_content_length))
+            }
             None => true,
         };
         if keep {
@@ -177,14 +213,17 @@ pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mu
             out.extend_from_slice(b"\r\n");
         }
     }
-    if client_close {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
+    (has_te, has_cl)
 }
 
 /// First-byte dispatch keeps the per-line cost to one comparison for the
 /// overwhelmingly common non-hop-by-hop headers.
+///
+/// Also two client headers that must never pass even though they are not
+/// hop-by-hop: X-Forwarded-Proto (the proxy appends its own; a client copy
+/// would claim TLS it never had) and HTTP2-Settings (h2c is never offered
+/// to a backend). The parser strips both via spans on the fast path; this
+/// covers the paths that re-derive the set by name.
 #[inline]
 pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
@@ -193,6 +232,8 @@ pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
         Some(b'p') => name.eq_ignore_ascii_case(b"proxy-connection"),
         Some(b't') => name.eq_ignore_ascii_case(b"te") || name.eq_ignore_ascii_case(b"trailer"),
         Some(b'e') => name.eq_ignore_ascii_case(b"expect"),
+        Some(b'h') => name.eq_ignore_ascii_case(b"http2-settings"),
+        Some(b'x') => name.eq_ignore_ascii_case(b"x-forwarded-proto"),
         _ => false,
     }
 }
@@ -637,6 +678,49 @@ mod tests {
     }
 
     #[test]
+    fn test_assemble_slow_path_keeps_upgrade_for_upgrade_requests() {
+        // An extra Connection token diverts a WebSocket to the slow path.
+        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, X-Foo\r\nX-Foo: 1\r\nSec-WebSocket-Key: k\r\n\r\n";
+        let ip = "10.1.2.3".parse().unwrap();
+        let mut out = Vec::new();
+        assemble_forward_headers_slow(req, true, ip, false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("Upgrade: websocket\r\n"), "{s}");
+        assert!(s.ends_with("Connection: upgrade\r\n\r\n"), "{s}");
+        assert_eq!(s.to_ascii_lowercase().matches("connection:").count(), 1);
+        assert!(!s.to_ascii_lowercase().contains("x-foo"), "{s}");
+        assert!(s.contains("Sec-WebSocket-Key: k\r\n"));
+
+        // Not an upgrade: the Upgrade line goes with the other nominated ones.
+        assemble_forward_headers_slow(req, false, ip, false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap().to_ascii_lowercase();
+        assert!(!s.contains("upgrade"), "{s}");
+    }
+
+    #[test]
+    fn test_assemble_slow_path_replaces_client_forwarded_proto() {
+        let req = b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto: https\r\nConnection: X-Internal\r\n\r\n";
+        let mut out = Vec::new();
+        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert_eq!(s.matches("X-Forwarded-Proto").count(), 1, "{s}");
+        assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
+    }
+
+    #[test]
+    fn test_assemble_slow_path_never_strips_framing_or_host() {
+        // Stripping Content-Length here would make the backend read the body
+        // as a second request while the proxy relays it as this one's body.
+        let req = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: keep-alive, Content-Length, HOST, Transfer-Encoding, X-Internal\r\nX-Internal: s\r\n\r\n";
+        let mut out = Vec::new();
+        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("Content-Length: 5\r\n"), "{s}");
+        assert!(s.contains("Host: h\r\n"), "{s}");
+        assert!(!s.to_ascii_lowercase().contains("x-internal"), "{s}");
+    }
+
+    #[test]
     fn test_sanitize_response_headers() {
         let resp =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nServer: x\r\n\r\n";
@@ -653,6 +737,34 @@ mod tests {
         sanitize_response_headers(resp, true, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_sanitize_response_drops_content_length_beside_transfer_encoding() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n";
+        let mut out = Vec::new();
+        sanitize_response_headers(resp, false, &mut out);
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n"
+        );
+
+        // Content-Length alone is the framing and stays.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        sanitize_response_headers(resp, false, &mut out);
+        assert!(std::str::from_utf8(&out)
+            .unwrap()
+            .contains("Content-Length: 5\r\n"));
+    }
+
+    #[test]
+    fn test_request_set_strips_forwarded_proto_and_h2c_settings() {
+        for name in ["X-Forwarded-Proto", "x-forwarded-proto", "HTTP2-Settings"] {
+            assert!(is_hop_by_hop_request_header(name.as_bytes()), "{name}");
+        }
+        for name in ["Host", "X-Forwarded-For", "Content-Length"] {
+            assert!(!is_hop_by_hop_request_header(name.as_bytes()), "{name}");
+        }
     }
 
     #[test]

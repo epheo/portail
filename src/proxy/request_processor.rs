@@ -7,9 +7,9 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 
-use crate::logging::{debug, error};
+use crate::logging::{debug, error, warn};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::http_parser::extract_routing_info;
+use crate::proxy::http_parser::{extract_routing_info, HttpRequestInfo};
 use crate::proxy::method::method_len;
 use crate::routing::{
     Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
@@ -36,6 +36,21 @@ pub struct RequestMeta {
     pub upgrade_span: Option<(u32, u32)>,
     /// Request carried `Expect: 100-continue`.
     pub expect_continue: bool,
+    /// Whether the connection may stay open if the proxy answers this
+    /// request itself (429); see `local_reply_reusable`.
+    pub local_reply_reusable: bool,
+}
+
+/// A response the proxy writes itself instead of forwarding the request.
+pub struct LocalReply {
+    pub status: u16,
+    /// Redirect target; `None` for an error status.
+    pub location: Option<String>,
+    /// Whether the connection stays open afterwards; see `local_reply_reusable`.
+    pub reusable: bool,
+    /// Answering HEAD: the reply must not carry its body, or a client on a
+    /// kept-open connection would read it as the next response.
+    pub head: bool,
 }
 
 /// Routing result that borrows from the RouteTable — zero per-request allocations.
@@ -45,22 +60,24 @@ pub enum RoutingResult<'a> {
         rule: &'a HttpRouteRule,
         meta: RequestMeta,
     },
-    HttpRedirect {
-        status_code: u16,
-        location: String,
-        keepalive: bool,
-    },
+    /// Redirect or error status, answered without a backend.
+    LocalReply(LocalReply),
     TcpForward {
         backend_addr: SocketAddr,
     },
     UdpForward {
         backend_addr: SocketAddr,
     },
-    SendHttpError {
-        error_code: u16,
-        close_connection: bool,
-    },
     CloseConnection,
+}
+
+/// Whether the connection may stay open after the proxy answers a request
+/// itself instead of forwarding it. The reply never reads the request body,
+/// so only a bodyless request qualifies: unread body bytes would be parsed
+/// as the next request. An upgrade closes too, as its client may already be
+/// streaming the new protocol.
+fn local_reply_reusable(info: &HttpRequestInfo<'_>) -> bool {
+    info.keepalive && !info.is_upgrade && !info.is_chunked && info.content_length.unwrap_or(0) == 0
 }
 
 pub fn analyze_request<'a>(
@@ -129,24 +146,40 @@ fn analyze_http_request<'a>(
     is_tls: bool,
     server_port: u16,
 ) -> Result<RoutingResult<'a>> {
-    let request_info = extract_routing_info(request_data)?;
-    let keepalive = request_info.keepalive;
-
-    // RFC 7230 §3.3.3: reject smuggling vectors at the front door — TE+CL
-    // coexistence, conflicting duplicate Content-Length values, and any
-    // Transfer-Encoding other than a lone `chunked`. Industry consensus
-    // (haproxy / envoy / nginx) is to refuse rather than try to interpret;
-    // the message ambiguity itself is the attack surface.
-    if request_info.header_violation {
-        crate::logging::warn!(
-            "Rejecting request with conflicting framing headers (TE+CL, duplicate CL, or unsupported TE) on port {}",
-            server_port
-        );
-        return Ok(RoutingResult::SendHttpError {
-            error_code: 400,
-            close_connection: true,
-        });
-    }
+    // A head the parser cannot represent, or flags as ambiguous (framing
+    // conflicts such as TE+CL, malformed lines), is refused rather than
+    // interpreted: the ambiguity itself is the smuggling surface (haproxy /
+    // envoy / nginx agree). Its framing is unknown, so the connection closes.
+    const BAD_REQUEST: RoutingResult<'static> = RoutingResult::LocalReply(LocalReply {
+        status: 400,
+        location: None,
+        reusable: false,
+        head: false,
+    });
+    let request_info = match extract_routing_info(request_data) {
+        Ok(info) if !info.header_violation => info,
+        Ok(_) => {
+            warn!("Rejecting malformed request head on port {}", server_port);
+            return Ok(BAD_REQUEST);
+        }
+        Err(e) => {
+            warn!(
+                "Rejecting unparseable request on port {}: {}",
+                server_port, e
+            );
+            return Ok(BAD_REQUEST);
+        }
+    };
+    let reusable = local_reply_reusable(&request_info);
+    let is_head = request_info.method.eq_ignore_ascii_case("HEAD");
+    let reply = |status, location| {
+        Ok(RoutingResult::LocalReply(LocalReply {
+            status,
+            location,
+            reusable,
+            head: is_head,
+        }))
+    };
 
     let rule = match routes.find_http_route(
         request_info.host,
@@ -157,12 +190,7 @@ fn analyze_http_request<'a>(
         server_port,
     ) {
         Ok(rule) => rule,
-        Err(_) => {
-            return Ok(RoutingResult::SendHttpError {
-                error_code: 404,
-                close_connection: !keepalive,
-            });
-        }
+        Err(_) => return reply(404, None),
     };
 
     // Check for redirect filters FIRST — redirect rules often have no backends,
@@ -175,29 +203,17 @@ fn analyze_http_request<'a>(
             is_tls,
             server_port,
         ) {
-            return Ok(RoutingResult::HttpRedirect {
-                status_code,
-                location,
-                keepalive,
-            });
+            return reply(status_code, Some(location));
         }
     }
 
     if rule.backends.is_empty() {
-        return Ok(RoutingResult::SendHttpError {
-            error_code: 500,
-            close_connection: !keepalive,
-        });
+        return reply(500, None);
     }
 
     let backend_index = match backend_selector.select_healthy_weighted_backend(rule, health) {
         Some(idx) => idx,
-        None => {
-            return Ok(RoutingResult::SendHttpError {
-                error_code: 503,
-                close_connection: !keepalive,
-            });
-        }
+        None => return reply(503, None),
     };
     let selected_backend = &rule.backends[backend_index];
 
@@ -208,12 +224,13 @@ fn analyze_http_request<'a>(
             content_length: request_info.content_length,
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
-            is_head: request_info.method.eq_ignore_ascii_case("HEAD"),
-            keepalive,
+            is_head,
+            keepalive: request_info.keepalive,
             path_span: subslice_span(request_data, request_info.path),
             strip_spans: request_info.strip_spans,
             upgrade_span: request_info.upgrade_span,
             expect_continue: request_info.expect_continue,
+            local_reply_reusable: reusable,
         },
     })
 }
@@ -469,10 +486,13 @@ mod tests {
         let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
 
         match result {
-            RoutingResult::HttpRedirect { location, .. } => {
+            RoutingResult::LocalReply(LocalReply {
+                location: Some(location),
+                ..
+            }) => {
                 assert!(location.ends_with("/new"), "location: {}", location);
             }
-            _ => panic!("expected HttpRedirect"),
+            _ => panic!("expected a redirect"),
         }
     }
 
@@ -774,10 +794,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            RoutingResult::HttpRedirect {
-                status_code: 301,
+            RoutingResult::LocalReply(LocalReply {
+                status: 301,
+                location: Some(_),
                 ..
-            }
+            })
         ));
     }
 
@@ -846,6 +867,117 @@ mod tests {
                 assert_eq!(meta.content_length, Some(0));
             }
             _ => panic!("expected HttpForward"),
+        }
+    }
+
+    /// (status, reusable) of a request the proxy answers itself.
+    fn local_reply(rt: &RouteTable, req: &[u8]) -> (u16, bool) {
+        let sel = BackendSelector::new();
+        match analyze_request(rt, &sel, req, 8080, &health(), false).unwrap() {
+            RoutingResult::LocalReply(r) => (r.status, r.reusable),
+            _ => panic!("expected a locally answered request"),
+        }
+    }
+
+    #[test]
+    fn local_reply_to_head_is_flagged_bodyless() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let sel = BackendSelector::new();
+        let req = b"HEAD / HTTP/1.1\r\nHost: nope.test\r\n\r\n";
+        match analyze_request(&rt, &sel, req, 8080, &health(), false).unwrap() {
+            RoutingResult::LocalReply(r) => assert!(r.status == 404 && r.head && r.reusable),
+            _ => panic!("expected a locally answered request"),
+        }
+    }
+
+    #[test]
+    fn local_reply_keeps_the_connection_only_for_bodyless_keepalive_requests() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let unrouted = |extra: &str| format!("POST / HTTP/1.1\r\nHost: nope.test\r\n{}\r\n", extra);
+        assert_eq!(local_reply(&rt, unrouted("").as_bytes()), (404, true));
+        assert_eq!(
+            local_reply(&rt, unrouted("Content-Length: 0\r\n").as_bytes()),
+            (404, true)
+        );
+        // The reply never reads a body: its bytes would parse as a request.
+        for extra in [
+            "Content-Length: 44\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Connection: close\r\n",
+        ] {
+            assert_eq!(
+                local_reply(&rt, unrouted(extra).as_bytes()),
+                (404, false),
+                "{extra}"
+            );
+        }
+        for req in [
+            &b"GET /ws HTTP/1.1\r\nHost: nope.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"[..],
+            &b"GET / HTTP/1.0\r\nHost: nope.test\r\n\r\n"[..],
+        ] {
+            assert_eq!(local_reply(&rt, req), (404, false));
+        }
+    }
+
+    #[test]
+    fn redirect_with_a_body_closes_the_connection() {
+        let rt = build_route_table(
+            "r.test",
+            "/",
+            PathMatchType::Prefix,
+            8001,
+            vec![HttpFilter::RequestRedirect {
+                scheme: Some("https".to_string()),
+                hostname: None,
+                port: None,
+                path: None,
+                status_code: 301,
+            }],
+        );
+        assert_eq!(
+            local_reply(&rt, b"GET /x HTTP/1.1\r\nHost: r.test\r\n\r\n"),
+            (301, true)
+        );
+        assert_eq!(
+            local_reply(
+                &rt,
+                b"POST /x HTTP/1.1\r\nHost: r.test\r\nContent-Length: 44\r\n\r\n"
+            ),
+            (301, false)
+        );
+    }
+
+    #[test]
+    fn unparseable_or_ambiguous_heads_get_a_closing_400() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        // HTTP/1.1 without Host, and a TE+CL framing conflict.
+        assert_eq!(local_reply(&rt, b"GET / HTTP/1.1\r\n\r\n"), (400, false));
+        assert_eq!(
+            local_reply(
+                &rt,
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            (400, false)
+        );
+    }
+
+    #[test]
+    fn forwarded_request_carries_the_local_reply_rule_for_429() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let sel = BackendSelector::new();
+        for (req, expected) in [
+            (&b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"[..], true),
+            (
+                &b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n"[..],
+                false,
+            ),
+        ] {
+            match analyze_request(&rt, &sel, req, 8080, &health(), false).unwrap() {
+                RoutingResult::HttpForward { meta, .. } => {
+                    assert_eq!(meta.local_reply_reusable, expected)
+                }
+                _ => panic!("expected HttpForward"),
+            }
         }
     }
 
