@@ -85,7 +85,8 @@ pub struct HttpRequestInfo<'a> {
     /// - syntax: a line not ended by CRLF, obs-fold, a field-name with a
     ///   non-token byte (`Content-Length : 5`), a CTL in a value, no blank
     ///   line ending the head;
-    /// - Host: repeated, empty on HTTP/1.1, or outside `host [":" port]`;
+    /// - Host: repeated, empty on HTTP/1.1, or not `host [":" port]` with
+    ///   host a DNS-alphabet name or a bracketed IPv6 address;
     /// - target: `*` without OPTIONS, CONNECT without authority-form, any
     ///   other non-origin target that is not `http(s)://` absolute-form,
     ///   userinfo, or an authority naming another host than Host.
@@ -113,8 +114,10 @@ const VALUE_HOLES: [u8; 1] = [0x7f];
 const TARGET_HOLES: [u8; 3] = [0x7f, b'#', b'\\'];
 
 /// Byte classes of the request-head grammar (RFC 9110, RFC 9112, RFC 3986).
-/// HOST is reg-name: unreserved, sub-delims and the `%` of pct-encoded; the
-/// structural `:`, `[` and `]` are left to `split_host`.
+/// HOST is the part of reg-name DNS names use. Sub-delims and '%' are out:
+/// `evil.com,a.example.com` suffix-matches `*.example.com` here, while a
+/// framework splitting Host on ',' or percent-decoding it reads evil.com.
+/// The structural `:`, `[` and `]` are left to `split_host`.
 static CLASS: [u8; 256] = {
     const fn any_of(b: u8, set: &[u8]) -> bool {
         let mut i = 0;
@@ -139,7 +142,7 @@ static CLASS: [u8; 256] = {
         if b > 0x20 && !any_of(b, &TARGET_HOLES) {
             table[i] |= TARGET;
         }
-        if b.is_ascii_alphanumeric() || any_of(b, b"-._~!$&'()*+,;=%") {
+        if b.is_ascii_alphanumeric() || any_of(b, b"-._") {
             table[i] |= HOST;
         }
         i += 1;
@@ -204,7 +207,8 @@ fn split_host(v: &[u8]) -> Option<usize> {
     let mut i = 0;
     if v.first() == Some(&b'[') {
         i = 1;
-        while i < v.len() && (is(v[i], HOST) || v[i] == b':') {
+        // IPv6 only: a zone ID would bring '%' back.
+        while i < v.len() && (v[i].is_ascii_hexdigit() || v[i] == b':' || v[i] == b'.') {
             i += 1;
         }
         if i == 1 || v.get(i) != Some(&b']') {

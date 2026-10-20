@@ -597,6 +597,40 @@ fn host_must_be_host_and_optional_port() {
 }
 
 #[test]
+fn host_and_authority_refuse_sub_delims_and_percent() {
+    // `evil.com,a.example.com` suffix-matches *.example.com here, while a
+    // framework splitting Host on ',' builds cache keys and reset links
+    // for evil.com. Percent-decoding frameworks are fooled the same way.
+    for value in [
+        "evil.com,a.example.com",
+        "a.example.com,",
+        "a!b",
+        "a$b",
+        "a&b",
+        "a'b",
+        "a(b)",
+        "a*b",
+        "a+b",
+        "a;b",
+        "a=b",
+        "a~b",
+        "a%2eexample.com",
+        "evil.com%2f.example.com",
+        "[fe80::1%25eth0]",
+        "[::1,::2]",
+        "[v1.x]",
+        "[::g]",
+        "[::1;x]",
+    ] {
+        assert_rejected(&head("GET / HTTP/1.1", &format!("Host: {value}\r\n")));
+        assert_rejected(&head(
+            &format!("GET http://{value}/ HTTP/1.1"),
+            &format!("Host: {value}\r\n"),
+        ));
+    }
+}
+
+#[test]
 fn empty_host_is_a_violation_on_http11_only() {
     assert_rejected(b"GET / HTTP/1.1\r\nHost:\r\n\r\n");
     assert_rejected(b"GET / HTTP/1.1\r\nHost:  \t \r\n\r\n");
@@ -729,10 +763,11 @@ fn host_port_and_ip_literal_are_accepted() {
         ("example.com:", "example.com"),
         ("[::1]:8080", "[::1]"),
         ("[::1]", "[::1]"),
-        ("[fe80::1%25eth0]:443", "[fe80::1%25eth0]"),
+        ("[2001:DB8::a]:443", "[2001:DB8::a]"),
+        ("[::ffff:192.0.2.1]", "[::ffff:192.0.2.1]"),
         ("192.0.2.1:80", "192.0.2.1"),
         ("xn--caf-dma.example", "xn--caf-dma.example"),
-        ("a_b-c~d.example", "a_b-c~d.example"),
+        ("_srv.a_b-c.example.", "_srv.a_b-c.example."),
     ] {
         let req = head("GET / HTTP/1.1", &format!("Host: {value}\r\n"));
         assert_eq!(accepted(&req).host, host, "{value}");
