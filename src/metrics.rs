@@ -78,6 +78,7 @@ metrics! {
     http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
     rate_limited_total: "Requests answered 429 by a per-client rate limit",
+    http_requests_rejected_total: "Requests answered 400 because their head was malformed or ambiguous",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
     pool_misses_total: "Backend pool checkouts that had to open a new connection",
@@ -505,6 +506,7 @@ mod tests {
 
         // Every metric line references a declared metric with HELP+TYPE.
         assert!(text.contains("# TYPE portail_pool_hits_total counter"));
+        assert!(text.contains("# TYPE portail_http_requests_rejected_total counter"));
         assert!(text.contains("# TYPE portail_active_connections gauge"));
         assert!(text.contains("portail_ready 1"));
         let hits: u64 = text

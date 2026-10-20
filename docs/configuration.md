@@ -40,7 +40,9 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
 - `GET /readyz` (any non-metrics path) — `200` once the data plane has bound
   its listener ports, `503` before. Gate traffic on this.
 - `GET /metrics` — Prometheus text format. Process-wide counters
-  (connections, backend pool, DNS refresh, health transitions, reconciles),
+  (connections, backend pool, DNS refresh, health transitions, reconciles,
+  and `portail_http_requests_rejected_total` for request heads refused with
+  `400` as malformed or ambiguous; those are logged at debug level only),
   `portail_http_requests_total{host=...}` and
   `portail_upstream_connect_{errors,timeouts}_total{backend=...}` families,
   per-listener `portail_listener_*{proto=...,port=...}` series including
