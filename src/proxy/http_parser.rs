@@ -264,7 +264,7 @@ fn split_host(v: &[u8]) -> Option<usize> {
 /// `1*DIGIT` only: a sign, a list or an overflow is a length some backend
 /// reads differently, and that difference is the body boundary.
 #[inline]
-fn parse_content_length(v: &[u8]) -> Option<usize> {
+pub(crate) fn parse_digits(v: &[u8]) -> Option<usize> {
     if v.is_empty() {
         return None;
     }
@@ -430,7 +430,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
                 }
             }
             (14, b'c') if name.eq_ignore_ascii_case(b"content-length") => {
-                match parse_content_length(trim_ows(value)) {
+                match parse_digits(trim_ows(value)) {
                     Some(n) if content_length.is_none() => content_length = Some(n),
                     _ => violation = true,
                 }

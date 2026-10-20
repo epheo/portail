@@ -24,7 +24,7 @@ use crate::proxy::http_filters::{
     assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods, extract_url_rewrite,
     header_lines, sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
 };
-use crate::proxy::http_parser::find_header_end;
+use crate::proxy::http_parser::{find_header_end, parse_digits, trim_ows};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
     analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
@@ -2760,30 +2760,6 @@ pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
 /// Whether the engine frames this head's body as chunked.
 pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
     parse_response_head(headers).is_some_and(|h| h.body == BodyFraming::Chunked)
-}
-
-/// `1*DIGIT` only, the request parser's Content-Length rule: a sign, a list
-/// or an overflow is a length some recipient reads differently.
-fn parse_digits(v: &[u8]) -> Option<usize> {
-    if v.is_empty() {
-        return None;
-    }
-    v.iter().try_fold(0usize, |n, &b| {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        n.checked_mul(10)?.checked_add((b - b'0') as usize)
-    })
-}
-
-fn trim_ows(mut v: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t', rest @ ..] = v {
-        v = rest;
-    }
-    while let [rest @ .., b' ' | b'\t'] = v {
-        v = rest;
-    }
-    v
 }
 
 /// Parse the 3-digit status code from a response status line
