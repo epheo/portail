@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1960,9 +1961,96 @@ async fn send_error_response(client: &mut Connection, error_code: u16) -> Result
     Ok(())
 }
 
+/// A response the proxy writes itself. Only redirects, which carry their
+/// Location, are built per call: 429 under a crawl and 502/504 storms
+/// answer every request, so their bytes are statics.
+fn local_reply_bytes(
+    status: u16,
+    location: Option<&str>,
+    close: bool,
+    head: bool,
+) -> Cow<'static, [u8]> {
+    let fixed = match location {
+        None => static_reply(status),
+        Some(_) => None,
+    };
+    match fixed {
+        Some(reply) => Cow::Borrowed(reply.bytes(close, head)),
+        None => Cow::Owned(build_local_reply(status, location, close, head)),
+    }
+}
+
+/// One fixed status in both connection modes. The body ends the bytes, so
+/// the HEAD form is the same slice minus `body_len`.
+struct FixedReply {
+    keep: &'static [u8],
+    close: &'static [u8],
+    body_len: usize,
+}
+
+impl FixedReply {
+    fn bytes(&self, close: bool, head: bool) -> &'static [u8] {
+        let full = if close { self.close } else { self.keep };
+        if head {
+            &full[..full.len() - self.body_len]
+        } else {
+            full
+        }
+    }
+}
+
+/// `$len` is the body's length, counted by hand: the test
+/// `fixed_replies_match_the_builder` holds every expansion to
+/// `build_local_reply`, byte for byte.
+macro_rules! fixed_reply {
+    ($status:literal, $reason:literal, $len:literal $(, $extra:literal)?) => {
+        FixedReply {
+            keep: concat!(
+                "HTTP/1.1 ", $status, " ", $reason, "\r\n", $($extra,)?
+                "Content-Length: ", $len, "\r\n\r\n", $status, " ", $reason
+            )
+            .as_bytes(),
+            close: concat!(
+                "HTTP/1.1 ", $status, " ", $reason, "\r\n", $($extra,)?
+                "Content-Length: ", $len, "\r\nConnection: close\r\n\r\n", $status, " ", $reason
+            )
+            .as_bytes(),
+            body_len: $len,
+        }
+    };
+}
+
+static BAD_REQUEST: FixedReply = fixed_reply!(400, "Bad Request", 15);
+static NOT_FOUND: FixedReply = fixed_reply!(404, "Not Found", 13);
+static REQUEST_TIMEOUT: FixedReply = fixed_reply!(408, "Request Timeout", 19);
+static TOO_MANY_REQUESTS: FixedReply =
+    fixed_reply!(429, "Too Many Requests", 21, "Retry-After: 1\r\n");
+static HEADERS_TOO_LARGE: FixedReply = fixed_reply!(431, "Request Header Fields Too Large", 35);
+static INTERNAL_SERVER_ERROR: FixedReply = fixed_reply!(500, "Internal Server Error", 25);
+static BAD_GATEWAY: FixedReply = fixed_reply!(502, "Bad Gateway", 15);
+static SERVICE_UNAVAILABLE: FixedReply = fixed_reply!(503, "Service Unavailable", 23);
+static GATEWAY_TIMEOUT: FixedReply = fixed_reply!(504, "Gateway Timeout", 19);
+
+/// The static for a reply without Location; `None` for a redirect status,
+/// which the builder keeps. Other statuses answer 500, as the builder does.
+fn static_reply(status: u16) -> Option<&'static FixedReply> {
+    Some(match status {
+        301 | 302 | 303 | 307 | 308 => return None,
+        400 => &BAD_REQUEST,
+        404 => &NOT_FOUND,
+        408 => &REQUEST_TIMEOUT,
+        429 => &TOO_MANY_REQUESTS,
+        431 => &HEADERS_TOO_LARGE,
+        502 => &BAD_GATEWAY,
+        503 => &SERVICE_UNAVAILABLE,
+        504 => &GATEWAY_TIMEOUT,
+        _ => &INTERNAL_SERVER_ERROR,
+    })
+}
+
 /// Serialize a response the proxy writes itself; the body repeats the
 /// status line ("404 Not Found") and is left out for HEAD.
-fn local_reply_bytes(status: u16, location: Option<&str>, close: bool, head: bool) -> Vec<u8> {
+fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: bool) -> Vec<u8> {
     use std::io::Write;
 
     let (status, reason) = match status {
@@ -2523,7 +2611,8 @@ mod connection_tests {
     #[test]
     fn local_reply_announces_close_exactly_when_closing() {
         let bytes = |status, location, close, head| {
-            String::from_utf8(local_reply_bytes(status, location, close, head)).unwrap()
+            String::from_utf8(local_reply_bytes(status, location, close, head).into_owned())
+                .unwrap()
         };
         let keep = bytes(429, None, false, false);
         assert!(keep.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
@@ -2543,6 +2632,26 @@ mod connection_tests {
 
         let unknown = bytes(418, None, true, false);
         assert!(unknown.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+    }
+
+    #[test]
+    fn fixed_replies_match_the_builder() {
+        for status in [400, 404, 408, 429, 431, 500, 502, 503, 504, 418] {
+            for (close, head) in [(false, false), (false, true), (true, false), (true, true)] {
+                let reply = local_reply_bytes(status, None, close, head);
+                assert!(matches!(reply, Cow::Borrowed(_)), "{status} allocated");
+                assert_eq!(
+                    String::from_utf8_lossy(&reply),
+                    String::from_utf8_lossy(&build_local_reply(status, None, close, head)),
+                    "{status} close={close} head={head}"
+                );
+            }
+        }
+        for (status, location) in [(301, Some("https://a/")), (302, None)] {
+            let reply = local_reply_bytes(status, location, false, false);
+            assert!(matches!(reply, Cow::Owned(_)));
+            assert_eq!(*reply, build_local_reply(status, location, false, false));
+        }
     }
 }
 
