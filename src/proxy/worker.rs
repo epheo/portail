@@ -642,8 +642,8 @@ async fn complete_headers(
 /// - `request_timeout` — total request lifetime, applied as an absolute
 ///   `Instant` deadline. Clamps the SAFE-zone phases too, then bounds the body
 ///   stream. On body-phase expiry we are in the UNSAFE zone (response headers
-///   already on the wire); we emit an encoding-aware terminator instead of a
-///   bogus `504` that would corrupt framing.
+///   already on the wire); we reset the client connection, since a `504` would
+///   corrupt framing and a synthetic terminator would fake a complete body.
 ///
 /// WebSocket upgrades skip the total deadline (long-lived stream).
 async fn proxy_http_request(
@@ -771,7 +771,7 @@ async fn proxy_http_request(
         has_mirrors,
         state.idle_body_timeout,
     );
-    let (mirror_body, relay_leftover) = match total_deadline {
+    let relay = match total_deadline {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, relay_fut).await {
@@ -788,6 +788,27 @@ async fn proxy_http_request(
             }
         }
         None => relay_fut.await?,
+    };
+    // An incomplete body drops `backend` on return, never pooling it. No
+    // final response has gone out yet (at most the interim 100), so a 400
+    // is still well-formed.
+    let (mirror_body, relay_leftover) = match relay {
+        RequestBody::Complete { mirror, leftover } => (mirror, leftover),
+        incomplete => {
+            if let RequestBody::Broken = incomplete {
+                warn!(
+                    "Rejecting request with malformed chunked body to backend {}",
+                    backend_addr
+                );
+            } else {
+                debug!("Client closed mid request body to backend {}", backend_addr);
+            }
+            state.last_status = 400;
+            // The client may already be gone (EOF case); the close follows
+            // either way.
+            let _ = send_error_response(client, 400).await;
+            return Ok((false, None));
+        }
     };
     if relay_leftover.is_some() {
         leftover = relay_leftover;
@@ -842,8 +863,9 @@ async fn proxy_http_request(
         return Ok((false, None));
     }
 
-    // Stream response body (UNSAFE: headers on wire; expiry → encoding-aware
-    // termination, never a synthetic 504 that would corrupt framing).
+    // Stream response body (UNSAFE: headers on wire). Expiry, errors, and
+    // truncation reset the client: no synthetic terminator or 504 may make a
+    // cut-short body look complete.
     let body_result = match total_deadline {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -861,7 +883,11 @@ async fn proxy_http_request(
             {
                 Ok(r) => r,
                 Err(_) => {
-                    terminate_stream_gracefully(client, &framing).await;
+                    warn!(
+                        "Response body from backend {} exceeded request timeout; resetting client connection",
+                        backend_addr
+                    );
+                    reset_on_drop(client);
                     return Ok((false, None));
                 }
             }
@@ -878,48 +904,52 @@ async fn proxy_http_request(
         }
     };
 
-    let response_complete = match body_result {
-        Ok(c) => c,
-        Err(_) => {
-            terminate_stream_gracefully(client, &framing).await;
+    match body_result {
+        Ok(BodyEnd::Complete) => {}
+        Ok(BodyEnd::Closed) => {
+            // Close-delimited: our clean close is how the client learns the
+            // body ended.
+            client.flush().await?;
             return Ok((false, None));
         }
-    };
+        Ok(BodyEnd::Broken) => {
+            warn!(
+                "Backend {} sent malformed chunked framing; resetting client connection",
+                backend_addr
+            );
+            reset_on_drop(client);
+            return Ok((false, None));
+        }
+        Ok(BodyEnd::Truncated) => {
+            debug!("Backend {} closed mid response body", backend_addr);
+            reset_on_drop(client);
+            return Ok((false, None));
+        }
+        Err(_e) => {
+            debug!("Response body from backend {} failed: {}", backend_addr, _e);
+            reset_on_drop(client);
+            return Ok((false, None));
+        }
+    }
 
     client.flush().await?;
 
-    // Pool only if framing terminated cleanly. The chunked observer signals
-    // termination at a true chunk boundary; content-length matches are exact.
-    // A Broken state means stale bytes could remain on the wire — don't reuse.
-    // Overshoot (bytes past the framing end) likewise poisons the conn: the
-    // excess was dropped here but whatever else follows would desync the next
-    // response.
-    let broken = framing.chunked.as_ref().is_some_and(|s| s.is_broken());
-    if broken {
-        warn!(
-            "Backend {} response framing broken; not pooling connection",
-            backend_addr
-        );
-    }
+    // Overshoot (bytes past the framing end) poisons the conn: the excess was
+    // dropped here but whatever else follows would desync the next response.
     if framing.overshoot {
         warn!(
             "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
             backend_addr
         );
     }
-    let framing_clean = !broken && !framing.overshoot;
-    let reusable = response_complete && framing_clean;
+    let reusable = !framing.overshoot;
 
-    // The client got a clean response, but the backend conn returns to the pool
-    // only when `backend_conn_poolable` allows — notably never after HEAD or a
-    // refused upgrade — and never when the backend announced Connection: close.
-    if backend_conn_poolable(
-        response_complete,
-        framing_clean,
-        meta.is_head,
-        meta.is_upgrade,
-    ) && !framing.backend_close
-    {
+    // Both bodies completed per their framing: every other outcome returned
+    // above, dropping `backend`. The client got a clean response, but the
+    // backend conn returns to the pool only when `backend_conn_poolable`
+    // allows (notably never after HEAD or a refused upgrade) and never when
+    // the backend announced Connection: close.
+    if backend_conn_poolable(reusable, meta.is_head, meta.is_upgrade) && !framing.backend_close {
         state.pool.release(
             backend_addr,
             backend_ref.use_tls,
@@ -936,9 +966,11 @@ async fn proxy_http_request(
     Ok((reusable, leftover))
 }
 
-/// Whether a backend connection may be returned to the idle pool after a response.
+/// Whether a backend connection may be returned to the idle pool after a
+/// complete exchange. Callers never ask after an incomplete request or
+/// response body: that conn holds stale state and is always dropped.
 ///
-/// Requires a fully-received response with clean framing, and — additionally —
+/// Requires clean response framing, and additionally
 /// **never after a HEAD request**. A non-compliant backend may send a response
 /// body (RFC 7230 §3.3 forbids it) that we cannot reliably detect at header time
 /// without blocking: a *compliant* HEAD response legitimately carries
@@ -948,13 +980,8 @@ async fn proxy_http_request(
 /// A refused upgrade is likewise never pooled: the client may have sent
 /// speculative tunnel bytes with the request (forwarded as-is, exempt from
 /// body framing), which the backend would parse as a next request.
-fn backend_conn_poolable(
-    response_complete: bool,
-    framing_clean: bool,
-    is_head: bool,
-    was_upgrade: bool,
-) -> bool {
-    response_complete && framing_clean && !is_head && !was_upgrade
+fn backend_conn_poolable(framing_clean: bool, is_head: bool, was_upgrade: bool) -> bool {
+    framing_clean && !is_head && !was_upgrade
 }
 
 /// Metrics label for a backend: the CONFIGURED name and target port
@@ -1270,7 +1297,7 @@ enum HeaderPhase {
 /// Read response headers from the backend within `header_budget` and forward
 /// them to the client. This is the SAFE→UNSAFE transition: on entry no client
 /// bytes have been written and timeout → `504`; on success the client has the
-/// headers and the caller must use encoding-aware termination on later expiry.
+/// headers, and any later failure must reset the client connection instead.
 ///
 /// Returns `ErrorSent` when the caller should bail out (`return Ok(false)`).
 #[allow(clippy::too_many_arguments)]
@@ -1349,15 +1376,30 @@ fn extract_response_mods<'a>(
     extract_header_mods(&rule.filters, true).or_else(|| extract_header_mods(&backend.filters, true))
 }
 
+/// How the request-body relay ended. Either incomplete outcome leaves a
+/// partial request on the backend conn, which must then be dropped: pooled,
+/// the next request's bytes would complete this body.
+enum RequestBody {
+    /// Forwarded in full per its framing (or there was none). `mirror` is
+    /// `Some` if mirrors are active and the body fit within
+    /// `MIRROR_BODY_MAX`; `leftover` holds bytes read past the body's end (a
+    /// pipelined next request), which go back to the keepalive loop, never
+    /// to the backend.
+    Complete {
+        mirror: Option<Vec<u8>>,
+        leftover: Option<Vec<u8>>,
+    },
+    /// Client EOF before the framing completed.
+    Truncated,
+    /// Malformed chunked framing; nothing from the offending byte on was
+    /// forwarded.
+    Broken,
+}
+
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.
 ///
 /// `chunked` is the observer pre-seeded with the initial-read body tail (built
-/// by the caller when the request is chunk-framed).
-///
-/// Returns `(mirror_body, leftover)`: `mirror_body` is `Some(bytes)` if
-/// mirrors are active and the body fit within `MIRROR_BODY_MAX`; `leftover`
-/// holds any bytes read past the body's framing end — a pipelined next
-/// request — which must go back to the keepalive loop, never to the backend.
+/// by the caller when the request is chunk-framed); it may already be Broken.
 #[allow(clippy::too_many_arguments)]
 async fn relay_request_body(
     client: &mut Connection,
@@ -1369,7 +1411,7 @@ async fn relay_request_body(
     chunked: Option<ChunkedStream>,
     has_mirrors: bool,
     idle: Option<Duration>,
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+) -> Result<RequestBody> {
     let body_in_initial = request_end.saturating_sub(header_end);
     let initial_body = &buf[header_end..request_end];
 
@@ -1390,7 +1432,7 @@ async fn relay_request_body(
         while remaining > 0 {
             let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
             if n == 0 {
-                break;
+                return Ok(RequestBody::Truncated);
             }
             let to_send = n.min(remaining);
             idle_guarded(idle, backend.write_all(&buf[..to_send])).await?;
@@ -1402,24 +1444,32 @@ async fn relay_request_body(
             }
         }
     } else if let Some(mut stream) = chunked {
-        // Broken framing exits too: there is no boundary left to find, and
-        // the backend cannot parse the body either — the exchange is doomed
-        // and the response phase will surface the failure.
         while !stream.is_terminated() && !stream.is_broken() {
             let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
             if n == 0 {
-                break;
+                return Ok(RequestBody::Truncated);
             }
             let consumed = stream.observe(&buf[..n]);
+            // The exchange is abandoned: even the valid prefix would only
+            // feed a backend conn about to be dropped.
+            if stream.is_broken() {
+                break;
+            }
             idle_guarded(idle, backend.write_all(&buf[..consumed])).await?;
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..consumed]);
             if consumed < n {
                 leftover = Some(buf[consumed..n].to_vec());
             }
         }
+        if stream.is_broken() {
+            return Ok(RequestBody::Broken);
+        }
     }
 
-    Ok((if overflow { None } else { mirror_body }, leftover))
+    Ok(RequestBody::Complete {
+        mirror: if overflow { None } else { mirror_body },
+        leftover,
+    })
 }
 
 /// Tee a chunk into the mirror body buffer, tracking overflow.
@@ -1442,8 +1492,8 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 }
 
 /// Response framing derived from raw backend headers. Drives the body-phase loop:
-/// when to stop reading from the backend, and how to terminate the client stream
-/// gracefully on a mid-body timeout.
+/// when to stop reading from the backend, and whether its EOF ends the body or
+/// truncates it.
 struct ResponseFraming {
     /// Response status code (0 when the status line is unparseable).
     status: u16,
@@ -1553,7 +1603,10 @@ async fn read_response_headers(
                 } else {
                     0
                 };
-                (consumed, Some(stream), consumed < tail_len)
+                // A Broken stream also stops short of the tail; that is no
+                // overshoot, and the body phase resets the client on it.
+                let overshoot = stream.is_terminated() && consumed < tail_len;
+                (consumed, Some(stream), overshoot)
             } else if let Some(cl) = content_length {
                 (tail_len.min(cl), None, tail_len > cl)
             } else {
@@ -1566,7 +1619,10 @@ async fn read_response_headers(
                 ResponseFraming {
                     status,
                     backend_close,
-                    content_length: if is_head_request {
+                    // Chunked overrides Content-Length (RFC 9112 6.3): a
+                    // stray small CL must not end the body early and pool a
+                    // conn with chunked bytes still unread.
+                    content_length: if is_head_request || is_chunked {
                         None
                     } else {
                         content_length
@@ -1595,28 +1651,43 @@ async fn read_response_headers(
     }
 }
 
+/// How the response body ended.
+enum BodyEnd {
+    /// The declared framing completed (or there was no body).
+    Complete,
+    /// Close-delimited body ended by the backend's EOF.
+    Closed,
+    /// Backend EOF before the declared length or chunked terminator.
+    Truncated,
+    /// Malformed chunked framing; nothing from the offending byte on was
+    /// forwarded.
+    Broken,
+}
+
 /// Phase 2 — stream response body to the client. Hot path: read → write → check
-/// framing terminator. Returns `Ok(true)` when the response framing completes
-/// cleanly (connection reusable for keepalive); `Ok(false)` on backend EOF
-/// without a terminator.
+/// framing terminator. Only `Complete` leaves both connections reusable.
 async fn forward_response_body(
     backend: &mut Connection,
     client: &mut Connection,
     buf: &mut [u8],
     framing: &mut ResponseFraming,
     idle: Option<Duration>,
-) -> Result<bool> {
+) -> Result<BodyEnd> {
     if framing.no_body {
-        return Ok(true);
+        return Ok(BodyEnd::Complete);
     }
     if let Some(cl) = framing.content_length {
         if framing.body_bytes_already_forwarded >= cl {
-            return Ok(true);
+            return Ok(BodyEnd::Complete);
         }
     }
     if let Some(stream) = &framing.chunked {
         if stream.is_terminated() {
-            return Ok(true);
+            return Ok(BodyEnd::Complete);
+        }
+        // Broken by the bytes that arrived with the headers.
+        if stream.is_broken() {
+            return Ok(BodyEnd::Broken);
         }
     }
 
@@ -1624,7 +1695,12 @@ async fn forward_response_body(
     loop {
         let n = idle_guarded(idle, backend.read(buf)).await?;
         if n == 0 {
-            return Ok(false);
+            let close_delimited = framing.chunked.is_none() && framing.content_length.is_none();
+            return Ok(if close_delimited {
+                BodyEnd::Closed
+            } else {
+                BodyEnd::Truncated
+            });
         }
 
         // Forward only bytes within the declared framing; anything past the
@@ -1632,10 +1708,15 @@ async fn forward_response_body(
         // never pools the connection.
         if let Some(stream) = &mut framing.chunked {
             let consumed = stream.observe(&buf[..n]);
+            // The client is about to be reset: even the valid prefix could
+            // not reach it as anything but a broken response.
+            if stream.is_broken() {
+                return Ok(BodyEnd::Broken);
+            }
             idle_guarded(idle, client.write_all(&buf[..consumed])).await?;
             if stream.is_terminated() {
                 framing.overshoot |= consumed < n;
-                return Ok(true);
+                return Ok(BodyEnd::Complete);
             }
         } else if let Some(cl) = framing.content_length {
             let to_write = n.min(cl - body_bytes_forwarded);
@@ -1643,7 +1724,7 @@ async fn forward_response_body(
             body_bytes_forwarded += to_write;
             if body_bytes_forwarded >= cl {
                 framing.overshoot |= to_write < n;
-                return Ok(true);
+                return Ok(BodyEnd::Complete);
             }
         } else {
             // EOF-framed: everything until close is body.
@@ -1652,24 +1733,18 @@ async fn forward_response_body(
     }
 }
 
-/// Best-effort clean shutdown after response headers were already forwarded.
-/// Called when an expiry or backend error strikes during the body phase — we
-/// are past the point where injecting a new HTTP response would be well-formed.
-///
-/// For chunked responses we emit `0\r\n\r\n` so a compliant client treats the
-/// transfer as complete (truncated body, no framing error). The proxy doesn't
-/// track inter-chunk boundaries — only watches a 5-byte rolling tail — so if
-/// the backend stalled mid-chunk-header the terminator is malformed, but no
-/// worse than a bare TCP close.
-///
-/// For Content-Length responses we cannot synthesize the missing bytes; the
-/// caller closes the connection and the client sees a well-defined premature
-/// EOF rather than malformed framing.
-async fn terminate_stream_gracefully(client: &mut Connection, framing: &ResponseFraming) {
-    if framing.chunked.is_some() {
-        let _ = client.write_all(b"0\r\n\r\n").await;
-        let _ = client.flush().await;
-    }
+/// Make dropping `client` send RST instead of FIN, for a response cut short
+/// after its headers went out. A FIN would pass a close-delimited body off as
+/// complete; a reset is an error for every framing. The h2 bridge's in-memory
+/// pipe has no reset: it relies on the CL or chunked framing to spot the cut.
+fn reset_on_drop(client: &Connection) {
+    let tcp = match client {
+        Connection::Plain { inner } => inner,
+        Connection::Tls { inner } => inner.get_ref().0,
+        Connection::ClientTls { .. } | Connection::Mem { .. } => return,
+    };
+    // Zero linger: close() discards unsent data and resets without blocking.
+    let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
 }
 
 /// Zero means disabled in the config; the streaming loops branch on Option.
@@ -1944,18 +2019,162 @@ mod tests {
     #[test]
     fn backend_conn_pooling_policy() {
         // A complete, cleanly-framed non-HEAD response is poolable.
-        assert!(backend_conn_poolable(true, true, false, false));
+        assert!(backend_conn_poolable(true, false, false));
         // HEAD is never pooled: a non-compliant backend body would desync the
         // conn, and we can't tell that apart from a compliant Content-Length at
         // header time without blocking.
-        assert!(!backend_conn_poolable(true, true, true, false));
+        assert!(!backend_conn_poolable(true, true, false));
         // A refused upgrade is never pooled: speculative tunnel bytes may have
         // been forwarded outside body framing.
-        assert!(!backend_conn_poolable(true, true, false, true));
-        // Incomplete or broken-framing responses are never pooled, HEAD or not.
-        assert!(!backend_conn_poolable(false, true, false, false));
-        assert!(!backend_conn_poolable(true, false, false, false));
-        assert!(!backend_conn_poolable(false, false, true, false));
+        assert!(!backend_conn_poolable(true, false, true));
+        // Overshoot is never pooled, HEAD or not.
+        assert!(!backend_conn_poolable(false, false, false));
+        assert!(!backend_conn_poolable(false, true, false));
+    }
+
+    /// An engine-side connection plus the peer end a test drives.
+    fn mem_pair() -> (Connection, tokio::io::DuplexStream) {
+        let (engine, peer) = tokio::io::duplex(64 * 1024);
+        (Connection::Mem { inner: engine }, peer)
+    }
+
+    async fn relay(
+        client: &mut Connection,
+        backend: &mut Connection,
+        content_length: Option<usize>,
+        chunked: Option<ChunkedStream>,
+    ) -> RequestBody {
+        let mut buf = vec![0u8; 4096];
+        relay_request_body(
+            client,
+            backend,
+            &mut buf,
+            0,
+            0,
+            content_length,
+            chunked,
+            false,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Pooled, a conn holding a partial body would take the next request's
+    /// bytes as the rest of it.
+    #[tokio::test]
+    async fn request_body_client_eof_is_truncated() {
+        let (mut client, mut client_peer) = mem_pair();
+        let (mut backend, _backend_peer) = mem_pair();
+        client_peer.write_all(b"hel").await.unwrap();
+        drop(client_peer);
+        let out = relay(&mut client, &mut backend, Some(10), None).await;
+        assert!(matches!(out, RequestBody::Truncated));
+
+        let (mut client, mut client_peer) = mem_pair();
+        client_peer.write_all(b"5\r\nhello\r\n").await.unwrap();
+        drop(client_peer);
+        let out = relay(&mut client, &mut backend, None, Some(ChunkedStream::new())).await;
+        assert!(matches!(out, RequestBody::Truncated));
+    }
+
+    #[tokio::test]
+    async fn request_body_broken_chunked_forwards_nothing_past_it() {
+        let (mut client, mut client_peer) = mem_pair();
+        let (mut backend, mut backend_peer) = mem_pair();
+        client_peer
+            .write_all(b"5\r\nhello\r\n0\r\n\nGET /smuggled HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let out = relay(&mut client, &mut backend, None, Some(ChunkedStream::new())).await;
+        assert!(matches!(out, RequestBody::Broken));
+        drop(backend);
+        let mut got = Vec::new();
+        backend_peer.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty(), "forwarded {:?}", got);
+    }
+
+    /// Broken in the initial read: reported without reading the client
+    /// again (its EOF would otherwise surface as Truncated).
+    #[tokio::test]
+    async fn request_body_already_broken_skips_client_read() {
+        let (mut client, client_peer) = mem_pair();
+        let (mut backend, _backend_peer) = mem_pair();
+        drop(client_peer);
+        let mut stream = ChunkedStream::new();
+        stream.observe(b"5 \r\n");
+        assert!(stream.is_broken());
+        let out = relay(&mut client, &mut backend, None, Some(stream)).await;
+        assert!(matches!(out, RequestBody::Broken));
+    }
+
+    fn framing(content_length: Option<usize>, chunked: bool) -> ResponseFraming {
+        ResponseFraming {
+            status: 200,
+            backend_close: false,
+            content_length,
+            no_body: false,
+            body_bytes_already_forwarded: 0,
+            chunked: chunked.then(ChunkedStream::new),
+            overshoot: false,
+        }
+    }
+
+    /// Feeds `wire` then backend EOF; returns the outcome and what the
+    /// client received.
+    async fn forward(mut framing: ResponseFraming, wire: &[u8]) -> (BodyEnd, Vec<u8>) {
+        let (mut backend, mut backend_peer) = mem_pair();
+        let (mut client, mut client_peer) = mem_pair();
+        backend_peer.write_all(wire).await.unwrap();
+        drop(backend_peer);
+        let mut buf = vec![0u8; 4096];
+        let end = forward_response_body(&mut backend, &mut client, &mut buf, &mut framing, None)
+            .await
+            .unwrap();
+        drop(client);
+        let mut got = Vec::new();
+        client_peer.read_to_end(&mut got).await.unwrap();
+        (end, got)
+    }
+
+    #[tokio::test]
+    async fn response_body_outcomes() {
+        let (end, got) = forward(framing(None, true), b"5\r\nhello\r\n0\r\n\r\n").await;
+        assert!(matches!(end, BodyEnd::Complete));
+        assert_eq!(got, b"5\r\nhello\r\n0\r\n\r\n");
+
+        // Only a close-delimited body may end at backend EOF.
+        let (end, _) = forward(framing(None, false), b"all of it").await;
+        assert!(matches!(end, BodyEnd::Closed));
+        let (end, _) = forward(framing(Some(100), false), b"partial").await;
+        assert!(matches!(end, BodyEnd::Truncated));
+        let (end, got) = forward(framing(None, true), b"5\r\nhello\r\n").await;
+        assert!(matches!(end, BodyEnd::Truncated));
+        assert!(!got.ends_with(b"0\r\n\r\n"));
+
+        let wire = b"5\r\nhello\r\n0\r\n\nHTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nSMUGGLED";
+        let (end, got) = forward(framing(None, true), wire).await;
+        assert!(matches!(end, BodyEnd::Broken));
+        assert!(got.is_empty(), "forwarded {:?}", got);
+    }
+
+    /// A stray small Content-Length beside chunked must not end the body
+    /// before the terminator.
+    #[tokio::test]
+    async fn chunked_response_ignores_content_length() {
+        let (mut backend, mut backend_peer) = mem_pair();
+        backend_peer
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut header_buf = Vec::new();
+        let (_, framing) = read_response_headers(&mut backend, &mut header_buf, false, false)
+            .await
+            .unwrap();
+        assert!(framing.chunked.is_some());
+        assert_eq!(framing.content_length, None);
     }
 
     #[test]

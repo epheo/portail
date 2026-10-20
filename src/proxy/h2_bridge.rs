@@ -407,7 +407,8 @@ async fn forward_response(
 }
 
 /// Decode one read's worth of chunked body and forward the payload.
-/// Returns `true` once the terminator has passed (stream ended).
+/// Returns `true` once the terminator has passed (stream ended). Malformed
+/// framing resets the stream and errors.
 async fn feed_chunked(
     dec: &mut ChunkedStream,
     bytes: &[u8],
@@ -418,6 +419,9 @@ async fn feed_chunked(
     scratch.clear();
     dec.decode_into(bytes, scratch);
     if dec.is_broken() {
+        // Reset here rather than trust every caller to: only a reset, never
+        // END_STREAM, tells the client its body is incomplete.
+        send.send_reset(h2::Reason::INTERNAL_ERROR);
         return Err(anyhow!("broken chunked framing from engine"));
     }
     let done = dec.is_terminated();

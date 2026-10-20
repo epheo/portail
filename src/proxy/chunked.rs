@@ -26,6 +26,14 @@
 //!
 //! This state machine knows where in the framing each byte belongs and so
 //! reaches `Done` only at a true chunk-boundary.
+//!
+//! ### Strictness
+//!
+//! Bytes are forwarded verbatim to a peer whose parser may be more lenient
+//! (bare LF as a line end, oversized sizes wrapped to 64 bits). Wherever two
+//! parsers could disagree on where the body ends, the framing turns Broken
+//! instead of guessing, and the caller stops forwarding at that byte: past
+//! it, a lenient peer could find a second message the proxy never routed.
 
 /// Position in a chunked-encoded body. Bytes are fed in via
 /// [`observe`](Self::observe); [`is_terminated`](Self::is_terminated)
@@ -47,28 +55,31 @@ enum Phase {
     /// once at least one hex digit has been consumed; a CR or `;` before
     /// any digit is malformed.
     Size { hex: u64, has_digit: bool },
-    /// Saw `;` in the size line. Skipping `chunk-ext` bytes until CR.
-    /// Carries the parsed size so it survives the extension.
+    /// Saw `;` in the size line. Skipping `chunk-ext` bytes until CR; a
+    /// CTL there (LF, NUL, DEL, ...) is Broken, since a lenient peer may end
+    /// the line at it. Carries the parsed size so it survives the extension.
     SizeExt { size: u64 },
     /// Saw the size line's CR. Carries the parsed size so we know
-    /// whether to enter `Data` or `Trailer` when the LF arrives.
+    /// whether to enter `Data` or `TrailerLineStart` when the LF arrives.
     SizeCrlf { size: u64 },
     /// Forwarding chunk-data; `remaining` bytes left until the
     /// chunk-data-end CRLF.
     Data { remaining: u64 },
     /// Chunk-data finished. Expecting the trailing `\r\n`.
     DataCrlf { saw_cr: bool },
-    /// Past `0\r\n` (last-chunk). Scanning for the blank line that ends
-    /// the trailer-section. `crlf_pairs` counts consecutive CRLFs;
-    /// reaching 2 means we just saw `\r\n\r\n` (the LF of the
-    /// last-chunk's CRLF counts as the first pair). Trailer header bytes
-    /// reset the run.
-    Trailer { crlf_pairs: u8, saw_cr: bool },
-    /// Final CRLF observed. Terminal — further bytes are ignored.
+    /// At the start of a trailer-section line: past `0\r\n` (last-chunk)
+    /// or a trailer field's CRLF. A CRLF here is the blank line that ends
+    /// the message.
+    TrailerLineStart,
+    /// Inside a trailer field line; `saw_colon` once its name has ended.
+    TrailerLine { saw_colon: bool },
+    /// Saw a trailer line's CR; only LF may follow. `blank` when the line
+    /// was empty, so that LF ends the message.
+    TrailerCr { blank: bool },
+    /// Final CRLF observed. Terminal: further bytes are not consumed.
     Done,
-    /// Malformed framing. Terminal — `is_terminated()` will never report
-    /// `true` from here, but we keep accepting bytes so the caller can
-    /// continue forwarding without panicking.
+    /// Malformed framing. Terminal: the byte that broke it and every byte
+    /// after are never consumed.
     Broken,
 }
 
@@ -85,22 +96,26 @@ impl ChunkedStream {
     }
 
     /// Feed a slice of bytes flowing through the proxy. Returns how many of
-    /// them belong to this chunked stream — once the terminator is reached,
+    /// them belong to this chunked stream: once the terminator is reached,
     /// the remaining bytes (e.g. a pipelined next message on the same
     /// connection) are NOT consumed, and the caller must not forward them as
-    /// body. While the framing is `Broken` every byte is reported consumed:
-    /// there is no boundary left to respect and the connection is already
-    /// unusable for reuse.
+    /// body.
+    ///
+    /// A byte that breaks the framing turns the stream Broken, and the
+    /// return value is that byte's index: forward only the bytes before it,
+    /// never the rest. Once Broken, every call returns 0. Callers must check
+    /// [`is_broken`](Self::is_broken) after every call, since a short count
+    /// alone does not tell a terminator from a framing error.
     pub fn observe(&mut self, bytes: &[u8]) -> usize {
         self.advance(bytes, |_| {})
     }
 
-    /// Like [`observe`](Self::observe), but appends the chunk payloads
-    /// (framing stripped) to `out`. Exists for the h2 bridge, which must
-    /// re-frame an h1 chunked body as DATA frames; the h1 relay paths keep
-    /// `observe` and forward wire bytes verbatim. Both drive the same state
-    /// machine ([`advance`](Self::advance)); the no-op closure in `observe`
-    /// monomorphizes back to the plain scan.
+    /// Like [`observe`](Self::observe), same return contract, but appends
+    /// the chunk payloads (framing stripped) to `out`. Exists for the h2
+    /// bridge, which must re-frame an h1 chunked body as DATA frames; the h1
+    /// relay paths keep `observe` and forward wire bytes verbatim. Both
+    /// drive the same state machine ([`advance`](Self::advance)); the no-op
+    /// closure in `observe` monomorphizes back to the plain scan.
     pub fn decode_into(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
         self.advance(bytes, |d| out.extend_from_slice(d))
     }
@@ -110,11 +125,11 @@ impl ChunkedStream {
     fn advance(&mut self, bytes: &[u8], mut on_data: impl FnMut(&[u8])) -> usize {
         let mut i = 0;
         while i < bytes.len() {
-            // Terminal phases: Done stops consuming at the boundary; Broken
-            // swallows the rest (see doc above).
             match self.phase {
                 Phase::Done => return i,
-                Phase::Broken => return bytes.len(),
+                // Only reachable on entry: the byte that breaks the framing
+                // returns its index below.
+                Phase::Broken => return 0,
                 _ => {}
             }
             // Fast-path: skip the whole chunk-data run in one shot
@@ -131,6 +146,9 @@ impl ChunkedStream {
                 continue;
             }
             self.step(bytes[i]);
+            if matches!(self.phase, Phase::Broken) {
+                return i;
+            }
             i += 1;
         }
         i
@@ -141,8 +159,9 @@ impl ChunkedStream {
         matches!(self.phase, Phase::Done)
     }
 
-    /// `true` if the observer has detected malformed framing. The proxy
-    /// should treat this connection as not reusable.
+    /// `true` if the observer has detected malformed framing. The proxy must
+    /// stop forwarding at the offending byte and never reuse either side's
+    /// connection for this exchange.
     pub fn is_broken(&self) -> bool {
         matches!(self.phase, Phase::Broken)
     }
@@ -179,13 +198,13 @@ impl ChunkedStream {
             },
             Phase::SizeExt { size } => match byte {
                 b'\r' => Phase::SizeCrlf { size },
-                _ => Phase::SizeExt { size },
+                // HTAB, SP, VCHAR and obs-text: covers token and
+                // quoted-string extension values without tracking quotes.
+                b'\t' | b' '..=b'~' | 0x80..=0xff => Phase::SizeExt { size },
+                _ => Phase::Broken,
             },
             Phase::SizeCrlf { size } => match byte {
-                b'\n' if size == 0 => Phase::Trailer {
-                    crlf_pairs: 1,
-                    saw_cr: false,
-                },
+                b'\n' if size == 0 => Phase::TrailerLineStart,
                 b'\n' => Phase::Data { remaining: size },
                 _ => Phase::Broken,
             },
@@ -204,28 +223,29 @@ impl ChunkedStream {
                 },
                 _ => Phase::Broken,
             },
-            Phase::Trailer { crlf_pairs, saw_cr } => match (saw_cr, byte) {
-                (false, b'\r') => Phase::Trailer {
-                    crlf_pairs,
-                    saw_cr: true,
-                },
-                (true, b'\n') => {
-                    let pairs = crlf_pairs + 1;
-                    if pairs >= 2 {
-                        Phase::Done
-                    } else {
-                        Phase::Trailer {
-                            crlf_pairs: pairs,
-                            saw_cr: false,
-                        }
-                    }
-                }
-                // Any byte that isn't a CR/LF in sequence is trailer
-                // header content; restart the CRLF run.
-                _ => Phase::Trailer {
-                    crlf_pairs: 0,
-                    saw_cr: false,
-                },
+            // Bare LF, bare CR and other CTLs all fall to Broken: a
+            // bare-LF-tolerant peer would end the trailer-section early and
+            // parse the remainder as a new request.
+            Phase::TrailerLineStart => match byte {
+                b'\r' => Phase::TrailerCr { blank: true },
+                // Leading SP/HTAB is obs-fold; a leading ':' an empty name.
+                b' ' | b'\t' | b':' => Phase::Broken,
+                _ if is_ctl(byte) => Phase::Broken,
+                _ => Phase::TrailerLine { saw_colon: false },
+            },
+            Phase::TrailerLine { saw_colon } => match byte {
+                // A line with no ':' is no field, e.g. a smuggled
+                // request-line.
+                b'\r' if saw_colon => Phase::TrailerCr { blank: false },
+                b':' => Phase::TrailerLine { saw_colon: true },
+                b'\t' => Phase::TrailerLine { saw_colon },
+                _ if is_ctl(byte) => Phase::Broken,
+                _ => Phase::TrailerLine { saw_colon },
+            },
+            Phase::TrailerCr { blank } => match byte {
+                b'\n' if blank => Phase::Done,
+                b'\n' => Phase::TrailerLineStart,
+                _ => Phase::Broken,
             },
             // Done / Broken are terminal — `observe` short-circuits before
             // reaching `step`, so these arms are unreachable. Listed for
@@ -236,9 +256,20 @@ impl ChunkedStream {
 }
 
 /// Shift a hex accumulator left by one nibble. Returns `None` on overflow.
+/// Not `checked_shl`: it only rejects shift amounts >= 64 and would wrap
+/// `10000000000000005` to 5 while a peer reads a huge chunk.
 #[inline]
 fn shift_hex(hex: u64, nibble: u8) -> Option<u64> {
-    hex.checked_shl(4)?.checked_add(nibble as u64)
+    if hex >> 60 != 0 {
+        return None;
+    }
+    Some((hex << 4) | u64::from(nibble))
+}
+
+/// RFC 5234 CTL: 0x00-0x1F and DEL.
+#[inline]
+fn is_ctl(byte: u8) -> bool {
+    byte < 0x20 || byte == 0x7f
 }
 
 #[cfg(test)]
@@ -418,15 +449,143 @@ mod tests {
         assert!(s.is_terminated());
     }
 
-    /// Broken framing consumes everything — there is no boundary left, and
-    /// the caller keeps forwarding until EOF on a connection that will never
-    /// be reused.
+    /// Neither the byte that breaks the framing nor anything after it is
+    /// consumed, so a caller cannot forward bytes a lenient peer might
+    /// parse as a second message; later calls consume nothing.
     #[test]
-    fn broken_framing_consumes_all_bytes() {
+    fn broken_framing_stops_at_offending_byte() {
         let mut s = ChunkedStream::new();
-        assert_eq!(s.observe(b"Z\r\ngarbage"), 10);
+        assert_eq!(s.observe(b"Z\r\ngarbage"), 0);
         assert!(s.is_broken());
-        assert_eq!(s.observe(b"more"), 4);
+        assert_eq!(s.observe(b"more"), 0);
+
+        let mut s = ChunkedStream::new();
+        assert_eq!(s.observe(b"5\r\nhello\r\nZ\r\n"), 10);
+        assert!(s.is_broken());
+        assert_eq!(s.observe(b"0\r\n\r\n"), 0);
+        assert!(!s.is_terminated());
+    }
+
+    /// Feeds `wire` one-shot and byte-by-byte: both must turn Broken with
+    /// the consumed total stopping exactly at the offending byte `at`.
+    fn assert_broken_at(wire: &[u8], at: usize) {
+        let mut s = ChunkedStream::new();
+        assert_eq!(s.observe(wire), at, "one-shot count for {:?}", wire);
+        assert!(s.is_broken(), "one-shot not broken: {:?}", wire);
+
+        let mut s = ChunkedStream::new();
+        let consumed: usize = wire.iter().map(|b| s.observe(&[*b])).sum();
+        assert_eq!(consumed, at, "byte-by-byte count for {:?}", wire);
+        assert!(s.is_broken(), "byte-by-byte not broken: {:?}", wire);
+        assert!(!s.is_terminated());
+    }
+
+    /// Feeds `wire` one-shot and byte-by-byte: both must terminate having
+    /// consumed all of it.
+    fn assert_terminates(wire: &[u8]) {
+        let mut s = ChunkedStream::new();
+        assert_eq!(s.observe(wire), wire.len(), "one-shot count for {:?}", wire);
+        assert!(s.is_terminated(), "one-shot not terminated: {:?}", wire);
+
+        let s = observe_byte_by_byte(wire);
+        assert!(s.is_terminated(), "byte-by-byte not terminated: {:?}", wire);
+    }
+
+    /// The u64 accumulator must not wrap: `10000000000000005` would parse
+    /// as 5 while a peer reads (or rejects) a 2^64+5 byte chunk.
+    #[test]
+    fn chunk_size_overflow_is_broken() {
+        let wire = b"10000000000000005\r\nhello\r\n0\r\n\r\n";
+        assert_broken_at(wire, 16);
+        // Leading zeros carry no bits, so they never overflow.
+        assert_terminates(b"000000000000000000005\r\nhello\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn chunk_size_max_u64_is_accepted() {
+        let mut s = ChunkedStream::new();
+        assert_eq!(s.observe(b"ffffffffffffffff\r\nabc"), 21);
+        assert!(!s.is_broken());
+        assert!(!s.is_terminated());
+    }
+
+    /// The verified smuggling vector: SP after the size digits.
+    #[test]
+    fn whitespace_after_size_digits_is_broken() {
+        assert_broken_at(b"5 \r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n", 1);
+        assert_broken_at(b"5\t;ext\r\nhello\r\n0\r\n\r\n", 1);
+    }
+
+    /// A lenient peer may end the size line at any of these, then read the
+    /// rest of the extension as chunk data.
+    #[test]
+    fn ctl_in_chunk_extension_is_broken() {
+        assert_broken_at(b"5;a\nhello\r\n0\r\n\r\n", 3);
+        assert_broken_at(b"5;a=\0\r\nhello\r\n0\r\n\r\n", 4);
+        assert_broken_at(b"5;a=\x7f\r\nhello\r\n0\r\n\r\n", 4);
+        assert_broken_at(b"5;a=\x01\r\nhello\r\n0\r\n\r\n", 4);
+        assert_broken_at(b"0;a\n\r\n", 3);
+    }
+
+    #[test]
+    fn chunk_extension_quoted_string_value() {
+        assert_terminates(b"5;name=\"quoted value; with\ttab \\\"esc\\\"\"\r\nhello\r\n0\r\n\r\n");
+        assert_terminates(b"5;n=\x80\xff ; m\r\nhello\r\n0;last=\"x\"\r\n\r\n");
+    }
+
+    /// The verified trailer vector: a bare LF ends the trailer-section for
+    /// a lenient peer, which then parses the rest as a second request.
+    #[test]
+    fn trailer_bare_lf_is_broken() {
+        assert_broken_at(b"5\r\nhello\r\n0\r\n\nGET /smuggled2 HTTP/1.1\r\n\r\n", 13);
+        assert_broken_at(b"0\r\nX-T: v\nGET /s HTTP/1.1\r\nH: x\r\n\r\n", 9);
+    }
+
+    #[test]
+    fn trailer_bare_cr_is_broken() {
+        assert_broken_at(b"0\r\nX-T: v\rX\r\n\r\n", 10);
+        assert_broken_at(b"0\r\n\rX", 4);
+        assert_broken_at(b"0\r\nX-T: v\r\n\r\r\n", 12);
+    }
+
+    #[test]
+    fn trailer_ctl_is_broken() {
+        assert_broken_at(b"0\r\nX-T: a\0b\r\n\r\n", 9);
+        assert_broken_at(b"0\r\nX-T: a\x7fb\r\n\r\n", 9);
+        assert_broken_at(b"0\r\nX\x01T: v\r\n\r\n", 4);
+        assert_broken_at(b"0\r\n\x0bX: v\r\n\r\n", 3);
+    }
+
+    #[test]
+    fn trailer_obs_fold_is_broken() {
+        assert_broken_at(b"0\r\nX-T: v\r\n folded\r\n\r\n", 11);
+        assert_broken_at(b"0\r\n\tX-T: v\r\n\r\n", 3);
+    }
+
+    #[test]
+    fn trailer_line_without_colon_is_broken() {
+        assert_broken_at(b"0\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n", 25);
+        assert_broken_at(b"0\r\nX-T: v\r\nnocolon\r\n\r\n", 18);
+        assert_broken_at(b"0\r\n: empty-name\r\n\r\n", 3);
+    }
+
+    #[test]
+    fn trailer_with_htab_terminates() {
+        assert_terminates(b"0\r\nX-T:\tv\t1\r\nX-U: a\tb \r\n\r\n");
+    }
+
+    /// `decode_into` keeps the payload decoded before the offending byte and
+    /// reports that byte's index, like `observe`.
+    #[test]
+    fn decode_into_broken_stops_at_offending_byte() {
+        let mut s = ChunkedStream::new();
+        let mut out = Vec::new();
+        let wire = b"5\r\nhello\r\n0\r\n\nGET / HTTP/1.1\r\n\r\n";
+        assert_eq!(s.decode_into(wire, &mut out), 13);
+        assert!(s.is_broken());
+        assert_eq!(out, b"hello");
+        assert_eq!(s.decode_into(b"more", &mut out), 0);
+        assert_eq!(out, b"hello");
     }
 
     #[test]
