@@ -24,6 +24,7 @@ use crate::proxy::http_filters::{
     header_lines, sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::find_header_end;
+use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
     analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
 };
@@ -575,13 +576,28 @@ pub(crate) async fn handle_connection(
         } else {
             n = client.read(&mut buf).await?;
         }
-        if n > 0 && find_header_end(&buf[..n]).is_none() {
+        // The connection is HTTP by now: bytes that cannot open a request
+        // (frames held back from a refused upgrade) close it. They must not
+        // reach TCP routing, nor wait out the header budget for a 408.
+        if n == 0 || !may_open_request(&buf[..n]) {
+            return Ok(());
+        }
+        if find_header_end(&buf[..n]).is_none() {
             n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
         }
-        if n == 0 {
+        if n == 0 || !is_http_request(&buf[..n]) {
             return Ok(());
         }
     }
+}
+
+/// Whether `data` can still be the start of a request: a method and its SP,
+/// or a read that ended inside the method token.
+fn may_open_request(data: &[u8]) -> bool {
+    is_http_request(data)
+        || (data.len() <= MAX_METHOD_LEN
+            && data.first().is_some_and(u8::is_ascii_uppercase)
+            && data.iter().all(|&b| is_method_byte(b)))
 }
 
 /// Complete a partially-read request header block within the slow-loris
@@ -2208,6 +2224,72 @@ mod connection_tests {
     async fn assert_never_connected(listener: &TcpListener) {
         let accepted = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
         assert!(accepted.is_err(), "the proxy connected to the backend");
+    }
+
+    /// A masked WebSocket text frame ("hello"), as a client streams it.
+    const WS_FRAME: &[u8] = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
+    /// Not HTTP, but holding the blank line that ends a head.
+    const OPAQUE: &[u8] = b"\x00\x01opaque\r\n\r\n";
+
+    /// `routes(http)` plus a TCP route on the engine's port.
+    fn routes_with_tcp(http: SocketAddr, tcp: SocketAddr) -> RouteTable {
+        let mut rt = routes(http);
+        rt.add_tcp_route(
+            8080,
+            vec![Backend {
+                socket_addr: tcp,
+                weight: 1,
+                filters: vec![],
+                use_tls: false,
+                server_name: String::new(),
+            }],
+        );
+        rt
+    }
+
+    #[tokio::test]
+    async fn refused_upgrade_closes_on_held_tunnel_frames() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, task) = serve(routes(addr));
+        let mut input = UPGRADE.to_vec();
+        input.extend_from_slice(WS_FRAME);
+        client.write_all(&input).await.unwrap();
+        // Not a 408 after the header budget: the connection is HTTP, and
+        // these bytes can never become a request.
+        let out = read_until_closed(&mut client).await;
+        assert_eq!(out, std::str::from_utf8(REFUSED).unwrap());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bytes_after_the_first_request_never_reach_tcp_routing() {
+        for first in [UPGRADE, b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n"] {
+            let (addr, _rx) = backend(REFUSED).await;
+            let tcp = idle_backend().await;
+            let (mut client, task) = serve(routes_with_tcp(addr, tcp.local_addr().unwrap()));
+            let mut input = first.to_vec();
+            input.extend_from_slice(OPAQUE);
+            client.write_all(&input).await.unwrap();
+            let out = read_until_closed(&mut client).await;
+            assert!(out.starts_with("HTTP/1.1 "), "{out}");
+            task.await.unwrap().unwrap();
+            assert_never_connected(&tcp).await;
+        }
+    }
+
+    /// A read can end inside the method: that is still a request.
+    #[tokio::test]
+    async fn held_bytes_split_inside_the_method_still_route() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let mut input = UPGRADE.to_vec();
+        input.extend_from_slice(b"GE");
+        client.write_all(&input).await.unwrap();
+        let mut head = vec![0u8; REFUSED.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, REFUSED);
+        let out = exchange(&mut client, b"T / HTTP/1.1\r\nHost: nope.test\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
     }
 
     #[tokio::test]
