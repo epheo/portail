@@ -826,7 +826,6 @@ mod tests {
             "DELETE",
             "OPTIONS",
             "PATCH",
-            "CONNECT",
             "TRACE",
             "PROPFIND",
             "PROPPATCH",
@@ -956,6 +955,20 @@ mod tests {
             local_reply(
                 &rt,
                 b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            (400, false)
+        );
+    }
+
+    /// Sniffed as HTTP so the client gets an answer instead of a silent
+    /// close, and that answer is never a 2xx: nothing here tunnels.
+    #[test]
+    fn connect_gets_a_closing_400() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        assert_eq!(
+            local_reply(
+                &rt,
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
             ),
             (400, false)
         );

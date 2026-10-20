@@ -89,9 +89,10 @@ pub struct HttpRequestInfo<'a> {
     ///   line ending the head;
     /// - Host: repeated, empty on HTTP/1.1, or not `host [":" port]` with
     ///   host a DNS-alphabet name or a bracketed IPv6 address;
-    /// - target: `*` without OPTIONS, CONNECT without authority-form, any
-    ///   other non-origin target that is not `http(s)://` absolute-form,
-    ///   userinfo, or an authority naming another host than Host.
+    /// - target: `*` without OPTIONS, any other non-origin target that is
+    ///   not `http(s)://` absolute-form, userinfo, or an authority naming
+    ///   another host than Host;
+    /// - method: CONNECT, as nothing here tunnels.
     ///
     /// The caller MUST reject such requests with `400` and close.
     pub header_violation: bool,
@@ -324,17 +325,12 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     let mut target_host: Option<&[u8]> = None;
     let mut path = target;
     let target_bytes = target.as_bytes();
-    let is_connect = method == "CONNECT";
-    if target_bytes[0] != b'/' || is_connect {
-        if is_connect {
-            // RFC 9110 9.3.6: CONNECT names only the tunnel's host:port.
-            match split_host(target_bytes) {
-                Some(h) if h > 0 && h + 1 < target_bytes.len() => {
-                    target_host = Some(&target_bytes[..h]);
-                }
-                _ => violation = true,
-            }
-        } else if target_bytes == b"*" {
+    if method == "CONNECT" {
+        // Nothing here tunnels: a 2xx would leave client and backend each
+        // waiting on a tunnel the other never opens.
+        violation = true;
+    } else if target_bytes[0] != b'/' {
+        if target_bytes == b"*" {
             violation = method != "OPTIONS";
         } else if let Some(scheme_len) = absolute_scheme_len(target_bytes) {
             // RFC 3986 ends the authority at '/', '?' or '#', a naive parser
@@ -533,8 +529,8 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
             return Err(anyhow!("Missing required Host header in HTTP/1.1 request"));
         }
     };
-    // Routing reads Host while an RFC 9112 recipient of an absolute-form or
-    // CONNECT target reads the target's authority: both must name one host.
+    // Routing reads Host while an RFC 9112 recipient of an absolute-form
+    // target reads the target's authority: both must name one host.
     if target_host.is_some_and(|t| !t.eq_ignore_ascii_case(host)) {
         violation = true;
     }

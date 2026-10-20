@@ -665,11 +665,6 @@ fn absolute_form_authority_must_name_the_host_header_host() {
 }
 
 #[test]
-fn connect_authority_must_name_the_host_header_host() {
-    assert_rejected(b"CONNECT internal.example:443 HTTP/1.1\r\nHost: public.example\r\n\r\n");
-}
-
-#[test]
 fn connection_cannot_nominate_framing_or_routing_fields() {
     for req in [
         &b"POST / HTTP/1.1\r\nHost: h\r\nConnection: close, Content-Length\r\nContent-Length: 5\r\n\r\n"[..],
@@ -829,12 +824,18 @@ fn options_asterisk_form_is_accepted() {
 }
 
 #[test]
-fn connect_authority_form_is_accepted() {
-    let info = accepted(b"CONNECT host:443 HTTP/1.1\r\nHost: host:443\r\n\r\n");
-    assert_eq!(info.method, "CONNECT");
-    assert_eq!(info.host, "host");
-    let info = accepted(b"CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]\r\n\r\n");
-    assert_eq!(info.host, "[::1]");
+fn connect_is_refused_in_every_form() {
+    // Nothing here tunnels: a 2xx would leave client and backend each
+    // waiting on a tunnel the other never opens.
+    for (line, host) in [
+        ("CONNECT host:443 HTTP/1.1", "host:443"),
+        ("CONNECT [::1]:443 HTTP/1.1", "[::1]"),
+        ("CONNECT host:443 HTTP/1.0", "host:443"),
+        ("CONNECT / HTTP/1.1", "host"),
+        ("CONNECT http://host/ HTTP/1.1", "host"),
+    ] {
+        assert_rejected(&head(line, &format!("Host: {host}\r\n")));
+    }
 }
 
 #[test]
@@ -908,7 +909,7 @@ fn mutated_heads_never_panic_and_frame_like_the_worker() {
     let seeds: [&[u8]; 4] = [
         b"GET /a?b=c HTTP/1.1\r\nHost: example.com:8080\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nX-Long: 0123456789abcdef0123\r\n\r\n",
         b"POST http://example.com/x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nX-Forwarded-Proto: https\r\n\r\nhello",
-        b"CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\n\r\n",
+        b"PATCH /x HTTP/1.1\r\nHost: [::1]:443\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\n\r\n",
         b"OPTIONS * HTTP/1.0\r\nExpect: 100-continue\r\nUpgrade: h2c\r\nHTTP2-Settings: x\r\n\r\n",
     ];
     let bytes = [
