@@ -117,6 +117,7 @@ const HOST: u8 = 1 << 3;
 const VALUE_HOLES: [u8; 1] = [0x7f];
 /// Routing reads `/admin#x` whole while a backend dropping the fragment, or
 /// reading '\' as '/', serves another path: a rule on that path is bypassed.
+/// A query may still carry '\': see `past_query_backslashes`.
 const TARGET_HOLES: [u8; 3] = [0x7f, b'#', b'\\'];
 
 /// Byte classes of the request-head grammar (RFC 9110, RFC 9112, RFC 3986).
@@ -173,7 +174,8 @@ pub(crate) fn is_field_value_byte(b: u8) -> bool {
     is(b, VALUE)
 }
 
-/// A byte this parser accepts in a request-target; see `TARGET_HOLES`.
+/// A byte this parser accepts anywhere in a request-target, so not '\',
+/// which passes in a query only; see `TARGET_HOLES`.
 #[inline(always)]
 pub(crate) fn is_target_byte(b: u8) -> bool {
     is(b, TARGET)
@@ -210,6 +212,19 @@ fn scan<const N: usize>(
         pos += 1;
     }
     pos
+}
+
+/// Resumes a target scan stopped at the '\' at `end` when a '?' before it
+/// opened the query: browsers send '\' raw there, where it is data. In a
+/// path the scan stays stopped, so the request line is refused.
+#[cold]
+fn past_query_backslashes(data: &[u8], start: usize, mut end: usize) -> usize {
+    if memchr::memchr(b'?', &data[start..end]).is_some() {
+        while data.get(end) == Some(&b'\\') {
+            end = scan(data, end + 1, TARGET, 0x21, TARGET_HOLES);
+        }
+    }
+    end
 }
 
 /// Strip RFC 9110 5.6.3 OWS (SP and HTAB only) from both ends.
@@ -327,7 +342,10 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         return Err(anyhow!("Malformed HTTP request line"));
     }
     let target_start = pos + 1;
-    let target_end = scan(data, target_start, TARGET, 0x21, TARGET_HOLES);
+    let mut target_end = scan(data, target_start, TARGET, 0x21, TARGET_HOLES);
+    if data.get(target_end) == Some(&b'\\') {
+        target_end = past_query_backslashes(data, target_start, target_end);
+    }
     if target_end == target_start || data.get(target_end) != Some(&b' ') {
         return Err(anyhow!("Malformed HTTP request line"));
     }
