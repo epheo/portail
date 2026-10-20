@@ -980,6 +980,23 @@ mod tests {
         }
     }
 
+    /// Browsers send '\' raw in a query; in a path some backends read it
+    /// as '/', past the rule routing matched.
+    #[test]
+    fn backslash_routes_in_the_query_only() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let sel = BackendSelector::new();
+        let req = make_request("GET", "/?q=a\\b", "example.com");
+        assert!(matches!(
+            analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap(),
+            RoutingResult::HttpForward { .. }
+        ));
+        for target in ["/a\\b", "/a\\b?x"] {
+            let req = make_request("GET", target, "example.com");
+            assert_eq!(local_reply(&rt, &req), (400, false), "{target}");
+        }
+    }
+
     /// Sniffed as HTTP so the client gets an answer instead of a silent
     /// close, and that answer is never a 2xx: nothing here tunnels.
     #[test]
