@@ -657,8 +657,28 @@ fn absolute_form_authority_must_name_the_host_header_host() {
         b"GET http://example.com#@evil.example/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
         b"GET http://example.com\\@evil.example/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
         b"GET http:///x HTTP/1.1\r\nHost: example.com\r\n\r\n",
-        // No Host to agree with.
-        b"GET http://example.com/ HTTP/1.0\r\n\r\n",
+    ] {
+        assert_rejected(req);
+    }
+}
+
+#[test]
+fn http10_absolute_form_without_host_routes_by_its_authority() {
+    // RFC 9112 3.2.2: the target names the host, and HTTP/1.0 need not
+    // repeat it in Host.
+    let info = accepted(b"GET http://Example.com:8080/x?y=1 HTTP/1.0\r\n\r\n");
+    assert_eq!(info.host, "Example.com");
+    assert_eq!(info.path, "/x");
+    assert_eq!(info.query_string, "y=1");
+    assert_eq!(
+        accepted(b"GET https://[::1] HTTP/1.0\r\n\r\n").host,
+        "[::1]"
+    );
+    // A Host present must still agree, and HTTP/1.1 still needs one.
+    for req in [
+        &b"GET http://example.com/ HTTP/1.0\r\nHost: other.example\r\n\r\n"[..],
+        b"GET http://example.com/ HTTP/1.0\r\nHost:\r\n\r\n",
+        b"GET http://example.com/ HTTP/1.1\r\n\r\n",
     ] {
         assert_rejected(req);
     }
