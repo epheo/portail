@@ -20,9 +20,10 @@ use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
-    apply_request_header_modifications, apply_response_header_mods, assemble_forward_headers,
-    assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods, extract_url_rewrite,
-    header_lines, sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
+    absolute_form_target, apply_request_header_modifications, apply_response_header_mods,
+    assemble_forward_headers, assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods,
+    extract_url_rewrite, header_lines, sanitize_response_headers, to_origin_form,
+    HeaderModifications, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{find_header_end, parse_digits, trim_ows};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
@@ -1129,6 +1130,14 @@ fn build_outgoing_headers(
         );
     }
 
+    // The backend is an origin server, sent origin-form only (RFC 9112
+    // 3.2.1). Before filters, so a URLRewrite or set Host meets the same
+    // head as for an origin-form request.
+    if let Some((target, authority)) = absolute_form_target(raw, meta.path_span) {
+        to_origin_form(&state.scratch_buf, target, authority, &mut state.filter_buf);
+        std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
+    }
+
     // has_filters already covers every backend's filters (see routing build).
     if rule.has_filters {
         let rule_mods = extract_header_mods(&rule.filters, false);
@@ -2095,7 +2104,7 @@ fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: boo
 #[cfg(test)]
 mod connection_tests {
     use super::*;
-    use crate::routing::{Backend, PathMatchType};
+    use crate::routing::{Backend, HttpHeader, PathMatchType, URLRewritePath};
     use tokio::io::DuplexStream;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -2264,6 +2273,135 @@ mod connection_tests {
             .expect("backend connection never closed")
             .unwrap();
         String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    /// One prefix rule on `host`, with `filters`, proxying to `backend`.
+    fn filtered_route(
+        host: &str,
+        prefix: &str,
+        filters: Vec<HttpFilter>,
+        backend: SocketAddr,
+    ) -> RouteTable {
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            host,
+            HttpRouteRule::new(
+                PathMatchType::Prefix,
+                prefix.to_string(),
+                vec![],
+                vec![],
+                filters,
+                vec![Backend {
+                    socket_addr: backend,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                }],
+            ),
+        );
+        rt
+    }
+
+    /// Sends `request` through `rt` (backend answering REFUSED) and returns
+    /// the head the backend received, after checking it has one Host line.
+    async fn forwarded_head(rt: impl FnOnce(SocketAddr) -> RouteTable, request: &str) -> String {
+        let (addr, mut rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(rt(addr));
+        let out = exchange(&mut client, request.as_bytes()).await;
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{request:?}: {out}");
+        let seen = delivered(&mut rx).await;
+        let hosts = seen.to_ascii_lowercase().matches("\r\nhost:").count();
+        assert_eq!(hosts, 1, "{seen}");
+        seen
+    }
+
+    /// RFC 9112 3.2.1: the backend is an origin server, which is sent
+    /// origin-form; 3.2.2: the target's authority goes to Host.
+    #[tokio::test]
+    async fn absolute_form_reaches_the_backend_as_origin_form() {
+        for (request, line, host) in [
+            (
+                "GET http://a.test:8080/p?q=1 HTTP/1.1\r\nHost: a.test:8080\r\n\r\n",
+                "GET /p?q=1 HTTP/1.1\r\n",
+                "a.test:8080",
+            ),
+            (
+                "GET HTTP://a.test/p HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /p HTTP/1.1\r\n",
+                "a.test",
+            ),
+            (
+                "GET http://a.test HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET / HTTP/1.1\r\n",
+                "a.test",
+            ),
+            // The target's port wins over a Host that leaves it out.
+            (
+                "GET http://a.test:8080/p HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /p HTTP/1.1\r\n",
+                "a.test:8080",
+            ),
+            (
+                "GET http://a.test/p?q HTTP/1.0\r\n\r\n",
+                "GET /p?q HTTP/1.0\r\n",
+                "a.test",
+            ),
+        ] {
+            let seen = forwarded_head(routes, request).await;
+            assert!(seen.starts_with(line), "{request:?}: {seen}");
+            assert!(seen.contains(&format!("\r\nHost: {host}\r\n")), "{seen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_takes_a_hostname_rewrite() {
+        let rewrite = vec![HttpFilter::URLRewrite {
+            hostname: Some("internal.example".to_string()),
+            path: None,
+        }];
+        let seen = forwarded_head(
+            |addr| filtered_route("w.test", "/", rewrite, addr),
+            "GET http://w.test/x?y HTTP/1.1\r\nHost: w.test\r\n\r\n",
+        )
+        .await;
+        assert!(seen.starts_with("GET /x?y HTTP/1.1\r\n"), "{seen}");
+        assert!(seen.contains("\r\nHost: internal.example\r\n"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn absolute_form_takes_a_path_prefix_rewrite() {
+        let rewrite = vec![HttpFilter::URLRewrite {
+            hostname: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+        }];
+        let seen = forwarded_head(
+            |addr| filtered_route("p.test", "/v1", rewrite, addr),
+            "GET http://p.test:8080/v1/users HTTP/1.1\r\nHost: p.test\r\n\r\n",
+        )
+        .await;
+        assert!(seen.starts_with("GET /v2/users HTTP/1.1\r\n"), "{seen}");
+        assert!(seen.contains("\r\nHost: p.test:8080\r\n"), "{seen}");
+    }
+
+    /// The authority's Host is replaced by a `set Host`, never doubled.
+    #[tokio::test]
+    async fn absolute_form_takes_a_set_host() {
+        let set = vec![HttpFilter::RequestHeaderModifier {
+            add: Arc::new(vec![]),
+            set: Arc::new(vec![HttpHeader {
+                name: "Host".to_string(),
+                value: "set.example".to_string(),
+            }]),
+            remove: Arc::new(vec![]),
+        }];
+        let seen = forwarded_head(
+            |addr| filtered_route("s.test", "/", set, addr),
+            "GET http://s.test/x HTTP/1.1\r\nHost: s.test\r\n\r\n",
+        )
+        .await;
+        assert!(seen.starts_with("GET /x HTTP/1.1\r\n"), "{seen}");
+        assert!(seen.contains("\r\nHost: set.example\r\n"), "{seen}");
     }
 
     #[tokio::test]
