@@ -637,7 +637,9 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                     .as_ref()
                     .map(crate::routing::URLRewritePath::from);
                 Self::RequestRedirect {
-                    scheme: config.scheme.clone(),
+                    // Accepted in any case, but the redirect builder compares
+                    // against lowercase literals to drop default ports.
+                    scheme: config.scheme.as_deref().map(str::to_ascii_lowercase),
                     hostname: config.hostname.clone(),
                     port: config.port,
                     path,
@@ -1035,6 +1037,38 @@ mod tests {
         assert_eq!(rule.filters.len(), 1);
         assert!(
             matches!(&rule.filters[0], crate::routing::HttpFilter::URLRewrite { hostname: Some(h), .. } if h == "new.example.com")
+        );
+    }
+
+    /// A file config may spell the scheme in any case (RFC 3986 3.1); the
+    /// redirect must still write it, and compare it, in lowercase.
+    #[test]
+    fn test_redirect_scheme_any_case_reaches_the_table_lowercase() {
+        let json = r#"{
+            "gateway": {
+                "name": "test-gw",
+                "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]
+            },
+            "httpRoutes": [{
+                "parentRefs": [{"name": "test-gw", "sectionName": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "filters": [{"type": "RequestRedirect", "requestRedirect": {"scheme": "HTTPS", "statusCode": 301}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table().unwrap();
+        let rule = rt
+            .find_http_route("example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(
+            matches!(&rule.filters[0], crate::routing::HttpFilter::RequestRedirect { scheme: Some(s), .. } if s == "https"),
+            "{:?}",
+            rule.filters
         );
     }
 

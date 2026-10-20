@@ -91,12 +91,12 @@ fn check_path(path: &str) -> Result<()> {
     }
 }
 
-/// Lowercase only: the redirect builder compares against these literals to
-/// drop default ports from `Location`.
+/// Any case (RFC 3986 3.1): the route table build lowercases it.
 fn check_scheme(scheme: &str) -> Result<()> {
-    match scheme {
-        "http" | "https" => Ok(()),
-        _ => Err(anyhow!("{:?} must be \"http\" or \"https\"", scheme)),
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        Ok(())
+    } else {
+        Err(anyhow!("{:?} must be \"http\" or \"https\"", scheme))
     }
 }
 
@@ -389,10 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn scheme_is_http_or_https() {
-        assert!(check_scheme("http").is_ok());
-        assert!(check_scheme("https").is_ok());
-        for bad in ["", "HTTPS", "ftp", "javascript", "https\r\n"] {
+    fn scheme_is_http_or_https_in_any_case() {
+        for ok in ["http", "https", "HTTPS", "Http"] {
+            assert!(check_scheme(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["", "ftp", "javascript", "https\r\n", "HTTPS ", "httpss"] {
             assert!(check_scheme(bad).is_err(), "{bad:?}");
         }
     }
