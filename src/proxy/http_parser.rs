@@ -62,7 +62,8 @@ impl StripSpans {
 #[derive(Debug, Clone)]
 pub struct HttpRequestInfo<'a> {
     pub method: &'a str,
-    /// Port stripped; an IP literal keeps its brackets (`[::1]`).
+    /// Port stripped; an IP literal keeps its brackets (`[::1]`). An HTTP/1.0
+    /// request without Host takes its absolute-form target's authority.
     pub host: &'a str,
     pub path: &'a str,
     pub query_string: &'a str,
@@ -521,10 +522,12 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     }
 
     // Per RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header.
-    // HTTP/1.0 clients may omit it, so use empty string for routing to handle.
+    // HTTP/1.0 clients may omit it; an absolute-form target then names the
+    // host itself (RFC 9112 3.2.2), else routing gets the empty host.
     let host = match host {
         Some(h) => h,
-        None if is_http10 || violation => &[][..],
+        None if is_http10 => target_host.unwrap_or_default(),
+        None if violation => &[][..],
         None => {
             return Err(anyhow!("Missing required Host header in HTTP/1.1 request"));
         }
