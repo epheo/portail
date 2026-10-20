@@ -35,6 +35,8 @@
 //! instead of guessing, and the caller stops forwarding at that byte: past
 //! it, a lenient peer could find a second message the proxy never routed.
 
+use crate::proxy::http_parser::is_field_value_byte;
+
 /// Position in a chunked-encoded body. Bytes are fed in via
 /// [`observe`](Self::observe); [`is_terminated`](Self::is_terminated)
 /// flips to `true` after the final CRLF of the stream.
@@ -198,9 +200,9 @@ impl ChunkedStream {
             },
             Phase::SizeExt { size } => match byte {
                 b'\r' => Phase::SizeCrlf { size },
-                // HTAB, SP, VCHAR and obs-text: covers token and
-                // quoted-string extension values without tracking quotes.
-                b'\t' | b' '..=b'~' | 0x80..=0xff => Phase::SizeExt { size },
+                // Covers token and quoted-string extension values without
+                // tracking quotes.
+                _ if is_field_value_byte(byte) => Phase::SizeExt { size },
                 _ => Phase::Broken,
             },
             Phase::SizeCrlf { size } => match byte {
@@ -230,7 +232,7 @@ impl ChunkedStream {
                 b'\r' => Phase::TrailerCr { blank: true },
                 // Leading SP/HTAB is obs-fold; a leading ':' an empty name.
                 b' ' | b'\t' | b':' => Phase::Broken,
-                _ if is_ctl(byte) => Phase::Broken,
+                _ if !is_field_value_byte(byte) => Phase::Broken,
                 _ => Phase::TrailerLine { saw_colon: false },
             },
             Phase::TrailerLine { saw_colon } => match byte {
@@ -239,7 +241,7 @@ impl ChunkedStream {
                 b'\r' if saw_colon => Phase::TrailerCr { blank: false },
                 b':' => Phase::TrailerLine { saw_colon: true },
                 b'\t' => Phase::TrailerLine { saw_colon },
-                _ if is_ctl(byte) => Phase::Broken,
+                _ if !is_field_value_byte(byte) => Phase::Broken,
                 _ => Phase::TrailerLine { saw_colon },
             },
             Phase::TrailerCr { blank } => match byte {
@@ -264,12 +266,6 @@ fn shift_hex(hex: u64, nibble: u8) -> Option<u64> {
         return None;
     }
     Some((hex << 4) | u64::from(nibble))
-}
-
-/// RFC 5234 CTL: 0x00-0x1F and DEL.
-#[inline]
-fn is_ctl(byte: u8) -> bool {
-    byte < 0x20 || byte == 0x7f
 }
 
 #[cfg(test)]

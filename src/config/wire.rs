@@ -7,21 +7,18 @@ use anyhow::{anyhow, Result};
 use std::net::Ipv6Addr;
 
 use super::types::{HeaderModifierConfig, HttpRouteFilter, HttpURLRewritePath};
+use crate::proxy::http_parser::{is_field_value_byte, is_target_byte, is_token};
 
-/// RFC 9110 5.1: a field name is a non-empty token (5.6.2 tchar).
+/// RFC 9110 5.1: a field name is a token.
 pub(crate) fn is_header_name(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+    is_token(name)
 }
 
-/// First byte RFC 9110 5.5 forbids in a field value: every CTL except HTAB.
-/// obs-text (0x80-0xFF) stays legal, which is what lets UTF-8 values through.
+/// First byte RFC 9110 5.5 forbids in a field value.
 fn header_value_violation(value: &[u8]) -> Option<(usize, u8)> {
     value
         .iter()
-        .position(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        .position(|&b| !is_field_value_byte(b))
         .map(|i| (i, value[i]))
 }
 
@@ -76,14 +73,12 @@ fn check_path(path: &str) -> Result<()> {
     if !path.starts_with('/') {
         return Err(anyhow!("{:?} must start with '/'", path));
     }
-    // SP would end the request-target mid-path; '#' is never part of one.
-    match path
-        .bytes()
-        .position(|b| b <= b' ' || b == 0x7f || b == b'#')
-    {
+    // The parser's own target alphabet: SP would end the request-target
+    // mid-path, and the proxy must not write a target it refuses to read.
+    match path.bytes().position(|b| !is_target_byte(b)) {
         None => Ok(()),
         Some(i) => Err(anyhow!(
-            "{:?} has forbidden byte 0x{:02x} at {} (no SP, CTL or '#')",
+            "{:?} has forbidden byte 0x{:02x} at {} (no SP, CTL, '#' or '\\')",
             path,
             path.as_bytes()[i],
             i
@@ -382,6 +377,7 @@ mod tests {
             "/a\0",
             "/a\x7f",
             "/a#frag",
+            "/a\\b",
             "http://x/a",
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
