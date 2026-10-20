@@ -21,7 +21,7 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
     apply_request_header_modifications, apply_response_header_mods, assemble_forward_headers,
     assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods, extract_url_rewrite,
-    sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
+    header_lines, sanitize_response_headers, HeaderModifications, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::find_header_end;
 use crate::proxy::request_processor::{
@@ -1306,18 +1306,22 @@ async fn forward_response_headers(
     expect_upgrade: bool,
     client_close: bool,
 ) -> Result<HeaderPhase> {
-    let (resp_header_end, framing) = match tokio::time::timeout(
-        header_budget,
-        read_response_headers(backend, header_buf, is_head_request, expect_upgrade),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            send_error_response(client, 504).await?;
-            return Ok(HeaderPhase::ErrorSent(504));
-        }
+    let resp_header_end =
+        match tokio::time::timeout(header_budget, read_response_head(backend, header_buf)).await {
+            Ok(Ok(end)) => end,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                send_error_response(client, 504).await?;
+                return Ok(HeaderPhase::ErrorSent(504));
+            }
+        };
+
+    let Some(framing) =
+        frame_response(header_buf, resp_header_end, is_head_request, expect_upgrade)
+    else {
+        warn!("Backend sent a response head with ambiguous framing; rejecting");
+        send_error_response(client, 502).await?;
+        return Ok(HeaderPhase::ErrorSent(502));
     };
 
     // A 101 nobody asked for would turn the client connection into an
@@ -1346,7 +1350,12 @@ async fn forward_response_headers(
 
     // Hop-by-hop response headers never reach the client (RFC 7230 §6.1);
     // the proxy owns the client-side Connection header.
-    sanitize_response_headers(&header_buf[..resp_header_end], client_close, scratch);
+    sanitize_response_headers(
+        &header_buf[..resp_header_end],
+        framing.transfer_encoded,
+        client_close || framing.close_delimited(),
+        scratch,
+    );
     let headers: &mut Vec<u8> = if let Some(mods) = resp_mods {
         apply_response_header_mods(scratch, mods, filter_buf);
         filter_buf
@@ -1494,6 +1503,10 @@ struct ResponseFraming {
     /// close, or an HTTP/1.0 response without keep-alive). Such a conn must
     /// not return to the pool: the next write would fail and burn the retry.
     backend_close: bool,
+    /// The head carries Transfer-Encoding, which overrides Content-Length:
+    /// the sanitizer then drops every Content-Length line.
+    transfer_encoded: bool,
+    /// `Some` iff the body is framed by Content-Length.
     content_length: Option<usize>,
     no_body: bool,
     /// Body bytes (within the declared framing) that arrived in the same
@@ -1501,7 +1514,7 @@ struct ResponseFraming {
     /// phase writes exactly this many tail bytes to the client, and it seeds
     /// the body-phase byte counter.
     body_bytes_already_forwarded: usize,
-    /// `Some` iff the response uses `Transfer-Encoding: chunked`. Pre-seeded
+    /// `Some` iff the final transfer coding is chunked. Pre-seeded
     /// with any chunked body bytes that arrived in the same read as the
     /// response headers, so the observer is already at the correct framing
     /// position when `forward_response_body` starts looping.
@@ -1514,27 +1527,31 @@ struct ResponseFraming {
     overshoot: bool,
 }
 
+impl ResponseFraming {
+    /// Only the backend's close ends this body, so the client connection
+    /// closes after it.
+    fn close_delimited(&self) -> bool {
+        !self.no_body && self.content_length.is_none() && self.chunked.is_none()
+    }
+}
+
 /// Cap of bytes accumulated while waiting for backend response headers. Protects
 /// against a backend that never finishes its header block. pub(crate) so the
 /// h2 bridge sizes its own response-head accumulation from the same limit
 /// instead of a copy that could drift below it.
 pub(crate) const RESPONSE_HEADER_CAP: usize = 65536;
 
-/// Phase 1 — read response headers from the backend into `header_buf`. Performs
-/// NO writes to the client; aborting/timeout/error before this returns leaves the
-/// client wire untouched, so the caller can still emit a clean `504`.
-/// On return, `header_buf` holds `[headers..header_end][same-read body tail...]`.
 /// Interim (1xx) responses tolerated per exchange before the backend is
 /// declared broken. Generous: a compliant exchange has at most a couple
 /// (100, 103), the cap only stops an infinite interim stream.
 const MAX_INTERIM_RESPONSES: u32 = 8;
 
-async fn read_response_headers(
-    backend: &mut Connection,
-    header_buf: &mut Vec<u8>,
-    is_head_request: bool,
-    expect_upgrade: bool,
-) -> Result<(usize, ResponseFraming)> {
+/// Phase 1: read response headers from the backend into `header_buf`. Performs
+/// NO writes to the client; aborting/timeout/error before this returns leaves the
+/// client wire untouched, so the caller can still emit a clean `504`.
+/// Returns where the final (non-interim) head ends: `header_buf` then holds
+/// `[headers..header_end][same-read body tail...]`.
+async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) -> Result<usize> {
     header_buf.clear();
     let mut interim_seen = 0u32;
 
@@ -1542,15 +1559,14 @@ async fn read_response_headers(
         // Check before reading: a swallowed interim response leaves the next
         // response's bytes already buffered.
         if let Some(header_end) = find_header_end(header_buf) {
-            let headers = &header_buf[..header_end];
-            let status = parse_response_status(headers);
+            let status = parse_response_status(&header_buf[..header_end]);
 
             // Interim responses are proxy-consumed: the proxy answers
             // 100-continue itself (Expect never reaches the backend), and
             // relaying other 1xx mid-exchange would confuse clients that
             // already got a 100. 1xx has no body, so everything past the
             // block belongs to the next response. 101 is not interim here —
-            // it is dispatched below (upgrade accept or reject).
+            // the caller dispatches it (upgrade accept or reject).
             if (100..200).contains(&status) && status != 101 {
                 interim_seen += 1;
                 if interim_seen > MAX_INTERIM_RESPONSES {
@@ -1563,69 +1579,7 @@ async fn read_response_headers(
                 header_buf.drain(..header_end);
                 continue;
             }
-            let backend_close = response_wants_close(headers);
-            let content_length = parse_content_length(headers);
-            let is_chunked = is_chunked_transfer(headers);
-            // RFC 7230 §3.3: responses to HEAD have no message body regardless
-            // of the response's Content-Length / Transfer-Encoding. Forcing
-            // no_body here keeps `forward_response_body` from blocking on
-            // bytes the backend correctly never sends.
-            let no_body = response_has_no_body(status, is_head_request);
-
-            // Decide how many of the tail bytes (same read as the headers)
-            // belong to THIS response's body. Anything beyond the declared
-            // framing is overshoot: dropped, and the conn is not poolable.
-            let tail_len = header_buf.len() - header_end;
-            let (tail_forward, chunked, overshoot) = if is_head_request {
-                // HEAD: any body bytes a non-compliant backend sent are
-                // dropped (never forwarded per RFC 7230 §3.3); the conn is
-                // already never pooled after HEAD.
-                (0, None, false)
-            } else if status == 101 && expect_upgrade {
-                // Accepted upgrade: bytes after the 101 header block are
-                // tunnel payload that arrived early — they must reach the
-                // client, not be dropped as no-body overshoot.
-                (tail_len, None, false)
-            } else if no_body {
-                // 204/304/1xx: no body allowed; any tail is overshoot.
-                (0, None, tail_len > 0)
-            } else if is_chunked {
-                let mut stream = ChunkedStream::new();
-                let consumed = if tail_len > 0 {
-                    stream.observe(&header_buf[header_end..])
-                } else {
-                    0
-                };
-                // A Broken stream also stops short of the tail; that is no
-                // overshoot, and the body phase resets the client on it.
-                let overshoot = stream.is_terminated() && consumed < tail_len;
-                (consumed, Some(stream), overshoot)
-            } else if let Some(cl) = content_length {
-                (tail_len.min(cl), None, tail_len > cl)
-            } else {
-                // EOF-framed: everything until close is body.
-                (tail_len, None, false)
-            };
-
-            return Ok((
-                header_end,
-                ResponseFraming {
-                    status,
-                    backend_close,
-                    // Chunked overrides Content-Length (RFC 9112 6.3): a
-                    // stray small CL must not end the body early and pool a
-                    // conn with chunked bytes still unread.
-                    content_length: if is_head_request || is_chunked {
-                        None
-                    } else {
-                        content_length
-                    },
-                    no_body,
-                    body_bytes_already_forwarded: tail_forward,
-                    chunked,
-                    overshoot,
-                },
-            ));
+            return Ok(header_end);
         }
 
         if header_buf.len() > RESPONSE_HEADER_CAP {
@@ -1642,6 +1596,76 @@ async fn read_response_headers(
             ));
         }
     }
+}
+
+/// Framing of the final head in `header_buf[..header_end]`, including how
+/// much of the same-read tail belongs to its body. `None` when the head is
+/// malformed (see `parse_response_head`): none of it may reach the client.
+fn frame_response(
+    header_buf: &[u8],
+    header_end: usize,
+    is_head_request: bool,
+    expect_upgrade: bool,
+) -> Option<ResponseFraming> {
+    let head = &header_buf[..header_end];
+    let parsed = parse_response_head(head)?;
+    let status = parse_response_status(head);
+    // RFC 7230 3.3: responses to HEAD have no message body regardless
+    // of the response's Content-Length / Transfer-Encoding. Forcing
+    // no_body here keeps `forward_response_body` from blocking on
+    // bytes the backend correctly never sends.
+    let no_body = response_has_no_body(status, is_head_request);
+    let mut framing = ResponseFraming {
+        status,
+        backend_close: parsed.backend_close,
+        transfer_encoded: parsed.transfer_encoded,
+        content_length: None,
+        no_body,
+        body_bytes_already_forwarded: 0,
+        chunked: None,
+        overshoot: false,
+    };
+
+    // Decide how many of the tail bytes (same read as the headers)
+    // belong to THIS response's body. Anything beyond the declared
+    // framing is overshoot: dropped, and the conn is not poolable.
+    let tail = &header_buf[header_end..];
+    if is_head_request {
+        // HEAD: any body bytes a non-compliant backend sent are
+        // dropped (never forwarded per RFC 7230 3.3); the conn is
+        // already never pooled after HEAD.
+    } else if status == 101 && expect_upgrade {
+        // Accepted upgrade: bytes after the 101 header block are
+        // tunnel payload that arrived early: they must reach the
+        // client, not be dropped as no-body overshoot.
+        framing.body_bytes_already_forwarded = tail.len();
+    } else if no_body {
+        // 204/304/1xx: no body allowed; any tail is overshoot.
+        framing.overshoot = !tail.is_empty();
+    } else {
+        match parsed.body {
+            BodyFraming::Chunked => {
+                let mut stream = ChunkedStream::new();
+                let consumed = if tail.is_empty() {
+                    0
+                } else {
+                    stream.observe(tail)
+                };
+                // A Broken stream also stops short of the tail; that is no
+                // overshoot, and the body phase resets the client on it.
+                framing.overshoot = stream.is_terminated() && consumed < tail.len();
+                framing.body_bytes_already_forwarded = consumed;
+                framing.chunked = Some(stream);
+            }
+            BodyFraming::Length(cl) => {
+                framing.body_bytes_already_forwarded = tail.len().min(cl);
+                framing.overshoot = tail.len() > cl;
+                framing.content_length = Some(cl);
+            }
+            BodyFraming::Close => framing.body_bytes_already_forwarded = tail.len(),
+        }
+    }
+    Some(framing)
 }
 
 /// How the response body ended.
@@ -1688,8 +1712,7 @@ async fn forward_response_body(
     loop {
         let n = idle_guarded(idle, backend.read(buf)).await?;
         if n == 0 {
-            let close_delimited = framing.chunked.is_none() && framing.content_length.is_none();
-            return Ok(if close_delimited {
+            return Ok(if framing.close_delimited() {
                 BodyEnd::Closed
             } else {
                 BodyEnd::Truncated
@@ -1979,20 +2002,21 @@ mod connection_tests {
 
     /// Backend answering the first request head of each connection with
     /// `reply`; yields all bytes a connection delivered once it closes.
-    async fn backend(reply: &'static [u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
+    async fn backend(reply: &[u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = reply.to_vec();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let tx = tx.clone();
+                let (tx, reply) = (tx.clone(), reply.clone());
                 tokio::spawn(async move {
                     let (mut seen, mut chunk, mut replied) = (Vec::new(), [0u8; 4096], false);
                     while let Ok(n @ 1..) = sock.read(&mut chunk).await {
                         seen.extend_from_slice(&chunk[..n]);
                         if !replied && find_header_end(&seen).is_some() {
                             replied = true;
-                            if sock.write_all(reply).await.is_err() {
+                            if sock.write_all(&reply).await.is_err() {
                                 break;
                             }
                         }
@@ -2002,6 +2026,30 @@ mod connection_tests {
             }
         });
         (addr, rx)
+    }
+
+    /// Backend answering the first request head of each connection with
+    /// `reply`, then closing: the end of a close-delimited body.
+    async fn closing_backend(reply: &[u8]) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = reply.to_vec();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
+                        seen.extend_from_slice(&chunk[..n]);
+                        if find_header_end(&seen).is_some() {
+                            let _ = sock.write_all(&reply).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
     }
 
     /// a.test proxies to `backend`; r.test redirects to https.
@@ -2083,6 +2131,17 @@ mod connection_tests {
     async fn exchange(client: &mut DuplexStream, input: &[u8]) -> String {
         client.write_all(input).await.unwrap();
         client.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("engine never closed the connection")
+            .unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Everything until the engine closes, without half-closing first: the
+    /// close must be the engine's own decision.
+    async fn read_until_closed(client: &mut DuplexStream) -> String {
         let mut out = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
             .await
@@ -2241,6 +2300,89 @@ mod connection_tests {
         );
     }
 
+    /// Codings before the final chunked do not change the framing, and the
+    /// Content-Length beside them neither ends the body nor reaches the client.
+    #[tokio::test]
+    async fn final_chunked_coding_frames_the_response() {
+        for te in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let reply =
+                format!("HTTP/1.1 200 OK\r\n{te}Content-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+            let (addr, _rx) = backend(reply.as_bytes()).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert_eq!(
+                out,
+                format!("HTTP/1.1 200 OK\r\n{te}\r\n5\r\nhello\r\n0\r\n\r\n"),
+                "{te}"
+            );
+        }
+    }
+
+    /// No final chunked: only the backend's close ends the body, so the
+    /// client connection closes after it and says so.
+    #[tokio::test]
+    async fn other_transfer_codings_are_read_to_the_backend_close() {
+        for te in [
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
+        ] {
+            let reply = format!("HTTP/1.1 200 OK\r\n{te}Content-Length: 2\r\n\r\nhello");
+            let addr = closing_backend(reply.as_bytes()).await;
+            let (mut client, task) = serve(routes(addr));
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET /2 HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let out = read_until_closed(&mut client).await;
+            assert_eq!(
+                out,
+                format!("HTTP/1.1 200 OK\r\n{te}Connection: close\r\n\r\nhello"),
+                "{te}"
+            );
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_backend_content_length_gets_a_502() {
+        for cl in [
+            "Content-Length: 5, 5\r\n",
+            "Content-Length: +5\r\n",
+            "Content-Length: 5\r\nContent-Length: 6\r\n",
+            "Content-Length: \r\n",
+            "Content-Length: 0x5\r\n",
+            "Content-Length: 99999999999999999999999\r\n",
+        ] {
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\n{cl}\r\nhelloHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfake"
+            );
+            let addr = closing_backend(reply.as_bytes()).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert_eq!(
+                out,
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway",
+                "{cl}"
+            );
+        }
+
+        // Repeated lines agreeing on one value frame by it.
+        let addr = closing_backend(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+        );
+    }
+
     #[test]
     fn local_reply_announces_close_exactly_when_closing() {
         let bytes = |status, location, close, head| {
@@ -2269,32 +2411,133 @@ mod connection_tests {
 
 // --- HTTP response parsing helpers ---
 
-pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    crate::routing::find_header_value(headers, "content-length")?
-        .parse()
-        .ok()
+/// How a response body is delimited (RFC 9112 6.3), absent a status or
+/// request method that rules out a body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyFraming {
+    Length(usize),
+    /// The final transfer coding is chunked; codings before it do not
+    /// change where the body ends.
+    Chunked,
+    /// Ends at the backend's close: neither header, or a Transfer-Encoding
+    /// whose final coding is not chunked.
+    Close,
 }
 
-pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
-    crate::routing::find_header_value(headers, "transfer-encoding")
-        .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
+/// The one reading of a response head that the body relay, the sanitizer
+/// and the h2 bridge all follow: two readings could disagree on where the
+/// body ends, and the client would take the rest as the next response.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResponseHead {
+    pub(crate) body: BodyFraming,
+    /// Any Transfer-Encoding overrides Content-Length, which must then not
+    /// be forwarded either.
+    pub(crate) transfer_encoded: bool,
+    /// An explicit Connection: close, or HTTP/1.0 without keep-alive.
+    pub(crate) backend_close: bool,
 }
 
-/// Whether the backend announced closing this connection: an explicit
-/// Connection: close token, or an HTTP/1.0 response without keep-alive.
-fn response_wants_close(headers: &[u8]) -> bool {
-    if let Some(v) = crate::routing::find_header_value(headers, "connection") {
-        for token in v.split(',') {
-            let t = token.trim();
-            if t.eq_ignore_ascii_case("close") {
-                return true;
+/// `None` when a recipient could frame the head differently than this
+/// reading: a Content-Length other than one `1*DIGIT` value (repeated lines
+/// must agree), Transfer-Encoding on HTTP/1.0, or a line a client could
+/// split or name otherwise (bare CR, obs-fold, whitespace or a CTL in a
+/// field name). Lines are split exactly as the sanitizer splits them.
+pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
+    let mut lines = header_lines(head);
+    let status_line = lines.next()?;
+    if memchr::memchr(b'\r', status_line).is_some() {
+        return None;
+    }
+    let is_http10 = status_line.starts_with(b"HTTP/1.0");
+    let mut content_length: Option<usize> = None;
+    let (mut transfer_encoded, mut chunked_last) = (false, false);
+    let (mut close, mut keep_alive) = (false, false);
+
+    for line in lines {
+        if matches!(line[0], b' ' | b'\t') || memchr::memchr(b'\r', line).is_some() {
+            return None;
+        }
+        let Some(colon) = memchr::memchr(b':', line) else {
+            continue;
+        };
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        if name.is_empty() || name.iter().any(|&b| b <= b' ' || b == 0x7f) {
+            return None;
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            let n = parse_digits(trim_ows(value))?;
+            if content_length.is_some_and(|seen| seen != n) {
+                return None;
             }
-            if t.eq_ignore_ascii_case("keep-alive") {
-                return false;
+            content_length = Some(n);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            transfer_encoded = true;
+            for coding in value.split(|&b| b == b',').map(trim_ows) {
+                if !coding.is_empty() {
+                    chunked_last = coding.eq_ignore_ascii_case(b"chunked");
+                }
+            }
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            for token in value.split(|&b| b == b',').map(trim_ows) {
+                close |= token.eq_ignore_ascii_case(b"close");
+                keep_alive |= token.eq_ignore_ascii_case(b"keep-alive");
             }
         }
     }
-    headers.starts_with(b"HTTP/1.0")
+
+    // RFC 9112 6.1: HTTP/1.0 has no transfer codings, so its framing is
+    // faulty whatever the rest of the head says.
+    if transfer_encoded && is_http10 {
+        return None;
+    }
+    let body = match (transfer_encoded, content_length) {
+        (true, _) if chunked_last => BodyFraming::Chunked,
+        (true, _) | (false, None) => BodyFraming::Close,
+        (false, Some(n)) => BodyFraming::Length(n),
+    };
+    Some(ResponseHead {
+        body,
+        transfer_encoded,
+        backend_close: close || (is_http10 && !keep_alive),
+    })
+}
+
+/// Content-Length the engine frames this head's body by: `None` when there
+/// is none, Transfer-Encoding overrides it, or the head is malformed.
+pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    match parse_response_head(headers)?.body {
+        BodyFraming::Length(n) => Some(n),
+        BodyFraming::Chunked | BodyFraming::Close => None,
+    }
+}
+
+/// Whether the engine frames this head's body as chunked.
+pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
+    parse_response_head(headers).is_some_and(|h| h.body == BodyFraming::Chunked)
+}
+
+/// `1*DIGIT` only, the request parser's Content-Length rule: a sign, a list
+/// or an overflow is a length some recipient reads differently.
+fn parse_digits(v: &[u8]) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+    v.iter().try_fold(0usize, |n, &b| {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n.checked_mul(10)?.checked_add((b - b'0') as usize)
+    })
+}
+
+fn trim_ows(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = v {
+        v = rest;
+    }
+    v
 }
 
 /// Parse the 3-digit status code from a response status line
@@ -2410,6 +2653,7 @@ mod tests {
         ResponseFraming {
             status: 200,
             backend_close: false,
+            transfer_encoded: chunked,
             content_length,
             no_body: false,
             body_bytes_already_forwarded: 0,
@@ -2458,21 +2702,106 @@ mod tests {
 
     /// A stray small Content-Length beside chunked must not end the body
     /// before the terminator.
-    #[tokio::test]
-    async fn chunked_response_ignores_content_length() {
-        let (mut backend, mut backend_peer) = mem_pair();
-        backend_peer
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut header_buf = Vec::new();
-        let (_, framing) = read_response_headers(&mut backend, &mut header_buf, false, false)
-            .await
-            .unwrap();
+    #[test]
+    fn chunked_response_ignores_content_length() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
+        let framing = frame_response(head, head.len(), false, false).unwrap();
         assert!(framing.chunked.is_some());
         assert_eq!(framing.content_length, None);
+        assert!(framing.transfer_encoded);
+    }
+
+    fn head_framing(fields: &str) -> Option<BodyFraming> {
+        parse_response_head(format!("HTTP/1.1 200 OK\r\n{fields}\r\n").as_bytes()).map(|h| h.body)
+    }
+
+    #[test]
+    fn response_framing_follows_the_final_transfer_coding() {
+        use BodyFraming::{Chunked, Close, Length};
+        for (fields, want) in [
+            ("Content-Length: 5\r\n", Length(5)),
+            ("Content-Length:5 \r\nContent-Length: 5\r\n", Length(5)),
+            ("Content-Length: 007\r\n", Length(7)),
+            ("", Close),
+            ("Transfer-Encoding: chunked\r\n", Chunked),
+            (
+                "Transfer-Encoding: CHUNKED\r\nContent-Length: 9\r\n",
+                Chunked,
+            ),
+            ("Transfer-Encoding: gzip, chunked\r\n", Chunked),
+            (
+                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+                Chunked,
+            ),
+            ("Transfer-Encoding: chunked, \r\n", Chunked),
+            ("Transfer-Encoding: chunked, gzip\r\n", Close),
+            (
+                "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
+                Close,
+            ),
+            (
+                "Transfer-Encoding: identity\r\nContent-Length: 5\r\n",
+                Close,
+            ),
+            ("Transfer-Encoding: chunked;x=1\r\n", Close),
+            ("Transfer-Encoding: \r\nContent-Length: 5\r\n", Close),
+        ] {
+            assert_eq!(head_framing(fields), Some(want), "{fields:?}");
+        }
+    }
+
+    #[test]
+    fn response_heads_a_client_could_frame_differently_are_malformed() {
+        for fields in [
+            "Content-Length: 5, 5\r\n",
+            "Content-Length: +5\r\n",
+            "Content-Length: -1\r\n",
+            "Content-Length: 5 5\r\n",
+            "Content-Length: 5\r\nContent-Length: 6\r\n",
+            "Content-Length: \r\n",
+            "Content-Length: 18446744073709551616\r\n",
+            // Malformed even where Transfer-Encoding overrides it.
+            "Transfer-Encoding: chunked\r\nContent-Length: x\r\n",
+            "Content-Length : 5\r\n",
+            "Transfer-Encoding\t: chunked\r\n",
+            ": x\r\n",
+            "X-A: 1\rContent-Length: 5\r\n",
+            "Content-Length: 5\r\r\n",
+            "Transfer-Encoding: gzip,\r\n chunked\r\n",
+            "X-A: 1\r\n\tContent-Length: 5\r\n",
+        ] {
+            assert_eq!(head_framing(fields), None, "{fields:?}");
+        }
+        let head = b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(parse_response_head(head), None);
+        assert_eq!(parse_response_head(b"HTTP/1.1 200 OK\rX\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn backend_close_is_any_close_token_or_a_bare_http10() {
+        let close = |head: &[u8]| parse_response_head(head).unwrap().backend_close;
+        assert!(!close(b"HTTP/1.1 200 OK\r\n\r\n"));
+        assert!(close(
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\n"
+        ));
+        assert!(close(
+            b"HTTP/1.1 200 OK\r\nX: 1\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(close(b"HTTP/1.0 200 OK\r\n\r\n"));
+        assert!(!close(b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n\r\n"));
+    }
+
+    /// The h2 bridge frames the engine's output with these; they must agree
+    /// with the engine's own reading.
+    #[test]
+    fn bridge_helpers_follow_the_engine_reading() {
+        let te =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 3\r\n\r\n";
+        assert!(is_chunked_transfer(te));
+        assert_eq!(parse_content_length(te), None);
+        let cl = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+        assert!(!is_chunked_transfer(cl));
+        assert_eq!(parse_content_length(cl), Some(3));
     }
 
     #[test]
