@@ -335,6 +335,10 @@ impl HttpRouteRule {
             backend_ref
                 .validate()
                 .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+            for (j, filter) in backend_ref.filters.iter().enumerate() {
+                validate_backend_filter(filter)
+                    .map_err(|e| anyhow!("Backend ref {} filter {}: {}", i, j, e))?;
+            }
         }
 
         for (i, match_rule) in self.matches.iter().enumerate() {
@@ -346,6 +350,7 @@ impl HttpRouteRule {
         for (i, filter) in self.filters.iter().enumerate() {
             validate_filter(filter).map_err(|e| anyhow!("Filter {}: {}", i, e))?;
         }
+        super::wire::check_rule_filters(&self.filters)?;
 
         // Gateway API restricts ReplacePrefixMatch to PathPrefix matches (CEL
         // enforces this in-cluster; file mode must reject it here). The data
@@ -491,12 +496,7 @@ fn validate_header_match(hm: &HttpHeaderMatch) -> Result<()> {
     if hm.name.is_empty() {
         return Err(anyhow!("Header match name cannot be empty"));
     }
-    // RFC 7230: header field names are tokens (visible ASCII, no delimiters)
-    if !hm
-        .name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
-    {
+    if !super::wire::is_header_name(hm.name.as_bytes()) {
         return Err(anyhow!(
             "Header match name '{}' contains invalid characters",
             hm.name
@@ -526,17 +526,6 @@ fn validate_query_param_match(qp: &HttpQueryParamMatch) -> Result<()> {
     Ok(())
 }
 
-fn validate_rewrite_path(p: &HttpURLRewritePath) -> Result<()> {
-    let value = match p {
-        HttpURLRewritePath::ReplaceFullPath { value } => value,
-        HttpURLRewritePath::ReplacePrefixMatch { value } => value,
-    };
-    if !value.starts_with('/') {
-        return Err(anyhow!("path value must start with '/'"));
-    }
-    Ok(())
-}
-
 fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
     match filter {
         HttpRouteFilter::RequestRedirect { config } => {
@@ -558,9 +547,6 @@ fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
                     ))
                 }
             }
-            if let Some(ref p) = config.path {
-                validate_rewrite_path(p).map_err(|e| anyhow!("RequestRedirect {}", e))?;
-            }
         }
         HttpRouteFilter::RequestHeaderModifier { .. }
         | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
@@ -570,15 +556,24 @@ fn validate_filter(filter: &HttpRouteFilter) -> Result<()> {
                     "URLRewrite must set at least one of: hostname, path"
                 ));
             }
-            if let Some(ref p) = config.path {
-                validate_rewrite_path(p).map_err(|e| anyhow!("URLRewrite {}", e))?;
-            }
         }
         HttpRouteFilter::RequestMirror { config } => {
             config.backend_ref.validate()?;
         }
     }
-    Ok(())
+    super::wire::check_filter(filter)
+}
+
+/// The data plane applies only header modifiers per backend: any other
+/// filter there would be accepted and then silently never run.
+fn validate_backend_filter(filter: &HttpRouteFilter) -> Result<()> {
+    match filter {
+        HttpRouteFilter::RequestHeaderModifier { .. }
+        | HttpRouteFilter::ResponseHeaderModifier { .. } => super::wire::check_filter(filter),
+        _ => Err(anyhow!(
+            "only RequestHeaderModifier and ResponseHeaderModifier are supported on a backend ref"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1054,124 @@ mod tests {
             }],
         });
         assert!(cfg.validate().is_ok());
+    }
+
+    // --- Filter values spliced raw into HTTP/1 bytes -------------------------
+
+    fn config_with_rule(rule: HttpRouteRule) -> PortailConfig {
+        let mut cfg = config_with_listeners(vec![listener_on("http", 8080, None, None)]);
+        cfg.http_routes.push(HttpRouteConfig {
+            parent_refs: vec![ParentRef {
+                name: "gw".to_string(),
+                section_name: Some("http".to_string()),
+                port: None,
+            }],
+            hostnames: vec!["example.com".to_string()],
+            rules: vec![rule],
+        });
+        cfg
+    }
+
+    fn header_mod(add: Vec<HttpHeader>, set: Vec<HttpHeader>) -> HeaderModifierConfig {
+        HeaderModifierConfig {
+            add,
+            set,
+            remove: vec![],
+        }
+    }
+
+    fn header(name: &str, value: &str) -> HttpHeader {
+        HttpHeader {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_crlf_in_filter_fails_validation_naming_route_rule_and_filter() {
+        let cases = [
+            (
+                HttpRouteFilter::RequestHeaderModifier {
+                    config: header_mod(vec![], vec![header("X-A", "ok\r\nX-Injected: 1")]),
+                },
+                "Filter 0: RequestHeaderModifier set[0].value (header \"X-A\")",
+            ),
+            (
+                HttpRouteFilter::ResponseHeaderModifier {
+                    config: header_mod(vec![header("X-A\r\nX-Injected", "1")], vec![]),
+                },
+                "Filter 0: ResponseHeaderModifier add[0].name",
+            ),
+            (
+                HttpRouteFilter::RequestRedirect {
+                    config: RequestRedirectConfig {
+                        scheme: None,
+                        hostname: Some("evil.com\r\nSet-Cookie: s=1".to_string()),
+                        port: None,
+                        path: None,
+                        status_code: 302,
+                    },
+                },
+                "Filter 0: RequestRedirect hostname",
+            ),
+            (
+                HttpRouteFilter::URLRewrite {
+                    config: URLRewriteConfig {
+                        hostname: None,
+                        path: Some(HttpURLRewritePath::ReplaceFullPath {
+                            value: "/a HTTP/1.1\r\n\r\nGET /admin".to_string(),
+                        }),
+                    },
+                },
+                "Filter 0: URLRewrite path.replaceFullPath",
+            ),
+        ];
+        for (filter, field) in cases {
+            let cfg = config_with_rule(make_rule(vec![filter], vec![default_backend()]));
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.starts_with("HTTP route 0: HTTP route rule 0: "),
+                "{err}"
+            );
+            assert!(err.contains(field), "{err}");
+            assert!(!err.contains("X-Injected: 1"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_backend_ref_filters_are_validated() {
+        let mut backend = default_backend();
+        backend.filters = vec![HttpRouteFilter::RequestHeaderModifier {
+            config: header_mod(vec![], vec![header("X-B", "a\nb")]),
+        }];
+        let err = config_with_rule(make_rule(vec![], vec![backend.clone()]))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Backend ref 0 filter 0: RequestHeaderModifier set[0].value"),
+            "{err}"
+        );
+
+        // Accepted before, then never run by the data plane.
+        backend.filters = vec![HttpRouteFilter::URLRewrite {
+            config: URLRewriteConfig {
+                hostname: Some("ok.example.com".to_string()),
+                path: None,
+            },
+        }];
+        let err = config_with_rule(make_rule(vec![], vec![backend.clone()]))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supported on a backend ref"), "{err}");
+
+        backend.filters = vec![HttpRouteFilter::ResponseHeaderModifier {
+            config: header_mod(vec![header("X-B", "fine\tvalue")], vec![]),
+        }];
+        assert!(config_with_rule(make_rule(vec![], vec![backend]))
+            .validate()
+            .is_ok());
     }
 
     // --- Unknown fields in rule-level config are rejected at parse time ------

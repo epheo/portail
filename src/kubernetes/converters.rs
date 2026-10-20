@@ -156,7 +156,8 @@ pub(crate) fn convert_http_route(route: &HTTPRoute, gateway_name: &str) -> Resul
         .map(|rules| {
             rules
                 .iter()
-                .map(|r| convert_http_rule(r, ns))
+                .enumerate()
+                .map(|(i, r)| convert_http_rule(r, ns).map_err(|e| anyhow!("rule {}: {}", i, e)))
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?
@@ -184,20 +185,28 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule> {
         .as_ref()
         .map(|f| {
             f.iter()
-                .map(|f| convert_http_filter(f, ns))
+                .enumerate()
+                .map(|(i, f)| {
+                    convert_http_filter(f, ns).map_err(|e| anyhow!("filter {}: {}", i, e))
+                })
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?
         .unwrap_or_default();
+    crate::config::wire::check_rule_filters(&filters)?;
 
     let backend_refs = rule
         .backend_refs
         .as_ref()
         .map(|refs| {
             refs.iter()
-                .map(|br| convert_http_backend_ref(br, ns))
-                .collect::<Vec<_>>()
+                .enumerate()
+                .map(|(i, br)| {
+                    convert_http_backend_ref(br, ns).map_err(|e| anyhow!("backendRef {}: {}", i, e))
+                })
+                .collect::<Result<Vec<_>>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     let timeouts = rule.timeouts.as_ref().map(convert_timeouts);
@@ -326,54 +335,59 @@ macro_rules! convert_header_mod {
 }
 
 pub(crate) fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteFilter> {
-    match f.r#type {
+    let filter = match f.r#type {
         HTTPRouteRulesFiltersType::RequestHeaderModifier => {
             let hm = f
                 .request_header_modifier
                 .as_ref()
                 .ok_or_else(|| anyhow!("RequestHeaderModifier filter missing config"))?;
-            Ok(HttpRouteFilter::RequestHeaderModifier {
+            HttpRouteFilter::RequestHeaderModifier {
                 config: convert_header_mod!(hm),
-            })
+            }
         }
         HTTPRouteRulesFiltersType::ResponseHeaderModifier => {
             let hm = f
                 .response_header_modifier
                 .as_ref()
                 .ok_or_else(|| anyhow!("ResponseHeaderModifier filter missing config"))?;
-            Ok(HttpRouteFilter::ResponseHeaderModifier {
+            HttpRouteFilter::ResponseHeaderModifier {
                 config: convert_header_mod!(hm),
-            })
+            }
         }
         HTTPRouteRulesFiltersType::RequestRedirect => {
             let rr = f
                 .request_redirect
                 .as_ref()
                 .ok_or_else(|| anyhow!("RequestRedirect filter missing config"))?;
-            Ok(HttpRouteFilter::RequestRedirect {
+            HttpRouteFilter::RequestRedirect {
                 config: convert_redirect_config(rr),
-            })
+            }
         }
         HTTPRouteRulesFiltersType::UrlRewrite => {
             let ur = f
                 .url_rewrite
                 .as_ref()
                 .ok_or_else(|| anyhow!("URLRewrite filter missing config"))?;
-            Ok(HttpRouteFilter::URLRewrite {
+            HttpRouteFilter::URLRewrite {
                 config: convert_url_rewrite_config(ur),
-            })
+            }
         }
         HTTPRouteRulesFiltersType::RequestMirror => {
             let rm = f
                 .request_mirror
                 .as_ref()
                 .ok_or_else(|| anyhow!("RequestMirror filter missing config"))?;
-            Ok(HttpRouteFilter::RequestMirror {
+            HttpRouteFilter::RequestMirror {
                 config: convert_mirror_config(rm, ns),
-            })
+            }
         }
-        _ => Err(anyhow!("unsupported filter type")),
-    }
+        ref other => return Err(anyhow!("unsupported filter type {:?}", other)),
+    };
+    // The CRD patterns header names but not values, and this path never runs
+    // PortailConfig::validate(): without the check a route author can splice
+    // CR/LF into backend requests and client responses.
+    crate::config::wire::check_filter(&filter)?;
+    Ok(filter)
 }
 
 fn convert_redirect_config(rr: &HTTPRouteRulesFiltersRequestRedirect) -> RequestRedirectConfig {
@@ -459,43 +473,59 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
 // HTTP backend refs
 // ---------------------------------------------------------------------------
 
-fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> BackendRef {
-    BackendRef {
+fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> Result<BackendRef> {
+    Ok(BackendRef {
         name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
         port: br.port.unwrap_or(80) as u16,
         weight: br.weight.unwrap_or(1) as u32,
         group: br.group.clone().unwrap_or_default(),
         kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
-        filters: convert_backend_ref_filters(&br.filters),
+        filters: convert_backend_ref_filters(&br.filters)?,
         app_protocol: None,
-    }
+    })
 }
 
-/// Convert per-backend filters (e.g. BackendRequestHeaderModifier).
+/// Convert per-backend filters (e.g. BackendRequestHeaderModifier). Errors
+/// fail the route like rule-level filters do: the data plane applies only
+/// header modifiers per backend, and dropping any other filter would serve
+/// the route without it.
 fn convert_backend_ref_filters(
     filters: &Option<Vec<HTTPRouteRulesBackendRefsFilters>>,
-) -> Vec<HttpRouteFilter> {
+) -> Result<Vec<HttpRouteFilter>> {
     let Some(filters) = filters else {
-        return vec![];
+        return Ok(vec![]);
     };
     filters
         .iter()
-        .filter_map(|f| match f.r#type {
-            HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
-                let hm = f.request_header_modifier.as_ref()?;
-                Some(HttpRouteFilter::RequestHeaderModifier {
-                    config: convert_header_mod!(hm),
-                })
-            }
-            HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
-                let hm = f.response_header_modifier.as_ref()?;
-                Some(HttpRouteFilter::ResponseHeaderModifier {
-                    config: convert_header_mod!(hm),
-                })
-            }
-            _ => None, // Other filter types not valid at backend level
-        })
+        .enumerate()
+        .map(|(i, f)| convert_backend_ref_filter(f).map_err(|e| anyhow!("filter {}: {}", i, e)))
         .collect()
+}
+
+fn convert_backend_ref_filter(f: &HTTPRouteRulesBackendRefsFilters) -> Result<HttpRouteFilter> {
+    let filter = match f.r#type {
+        HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+            let hm = f
+                .request_header_modifier
+                .as_ref()
+                .ok_or_else(|| anyhow!("RequestHeaderModifier filter missing config"))?;
+            HttpRouteFilter::RequestHeaderModifier {
+                config: convert_header_mod!(hm),
+            }
+        }
+        HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+            let hm = f
+                .response_header_modifier
+                .as_ref()
+                .ok_or_else(|| anyhow!("ResponseHeaderModifier filter missing config"))?;
+            HttpRouteFilter::ResponseHeaderModifier {
+                config: convert_header_mod!(hm),
+            }
+        }
+        ref other => return Err(anyhow!("{:?} is not supported on a backendRef", other)),
+    };
+    crate::config::wire::check_filter(&filter)?;
+    Ok(filter)
 }
 
 // ---------------------------------------------------------------------------

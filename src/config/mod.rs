@@ -3,6 +3,7 @@ pub mod examples;
 pub mod parsing;
 pub mod types;
 pub mod validation;
+pub(crate) mod wire;
 
 pub use types::*;
 
