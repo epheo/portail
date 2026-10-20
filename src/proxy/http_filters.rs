@@ -74,7 +74,7 @@ pub(crate) fn assemble_forward_headers(
         cursor = ue;
     }
     out.extend_from_slice(&raw[cursor..terminator_start]);
-    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, raw, client_ip, is_tls, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -143,17 +143,23 @@ pub(crate) fn assemble_forward_headers_slow(
             out.extend_from_slice(b"\r\n");
         }
     }
-    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, raw, client_ip, is_tls, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
 fn append_forward_headers(
     out: &mut Vec<u8>,
+    raw: &[u8],
     client_ip: std::net::IpAddr,
     is_tls: bool,
     keep_upgrade: bool,
 ) {
     use std::io::Write;
+    if let Some(authority) = hostless_authority(raw) {
+        out.extend_from_slice(b"Host: ");
+        out.extend_from_slice(authority);
+        out.extend_from_slice(b"\r\n");
+    }
     // A fresh X-Forwarded-For line: multiple XFF headers concatenate as one
     // list, which avoids locating and splicing an existing header.
     out.extend_from_slice(b"X-Forwarded-For: ");
@@ -164,6 +170,34 @@ fn append_forward_headers(
     if keep_upgrade {
         out.extend_from_slice(b"Connection: upgrade\r\n");
     }
+}
+
+/// Host for a request that has no Host line, which only HTTP/1.0 may send:
+/// its absolute-form target's authority, the host it was routed by (RFC
+/// 9112 3.2.2). Without the line the backend sees no host at all, and a
+/// URLRewrite hostname or `set Host` finds nothing to replace. `None` with
+/// a Host line, or for any other target: routed with the empty host, such a
+/// request gets no Host rather than an empty one.
+fn hostless_authority(raw: &[u8]) -> Option<&[u8]> {
+    let line_end = memchr::memchr(b'\n', raw)?;
+    let line = raw[..line_end]
+        .strip_suffix(b"\r")?
+        .strip_suffix(b" HTTP/1.0")?;
+    let target = &line[memchr::memchr(b' ', line)? + 1..];
+    let scheme_len = [&b"http://"[..], b"https://"]
+        .into_iter()
+        .find(|s| {
+            target
+                .get(..s.len())
+                .is_some_and(|t| t.eq_ignore_ascii_case(s))
+        })?
+        .len();
+    // The parser held everything up to '/' to host[:port].
+    let rest = &target[scheme_len..];
+    let authority = &rest[..memchr::memchr(b'/', rest).unwrap_or(rest.len())];
+    let has_host = header_lines(&raw[line_end + 1..])
+        .any(|l| memchr::memchr(b':', l).is_some_and(|p| l[..p].eq_ignore_ascii_case(b"host")));
+    (!authority.is_empty() && !has_host).then_some(authority)
 }
 
 /// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 §6.1).
@@ -443,6 +477,8 @@ fn apply_header_mods_inner(
 ) {
     // Track which "set" headers were applied (matched existing headers)
     let mut set_applied: Vec<bool> = mods.map(|m| vec![false; m.set.len()]).unwrap_or_default();
+    // Like `set`, a hostname rewrite adds the Host it finds no line for.
+    let mut host_missing = rewrite_hostname;
 
     for line in header_lines(raw) {
         // Find colon to extract header name
@@ -462,6 +498,7 @@ fn apply_header_mods_inner(
                 out.extend_from_slice(b"Host: ");
                 out.extend_from_slice(new_host.as_bytes());
                 out.extend_from_slice(b"\r\n");
+                host_missing = None;
                 continue;
             }
         }
@@ -496,6 +533,12 @@ fn apply_header_mods_inner(
         }
 
         out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    if let Some(new_host) = host_missing {
+        out.extend_from_slice(b"Host: ");
+        out.extend_from_slice(new_host.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
 
@@ -711,6 +754,104 @@ mod tests {
         let s = std::str::from_utf8(&out).unwrap();
         assert_eq!(s.matches("X-Forwarded-Proto").count(), 1, "{s}");
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
+    }
+
+    /// An HTTP/1.0 request may omit Host and name its host in an
+    /// absolute-form target, which it is then routed by (RFC 9112 3.2.2).
+    #[test]
+    fn test_hostless_absolute_form_is_forwarded_with_its_authority_as_host() {
+        let ip = "10.1.2.3".parse().unwrap();
+        let spans = crate::proxy::http_parser::StripSpans::default();
+        for (req, authority) in [
+            (
+                &b"GET http://example.com:8080/x HTTP/1.0\r\nAccept: */*\r\n\r\n"[..],
+                "example.com:8080",
+            ),
+            (b"GET HTTPS://[::1] HTTP/1.0\r\n\r\n", "[::1]"),
+        ] {
+            let mut out = Vec::new();
+            assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert_eq!(s.matches("Host:").count(), 1, "{s}");
+            assert!(s.contains(&format!("\r\nHost: {authority}\r\n")), "{s}");
+            let mut slow = Vec::new();
+            assemble_forward_headers_slow(req, false, ip, false, &mut slow);
+            assert_eq!(slow, out);
+        }
+
+        // Filters then replace it like any other Host.
+        let req = b"GET http://example.com/x HTTP/1.0\r\n\r\n";
+        let mut out = Vec::new();
+        assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
+        let rewrite = URLRewrite {
+            hostname: Some("internal.example".to_string()),
+            path: None,
+        };
+        let set = [HttpHeader {
+            name: "Host".to_string(),
+            value: "set.example".to_string(),
+        }];
+        let mods = HeaderModifications {
+            add: &[],
+            set: &set,
+            remove: &[],
+        };
+        for (mods, rewrite, host) in [
+            (None, Some(&rewrite), "internal.example"),
+            (Some(&mods), None, "set.example"),
+        ] {
+            let mut result = Vec::new();
+            apply_request_header_modifications(&out, mods, rewrite, &mut result);
+            let s = std::str::from_utf8(&result).unwrap();
+            assert_eq!(s.matches("Host:").count(), 1, "{s}");
+            assert!(s.contains(&format!("\r\nHost: {host}\r\n")), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_assembly_adds_host_only_where_a_host_is_known_and_missing() {
+        let ip = "10.1.2.3".parse().unwrap();
+        let spans = crate::proxy::http_parser::StripSpans::default();
+        let host_lines = |req: &[u8]| {
+            let mut out = Vec::new();
+            assemble_forward_headers(req, &spans, None, false, ip, false, &mut out);
+            String::from_utf8(out)
+                .unwrap()
+                .to_ascii_lowercase()
+                .matches("\r\nhost:")
+                .count()
+        };
+        // Routed with the empty host: an empty Host line would be worse than none.
+        assert_eq!(host_lines(b"GET /x HTTP/1.0\r\n\r\n"), 0);
+        assert_eq!(host_lines(b"OPTIONS * HTTP/1.0\r\n\r\n"), 0);
+        for req in [
+            &b"GET http://example.com/x HTTP/1.0\r\nhost: example.com\r\n\r\n"[..],
+            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            assert_eq!(host_lines(req), 1, "{}", String::from_utf8_lossy(req));
+        }
+    }
+
+    /// Like `set`, a URLRewrite hostname adds the Host it finds no line to
+    /// replace: an HTTP/1.0 origin-form request may carry none.
+    #[test]
+    fn test_url_rewrite_hostname_adds_a_missing_host() {
+        let rewrite = URLRewrite {
+            hostname: Some("internal.example".to_string()),
+            path: None,
+        };
+        let mut out = Vec::new();
+        apply_request_header_modifications(
+            b"GET /x HTTP/1.0\r\nAccept: */*\r\n\r\n",
+            None,
+            Some(&rewrite),
+            &mut out,
+        );
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "GET /x HTTP/1.0\r\nAccept: */*\r\nHost: internal.example\r\n\r\n"
+        );
     }
 
     /// The fast path strips these by parser span; a Connection-nominated
