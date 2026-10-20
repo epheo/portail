@@ -2,7 +2,7 @@
 //! All parsing functions use direct buffer references for maximum efficiency.
 
 use crate::logging::debug;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 /// Find the end of HTTP headers (\r\n\r\n boundary).
 /// Returns the position just past the double CRLF.
@@ -60,6 +60,7 @@ impl StripSpans {
 #[derive(Debug, Clone)]
 pub struct HttpRequestInfo<'a> {
     pub method: &'a str,
+    /// Port stripped; an IP literal keeps its brackets (`[::1]`).
     pub host: &'a str,
     pub path: &'a str,
     pub query_string: &'a str,
@@ -74,16 +75,22 @@ pub struct HttpRequestInfo<'a> {
     pub is_chunked: bool,
     /// Whether this is a WebSocket/protocol upgrade request
     pub is_upgrade: bool,
-    /// Set when the request carries headers that constitute a smuggling vector
-    /// per RFC 7230 §3.3.3:
-    /// - both `Content-Length` and `Transfer-Encoding: chunked` present,
-    /// - multiple `Content-Length` lines with conflicting values, or
-    /// - a `Transfer-Encoding` value other than a single, exact `chunked`
-    ///   (e.g. `gzip, chunked`, `identity`, repeated TE lines): the proxy
-    ///   would forward the TE header verbatim while framing the body
-    ///   differently than the backend — the classic TE.CL desync.
+    /// Set when a lenient backend could read this head differently from this
+    /// parser. Header bytes are forwarded verbatim, so any such gap is a
+    /// desync: request smuggling, or routing one vhost while the backend
+    /// serves another. Covers:
+    /// - framing: TE with CL, a repeated or non-`1*DIGIT` CL, any TE but one
+    ///   exact `chunked`, TE on HTTP/1.0, Connection nominating CL, TE or
+    ///   Host (forwarding strips what Connection nominates);
+    /// - syntax: a line not ended by CRLF, obs-fold, a field-name with a
+    ///   non-token byte (`Content-Length : 5`), a CTL in a value, no blank
+    ///   line ending the head;
+    /// - Host: repeated, empty on HTTP/1.1, or outside `host [":" port]`;
+    /// - target: `*` without OPTIONS, CONNECT without authority-form, any
+    ///   other non-origin target that is not `http(s)://` absolute-form,
+    ///   userinfo, or an authority naming another host than Host.
     ///
-    /// The caller MUST reject such requests with `400`.
+    /// The caller MUST reject such requests with `400` and close.
     pub header_violation: bool,
     /// Hop-by-hop header lines to strip when forwarding (RFC 7230 §6.1).
     pub strip_spans: StripSpans,
@@ -93,84 +100,280 @@ pub struct HttpRequestInfo<'a> {
     pub expect_continue: bool,
 }
 
-/// Extract complete HTTP routing information with zero-copy parsing
-/// Single-pass algorithm - parses method, host, path, headers in one scan
+const TCHAR: u8 = 1;
+const VALUE: u8 = 1 << 1;
+const TARGET: u8 = 1 << 2;
+const HOST: u8 = 1 << 3;
+
+/// Byte classes of the request-head grammar (RFC 9110, RFC 9112, RFC 3986).
+/// HOST is reg-name: unreserved, sub-delims and the `%` of pct-encoded; the
+/// structural `:`, `[` and `]` are left to `split_host`.
+static CLASS: [u8; 256] = {
+    const fn any_of(b: u8, set: &[u8]) -> bool {
+        let mut i = 0;
+        while i < set.len() {
+            if set[i] == b {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b.is_ascii_alphanumeric() || any_of(b, b"!#$%&'*+-.^_`|~") {
+            table[i] |= TCHAR;
+        }
+        if b == b'\t' || (b >= 0x20 && b != 0x7f) {
+            table[i] |= VALUE;
+        }
+        if b > 0x20 && b != 0x7f {
+            table[i] |= TARGET;
+        }
+        if b.is_ascii_alphanumeric() || any_of(b, b"-._~!$&'()*+,;=%") {
+            table[i] |= HOST;
+        }
+        i += 1;
+    }
+    table
+};
+
+#[inline(always)]
+fn is(b: u8, class: u8) -> bool {
+    CLASS[b as usize] & class != 0
+}
+
+const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+
+/// End of the run of `class` bytes starting at `pos`. Every byte at or above
+/// `floor` except DEL must belong to `class`, so whole words of such bytes
+/// skip the per-byte lookup; long values and targets cost a fraction of a
+/// lookup per byte. `floor` must not exceed 0x80 for the word test to be exact.
+#[inline(always)]
+fn scan(data: &[u8], mut pos: usize, class: u8, floor: u8) -> usize {
+    while let Some(word) = data[pos..].first_chunk::<8>() {
+        let w = u64::from_ne_bytes(*word);
+        let below_floor = w.wrapping_sub(ONES * floor as u64) & !w & HIGHS;
+        let del = w ^ (ONES * 0x7f);
+        if below_floor | (del.wrapping_sub(ONES) & !del & HIGHS) != 0 {
+            break;
+        }
+        pos += 8;
+    }
+    while pos < data.len() && is(data[pos], class) {
+        pos += 1;
+    }
+    pos
+}
+
+#[inline(always)]
+fn trim_ows(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = v {
+        v = rest;
+    }
+    v
+}
+
+/// Length of the uri-host opening `v` when all of `v` is `uri-host [":" port]`,
+/// else `None`. Host and a request-target authority both go through here, so
+/// the two are always compared under the same port stripping.
+#[inline]
+fn split_host(v: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    if v.first() == Some(&b'[') {
+        i = 1;
+        while i < v.len() && (is(v[i], HOST) || v[i] == b':') {
+            i += 1;
+        }
+        if i == 1 || v.get(i) != Some(&b']') {
+            return None;
+        }
+        i += 1;
+    } else {
+        while i < v.len() && is(v[i], HOST) {
+            i += 1;
+        }
+    }
+    let host_end = i;
+    if i < v.len() {
+        if v[i] != b':' {
+            return None;
+        }
+        i += 1;
+        while i < v.len() && v[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < v.len() {
+            return None;
+        }
+    }
+    Some(host_end)
+}
+
+/// `1*DIGIT` only: a sign, a list or an overflow is a length some backend
+/// reads differently, and that difference is the body boundary.
+#[inline]
+fn parse_content_length(v: &[u8]) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(n)
+}
+
+/// Length of an `http://` or `https://` prefix (schemes are case-insensitive).
+#[inline]
+fn absolute_scheme_len(target: &[u8]) -> Option<usize> {
+    if target.len() >= 7 && target[..7].eq_ignore_ascii_case(b"http://") {
+        Some(7)
+    } else if target.len() >= 8 && target[..8].eq_ignore_ascii_case(b"https://") {
+        Some(8)
+    } else {
+        None
+    }
+}
+
+/// Whether an Upgrade value offers h2c, with or without a version suffix.
+fn offers_h2c(value: &[u8]) -> bool {
+    value.split(|&b| b == b',').any(|offer| {
+        let offer = trim_ows(offer);
+        let name = match memchr::memchr(b'/', offer) {
+            Some(i) => &offer[..i],
+            None => offer,
+        };
+        trim_ows(name).eq_ignore_ascii_case(b"h2c")
+    })
+}
+
+/// Extract complete HTTP routing information with zero-copy parsing, in one
+/// pass that also validates the head. Header bytes are forwarded verbatim, so
+/// a head a lenient backend could read differently is refused, never
+/// normalized: `Err` when no request line or Host can be extracted,
+/// `header_violation` for everything else. Both mean 400 and close.
 #[inline(always)]
 pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> {
     debug!(
         "UNIFIED_PARSER: Processing HTTP request - content length: {}",
         request_data.len()
     );
+    let data = request_data;
+    let len = data.len();
 
-    // Single-pass state machine parser
+    // Exactly `method SP request-target SP HTTP-version CRLF`: any looser
+    // split lets a backend find a different method, target or version.
     let mut pos = 0;
-    let mut method: Option<&str> = None;
-    let mut path: Option<&str> = None;
-    let mut host: Option<&str> = None;
+    while pos < len && is(data[pos], TCHAR) {
+        pos += 1;
+    }
+    let method_end = pos;
+    if method_end == 0 || data.get(pos) != Some(&b' ') {
+        return Err(anyhow!("Malformed HTTP request line"));
+    }
+    let target_start = pos + 1;
+    let target_end = scan(data, target_start, TARGET, 0x21);
+    if target_end == target_start || data.get(target_end) != Some(&b' ') {
+        return Err(anyhow!("Malformed HTTP request line"));
+    }
+    let is_http10 = match data.get(target_end + 1..target_end + 11) {
+        Some(b"HTTP/1.1\r\n") => false,
+        Some(b"HTTP/1.0\r\n") => true,
+        _ => return Err(anyhow!("Malformed HTTP request line")),
+    };
+    let line = std::str::from_utf8(&data[..target_end])
+        .map_err(|_| anyhow!("Non-UTF8 data in HTTP request line"))?;
+    let method = &line[..method_end];
+    let target = &line[target_start..];
+
+    let mut violation = false;
+    let mut target_host: Option<&[u8]> = None;
+    let mut path = target;
+    let target_bytes = target.as_bytes();
+    let is_connect = method == "CONNECT";
+    if target_bytes[0] != b'/' || is_connect {
+        if is_connect {
+            // RFC 9110 9.3.6: CONNECT names only the tunnel's host:port.
+            match split_host(target_bytes) {
+                Some(h) if h > 0 && h + 1 < target_bytes.len() => {
+                    target_host = Some(&target_bytes[..h]);
+                }
+                _ => violation = true,
+            }
+        } else if target_bytes == b"*" {
+            violation = method != "OPTIONS";
+        } else if let Some(scheme_len) = absolute_scheme_len(target_bytes) {
+            // RFC 3986 ends the authority at '/', '?' or '#', a naive parser
+            // at '/' only. Holding everything up to '/' to host[:port] leaves
+            // no '?', '#' or '@' for the two readings to disagree on.
+            let rest = &target[scheme_len..];
+            let authority_len = memchr::memchr(b'/', rest.as_bytes()).unwrap_or(rest.len());
+            let authority = &rest.as_bytes()[..authority_len];
+            match split_host(authority) {
+                Some(h) if h > 0 => target_host = Some(&authority[..h]),
+                _ => violation = true,
+            }
+            path = if authority_len < rest.len() {
+                &rest[authority_len..]
+            } else {
+                "/"
+            };
+        } else {
+            violation = true;
+        }
+    }
+
+    pos = target_end + 11;
+    let header_start = pos;
+    let mut host: Option<&[u8]> = None;
     let mut explicit_keepalive: Option<bool> = None;
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     let mut has_upgrade_header = false;
+    let mut offers_h2c_upgrade = false;
     let mut connection_has_upgrade = false;
-    let mut is_http10 = false;
-    // RFC 7230 §3.3.3 smuggling guards. We flag (but keep parsing) so the
-    // request_processor can reject with a clean 400.
-    let mut duplicate_content_length_conflict = false;
-    let mut transfer_encoding_violation = false;
     let mut strip_spans = StripSpans::default();
     let mut upgrade_span: Option<(u32, u32)> = None;
     let mut expect_continue = false;
+    let mut terminated = false;
 
-    // Parse first line (method, path, version)
-    let mut line_end = pos;
-    while line_end < request_data.len()
-        && request_data[line_end] != b'\r'
-        && request_data[line_end] != b'\n'
-    {
-        line_end += 1;
-    }
-
-    if line_end > pos {
-        let first_line = match std::str::from_utf8(&request_data[pos..line_end]) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::anyhow!("Non-UTF8 data in HTTP request line")),
-        };
-        let mut parts = first_line.split_whitespace();
-        method = parts.next();
-        path = parts.next();
-
-        is_http10 = line_end >= 8 && &request_data[line_end - 8..line_end] == b"HTTP/1.0";
-    }
-
-    // Skip to headers (past CRLF)
-    pos = line_end;
-    if pos < request_data.len() && request_data[pos] == b'\r' {
-        pos += 1;
-    }
-    if pos < request_data.len() && request_data[pos] == b'\n' {
-        pos += 1;
-    }
-
-    let header_start = pos;
-
-    // Parse headers in single pass
-    while pos < request_data.len() {
-        // Check for end of headers
-        if pos + 1 < request_data.len() && &request_data[pos..pos + 2] == b"\r\n" {
+    while !violation && pos < len {
+        let line_start = pos;
+        if data[pos] == b'\r' {
+            terminated = data.get(pos + 1) == Some(&b'\n');
             break;
         }
-
-        let line_start = pos;
-        let mut line_end = pos;
-        while line_end < request_data.len()
-            && request_data[line_end] != b'\r'
-            && request_data[line_end] != b'\n'
-        {
-            line_end += 1;
+        while pos < len && is(data[pos], TCHAR) {
+            pos += 1;
         }
+        let name_end = pos;
+        // An empty name is obs-fold or a stray separator; a non-token byte
+        // (`Content-Length : 5`) makes a name this parser ignores but a
+        // lenient backend still honors.
+        if name_end == line_start || data.get(pos) != Some(&b':') {
+            violation = true;
+            break;
+        }
+        let value_start = pos + 1;
+        let value_end = scan(data, value_start, VALUE, 0x20);
+        if data.get(value_end) != Some(&b'\r') || data.get(value_end + 1) != Some(&b'\n') {
+            violation = true;
+            break;
+        }
+        pos = value_end + 2;
+        let name = &data[line_start..name_end];
+        let value = &data[value_start..value_end];
 
-        // Header-line disposition, applied after the CRLF advance below
-        // (spans must include the terminator).
         enum LineKind {
             Keep,
             Strip,
@@ -178,122 +381,98 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         }
         let mut line_kind = LineKind::Keep;
 
-        if line_end > line_start {
-            let line = &request_data[line_start..line_end];
-
-            // Fast header matching using first few bytes
-            if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"Host:") {
-                let mut value_start = 5;
-                while value_start < line.len() && line[value_start] == b' ' {
-                    value_start += 1;
+        match (name.len(), name[0] | 0x20) {
+            (4, b'h') if name.eq_ignore_ascii_case(b"host") => {
+                let value = trim_ows(value);
+                match split_host(value) {
+                    Some(h) if host.is_none() => host = Some(&value[..h]),
+                    _ => violation = true,
                 }
-
-                let mut value_end = line.len();
-                while value_end > value_start
-                    && (line[value_end - 1] == b' ' || line[value_end - 1] == b'\t')
-                {
-                    value_end -= 1;
+            }
+            (14, b'c') if name.eq_ignore_ascii_case(b"content-length") => {
+                match parse_content_length(trim_ows(value)) {
+                    Some(n) if content_length.is_none() => content_length = Some(n),
+                    _ => violation = true,
                 }
-
-                // Find port separator and truncate for Gateway API compliance
-                let normalized_end = line[value_start..value_end]
-                    .iter()
-                    .position(|&b| b == b':')
-                    .map_or(value_end, |pos| value_start + pos);
-
-                host = std::str::from_utf8(&line[value_start..normalized_end]).ok();
-            } else if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
-                let mut vs = 15;
-                while vs < line.len() && line[vs] == b' ' {
-                    vs += 1;
-                }
-                if let Some(val) = std::str::from_utf8(&line[vs..])
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                {
-                    record_content_length(
-                        val,
-                        &mut content_length,
-                        &mut duplicate_content_length_conflict,
-                    );
-                }
-            } else if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"Transfer-Encoding:") {
-                let mut vs = 18;
-                while vs < line.len() && line[vs] == b' ' {
-                    vs += 1;
-                }
+            }
+            (17, b't') if name.eq_ignore_ascii_case(b"transfer-encoding") => {
                 // The only transfer coding this proxy understands is a single,
-                // exact `chunked`. Anything else — `gzip, chunked`, `identity`,
-                // a repeated TE line, a non-UTF8 value — is flagged: we cannot
-                // frame such a body ourselves, so forwarding it would desync
-                // our framing from the backend's.
-                match std::str::from_utf8(&line[vs..]) {
-                    Ok(val) if val.trim().eq_ignore_ascii_case("chunked") && !is_chunked => {
-                        is_chunked = true;
-                    }
-                    _ => transfer_encoding_violation = true,
+                // exact `chunked`, and HTTP/1.0 has no chunked framing at all:
+                // anything else is a body we would frame differently than the
+                // backend (TE.CL desync).
+                if is_http10 || is_chunked || !trim_ows(value).eq_ignore_ascii_case(b"chunked") {
+                    violation = true;
+                } else {
+                    is_chunked = true;
                 }
-            } else if line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Upgrade:") {
-                has_upgrade_header = true;
-                line_kind = LineKind::Upgrade;
-            } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Connection:") {
+            }
+            (7, b'u') if name.eq_ignore_ascii_case(b"upgrade") => {
+                if offers_h2c(value) {
+                    // An h2c tunnel would let the client multiplex any request
+                    // to the backend past per-request routing.
+                    offers_h2c_upgrade = true;
+                    line_kind = LineKind::Strip;
+                } else {
+                    // Only one Upgrade span is tracked; the slow path handles
+                    // every line.
+                    strip_spans.needs_slow_path |= has_upgrade_header;
+                    has_upgrade_header = true;
+                    line_kind = LineKind::Upgrade;
+                }
+            }
+            (10, b'c') if name.eq_ignore_ascii_case(b"connection") => {
                 line_kind = LineKind::Strip;
-                let mut value_start = 11;
-                while value_start < line.len() && line[value_start] == b' ' {
-                    value_start += 1;
-                }
-
-                let mut value_end = line.len();
-                while value_end > value_start
-                    && (line[value_end - 1] == b' ' || line[value_end - 1] == b'\t')
-                {
-                    value_end -= 1;
-                }
-
-                if let Ok(value) = std::str::from_utf8(&line[value_start..value_end]) {
-                    // Token list ("keep-alive, upgrade"): scan each. Only runs
-                    // when a Connection header is present, on a short value.
-                    for token in value.split(',') {
-                        let token = token.trim();
-                        if token.eq_ignore_ascii_case("close") {
-                            explicit_keepalive = Some(false);
-                        } else if token.eq_ignore_ascii_case("keep-alive") {
-                            explicit_keepalive = Some(true);
-                        } else if token.eq_ignore_ascii_case("upgrade") {
-                            connection_has_upgrade = true;
-                        } else if !token.is_empty() {
-                            // Connection nominated an extra header to strip;
-                            // the span fast path cannot honor that.
-                            strip_spans.needs_slow_path = true;
-                        }
+                for token in value.split(|&b| b == b',') {
+                    let token = trim_ows(token);
+                    if token.eq_ignore_ascii_case(b"close") {
+                        explicit_keepalive = Some(false);
+                    } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                        explicit_keepalive = Some(true);
+                    } else if token.eq_ignore_ascii_case(b"upgrade") {
+                        connection_has_upgrade = true;
+                    } else if token.eq_ignore_ascii_case(b"content-length")
+                        || token.eq_ignore_ascii_case(b"transfer-encoding")
+                        || token.eq_ignore_ascii_case(b"host")
+                    {
+                        // The slow path strips what Connection nominates: the
+                        // backend would then frame or route a different
+                        // message than the one framed and routed here.
+                        violation = true;
+                    } else if !token.is_empty() && !token.eq_ignore_ascii_case(b"http2-settings") {
+                        // Connection nominated an extra header to strip;
+                        // the span fast path cannot honor that. HTTP2-Settings
+                        // lines are span-stripped anyway.
+                        strip_spans.needs_slow_path = true;
                     }
                 }
-            } else if (line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"Keep-Alive:"))
-                || (line.len() >= 17 && line[..17].eq_ignore_ascii_case(b"Proxy-Connection:"))
-                || (line.len() >= 3 && line[..3].eq_ignore_ascii_case(b"TE:"))
-                || (line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"Trailer:"))
-            {
-                line_kind = LineKind::Strip;
-            } else if line.len() >= 7 && line[..7].eq_ignore_ascii_case(b"Expect:") {
+            }
+            (6, b'e') if name.eq_ignore_ascii_case(b"expect") => {
                 // The proxy answers 100-continue itself and strips the header;
                 // other expectations are stripped and ignored (RFC 9110 lets
                 // an intermediary absorb expectations it handles).
                 line_kind = LineKind::Strip;
-                if let Ok(value) = std::str::from_utf8(&line[7..]) {
-                    if value.trim().eq_ignore_ascii_case("100-continue") {
-                        expect_continue = true;
-                    }
+                if trim_ows(value).eq_ignore_ascii_case(b"100-continue") {
+                    expect_continue = true;
                 }
             }
+            (10, b'k') if name.eq_ignore_ascii_case(b"keep-alive") => line_kind = LineKind::Strip,
+            (16, b'p') if name.eq_ignore_ascii_case(b"proxy-connection") => {
+                line_kind = LineKind::Strip;
+            }
+            (2, b't') if name.eq_ignore_ascii_case(b"te") => line_kind = LineKind::Strip,
+            (7, b't') if name.eq_ignore_ascii_case(b"trailer") => line_kind = LineKind::Strip,
+            (14, b'h') if name.eq_ignore_ascii_case(b"http2-settings") => {
+                line_kind = LineKind::Strip;
+            }
+            // The proxy appends its own; a client copy ahead of it could make
+            // a plaintext request look like TLS to the backend.
+            (17, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-proto") => {
+                line_kind = LineKind::Strip;
+            }
+            _ => {}
         }
-
-        // Move to next line
-        pos = line_end;
-        if pos < request_data.len() && request_data[pos] == b'\r' {
-            pos += 1;
-        }
-        if pos < request_data.len() && request_data[pos] == b'\n' {
-            pos += 1;
+        if violation {
+            break;
         }
         match line_kind {
             LineKind::Keep => {}
@@ -302,76 +481,72 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         }
     }
 
-    // Apply HTTP version-aware connection defaults
-    let keepalive = explicit_keepalive.unwrap_or(!is_http10);
-
-    // header_data covers everything from header_start to current pos (end of headers)
-    let header_data = &request_data[header_start..pos];
-
-    // Handle absolute-form URIs (RFC 7230 §5.3.2):
-    // "GET http://host/path HTTP/1.1" → extract "/path"
-    let raw_path = path.unwrap_or("/");
-    let raw_path = match raw_path
-        .strip_prefix("http://")
-        .or_else(|| raw_path.strip_prefix("https://"))
-    {
-        Some(rest) => match rest.find('/') {
-            Some(path_start) => &rest[path_start..],
-            None => "/",
-        },
-        None => raw_path,
-    };
-    let (clean_path, query_string) = match raw_path.find('?') {
-        Some(pos) => (&raw_path[..pos], &raw_path[pos + 1..]),
-        None => (raw_path, ""),
-    };
+    let header_data = &data[header_start..pos];
+    if !terminated {
+        violation = true;
+    }
 
     // Per RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header.
     // HTTP/1.0 clients may omit it, so use empty string for routing to handle.
-    let resolved_host = match host {
+    let host = match host {
         Some(h) => h,
-        None if !is_http10 => {
-            return Err(anyhow::anyhow!(
-                "Missing required Host header in HTTP/1.1 request"
-            ));
+        None if is_http10 || violation => &[][..],
+        None => {
+            return Err(anyhow!("Missing required Host header in HTTP/1.1 request"));
         }
-        None => "",
+    };
+    // Routing reads Host while an RFC 9112 recipient of an absolute-form or
+    // CONNECT target reads the target's authority: both must name one host.
+    if target_host.is_some_and(|t| !t.eq_ignore_ascii_case(host)) {
+        violation = true;
+    }
+    violation |= (host.is_empty() && !is_http10) || (content_length.is_some() && is_chunked);
+    let host = std::str::from_utf8(host).map_err(|_| anyhow!("Non-ASCII Host"))?;
+
+    let (path, query_string) = match path.find('?') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (path, ""),
     };
 
-    // RFC 7230 §3.3.3: reject TE+CL coexistence, conflicting duplicate
-    // Content-Length values, and unsupported Transfer-Encoding values — all
-    // classic request-smuggling vectors.
-    let header_violation = duplicate_content_length_conflict
-        || transfer_encoding_violation
-        || (content_length.is_some() && is_chunked);
-
     Ok(HttpRequestInfo {
-        method: method.unwrap_or("GET"),
-        host: resolved_host,
-        path: clean_path,
+        method,
+        host,
+        path,
         query_string,
-        keepalive,
+        keepalive: explicit_keepalive.unwrap_or(!is_http10),
         header_data,
         content_length,
         is_chunked,
         // RFC 7230 6.7: an upgrade is only requested when Connection also
         // nominates it. A bare Upgrade header must not switch protocols.
-        is_upgrade: has_upgrade_header && connection_has_upgrade,
-        header_violation,
+        is_upgrade: has_upgrade_header && connection_has_upgrade && !offers_h2c_upgrade,
+        header_violation: violation,
         strip_spans,
         upgrade_span,
         expect_continue,
     })
 }
 
-/// Record a parsed `Content-Length` value, flagging a conflict if a previous
-/// value was different. Multiple identical CL lines are not flagged (RFC 7230
-/// §3.3.2 allows them).
-#[inline]
-fn record_content_length(val: usize, current: &mut Option<usize>, conflict: &mut bool) {
-    match *current {
-        Some(prev) if prev != val => *conflict = true,
-        Some(_) => {} // duplicate but equal — benign
-        None => *current = Some(val),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_scan_stops_exactly_where_a_byte_scan_would() {
+        for (class, floor) in [(VALUE, 0x20), (TARGET, 0x21)] {
+            for b in 0..=255u8 {
+                for at in 0..20 {
+                    let mut buf = [b'a'; 24];
+                    buf[at] = b;
+                    let want = if is(b, class) { buf.len() } else { at };
+                    assert_eq!(scan(&buf, 0, class, floor), want, "{b:#04x} at {at}");
+                    assert_eq!(
+                        scan(&buf, 1.min(at), class, floor),
+                        want,
+                        "{b:#04x} at {at}"
+                    );
+                }
+            }
+        }
     }
 }
