@@ -167,44 +167,33 @@ fn append_forward_headers(
 }
 
 /// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 §6.1).
-/// The proxy owns the client-side Connection header: `client_close` appends
-/// its own close announcement. The status line is copied untouched.
-pub(crate) fn sanitize_response_headers(raw: &[u8], client_close: bool, out: &mut Vec<u8>) {
-    let (has_te, has_cl) = copy_response_lines(raw, false, out);
-    // RFC 9112 6.3: Transfer-Encoding overrides Content-Length, and an
-    // intermediary must drop the latter before forwarding: a client that
-    // framed by it would read past this body into the next response. Rare
-    // enough to redo the copy instead of tracking line spans.
-    if has_te && has_cl {
-        copy_response_lines(raw, true, out);
-    }
-    if client_close {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-}
-
-/// Status line plus every end-to-end header line into `out` (cleared
-/// first). Returns whether Transfer-Encoding and Content-Length were seen.
-fn copy_response_lines(raw: &[u8], drop_content_length: bool, out: &mut Vec<u8>) -> (bool, bool) {
+/// The status line is copied untouched.
+///
+/// Framing is the caller's reading of the head (`worker::parse_response_head`),
+/// never re-derived here. `transfer_encoded` drops every Content-Length line:
+/// Transfer-Encoding overrides it (RFC 9112 6.3), and a client that framed
+/// by it would read past this body into the next response. The proxy owns
+/// the client-side Connection header: `client_close` appends its own close
+/// announcement.
+pub(crate) fn sanitize_response_headers(
+    raw: &[u8],
+    transfer_encoded: bool,
+    client_close: bool,
+    out: &mut Vec<u8>,
+) {
     out.clear();
     out.reserve(raw.len() + 24);
-    let (mut has_te, mut has_cl) = (false, false);
-    let mut first = true;
-    for line in header_lines(raw) {
-        if first {
-            first = false;
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            continue;
-        }
+    let mut lines = header_lines(raw);
+    if let Some(status_line) = lines.next() {
+        out.extend_from_slice(status_line);
+        out.extend_from_slice(b"\r\n");
+    }
+    for line in lines {
         let keep = match memchr::memchr(b':', line) {
             Some(p) => {
                 let name = &line[..p];
-                let is_cl = name.eq_ignore_ascii_case(b"content-length");
-                has_cl |= is_cl;
-                has_te |= name.eq_ignore_ascii_case(b"transfer-encoding");
-                !(is_hop_by_hop_response_header(name) || (is_cl && drop_content_length))
+                !(is_hop_by_hop_response_header(name)
+                    || (transfer_encoded && name.eq_ignore_ascii_case(b"content-length")))
             }
             None => true,
         };
@@ -213,7 +202,10 @@ fn copy_response_lines(raw: &[u8], drop_content_length: bool, out: &mut Vec<u8>)
             out.extend_from_slice(b"\r\n");
         }
     }
-    (has_te, has_cl)
+    if client_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// First-byte dispatch keeps the per-line cost to one comparison for the
@@ -725,7 +717,7 @@ mod tests {
         let resp =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, false, &mut out);
+        sanitize_response_headers(resp, false, false, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 2\r\n"));
@@ -734,24 +726,24 @@ mod tests {
         assert!(!s.to_ascii_lowercase().contains("keep-alive"));
         assert!(s.ends_with("\r\n\r\n"));
 
-        sanitize_response_headers(resp, true, &mut out);
+        sanitize_response_headers(resp, false, true, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.ends_with("Connection: close\r\n\r\n"));
     }
 
     #[test]
-    fn test_sanitize_response_drops_content_length_beside_transfer_encoding() {
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n";
+    fn test_sanitize_transfer_encoded_response_drops_every_content_length() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: gzip, chunked\r\ncontent-length: 5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, false, &mut out);
+        sanitize_response_headers(resp, true, false, &mut out);
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nServer: x\r\n\r\n"
         );
 
         // Content-Length alone is the framing and stays.
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        sanitize_response_headers(resp, false, &mut out);
+        sanitize_response_headers(resp, false, false, &mut out);
         assert!(std::str::from_utf8(&out)
             .unwrap()
             .contains("Content-Length: 5\r\n"));
