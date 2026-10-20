@@ -741,15 +741,7 @@ fn test_exact_vs_prefix_path_e2e() {
         .expect("create temp config");
     std::fs::write(config_file.path(), config).expect("write temp config");
 
-    let binary =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/portail");
-    let debug_binary =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/portail");
-    let bin = if binary.exists() {
-        binary
-    } else {
-        debug_binary
-    };
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_portail"));
 
     let mut child = std::process::Command::new(&bin)
         .arg("--config")

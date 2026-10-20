@@ -1171,19 +1171,7 @@ pub fn build_test_config_with_filters(
 }
 
 fn cargo_bin_path() -> PathBuf {
-    // Look for the binary in target/release or target/debug
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release_bin = project_root.join("target/release/portail");
-    if release_bin.exists() {
-        return release_bin;
-    }
-    let debug_bin = project_root.join("target/debug/portail");
-    if debug_bin.exists() {
-        return debug_bin;
-    }
-    panic!(
-        "Portail binary not found. Build with `cargo build --release` first.\n\
-         Looked in: {:?} and {:?}",
-        release_bin, debug_bin
-    );
+    // Probing target/{release,debug} ran a stale release build under a debug
+    // `cargo test` and ignored CARGO_TARGET_DIR; cargo builds this exact binary.
+    PathBuf::from(env!("CARGO_BIN_EXE_portail"))
 }
