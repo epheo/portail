@@ -2901,6 +2901,251 @@ fn route_on_an_unservable_listener_is_served_nowhere() {
     assert!(!app_served_on(&table, 80), "leaked onto every port");
 }
 
+fn tcp_parent(section: Option<&str>, port: Option<i32>) -> TCPRouteParentRefs {
+    TCPRouteParentRefs {
+        name: "gw".to_string(),
+        section_name: section.map(String::from),
+        port,
+        ..Default::default()
+    }
+}
+
+/// One rule per entry of `rules`, each a list of (backend name, port, weight).
+fn tcp_route(
+    name: &str,
+    secs: i64,
+    parent_refs: Vec<TCPRouteParentRefs>,
+    rules: &[&[(&str, i32, i32)]],
+) -> TCPRoute {
+    TCPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: TCPRouteSpec {
+            parent_refs: Some(parent_refs),
+            rules: rules
+                .iter()
+                .map(|backends| TCPRouteRules {
+                    backend_refs: backends
+                        .iter()
+                        .map(|(svc, port, weight)| TCPRouteRulesBackendRefs {
+                            name: svc.to_string(),
+                            port: Some(*port),
+                            weight: Some(*weight),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+fn tcp_backend_port(table: &RouteTable, port: u16) -> Option<u16> {
+    table
+        .find_tcp_backends(port)
+        .ok()
+        .map(|b| b[0].socket_addr.port())
+}
+
+/// k8s #2: an accepted TCPRoute whose parentRef names no sectionName (bare,
+/// or port only) was programmed nowhere.
+#[test]
+fn tcp_route_attaches_without_section_name() {
+    let gw = attach_gateway(vec![
+        gw_listener("db", 5432, "TCP"),
+        gw_listener("cache", 6379, "TCP"),
+    ]);
+    for (parent, served) in [
+        (tcp_parent(None, None), [true, true]),
+        (tcp_parent(None, Some(6379)), [false, true]),
+    ] {
+        let route = tcp_route("t", 100, vec![parent], &[&[("127.0.0.1", 7001, 1)]]);
+        let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+        assert!(status_of(&result, "t").accepted);
+        for (port, want) in [5432, 6379].into_iter().zip(served) {
+            assert_eq!(
+                tcp_backend_port(&table, port).is_some(),
+                want,
+                "port {}",
+                port
+            );
+        }
+    }
+}
+
+/// k8s #2: only the first parentRef of a TCPRoute was ever programmed.
+#[test]
+fn tcp_route_attaches_through_every_parent_ref() {
+    let gw = attach_gateway(vec![
+        gw_listener("db", 5432, "TCP"),
+        gw_listener("cache", 6379, "TCP"),
+    ]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![
+            tcp_parent(Some("db"), None),
+            tcp_parent(Some("cache"), None),
+        ],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+    assert_eq!(tcp_backend_port(&table, 6379), Some(7001));
+}
+
+/// config-routing #7: TCPRoutes on one listener overwrote each other in
+/// input order. Listener.allowedRoutes precedence: the oldest Route, then
+/// namespace/name; the other reports Conflicted.
+#[test]
+fn oldest_tcp_route_owns_its_listener() {
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let older = tcp_route(
+        "older",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let newer = tcp_route(
+        "newer",
+        200,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7002, 1)]],
+    );
+    for routes in [
+        vec![newer.clone(), older.clone()],
+        vec![older.clone(), newer.clone()],
+    ] {
+        let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], routes, vec![]));
+        assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+        assert!(status_of(&result, "older").accepted);
+        let loser = status_of(&result, "newer");
+        assert!(!loser.accepted);
+        assert_eq!(loser.accepted_reason, "Conflicted");
+        assert!(loser.listener_names.is_empty());
+    }
+}
+
+/// config-routing #7: every rule overwrote the previous one on the same
+/// port. TCPRoute rules have no match to choose between, so the first rule
+/// takes the listener, as ties go to the first rule (HTTPRouteRule.matches).
+#[test]
+fn tcp_route_first_rule_owns_the_listener() {
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1)], &[("127.0.0.1", 7002, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+}
+
+/// k8s #2 for UDPRoute: a bare parentRef is programmed, and the oldest
+/// route owns the listener.
+#[test]
+fn udp_route_attaches_like_tcp() {
+    let gw = attach_gateway(vec![gw_listener("dns", 5353, "UDP")]);
+    let udp = |name: &str, secs: i64, port: i32| UDPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: UDPRouteSpec {
+            parent_refs: Some(vec![UDPRouteParentRefs {
+                name: "gw".to_string(),
+                ..Default::default()
+            }]),
+            rules: vec![UDPRouteRules {
+                backend_refs: vec![UDPRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (result, table) = reconcile_table(
+        &gw,
+        &snapshot_of(
+            vec![],
+            vec![],
+            vec![udp("newer", 200, 7002), udp("older", 100, 7001)],
+        ),
+    );
+    assert_eq!(
+        table.find_udp_backends(5353).unwrap()[0].socket_addr.port(),
+        7001
+    );
+    assert!(status_of(&result, "older").accepted);
+    assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+}
+
+/// TLSRoutes claiming the same SNI on one listener overwrote each other in
+/// input order; the oldest wins, as for any tie.
+#[test]
+fn oldest_tls_route_owns_its_hostname() {
+    let mut passthrough = gw_listener("tls", 6443, "TLS");
+    passthrough.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Passthrough),
+        ..Default::default()
+    });
+    let gw = attach_gateway(vec![passthrough]);
+    let tls = |name: &str, secs: i64, port: i32| TLSRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                ..Default::default()
+            }]),
+            hostnames: vec!["secure.example.com".to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    for routes in [
+        vec![tls("newer", 200, 7002), tls("older", 100, 7001)],
+        vec![tls("older", 100, 7001), tls("newer", 200, 7002)],
+    ] {
+        let snapshot = test_snapshot(vec![], vec![], routes, vec![], &default_ns_labels(), vec![]);
+        let (_, table) = reconcile_table(&gw, &snapshot);
+        let backend = table
+            .resolve_tls_passthrough("secure.example.com", 6443, &selector, &health)
+            .unwrap();
+        assert_eq!(backend.port(), 7001);
+    }
+}
+
 /// An unset parentRef namespace is the route's own: a route in other-ns
 /// naming "gw" targets other-ns/gw, never default/gw, even where default/gw
 /// admits every namespace.

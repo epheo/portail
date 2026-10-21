@@ -56,6 +56,10 @@ pub(crate) trait GatewayRoute: Sized {
     type ParentRef: ParentRefAccess;
     type Config;
     const KIND: &'static str;
+    /// TCP and UDP listeners carry one route: their rules have no match to
+    /// choose between routes, so the oldest takes the listener
+    /// (Listener.allowedRoutes precedence) and later ones report Conflicted.
+    const ONE_ROUTE_PER_LISTENER: bool = false;
 
     fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
     fn route_namespace(&self) -> &str;
@@ -201,8 +205,11 @@ extras: {
 });
 
 impl_gateway_route!(TCPRoute, TCPRouteParentRefs, TcpRouteConfig, "TCPRoute",
-    parent_refs: self.spec.parent_refs,
-    convert:     convert_tcp_route);
+parent_refs: self.spec.parent_refs,
+convert:     convert_tcp_route,
+extras: {
+    const ONE_ROUTE_PER_LISTENER: bool = true;
+});
 
 impl_gateway_route!(TLSRoute, TLSRouteParentRefs, TlsRouteConfig, "TLSRoute",
 parent_refs: self.spec.parent_refs,
@@ -214,8 +221,11 @@ extras: {
 });
 
 impl_gateway_route!(UDPRoute, UDPRouteParentRefs, UdpRouteConfig, "UDPRoute",
-    parent_refs: self.spec.parent_refs,
-    convert:     convert_udp_route);
+parent_refs: self.spec.parent_refs,
+convert:     convert_udp_route,
+extras: {
+    const ONE_ROUTE_PER_LISTENER: bool = true;
+});
 
 pub struct ReconcileResult {
     pub config: PortailConfig,
@@ -601,6 +611,8 @@ fn collect_routes<R: GatewayRoute>(
         .collect();
     ordered.sort_by(|a, b| precedence(*a).cmp(&precedence(*b)));
 
+    // Listeners an older route already serves (ONE_ROUTE_PER_LISTENER kinds).
+    let mut claimed: HashSet<String> = HashSet::new();
     let mut configs = Vec::new();
     for route in ordered {
         let route_ns = route.route_namespace();
@@ -625,18 +637,29 @@ fn collect_routes<R: GatewayRoute>(
                         parent_ref_matches_gateway(*pr, route_ns, cx.gateway_name, cx.gateway_ns)
                     })
                     .map(|pr| {
+                        let mut result = listeners_for_parent_ref(
+                            pr,
+                            cx.listeners,
+                            cx.gateway_ns,
+                            route_ns,
+                            kind,
+                            route_hostnames,
+                            cx.namespace_labels,
+                        );
+                        if R::ONE_ROUTE_PER_LISTENER {
+                            result = result.and_then(|mut listeners| {
+                                listeners.retain(|l| !claimed.contains(l));
+                                if listeners.is_empty() {
+                                    Err("Conflicted")
+                                } else {
+                                    Ok(listeners)
+                                }
+                            });
+                        }
                         (
                             pr.ref_section_name().map(String::from),
                             pr.ref_port(),
-                            listeners_for_parent_ref(
-                                pr,
-                                cx.listeners,
-                                cx.gateway_ns,
-                                route_ns,
-                                kind,
-                                route_hostnames,
-                                cx.namespace_labels,
-                            ),
+                            result,
                         )
                     })
                     .collect()
@@ -649,6 +672,9 @@ fn collect_routes<R: GatewayRoute>(
                     "Route hostnames do not intersect with any listener hostname"
                 }
                 "NoMatchingParent" => "No matching listener found for route parentRef",
+                "Conflicted" => {
+                    "An older route already serves every listener this parentRef selects"
+                }
                 _ => "Route not allowed by any listener policy (namespace/hostname/kind)",
             };
             RouteAcceptance {
@@ -793,6 +819,9 @@ fn collect_routes<R: GatewayRoute>(
                     if !attached.contains(&listener) {
                         attached.push(listener);
                     }
+                }
+                if R::ONE_ROUTE_PER_LISTENER {
+                    claimed.extend(attached.iter().map(|l| l.to_string()));
                 }
                 R::attach(
                     &mut config,

@@ -287,38 +287,51 @@ impl PortailConfig {
 impl PortailConfig {
     /// `UdpRouteConfig` aliases `TcpRouteConfig`, so one signature serves
     /// both route lists; `is_udp` picks the socket family.
+    ///
+    /// Attachment is the same as for HTTP routes. A TCP or UDP listener
+    /// carries one rule: rules have no match to choose between, so the
+    /// first rule of the first route wins (routes come in precedence order,
+    /// oldest first in Kubernetes mode, file order otherwise).
     fn convert_l4_routes(
         &self,
         route_table: &mut crate::routing::RouteTable,
         routes: &[TcpRouteConfig],
         is_udp: bool,
     ) {
-        for route in routes {
-            if let Some(parent_ref) = route.parent_refs.first() {
-                if let Some(section_name) = &parent_ref.section_name {
-                    // TCPRoutes may also attach to TLS(Passthrough) listeners.
-                    let protocol_matches = |l: &&ListenerConfig| {
+        let proto = if is_udp { "UDP" } else { "TCP" };
+        for (route_idx, route) in routes.iter().enumerate() {
+            let Some(rule) = route.rules.first() else {
+                continue;
+            };
+            // TCPRoutes may also attach to TLS(Passthrough) listeners.
+            let listeners: Vec<&ListenerConfig> =
+                find_listeners_for_route(&route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| {
                         if is_udp {
                             l.protocol == Protocol::UDP
                         } else {
                             matches!(l.protocol, Protocol::TCP | Protocol::TLS)
                         }
-                    };
-                    if let Some(listener) = self
-                        .gateway
-                        .listeners
-                        .iter()
-                        .find(|l| l.name == *section_name && protocol_matches(l))
-                    {
-                        for rule in &route.rules {
-                            let backends = resolve_backends_lenient(&rule.backend_refs, "L4");
-                            if is_udp {
-                                route_table.add_udp_route(listener.port, backends);
-                            } else {
-                                route_table.add_tcp_route(listener.port, backends);
-                            }
-                        }
-                    }
+                    })
+                    .collect();
+            if listeners.is_empty() {
+                continue;
+            }
+            let backends = resolve_backends_lenient(&rule.backend_refs, "L4");
+            for listener in listeners {
+                let added = if is_udp {
+                    route_table.add_udp_route(listener.port, backends.clone())
+                } else {
+                    route_table.add_tcp_route(listener.port, backends.clone())
+                };
+                if !added {
+                    tracing::warn!(
+                        "{} route {}: listener '{}' already carries an earlier route, skipping",
+                        proto,
+                        route_idx,
+                        listener.name
+                    );
                 }
             }
         }
@@ -347,9 +360,10 @@ fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routi
         .collect()
 }
 
-/// Listeners a route's parentRefs select, in both modes. In Kubernetes mode
-/// each ref names one listener the reconciler accepted the route on; in a
-/// file config an unset sectionName or port selects every listener.
+/// Listeners a route's parentRefs select, for every route kind in both
+/// modes. In Kubernetes mode each ref names one listener the reconciler
+/// accepted the route on; in a file config an unset sectionName or port
+/// selects every listener.
 fn find_listeners_for_route<'a>(
     parent_refs: &[ParentRef],
     gateway: &'a GatewayConfig,
@@ -786,6 +800,34 @@ mod tests {
             vec![3000],
             "headless backend must connect on the targetPort, not the service port"
         );
+    }
+
+    /// config-routing #7, file configs: a TCP route without sectionName
+    /// passed validation, then vanished. It attaches like an HTTP route now,
+    /// and on a shared listener the first route's first rule wins.
+    #[test]
+    fn test_l4_routes_attach_like_http_routes() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "cache", "protocol": "TCP", "port": 6379},
+                {"name": "web", "protocol": "HTTP", "port": 8080}
+            ]},
+            "tcpRoutes": [
+                {"parentRefs": [{"name": "g"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]},
+                           {"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]},
+                {"parentRefs": [{"name": "g", "sectionName": "db"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7003}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table().unwrap();
+        let backend_port = |port| rt.find_tcp_backends(port).unwrap()[0].socket_addr.port();
+        assert_eq!(backend_port(5432), 7001);
+        assert_eq!(backend_port(6379), 7001);
+        assert!(rt.find_tcp_backends(8080).is_err());
     }
 
     #[test]

@@ -193,29 +193,41 @@ impl RouteTable {
         });
     }
 
-    pub fn add_tcp_route(&mut self, port: u16, backends: Vec<Backend>) {
-        self.tcp_routes.insert(port, backends);
+    /// The first registration of a port wins and later ones return false:
+    /// callers add routes in precedence order, as for HTTP ties.
+    pub fn add_tcp_route(&mut self, port: u16, backends: Vec<Backend>) -> bool {
+        insert_first(&mut self.tcp_routes, port, backends)
     }
 
-    pub fn add_udp_route(&mut self, port: u16, backends: Vec<Backend>) {
-        self.udp_routes.insert(port, backends);
+    /// First registration wins, as for TCP.
+    pub fn add_udp_route(&mut self, port: u16, backends: Vec<Backend>) -> bool {
+        insert_first(&mut self.udp_routes, port, backends)
     }
 
     /// Register a TLS passthrough route on a listener port. Port 0 means
-    /// any-port (file-based configs without gateway context).
-    pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) {
+    /// any-port (file-based configs without gateway context). The first
+    /// registration of a hostname on a port wins, as for TCP.
+    pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) -> bool {
         let host_lower = hostname.to_ascii_lowercase();
-        if let Some(stripped) = host_lower.strip_prefix("*.") {
-            self.wildcard_tls_routes
-                .entry(port)
-                .or_default()
-                .insert(stripped.to_string(), backends);
-        } else {
-            self.tls_routes
-                .entry(port)
-                .or_default()
-                .insert(host_lower, backends);
+        let (by_port, host_key) = match host_lower.strip_prefix("*.") {
+            Some(parent) => (&mut self.wildcard_tls_routes, parent.to_string()),
+            None => (&mut self.tls_routes, host_lower),
+        };
+        insert_first(by_port.entry(port).or_default(), host_key, backends)
+    }
+}
+
+fn insert_first<K: std::hash::Hash + Eq>(
+    map: &mut FnvHashMap<K, Vec<Backend>>,
+    key: K,
+    backends: Vec<Backend>,
+) -> bool {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(backends);
+            true
         }
+        std::collections::hash_map::Entry::Occupied(_) => false,
     }
 }
 
