@@ -588,11 +588,19 @@ mod policy_tests {
 /// API, Listener: listeners sharing a port need distinct protocols, or
 /// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
 /// indistinct listeners are rejected: the spec forbids picking a winner.
+/// HTTPS and TLS are one family here: one socket serves both, told apart
+/// by SNI, so only their hostnames must differ.
 pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
+    fn family(protocol: &str) -> &str {
+        match protocol {
+            "HTTPS" => "TLS",
+            other => other,
+        }
+    }
     let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
     for (i, a) in listeners.iter().enumerate() {
         for b in listeners[i + 1..].iter().filter(|b| b.port == a.port) {
-            let reason = if a.protocol != b.protocol {
+            let reason = if family(&a.protocol) != family(&b.protocol) {
                 "ProtocolConflict"
             } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
                 "HostnameConflict"

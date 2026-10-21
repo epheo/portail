@@ -3353,6 +3353,94 @@ fn conflicted_listeners_serve_nothing() {
     assert_eq!(tcp_backend_port(&table, 6379), Some(7003));
 }
 
+/// HTTPS and TLS passthrough on one port are distinct by hostname: one
+/// socket serves both, by SNI. Gateway API v1.4.1 GatewaySpec.listeners,
+/// Compatible Listeners: an implementation that cannot mix them on a port
+/// would not consider them compatible; this one can. Both were dropped as
+/// ProtocolConflict, and nothing served the port.
+#[test]
+fn https_and_tls_passthrough_share_a_port() {
+    let mut https = gw_listener("web", 443, "HTTPS");
+    https.hostname = Some("app.example.com".to_string());
+    https.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Terminate),
+        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+            name: "cert".to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    let mut passthrough = gw_listener("db", 443, "TLS");
+    passthrough.hostname = Some("secure.example.com".to_string());
+    passthrough.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Passthrough),
+        ..Default::default()
+    });
+    let gw = attach_gateway(vec![passthrough, https]);
+    let app = app_route(
+        "app",
+        "default",
+        vec![http_parent(None, Some("web"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let tls = TLSRoute {
+        metadata: ObjectMeta {
+            name: Some("secure".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                section_name: Some("db".to_string()),
+                ..Default::default()
+            }]),
+            hostnames: vec!["secure.example.com".to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(7001),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let snapshot = test_snapshot(
+        vec![app],
+        vec![],
+        vec![tls],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot);
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["db", "web"]);
+    for name in ["app", "secure"] {
+        assert!(status_of(&result, name).accepted, "{name}");
+    }
+    assert!(app_served_on(&table, 443));
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let backend = table
+        .resolve_tls_passthrough("secure.example.com", 443, &selector, &health)
+        .unwrap();
+    assert_eq!(backend.port(), 7001);
+    assert!(!table.has_tls_passthrough_route("app.example.com", 443));
+}
+
 /// config-routing #7: every rule overwrote the previous one on the same
 /// port. TCPRoute rules have no match to choose between, so the first rule
 /// takes the listener, as ties go to the first rule (HTTPRouteRule.matches).

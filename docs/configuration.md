@@ -177,6 +177,7 @@ Kubernetes mode:
 - A parentRef attaches to the listeners it selects (by `sectionName`, `port`, or all) that admit the route: `allowedRoutes` namespaces and kinds, hostname intersection, and a protocol portail serves.
 - A parentRef without `namespace` names a Gateway in the route's own namespace.
 - A `Conflicted` listener, not distinct from another on its port, is not served: nothing binds, no route attaches, and a parentRef naming it reports `NoMatchingParent`.
+- HTTPS and TLS listeners can share a port if their hostnames differ: one socket serves both, by SNI. Any other two protocols on one port are `ProtocolConflict`.
 - Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
 - A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
 - TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.

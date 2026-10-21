@@ -182,7 +182,7 @@ pub(super) fn validate_gateway(
             let message = if reason == "ProtocolConflict" {
                 "Listener port shared with another listener using different protocol"
             } else {
-                "Listener not distinct from another on its port and protocol"
+                "Listener not distinct from another on its port"
             };
             ls.accepted = false;
             ls.accepted_reason = reason.into();
@@ -639,5 +639,42 @@ mod tests {
         assert!(gw_cond.ok);
         assert_eq!(gw_cond.reason, "ListenersNotValid");
         assert!(gw_cond.message.contains("tcp-a (HostnameConflict)"));
+    }
+
+    /// One socket serves HTTPS and TLS on a port, told apart by SNI, so
+    /// they conflict only on a shared hostname. Both were ProtocolConflict,
+    /// and nothing bound the port.
+    #[test]
+    fn https_and_tls_share_a_port_by_hostname() {
+        let mut gw = https_gateway("unused");
+        let passthrough = GatewayListeners {
+            tls: Some(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Passthrough),
+                ..Default::default()
+            }),
+            ..listener("db", 443, "TLS", Some("db.example.com"))
+        };
+        gw.spec.listeners[0].name = "web".into();
+        gw.spec.listeners[0].hostname = Some("web.example.com".into());
+        gw.spec.listeners.push(passthrough);
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        for name in ["web", "db"] {
+            let ls = &listeners[name];
+            assert!(ls.accepted && !ls.conflicted, "{name}");
+        }
+        assert!(gw_cond.ok);
+        assert_eq!(gw_cond.reason, "Accepted");
+
+        gw.spec.listeners[1].hostname = Some("web.example.com".into());
+        gw.spec.listeners.push(listener("plain", 443, "HTTP", None));
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        for name in ["web", "db", "plain"] {
+            assert!(listeners[name].conflicted, "{name}");
+        }
+        assert_eq!(listeners["plain"].conflicted_reason, "ProtocolConflict");
     }
 }
