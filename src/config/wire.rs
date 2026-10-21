@@ -75,20 +75,12 @@ fn check_path(path: &str) -> Result<()> {
     }
     // The parser's own target alphabet: SP would end the request-target
     // mid-path, and the proxy must not write a target it refuses to read.
-    if let Some(i) = path.bytes().position(|b| !is_target_byte(b)) {
-        return Err(anyhow!(
+    match path.bytes().position(|b| !is_target_byte(b)) {
+        None => Ok(()),
+        Some(i) => Err(anyhow!(
             "{:?} has forbidden byte 0x{:02x} at {} (no SP, CTL, '#' or '\\')",
             path,
             path.as_bytes()[i],
-            i
-        ));
-    }
-    // The request's query follows the value: one of its own would make two.
-    match path.find('?') {
-        None => Ok(()),
-        Some(i) => Err(anyhow!(
-            "{:?} has '?' at {}: the value replaces the path, the request keeps its query",
-            path,
             i
         )),
     }
@@ -371,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn path_starts_with_slash_without_sp_ctl_query_or_fragment() {
-        for ok in ["/", "/a/b", "/%20", "/caf\u{e9}", "/~user"] {
+    fn path_starts_with_slash_without_sp_ctl_or_fragment() {
+        for ok in ["/", "/a/b", "/a?b=c", "/a?", "/%20", "/caf\u{e9}", "/~user"] {
             assert!(check_path(ok).is_ok(), "{ok:?}");
         }
         for bad in [
@@ -384,8 +376,6 @@ mod tests {
             "/a\tb",
             "/a\0",
             "/a\x7f",
-            "/a?b=c",
-            "/a?",
             "/a#frag",
             "/a\\b",
             "http://x/a",
@@ -394,12 +384,12 @@ mod tests {
         }
     }
 
-    /// The data plane appends the request's query to a replaced path, so a
-    /// value with its own made /new?src=gw?id=7. Both config paths compile
-    /// a route through the funnel.
+    /// Gateway API v1.4.1 bounds these values by length only: replaceFullPath
+    /// "/login?next=home" is valid, and the request's query joins it. Both
+    /// config paths compile a route through the funnel.
     #[test]
-    fn a_path_modifier_value_with_a_query_is_unsupported() {
-        use crate::config::compile::{compile_http_route, RejectReason};
+    fn a_path_modifier_value_may_carry_a_query() {
+        use crate::config::compile::compile_http_route;
         for (filter, path) in [
             (
                 "urlRewrite",
@@ -431,9 +421,9 @@ mod tests {
                     "backendRefs":[{backends}]}}]}}"#
             );
             let route: crate::config::HttpRouteConfig = serde_json::from_str(&json).unwrap();
-            let err = compile_http_route(&route).err().expect(&json);
-            assert_eq!(err.reason, RejectReason::UnsupportedValue, "{err}");
-            assert!(err.message.contains("query"), "{err}");
+            if let Err(err) = compile_http_route(&route) {
+                panic!("{json}: {err}");
+            }
         }
     }
 

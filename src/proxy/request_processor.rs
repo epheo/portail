@@ -377,7 +377,8 @@ fn subslice_span(base: &[u8], sub: &str) -> Option<(u32, u32)> {
 }
 
 /// The redirect's path replaces the request's path only (HTTPPathModifier):
-/// a non-empty `query` follows it as sent.
+/// a non-empty `query` follows it, after the path's own query if it has
+/// one.
 fn build_redirect_location(
     scheme: Option<&str>,
     hostname: &str,
@@ -388,7 +389,11 @@ fn build_redirect_location(
     incoming_port: u16,
 ) -> String {
     let final_scheme = scheme.unwrap_or(default_scheme);
-    let query_mark = if query.is_empty() { "" } else { "?" };
+    let query_mark = if query.is_empty() {
+        ""
+    } else {
+        crate::proxy::http_filters::query_separator(path.as_bytes())
+    };
     let scheme_changed = scheme.is_some() && final_scheme != default_scheme;
 
     // Determine effective port:
@@ -912,6 +917,34 @@ mod tests {
                 "https://r.test/full?a=1",
             ),
             (None, "/old/x", "https://r.test/old/x"),
+            // A value's own query comes first, then the request's after a
+            // '&'. It made two: /login?next=home?a=1.
+            (
+                Some(URLRewritePath::ReplaceFullPath(
+                    "/login?next=home".to_string(),
+                )),
+                "/old/x?a=1",
+                "https://r.test/login?next=home&a=1",
+            ),
+            (
+                Some(URLRewritePath::ReplaceFullPath(
+                    "/login?next=home".to_string(),
+                )),
+                "/old/x",
+                "https://r.test/login?next=home",
+            ),
+            (
+                Some(URLRewritePath::ReplacePrefixMatch(
+                    "/new?src=gw".to_string(),
+                )),
+                "/old/x?a=1",
+                "https://r.test/new/x?src=gw&a=1",
+            ),
+            (
+                Some(URLRewritePath::ReplaceFullPath("/login?".to_string())),
+                "/old/x?a=1",
+                "https://r.test/login?a=1",
+            ),
         ] {
             let redirect = HttpFilter::RequestRedirect {
                 scheme: Some("https".to_string()),

@@ -355,8 +355,10 @@ pub(crate) fn prefix_remainder<'a>(rule_path: &str, request_path: &'a str) -> &'
 }
 
 /// Join a prefix replacement with the remaining suffix from the original path.
-/// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
+/// Avoids double-slash: `/` + `/three` is `/three`, not `//three`. A query in
+/// the replacement follows the joined path: `/new?a` + `/x` is `/new/x?a`.
 pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
+    let (prefix, query) = prefix.split_at(prefix.find('?').unwrap_or(prefix.len()));
     // Strip trailing slash from prefix if suffix starts with slash
     let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
         &prefix[..prefix.len() - 1]
@@ -364,7 +366,8 @@ pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
         prefix
     };
     let needs_slash = !prefix.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-    let mut result = String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash));
+    let mut result =
+        String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash) + query.len());
     result.push_str(prefix);
     if needs_slash {
         result.push('/');
@@ -373,6 +376,7 @@ pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     if result.is_empty() {
         result.push('/');
     }
+    result.push_str(query);
     result
 }
 
@@ -629,10 +633,11 @@ fn rewrite_request_head(
 }
 
 /// Request line `line` (no CRLF) into `out`, with `path` in place of all
-/// its target holds before the query. The query stays as sent: path
-/// normalization and path modifiers (HTTPPathModifier) change the path
-/// only. The parser let no '?' into an absolute-form authority, so such a
-/// target leaves origin-form.
+/// its target holds before the query. The query stays: path normalization
+/// and path modifiers (HTTPPathModifier) change the path only. A modifier
+/// value with a query of its own takes the request's after it
+/// ([`query_separator`]). The parser let no '?' into an absolute-form
+/// authority, so such a target leaves origin-form.
 fn put_request_line(line: &[u8], path: &[u8], out: &mut Vec<u8>) {
     let Some((start, end)) = target_bounds(line) else {
         out.extend_from_slice(line);
@@ -641,7 +646,28 @@ fn put_request_line(line: &[u8], path: &[u8], out: &mut Vec<u8>) {
     let query = memchr::memchr(b'?', &line[start..end]).map_or(end, |q| start + q);
     out.extend_from_slice(&line[..start]);
     out.extend_from_slice(path);
-    out.extend_from_slice(&line[query..]);
+    match query_separator(path) {
+        // As sent, a bare '?' included.
+        "?" => out.extend_from_slice(&line[query..end]),
+        sep if end > query + 1 => {
+            out.extend_from_slice(sep.as_bytes());
+            out.extend_from_slice(&line[query + 1..end]);
+        }
+        _ => {}
+    }
+    out.extend_from_slice(&line[end..]);
+}
+
+/// What goes between a path modifier's value and the request's query,
+/// when the request has one. A value may carry a query (Gateway API
+/// v1.4.1 bounds it by length only): it comes first, then the request's,
+/// after a '&'.
+pub(crate) fn query_separator(value: &[u8]) -> &'static str {
+    match memchr::memchr(b'?', value) {
+        None => "?",
+        Some(mark) if mark + 1 == value.len() => "",
+        Some(_) => "&",
+    }
 }
 
 /// Apply response header modifications into `out` (cleared first), including
@@ -1102,6 +1128,62 @@ mod tests {
             apply_request_header_modifications(head, None, Some(&rewrite), &mut out);
             let s = std::str::from_utf8(&out).unwrap();
             assert!(s.starts_with(line), "{s}");
+        }
+    }
+
+    /// A value with a query of its own made two: /login?next=home?a=1.
+    /// The value's query comes first, then the request's after a '&';
+    /// either alone stays as it is.
+    #[test]
+    fn test_url_rewrite_joins_a_value_query_and_the_request_query() {
+        let mut out = Vec::new();
+        let prefix = |value: &str, path: &str| {
+            let rewrite = extract_url_rewrite(
+                &[HttpFilter::URLRewrite {
+                    hostname: None,
+                    path: Some(URLRewritePath::ReplacePrefixMatch(value.to_string())),
+                }],
+                "/old",
+                path,
+            );
+            rewrite.unwrap().path.unwrap()
+        };
+        for (path, target, want) in [
+            (
+                RewrittenPath::Full("/login?next=home".to_string()),
+                "/old?a=1&b",
+                "/login?next=home&a=1&b",
+            ),
+            (
+                RewrittenPath::Full("/login?next=home".to_string()),
+                "/old",
+                "/login?next=home",
+            ),
+            (
+                RewrittenPath::Full("/login?next=home".to_string()),
+                "/old?",
+                "/login?next=home",
+            ),
+            (
+                RewrittenPath::Full("/login?".to_string()),
+                "/old?a=1",
+                "/login?a=1",
+            ),
+            (
+                prefix("/new?src=gw", "/old/x"),
+                "/old/x?a=1",
+                "/new/x?src=gw&a=1",
+            ),
+            (prefix("/?src=gw", "/old/x"), "/old/x", "/x?src=gw"),
+        ] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let rewrite = URLRewrite {
+                hostname: None,
+                path: Some(path),
+            };
+            apply_request_header_modifications(head.as_bytes(), None, Some(&rewrite), &mut out);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(s.starts_with(&format!("GET {want} HTTP/1.1\r\n")), "{s}");
         }
     }
 

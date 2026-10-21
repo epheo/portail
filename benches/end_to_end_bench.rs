@@ -290,6 +290,57 @@ fn path_analysis(c: &mut Criterion) {
     }
 }
 
+/// Path modifiers per request: a redirect's Location (prefix join plus
+/// the query join), and a URLRewrite's prefix join. A value may carry a
+/// query of its own, so both look for its '?'.
+fn path_modifiers(c: &mut Criterion) {
+    use portail::proxy::http_filters::extract_url_rewrite;
+    use portail::routing::{HttpFilter, URLRewritePath};
+
+    let mut table = RouteTable::new();
+    let redirect = HttpFilter::RequestRedirect {
+        scheme: Some("https".to_string()),
+        hostname: None,
+        port: None,
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+        status_code: 302,
+    };
+    table.add_http_route(
+        "app.api.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/old".to_string(),
+            vec![],
+            vec![],
+            vec![redirect],
+            vec![],
+        ),
+    );
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+    let request = b"GET /old/users/42?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n";
+    c.bench_function("e2e_analyze_redirect_prefix_with_query", |b| {
+        b.iter(|| {
+            analyze_request(
+                black_box(&table),
+                &selector,
+                black_box(&request[..]),
+                black_box(80),
+                &health,
+                false,
+            )
+        })
+    });
+
+    let rewrite = [HttpFilter::URLRewrite {
+        hostname: None,
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+    }];
+    c.bench_function("url_rewrite_prefix", |b| {
+        b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
+    });
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(1000))
@@ -303,6 +354,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = e2e_benches;
     config = config();
-    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis, path_analysis
+    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis, path_analysis, path_modifiers
 }
 criterion_main!(e2e_benches);
