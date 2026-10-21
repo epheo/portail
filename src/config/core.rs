@@ -985,7 +985,7 @@ mod tests {
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
                     "filters": [{"type": "RequestRedirect", "requestRedirect": {"scheme": "HTTPS", "statusCode": 301}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                    "backendRefs": []
                 }]
             }]
         }"#;

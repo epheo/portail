@@ -1847,7 +1847,13 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
         ),
     ];
     for (filter, field) in cases {
-        let result = reconcile_http(vec![route_with_filters("inj", vec![filter], vec![])]);
+        // The CRD refuses a redirect beside backendRefs.
+        let redirects = filter.r#type == HTTPRouteRulesFiltersType::RequestRedirect;
+        let mut route = route_with_filters("inj", vec![filter], vec![]);
+        if redirects {
+            route.spec.rules.as_mut().unwrap()[0].backend_refs = None;
+        }
+        let result = reconcile_http(vec![route]);
         assert!(result.config.http_routes.is_empty(), "{field}");
         let ra = &result.route_status[0];
         assert!(!ra.accepted, "{field}");

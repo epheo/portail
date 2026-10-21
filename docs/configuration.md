@@ -203,12 +203,14 @@ Filters:
 
 - Only `RequestMirror` may appear more than once in one filter list.
 - `RequestRedirect` and `URLRewrite` cannot share a rule.
+- `RequestRedirect` and `backendRefs` cannot share a rule.
 - A `URLRewrite` hostname and a `RequestHeaderModifier` that sets `Host` cannot share a rule.
 - `ReplacePrefixMatch` needs every match of its rule to be a `PathPrefix`.
 - A `replaceFullPath` or `replacePrefixMatch` value cannot contain `?`: the request keeps its query, which would follow the value's.
 - A backendRef filter must be a `RequestHeaderModifier` or `ResponseHeaderModifier`.
 - `RequestMirror` keeps its share exact: `fraction: {numerator: 1, denominator: 1000}` mirrors one request in a thousand.
 - `percent` must be 0 to 100; a `fraction` needs a denominator of at least 1 and a numerator no larger.
+- A `RequestMirror` sets `percent` or `fraction`, not both.
 
 A route that breaks one of these rules:
 

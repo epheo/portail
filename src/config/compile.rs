@@ -143,6 +143,7 @@ pub(crate) fn compile_http_route(route: &HttpRouteConfig) -> Result<CompiledRout
 fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
     check_filter_combination(&rule.filters)?;
     check_prefix_replacement(rule)?;
+    check_redirect_has_no_backends(rule)?;
 
     let backend_filters = rule
         .backend_refs
@@ -249,6 +250,22 @@ fn check_prefix_replacement(rule: &HttpRouteRule) -> Result<(), RouteError> {
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// The HTTPRoute CRD of Gateway API v1.4.1 refuses this rule: "RequestRedirect
+/// filter must not be used together with backendRefs". A file config, or a
+/// cluster that skips CEL validation, gets here.
+fn check_redirect_has_no_backends(rule: &HttpRouteRule) -> Result<(), RouteError> {
+    let redirects = rule
+        .filters
+        .iter()
+        .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
+    if redirects && !rule.backend_refs.is_empty() {
+        return Err(RouteError::incompatible(
+            "RequestRedirect filter must not be used together with backendRefs",
+        ));
     }
     Ok(())
 }
@@ -481,10 +498,15 @@ fn table_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError> {
 
 /// Gateway API v1.4.1 bounds: percent 0 to 100, or a fraction whose
 /// denominator is at least 1 and whose numerator is no larger. Neither
-/// set mirrors every request; the fraction wins when both are.
+/// set mirrors every request; both set is refused, as the CRD refuses it.
 fn mirror_fraction(config: &RequestMirrorConfig) -> Result<routing::Fraction, RouteError> {
     let (numerator, denominator) = match (&config.fraction, config.percent) {
-        (Some(f), _) => (f.numerator, f.denominator),
+        (Some(_), Some(_)) => {
+            return Err(RouteError::unsupported(
+                "Only one of percent or fraction may be specified in HTTPRequestMirrorFilter",
+            ))
+        }
+        (Some(f), None) => (f.numerator, f.denominator),
         (None, Some(percent)) => (percent, 100),
         (None, None) => return Ok(routing::Fraction::ALL),
     };
@@ -579,5 +601,55 @@ mod tests {
         assert_eq!(edge(Some(0), None), routing::Fraction::new(0, 100).unwrap());
         assert_eq!(edge(Some(100), None), routing::Fraction::new(1, 1).unwrap());
         assert_eq!(edge(None, Some((7, 7))), routing::Fraction::ALL);
+    }
+
+    fn route_with(rule: serde_json::Value) -> HttpRouteConfig {
+        serde_json::from_value(serde_json::json!({
+            "hostnames": ["a.example.com"],
+            "rules": [rule],
+        }))
+        .unwrap()
+    }
+
+    /// The CRD refuses a mirror with both; a file config took the fraction
+    /// and dropped the percent.
+    #[test]
+    fn a_mirror_with_percent_and_fraction_is_rejected() {
+        let route = route_with(serde_json::json!({
+            "filters": [{"type": "RequestMirror", "requestMirror": {
+                "backendRef": {"name": "m.svc", "port": 80},
+                "percent": 50,
+                "fraction": {"numerator": 1, "denominator": 1000},
+            }}],
+            "backendRefs": [{"name": "b.svc", "port": 80}],
+        }));
+        let err = compile_http_route(&route).err().unwrap();
+        assert_eq!(err.reason, RejectReason::UnsupportedValue);
+        assert_eq!(
+            err.message,
+            "rule 0: filter 0: Only one of percent or fraction may be specified in HTTPRequestMirrorFilter"
+        );
+    }
+
+    /// The CRD refuses a redirect beside backendRefs; a file config served
+    /// the redirect and never its backends.
+    #[test]
+    fn a_redirect_with_backend_refs_is_rejected() {
+        let redirect = serde_json::json!([
+            {"type": "RequestRedirect", "requestRedirect": {"scheme": "https"}}
+        ]);
+        let route = route_with(serde_json::json!({
+            "filters": redirect,
+            "backendRefs": [{"name": "b.svc", "port": 80}],
+        }));
+        let err = compile_http_route(&route).err().unwrap();
+        assert_eq!(err.reason, RejectReason::IncompatibleFilters);
+        assert_eq!(
+            err.message,
+            "rule 0: RequestRedirect filter must not be used together with backendRefs"
+        );
+
+        let alone = route_with(serde_json::json!({"filters": redirect, "backendRefs": []}));
+        assert!(compile_http_route(&alone).is_ok());
     }
 }

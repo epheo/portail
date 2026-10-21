@@ -418,16 +418,17 @@ mod tests {
                 r#"{"type":"ReplacePrefixMatch","replacePrefixMatch":"/new?src=gw"}"#,
             ),
         ] {
-            let kind = if filter == "urlRewrite" {
-                "URLRewrite"
+            // A redirect may have no backendRefs (the HTTPRoute CRD).
+            let (kind, backends) = if filter == "urlRewrite" {
+                ("URLRewrite", r#"{"name":"127.0.0.1","port":8001}"#)
             } else {
-                "RequestRedirect"
+                ("RequestRedirect", "")
             };
             let json = format!(
                 r#"{{"hostnames":["p.example.com"],"rules":[{{
                     "matches":[{{"path":{{"type":"PathPrefix","value":"/old"}}}}],
                     "filters":[{{"type":"{kind}","{filter}":{{"path":{path}}}}}],
-                    "backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}"#
+                    "backendRefs":[{backends}]}}]}}"#
             );
             let route: crate::config::HttpRouteConfig = serde_json::from_str(&json).unwrap();
             let err = compile_http_route(&route).err().expect(&json);

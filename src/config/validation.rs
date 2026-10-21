@@ -991,7 +991,11 @@ mod tests {
             ),
         ];
         for (filter, field) in cases {
-            let cfg = config_with_rule(make_rule(vec![filter], vec![default_backend()]));
+            let backends = match filter {
+                HttpRouteFilter::RequestRedirect { .. } => vec![],
+                _ => vec![default_backend()],
+            };
+            let cfg = config_with_rule(make_rule(vec![filter], backends));
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.starts_with("HTTP route 0: rule 0: filter 0: "), "{err}");
             assert!(err.contains(field), "{err}");
