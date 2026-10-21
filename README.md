@@ -18,7 +18,8 @@ But in front of the complexity, I took a step back and removed both the io_uring
 and eBPF implementations that were getting out of hands in favor of Tokio runtime.
 
 Portail targets **Gateway API v1.4.1** and does not support the mesh (GAMMA) profile.
-I plan on adding HTTP/2 (and gRPC) support in a future release.
+HTTP/2 is opt-in on HTTPS listeners via `--http2`.
+I plan on adding gRPC support in a future release.
 
 ## License
 
