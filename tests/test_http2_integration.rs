@@ -7,9 +7,12 @@ mod helpers;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use helpers::{extract_status, generate_test_cert, PortailProcess, TestBackend};
+use helpers::{
+    extract_status, generate_test_cert, spawn_slow_backend, PortailProcess, TestBackend,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -525,6 +528,45 @@ async fn test_h1_coexists_on_h2_port() {
     let _ = tls.read_to_end(&mut resp).await;
     assert_eq!(extract_status(&resp), Some(200));
     assert!(resp.ends_with(b"h1-still-works"));
+}
+
+/// SIGTERM: an h2 connection gets GOAWAY, its stream in flight finishes,
+/// then the connection closes and the process exits, well inside the 30s
+/// drain window an open h2 connection used to hold it for.
+#[tokio::test]
+async fn test_h2_drain_sends_goaway_and_finishes_streams() {
+    let (backend, arrived) = spawn_slow_backend(Duration::from_secs(1));
+    let Some(mut proxy) = spawn_h2_proxy(25083, backend) else {
+        return;
+    };
+    let tls = tls_connect(25083, &[b"h2"]).await;
+    let (sr, connection) = h2::client::handshake(tls).await.expect("h2 handshake");
+    let connection = tokio::spawn(connection);
+
+    let mut s = sr.ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{}/slow", SNI))
+        .body(())
+        .unwrap();
+    let (resp, _) = s.send_request(req, true).expect("send_request");
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("request never reached the backend");
+
+    proxy.terminate();
+    let (status, body) = read_response(resp.await.expect("h2 response")).await;
+    assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("h2 connection still open after the drain")
+        .unwrap()
+        .expect("h2 connection ended in error, not by GOAWAY");
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("no exit within 10s of SIGTERM");
+    assert!(status.success(), "{status}");
 }
 
 #[tokio::test]

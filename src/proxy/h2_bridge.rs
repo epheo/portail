@@ -69,6 +69,7 @@ pub(crate) struct H2Ctx {
     pub(crate) cfg: WorkerConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
+    /// Cancelled when the data plane drains: the connection sends GOAWAY.
     pub(crate) drain: CancellationToken,
 }
 
@@ -93,9 +94,21 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     };
 
     let ctx = Arc::new(ctx);
-    while let Some(stream) = conn.accept().await {
-        let Ok((req, respond)) = stream else {
-            // Connection-level error; h2 already sent GOAWAY where due.
+    let mut draining = false;
+    loop {
+        let stream = tokio::select! {
+            stream = conn.accept() => stream,
+            // GOAWAY: the client opens no new streams, the ones in flight
+            // finish, and accept() ends once the last of them closes.
+            () = ctx.drain.cancelled(), if !draining => {
+                draining = true;
+                conn.graceful_shutdown();
+                continue;
+            }
+        };
+        let Some(Ok((req, respond))) = stream else {
+            // Closed, or a connection-level error; h2 already sent GOAWAY
+            // where due.
             return;
         };
         let ctx = ctx.clone();
