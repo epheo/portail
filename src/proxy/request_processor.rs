@@ -20,6 +20,8 @@ use crate::routing::{
 
 /// Stack-allocated request metadata: only a normalized path is on the heap.
 pub struct RequestMeta {
+    /// Length of the head, its blank line included.
+    pub head_len: usize,
     pub content_length: Option<usize>,
     pub is_chunked: bool,
     pub is_upgrade: bool,
@@ -296,6 +298,7 @@ fn analyze_http_request<'a>(
         backend: selected_backend,
         rule,
         meta: RequestMeta {
+            head_len: request_info.head_len,
             content_length: request_info.content_length,
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
@@ -573,6 +576,23 @@ mod tests {
 
     fn health() -> HealthRegistry {
         HealthRegistry::new()
+    }
+
+    #[test]
+    fn head_len_is_where_the_first_blank_line_ends() {
+        let rt = build_route_table("h.test", "/", PathMatchType::Prefix, 8001, vec![]);
+        for req in [
+            &b"GET / HTTP/1.1\r\nHost: h.test\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\nHost: h.test\r\nContent-Length: 4\r\n\r\n\r\n\r\nGET",
+            b"GET http://h.test/x HTTP/1.0\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+        ] {
+            let result = analyze_request(&rt, &BackendSelector::new(), req, 80, &health(), false);
+            let Ok(RoutingResult::HttpForward { meta, .. }) = result else {
+                panic!("not forwarded: {}", String::from_utf8_lossy(req));
+            };
+            let want = crate::proxy::http_parser::find_header_end(req);
+            assert_eq!(Some(meta.head_len), want);
+        }
     }
 
     #[test]
