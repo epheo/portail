@@ -315,12 +315,13 @@ impl PortailConfig {
                     .filter(|l| takes_http_routes(l))
                     .collect();
 
-            // No parentRefs: route without gateway context (file-based
-            // configs). One pseudo-scope on port 0 with no hostname
-            // constraint, so hostname intersection passes routes through.
-            // Rate limiting rides the listener, so the pseudo-scope has none.
-            // Refs that select no listener attach nowhere: the any-port scope
-            // would serve the route on every port.
+            // No parentRefs: route without gateway context. One pseudo-scope
+            // per HTTP or HTTPS listener port, with no hostname constraint,
+            // so hostname intersection passes routes through. Not port 0:
+            // a TCP port would then wait to sniff, and hang a
+            // server-speaks-first client. Rate limiting rides the listener,
+            // so the pseudo-scope has none. Refs that select no listener
+            // attach nowhere.
             type Scope<'a> = (
                 u16,
                 Option<&'a str>,
@@ -328,7 +329,19 @@ impl PortailConfig {
                 Option<std::sync::Arc<crate::rate_limit::Limiter>>,
             );
             let scopes: Vec<Scope> = if http_route.parent_refs.is_empty() {
-                vec![(0, None, "", None)]
+                let mut ports: Vec<u16> = self
+                    .gateway
+                    .listeners
+                    .iter()
+                    .filter(|l| takes_http_routes(l))
+                    .map(|l| l.port)
+                    .collect();
+                ports.sort_unstable();
+                ports.dedup();
+                ports
+                    .into_iter()
+                    .map(|port| (port, None, "", None))
+                    .collect()
             } else {
                 matched_listeners
                     .iter()
@@ -778,6 +791,33 @@ mod tests {
             "{err}"
         );
         assert!(!on_tcp.to_route_table().unwrap().has_http_routes(5432));
+    }
+
+    /// A route with no parentRefs went to the any-port scope, which every
+    /// port searches: the TCP port then waited to sniff, and a
+    /// server-speaks-first client hung.
+    #[test]
+    fn a_route_without_parent_refs_serves_http_ports_only() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "web", "protocol": "HTTP", "port": 8080},
+                {"name": "db", "protocol": "TCP", "port": 5432}
+            ]},
+            "httpRoutes": [{"hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt.has_tcp_route(5432));
+        assert!(!rt.has_http_routes(5432), "the TCP port must not sniff");
+        let found = |port| {
+            rt.find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_some()
+        };
+        assert!(found(8080));
+        assert!(!found(5432));
     }
 
     #[test]

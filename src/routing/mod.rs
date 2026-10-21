@@ -115,7 +115,7 @@ impl ListenerScope {
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
-    /// Port 0 is a wildcard that matches any port (used in file-based configs / tests).
+    /// Port 0 is a wildcard that matches any port (`add_http_route`, tests and benches).
     pub listener_scopes: FnvHashMap<u16, Vec<ListenerScope>>,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
@@ -169,7 +169,7 @@ impl RouteTable {
         };
 
         // O(1) port lookup, then iterate only matching scopes.
-        // Also check port-0 wildcard scopes (file-based configs / tests).
+        // Also check port-0 wildcard scopes (`add_http_route`, tests and benches).
         let port_scopes = self.listener_scopes.get(&server_port);
         let wildcard_scopes = if server_port != 0 {
             self.listener_scopes.get(&0)
