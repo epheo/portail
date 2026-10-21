@@ -30,7 +30,7 @@ use crate::proxy::http_filters::{
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{self, progress, WorkerConfig};
+use crate::proxy::worker::{self, progress, BodyFraming, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough
@@ -334,13 +334,16 @@ async fn forward_response(
         }
     };
 
-    let status = worker::parse_response_status(&acc[..header_end]);
-    let content_length = worker::parse_content_length(&acc[..header_end]);
-    let chunked = worker::is_chunked_transfer(&acc[..header_end]);
-    // Chunked framing wins over content-length (RFC 7230 3.3.3), matching the
-    // engine, so a chunked body is never cut short by a stray Content-Length: 0.
-    let no_body =
-        worker::response_has_no_body(status, is_head) || (!chunked && content_length == Some(0));
+    // The engine framed its output by this same reading.
+    let head = worker::parse_response_head(&acc[..header_end])
+        .ok_or_else(|| anyhow!("engine sent a malformed response head"))?;
+    let status = head.status;
+    let (chunked, content_length) = match head.body {
+        BodyFraming::Chunked => (true, None),
+        BodyFraming::Length(n) => (false, Some(n)),
+        BodyFraming::Close => (false, None),
+    };
+    let no_body = worker::response_has_no_body(status, is_head) || content_length == Some(0);
     // We reframe a chunked body into DATA, so the h2 response must not also
     // carry the backend's content-length: the DATA total need not equal it and
     // a mismatch is malformed per RFC 9113 8.1.1.
@@ -627,7 +630,8 @@ mod tests {
     fn response_mapping_strips_hop_by_hop_keeps_the_rest() {
         // Content-Length body (not chunked): the length is preserved.
         let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 3\r\nx-custom: v\r\n\r\n";
-        let resp = build_h2_response(head, worker::parse_response_status(head), false).unwrap();
+        let status = worker::parse_response_head(head).unwrap().status;
+        let resp = build_h2_response(head, status, false).unwrap();
         assert_eq!(resp.status(), 200);
         let h = resp.headers();
         assert_eq!(h.get("content-type").unwrap(), "text/plain");
