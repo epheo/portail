@@ -32,8 +32,8 @@ use crate::proxy::http_parser::{
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
-    analyze_request, analyze_tcp_request, client_done, is_http_request, LocalReply, RequestMeta,
-    RoutingResult,
+    analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
+    RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
@@ -1045,12 +1045,11 @@ async fn proxy_http_request(
         (None, None) => true,
     };
     // Settled again once the relay below is through.
-    state.client_done = client_done(
-        meta.keepalive,
-        meta.is_upgrade,
-        body_held,
-        leftover.is_some(),
-    );
+    state.client_done = client_done(ClientSent {
+        keepalive: meta.keepalive,
+        request_in: body_held && !meta.is_upgrade,
+        seen_past: leftover.is_some(),
+    });
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (backend, from_pool) =
@@ -1172,8 +1171,12 @@ async fn proxy_http_request(
         leftover = relay_leftover;
     }
     if !answered_early {
-        // All of the request is in.
-        state.client_done = client_done(meta.keepalive, meta.is_upgrade, true, leftover.is_some());
+        // All of the request is in, unless it switches protocols.
+        state.client_done = client_done(ClientSent {
+            keepalive: meta.keepalive,
+            request_in: !meta.is_upgrade,
+            seen_past: leftover.is_some(),
+        });
     }
 
     // Both are Some iff has_mirrors: pairing them here keeps any fallback to

@@ -94,14 +94,24 @@ fn local_reply_reusable(info: &HttpRequestInfo<'_>) -> bool {
     info.keepalive && head_is_whole(info)
 }
 
+/// What a client has sent on its connection, for [`client_done`].
+pub struct ClientSent {
+    /// Its request asked to keep the connection open.
+    pub keepalive: bool,
+    /// All of its request is in. Never so for an upgrade: its client may
+    /// already stream the new protocol.
+    pub request_in: bool,
+    /// Bytes past its request were read.
+    pub seen_past: bool,
+}
+
 /// Whether the client sends nothing more on its connection, the one rule
 /// behind every closing reply's linger. It must have asked to close
 /// (`Connection: close`, or HTTP/1.0 without keep-alive), its request must
 /// be all in, and no byte past it seen: a client sending past its request
-/// may send more, whatever it asked. An upgrade's client may stream the
-/// new protocol.
-pub fn client_done(keepalive: bool, is_upgrade: bool, request_in: bool, seen_past: bool) -> bool {
-    !keepalive && !is_upgrade && request_in && !seen_past
+/// may send more, whatever it asked.
+pub fn client_done(sent: ClientSent) -> bool {
+    !sent.keepalive && sent.request_in && !sent.seen_past
 }
 
 pub fn analyze_request<'a>(
@@ -200,12 +210,11 @@ fn analyze_http_request<'a>(
     };
     let reusable = local_reply_reusable(&request_info);
     // A reply the proxy writes itself reads no body.
-    let client_done = client_done(
-        request_info.keepalive,
-        request_info.is_upgrade,
-        head_is_whole(&request_info),
-        request_data.len() > request_info.head_len,
-    );
+    let client_done = client_done(ClientSent {
+        keepalive: request_info.keepalive,
+        request_in: head_is_whole(&request_info),
+        seen_past: request_data.len() > request_info.head_len,
+    });
     let is_head = request_info.method.eq_ignore_ascii_case("HEAD");
     let reply = |status, location| {
         Ok(RoutingResult::LocalReply(LocalReply {
