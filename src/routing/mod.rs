@@ -699,12 +699,18 @@ impl BackendSelector {
     /// Health-aware weighted backend selection.
     ///
     /// Weight-0 backends receive no traffic (Gateway API semantics), matching
-    /// `select_l4_backend`. Returns `None` when no healthy backend with
-    /// positive weight exists (caller should send 503).
+    /// `select_l4_backend`. Returns `None` only when no backend has positive
+    /// weight (caller should send 503).
     ///
-    /// Fast path: every positive-weight backend healthy, reuse pre-computed
-    /// `cumulative_weights` (a weight-0 backend's prefix sum equals its
-    /// predecessor's, so `partition_point` can never land on it).
+    /// With no healthy positive-weight backend left, selection fails open over
+    /// all of them by weight (Envoy-style panic routing). Passive health cannot
+    /// tell a dead pod from a ClusterIP VIP whose endpoints are briefly gone,
+    /// nor spare a route's only backend: ejecting those turned a short endpoint
+    /// gap into minutes of 503s.
+    ///
+    /// Fast path: every positive-weight backend healthy, or none, reuses
+    /// pre-computed `cumulative_weights` (a weight-0 backend's prefix sum
+    /// equals its predecessor's, so `partition_point` can never land on it).
     /// Slow path: O(n) filter + walk, taken only during partial failures.
     pub fn select_healthy_weighted_backend(
         &self,
@@ -714,8 +720,7 @@ impl BackendSelector {
         let backends = &rule.backends;
 
         if backends.len() == 1 {
-            let b = &backends[0];
-            return (b.weight > 0 && health.is_healthy(&b.socket_addr)).then_some(0);
+            return (backends[0].weight > 0).then_some(0);
         }
 
         let mut healthy_weight: u64 = 0;
@@ -725,9 +730,17 @@ impl BackendSelector {
             }
         }
 
-        // Covers empty, all-unhealthy, and all-weight-zero: modulo below must
-        // never see a zero divisor (panic = abort kills the data plane).
-        if healthy_weight == 0 {
+        // Panic routing: with nothing healthy, pool every positive-weight
+        // backend, which is exactly what the fast path picks from.
+        let pool_weight = if healthy_weight == 0 {
+            rule.total_weight
+        } else {
+            healthy_weight
+        };
+
+        // Covers empty and all-weight-zero: modulo below must never see a
+        // zero divisor (panic = abort kills the data plane).
+        if pool_weight == 0 {
             return None;
         }
 
@@ -735,13 +748,13 @@ impl BackendSelector {
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if healthy_weight == rule.total_weight {
+        if pool_weight == rule.total_weight {
             let slot = counter % rule.total_weight;
             return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
         }
 
         // Slow path — some positive-weight backends are unhealthy
-        let slot = counter % healthy_weight;
+        let slot = counter % pool_weight;
 
         if let Some(i) = nth_healthy_weighted(backends, health, slot) {
             return Some(i);
@@ -751,29 +764,44 @@ impl BackendSelector {
         backends
             .iter()
             .position(|b| b.weight > 0 && health.is_healthy(&b.socket_addr))
+            .or_else(|| backends.iter().position(|b| b.weight > 0))
     }
 
     /// Health-aware weighted round-robin over an L4 backend list, keyed by
     /// listener port. Weight-0 backends receive no traffic (Gateway API
-    /// semantics). Returns `None` when no healthy backend with positive
-    /// weight exists.
+    /// semantics). Fails open over every positive-weight backend when none is
+    /// healthy, as `select_healthy_weighted_backend` does. Returns `None` only
+    /// when no backend has positive weight.
     pub fn select_l4_backend<'a>(
         &self,
         key: u64,
         backends: &'a [Backend],
         health: &crate::proxy::health::HealthRegistry,
     ) -> Option<&'a Backend> {
+        let mut total_weight: u64 = 0;
         let mut healthy_weight: u64 = 0;
         for b in backends {
-            if health.is_healthy(&b.socket_addr) {
+            total_weight += b.weight as u64;
+            if b.weight > 0 && health.is_healthy(&b.socket_addr) {
                 healthy_weight += b.weight as u64;
             }
         }
-        if healthy_weight == 0 {
+        if total_weight == 0 {
             return None;
         }
-        let slot = self.next_counter(key) % healthy_weight;
-        nth_healthy_weighted(backends, health, slot).map(|i| &backends[i])
+        let counter = self.next_counter(key);
+        if healthy_weight > 0 {
+            if let Some(i) = nth_healthy_weighted(backends, health, counter % healthy_weight) {
+                return Some(&backends[i]);
+            }
+        }
+        // Panic routing, or health flipped between the sum and the walk.
+        let slot = counter % total_weight;
+        let mut cumulative: u64 = 0;
+        backends.iter().find(|b| {
+            cumulative += b.weight as u64;
+            cumulative > slot
+        })
     }
 }
 
