@@ -598,10 +598,12 @@ pub struct PerformanceConfig {
     /// Concurrent UDP sessions per listener socket; datagrams that would open
     /// one more are dropped. Each session holds an fd, a task, a 64KiB reply
     /// buffer and an ephemeral port, and a session per spoofed source address
-    /// costs an attacker nothing. Defaults to 1024, Envoy's default
-    /// `max_connections` circuit breaker, which also bounds its UDP sessions.
-    #[serde(default = "default_udp_max_sessions")]
-    pub udp_max_sessions: usize,
+    /// costs an attacker nothing. Unset, each listener gets a quarter of the
+    /// fd budget (the `RLIMIT_NOFILE` soft limit), leaving the rest for TCP:
+    /// a fixed default would cut off UDP workloads larger than it, and
+    /// Kubernetes mode cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_max_sessions: Option<usize>,
 
     /// How often the background DNS-refresh task re-resolves backend FQDNs and,
     /// on an actual change, rebuilds + swaps the route table. Bounds how quickly
@@ -689,10 +691,6 @@ fn default_udp_session_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_udp_max_sessions() -> usize {
-    1024
-}
-
 fn default_dns_refresh_interval() -> Duration {
     Duration::from_secs(5)
 }
@@ -714,7 +712,7 @@ impl Default for PerformanceConfig {
         Self {
             backend_timeout: default_backend_timeout(),
             udp_session_timeout: default_udp_session_timeout(),
-            udp_max_sessions: default_udp_max_sessions(),
+            udp_max_sessions: None,
             dns_refresh_interval: default_dns_refresh_interval(),
             client_header_timeout: default_client_header_timeout(),
             tcp_keepalive_time: default_tcp_keepalive_time(),
