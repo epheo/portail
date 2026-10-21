@@ -132,7 +132,7 @@ values; defaults shown):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `backendTimeout` | `30s` | Backend connect timeout |
-| `clientHeaderTimeout` | `30s` | Max time for a client TLS handshake, or to finish a request's header block once its first bytes arrive (slow-loris guard). Does not bound idle keepalive waits |
+| `clientHeaderTimeout` | `30s` | Max time for a client TLS handshake, or to finish a request's header block once its first bytes arrive (slow-loris guard). Also bounds each connection's close: the TLS close_notify and, after a reply the proxy wrote itself, the wait for the client to finish sending. Does not bound idle keepalive waits |
 | `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming, and on an L4 relay once one direction has closed; reaps peers that stay connected but stop transferring. `0s` disables |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
