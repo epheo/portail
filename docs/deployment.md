@@ -73,11 +73,17 @@ See: `examples/kubernetes/multi-network/`
 ghcr.io/epheo/portail:latest
 ```
 
-Build from source:
+Build from source (compiles inside the build stage):
+
+```bash
+podman build -t ghcr.io/epheo/portail:latest -f Containerfile .
+```
+
+Or package a host build:
 
 ```bash
 cargo build --release
-podman build -t ghcr.io/epheo/portail:latest -f Containerfile .
+podman build --build-arg PREBUILT=1 -t ghcr.io/epheo/portail:latest -f Containerfile .
 ```
 
 ## Probes and Metrics

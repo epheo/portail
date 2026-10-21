@@ -5,21 +5,28 @@
 #
 # Or with a pre-built binary (faster iteration):
 #   cargo build --release
-#   podman build --target runtime --build-arg PREBUILT=1 -t ghcr.io/epheo/portail:latest -f Containerfile .
+#   podman build --build-arg PREBUILT=1 -t ghcr.io/epheo/portail:latest -f Containerfile .
+
+ARG PREBUILT=0
 
 FROM docker.io/library/rust:1-slim AS builder
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
 # Compile-time dependency: config/examples.rs embeds these via include_str!
 COPY examples/standalone/ examples/standalone/
-RUN cargo build --release --bin portail && strip target/release/portail
+RUN cargo build --release --locked --bin portail && strip target/release/portail
+
+# Only the stage PREBUILT selects gets built, so the default build needs no host binary.
+FROM builder AS binary-0
+FROM scratch AS binary-1
+COPY target/release/portail /src/target/release/portail
+FROM binary-${PREBUILT} AS binary
 
 FROM registry.fedoraproject.org/fedora-minimal:43 AS runtime
 RUN microdnf install -y libgcc libcap && microdnf clean all
-COPY --from=builder /src/target/release/portail /usr/local/bin/portail
+COPY --from=binary /src/target/release/portail /usr/local/bin/portail
 # Carry CAP_NET_BIND_SERVICE as a *file* capability so the data plane can bind
 # privileged ports (80/443) directly in multi-network/UDN and host-network modes
 # while staying non-root under restricted Pod Security (no allowPrivilegeEscalation,
