@@ -110,8 +110,8 @@ impl WorkerConfig {
 pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const TCP_KEEPALIVE_RETRIES: u32 = 5;
 
-/// The keepalive accepted sockets get, for backend sockets: a dead backend
-/// pins an idle client's task and both fds as surely as a dead client.
+/// The keepalive of accepted and backend sockets alike: a dead backend pins
+/// an idle client's task and both fds as surely as a dead client.
 pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
     socket2::TcpKeepalive::new()
         .with_time(time)
@@ -330,10 +330,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     // Dead-peer detection: a client that vanishes without FIN/RST would
     // otherwise park its connection task forever, since the idle wait
     // between keepalive requests is intentionally unbounded.
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(cfg.tcp_keepalive_time)
-        .with_interval(TCP_KEEPALIVE_INTERVAL)
-        .with_retries(TCP_KEEPALIVE_RETRIES);
+    let keepalive = tcp_keepalive(cfg.tcp_keepalive_time);
 
     let mut backoff = AcceptBackoff::default();
     loop {
