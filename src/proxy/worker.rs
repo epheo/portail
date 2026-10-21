@@ -243,6 +243,7 @@ pub(crate) struct ConnectionState {
     drain: CancellationToken,
     /// The connection closes after a reply while the client may still be
     /// sending: the close reads off what comes instead of resetting on it.
+    /// Set by `close_after_reply` only, so every reply follows one rule.
     linger: bool,
     /// This request's client sends nothing more (see [`client_done`]), so a
     /// closing reply has nothing to linger for. Reset as each request
@@ -1144,11 +1145,9 @@ async fn proxy_http_request(
         RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
         // A backend may answer before it has the whole body (a 413, a 401)
         // and stop reading it; RFC 9112 9.5 has the client watch for that.
-        // The rest of the client's body stays unread: the close reads it off.
-        RequestBody::BackendGone => {
-            state.linger = true;
-            (None, None, true)
-        }
+        // The rest of the client's body stays unread, so the client is not
+        // done: the close reads it off.
+        RequestBody::BackendGone => (None, None, true),
         incomplete => {
             if let RequestBody::Broken = incomplete {
                 warn!(
@@ -1343,6 +1342,7 @@ async fn proxy_http_request(
     client.flush().await?;
     if answered_early {
         // Never pooled: its request was cut short.
+        state.close_after_reply();
         return Ok((false, None));
     }
 
@@ -2569,7 +2569,10 @@ async fn send_local_reply(
 ) -> Result<bool> {
     let location = reply.location.as_deref();
     let bytes = local_reply_bytes(reply.status, location, !reply.reusable, reply.head);
-    state.linger = !(reply.reusable || reply.client_done);
+    state.client_done = reply.client_done;
+    if !reply.reusable {
+        state.close_after_reply();
+    }
     client.write_all(&bytes).await?;
     client.flush().await?;
     crate::access_log::emit(access, reply.status, None);
