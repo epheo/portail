@@ -681,13 +681,15 @@ async fn serve_http(
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
                     let backend_addr = backend.socket_addr;
-                    let (ka, leftover) =
+                    let (keep, leftover) =
                         proxy_http_request(client, buf, n, backend, rule, &meta, state).await?;
                     if !meta.is_upgrade {
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
                     crate::access_log::emit(access, state.last_status, Some(backend_addr));
-                    if !keep_open(&state.drain, ka && meta.keepalive) {
+                    // No drain check: the head already told the client. A
+                    // drain since then ends the idle wait, or the next reply.
+                    if !keep {
                         return Ok(Handoff::Close);
                     }
                     leftover
@@ -917,10 +919,11 @@ async fn complete_headers(
 }
 
 /// Proxy a single HTTP request to a backend and forward the response.
-/// Returns `(reusable, leftover)`: `reusable` is true if the response was
-/// fully received (connection reusable for keepalive); `leftover` holds any
-/// bytes read past this request's body — a pipelined next request — which the
-/// keepalive loop replays instead of reading from the socket again.
+/// Returns `(keep, leftover)`: `keep` when the response went out whole and
+/// its head announced keep-alive, which the client may already act on;
+/// `leftover` holds any bytes read past this request's body (a pipelined
+/// next request), which the keepalive loop replays instead of reading from
+/// the socket again.
 ///
 /// Owns all timing for the request lifecycle. Two timeouts come in from the rule:
 ///
@@ -1137,7 +1140,7 @@ async fn proxy_http_request(
     // Forward response headers (SAFE→UNSAFE transition lives inside this call;
     // on timeout the helper emits a 504 — no client bytes written yet).
     let resp_mods = extract_response_mods(rule, backend_ref);
-    let mut framing = loop {
+    let (mut framing, keep) = loop {
         let header_budget = clamp_to_deadline(
             backend_budget.saturating_sub(backend_phase_start.elapsed()),
             total_deadline,
@@ -1157,7 +1160,7 @@ async fn proxy_http_request(
         )
         .await?
         {
-            HeaderPhase::Proxied(f) => break f,
+            HeaderPhase::Proxied { framing, keep } => break (framing, keep),
             HeaderPhase::ErrorSent(code) => {
                 state.refused(code);
                 return Ok((false, None));
@@ -1291,28 +1294,29 @@ async fn proxy_http_request(
             backend_addr
         );
     }
-    let reusable = !framing.overshoot;
+    let framing_clean = !framing.overshoot;
 
     // Both bodies completed per their framing: every other outcome returned
     // above, dropping `backend`. The client got a clean response, but the
     // backend conn returns to the pool only when `backend_conn_poolable`
     // allows (notably never after HEAD or a refused upgrade) and never when
     // the backend announced Connection: close.
-    if backend_conn_poolable(reusable, meta.is_head, meta.is_upgrade) && !framing.backend_close {
+    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade) && !framing.backend_close
+    {
         state.pool.release(
             backend_addr,
             backend_ref.use_tls,
             &backend_ref.server_name,
             backend,
         );
-    } else if reusable {
+    } else if framing_clean {
         debug!(
             "Backend {} conn not pooled (HEAD, refused upgrade, or backend Connection: close)",
             backend_addr
         );
     }
 
-    Ok((reusable, leftover))
+    Ok((keep, leftover))
 }
 
 /// Whether a backend connection may be returned to the idle pool after a
@@ -1685,7 +1689,12 @@ async fn resend_on_fresh(
 /// Outcome of the response-header phase: the framing to stream the body
 /// under, or the error status this helper already wrote to the client.
 enum HeaderPhase {
-    Proxied(ResponseFraming),
+    /// `keep`: the head told the client the connection stays open, which
+    /// holds once the body is through, whatever starts meanwhile.
+    Proxied {
+        framing: ResponseFraming,
+        keep: bool,
+    },
     ErrorSent(u16),
     /// The backend closed or reset before its first byte, and nothing was
     /// written to the client: the caller replays or answers.
@@ -1763,7 +1772,10 @@ async fn forward_response_headers(
     // Connection/Upgrade headers intact, and the connection leaves HTTP.
     if framing.status == 101 {
         client.write_all(&header_buf[..tail_end]).await?;
-        return Ok(HeaderPhase::Proxied(framing));
+        return Ok(HeaderPhase::Proxied {
+            framing,
+            keep: false,
+        });
     }
 
     // Hop-by-hop response headers never reach the client (RFC 7230 6.1);
@@ -1775,10 +1787,11 @@ async fn forward_response_headers(
     };
     // Decided only now that the head is in: a drain that started while
     // the backend worked is still announced.
+    let keep = keep_open(drain, keepalive) && !framing.close_delimited();
     sanitize_response_headers(
         &header_buf[..resp_header_end],
         content_length,
-        !keep_open(drain, keepalive) || framing.close_delimited(),
+        !keep,
         scratch,
     );
     let headers: &mut Vec<u8> = if let Some(mods) = resp_mods {
@@ -1792,7 +1805,7 @@ async fn forward_response_headers(
     let keep_len = headers.len();
     let tail = &header_buf[resp_header_end..tail_end];
     write_with_tail(client, headers, keep_len, tail).await?;
-    Ok(HeaderPhase::Proxied(framing))
+    Ok(HeaderPhase::Proxied { framing, keep })
 }
 
 /// Extract response header modifications from rule + backend filters (zero-alloc borrows).
@@ -3857,6 +3870,52 @@ mod connection_tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"
         );
         task.await.unwrap().unwrap();
+    }
+
+    /// A head that went out announcing keep-alive decided: a drain that
+    /// starts during its body does not close under the client, whose next
+    /// request, pipelined or sent meanwhile, is answered with the close.
+    /// Closed on it unread, the kernel's reset could also destroy the
+    /// response the client was still reading.
+    #[tokio::test]
+    async fn a_drain_after_a_keepalive_head_answers_the_request_already_sent() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        const NEXT: &[u8] = b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n";
+        for pipelined in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let drain = CancellationToken::new();
+            let (mut client, task) =
+                serve_draining(routes(listener.local_addr().unwrap()), drain.clone());
+            let first = if pipelined {
+                [GET_A, NEXT].concat()
+            } else {
+                GET_A.to_vec()
+            };
+            client.write_all(&first).await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+            while find_header_end(&seen).is_none() {
+                let n = sock.read(&mut chunk).await.unwrap();
+                seen.extend_from_slice(&chunk[..n]);
+            }
+            sock.write_all(HEAD).await.unwrap();
+            let mut head = vec![0u8; HEAD.len()];
+            client.read_exact(&mut head).await.unwrap();
+            assert_eq!(head, HEAD);
+
+            drain.cancel();
+            if !pipelined {
+                client.write_all(NEXT).await.unwrap();
+            }
+            sock.write_all(b"ok").await.unwrap();
+            let out = read_until_closed(&mut client).await;
+            assert_eq!(
+                out,
+                "okHTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found",
+                "pipelined={pipelined}"
+            );
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
