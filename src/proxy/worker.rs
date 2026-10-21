@@ -815,7 +815,7 @@ async fn close_connection(client: &mut Connection, buf: &mut [u8], state: &Conne
 
 /// How long a lingering close waits for the client's next bytes: a client
 /// silent this long is done. nginx's lingering_timeout default.
-pub const LINGER_IDLE: Duration = Duration::from_secs(5);
+pub(crate) const LINGER_IDLE: Duration = Duration::from_secs(5);
 
 /// Read and drop what the client still sends, up to one `buf` of it, until
 /// it closes, falls silent for `LINGER_IDLE`, or `deadline` passes.

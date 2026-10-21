@@ -625,8 +625,8 @@ pub struct PerformanceConfig {
     /// `timeout http-request` settings (5–30s).
     /// Also bounds each connection's close: the TLS close_notify, and the
     /// read-off of what a client still sends after a closing reply. That
-    /// read also ends once the client sends nothing new for
-    /// [`crate::proxy::worker::LINGER_IDLE`].
+    /// read also ends once the client sends nothing new for 5s
+    /// (`proxy::worker::LINGER_IDLE`).
     #[serde(default = "default_client_header_timeout", with = "human_duration")]
     pub client_header_timeout: Duration,
 

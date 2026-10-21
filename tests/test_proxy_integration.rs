@@ -20,7 +20,6 @@ use helpers::{
     read_one_response, spawn_slow_backend, tcp_roundtrip, wait_for_listener, InspectingBackend,
     PortailProcess, TcpEchoBackend, TestBackend,
 };
-use portail::proxy::worker::LINGER_IDLE;
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
 fn proxy_port(offset: u16) -> u16 {
@@ -2046,6 +2045,10 @@ fn test_controller_failure_exits_nonzero() {
         .unwrap_or_else(|| panic!("still running without a controller:\n{}", proxy.output()));
     assert!(!status.success(), "{status}:\n{}", proxy.output());
 }
+
+/// A copy of `portail::proxy::worker::LINGER_IDLE`, which is crate-private:
+/// keep the two equal.
+const LINGER_IDLE: Duration = Duration::from_secs(5);
 
 /// SIGTERM: idle connections close at once (keepalive, or one that has not
 /// sent its first request yet), an in-flight exchange finishes and
