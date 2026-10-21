@@ -1131,38 +1131,69 @@ mod tests {
         assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
     }
 
+    /// Reconcile passes until `want` more listeners are bound, as the
+    /// controller's next pass retries a failed bind. A port this process
+    /// just closed can stay busy a moment: tests running beside this one
+    /// hold references to its sockets (a spawned child until its exec, an
+    /// fd scan's dups).
+    async fn bind_until(
+        dp: &mut DataPlane,
+        listeners: &[ListenerConfig],
+        routes: &Arc<ArcSwap<RouteTable>>,
+        perf: &crate::config::PerformanceConfig,
+        want: usize,
+    ) {
+        let mut opened = 0;
+        for _ in 0..200 {
+            opened += dp.add_tcp_listeners(listeners, &[], routes.clone(), perf).0;
+            if opened == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{opened} of {want} listeners bound");
+    }
+
     /// A listener removed from the Gateway spec must stop serving — the old
     /// add-only flow kept its port accepting until pod restart.
     #[tokio::test]
     async fn removed_listener_torn_down_and_port_released() {
+        // A loopback address no other socket here binds or connects from,
+        // and ports the OS hands out on it: neither this process's own
+        // connects nor a run of this test in a parallel tree can take them.
+        // Port 0 itself will not do, as listeners are keyed by port; both
+        // probes are held until read, so the two differ.
+        const ADDR: &str = "127.0.0.3";
+        let probes = [(); 2].map(|()| std::net::TcpListener::bind((ADDR, 0)).unwrap());
+        let [a, b] = probes.map(|probe| probe.local_addr().unwrap().port());
         let mk = |name: &str, port: u16| ListenerConfig {
             name: name.into(),
             protocol: P::HTTP,
             port,
             target_port: None,
             hostname: None,
-            address: None,
+            address: Some(ADDR.into()),
             interface: None,
             tls: None,
             rate_limit: None,
         };
-        let both = vec![mk("a", 23448), mk("b", 23449)];
+        let endpoint = |port| (Some(ADDR.to_string()), port);
+        let both = vec![mk("a", a), mk("b", b)];
         let perf = test_perf();
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        let (opened, errors) = dp.add_tcp_listeners(&both, &[], routes.clone(), &perf);
-        assert_eq!((opened, errors.len()), (2, 0));
+        bind_until(&mut dp, &both, &routes, &perf, 2).await;
 
         // Spec drops listener b: its endpoint must leave the map and the
         // socket must actually close (cancel lands async, poll briefly).
         let (opened, errors) = dp.add_tcp_listeners(&both[..1], &[], routes.clone(), &perf);
         assert_eq!((opened, errors.len()), (0, 0));
-        assert!(!dp.is_ready_for_endpoints(&[(None, 23449)]));
-        assert!(dp.is_ready_for_endpoints(&[(None, 23448)]), "sibling kept");
+        assert!(!dp.is_ready_for_endpoints(&[endpoint(b)]));
+        assert!(dp.is_ready_for_endpoints(&[endpoint(a)]), "sibling kept");
         let mut released = false;
         for _ in 0..200 {
-            if std::net::TcpListener::bind(("0.0.0.0", 23449u16)).is_ok() {
+            if std::net::TcpListener::bind((ADDR, b)).is_ok() {
                 released = true;
                 break;
             }
@@ -1171,8 +1202,7 @@ mod tests {
         assert!(released, "removed listener must release its port");
 
         // Re-adding the listener rebinds it.
-        let (opened, errors) = dp.add_tcp_listeners(&both, &[], routes, &perf);
-        assert_eq!((opened, errors.len()), (1, 0));
-        assert!(dp.is_ready_for_endpoints(&[(None, 23449)]));
+        bind_until(&mut dp, &both, &routes, &perf, 1).await;
+        assert!(dp.is_ready_for_endpoints(&[endpoint(b)]));
     }
 }
