@@ -13,8 +13,9 @@
 //! per-connection pool carried implicitly.
 //!
 //! On a pool hit `acquire` returns `(Connection, true)`; the caller uses that
-//! signal to retry once with a fresh conn if the pooled conn turns out to be
-//! half-closed by the time we write to it (`acquire_fresh`).
+//! signal to retry once with a fresh conn (`acquire_fresh`) if the pooled
+//! conn turns out to be closed by the time we write to it, or closes before
+//! answering a request it may replay.
 
 use crate::logging::debug;
 use crate::metrics::METRICS;
@@ -38,30 +39,17 @@ fn new_tls_connector() -> Arc<tokio_rustls::TlsConnector> {
     Arc::new(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
 }
 
-/// Pop idle conns until one probes alive; dead ones are discarded.
-///
-/// 1-byte probe: WouldBlock on an idle TCP socket means open with no readable
-/// data — alive. Ok(0) is a peer FIN; Ok(1) is an unsolicited byte from a
-/// supposedly-idle HTTP backend (poisoned or desynced). In both Ok cases the
-/// conn is unusable; the byte we may have read in the poisoned case is on a
-/// conn we're dropping anyway, so it's harmless.
-///
-/// For Connection::Tls / ClientTls this resolves to a hardcoded WouldBlock in
-/// tls.rs — TLS state can't be peeked without consuming framing. The caller's
-/// retry-on-from_pool path is the safety net for stale TLS pool entries.
+/// Pop idle conns until one probes alive; dead ones are discarded. A peer
+/// FIN, a reset, or a byte from a supposedly idle HTTP backend (poisoned or
+/// desynced) all make a conn unusable. The probe cannot see a close racing
+/// the next request: the caller's from_pool replay covers that.
 fn take_live(conns: &mut Vec<Connection>) -> Option<Connection> {
-    while let Some(conn) = conns.pop() {
-        let mut probe = [0u8; 1];
-        match conn.try_read(&mut probe) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                METRICS.pool_hits_total.inc();
-                return Some(conn);
-            }
-            _ => {
-                METRICS.pool_stale_discards_total.inc();
-                continue;
-            }
+    while let Some(mut conn) = conns.pop() {
+        if conn.idle_and_open() {
+            METRICS.pool_hits_total.inc();
+            return Some(conn);
         }
+        METRICS.pool_stale_discards_total.inc();
     }
     None
 }
@@ -138,10 +126,9 @@ impl BackendPool {
     /// Get a backend connection — pooled if available and alive, otherwise fresh.
     ///
     /// Returns `(Connection, from_pool)`. `from_pool == true` means the caller
-    /// may retry once with `acquire_fresh` if the conn errors during the SAFE
-    /// zone (before any client bytes are read for the body or written): the
-    /// probe is best-effort and a backend can close a pooled conn between the
-    /// probe and our write.
+    /// may retry once with `acquire_fresh` if the conn fails before the
+    /// backend answered (see the module docs): the probe is best-effort and
+    /// a backend can close a pooled conn between the probe and our request.
     ///
     /// `keepalive` comes per call, not per pool: the process-wide pool
     /// serves every listener, each with its own config.
@@ -398,44 +385,97 @@ mod tests {
         (client, server)
     }
 
-    /// Probe an idle TcpStream the way `acquire` does and report the branch taken.
-    #[derive(Debug, PartialEq)]
-    enum ProbeOutcome {
-        Alive,
-        Stale,
-    }
-
-    fn probe_tcp(stream: &TcpStream) -> ProbeOutcome {
-        let mut buf = [0u8; 1];
-        match stream.try_read(&mut buf) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => ProbeOutcome::Alive,
-            _ => ProbeOutcome::Stale,
-        }
+    /// Lets what the remote end sent land before probing.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
     async fn probe_idle_conn_returns_alive() {
         let (local, _remote) = pair().await;
-        assert_eq!(probe_tcp(&local), ProbeOutcome::Alive);
+        assert!(Connection::Plain { inner: local }.idle_and_open());
     }
 
     #[tokio::test]
     async fn probe_half_closed_returns_stale() {
         let (local, mut remote) = pair().await;
-        // Remote half-closes — local should see Ok(0) on read.
         remote.shutdown().await.unwrap();
-        // Give the FIN a moment to land.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(probe_tcp(&local), ProbeOutcome::Stale);
+        settle().await;
+        assert!(!Connection::Plain { inner: local }.idle_and_open());
     }
 
+    /// An idle HTTP backend never speaks first: the conn is poisoned.
     #[tokio::test]
     async fn probe_unsolicited_byte_returns_stale() {
         let (local, mut remote) = pair().await;
-        // Remote sends an unsolicited byte — an idle HTTP backend shouldn't
-        // speak first. Probe returns Ok(1); treated as stale (poisoned conn).
         remote.write_all(b"x").await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(probe_tcp(&local), ProbeOutcome::Stale);
+        settle().await;
+        assert!(!Connection::Plain { inner: local }.idle_and_open());
+    }
+
+    /// A client TLS conn, idle after one exchange as when pooled, and the
+    /// server end driving it; `None` without openssl. The exchange matters:
+    /// a TLS 1.3 server's session tickets trail the handshake, and only the
+    /// first response read consumes them.
+    async fn tls_pair() -> Option<(Connection, tokio_rustls::server::TlsStream<TcpStream>)> {
+        use tokio::io::AsyncReadExt;
+        let (cert_pem, key_pem) = crate::proxy::tls::test_util::generate_test_cert("b.test")?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = crate::config::CertificateRef {
+            name: "b".to_string(),
+            cert_pem: Some(cert_pem),
+            key_pem: Some(key_pem),
+            ..Default::default()
+        };
+        let server_cfg =
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let (local, remote) = pair().await;
+        let sni = rustls::pki_types::ServerName::try_from("b.test").unwrap();
+        let (client, server) = tokio::join!(new_tls_connector().connect(sni, local), async {
+            acceptor.accept(remote).await
+        });
+        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+        server.write_all(b"x").await.unwrap();
+        server.flush().await.unwrap();
+        client.read_exact(&mut [0u8; 1]).await.unwrap();
+        Some((Connection::ClientTls { inner: client }, server))
+    }
+
+    #[tokio::test]
+    async fn probe_idle_tls_conn_returns_alive() {
+        let Some((mut conn, _server)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        settle().await;
+        assert!(conn.idle_and_open());
+    }
+
+    /// Node's https server ends an idle keep-alive conn with close_notify
+    /// and FIN: probing only plain conns reused it, and the next request
+    /// met EOF.
+    #[tokio::test]
+    async fn probe_tls_conn_closed_by_the_server_returns_stale() {
+        let Some((mut conn, mut server)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        server.shutdown().await.unwrap();
+        settle().await;
+        assert!(!conn.idle_and_open());
+    }
+
+    /// Bytes rustls decrypted but nobody read are past the socket peek;
+    /// pooled, they would answer the next request.
+    #[tokio::test]
+    async fn probe_tls_conn_holding_unread_plaintext_returns_stale() {
+        use tokio::io::AsyncReadExt;
+        let Some((mut conn, mut server)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        server.write_all(b"ab").await.unwrap();
+        server.flush().await.unwrap();
+        conn.read_exact(&mut [0u8; 1]).await.unwrap();
+        assert!(!conn.idle_and_open());
     }
 }

@@ -40,6 +40,16 @@ pub fn method_len(data: &[u8]) -> Option<usize> {
     None
 }
 
+/// Idempotent methods (RFC 9110 9.2.2): sent twice, they act as once, so a
+/// request a backend dropped unanswered may go out again. Case-sensitive:
+/// the sniff admits uppercase methods only.
+pub fn is_idempotent(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE"
+    )
+}
+
 /// Whether a configured route method is one portail could ever see on the
 /// wire. Case-insensitive because the matcher is (`method: get` has always
 /// matched GET); the alphabet is the wire alphabet above.
@@ -122,6 +132,16 @@ mod tests {
         );
         let over = "M".repeat(MAX_METHOD_LEN + 1);
         assert_eq!(method_len(format!("{over} /").as_bytes()), None);
+    }
+
+    #[test]
+    fn only_rfc_idempotent_methods_may_be_replayed() {
+        for m in ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"] {
+            assert!(is_idempotent(m), "{m}");
+        }
+        for m in ["POST", "PATCH", "CONNECT", "LOCK", "MKCOL", "get", "PUTS"] {
+            assert!(!is_idempotent(m), "{m}");
+        }
     }
 
     #[test]
