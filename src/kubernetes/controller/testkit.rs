@@ -72,12 +72,12 @@ impl MockApi {
         Client::new(service, "default")
     }
 
-    /// Answer requests whose path starts with `prefix` with `body`.
+    /// Answer requests whose path starts with `prefix` with `body`, in place
+    /// of any earlier reply for that prefix.
     pub fn reply_to(&self, prefix: &str, code: u16, body: Value) {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((prefix.to_string(), code, body));
+        let mut replies = self.replies.lock().unwrap();
+        replies.retain(|(p, _, _)| p != prefix);
+        replies.push((prefix.to_string(), code, body));
     }
 
     fn reply(&self, req: &Recorded) -> (u16, Value) {
@@ -216,6 +216,9 @@ impl TestCluster {
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             named_ports: Default::default(),
+            pending_watches: Arc::new(super::PendingWatches::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(super::RESYNC_SECS),
+            )),
             started: std::time::Instant::now(),
         })
     }

@@ -30,8 +30,8 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "secrets", "services"]
     verbs: ["get", "list", "watch"]
-  # Portail's own policy CRDs (rate limiting). Optional: without the CRD
-  # installed the watcher is skipped at startup.
+  # Portail's own policy CRDs (rate limiting). Optional: the watcher starts
+  # once API discovery serves the CRD.
   - apiGroups: ["portail.epheo.eu"]
     resources: ["ratelimitpolicies"]
     verbs: ["get", "list", "watch"]

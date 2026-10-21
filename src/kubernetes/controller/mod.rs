@@ -44,7 +44,7 @@ use reconcile::reconcile;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
     create_reflector_gated_with_config, drop_unread_metadata, map_policy_to_gateways,
-    map_route_to_gateways, map_secret_to_gateways,
+    map_route_to_gateways, map_secret_to_gateways, PendingWatches,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -115,6 +115,7 @@ struct ControllerCtx {
     gateway_configs:
         Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
     named_ports: Arc<NamedPortCache>,
+    pending_watches: Arc<PendingWatches>,
     /// When the controller came up — cold-start latency context for the
     /// "Data plane ready" log line and the not-ready watchdog.
     started: std::time::Instant,
@@ -197,11 +198,30 @@ pub async fn run_controller(
     // routes, and stays cluster-wide and ungated for the same reason routes
     // do: a policy in any namespace may target this Gateway and must get an
     // ancestor status, which requires observing it.
+    let pending_watches = Arc::new(PendingWatches::new(
+        std::time::Instant::now() + Duration::from_secs(RESYNC_SECS),
+    ));
     let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector) = tokio::join!(
-        create_optional_reflector(Api::<TCPRoute>::all(client.clone())),
-        create_optional_reflector(Api::<TLSRoute>::all(client.clone())),
-        create_optional_reflector(Api::<UDPRoute>::all(client.clone())),
-        create_optional_reflector(Api::<RateLimitPolicy>::all(client.clone())),
+        create_optional_reflector(
+            Api::<TCPRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<TLSRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<UDPRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<RateLimitPolicy>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
     );
     let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
     let (store_tls_routes, tls_route_stream) = tls_reflector;
@@ -268,6 +288,7 @@ pub async fn run_controller(
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         named_ports: Arc::new(NamedPortCache::default()),
+        pending_watches,
         started: std::time::Instant::now(),
     });
 
@@ -397,6 +418,9 @@ pub async fn run_controller(
     Ok(())
 }
 
+/// The safety-net re-check of a converged Gateway, in seconds.
+const RESYNC_SECS: u64 = 600;
+
 /// Requeue cadence after a reconcile that APPLIED changes. A *converged*
 /// Gateway — its data plane Programmed and every attached route Accepted —
 /// only needs a slow safety-net re-check (600s). An unconverged one re-runs
@@ -407,7 +431,7 @@ pub async fn run_controller(
 /// `skip_requeue_secs` cadence.
 fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
-        600
+        RESYNC_SECS
     } else {
         5
     }
@@ -417,7 +441,7 @@ fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
 /// fast heal cadence has nothing to heal, so back off to a periodic re-check.
 fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
-        600
+        RESYNC_SECS
     } else {
         60
     }

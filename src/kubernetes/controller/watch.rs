@@ -3,17 +3,21 @@
 //! the operator-provided `WatchShape` that decides which gate-able watches a
 //! scoped data plane opens at all.
 
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::Api;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
 use kube::runtime::{reflector, WatchStreamExt};
+use kube::Client;
 
 use gateway_api::gateways::Gateway;
 
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::parent_ref::ParentRefAccess;
-use crate::logging::warn;
+use crate::logging::{info, warn};
 
 /// Create a reflector for a resource type, returning the store and a stream.
 /// The stream is consumed by `Controller::watches_stream()` which both drives
@@ -51,10 +55,15 @@ where
     (writer.as_reader(), Box::pin(futures::stream::pending()))
 }
 
-/// Like `create_reflector`, but first probes the API endpoint with a lightweight
-/// list request. If the CRD is not installed (404), returns an empty store and
-/// a stream that never yields, so the controller can still start without it.
-pub(super) async fn create_optional_reflector<K>(api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
+/// Like `create_reflector`, for a CRD that may not be installed. When API
+/// discovery does not serve it, the store stays empty and the stream waits
+/// until [`PendingWatches::recheck`] finds it served, so a CRD installed
+/// after startup is watched without a restart.
+pub(super) async fn create_optional_reflector<K>(
+    api: Api<K>,
+    client: &Client,
+    pending: &PendingWatches,
+) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
         + Clone
@@ -65,18 +74,105 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
-    // Probe with limit=0 — just checks the endpoint exists
-    let probe = api.list(&kube::api::ListParams::default().limit(1)).await;
-    match probe {
-        Err(kube::Error::Api(ref status)) if status.code == 404 => {
-            let kind = std::any::type_name::<K>()
-                .rsplit("::")
-                .next()
-                .unwrap_or("Unknown");
-            warn!("CRD not installed, skipping watcher: {kind}");
-            empty_reflector()
+    let dt = K::DynamicType::default();
+    let watch = PendingWatch {
+        api_version: K::api_version(&dt).into_owned(),
+        plural: K::plural(&dt).into_owned(),
+        kind: K::kind(&dt).into_owned(),
+    };
+    if crd_served(client, &watch.api_version, &watch.plural).await != Some(false) {
+        return create_reflector(api);
+    }
+    warn!(
+        "CRD not installed, its watcher waits for it: {}",
+        watch.kind
+    );
+    let writer = reflector::store::Writer::default();
+    let reader = writer.as_reader();
+    let (start, started) = tokio::sync::oneshot::channel();
+    pending.add(watch, start);
+    let stream = futures::stream::once(async move {
+        match started.await {
+            Ok(()) => reflector_stream(writer, api, watcher::Config::default().streaming_lists()),
+            Err(_) => Box::pin(futures::stream::pending()),
         }
-        _ => create_reflector(api),
+    })
+    .flatten();
+    (reader, Box::pin(stream))
+}
+
+/// Whether API discovery serves `plural` in `api_version`; `None` when
+/// discovery itself failed.
+async fn crd_served(client: &Client, api_version: &str, plural: &str) -> Option<bool> {
+    match client.list_api_group_resources(api_version).await {
+        Ok(list) => Some(list.resources.iter().any(|r| r.name == plural)),
+        Err(kube::Error::Api(e)) if e.code == 404 => Some(false),
+        Err(e) => {
+            warn!("API discovery of {} failed: {}", api_version, e);
+            None
+        }
+    }
+}
+
+struct PendingWatch {
+    api_version: String,
+    plural: String,
+    kind: String,
+}
+
+/// Optional-CRD watches waiting for their CRD. Discovery is readable by
+/// every authenticated client, so the recheck needs no RBAC.
+pub(super) struct PendingWatches {
+    watches: std::sync::Mutex<Vec<(PendingWatch, tokio::sync::oneshot::Sender<()>)>>,
+    next_check: std::sync::Mutex<Instant>,
+}
+
+impl PendingWatches {
+    pub fn new(first_check: Instant) -> Self {
+        Self {
+            watches: Default::default(),
+            next_check: std::sync::Mutex::new(first_check),
+        }
+    }
+
+    fn add(&self, watch: PendingWatch, start: tokio::sync::oneshot::Sender<()>) {
+        let mut watches = self.watches.lock().unwrap_or_else(|p| p.into_inner());
+        watches.push((watch, start));
+    }
+
+    /// Start the watches whose CRD discovery now serves. Runs from
+    /// reconcile, at most once per safety-net requeue interval: no new
+    /// timer, and a quiet cluster still rechecks on its periodic requeue.
+    pub async fn recheck(&self, client: &Client) {
+        let now = Instant::now();
+        {
+            let mut next = self.next_check.lock().unwrap_or_else(|p| p.into_inner());
+            if now < *next {
+                return;
+            }
+            *next = now + Duration::from_secs(super::RESYNC_SECS);
+        }
+        let waiting: Vec<(String, String)> = self
+            .watches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(w, _)| (w.api_version.clone(), w.plural.clone()))
+            .collect();
+        for (api_version, plural) in waiting {
+            if crd_served(client, &api_version, &plural).await != Some(true) {
+                continue;
+            }
+            let mut watches = self.watches.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(i) = watches
+                .iter()
+                .position(|(w, _)| w.api_version == api_version && w.plural == plural)
+            {
+                let (watch, start) = watches.swap_remove(i);
+                info!("CRD installed, starting its watcher: {}", watch.kind);
+                let _ = start.send(());
+            }
+        }
     }
 }
 
@@ -331,13 +427,32 @@ where
     }
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
-    let stream = reflector::reflector(
-        writer,
-        watcher::watcher(api, config).modify(drop_unread_metadata),
+    (reader, reflector_stream(writer, api, config))
+}
+
+fn reflector_stream<K>(
+    writer: reflector::store::Writer<K>,
+    api: Api<K>,
+    config: watcher::Config,
+) -> BoxedReflectorStream<K>
+where
+    K: kube::Resource
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    Box::pin(
+        reflector::reflector(
+            writer,
+            watcher::watcher(api, config).modify(drop_unread_metadata),
+        )
+        .default_backoff()
+        .touched_objects(), // touched_objects includes deletes; applied_objects drops them
     )
-    .default_backoff()
-    .touched_objects(); // touched_objects includes deletes; applied_objects drops them
-    (reader, Box::pin(stream))
 }
 
 const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
@@ -375,7 +490,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{self, apply, CONTROLLER};
+    use super::super::testkit::{self, apply, MockApi, CONTROLLER};
     use super::*;
 
     fn served_gateways(names: &[&str]) -> Store<Gateway> {
@@ -421,6 +536,103 @@ mod tests {
         );
         let refs = map_policy_to_gateways(&policy, &store, CONTROLLER);
         assert_eq!(names(&refs), vec!["b", "a"]);
+    }
+
+    const TCPROUTE_GROUP: &str = "/apis/gateway.networking.k8s.io/v1alpha2";
+
+    fn discovery_serves_tcproutes(api: &MockApi, served: bool) {
+        if served {
+            api.reply_to(
+                TCPROUTE_GROUP,
+                200,
+                serde_json::json!({
+                    "kind": "APIResourceList",
+                    "apiVersion": "v1",
+                    "groupVersion": "gateway.networking.k8s.io/v1alpha2",
+                    "resources": [{
+                        "name": "tcproutes",
+                        "singularName": "tcproute",
+                        "namespaced": true,
+                        "kind": "TCPRoute",
+                        "verbs": ["get", "list", "watch"],
+                    }],
+                }),
+            );
+        } else {
+            api.reply_to(
+                TCPROUTE_GROUP,
+                404,
+                serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found",
+                }),
+            );
+        }
+    }
+
+    fn discovery_reads(api: &MockApi) -> usize {
+        api.requests()
+            .iter()
+            .filter(|r| r.path.split('?').next() == Some(TCPROUTE_GROUP))
+            .count()
+    }
+
+    fn tcproutes_watched(api: &MockApi) -> bool {
+        let watch_path = format!("{TCPROUTE_GROUP}/tcproutes");
+        api.requests()
+            .iter()
+            .any(|r| r.path.starts_with(&watch_path))
+    }
+
+    /// A CRD installed after startup is watched from the next recheck; it
+    /// used to stay ignored until a restart.
+    #[tokio::test]
+    async fn optional_crd_installed_later_starts_its_watch() {
+        use gateway_api::experimental::tcproutes::TCPRoute;
+        let api = MockApi::default();
+        discovery_serves_tcproutes(&api, false);
+        let client = api.client();
+        let pending = PendingWatches::new(Instant::now());
+        let (_store, stream) =
+            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
+                .await;
+        let driver = tokio::spawn(stream.for_each(|_| async {}));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!tcproutes_watched(&api), "no watch before the CRD exists");
+
+        discovery_serves_tcproutes(&api, true);
+        pending.recheck(&client).await;
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while !tcproutes_watched(&api) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        driver.abort();
+        assert!(
+            started.is_ok(),
+            "the watch starts once discovery serves the CRD"
+        );
+    }
+
+    /// Discovery is read at most once per safety-net interval.
+    #[tokio::test]
+    async fn recheck_waits_for_the_resync_interval() {
+        use gateway_api::experimental::tcproutes::TCPRoute;
+        let api = MockApi::default();
+        discovery_serves_tcproutes(&api, false);
+        let client = api.client();
+        let pending = PendingWatches::new(Instant::now());
+        let _reflector =
+            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
+                .await;
+        assert_eq!(discovery_reads(&api), 1, "the startup check");
+        pending.recheck(&client).await;
+        assert_eq!(discovery_reads(&api), 2, "due at once");
+        pending.recheck(&client).await;
+        assert_eq!(discovery_reads(&api), 2, "not again before the interval");
     }
 
     #[test]
