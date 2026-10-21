@@ -12,6 +12,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -163,6 +164,7 @@ async fn serve_stream(
     let _engine_slot = unless_reset(engines.acquire(), |cx| respond.poll_reset(cx)).await?;
 
     let (io, engine_io) = tokio::io::duplex(DUPLEX_BUF);
+    let aborted = Arc::new(AtomicBool::new(false));
     let state = worker::ConnectionState::new(
         ctx.server_port,
         ctx.routes.clone(),
@@ -175,7 +177,11 @@ async fn serve_stream(
         ctx.listener_stats.clone(),
         ctx.drain.clone(),
     );
-    let engine = worker::handle_connection(Connection::Mem { inner: engine_io }, ctx.peer, state);
+    let engine_conn = Connection::Mem {
+        inner: engine_io,
+        aborted: aborted.clone(),
+    };
+    let engine = worker::handle_connection(engine_conn, ctx.peer, state);
 
     // The bridge owns its duplex half and drops it on completion, so an
     // engine still reading the duplex sees EOF instead of parking on it.
@@ -199,7 +205,7 @@ async fn serve_stream(
                 read_response_head(&mut io).await
             };
             let resp_head = unless_reset(to_head, |cx| respond.poll_reset(cx)).await?;
-            forward_response(&mut io, &mut respond, resp_head, is_head, idle).await
+            forward_response(&mut io, &mut respond, resp_head, is_head, idle, &aborted).await
         }
         .await;
         drop(io);
@@ -407,13 +413,15 @@ async fn read_response_head(io: &mut DuplexStream) -> Result<(BytesMut, usize)> 
 
 /// Translate the engine's h1 response, its head read by
 /// [`read_response_head`], onto the h2 stream: headers mapped (hop-by-hop
-/// dropped), body de-framed into DATA.
+/// dropped), body de-framed into DATA. The engine sets `aborted` where an h1
+/// client would get a reset.
 async fn forward_response(
     io: &mut DuplexStream,
     respond: &mut h2::server::SendResponse<Bytes>,
     (mut acc, header_end): (BytesMut, usize),
     is_head: bool,
     idle: Option<Duration>,
+    aborted: &AtomicBool,
 ) -> Result<()> {
     // The engine framed its output by this same reading, which admits no
     // transfer coding but the chunked framing removed here: h2 carries none.
@@ -477,6 +485,10 @@ async fn forward_response(
                 send_data(&mut send, acc.split().freeze(), false, idle).await?;
             }
             if read_body(io, &mut acc, &mut send, idle).await? == 0 {
+                // EOF alone cannot tell this body's end from its cut.
+                if aborted.load(Ordering::Acquire) {
+                    return Err(anyhow!("engine cut the response short"));
+                }
                 send.send_data(Bytes::new(), true)
                     .map_err(|e| anyhow!("h2 send: {}", e))?;
                 return Ok(());

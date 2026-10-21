@@ -801,6 +801,18 @@ impl PortailProcess {
         proxy_port: u16,
         extra_args: &[&str],
     ) -> Self {
+        Self::spawn_with_tls_rule(certs, routes, proxy_port, extra_args, "")
+    }
+
+    /// [`spawn_with_tls_args`] plus `rule_extra`, JSON members appended to
+    /// every route rule (e.g. `, "timeouts": {"request": "1s"}`).
+    pub fn spawn_with_tls_rule(
+        certs: &[(&str, &str, &[u8], &[u8])],
+        routes: &[(&str, SocketAddr)],
+        proxy_port: u16,
+        extra_args: &[&str],
+        rule_extra: &str,
+    ) -> Self {
         let cert_dir = tempfile::tempdir().expect("create cert dir");
         for (name, _, cert_pem, key_pem) in certs {
             std::fs::write(cert_dir.path().join(format!("{}.crt", name)), cert_pem)
@@ -822,12 +834,13 @@ impl PortailProcess {
         "hostnames": ["{}"],
         "rules": [{{
             "matches": [{{"path": {{"type": "PathPrefix", "value": "/"}}}}],
-            "backendRefs": [{{"name": "{}", "port": {}}}]
+            "backendRefs": [{{"name": "{}", "port": {}}}]{}
         }}]
     }}"#,
                     host,
                     addr.ip(),
-                    addr.port()
+                    addr.port(),
+                    rule_extra
                 )
             })
             .collect();
