@@ -22,8 +22,10 @@ use crate::logging::{debug, warn};
 use crate::metrics::METRICS;
 use crate::proxy::tls::Connection;
 use dashmap::DashMap;
+// Keys are backend addresses from routes, never client input: no need for
+// SipHash's flood resistance, which costs on every checkout and check-in.
+use fnv::{FnvBuildHasher, FnvHashMap};
 use socket2::TcpKeepalive;
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -258,7 +260,7 @@ pub struct BackendPool {
     /// Keyed by (addr, use_tls): one addr can be reachable both plain and
     /// TLS (two routes, different backendRef TLS), and a plain conn handed
     /// to a TLS request (or vice versa) would speak the wrong protocol.
-    pools: HashMap<(SocketAddr, bool), IdleConns>,
+    pools: FnvHashMap<(SocketAddr, bool), IdleConns>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     tls_connector: Arc<tokio_rustls::TlsConnector>,
@@ -267,7 +269,7 @@ pub struct BackendPool {
 impl BackendPool {
     pub fn new(max_idle_per_backend: usize, connect_timeout: Duration) -> Self {
         Self {
-            pools: HashMap::new(),
+            pools: FnvHashMap::default(),
             max_idle_per_backend,
             connect_timeout,
             tls_connector: new_tls_connector(),
@@ -362,7 +364,7 @@ impl BackendPool {
 /// per-connection pool, dead idle conns are discarded at checkout by the
 /// probe, with the caller's from_pool retry as the safety net.
 pub struct SharedBackendPool {
-    pools: DashMap<(SocketAddr, bool), IdleConns>,
+    pools: DashMap<(SocketAddr, bool), IdleConns, FnvBuildHasher>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     tls_connector: Arc<tokio_rustls::TlsConnector>,
@@ -371,7 +373,7 @@ pub struct SharedBackendPool {
 impl SharedBackendPool {
     pub fn new(max_idle_per_backend: usize, connect_timeout: Duration) -> Self {
         Self {
-            pools: DashMap::new(),
+            pools: DashMap::default(),
             max_idle_per_backend,
             connect_timeout,
             tls_connector: new_tls_connector(),
