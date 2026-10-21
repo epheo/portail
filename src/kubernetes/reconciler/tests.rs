@@ -1977,6 +1977,8 @@ fn test_bad_regex_route_is_rejected_alone() {
         "{}",
         ra.message
     );
+    // Still attached by allowedRoutes: Listener.attachedRoutes counts it.
+    assert_eq!(ra.listener_names, vec!["http".to_string()]);
     assert_eq!(result.config.http_routes.len(), 1, "only the sibling");
     let mut config = result.config.clone();
     fixup_backends_for_test(&mut config);
