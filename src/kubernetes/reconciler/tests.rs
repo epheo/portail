@@ -1991,6 +1991,35 @@ fn test_bad_regex_route_is_rejected_alone() {
     assert!(config.to_route_table().is_ok());
 }
 
+/// A route that fails its check still reports ResolvedRefs from its refs.
+/// It said False with InvalidKind whatever they were: a bad regex is not a
+/// ref problem, and a ref problem beside a bad filter kept its own reason.
+#[test]
+fn rejected_route_reports_resolved_refs_from_its_refs() {
+    let bad_regex = route_with_rule(
+        "bad-regex",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/(?=x)"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let bad_filter_and_ref = route_with_rule(
+        "bad-filter-and-ref",
+        serde_json::json!({"filters": [
+            {"type": "ExtensionRef", "extensionRef": {"group": "x.io", "kind": "Auth", "name": "a"}}
+        ], "backendRefs": [{"name": "svc", "namespace": "db", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![bad_regex, bad_filter_and_ref]);
+
+    let ra = rejection(&result, "bad-regex");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(ra.refs_resolved, "{}", ra.refs_message);
+    assert_eq!(ra.refs_reason, "ResolvedRefs");
+
+    let ra = rejection(&result, "bad-filter-and-ref");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(!ra.refs_resolved);
+    assert_eq!(ra.refs_reason, "RefNotPermitted", "{}", ra.refs_message);
+}
+
 /// Gateway API v1.4.1 RouteReasonIncompatibleFilters: "incompatible filters
 /// present on a route rule (for example if the URLRewrite and
 /// RequestRedirect are both present on an HTTPRoute)".

@@ -11,7 +11,6 @@ use gateway_api::experimental::udproutes::*;
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::httproutes::*;
 
-use crate::config::compile::compile_http_route;
 use crate::config::*;
 use crate::logging::warn;
 
@@ -144,31 +143,37 @@ fn convert_listener(
 // HTTP route conversion
 // ---------------------------------------------------------------------------
 
-/// Also runs the check the table build applies: route acceptance then
-/// rejects, with the spec reason, every route the build would leave out.
-pub(crate) fn convert_http_route(route: &HTTPRoute) -> Result<HttpRouteConfig> {
+/// `Err` names the first part the proxy cannot represent: a filter type it
+/// does not support, or one missing its config. That part is left out and
+/// the rest converted, so the config keeps every backendRef for the
+/// ResolvedRefs check. The route itself is not served.
+pub(crate) fn convert_http_route(route: &HTTPRoute) -> (HttpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
-    let hostnames = route.spec.hostnames.clone().unwrap_or_default();
-
+    let mut first = None;
     let rules = route
         .spec
         .rules
         .iter()
         .flatten()
         .enumerate()
-        .map(|(i, r)| convert_http_rule(r, ns).map_err(|e| e.at(format_args!("rule {}", i))))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(i, r)| {
+            let (rule, err) = convert_http_rule(r, ns);
+            if let Some(e) = err {
+                first.get_or_insert(e.at(format_args!("rule {}", i)));
+            }
+            rule
+        })
+        .collect();
 
     let config = HttpRouteConfig {
         parent_refs: Vec::new(),
-        hostnames,
+        hostnames: route.spec.hostnames.clone().unwrap_or_default(),
         rules,
     };
-    compile_http_route(&config)?;
-    Ok(config)
+    (config, first.map_or(Ok(()), Err))
 }
 
-fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule, RouteError> {
+fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> (HttpRouteRule, Option<RouteError>) {
     let matches = rule
         .matches
         .as_ref()
@@ -177,13 +182,20 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule, R
 
     // A filter this proxy cannot represent fails the route, never dropped
     // while the route serves without it.
+    let mut first = None;
     let filters = rule
         .filters
         .iter()
         .flatten()
         .enumerate()
-        .map(|(i, f)| convert_http_filter(f, ns).map_err(|e| e.at(format_args!("filter {}", i))))
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|(i, f)| match convert_http_filter(f, ns) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                first.get_or_insert(e.at(format_args!("filter {}", i)));
+                None
+            }
+        })
+        .collect();
 
     let backend_refs = rule
         .backend_refs
@@ -191,18 +203,23 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> Result<HttpRouteRule, R
         .flatten()
         .enumerate()
         .map(|(i, br)| {
-            convert_http_backend_ref(br, ns).map_err(|e| e.at(format_args!("backendRef {}", i)))
+            let (backend, err) = convert_http_backend_ref(br, ns);
+            if let Some(e) = err {
+                first.get_or_insert(e.at(format_args!("backendRef {}", i)));
+            }
+            backend
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     let timeouts = rule.timeouts.as_ref().map(convert_timeouts);
 
-    Ok(HttpRouteRule {
+    let rule = HttpRouteRule {
         matches,
         filters,
         backend_refs,
         timeouts,
-    })
+    };
+    (rule, first)
 }
 
 fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
@@ -463,28 +480,37 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
 // HTTP backend refs
 // ---------------------------------------------------------------------------
 
+/// Like `convert_http_rule`: a filter that cannot be represented is left
+/// out and named.
 fn convert_http_backend_ref(
     br: &HTTPRouteRulesBackendRefs,
     ns: &str,
-) -> Result<BackendRef, RouteError> {
-    Ok(BackendRef {
+) -> (BackendRef, Option<RouteError>) {
+    let mut first = None;
+    let filters = br
+        .filters
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, f)| match convert_backend_ref_filter(f) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                first.get_or_insert(e.at(format_args!("filter {}", i)));
+                None
+            }
+        })
+        .collect();
+    let backend = BackendRef {
         name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
         port: br.port.unwrap_or(80) as u16,
         weight: br.weight.unwrap_or(1) as u32,
         group: br.group.clone().unwrap_or_default(),
         kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
-        filters: br
-            .filters
-            .iter()
-            .flatten()
-            .enumerate()
-            .map(|(i, f)| {
-                convert_backend_ref_filter(f).map_err(|e| e.at(format_args!("filter {}", i)))
-            })
-            .collect::<Result<_, _>>()?,
+        filters,
         app_protocol: None,
         invalid: false,
-    })
+    };
+    (backend, first)
 }
 
 /// Per-backend filters (e.g. BackendRequestHeaderModifier). The data plane
@@ -600,7 +626,7 @@ fn convert_l4_backend_refs<B: L4BackendRefAccess>(
         .collect()
 }
 
-pub(crate) fn convert_tcp_route(route: &TCPRoute) -> Result<TcpRouteConfig> {
+pub(crate) fn convert_tcp_route(route: &TCPRoute) -> (TcpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let rules = route
         .spec
@@ -610,13 +636,14 @@ pub(crate) fn convert_tcp_route(route: &TCPRoute) -> Result<TcpRouteConfig> {
             backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "TCP", Some(80)),
         })
         .collect();
-    Ok(TcpRouteConfig {
+    let config = TcpRouteConfig {
         parent_refs: Vec::new(),
         rules,
-    })
+    };
+    (config, Ok(()))
 }
 
-pub(crate) fn convert_tls_route(route: &TLSRoute) -> Result<TlsRouteConfig> {
+pub(crate) fn convert_tls_route(route: &TLSRoute) -> (TlsRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let hostnames = route.spec.hostnames.clone();
     let rules = route
@@ -627,14 +654,15 @@ pub(crate) fn convert_tls_route(route: &TLSRoute) -> Result<TlsRouteConfig> {
             backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "TLS", Some(443)),
         })
         .collect();
-    Ok(TlsRouteConfig {
+    let config = TlsRouteConfig {
         parent_refs: Vec::new(),
         hostnames,
         rules,
-    })
+    };
+    (config, Ok(()))
 }
 
-pub(crate) fn convert_udp_route(route: &UDPRoute) -> Result<UdpRouteConfig> {
+pub(crate) fn convert_udp_route(route: &UDPRoute) -> (UdpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let rules = route
         .spec
@@ -644,10 +672,11 @@ pub(crate) fn convert_udp_route(route: &UDPRoute) -> Result<UdpRouteConfig> {
             backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "UDP", None),
         })
         .collect();
-    Ok(UdpRouteConfig {
+    let config = UdpRouteConfig {
         parent_refs: Vec::new(),
         rules,
-    })
+    };
+    (config, Ok(()))
 }
 
 // ---------------------------------------------------------------------------

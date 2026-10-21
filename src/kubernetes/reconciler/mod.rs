@@ -12,6 +12,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
+use crate::config::compile::compile_http_route;
 use crate::config::*;
 use crate::logging::warn;
 
@@ -69,8 +70,15 @@ pub(crate) trait GatewayRoute: Sized {
     fn hostnames(&self) -> &[String] {
         &[]
     }
-    /// The converted config carries no parentRefs: see `attach`.
-    fn convert(&self) -> Result<Self::Config>;
+    /// The converted config carries no parentRefs: see `attach`. `Err`
+    /// names a part the config could not represent and leaves out; every
+    /// backendRef is still in it.
+    fn convert(&self) -> (Self::Config, Result<(), RouteError>);
+    /// The table build's own check of a converted route: acceptance then
+    /// rejects, with the spec reason, every route the build would leave out.
+    fn check(_config: &Self::Config) -> Result<(), RouteError> {
+        Ok(())
+    }
     /// The one source of attachment for the table: one ref per listener
     /// the route was accepted on, never re-derived from the spec's refs.
     fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>);
@@ -125,7 +133,7 @@ macro_rules! impl_gateway_route {
             fn creation_timestamp(&self) -> Option<&Time> {
                 self.metadata.creation_timestamp.as_ref()
             }
-            fn convert(&self) -> Result<Self::Config> {
+            fn convert(&self) -> (Self::Config, Result<(), RouteError>) {
                 $cv(self)
             }
             fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>) {
@@ -160,6 +168,9 @@ convert:     convert_http_route,
 extras: {
     fn hostnames(&self) -> &[String] {
         self.spec.hostnames.as_deref().unwrap_or(&[])
+    }
+    fn check(config: &HttpRouteConfig) -> Result<(), RouteError> {
+        compile_http_route(config).map(drop)
     }
     fn mirror_backend_refs(config: &HttpRouteConfig) -> Vec<(&str, u16, &str, &str)> {
         config
@@ -752,174 +763,151 @@ fn collect_routes<R: GatewayRoute>(
             continue;
         }
 
-        match route.convert() {
-            Ok(mut config) => {
-                let mut refs_resolved = true;
-                let mut refs_messages = Vec::new();
-                let mut refs_reason = "ResolvedRefs";
-                let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
+        let (mut config, converted) = route.convert();
+        let verdict = converted.and_then(|()| R::check(&config));
 
-                // Group/kind (core Service only), cross-namespace ReferenceGrant,
-                // and service existence — one checker for forward and mirror refs.
-                let check_ref = |backend_name: &str,
-                                 group: &str,
-                                 ref_kind: &str|
-                 -> Option<(&'static str, String)> {
-                    if (!group.is_empty() && group != "core")
-                        || (ref_kind != "Service" && !ref_kind.is_empty())
-                    {
-                        return Some((
-                            "InvalidKind",
-                            format!("Unsupported backend ref group/kind: {}/{}", group, ref_kind),
-                        ));
-                    }
-                    // backend_name is "{svc}.{ns}.svc"; unparseable names get no
-                    // further checks (None here means "no error", not failure)
-                    let (svc_name, svc_ns) = parse_backend_dns_name(backend_name)?;
-                    if svc_ns != route_ns
-                        && !is_reference_allowed(
-                            cx.reference_grants,
-                            "gateway.networking.k8s.io",
-                            kind,
-                            route_ns,
-                            "",
-                            "Service",
-                            &svc_ns,
-                            &svc_name,
-                        )
-                    {
-                        return Some((
-                            "RefNotPermitted",
-                            format!(
-                                "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
-                                svc_name, svc_ns
-                            ),
-                        ));
-                    }
-                    if !cx
-                        .known_services
-                        .contains(&(svc_name.clone(), svc_ns.clone()))
-                    {
-                        return Some((
-                            "BackendNotFound",
-                            format!("Backend service {}.{} not found", svc_name, svc_ns),
-                        ));
-                    }
-                    None
-                };
+        let mut refs_resolved = true;
+        let mut refs_messages = Vec::new();
+        let mut refs_reason = "ResolvedRefs";
+        let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
-                // An invalid ref keeps its weight so its share fails rather
-                // than moving to the valid refs (HTTPRouteRule.backendRefs).
-                for backend in R::backend_refs_mut(&mut config) {
-                    if let Some((reason, message)) =
-                        check_ref(&backend.name, &backend.group, &backend.kind)
-                    {
-                        refs_resolved = false;
-                        refs_reason = reason;
-                        refs_messages.push(message);
-                        backend.invalid = true;
-                    }
-                }
-                for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
-                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
-                        refs_resolved = false;
-                        refs_reason = reason;
-                        refs_messages.push(message);
-                        invalid_mirrors.insert((backend_name.to_string(), port));
-                    }
-                }
-
-                if !invalid_mirrors.is_empty() {
-                    R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
-                }
-
-                let refs_message = if refs_resolved {
-                    "All references resolved".to_string()
-                } else {
-                    refs_messages.join("; ")
-                };
-
-                for (section_name, port, attached, result) in &per_parent {
-                    match result {
-                        Ok(_) => route_status.push(RouteAcceptance {
-                            name: name.to_string(),
-                            namespace: route_ns.to_string(),
-                            kind,
-                            accepted: true,
-                            accepted_reason: "Accepted",
-                            message: "Accepted".to_string(),
-                            refs_resolved,
-                            refs_reason,
-                            refs_message: refs_message.clone(),
-                            generation,
-                            section_name: section_name.clone(),
-                            port: *port,
-                            listener_names: attached.clone(),
-                        }),
-                        Err(reason) => route_status.push(RouteAcceptance {
-                            listener_names: attached.clone(),
-                            ..rejection(section_name, *port, reason)
-                        }),
-                    }
-                }
-                let mut attached: Vec<&String> = Vec::new();
-                for listener in per_parent
-                    .iter()
-                    .filter_map(|(_, _, _, result)| result.as_ref().ok())
-                    .flatten()
+        // Group/kind (core Service only), cross-namespace ReferenceGrant,
+        // and service existence — one checker for forward and mirror refs.
+        let check_ref =
+            |backend_name: &str, group: &str, ref_kind: &str| -> Option<(&'static str, String)> {
+                if (!group.is_empty() && group != "core")
+                    || (ref_kind != "Service" && !ref_kind.is_empty())
                 {
-                    if !attached.contains(&listener) {
-                        attached.push(listener);
-                    }
+                    return Some((
+                        "InvalidKind",
+                        format!("Unsupported backend ref group/kind: {}/{}", group, ref_kind),
+                    ));
                 }
-                if R::ONE_ROUTE_PER_LISTENER {
-                    claimed.extend(attached.iter().filter_map(|l| port_of(l)));
+                // backend_name is "{svc}.{ns}.svc"; unparseable names get no
+                // further checks (None here means "no error", not failure)
+                let (svc_name, svc_ns) = parse_backend_dns_name(backend_name)?;
+                if svc_ns != route_ns
+                    && !is_reference_allowed(
+                        cx.reference_grants,
+                        "gateway.networking.k8s.io",
+                        kind,
+                        route_ns,
+                        "",
+                        "Service",
+                        &svc_ns,
+                        &svc_name,
+                    )
+                {
+                    return Some((
+                        "RefNotPermitted",
+                        format!(
+                            "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
+                            svc_name, svc_ns
+                        ),
+                    ));
                 }
-                R::attach(
-                    &mut config,
-                    attached
-                        .into_iter()
-                        .map(|listener| ParentRef {
-                            name: cx.gateway_name.to_string(),
-                            section_name: Some(listener.clone()),
-                            port: None,
-                        })
-                        .collect(),
-                );
-                configs.push(config);
-            }
-            Err(e) => {
-                // Conversion runs the table build's own check, so this is
-                // exactly the set of routes the build would leave out.
-                let conversion_reason = crate::config::RejectReason::of(&e).as_str();
-                for (section_name, port, attached, result) in &per_parent {
-                    match result {
-                        // A parentRef the listeners would admit: report the
-                        // conversion failure. A ref rejected before conversion
-                        // keeps its own rejection reason.
-                        Ok(_) => route_status.push(RouteAcceptance {
-                            name: name.to_string(),
-                            namespace: route_ns.to_string(),
-                            kind,
-                            accepted: false,
-                            accepted_reason: conversion_reason,
-                            message: format!("Conversion failed: {}", e),
-                            refs_resolved: false,
-                            refs_reason: "InvalidKind",
-                            refs_message: format!("Conversion failed: {}", e),
-                            generation,
-                            section_name: section_name.clone(),
-                            port: *port,
-                            listener_names: attached.clone(),
-                        }),
-                        Err(reason) => route_status.push(RouteAcceptance {
-                            listener_names: attached.clone(),
-                            ..rejection(section_name, *port, reason)
-                        }),
-                    }
+                if !cx
+                    .known_services
+                    .contains(&(svc_name.clone(), svc_ns.clone()))
+                {
+                    return Some((
+                        "BackendNotFound",
+                        format!("Backend service {}.{} not found", svc_name, svc_ns),
+                    ));
                 }
+                None
+            };
+
+        // An invalid ref keeps its weight so its share fails rather
+        // than moving to the valid refs (HTTPRouteRule.backendRefs).
+        for backend in R::backend_refs_mut(&mut config) {
+            if let Some((reason, message)) = check_ref(&backend.name, &backend.group, &backend.kind)
+            {
+                refs_resolved = false;
+                refs_reason = reason;
+                refs_messages.push(message);
+                backend.invalid = true;
             }
         }
+        for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
+            if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+                refs_resolved = false;
+                refs_reason = reason;
+                refs_messages.push(message);
+                invalid_mirrors.insert((backend_name.to_string(), port));
+            }
+        }
+
+        if !invalid_mirrors.is_empty() {
+            R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
+        }
+
+        let refs_message = if refs_resolved {
+            "All references resolved".to_string()
+        } else {
+            refs_messages.join("; ")
+        };
+
+        // A route that fails its check is exactly one the table build
+        // would leave out. Its refs still decide ResolvedRefs.
+        let (accepted_reason, message) = match &verdict {
+            Ok(()) => ("Accepted", "Accepted".to_string()),
+            Err(e) => (e.reason.as_str(), format!("Conversion failed: {}", e)),
+        };
+        for (section_name, port, attached, result) in &per_parent {
+            match result {
+                // A parentRef the listeners admit. One they reject keeps
+                // its own rejection reason.
+                Ok(_) => route_status.push(RouteAcceptance {
+                    name: name.to_string(),
+                    namespace: route_ns.to_string(),
+                    kind,
+                    accepted: verdict.is_ok(),
+                    accepted_reason,
+                    message: message.clone(),
+                    refs_resolved,
+                    refs_reason,
+                    refs_message: refs_message.clone(),
+                    generation,
+                    section_name: section_name.clone(),
+                    port: *port,
+                    listener_names: attached.clone(),
+                }),
+                Err(reason) => route_status.push(RouteAcceptance {
+                    listener_names: attached.clone(),
+                    ..rejection(section_name, *port, reason)
+                }),
+            }
+        }
+        if verdict.is_err() {
+            continue;
+        }
+
+        let mut attached: Vec<&String> = Vec::new();
+        for listener in per_parent
+            .iter()
+            .filter_map(|(_, _, _, result)| result.as_ref().ok())
+            .flatten()
+        {
+            if !attached.contains(&listener) {
+                attached.push(listener);
+            }
+        }
+        if R::ONE_ROUTE_PER_LISTENER {
+            claimed.extend(attached.iter().filter_map(|l| port_of(l)));
+        }
+        R::attach(
+            &mut config,
+            attached
+                .into_iter()
+                .map(|listener| ParentRef {
+                    name: cx.gateway_name.to_string(),
+                    section_name: Some(listener.clone()),
+                    port: None,
+                })
+                .collect(),
+        );
+        configs.push(config);
     }
     configs
 }

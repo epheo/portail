@@ -25,13 +25,6 @@ impl RejectReason {
             Self::IncompatibleFilters => "IncompatibleFilters",
         }
     }
-
-    /// The reason a route failed conversion or its check. An error without
-    /// one names a value the proxy cannot apply.
-    pub fn of(e: &anyhow::Error) -> Self {
-        e.downcast_ref::<RouteError>()
-            .map_or(Self::UnsupportedValue, |r| r.reason)
-    }
 }
 
 /// Why a route is rejected: the spec reason, and the field at fault.
