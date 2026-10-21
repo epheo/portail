@@ -60,10 +60,12 @@ See: `examples/kubernetes/loadbalancer/`
 A Portail pod attached to multiple User Defined Networks (UDN) via Multus, routing between isolated network segments at L4-L7.
 
 ```bash
-kubectl apply -k examples/kubernetes/multi-network/
+kubectl apply -k examples/kubernetes/multi-network/http-single-namespace/
 ```
 
-Each UDN gets its own Gateway with `spec.addresses` set to Portail's IP on that network. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
+Each UDN gets its own Gateway with a `portail.epheo.eu/Network` address naming it. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
+portail reads the network's NetworkAttachmentDefinition (the base ClusterRole allows it) and binds the pod's IP on that network.
+One portail serving several Gateways routes by port: Gateways sharing a port are not isolated from each other.
 
 NAT is implicit: the backend sees Portail's UDN IP as source, not the original client. No iptables or kernel NAT required.
 
@@ -117,6 +119,13 @@ kubectl get gatewayclass portail -o jsonpath='{.status.conditions[?(@.type=="Acc
 kubectl get gateway my-gateway -o yaml
 # Look for Accepted: True and Programmed: True
 ```
+
+portail writes only the status that differs from what the API server holds, so a wiped or outdated status is rewritten on the next pass.
+A route or RateLimitPolicy that stops naming a Gateway loses portail's status entry for that Gateway.
+A listener whose port is not bound reports `Programmed=False` with reason `Pending`.
+Listeners sharing a port and protocol conflict unless their hostnames differ; TCP and UDP listeners need a port each.
+Without portail-operator, a Gateway with some listeners rejected stays `Accepted=True` with reason `ListenersNotValid`.
+`attachedRoutes` counts every route attached to the listener, accepted or not.
 
 ## Uninstall
 
