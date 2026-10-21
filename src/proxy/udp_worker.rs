@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::PerformanceConfig;
 use crate::logging::{debug, info, warn};
 use crate::metrics::METRICS;
+use crate::proxy::backend_pool::{log_local_exhaustion, out_of_fds_or_memory};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
@@ -323,12 +324,20 @@ impl Sessions {
         let backend_socket = match connect_backend(backend_addr).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                warn!("UDP backend socket to {} failed: {}", backend_addr, e);
+                if out_of_own_resources(&e) {
+                    log_local_exhaustion(backend_addr, &e);
+                } else {
+                    warn!("UDP backend socket to {} failed: {}", backend_addr, e);
+                }
                 return;
             }
         };
         if let Err(e) = backend_socket.send(datagram).await {
-            warn!("UDP initial send to {} failed: {}", backend_addr, e);
+            if out_of_own_resources(&e) {
+                log_local_exhaustion(backend_addr, &e);
+            } else {
+                warn!("UDP initial send to {} failed: {}", backend_addr, e);
+            }
             return;
         }
         let last_active = Arc::new(AtomicU64::new(now));
@@ -378,6 +387,14 @@ impl Sessions {
             );
         }
     }
+}
+
+/// Whether a session failed to open for want of the proxy's own fds, memory
+/// or ports: the bind takes its port from the host's range, whatever the
+/// backend, and fails EADDRINUSE once none is left. Every datagram from a
+/// new source then fails alike, at packet rate under a spoofed flood.
+fn out_of_own_resources(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EADDRINUSE) || out_of_fds_or_memory(e)
 }
 
 /// A socket connected to `backend`, bound in the backend's address family:
@@ -643,6 +660,79 @@ mod tests {
             roundtrip(&clients[0], two.addr, b"5").await.as_deref(),
             Some("a:5")
         );
+    }
+
+    /// A session's port comes from the host's range whatever the backend:
+    /// none left is the proxy's own shortage, like fds.
+    #[test]
+    fn running_out_of_ports_is_local() {
+        let local = |errno| out_of_own_resources(&std::io::Error::from_raw_os_error(errno));
+        for errno in [libc::EADDRINUSE, libc::EMFILE, libc::ENFILE, libc::ENOBUFS] {
+            assert!(local(errno), "{errno}");
+        }
+        for errno in [libc::ENETUNREACH, libc::ECONNREFUSED, libc::EPERM] {
+            assert!(!local(errno), "{errno}");
+        }
+    }
+
+    /// A log sink a test reads back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Out of fds, every datagram from a new source fails to open its
+    /// session, and a spoofed flood sends those at packet rate: one line
+    /// per window, not one per datagram.
+    #[test]
+    fn running_out_of_fds_logs_once_per_window() {
+        use crate::proxy::test_util::{in_own_process, FdsExhausted};
+        if !in_own_process(module_path!(), "running_out_of_fds_logs_once_per_window") {
+            return;
+        }
+        let log = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = runtime.block_on(async {
+            let (a, _echo) = echo_backend("127.0.0.1:0", "a").await.unwrap();
+            let proxy = start_proxy(&[a], limits(Duration::from_secs(30), 16)).await;
+            let clients = [client().await, client().await, client().await];
+
+            let exhausted = FdsExhausted::new();
+            for client in &clients {
+                let wait = Duration::from_millis(100);
+                assert_eq!(roundtrip_within(client, proxy.addr, b"x", wait).await, None);
+            }
+            drop(exhausted);
+            assert_eq!(
+                roundtrip(&clients[0], proxy.addr, b"1").await.as_deref(),
+                Some("a:1")
+            );
+            a
+        });
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches(&backend.to_string()).count(), 1, "{log}");
     }
 
     #[tokio::test]
