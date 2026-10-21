@@ -204,7 +204,9 @@ impl NamedTargetPortReq {
 }
 
 /// (FQDN, port) of every backend a rule of `config` routes to: the keys the
-/// override maps are read with. Mirrors resolve their target directly.
+/// override maps are read with. Mirrors resolve their target directly. An
+/// invalid ref is never resolved, and a RefNotPermitted one names a
+/// namespace this Gateway may not read.
 pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u16)> {
     let http = config
         .http_routes
@@ -218,7 +220,10 @@ pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u1
         .flat_map(|r| &r.rules)
         .chain(config.tls_routes.iter().flat_map(|r| &r.rules))
         .flat_map(|rule| &rule.backend_refs);
-    http.chain(l4).map(|b| (b.name.clone(), b.port)).collect()
+    http.chain(l4)
+        .filter(|b| !b.invalid)
+        .map(|b| (b.name.clone(), b.port))
+        .collect()
 }
 
 /// Drop the override entries of Services `config` does not route to. The

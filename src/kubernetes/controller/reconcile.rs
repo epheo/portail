@@ -1309,6 +1309,35 @@ mod tests {
         assert!(api.requests().is_empty(), "{:?}", api.requests());
     }
 
+    /// A backendRef this route may not use reads nothing about its Service:
+    /// without a ReferenceGrant, the other namespace is not this Gateway's
+    /// to list.
+    #[tokio::test]
+    async fn refused_backend_reads_no_endpoint_slices() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        let mut svc = testkit::service("db", "web", 80, serde_json::json!("http"));
+        svc.metadata.namespace = Some("other".into());
+        apply(&mut cluster.services, svc);
+        let mut route = testkit::http_route("r", &["gw"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
+            "backendRefs": [{"name": "db", "namespace": "other", "port": 80}],
+        }))
+        .unwrap()]);
+        apply(&mut cluster.http_routes, route);
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        let patch = api.status_patch("httproutes", "r").unwrap();
+        assert_eq!(
+            patch["status"]["parents"][0]["conditions"][1]["reason"],
+            "RefNotPermitted"
+        );
+        assert_eq!(endpoint_slice_lists(&api), 0);
+    }
+
     /// A referenced headless backend with a named targetPort connects on
     /// the number its EndpointSlices publish.
     #[tokio::test]
