@@ -27,7 +27,7 @@ use super::{
 };
 use crate::kubernetes::addresses::{
     compute_bind_addresses, discover_usable_addresses, resolve_network_addresses,
-    substitute_network_ips, unresolved_networks, UsableAddresses,
+    substitute_network_ips, unresolved_networks,
 };
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::dns_refresh::Published;
@@ -193,20 +193,20 @@ fn observed_policies(
     out
 }
 
-/// Open data-plane TCP listeners for this Gateway's ports. Called after the
-/// per-Gateway config is built so ListenerConfig has resolved TLS cert data.
-/// Returns the bind errors, keyed by published port.
+/// Bind the data plane to `binds` (see [`Served::binds`]) and close what
+/// they no longer hold. Called after the config is built so ListenerConfig
+/// has resolved TLS cert data. Returns the bind errors, keyed by published
+/// port.
 async fn ensure_data_plane_listeners(
     ctx: &ControllerCtx,
-    listeners: &[crate::config::ListenerConfig],
-    bind_addresses: &[String],
+    binds: &[crate::config::ListenerConfig],
 ) -> Vec<(u16, String)> {
     info!(
         "Ensuring data plane listeners for ports: {:?}",
-        listeners.iter().map(|l| l.port).collect::<Vec<_>>()
+        binds.iter().map(|l| l.port).collect::<Vec<_>>()
     );
     let closing = match ctx.data_plane.lock() {
-        Ok(mut dp) => dp.close_unwanted(listeners, bind_addresses),
+        Ok(mut dp) => dp.close_unwanted(binds, &[]),
         Err(e) => {
             warn!("Failed to lock data plane: {}", e);
             return Vec::new();
@@ -220,12 +220,8 @@ async fn ensure_data_plane_listeners(
     }
     match ctx.data_plane.lock() {
         Ok(mut dp) => {
-            let (opened, errors) = dp.add_tcp_listeners(
-                listeners,
-                bind_addresses,
-                ctx.routes.clone(),
-                &ctx.performance_config,
-            );
+            let (opened, errors) =
+                dp.add_tcp_listeners(binds, &[], ctx.routes.clone(), &ctx.performance_config);
             if opened > 0 {
                 info!("Opened {} new port(s)", opened);
             }
@@ -331,7 +327,10 @@ async fn build_route_table(
 /// bind plan. Status is not hashed: it is compared with the observed status
 /// per object instead. Hash inputs with non-deterministic iteration order
 /// (HashMaps) are canonicalized by sorting.
-fn data_plane_fingerprint(config: &crate::config::PortailConfig, bind: Option<&[String]>) -> u64 {
+fn data_plane_fingerprint(
+    config: &crate::config::PortailConfig,
+    binds: &[crate::config::ListenerConfig],
+) -> u64 {
     use std::hash::Hasher;
 
     fn write_sorted(h: &mut fnv::FnvHasher, mut items: Vec<String>) {
@@ -381,7 +380,10 @@ fn data_plane_fingerprint(config: &crate::config::PortailConfig, bind: Option<&[
             )
             .collect(),
     );
-    h.write(format!("{:?}", bind).as_bytes());
+    for b in binds {
+        h.write(format!("{:?}:{}", b.address, b.port).as_bytes());
+        h.write(&[0]);
+    }
     h.finish()
 }
 
@@ -413,9 +415,7 @@ fn count_attached_routes(
 /// Listener names and route parentRef sectionNames are prefixed with their
 /// Gateway's identity so a route can never cross-match a same-named listener
 /// on another Gateway.
-fn merge_gateway_configs(
-    configs: &HashMap<(String, String), Arc<crate::config::PortailConfig>>,
-) -> crate::config::PortailConfig {
+fn merge_gateway_configs(configs: &GatewayConfigs) -> crate::config::PortailConfig {
     use crate::config::{ParentRef, PortailConfig};
 
     let mut ordered: Vec<_> = configs.iter().collect();
@@ -425,9 +425,9 @@ fn merge_gateway_configs(
     merged.gateway.name = "portail-merged".to_string();
     merged.gateway.listeners.clear();
 
-    for ((ns, name), cfg) in ordered {
+    for ((ns, name), served) in ordered {
         let prefix = format!("{}/{}/", ns, name);
-        let mut c: PortailConfig = (**cfg).clone();
+        let mut c: PortailConfig = (*served.config).clone();
 
         for l in &mut c.gateway.listeners {
             l.name = format!("{}{}", prefix, l.name);
@@ -619,7 +619,47 @@ fn gateway_class_is_ours(
     })
 }
 
-type GatewayConfigs = HashMap<(String, String), Arc<crate::config::PortailConfig>>;
+/// One Gateway as the data plane serves it.
+#[derive(Clone)]
+pub(super) struct Served {
+    config: Arc<crate::config::PortailConfig>,
+    /// Where its listeners bind: [`compute_bind_addresses`] of its own
+    /// addresses, so a Gateway that may bind nothing closes only its own.
+    bind: Option<Vec<String>>,
+}
+
+impl Served {
+    /// Its listeners as the data plane binds them: one per bind address,
+    /// with `address` set to it; as they are on every interface; none when
+    /// nothing may bind.
+    fn binds(&self) -> Vec<crate::config::ListenerConfig> {
+        let listeners = &self.config.gateway.listeners;
+        match self.bind.as_deref() {
+            None => Vec::new(),
+            Some([]) => listeners.clone(),
+            Some(addresses) => listeners
+                .iter()
+                .flat_map(|l| {
+                    addresses.iter().map(|a| crate::config::ListenerConfig {
+                        address: Some(a.clone()),
+                        ..l.clone()
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The endpoints its listeners must have live to be ready. Unbindable
+    /// listeners still count, so readiness stays down.
+    fn required(&self) -> Vec<(Option<String>, u16)> {
+        required_endpoints(
+            &self.config.gateway.listeners,
+            self.bind.as_deref().unwrap_or_default(),
+        )
+    }
+}
+
+pub(super) type GatewayConfigs = HashMap<(String, String), Served>;
 
 /// Drop the configs of Gateways no longer in the store.
 fn retain_live_gateways(ctx: &ControllerCtx, configs: &mut GatewayConfigs) {
@@ -634,13 +674,28 @@ fn retain_live_gateways(ctx: &ControllerCtx, configs: &mut GatewayConfigs) {
     ctx.route_verdicts.retain(|k| live.contains(k));
 }
 
-/// What the data plane runs: the one Gateway's config in scoped mode, the
-/// merge of all of them in legacy unscoped mode.
-fn effective_of(configs: &GatewayConfigs) -> Arc<crate::config::PortailConfig> {
-    match configs.values().next() {
-        Some(only) if configs.len() == 1 => only.clone(),
+/// What the data plane runs: the route table's config, and the listeners
+/// to bind (see [`Served::binds`]).
+struct Effective {
+    config: Arc<crate::config::PortailConfig>,
+    binds: Vec<crate::config::ListenerConfig>,
+}
+
+/// The one Gateway's config in scoped mode, the merge of all of them in
+/// legacy unscoped mode; each Gateway's listeners bound on its own
+/// addresses either way.
+fn effective_of(configs: &GatewayConfigs) -> Effective {
+    let config = match configs.values().next() {
+        Some(only) if configs.len() == 1 => only.config.clone(),
         _ => Arc::new(merge_gateway_configs(configs)),
-    }
+    };
+    let mut ordered: Vec<_> = configs.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    let binds = ordered
+        .into_iter()
+        .flat_map(|(_, served)| served.binds())
+        .collect();
+    Effective { config, binds }
 }
 
 /// Unscoped mode: stop serving Gateways deleted from the store. Deletion
@@ -648,7 +703,7 @@ fn effective_of(configs: &GatewayConfigs) -> Arc<crate::config::PortailConfig> {
 /// close their listeners or drop their routes.
 pub(super) async fn prune_deleted_gateways(ctx: &ControllerCtx) {
     let _apply_guard = ctx.apply_lock.lock().await;
-    let (effective, left) = {
+    let (effective, required, left) = {
         let mut configs = match ctx.gateway_configs.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -658,15 +713,10 @@ pub(super) async fn prune_deleted_gateways(ctx: &ControllerCtx) {
         if configs.len() == before {
             return;
         }
-        (effective_of(&configs), configs.len())
+        let required: Vec<_> = configs.values().flat_map(Served::required).collect();
+        (effective_of(&configs), required, configs.len())
     };
-    let usable = discover_usable_addresses();
-    let bind = compute_bind_addresses(&effective.gateway.addresses, &usable);
-    let required = required_endpoints(
-        &effective.gateway.listeners,
-        bind.as_deref().unwrap_or_default(),
-    );
-    match apply_data_plane(ctx, &effective, &usable, &required)
+    match apply_data_plane(ctx, &effective, &required)
         .await
         .build_error
     {
@@ -696,29 +746,28 @@ struct DataPlaneState {
     bind_errors: Vec<(u16, String)>,
 }
 
-/// Bring the data plane in line with `effective_config`. The gate is
-/// three-way:
+/// Bring the data plane in line with `effective`. The gate is three-way:
 /// - unchanged fingerprint, `required` live: nothing to do. The fingerprint
 ///   covers the cert bytes (no hot-reload can be pending), and readiness is
 ///   read from live accept loops, so a dead listener takes the bind path.
 /// - unchanged, not live: the one thing still owed is a bind retry.
 /// - changed: bind, rebuild the table, publish it.
 ///
-/// The data plane gets the EFFECTIVE (merged) listeners, not this Gateway's:
-/// in legacy unscoped mode several Gateways may share a port, and
-/// merge_cert_refs_by_port can only merge cert refs it can see. Passing one
-/// Gateway's listeners at a time made alternating reconciles rebuild the
-/// port's ServerConfig with only that Gateway's certs (v0.1.13 regression).
-/// Readiness (`required`) stays keyed on this Gateway's own listeners: its
-/// Programmed condition should not depend on sibling Gateways' ports.
+/// The data plane gets the EFFECTIVE (every Gateway's) listeners, not this
+/// Gateway's: in legacy unscoped mode several Gateways may share a port,
+/// and merge_cert_refs_by_port can only merge cert refs it can see. Passing
+/// one Gateway's listeners at a time made alternating reconciles rebuild
+/// the port's ServerConfig with only that Gateway's certs (v0.1.13
+/// regression). Readiness (`required`) stays keyed on this Gateway's own
+/// listeners: its Programmed condition should not depend on sibling
+/// Gateways' ports.
 async fn apply_data_plane(
     ctx: &ControllerCtx,
-    effective_config: &Arc<crate::config::PortailConfig>,
-    usable: &UsableAddresses,
+    effective: &Effective,
     required: &[(Option<String>, u16)],
 ) -> DataPlaneState {
-    let bind = compute_bind_addresses(&effective_config.gateway.addresses, usable);
-    let fingerprint = data_plane_fingerprint(effective_config, bind.as_deref());
+    let effective_config = &effective.config;
+    let fingerprint = data_plane_fingerprint(effective_config, &effective.binds);
     let last = match ctx.last_applied.lock() {
         Ok(last) => last.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -743,13 +792,7 @@ async fn apply_data_plane(
         }
     }
 
-    let bind_errors = match &bind {
-        Some(bind) => {
-            ensure_data_plane_listeners(ctx, &effective_config.gateway.listeners, bind).await
-        }
-        // Nothing may bind: close what is open instead of binding the wildcard.
-        None => ensure_data_plane_listeners(ctx, &[], &[]).await,
-    };
+    let bind_errors = ensure_data_plane_listeners(ctx, &effective.binds).await;
     let ready = is_ready();
     // Store the truth in BOTH directions: readiness must also drop when a
     // required endpoint has no live accept loop and the rebind above failed,
@@ -870,7 +913,7 @@ pub(super) async fn reconcile(
         validate_gateway(&gateway, &gw_ns, &resolved_certs);
 
     let mut usable = discover_usable_addresses();
-    resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
+    resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable, &ctx.network_ips).await;
 
     // Build per-Gateway config; bail out with a failing Programmed condition on error.
     let mut result = match reconcile_to_config(
@@ -922,23 +965,12 @@ pub(super) async fn reconcile(
         ok: false,
         reason: "AddressNotUsable".to_string(),
         message: format!(
-            "Network address {} has no IP on this pod, so no listener is bound; \
-                 check the NetworkAttachmentDefinition and the pod's network attachment",
+            "Network address {} has no IP on this pod, or its NetworkAttachmentDefinition \
+             could not be read, so no listener of this Gateway is bound; check the \
+             NetworkAttachmentDefinition and the pod's network attachment",
             unresolved_networks(&result.config.gateway.addresses).join(", ")
         ),
     });
-
-    // Readiness keys on each listener's bound port (`target_port` when the
-    // fronting Service decouples it, else the published port). Computed before
-    // `result.config` is moved into the route-table build below. In the brief
-    // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service is
-    // not yet observed, a privileged published bind fails harmlessly and
-    // readiness stays down until the Service (and its targetPort) appear.
-    // Unbindable listeners still count, so readiness stays down.
-    let required = required_endpoints(
-        &result.config.gateway.listeners,
-        bind_addresses.as_deref().unwrap_or_default(),
-    );
     let listeners_empty = result.config.gateway.listeners.is_empty();
 
     // Serialize the apply section: from here on the pass reads and writes
@@ -957,18 +989,28 @@ pub(super) async fn reconcile(
     // process) that is simply this Gateway's config; in legacy unscoped mode
     // one process serves EVERY Gateway, so publishing only this Gateway's
     // config would clobber the others' routes in the shared table.
-    let config = Arc::new(std::mem::take(&mut result.config));
-    let effective_config = {
+    let served = Served {
+        config: Arc::new(std::mem::take(&mut result.config)),
+        bind: bind_addresses.clone(),
+    };
+    // Readiness keys on each listener's bound port (`target_port` when the
+    // fronting Service decouples it, else the published port). In the brief
+    // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service
+    // is not yet observed, a privileged published bind fails harmlessly and
+    // readiness stays down until the Service (and its targetPort) appear.
+    let required = served.required();
+    let config = served.config.clone();
+    let effective = {
         let mut map = match ctx.gateway_configs.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        map.insert(gw_key.clone(), config.clone());
+        map.insert(gw_key.clone(), served);
         retain_live_gateways(&ctx, &mut map);
         effective_of(&map)
     };
 
-    let dp = apply_data_plane(&ctx, &effective_config, &usable, &required).await;
+    let dp = apply_data_plane(&ctx, &effective, &required).await;
     apply_bind_state(
         &ctx,
         &mut listener_statuses,
@@ -1088,6 +1130,7 @@ mod tests {
     use super::super::testkit::{self, apply, MockApi, TestCluster};
     use super::*;
     use crate::config::{ListenerConfig, Protocol};
+    use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 
     /// Every observedGeneration in a written status.
     fn observed_generations(v: &serde_json::Value) -> Vec<i64> {
@@ -1462,6 +1505,102 @@ mod tests {
                 assert!(accepts("127.0.0.1"), "the wildcard is bound in this pass");
             },
         );
+    }
+
+    const NAD_UDN_A: &str =
+        "/apis/k8s.cni.cncf.io/v1/namespaces/default/network-attachment-definitions/udn-a";
+
+    /// NetworkAttachmentDefinition udn-a in `default`, on `subnet`.
+    fn nad_udn_a(subnet: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "k8s.cni.cncf.io/v1",
+            "kind": "NetworkAttachmentDefinition",
+            "metadata": {"name": "udn-a", "namespace": "default"},
+            "spec": {
+                "config": serde_json::json!({"cniVersion": "0.3.1", "subnets": subnet}).to_string(),
+            },
+        })
+    }
+
+    /// A NetworkAttachmentDefinition that cannot be read keeps its network's
+    /// last IP. An apiserver blip used to close every listener of the
+    /// Gateway.
+    #[test]
+    fn a_failed_network_read_keeps_the_last_ip() {
+        alone("a_failed_network_read_keeps_the_last_ip", async {
+            // Accepting a probe builds a backend pool: rustls needs its provider.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let Some(ip) = local_ipv4() else {
+                return; // no address off loopback to name
+            };
+            let port = free_port();
+            let accepts = |addr: &str| std::net::TcpStream::connect((addr, port)).is_ok();
+            let api = MockApi::default();
+            api.reply_to(NAD_UDN_A, 200, nad_udn_a(&format!("{ip}/32")));
+            let mut cluster = TestCluster::default();
+            let ctx = cluster.ctx(api.client());
+            let gw = gateway_on("gw", port);
+            let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+
+            let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 1, &network).await;
+            assert_eq!(programmed["status"], "True", "{programmed}");
+            assert!(accepts(&ip));
+
+            api.reply_to(
+                NAD_UDN_A,
+                500,
+                serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "InternalError", "code": 500,
+                    "message": "etcdserver: request timed out",
+                }),
+            );
+            let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 2, &network).await;
+            assert_eq!(programmed["status"], "True", "{programmed}");
+            assert!(accepts(&ip), "still bound");
+        });
+    }
+
+    /// Unscoped mode: a network with no IP on the pod unbinds its own
+    /// Gateway's listeners, no other Gateway's, and never falls back to
+    /// every interface. One such name closed every listener of the process.
+    #[test]
+    fn an_absent_network_unbinds_only_its_gateway() {
+        alone("an_absent_network_unbinds_only_its_gateway", async {
+            // Accepting a probe builds a backend pool: rustls needs its provider.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let port_a = free_port();
+            let port_b = std::iter::repeat_with(free_port)
+                .find(|&port| port != port_a)
+                .unwrap();
+            let accepts = |port: u16| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+            let api = MockApi::default();
+            // TEST-NET-1: no pod has an address there.
+            api.reply_to(NAD_UDN_A, 200, nad_udn_a("192.0.2.0/24"));
+            let mut cluster = TestCluster::default();
+            let ctx = cluster.ctx(api.client());
+            let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+            let gw_a = with_addresses(gateway_on("a", port_a), 1, &network);
+            let gw_b = gateway_on("b", port_b);
+            apply(&mut cluster.gateways, gw_a.clone());
+            apply(&mut cluster.gateways, gw_b.clone());
+
+            reconcile(Arc::new(gw_b), ctx.clone()).await.unwrap();
+            assert!(accepts(port_b));
+            reconcile(Arc::new(gw_a), ctx).await.unwrap();
+            assert!(accepts(port_b), "the other Gateway keeps its listener");
+            assert!(
+                !accepts(port_a),
+                "bound nowhere, every interface least of all"
+            );
+            let patch = api.status_patch("gateways", "a").unwrap();
+            let conditions = patch["status"]["conditions"].as_array().unwrap();
+            let programmed = conditions
+                .iter()
+                .find(|c| c["type"] == "Programmed")
+                .unwrap();
+            assert_eq!(programmed["reason"], "AddressNotUsable");
+        });
     }
 
     fn endpoint_slice_lists(api: &MockApi) -> usize {
@@ -1942,8 +2081,13 @@ mod tests {
     fn fingerprint_deterministic_and_sensitive() {
         let config = crate::config::PortailConfig::default();
         let bind = vec!["10.0.0.1".to_string()];
-        let fp =
-            |c: &crate::config::PortailConfig, b: Option<&[String]>| data_plane_fingerprint(c, b);
+        let fp = |c: &crate::config::PortailConfig, bind: Option<&[String]>| {
+            let served = Served {
+                config: Arc::new(c.clone()),
+                bind: bind.map(<[String]>::to_vec),
+            };
+            data_plane_fingerprint(c, &served.binds())
+        };
 
         assert_eq!(fp(&config, Some(&bind)), fp(&config, Some(&bind)));
 
@@ -1973,6 +2117,14 @@ mod tests {
             c
         };
         assert_ne!(fp(&with_cert(b"A"), None), fp(&with_cert(b"B"), None));
+    }
+
+    /// `config` served on every interface.
+    fn wildcard(config: crate::config::PortailConfig) -> Served {
+        Served {
+            config: Arc::new(config),
+            bind: Some(vec![]),
+        }
     }
 
     /// Unscoped mode: merging two Gateways' configs must keep every route,
@@ -2020,11 +2172,11 @@ mod tests {
         // Both Gateways use the SAME listener name "http" — the cross-match trap.
         map.insert(
             ("ns-a".to_string(), "gw-a".to_string()),
-            Arc::new(gw_config("gw-a", "http", 8080, "a.example.com")),
+            wildcard(gw_config("gw-a", "http", 8080, "a.example.com")),
         );
         map.insert(
             ("ns-b".to_string(), "gw-b".to_string()),
-            Arc::new(gw_config("gw-b", "http", 9090, "b.example.com")),
+            wildcard(gw_config("gw-b", "http", 9090, "b.example.com")),
         );
 
         let merged = merge_gateway_configs(&map);
@@ -2108,11 +2260,11 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             ("ns-a".to_string(), "gw-a".to_string()),
-            Arc::new(tls_gw("gw-a", "cert-a", "a.example.com")),
+            wildcard(tls_gw("gw-a", "cert-a", "a.example.com")),
         );
         map.insert(
             ("ns-b".to_string(), "gw-b".to_string()),
-            Arc::new(tls_gw("gw-b", "cert-b", "b.example.com")),
+            wildcard(tls_gw("gw-b", "cert-b", "b.example.com")),
         );
 
         let merged = merge_gateway_configs(&map);

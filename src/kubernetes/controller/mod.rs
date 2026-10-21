@@ -34,6 +34,7 @@ use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
 
+use crate::kubernetes::addresses::NetworkIps;
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::dns_refresh::Published;
 use crate::kubernetes::reconciler::RouteVerdicts;
@@ -111,13 +112,14 @@ struct ControllerCtx {
     /// table built from a stale merge over the shared data plane. Uncontended
     /// in scoped mode (one Gateway per process).
     apply_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Last built config per Gateway. In scoped mode this holds exactly one
-    /// entry; in legacy unscoped mode (one process watching every Gateway)
-    /// the entries are merged before each route-table build so reconciling
-    /// Gateway A cannot clobber Gateway B's routes in the shared table.
-    gateway_configs:
-        Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
+    /// Last built config and bind addresses per Gateway. In scoped mode this
+    /// holds exactly one entry; in legacy unscoped mode (one process
+    /// watching every Gateway) the entries are merged before each
+    /// route-table build so reconciling Gateway A cannot clobber Gateway B's
+    /// routes in the shared table, nor bind them on its addresses.
+    gateway_configs: Arc<std::sync::Mutex<reconcile::GatewayConfigs>>,
     named_ports: Arc<NamedPortCache>,
+    network_ips: Arc<NetworkIps>,
     /// When the controller came up — cold-start latency context for the
     /// "Data plane ready" log line and the not-ready watchdog.
     started: std::time::Instant,
@@ -307,6 +309,7 @@ pub async fn run_controller(
         route_verdicts: Arc::default(),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        network_ips: Arc::default(),
         // A stale read lasts as long as before the cache: every requeue
         // listed the slices again.
         named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),

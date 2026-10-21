@@ -9,6 +9,7 @@ use kube::api::Api;
 use kube::Client;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use gateway_api::gateways::Gateway;
 
@@ -52,6 +53,15 @@ impl UsableAddresses {
     }
 }
 
+/// What a NetworkAttachmentDefinition says about this pod on its network.
+enum NetworkIp {
+    Local(String),
+    /// No IP of this pod is in the network, or the network is gone.
+    Absent,
+    /// The NAD could not be read: says nothing about the network.
+    Unknown(kube::Error),
+}
+
 /// Resolve a network name to this pod's local IP on that network.
 ///
 /// Reads the NetworkAttachmentDefinition to get the subnet CIDR, then matches
@@ -61,7 +71,7 @@ async fn resolve_network_to_local_ip(
     network_name: &str,
     namespace: &str,
     local_ips: &[String],
-) -> Option<String> {
+) -> NetworkIp {
     // Read the NAD in the Gateway's namespace
     let nad_api: Api<kube::api::DynamicObject> = Api::namespaced_with(
         client.clone(),
@@ -76,30 +86,32 @@ async fn resolve_network_to_local_ip(
     );
     let nad = match nad_api.get(network_name).await {
         Ok(n) => n,
-        Err(e) => {
-            warn!("Failed to read NetworkAttachmentDefinition {namespace}/{network_name}: {e}");
-            return None;
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            warn!("NetworkAttachmentDefinition {namespace}/{network_name} not found");
+            return NetworkIp::Absent;
         }
+        Err(e) => return NetworkIp::Unknown(e),
     };
 
-    // Extract subnet from spec.config JSON
-    let config_str = nad.data["spec"]["config"].as_str()?;
-    let config: serde_json::Value = serde_json::from_str(config_str).ok()?;
-    let subnets_str = config["subnets"].as_str()?;
-
-    // Parse CIDR and match against local IPs
-    let (net_addr, prefix_len) = parse_cidr(subnets_str)?;
-    for ip_str in local_ips {
-        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-            if ip_in_subnet(ip, net_addr, prefix_len) {
-                return Some(ip_str.clone());
-            }
-        }
+    let local = local_ip_in(&nad.data, local_ips);
+    if local.is_none() {
+        warn!("No local interface IP is in the subnet of network {namespace}/{network_name}");
     }
-    warn!(
-        "No local interface IP matches subnet {subnets_str} for network {namespace}/{network_name}"
-    );
-    None
+    local.map_or(NetworkIp::Absent, NetworkIp::Local)
+}
+
+/// The first of `local_ips` in the subnet a NAD's spec.config names.
+fn local_ip_in(nad: &serde_json::Value, local_ips: &[String]) -> Option<String> {
+    let config_str = nad["spec"]["config"].as_str()?;
+    let config: serde_json::Value = serde_json::from_str(config_str).ok()?;
+    let (net_addr, prefix_len) = parse_cidr(config["subnets"].as_str()?)?;
+    local_ips
+        .iter()
+        .find(|ip| {
+            ip.parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip_in_subnet(ip, net_addr, prefix_len))
+        })
+        .cloned()
 }
 
 fn parse_cidr(cidr: &str) -> Option<(std::net::Ipv4Addr, u32)> {
@@ -167,14 +179,23 @@ pub(crate) fn discover_usable_addresses() -> UsableAddresses {
     }
 }
 
+/// The last local IP each network resolved to, by (namespace, network).
+#[derive(Default)]
+pub(crate) struct NetworkIps(Mutex<HashMap<(String, String), String>>);
+
 /// Resolve `portail.epheo.eu/Network` entries in `spec.addresses` to local IPs.
 /// Reads each named NetworkAttachmentDefinition for its subnet and matches it
 /// against the addresses we already discovered via `getifaddrs()`.
+///
+/// A NAD that cannot be read keeps the network's last IP, while the pod
+/// still has it: unbinding on an apiserver blip was an outage. Only an
+/// answer that the network has no IP here (or is gone) unbinds it.
 pub(crate) async fn resolve_network_addresses(
     client: &Client,
     gateway: &Gateway,
     gw_ns: &str,
     usable: &mut UsableAddresses,
+    last: &NetworkIps,
 ) {
     let Some(spec_addrs) = &gateway.spec.addresses else {
         return;
@@ -185,16 +206,45 @@ pub(crate) async fn resolve_network_addresses(
             continue;
         }
         let network_name = addr.value.as_deref().unwrap_or("");
-        match resolve_network_to_local_ip(client, network_name, gw_ns, &usable.interface_ips).await
-        {
-            Some(ip) => {
-                info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
-                usable.network_ips.insert(network_name.to_string(), ip);
+        let key = (gw_ns.to_string(), network_name.to_string());
+        let resolved =
+            resolve_network_to_local_ip(client, network_name, gw_ns, &usable.interface_ips).await;
+        let mut known = last.0.lock().unwrap_or_else(|p| p.into_inner());
+        let ip = match resolved {
+            NetworkIp::Local(ip) => {
+                if known.get(&key) != Some(&ip) {
+                    info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
+                    known.insert(key, ip.clone());
+                }
+                ip
             }
-            None => warn!(
-                "Gateway {gw_ns}/{gw_name}: could not resolve network '{network_name}' to a local IP"
-            ),
-        }
+            NetworkIp::Absent => {
+                known.remove(&key);
+                continue;
+            }
+            NetworkIp::Unknown(e) => {
+                match known
+                    .get(&key)
+                    .filter(|ip| usable.interface_ips.contains(ip))
+                {
+                    Some(ip) => {
+                        warn!(
+                            "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
+                             not read ({e}); keeping {ip}"
+                        );
+                        ip.clone()
+                    }
+                    None => {
+                        warn!(
+                            "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
+                             not read ({e}); network unresolved"
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        usable.network_ips.insert(network_name.to_string(), ip);
     }
 }
 
