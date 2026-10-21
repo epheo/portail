@@ -597,8 +597,15 @@ fn collect_routes<R: GatewayRoute>(
         .collect();
     ordered.sort_by(|a, b| precedence(*a).cmp(&precedence(*b)));
 
-    // Listeners an older route already serves (ONE_ROUTE_PER_LISTENER kinds).
-    let mut claimed: HashSet<String> = HashSet::new();
+    // Ports an older route already serves (ONE_ROUTE_PER_LISTENER kinds).
+    // Keyed by port like the table: two listeners on one port share a socket.
+    let port_of = |listener: &str| {
+        cx.listeners
+            .iter()
+            .find(|l| l.name == listener)
+            .map(|l| l.port)
+    };
+    let mut claimed: HashSet<i32> = HashSet::new();
     let mut configs = Vec::new();
     for route in ordered {
         let route_ns = route.route_namespace();
@@ -634,7 +641,8 @@ fn collect_routes<R: GatewayRoute>(
                         );
                         if R::ONE_ROUTE_PER_LISTENER {
                             result = result.and_then(|mut listeners| {
-                                listeners.retain(|l| !claimed.contains(l));
+                                listeners
+                                    .retain(|l| !port_of(l).is_some_and(|p| claimed.contains(&p)));
                                 if listeners.is_empty() {
                                     Err("Conflicted")
                                 } else {
@@ -806,7 +814,7 @@ fn collect_routes<R: GatewayRoute>(
                     }
                 }
                 if R::ONE_ROUTE_PER_LISTENER {
-                    claimed.extend(attached.iter().map(|l| l.to_string()));
+                    claimed.extend(attached.iter().filter_map(|l| port_of(l)));
                 }
                 R::attach(
                     &mut config,

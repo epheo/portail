@@ -3033,6 +3033,32 @@ fn oldest_tcp_route_owns_its_listener() {
     }
 }
 
+/// Two TCP listeners on one port share one socket and one table entry, so
+/// the newer route conflicts there too, rather than reporting an
+/// attachment the table cannot serve.
+#[test]
+fn tcp_routes_on_listeners_sharing_a_port_conflict() {
+    let gw = attach_gateway(vec![
+        gw_listener("a", 5432, "TCP"),
+        gw_listener("b", 5432, "TCP"),
+    ]);
+    let older = tcp_route(
+        "older",
+        100,
+        vec![tcp_parent(Some("a"), None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let newer = tcp_route(
+        "newer",
+        200,
+        vec![tcp_parent(Some("b"), None)],
+        &[&[("127.0.0.1", 7002, 1)]],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![newer, older], vec![]));
+    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+    assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+}
+
 /// config-routing #7: every rule overwrote the previous one on the same
 /// port. TCPRoute rules have no match to choose between, so the first rule
 /// takes the listener, as ties go to the first rule (HTTPRouteRule.matches).
