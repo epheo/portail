@@ -12,9 +12,10 @@
 //! already backs config reload — a DNS change triggers the same atomic swap a
 //! reconcile would, with no apiserver call and no hot-path change (every
 //! resolved address is an ordinary fixed-`socket_addr` backend). Health state is
-//! intentionally **not** cleared on swap: it is keyed by `socket_addr` and lives
-//! outside the table, so surviving pods keep their passive-health status and new
-//! pod IPs start optimistically healthy — matching the reconcile-driven swap.
+//! keyed by `socket_addr` and lives outside the table: a swap prunes the pods
+//! that left it, so surviving pods keep their passive-health status and new or
+//! recycled pod IPs start optimistically healthy, matching the reconcile-driven
+//! swap.
 //!
 //! The swap is a **compare-and-swap** against the table this task snapshotted at
 //! the start of the tick: the reconciler is a second, authoritative writer of the
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::PortailConfig;
 use crate::logging::{debug, info, warn};
 use crate::metrics::METRICS;
+use crate::proxy::health::HealthRegistry;
 use crate::routing::RouteTable;
 
 /// Spawn the background DNS-refresh task.
@@ -43,6 +45,7 @@ use crate::routing::RouteTable;
 pub fn spawn_dns_refresh(
     config: Arc<ArcSwapOption<PortailConfig>>,
     routes: Arc<ArcSwap<RouteTable>>,
+    health: Arc<HealthRegistry>,
     interval: Duration,
     shutdown: CancellationToken,
 ) {
@@ -102,6 +105,7 @@ pub fn spawn_dns_refresh(
 
             match apply_refresh(&routes, &current, built) {
                 SwapOutcome::Swapped => {
+                    health.prune(&routes.load());
                     METRICS.dns_refresh_swaps_total.inc();
                     info!("DNS refresh: resolved backend set changed; route table swapped")
                 }

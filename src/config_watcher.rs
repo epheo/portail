@@ -54,7 +54,7 @@ pub async fn watch_config(
                 info!("SIGHUP received — reloading configuration from {:?}", config_path);
                 match reload_routes(&config_path, &routes) {
                     Ok(()) => {
-                        health.clear();
+                        health.prune(&routes.load());
                         info!("Route configuration reloaded successfully");
                     }
                     Err(e) => error!("Config reload failed (keeping existing routes): {}", e),

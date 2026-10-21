@@ -881,6 +881,9 @@ pub(super) async fn reconcile(
     let programmed_cond = match build_route_table(effective_config.clone()).await {
         Ok(route_table) => {
             ctx.routes.store(Arc::new(route_table));
+            if let Ok(health) = ctx.data_plane.lock().map(|dp| dp.health().clone()) {
+                health.prune(&ctx.routes.load());
+            }
             // Publish the config only after the table it produced is live:
             // the background DNS-refresh task re-resolves from this cell, and
             // must never pick up a config whose build failed — nor one whose
