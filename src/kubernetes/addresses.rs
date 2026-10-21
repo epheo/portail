@@ -198,21 +198,49 @@ pub(crate) async fn resolve_network_addresses(
     }
 }
 
+/// Swap each resolved `portail.epheo.eu/Network` name in `addresses` for this
+/// pod's IP on that network. An unresolved name stays as it is.
+pub(crate) fn substitute_network_ips(addresses: &mut [String], usable: &UsableAddresses) {
+    for addr in addresses {
+        if let Some(ip) = usable.network_ips.get(addr.as_str()) {
+            *addr = ip.clone();
+        }
+    }
+}
+
 /// Pick which spec.addresses are bind-targets on this pod. LB VIPs are external
 /// routing identities handled by kube-proxy/MetalLB and bind to 0.0.0.0; only
 /// pod-local interface IPs and resolved Network-type IPs get bound specifically.
+/// `Some(empty)` binds every interface; `None` binds nothing.
 pub(crate) fn compute_bind_addresses(
     addresses: &[String],
     usable: &UsableAddresses,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let network_ip_set: HashSet<&str> = usable.network_ips.values().map(|s| s.as_str()).collect();
-    addresses
+    let bindable: Vec<String> = addresses
         .iter()
         .filter(|addr| {
             usable.interface_ips.iter().any(|ip| ip == *addr)
                 || network_ip_set.contains(addr.as_str())
         })
         .cloned()
+        .collect();
+    // A Network name left after substitution did not resolve. Falling back to
+    // every interface would expose the listeners on networks the Gateway
+    // never named.
+    if bindable.is_empty() && !unresolved_networks(addresses).is_empty() {
+        return None;
+    }
+    Some(bindable)
+}
+
+/// Network names that did not resolve: IPAddress values are IP literals
+/// (CRD-validated), so anything else left after substitution is a name.
+pub(crate) fn unresolved_networks(addresses: &[String]) -> Vec<&str> {
+    addresses
+        .iter()
+        .filter(|a| a.parse::<std::net::IpAddr>().is_err())
+        .map(String::as_str)
         .collect()
 }
 
@@ -261,8 +289,82 @@ mod tests {
         ];
         assert_eq!(
             compute_bind_addresses(&spec_addrs, &usable),
-            vec!["10.244.1.5".to_string(), "192.168.10.3".to_string()]
+            Some(vec!["10.244.1.5".to_string(), "192.168.10.3".to_string()])
         );
-        assert!(compute_bind_addresses(&[], &usable).is_empty());
+        assert_eq!(compute_bind_addresses(&[], &usable), Some(vec![]));
+        // A VIP alone binds every interface; the Service carries it.
+        assert_eq!(
+            compute_bind_addresses(&["203.0.113.10".to_string()], &usable),
+            Some(vec![])
+        );
+    }
+
+    fn gateway_with_addresses(addrs: &[(&str, &str)]) -> Gateway {
+        use gateway_api::gateways::{GatewayAddresses, GatewaySpec};
+        Gateway {
+            metadata: kube::core::ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "portail".into(),
+                addresses: Some(
+                    addrs
+                        .iter()
+                        .map(|(t, v)| GatewayAddresses {
+                            r#type: Some(t.to_string()),
+                            value: Some(v.to_string()),
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// A Network entry binds this pod's IP on that network, not every
+    /// interface. convert_gateway used to drop it, so the substitution never
+    /// ran and listeners bound the wildcard.
+    #[test]
+    fn network_address_binds_its_local_ip() {
+        let gw = gateway_with_addresses(&[
+            (NETWORK_ADDRESS_TYPE, "udn-a"),
+            ("Hostname", "gw.example.com"),
+        ]);
+        let mut config =
+            crate::kubernetes::converters::convert_gateway(&gw, &Default::default()).unwrap();
+        assert_eq!(config.addresses, vec!["udn-a".to_string()]);
+
+        let usable = UsableAddresses {
+            interface_ips: vec!["10.244.1.5".into(), "192.168.10.3".into()],
+            network_ips: HashMap::from([("udn-a".into(), "192.168.10.3".into())]),
+        };
+        substitute_network_ips(&mut config.addresses, &usable);
+        assert_eq!(
+            compute_bind_addresses(&config.addresses, &usable),
+            Some(vec!["192.168.10.3".to_string()])
+        );
+    }
+
+    /// An unresolved Network name never falls back to every interface.
+    #[test]
+    fn unresolved_network_binds_nothing() {
+        let usable = UsableAddresses {
+            interface_ips: vec!["10.244.1.5".into()],
+            network_ips: HashMap::new(),
+        };
+        let mut addrs = vec!["udn-a".to_string()];
+        substitute_network_ips(&mut addrs, &usable);
+        assert_eq!(compute_bind_addresses(&addrs, &usable), None);
+        assert_eq!(unresolved_networks(&addrs), vec!["udn-a"]);
+
+        // A local address still binds; the unresolved name adds nothing.
+        addrs.push("10.244.1.5".to_string());
+        assert_eq!(
+            compute_bind_addresses(&addrs, &usable),
+            Some(vec!["10.244.1.5".to_string()])
+        );
     }
 }

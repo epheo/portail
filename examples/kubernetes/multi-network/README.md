@@ -40,7 +40,9 @@ spec:
     value: udn-frontend
 ```
 
-Portail reads the NetworkAttachmentDefinition to get the subnet CIDR, matches it against local interface IPs, and reports the resolved IP in `status.addresses`. Addresses update automatically on pod restart.
+Portail reads the NetworkAttachmentDefinition to get the subnet CIDR, matches it against local interface IPs, binds listeners to the matching IP, and reports it in `status.addresses`. Addresses update automatically on pod restart.
+If the network has no IP on the pod, nothing binds and `Programmed` is `False` with reason `AddressNotUsable`.
+One portail serving several Gateways, as in these examples, binds every Gateway's listeners on all of their addresses and routes by port: Gateways that share a port are not isolated from each other.
 
 ## Examples
 

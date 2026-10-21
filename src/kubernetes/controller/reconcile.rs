@@ -22,7 +22,8 @@ use crate::routing::RouteTable;
 use super::validate::{resolve_gateway_certs, validate_gateway};
 use super::{skip_requeue_secs, success_requeue_secs, ControllerCtx, ReconcileError};
 use crate::kubernetes::addresses::{
-    compute_bind_addresses, discover_usable_addresses, resolve_network_addresses, UsableAddresses,
+    compute_bind_addresses, discover_usable_addresses, resolve_network_addresses,
+    substitute_network_ips, unresolved_networks, UsableAddresses,
 };
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::parent_ref::route_targets_gateway;
@@ -603,25 +604,17 @@ pub(super) async fn reconcile(
             }
         };
 
-    // Substitute resolved IPs for portail.epheo.eu/Network entries (reconcile_to_config
-    // copies spec.addresses values as-is).
-    if !usable.network_ips.is_empty() {
-        result.config.gateway.addresses = result
-            .config
-            .gateway
-            .addresses
-            .iter()
-            .map(|addr| {
-                usable
-                    .network_ips
-                    .get(addr)
-                    .cloned()
-                    .unwrap_or_else(|| addr.clone())
-            })
-            .collect();
-    }
-
+    substitute_network_ips(&mut result.config.gateway.addresses, &usable);
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
+    let unbindable = bind_addresses.is_none().then(|| status::GatewayCondition {
+        ok: false,
+        reason: "AddressNotUsable".to_string(),
+        message: format!(
+            "Network address {} has no IP on this pod, so no listener is bound; \
+                 check the NetworkAttachmentDefinition and the pod's network attachment",
+            unresolved_networks(&result.config.gateway.addresses).join(", ")
+        ),
+    });
 
     // Readiness keys on each listener's bound port (`target_port` when the
     // fronting Service decouples it, else the published port). Computed before
@@ -629,7 +622,11 @@ pub(super) async fn reconcile(
     // window where a LoadBalancer pod has no NET_BIND_SERVICE and its Service is
     // not yet observed, a privileged published bind fails harmlessly and
     // readiness stays down until the Service (and its targetPort) appear.
-    let required = required_endpoints(&result.config.gateway.listeners, &bind_addresses);
+    // Unbindable listeners still count, so readiness stays down.
+    let required = required_endpoints(
+        &result.config.gateway.listeners,
+        bind_addresses.as_deref().unwrap_or_default(),
+    );
     let listeners_empty = result.config.gateway.listeners.is_empty();
 
     // Read-only readiness probe — no listener work yet. Feeds the fingerprint
@@ -783,13 +780,11 @@ pub(super) async fn reconcile(
     // Readiness (`required`) deliberately stays keyed on THIS Gateway's own
     // listeners: its Programmed condition should not depend on sibling
     // Gateways' ports.
-    let ensure_bind_addresses =
-        compute_bind_addresses(&effective_config.gateway.addresses, &usable);
-    ensure_data_plane_listeners(
-        &ctx,
-        &effective_config.gateway.listeners,
-        &ensure_bind_addresses,
-    );
+    match compute_bind_addresses(&effective_config.gateway.addresses, &usable) {
+        Some(bind) => ensure_data_plane_listeners(&ctx, &effective_config.gateway.listeners, &bind),
+        // Nothing may bind: close what is open instead of binding the wildcard.
+        None => ensure_data_plane_listeners(&ctx, &[], &[]),
+    }
     let dp_ready = ctx
         .data_plane
         .lock()
@@ -876,6 +871,8 @@ pub(super) async fn reconcile(
             // endpoints makes dp_ready vacuously true, but nothing serves.
             if listeners_empty && !gateway.spec.listeners.is_empty() {
                 status::GatewayCondition::invalid("No listener could be programmed")
+            } else if let Some(cond) = unbindable {
+                cond
             } else {
                 compute_programmed_condition(dp_ready)
             }

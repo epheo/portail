@@ -36,6 +36,8 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
 
     let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
 
+    // A Network value is a network name; the controller swaps in this pod's
+    // IP on that network before anything binds.
     let addresses: Vec<String> = gw
         .spec
         .addresses
@@ -43,13 +45,10 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
         .map(|addrs| {
             addrs
                 .iter()
-                .filter_map(|a| {
-                    let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
-                    if addr_type == "IPAddress" {
-                        a.value.clone()
-                    } else {
-                        None
-                    }
+                .filter_map(|a| match a.r#type.as_deref().unwrap_or("IPAddress") {
+                    "IPAddress" => a.value.clone(),
+                    t if t == super::addresses::NETWORK_ADDRESS_TYPE => a.value.clone(),
+                    _ => None,
                 })
                 .collect()
         })

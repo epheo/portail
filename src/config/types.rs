@@ -25,8 +25,8 @@ pub struct GatewayConfig {
     pub name: String,
     pub listeners: Vec<ListenerConfig>,
 
-    /// Bind addresses from Gateway spec.addresses (IPAddress entries only).
-    /// When non-empty, listeners bind to each address instead of 0.0.0.0.
+    /// Gateway spec.addresses: IPAddress values and portail.epheo.eu/Network
+    /// names. Kubernetes mode binds the ones local to the pod.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
 }
