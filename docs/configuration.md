@@ -306,7 +306,9 @@ Limits to know about:
 - Trailers do not survive the bridge, so gRPC cannot ride it; GRPCRoute
   support requires the future native h2 path.
 - WebSocket/CONNECT streams are refused over h2; h2-capable browsers fall
-  back to HTTP/1.1 for WebSocket automatically.
+  back to HTTP/1.1 for WebSocket automatically. A refused stream gets
+  `400` and counts in `portail_http_requests_rejected_total`, as an h1
+  CONNECT does.
 
 ## Custom Controller Name
 
