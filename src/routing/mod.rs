@@ -1,4 +1,4 @@
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,8 +115,14 @@ impl ListenerScope {
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
-    /// Port 0 is a wildcard that matches any port (`add_http_route`, tests and benches).
+    /// Port 0 holds the scopes every port in `any_port_http` shares: routes
+    /// without parentRefs, or `add_http_route` in tests and benches.
     pub listener_scopes: FnvHashMap<u16, Vec<ListenerScope>>,
+    /// The ports the port-0 scopes serve: every port when `None` (a table
+    /// built by hand), else the HTTP and HTTPS listener ports of the config
+    /// the table was built from. A TCP port that searched them would wait
+    /// to sniff, and hang a server-speaks-first client.
+    any_port_http: Option<FnvHashSet<u16>>,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
@@ -169,10 +175,12 @@ impl RouteTable {
         };
 
         // O(1) port lookup, then iterate only matching scopes.
-        // Also check port-0 wildcard scopes (`add_http_route`, tests and benches).
+        // Also the port-0 scopes this port shares (see `any_port_http`).
         let port_scopes = self.listener_scopes.get(&server_port);
         let wildcard_scopes = if server_port != 0 {
-            self.listener_scopes.get(&0)
+            self.listener_scopes
+                .get(&0)
+                .filter(|_| self.shares_any_port_scopes(server_port))
         } else {
             None
         };
@@ -217,13 +225,22 @@ impl RouteTable {
     }
 
     /// Whether any HTTP route can match on `server_port`: its own scopes or
-    /// the any-port (0) ones, as `find_http_route` searches them.
+    /// the port-0 ones it shares, as `find_http_route` searches them.
     pub fn has_http_routes(&self, server_port: u16) -> bool {
-        [server_port, 0].iter().any(|port| {
+        let routed = |port| {
             self.listener_scopes
-                .get(port)
+                .get(&port)
                 .is_some_and(|s| !s.is_empty())
-        })
+        };
+        routed(server_port) || (routed(0) && self.shares_any_port_scopes(server_port))
+    }
+
+    /// Whether `server_port` searches the port-0 scopes (`any_port_http`).
+    #[inline]
+    fn shares_any_port_scopes(&self, server_port: u16) -> bool {
+        self.any_port_http
+            .as_ref()
+            .is_none_or(|ports| ports.contains(&server_port))
     }
 
     pub fn has_tcp_route(&self, server_port: u16) -> bool {

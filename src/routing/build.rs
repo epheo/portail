@@ -72,6 +72,7 @@ impl RouteTable {
     pub fn new() -> Self {
         Self {
             listener_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
+            any_port_http: None,
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -185,6 +186,11 @@ impl RouteTable {
                 scopes.last_mut().unwrap()
             }
         }
+    }
+
+    /// Serve the port-0 scopes on `ports` only, and on no other port.
+    pub(crate) fn share_any_port_scopes_on(&mut self, ports: impl IntoIterator<Item = u16>) {
+        self.any_port_http = Some(ports.into_iter().collect());
     }
 
     /// Convenience: add an HTTP route to a default catch-all scope on port 0.

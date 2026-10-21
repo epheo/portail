@@ -316,12 +316,12 @@ impl PortailConfig {
                     .collect();
 
             // No parentRefs: route without gateway context. One pseudo-scope
-            // per HTTP or HTTPS listener port, with no hostname constraint,
-            // so hostname intersection passes routes through. Not port 0:
-            // a TCP port would then wait to sniff, and hang a
-            // server-speaks-first client. Rate limiting rides the listener,
-            // so the pseudo-scope has none. Refs that select no listener
-            // attach nowhere.
+            // on port 0, with no hostname constraint, so hostname
+            // intersection passes routes through; the HTTP and HTTPS
+            // listener ports share it, and no other port does
+            // (`share_any_port_scopes_on`). One copy, not one per port.
+            // Rate limiting rides the listener, so the pseudo-scope has
+            // none. Refs that select no listener attach nowhere.
             type Scope<'a> = (
                 u16,
                 Option<&'a str>,
@@ -329,19 +329,7 @@ impl PortailConfig {
                 Option<std::sync::Arc<crate::rate_limit::Limiter>>,
             );
             let scopes: Vec<Scope> = if http_route.parent_refs.is_empty() {
-                let mut ports: Vec<u16> = self
-                    .gateway
-                    .listeners
-                    .iter()
-                    .filter(|l| takes_http_routes(l))
-                    .map(|l| l.port)
-                    .collect();
-                ports.sort_unstable();
-                ports.dedup();
-                ports
-                    .into_iter()
-                    .map(|port| (port, None, "", None))
-                    .collect()
+                vec![(0, None, "", None)]
             } else {
                 matched_listeners
                     .iter()
@@ -414,6 +402,13 @@ impl PortailConfig {
             }
         }
         route_table.sort_http_routes();
+        route_table.share_any_port_scopes_on(
+            self.gateway
+                .listeners
+                .iter()
+                .filter(|l| takes_http_routes(l))
+                .map(|l| l.port),
+        );
 
         self.convert_l4_routes(&mut route_table, &self.tcp_routes, false, &mut resolver)?;
         self.convert_l4_routes(&mut route_table, &self.udp_routes, true, &mut resolver)?;
@@ -822,6 +817,42 @@ mod tests {
         };
         assert!(found(8080));
         assert!(!found(5432));
+    }
+
+    /// A route without parentRefs went into one copy of itself per HTTP or
+    /// HTTPS port: memory and build time grew with ports times rules. One
+    /// shared scope now serves every such port, and no other.
+    #[test]
+    fn a_route_without_parent_refs_is_one_scope_for_every_http_port() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "a", "protocol": "HTTP", "port": 8080},
+                {"name": "b", "protocol": "HTTP", "port": 8081},
+                {"name": "s", "protocol": "HTTPS", "port": 8443,
+                 "tls": {"mode": "Terminate", "certificateRefs": [{"name": "c"}]}},
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "raw", "protocol": "TCP", "port": 6000}
+            ]},
+            "httpRoutes": [{"hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert_eq!(rt.listener_scopes.values().flatten().count(), 1);
+        for port in [8080, 8081, 8443] {
+            assert!(rt.has_http_routes(port), "{port}");
+            assert!(rt
+                .find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_some());
+        }
+        for port in [5432, 6000] {
+            assert!(!rt.has_http_routes(port), "{port}");
+            assert!(rt
+                .find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_none());
+        }
     }
 
     #[test]

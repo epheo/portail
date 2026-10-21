@@ -178,11 +178,12 @@ fn config() -> Criterion {
         .with_plots()
 }
 
-/// A file config with one host and the given rules, as JSON.
+/// A file config with one host and the given rules, as JSON, its route on
+/// the listener by parentRef.
 fn route_config(rules: &[String]) -> portail::config::PortailConfig {
     let json = format!(
         r#"{{"gateway":{{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":443}}]}},
-            "httpRoutes":[{{"hostnames":["api.com"],"rules":[{}]}}]}}"#,
+            "httpRoutes":[{{"parentRefs":[{{"name":"g"}}],"hostnames":["api.com"],"rules":[{}]}}]}}"#,
         rules.join(",")
     );
     serde_json::from_str(&json).unwrap()
@@ -201,6 +202,18 @@ fn config_benchmark(c: &mut Criterion) {
     ] {
         c.bench_function(name, |b| b.iter(|| lookup(&regex_table, "api.com", path)));
     }
+
+    // A route without parentRefs: one scope every HTTP port shares, found
+    // through the port-0 scopes and the table's set of HTTP ports.
+    let shared: portail::config::PortailConfig = serde_json::from_str(
+        r#"{"gateway":{"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":443}]},
+            "httpRoutes":[{"hostnames":["api.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/api"}}],"backendRefs":[{"name":"127.0.0.1","port":8080}]}]}]}"#,
+    )
+    .unwrap();
+    let shared_table = shared.to_route_table().unwrap();
+    c.bench_function("http_route_lookup_shared_scope", |b| {
+        b.iter(|| lookup(&shared_table, "api.com", "/api/users"))
+    });
 
     // Control plane, not per request: one host's rules sort once per build.
     let many_rules: Vec<String> = (0..1000)
