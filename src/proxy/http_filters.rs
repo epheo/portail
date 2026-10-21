@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::logging::warn;
-use crate::proxy::http_parser::is_forwarding_claim;
+use crate::proxy::http_parser::{is_forwarding_claim, StripSpans};
 use crate::routing::{HttpFilter, HttpHeader, URLRewritePath};
 
 /// Borrowed header modification parameters — zero per-request allocation.
@@ -67,7 +67,7 @@ impl<'a> RewrittenPath<'a> {
 pub(crate) fn assemble_forward_headers(
     raw: &[u8],
     path: Option<&[u8]>,
-    spans: &crate::proxy::http_parser::StripSpans,
+    spans: &StripSpans,
     upgrade_span: Option<(u32, u32)>,
     keep_upgrade: bool,
     client_ip: std::net::IpAddr,
@@ -256,6 +256,18 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Where [`sanitize_response_headers`] cuts a head whose lines all end in
+/// CRLF and none is empty, recorded by the pass that parsed it
+/// (`worker::scan_response_head`): the copy is then a few bulk copies.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ResponseCuts {
+    /// Hop-by-hop lines and every Content-Length line past the first.
+    pub(crate) strip: StripSpans,
+    /// The first Content-Length line, and its value's digits past any
+    /// leading zeros: the `<n>` the copy writes in its place.
+    pub(crate) length: Option<((u32, u32), (u32, u32))>,
+}
+
 /// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 6.1).
 /// The status line is copied untouched.
 ///
@@ -266,16 +278,61 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
 /// Transfer-Encoding overrides them (RFC 9112 6.3), and a client framing by
 /// one would read past this body into the next response. The proxy owns the
 /// client-side Connection header: `client_close` appends its own close
-/// announcement.
+/// announcement. With `cuts` the copy follows them instead of splitting
+/// lines, to the same bytes.
 pub(crate) fn sanitize_response_headers(
     raw: &[u8],
     content_length: Option<usize>,
+    cuts: Option<&ResponseCuts>,
     client_close: bool,
     out: &mut Vec<u8>,
 ) {
-    use std::io::Write;
     out.clear();
     out.reserve(raw.len() + 24);
+    match cuts {
+        Some(cuts) => copy_around_cuts(raw, content_length.is_some(), cuts, out),
+        None => copy_lines_sanitized(raw, content_length, out),
+    }
+    if client_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+/// `sanitize_response_headers` over recorded cuts, up to the blank line.
+fn copy_around_cuts(raw: &[u8], keep_length: bool, cuts: &ResponseCuts, out: &mut Vec<u8>) {
+    // Copies up to the Content-Length line, then its canonical form in its
+    // place; returns where the copy resumes.
+    let put_length =
+        |cursor: usize, ((s, e), (ds, de)): ((u32, u32), (u32, u32)), out: &mut Vec<u8>| {
+            out.extend_from_slice(&raw[cursor..s as usize]);
+            if keep_length {
+                out.extend_from_slice(b"Content-Length: ");
+                out.extend_from_slice(&raw[ds as usize..de as usize]);
+                out.extend_from_slice(b"\r\n");
+            }
+            e as usize
+        };
+    // Both sources are in head order; merge while copying gaps.
+    let mut cursor = 0usize;
+    let mut length = cuts.length;
+    for (s, e) in cuts.strip.iter() {
+        if let Some(line) = length.filter(|&((ls, _), _)| (ls as usize) < s) {
+            cursor = put_length(cursor, line, out);
+            length = None;
+        }
+        out.extend_from_slice(&raw[cursor..s]);
+        cursor = e;
+    }
+    if let Some(line) = length {
+        cursor = put_length(cursor, line, out);
+    }
+    out.extend_from_slice(&raw[cursor..raw.len() - 2]);
+}
+
+/// `sanitize_response_headers` line by line, up to the blank line.
+fn copy_lines_sanitized(raw: &[u8], content_length: Option<usize>, out: &mut Vec<u8>) {
+    use std::io::Write;
     let mut lines = header_lines(raw);
     if let Some(status_line) = lines.next() {
         out.extend_from_slice(status_line);
@@ -296,10 +353,6 @@ pub(crate) fn sanitize_response_headers(
             }
         }
     }
-    if client_close {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
 }
 
 /// First-byte dispatch keeps the per-line cost to one comparison for the
@@ -1002,7 +1055,7 @@ mod tests {
         let resp =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, Some(2), false, &mut out);
+        sanitize_response_headers(resp, Some(2), None, false, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 2\r\n"));
@@ -1011,7 +1064,7 @@ mod tests {
         assert!(!s.to_ascii_lowercase().contains("keep-alive"));
         assert!(s.ends_with("\r\n\r\n"));
 
-        sanitize_response_headers(resp, Some(2), true, &mut out);
+        sanitize_response_headers(resp, Some(2), None, true, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.ends_with("Connection: close\r\n\r\n"));
     }
@@ -1021,7 +1074,7 @@ mod tests {
         // Under Transfer-Encoding, none.
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\ncontent-length: 5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, None, false, &mut out);
+        sanitize_response_headers(resp, None, None, false, &mut out);
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n"
@@ -1030,7 +1083,7 @@ mod tests {
         // Else one, where the first was, with the value framed by.
         let resp =
             b"HTTP/1.1 200 OK\r\ncontent-length:  05\r\nServer: x\r\nContent-Length: 5\r\n\r\n";
-        sanitize_response_headers(resp, Some(5), false, &mut out);
+        sanitize_response_headers(resp, Some(5), None, false, &mut out);
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\n"
