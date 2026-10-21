@@ -123,6 +123,17 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
         .with_retries(TCP_KEEPALIVE_RETRIES)
 }
 
+/// Whether `listener` already carries the keepalive of `tcp_keepalive(time)`,
+/// which Linux copies to every socket it accepts: the data plane sets it
+/// before listen(), and then accepting costs no setsockopt per connection.
+fn carries_keepalive(listener: &TcpListener, time: Duration) -> bool {
+    let sock = socket2::SockRef::from(listener);
+    sock.keepalive().unwrap_or(false)
+        && sock.tcp_keepalive_time().ok() == Some(time)
+        && sock.tcp_keepalive_interval().ok() == Some(TCP_KEEPALIVE_INTERVAL)
+        && sock.tcp_keepalive_retries().ok() == Some(TCP_KEEPALIVE_RETRIES)
+}
+
 /// Pause before retrying a failed accept(). EMFILE, ENFILE, ENOBUFS and
 /// ENOMEM leave the listener readable, so an immediate retry fails the same
 /// way: the loop spins a core and logs every turn until resources free up.
@@ -432,6 +443,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     // otherwise park its connection task forever, since the idle wait
     // between keepalive requests is intentionally unbounded.
     let keepalive = tcp_keepalive(cfg.tcp_keepalive_time);
+    let keepalive_inherited = carries_keepalive(&listener, cfg.tcp_keepalive_time);
 
     let mut backoff = AcceptBackoff::default();
     loop {
@@ -445,11 +457,12 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                 match result {
                     Ok((tcp_stream, peer)) => {
                         backoff.reset();
-                        // _-prefixed: debug! compiles out in release builds.
-                        if let Err(_e) =
-                            socket2::SockRef::from(&tcp_stream).set_tcp_keepalive(&keepalive)
-                        {
-                            debug!("TCP keepalive setup failed for {}: {}", peer, _e);
+                        if !keepalive_inherited {
+                            let sock = socket2::SockRef::from(&tcp_stream);
+                            // _-prefixed: debug! compiles out in release builds.
+                            if let Err(_e) = sock.set_tcp_keepalive(&keepalive) {
+                                debug!("TCP keepalive setup failed for {}: {}", peer, _e);
+                            }
                         }
                         let routes = routes.clone();
                         let health = health.clone();
@@ -3510,6 +3523,13 @@ mod connection_tests {
     /// whose local address is `local`: the proxy end of a backend connection,
     /// as the backend saw its peer. `None` when keepalive is off.
     fn keepalive_of(local: SocketAddr) -> Option<(Duration, Duration, u32)> {
+        keepalive_where(|sock| sock.local_addr().ok().and_then(|a| a.as_socket()) == Some(local))
+    }
+
+    /// `keepalive_of` the socket in this process that `is_it` picks.
+    fn keepalive_where(
+        is_it: impl Fn(&socket2::SockRef<'_>) -> bool,
+    ) -> Option<(Duration, Duration, u32)> {
         use std::os::fd::FromRawFd;
         for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
             let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse() else {
@@ -3522,7 +3542,7 @@ mod connection_tests {
             }
             let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
             let sock = socket2::SockRef::from(&owned);
-            if sock.local_addr().ok().and_then(|a| a.as_socket()) != Some(local) {
+            if !is_it(&sock) {
                 continue;
             }
             return sock.keepalive().unwrap().then(|| {
@@ -3533,7 +3553,60 @@ mod connection_tests {
                 )
             });
         }
-        panic!("no socket bound to {local}");
+        panic!("no such socket");
+    }
+
+    /// A client that vanishes without FIN or RST would otherwise pin its
+    /// task and fd forever. A data-plane listener hands its keepalive to
+    /// every socket it accepts, one queued before the accept loop started
+    /// included; any other listener's sockets get it one by one.
+    #[tokio::test]
+    async fn accepted_sockets_get_the_client_keepalive() {
+        let time = Duration::from_secs(61);
+        let want = Some((time, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES));
+        let data_plane = crate::proxy::data_plane::create_tcp_listener(
+            0,
+            Some("127.0.0.1"),
+            None,
+            &tcp_keepalive(time),
+        )
+        .unwrap();
+        let data_plane = TcpListener::from_std(data_plane).unwrap();
+        assert!(carries_keepalive(&data_plane, time));
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(!carries_keepalive(&plain, time));
+
+        for listener in [data_plane, plain] {
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let state = conn_state(RouteTable::new(), false);
+            let ctx = ListenerCtx {
+                server_port: addr.port(),
+                routes: state.routes.clone(),
+                cfg: WorkerConfig {
+                    tcp_keepalive_time: time,
+                    ..WorkerConfig::from_perf(&Default::default(), 4)
+                },
+                plan: Default::default(),
+                health: state.health.clone(),
+                selector: state.selector.clone(),
+                active_connections: Default::default(),
+                shared_pool: None,
+            };
+            tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+            // Answered, so accepted.
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let reply = read_one_reply(&mut client).await;
+            assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
+            let me = client.local_addr().unwrap();
+            let accepted = keepalive_where(|sock| {
+                sock.peer_addr().ok().and_then(|a| a.as_socket()) == Some(me)
+            });
+            assert_eq!(accepted, want, "{addr}");
+        }
     }
 
     /// A backend that vanishes without FIN or RST would otherwise pin an
