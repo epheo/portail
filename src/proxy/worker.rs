@@ -1100,13 +1100,14 @@ async fn proxy_http_request(
     // An incomplete body drops `backend` on return, never pooling it. No
     // final response has gone out yet (at most the interim 100), so a 400
     // is still well-formed.
-    let (mirror_body, relay_leftover) = match relay {
-        RequestBody::Complete { mirror, leftover } => (mirror, leftover),
+    let (mirror_body, relay_leftover, answered_early) = match relay {
+        RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
+        // A backend may answer before it has the whole body (a 413, a 401)
+        // and stop reading it; RFC 9112 9.5 has the client watch for that.
+        // The rest of the client's body stays unread: the close reads it off.
         RequestBody::BackendGone => {
-            warn!("Backend {} stopped taking the request body", backend_addr);
-            state.refused(502);
-            let _ = send_error_response(client, 502).await;
-            return Ok((false, None));
+            state.linger = true;
+            (None, None, true)
         }
         incomplete => {
             if let RequestBody::Broken = incomplete {
@@ -1141,10 +1142,16 @@ async fn proxy_http_request(
     // on timeout the helper emits a 504 — no client bytes written yet).
     let resp_mods = extract_response_mods(rule, backend_ref);
     let (mut framing, keep) = loop {
-        let header_budget = clamp_to_deadline(
-            backend_budget.saturating_sub(backend_phase_start.elapsed()),
-            total_deadline,
-        );
+        // An early answer is one already here: a backend that only stalled
+        // gets no fresh budget to answer in.
+        let header_budget = (!answered_early).then(|| {
+            clamp_to_deadline(
+                backend_budget.saturating_sub(backend_phase_start.elapsed()),
+                total_deadline,
+            )
+        });
+        // With the body cut short, the connection neither tunnels nor
+        // stays open.
         match forward_response_headers(
             client,
             &mut backend,
@@ -1154,8 +1161,8 @@ async fn proxy_http_request(
             resp_mods.as_ref(),
             header_budget,
             meta.is_head,
-            meta.is_upgrade,
-            meta.keepalive,
+            meta.is_upgrade && !answered_early,
+            meta.keepalive && !answered_early,
             &state.drain,
         )
         .await?
@@ -1189,7 +1196,11 @@ async fn proxy_http_request(
                 };
             }
             HeaderPhase::Unanswered => {
-                warn!("Backend {} closed without answering", backend_addr);
+                if answered_early {
+                    warn!("Backend {} stopped taking the request body", backend_addr);
+                } else {
+                    warn!("Backend {} closed without answering", backend_addr);
+                }
                 state.refused(502);
                 send_error_response(client, 502).await?;
                 return Ok((false, None));
@@ -1285,6 +1296,10 @@ async fn proxy_http_request(
     }
 
     client.flush().await?;
+    if answered_early {
+        // Never pooled: its request was cut short.
+        return Ok((false, None));
+    }
 
     // Overshoot (bytes past the framing end) poisons the conn: the excess was
     // dropped here but whatever else follows would desync the next response.
@@ -1696,8 +1711,9 @@ enum HeaderPhase {
         keep: bool,
     },
     ErrorSent(u16),
-    /// The backend closed or reset before its first byte, and nothing was
-    /// written to the client: the caller replays or answers.
+    /// No head came, and nothing was written to the client: the backend
+    /// closed or reset before its first byte, or held no complete head
+    /// where only one already here counts. The caller replays or answers.
     Unanswered,
 }
 
@@ -1705,6 +1721,7 @@ enum HeaderPhase {
 /// them to the client. This is the SAFE→UNSAFE transition: on entry no client
 /// bytes have been written and timeout → `504`; on success the client has the
 /// headers, and any later failure must reset the client connection instead.
+/// A `None` budget takes only a head that has already arrived.
 ///
 /// Returns `ErrorSent` when the caller should bail out (`return Ok(false)`).
 #[allow(clippy::too_many_arguments)]
@@ -1715,25 +1732,28 @@ async fn forward_response_headers(
     scratch: &mut Vec<u8>,
     filter_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
-    header_budget: Duration,
+    header_budget: Option<Duration>,
     is_head_request: bool,
     expect_upgrade: bool,
     keepalive: bool,
     drain: &CancellationToken,
 ) -> Result<HeaderPhase> {
-    let read =
-        match tokio::time::timeout(header_budget, read_response_head(backend, header_buf)).await {
-            Ok(Ok(read)) => read,
-            Ok(Err(e)) => {
-                warn!("Backend response head failed: {}", e);
-                send_error_response(client, 502).await?;
-                return Ok(HeaderPhase::ErrorSent(502));
-            }
-            Err(_) => {
-                send_error_response(client, 504).await?;
-                return Ok(HeaderPhase::ErrorSent(504));
-            }
-        };
+    let read = match header_budget {
+        Some(budget) => tokio::time::timeout(budget, read_response_head(backend, header_buf)).await,
+        None => Ok(arrived_head(backend, header_buf).await),
+    };
+    let read = match read {
+        Ok(Ok(read)) => read,
+        Ok(Err(e)) => {
+            warn!("Backend response head failed: {}", e);
+            send_error_response(client, 502).await?;
+            return Ok(HeaderPhase::ErrorSent(502));
+        }
+        Err(_) => {
+            send_error_response(client, 504).await?;
+            return Ok(HeaderPhase::ErrorSent(504));
+        }
+    };
     let (resp_header_end, head) = match read {
         HeadRead::Head(end, head) => (end, head),
         HeadRead::Malformed => {
@@ -2001,8 +2021,21 @@ enum HeadRead {
     /// A head, interim ones included, a recipient could frame differently
     /// (see `parse_response_head`).
     Malformed,
-    /// Closed or reset before a single byte.
+    /// Closed or reset before a single byte; from [`arrived_head`], also no
+    /// complete head yet.
     Unanswered,
+}
+
+/// [`read_response_head`] over what the backend has already sent, with no
+/// wait for more.
+async fn arrived_head(backend: &mut Connection, header_buf: &mut Vec<u8>) -> Result<HeadRead> {
+    use futures::FutureExt;
+    // tokio resumes a yielded task only after polling the reactor, which
+    // then knows of bytes that landed while this task kept busy.
+    tokio::task::yield_now().await;
+    read_response_head(backend, header_buf)
+        .now_or_never()
+        .unwrap_or(Ok(HeadRead::Unanswered))
 }
 
 /// Phase 1: read response headers from the backend into `header_buf`. Performs
@@ -4191,7 +4224,7 @@ mod connection_tests {
     }
 
     /// One response off `client`, by its Content-Length.
-    async fn read_one_reply(client: &mut TcpStream) -> String {
+    async fn read_one_reply<R: tokio::io::AsyncRead + Unpin>(client: &mut R) -> String {
         let (mut out, mut chunk) = (Vec::new(), [0u8; 4096]);
         loop {
             if let Some(end) = find_header_end(&out) {
@@ -4278,6 +4311,100 @@ mod connection_tests {
         let reply = read_one_reply(&mut client).await;
         assert!(reply.contains("\r\nConnection: close\r\n"), "{reply}");
         closed_at_once(engine).await;
+    }
+
+    /// Reads a request head, answers `reply` without reading the body, and
+    /// closes, resetting at once when `reset`. `answered` fires then.
+    async fn early_backend(
+        reply: &'static [u8],
+        reset: bool,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (answered, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // A byte at a time: the body stays unread, as at a server
+            // that refuses the request from its head.
+            let mut head = Vec::new();
+            while find_header_end(&head).is_none() {
+                let mut byte = [0u8];
+                if sock.read(&mut byte).await.unwrap() == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            sock.write_all(reply).await.unwrap();
+            if reset {
+                let _ = socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO));
+            }
+            drop(sock);
+            let _ = answered.send(());
+        });
+        (addr, rx)
+    }
+
+    /// A backend may answer before it has the whole body (413, 401) and
+    /// stop reading it. Its answer reaches the client, still uploading, in
+    /// place of a 502; the connection then closes.
+    #[tokio::test]
+    async fn an_early_answer_to_an_upload_reaches_the_client() {
+        const TOO_LARGE: &[u8] =
+            b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 8\r\n\r\ntoo much";
+        for reset in [false, true] {
+            let (addr, answered) = early_backend(TOO_LARGE, reset).await;
+            let (mut client, engine) = tcp_client(conn_state(routes(addr), false)).await;
+            client
+                .write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 65536\r\n\r\n")
+                .await
+                .unwrap();
+            client.write_all(&[b'x'; 1024]).await.unwrap();
+            answered.await.unwrap();
+            // More body after the backend's close, in separate sends: after
+            // a FIN, only the send after the one its kernel resets fails.
+            for _ in 0..4 {
+                client.write_all(&[b'x'; 8 * 1024]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let reply = read_one_reply(&mut client).await;
+            assert_eq!(
+                reply,
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntoo much",
+                "reset={reset}"
+            );
+            // The unread rest of the upload is read off, not reset on.
+            client.shutdown().await.unwrap();
+            engine.await.unwrap().unwrap();
+            assert!(client.take_error().unwrap().is_none(), "reset={reset}");
+            assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
+        }
+    }
+
+    /// Nothing answered when the backend stopped taking the body: a 502,
+    /// with no fresh budget for an answer to come in.
+    #[tokio::test]
+    async fn a_backend_that_stops_reading_unanswered_gets_a_502_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = conn_state(routes(listener.local_addr().unwrap()), false);
+        state.idle_body_timeout = Some(IDLE);
+        let (client, _engine) = tcp_client(state).await;
+        let (mut rd, mut wr) = client.into_split();
+        // More than the sockets between proxy and backend hold.
+        let uploader = tokio::spawn(async move {
+            let head = b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 67108864\r\n\r\n";
+            let chunk = [b'x'; 64 * 1024];
+            if wr.write_all(head).await.is_ok() {
+                while wr.write_all(&chunk).await.is_ok() {}
+            }
+        });
+        let (_stalled, _) = listener.accept().await.unwrap();
+        let started = std::time::Instant::now();
+        let reply = tokio::time::timeout(Duration::from_secs(2), read_one_reply(&mut rd))
+            .await
+            .expect("waited on the backend for an answer");
+        assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
+        assert!(started.elapsed() >= IDLE, "{:?}", started.elapsed());
+        uploader.abort();
     }
 
     /// Lingering is bounded: by the header budget for a client that sends
