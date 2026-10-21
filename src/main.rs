@@ -9,6 +9,7 @@ use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
 use proxy::data_plane::DataPlane;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -222,7 +223,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         // operator's readinessProbe gates LB traffic and the Programmed status.
         let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(admin::serve(
-            args.readiness_port,
+            SocketAddr::new(args.admin_address, args.readiness_port),
             ready_flag.clone(),
             shutdown_token.clone(),
         ));
@@ -245,7 +246,8 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         // scrape. Listeners are already up at this point, so ready = true.
         if let Some(metrics_port) = args.metrics_port {
             let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            tokio::spawn(admin::serve(metrics_port, ready, shutdown_token.clone()));
+            let addr = SocketAddr::new(args.admin_address, metrics_port);
+            tokio::spawn(admin::serve(addr, ready, shutdown_token.clone()));
         }
 
         // Watch the config file for SIGHUP-triggered reloads

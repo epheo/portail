@@ -89,7 +89,10 @@ only when the data plane has bound its listener ports; `/metrics` is
 Prometheus text format. Point `readinessProbe` at `/readyz` and
 `livenessProbe` at `/livez`, always via the pod IP — probing through a
 Gateway VIP has no delivery guarantee to this pod and turns a neighbor's
-outage into your restart loop.
+outage into your restart loop. The endpoint listens on every interface;
+`--admin-address=$(POD_IP)` binds the pod IP alone, so a Gateway VIP or
+Multus interface no longer exposes `/metrics` (see
+[configuration](configuration.md#admin-endpoint)).
 
 ## Verifying
 
