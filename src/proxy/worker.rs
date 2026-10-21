@@ -25,7 +25,9 @@ use crate::proxy::http_filters::{
     extract_url_rewrite, header_lines, sanitize_response_headers, to_origin_form,
     HeaderModifications, MIRROR_BODY_MAX,
 };
-use crate::proxy::http_parser::{find_header_end, is_token, parse_digits, trim_ows};
+use crate::proxy::http_parser::{
+    find_header_end, is_field_value_byte, is_token, parse_digits, trim_ows,
+};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
     analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
@@ -2991,7 +2993,8 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
 }
 
 /// The status code and whether the version is HTTP/1.0, from a status line
-/// without its CRLF. `HTTP/1.x SP 3DIGIT`, then nothing or SP and a reason.
+/// without its CRLF. `HTTP/1.x SP 3DIGIT`, then nothing or SP and a reason
+/// of field-value bytes: a CTL there is where a client may end the line.
 /// No code below 100: a client may read one as interim, so bodiless.
 fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
     let [b'H', b'T', b'T', b'P', b'/', b'1', b'.', minor, b' ', d0 @ b'1'..=b'9', d1, d2, reason @ ..] =
@@ -3001,7 +3004,7 @@ fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
     };
     if !(minor.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit())
         || !matches!(reason, [] | [b' ', ..])
-        || memchr::memchr(b'\r', reason).is_some()
+        || !reason.iter().all(|&b| is_field_value_byte(b))
     {
         return None;
     }
@@ -3271,6 +3274,11 @@ mod tests {
             (b"HTTP/1.1 200", Some((200, false))),
             (b"HTTP/1.1 200 ", Some((200, false))),
             (b"HTTP/1.1 999 Request denied", Some((999, false))),
+            (b"HTTP/1.1 200 O\tK", Some((200, false))),
+            (b"HTTP/1.1 200 \xc3\xa9t\xc3\xa9", Some((200, false))),
+            (b"HTTP/1.1 200 O\x00K", None),
+            (b"HTTP/1.1 200 O\x0bK", None),
+            (b"HTTP/1.1 200 O\x7fK", None),
             (b"HTTP/1.1 2040 OK", None),
             (b"HTTP/1.1 20 OK", None),
             (b"HTTP/1.1 099 Early", None),
