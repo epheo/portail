@@ -214,6 +214,15 @@ A backend or mirror name DNS cannot resolve:
 - The DNS refresh (`dnsRefreshInterval`) brings it back once it resolves.
 - Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
 
+## Backend Services
+
+In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirror` all reach a Service the same way:
+
+- ClusterIP: its DNS name, on the Service port, which kube-proxy maps to the pods.
+- Headless: every ready pod DNS returns, on the `targetPort`, as DNS carries no port. A named `targetPort` is read from the Service's EndpointSlices.
+- ExternalName: its external name, on the Service port.
+- A mirror sends its copies to one address: the smallest the Service resolves to.
+
 ## Performance Options
 
 The `performance` block of a config file (all durations accept `"30s"`-style
