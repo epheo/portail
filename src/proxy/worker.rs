@@ -2734,16 +2734,17 @@ mod connection_tests {
             );
         }
 
-        // Repeated lines agreeing on one value frame by it.
+        // Repeated lines agreeing on one value frame by it, and reach the
+        // client as one: some clients (llhttp) refuse any repeat.
         let addr = closing_backend(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: 1\r\ncontent-length: 05\r\n\r\nhello",
         )
         .await;
         let (mut client, _task) = serve(routes(addr));
         let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
         assert_eq!(
             out,
-            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: 1\r\n\r\nhello"
         );
     }
 
