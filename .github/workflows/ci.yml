@@ -29,3 +29,12 @@ jobs:
 
       - name: Test
         run: cargo test --release
+
+  # Blocking on purpose: publish.yml calls this workflow, so a new advisory
+  # holds the release too.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
