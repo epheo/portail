@@ -1,6 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::extract_routing_info;
-use portail::routing::{Backend, HttpRouteRule, PathMatchType, RouteTable};
+use portail::proxy::request_processor::analyze_request;
+use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
@@ -209,6 +211,44 @@ fn latency_scenarios(c: &mut Criterion) {
     }
 }
 
+/// `analyze_request` per request: parse, route lookup, weighted backend
+/// selection and the invalid-backendRef check on the selected backend.
+fn request_analysis(c: &mut Criterion) {
+    let mut table = RouteTable::new();
+    let backends = vec![
+        Backend::with_weight("127.0.0.1".to_string(), 8080, 3).unwrap(),
+        Backend::with_weight("127.0.0.1".to_string(), 8081, 1).unwrap(),
+    ];
+    table.add_http_route(
+        "api.example.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            backends,
+        ),
+    );
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+    let request = b"GET /users/42 HTTP/1.1\r\nHost: api.example.com\r\nAccept: */*\r\n\r\n";
+
+    c.bench_function("e2e_analyze_request_weighted_backends", |b| {
+        b.iter(|| {
+            let result = analyze_request(
+                &table,
+                &selector,
+                std::hint::black_box(request),
+                std::hint::black_box(80),
+                &health,
+                false,
+            );
+            std::hint::black_box(result.is_ok())
+        })
+    });
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(1000))
@@ -222,6 +262,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = e2e_benches;
     config = config();
-    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios
+    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis
 }
 criterion_main!(e2e_benches);

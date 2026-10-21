@@ -3146,6 +3146,82 @@ fn oldest_tls_route_owns_its_hostname() {
     }
 }
 
+/// k8s #7: an invalid backendRef was removed, so its weight went to the
+/// valid ones. HTTPRouteRule.backendRefs: the share of requests that would
+/// have gone to an invalid backend gets a 500.
+#[test]
+fn invalid_backend_share_answers_500() {
+    use crate::proxy::request_processor::{analyze_request, RoutingResult};
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP")]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, None)],
+        &[
+            ("127.0.0.1", None, 8001, 2),
+            // BackendNotFound
+            ("ghost-svc", None, 8002, 1),
+            // RefNotPermitted: no ReferenceGrant in db
+            ("127.0.0.1", Some("db"), 8003, 1),
+        ],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+    assert!(!status_of(&result, "r").refs_resolved);
+
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let request = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n";
+    let (mut forwarded, mut failed) = (0, 0);
+    for _ in 0..400 {
+        match analyze_request(&table, &selector, request, 80, &health, false).unwrap() {
+            RoutingResult::HttpForward { backend, .. } => {
+                assert_eq!(backend.socket_addr.port(), 8001);
+                forwarded += 1;
+            }
+            RoutingResult::LocalReply(reply) => {
+                assert_eq!(reply.status, 500);
+                failed += 1;
+            }
+            _ => panic!("unexpected routing result"),
+        }
+    }
+    assert_eq!((forwarded, failed), (200, 200));
+}
+
+/// k8s #7 for TCPRoute: connections for an invalid backend's share are
+/// rejected (TCPRouteRule.backendRefs), not sent to the valid backend.
+#[test]
+fn invalid_tcp_backend_share_is_rejected() {
+    use crate::proxy::request_processor::{analyze_tcp_request, RoutingResult};
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1), ("ghost-svc", 7002, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let (mut forwarded, mut rejected) = (0, 0);
+    for _ in 0..400 {
+        match analyze_tcp_request(&table, &selector, 5432, &health).unwrap() {
+            RoutingResult::TcpForward { backend_addr } => {
+                assert_eq!(backend_addr.port(), 7001);
+                forwarded += 1;
+            }
+            RoutingResult::CloseConnection => rejected += 1,
+            _ => panic!("unexpected routing result"),
+        }
+    }
+    assert_eq!((forwarded, rejected), (200, 200));
+}
+
 /// An unset parentRef namespace is the route's own: a route in other-ns
 /// naming "gw" targets other-ns/gw, never default/gw, even where default/gw
 /// admits every namespace.

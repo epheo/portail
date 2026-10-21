@@ -13,7 +13,7 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::{extract_routing_info, HttpRequestInfo};
 use crate::proxy::method::{is_idempotent, method_len};
 use crate::routing::{
-    Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
+    Backend, BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
 
 /// Stack-allocated request metadata — no heap allocation.
@@ -261,6 +261,9 @@ fn analyze_http_request<'a>(
         None => return reply(503, None),
     };
     let selected_backend = &rule.backends[backend_index];
+    if selected_backend.action == BackendAction::Reject {
+        return reply(500, None);
+    }
 
     Ok(RoutingResult::HttpForward {
         backend: selected_backend,
@@ -444,6 +447,13 @@ fn analyze_l4_request<'a>(
                 return Ok(RoutingResult::CloseConnection);
             }
         };
+    if selected_backend.action == BackendAction::Reject {
+        debug!(
+            "{} routing: port {} picked an invalid backendRef's share; rejecting",
+            proto, server_port
+        );
+        return Ok(RoutingResult::CloseConnection);
+    }
 
     debug!(
         "{} route found: port {} -> backend {}",
@@ -485,6 +495,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 }],
             ),
         );
@@ -522,6 +533,7 @@ mod tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: BackendAction::Forward,
             }],
         );
         rule.path_regex = Some(regex::Regex::new(pattern).unwrap());
@@ -832,6 +844,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 }],
             ),
         );

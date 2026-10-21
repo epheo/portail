@@ -105,7 +105,7 @@ impl PortailConfig {
         let mut seen = std::collections::HashSet::new();
         for (refs, proto) in http.chain(tcp).chain(udp).chain(tls) {
             for br in refs {
-                if !seen.insert((br.name.clone(), br.port)) {
+                if br.invalid || !seen.insert((br.name.clone(), br.port)) {
                     continue;
                 }
                 crate::routing::Backend::all_with_weight(br.name.clone(), br.port, 1).map_err(
@@ -345,6 +345,9 @@ impl PortailConfig {
 fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routing::Backend> {
     refs.iter()
         .flat_map(|br| {
+            if br.invalid {
+                return vec![crate::routing::Backend::rejecting(br.weight)];
+            }
             crate::routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
                 .map_err(|e| {
                     tracing::warn!(
@@ -402,6 +405,10 @@ fn build_rule_components(
 
     let mut backends = Vec::new();
     for backend_ref in &rule.backend_refs {
+        if backend_ref.invalid {
+            backends.push(routing::Backend::rejecting(backend_ref.weight));
+            continue;
+        }
         let backend_filters = convert_filters(&backend_ref.filters)?;
 
         // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override

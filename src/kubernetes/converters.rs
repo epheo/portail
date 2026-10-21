@@ -462,6 +462,7 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
                 .unwrap_or_else(|| "Service".to_string()),
             filters: vec![],
             app_protocol: None,
+            invalid: false,
         },
         percent,
         fraction,
@@ -481,6 +482,7 @@ fn convert_http_backend_ref(br: &HTTPRouteRulesBackendRefs, ns: &str) -> Result<
         kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
         filters: convert_backend_ref_filters(&br.filters)?,
         app_protocol: None,
+        invalid: false,
     })
 }
 
@@ -589,6 +591,7 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
             .unwrap_or_else(|| "Service".to_string()),
         filters: vec![],
         app_protocol: None,
+        invalid: false,
     }
 }
 

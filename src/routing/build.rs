@@ -291,7 +291,21 @@ impl Backend {
             filters: vec![],
             use_tls: false,
             server_name: address,
+            action: BackendAction::Forward,
         })
+    }
+
+    /// The stand-in for an invalid backendRef: see [`BackendAction::Reject`].
+    /// The address is unspecified and never dialed.
+    pub fn rejecting(weight: u32) -> Self {
+        Self {
+            socket_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            weight,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: BackendAction::Reject,
+        }
     }
 
     /// Resolve to one backend per resolved address (STRICT_DNS-style multi-A).
@@ -312,6 +326,7 @@ impl Backend {
                 filters: vec![],
                 use_tls: false,
                 server_name: address.clone(),
+                action: BackendAction::Forward,
             })
             .collect())
     }

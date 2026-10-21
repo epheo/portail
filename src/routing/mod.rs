@@ -359,8 +359,8 @@ impl RouteTable {
     /// Resolve a TLS passthrough connection to a backend address.
     /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
     /// back to port-based TCP routes. Selection is healthy weighted
-    /// round-robin, same as the L4 path; `None` also covers the
-    /// all-backends-unhealthy case (caller drops the connection).
+    /// round-robin, same as the L4 path; `None` (caller drops the
+    /// connection) also covers no positive weight and a Reject pick.
     pub fn resolve_tls_passthrough(
         &self,
         sni: &str,
@@ -380,6 +380,7 @@ impl RouteTable {
             };
             return selector
                 .select_l4_backend(key, backends, health)
+                .filter(|b| b.action == BackendAction::Forward)
                 .map(|b| b.socket_addr);
         }
 
@@ -387,6 +388,7 @@ impl RouteTable {
         self.tcp_routes.get(&server_port).and_then(|backends| {
             selector
                 .select_l4_backend(server_port as u64, backends, health)
+                .filter(|b| b.action == BackendAction::Forward)
                 .map(|b| b.socket_addr)
         })
     }
@@ -565,6 +567,19 @@ pub struct Backend {
     pub use_tls: bool,
     /// Hostname for TLS SNI (the original DNS name before resolution)
     pub server_name: String,
+    pub action: BackendAction,
+}
+
+/// What a request or connection that selects a backend gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAction {
+    Forward,
+    /// Stands for an invalid backendRef (RefNotPermitted, BackendNotFound,
+    /// InvalidKind) and keeps its weight: its share fails (HTTP 500, L4
+    /// connection closed or datagram dropped) instead of moving to the
+    /// valid refs (HTTPRouteRule.backendRefs, TCPRouteRule.backendRefs).
+    /// Never connected to, so health never tracks it.
+    Reject,
 }
 
 /// True when `host` is a strict subdomain of `parent` on a label boundary
@@ -767,18 +782,7 @@ impl BackendSelector {
             return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
         }
 
-        // Slow path — some positive-weight backends are unhealthy
-        let slot = counter % pool_weight;
-
-        if let Some(i) = nth_healthy_weighted(backends, health, slot) {
-            return Some(i);
-        }
-
-        // Only reachable if health flipped between the sum and the walk.
-        backends
-            .iter()
-            .position(|b| b.weight > 0 && health.is_healthy(&b.socket_addr))
-            .or_else(|| backends.iter().position(|b| b.weight > 0))
+        select_degraded(backends, health, counter, rule.total_weight)
     }
 
     /// Health-aware weighted round-robin over an L4 backend list, keyed by
@@ -804,24 +808,67 @@ impl BackendSelector {
             return None;
         }
         let counter = self.next_counter(key);
-        if healthy_weight > 0 {
-            if let Some(i) = nth_healthy_weighted(backends, health, counter % healthy_weight) {
-                return Some(&backends[i]);
-            }
-        }
-        // Panic routing, or health flipped between the sum and the walk.
-        let slot = counter % total_weight;
-        let mut cumulative: u64 = 0;
-        backends.iter().find(|b| {
-            cumulative += b.weight as u64;
-            cumulative > slot
-        })
+        let index = if healthy_weight == total_weight || healthy_weight == 0 {
+            // Every backend healthy, or panic routing over all of them.
+            slot_owner(backends, counter % total_weight)
+        } else {
+            select_degraded(backends, health, counter, total_weight)
+        };
+        index.map(|i| &backends[i])
     }
 }
 
-/// Walk to the healthy positive-weight backend owning weighted slot `slot`.
-/// `None` only when health flipped between the caller's weight sum and this
-/// walk.
+/// The backend owning weighted slot `slot` of the configured weights.
+#[inline]
+fn slot_owner(backends: &[Backend], slot: u64) -> Option<usize> {
+    let mut cumulative: u64 = 0;
+    backends.iter().position(|b| {
+        cumulative += b.weight as u64;
+        cumulative > slot
+    })
+}
+
+/// Selection while some positive-weight backend is unhealthy. A Reject
+/// entry keeps exactly its configured share: it stands for an invalid
+/// backendRef, whose share alone must fail, so it never absorbs an
+/// unhealthy backend's. The forwarding share spreads over the healthy
+/// forwarding backends by weight; with none healthy it stays with the slot's
+/// owner (panic routing).
+fn select_degraded(
+    backends: &[Backend],
+    health: &crate::proxy::health::HealthRegistry,
+    counter: u64,
+    total_weight: u64,
+) -> Option<usize> {
+    let slot = counter % total_weight;
+    let owner = slot_owner(backends, slot)?;
+    let (mut cumulative, mut rejected, mut rejected_below_slot, mut healthy) = (0u64, 0, 0, 0);
+    for b in backends {
+        let weight = b.weight as u64;
+        if b.action == BackendAction::Reject {
+            rejected += weight;
+            if cumulative + weight <= slot {
+                rejected_below_slot += weight;
+            }
+        } else if weight > 0 && health.is_healthy(&b.socket_addr) {
+            healthy += weight;
+        }
+        cumulative += weight;
+    }
+    if backends[owner].action == BackendAction::Reject || healthy == 0 {
+        return Some(owner);
+    }
+    // Forwarding picks made since the counter started: consecutive ones
+    // rotate over the healthy backends whatever share the Reject entries
+    // take in between. Without Reject entries this is `counter`.
+    let forward_pick =
+        counter / total_weight * (total_weight - rejected) + (slot - rejected_below_slot);
+    nth_healthy_weighted(backends, health, forward_pick % healthy).or(Some(owner))
+}
+
+/// Walk to the healthy positive-weight forwarding backend owning weighted
+/// slot `slot`. `None` only when health flipped between the caller's
+/// weight sum and this walk.
 #[inline]
 fn nth_healthy_weighted(
     backends: &[Backend],
@@ -830,7 +877,8 @@ fn nth_healthy_weighted(
 ) -> Option<usize> {
     let mut cumulative: u64 = 0;
     for (i, b) in backends.iter().enumerate() {
-        if b.weight == 0 || !health.is_healthy(&b.socket_addr) {
+        if b.weight == 0 || b.action == BackendAction::Reject || !health.is_healthy(&b.socket_addr)
+        {
             continue;
         }
         cumulative += b.weight as u64;

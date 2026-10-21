@@ -2821,6 +2821,7 @@ mod connection_tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );
@@ -2948,6 +2949,7 @@ mod connection_tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );
@@ -3128,6 +3130,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             }],
         );
         rt
@@ -3335,6 +3338,7 @@ mod connection_tests {
                         filters: vec![],
                         use_tls: true,
                         server_name: sni.to_string(),
+                        action: crate::routing::BackendAction::Forward,
                     }],
                 ),
             );
@@ -3567,6 +3571,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             };
             // A conn whose peer is gone: the first write fails.
             let (dead, _) = tokio::io::duplex(1);
@@ -3625,6 +3630,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             }],
         );
         rt

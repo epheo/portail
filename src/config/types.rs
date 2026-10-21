@@ -454,6 +454,11 @@ pub struct BackendRef {
     /// Application protocol for backend connections (e.g. "https" for TLS backends)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_protocol: Option<String>,
+    /// Set by the Kubernetes reconciler on a ref it may not forward to
+    /// (RefNotPermitted, BackendNotFound, InvalidKind). The ref keeps its
+    /// weight and its share of traffic fails; it is never resolved.
+    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
+    pub invalid: bool,
 }
 
 fn default_backend_kind() -> String {

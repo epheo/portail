@@ -74,8 +74,7 @@ pub(crate) trait GatewayRoute: Sized {
     /// The one source of attachment for the table: one ref per listener
     /// the route was accepted on, never re-derived from the spec's refs.
     fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>);
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
+    fn backend_refs_mut(config: &mut Self::Config) -> Vec<&mut BackendRef>;
     /// Mirror-filter backend refs (HTTPRoute only). Validated like forward
     /// refs, but an invalid mirror drops the filter instead of the backends:
     /// a mirror the route may not reference must not break primary traffic.
@@ -132,25 +131,12 @@ macro_rules! impl_gateway_route {
             fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>) {
                 config.parent_refs = parent_refs;
             }
-            fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+            fn backend_refs_mut(config: &mut Self::Config) -> Vec<&mut BackendRef> {
                 config
                     .rules
-                    .iter()
-                    .flat_map(|r| {
-                        r.backend_refs
-                            .iter()
-                            .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                    })
+                    .iter_mut()
+                    .flat_map(|r| r.backend_refs.iter_mut())
                     .collect()
-            }
-            fn remove_invalid_backends(
-                config: &mut Self::Config,
-                invalid: &HashSet<(String, u16)>,
-            ) {
-                for rule in &mut config.rules {
-                    rule.backend_refs
-                        .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-                }
             }
             fn status_parents_json(&self) -> Vec<serde_json::Value> {
                 self.status
@@ -707,7 +693,6 @@ fn collect_routes<R: GatewayRoute>(
                 let mut refs_resolved = true;
                 let mut refs_messages = Vec::new();
                 let mut refs_reason = "ResolvedRefs";
-                let mut invalid_backends: HashSet<(String, u16)> = HashSet::new();
                 let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
                 // Group/kind (core Service only), cross-namespace ReferenceGrant,
@@ -759,12 +744,16 @@ fn collect_routes<R: GatewayRoute>(
                     None
                 };
 
-                for (backend_name, port, group, ref_kind) in R::backend_refs(&config) {
-                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+                // An invalid ref keeps its weight so its share fails rather
+                // than moving to the valid refs (HTTPRouteRule.backendRefs).
+                for backend in R::backend_refs_mut(&mut config) {
+                    if let Some((reason, message)) =
+                        check_ref(&backend.name, &backend.group, &backend.kind)
+                    {
                         refs_resolved = false;
                         refs_reason = reason;
                         refs_messages.push(message);
-                        invalid_backends.insert((backend_name.to_string(), port));
+                        backend.invalid = true;
                     }
                 }
                 for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
@@ -776,10 +765,6 @@ fn collect_routes<R: GatewayRoute>(
                     }
                 }
 
-                // Remove invalid backends so the data plane returns 500 for them
-                if !invalid_backends.is_empty() {
-                    R::remove_invalid_backends(&mut config, &invalid_backends);
-                }
                 if !invalid_mirrors.is_empty() {
                     R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
                 }

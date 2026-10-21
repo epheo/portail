@@ -1199,6 +1199,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );

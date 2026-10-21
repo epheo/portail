@@ -611,6 +611,7 @@ mod tests {
             kind: "Service".to_string(),
             filters: vec![],
             app_protocol: None,
+            invalid: false,
         }
     }
 
@@ -730,6 +731,7 @@ mod tests {
                         kind: "Service".to_string(),
                         filters: vec![],
                         app_protocol: None,
+                        invalid: false,
                     },
                     percent: None,
                     fraction: None,
@@ -1029,6 +1031,7 @@ mod tests {
                     kind: "Service".to_string(),
                     filters: vec![],
                     app_protocol: None,
+                    invalid: false,
                 }],
                 timeouts: None,
             }],
@@ -1062,6 +1065,7 @@ mod tests {
                     kind: "Service".to_string(),
                     filters: vec![],
                     app_protocol: None,
+                    invalid: false,
                 }],
                 timeouts: None,
             }],

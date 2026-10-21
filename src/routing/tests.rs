@@ -13,6 +13,7 @@ fn backend(port: u16) -> Backend {
         filters: vec![],
         use_tls: false,
         server_name: String::new(),
+        action: BackendAction::Forward,
     }
 }
 
@@ -285,6 +286,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -292,6 +294,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -807,6 +810,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -814,6 +818,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -853,6 +858,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -860,6 +866,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -1061,6 +1068,77 @@ fn test_zero_weight_backend_skipped_on_slow_path() {
     }
 }
 
+/// An invalid backendRef's Reject entry keeps exactly its configured share
+/// while a sibling is unhealthy: the unhealthy share moves to the healthy
+/// forwarding backends only, evenly, never to the Reject entry.
+#[test]
+fn test_reject_share_is_exact_while_a_sibling_is_unhealthy() {
+    let backends = vec![
+        weighted(8001, 1),
+        weighted(8002, 1),
+        Backend::rejecting(1),
+        weighted(8003, 1),
+    ];
+    let mut rt = RouteTable::new();
+    rt.add_http_route(
+        "test.com",
+        rule(PathMatchType::Prefix, "/", backends.clone()),
+    );
+    let r = rt
+        .find_http_route("test.com", "GET", "/", &[], "", 0)
+        .unwrap();
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+
+    let selector = BackendSelector::new();
+    let mut http = [0u32; 4];
+    let mut l4 = [0u32; 4];
+    for _ in 0..800 {
+        http[selector
+            .select_healthy_weighted_backend(r, &health)
+            .unwrap()] += 1;
+        let b = selector
+            .select_l4_backend(7000, &backends, &health)
+            .unwrap();
+        let i = backends.iter().position(|c| std::ptr::eq(c, b)).unwrap();
+        l4[i] += 1;
+    }
+    assert_eq!(http, [0, 300, 200, 300]);
+    assert_eq!(l4, [0, 300, 200, 300]);
+}
+
+/// With every forwarding backend down, panic routing keeps each one's own
+/// share; the Reject entry still gets only its own.
+#[test]
+fn test_reject_share_is_exact_when_every_forwarding_backend_is_down() {
+    let backends = vec![weighted(8001, 3), Backend::rejecting(1)];
+    let mut rt = RouteTable::new();
+    rt.add_http_route(
+        "test.com",
+        rule(PathMatchType::Prefix, "/", backends.clone()),
+    );
+    let r = rt
+        .find_http_route("test.com", "GET", "/", &[], "", 0)
+        .unwrap();
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+
+    let selector = BackendSelector::new();
+    let mut http = [0u32; 2];
+    let mut l4 = [0u32; 2];
+    for _ in 0..400 {
+        http[selector
+            .select_healthy_weighted_backend(r, &health)
+            .unwrap()] += 1;
+        let b = selector
+            .select_l4_backend(7000, &backends, &health)
+            .unwrap();
+        l4[usize::from(b.action == BackendAction::Reject)] += 1;
+    }
+    assert_eq!(http, [300, 100]);
+    assert_eq!(l4, [300, 100]);
+}
+
 #[test]
 fn test_cumulative_weights_precomputed() {
     let mut rt = RouteTable::new();
@@ -1079,6 +1157,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -1086,6 +1165,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
