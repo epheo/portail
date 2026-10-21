@@ -165,8 +165,13 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 - The header budget starts at a request's first bytes.
 - Idle keepalive waits stay unbounded.
 - It also bounds each connection's close, TLS close_notify included.
-- A closing reply reads off what the client still sends, for up to `clientHeaderTimeout`.
-- That read stops after 5s with nothing new from the client.
+- A closing reply lingers: it reads off what the client still sends, so no reset destroys the reply.
+- Unless the client is done: it asked to close, its request is all in, and nothing came past it.
+- These closes never linger: a 408, a 503 for the proxy's own fd or memory shortage, a tunnel's end, a reset after a response cut short.
+- The linger lasts `clientHeaderTimeout` at most.
+- It stops after 5s with nothing new from the client.
+- It stops after 64KiB, one client buffer.
+- An HTTP/2 connection's close always lingers, within the same bounds.
 
 `idleBodyTimeout`:
 
