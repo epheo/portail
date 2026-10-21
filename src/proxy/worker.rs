@@ -4731,13 +4731,15 @@ mod connection_tests {
     /// A client told to close that keeps its socket open, as urllib3 and
     /// HttpURLConnection pools do, held its fd and task, and a drain, for
     /// the whole header budget. Silent for LINGER_IDLE, it is done.
-    #[tokio::test(start_paused = true)]
+    /// Real time: a paused clock jumps to the next timer whenever the
+    /// runtime parks on loopback I/O, and could expire the header budget.
+    #[tokio::test]
     async fn a_lingering_close_ends_once_the_client_falls_silent() {
         let budget = LINGER_IDLE * 6;
         let mut state = conn_state(RouteTable::new(), false);
         state.client_header_timeout = budget;
         let (mut client, engine) = tcp_client(state).await;
-        let started = tokio::time::Instant::now();
+        let started = std::time::Instant::now();
         client
             .write_all(b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 9\r\n\r\n")
             .await
