@@ -222,9 +222,10 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
 /// Framing is the caller's reading of the head (`worker::parse_response_head`),
 /// never re-derived here. `transfer_encoded` drops every Content-Length line:
 /// Transfer-Encoding overrides it (RFC 9112 6.3), and a client that framed
-/// by it would read past this body into the next response. The proxy owns
-/// the client-side Connection header: `client_close` appends its own close
-/// announcement.
+/// by it would read past this body into the next response. Otherwise only
+/// the first is kept: the reading made repeats agree, and some clients
+/// (llhttp) refuse any repeat. The proxy owns the client-side Connection
+/// header: `client_close` appends its own close announcement.
 pub(crate) fn sanitize_response_headers(
     raw: &[u8],
     transfer_encoded: bool,
@@ -238,13 +239,13 @@ pub(crate) fn sanitize_response_headers(
         out.extend_from_slice(status_line);
         out.extend_from_slice(b"\r\n");
     }
+    let mut drop_content_length = transfer_encoded;
     for line in lines {
         let keep = match memchr::memchr(b':', line) {
-            Some(p) => {
-                let name = &line[..p];
-                !(is_hop_by_hop_response_header(name)
-                    || (transfer_encoded && name.eq_ignore_ascii_case(b"content-length")))
+            Some(p) if line[..p].eq_ignore_ascii_case(b"content-length") => {
+                !std::mem::replace(&mut drop_content_length, true)
             }
+            Some(p) => !is_hop_by_hop_response_header(&line[..p]),
             None => true,
         };
         if keep {
@@ -922,12 +923,14 @@ mod tests {
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nServer: x\r\n\r\n"
         );
 
-        // Content-Length alone is the framing and stays.
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        // Content-Length alone is the framing and stays, once.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\ncontent-length: 5\r\n\r\n";
         sanitize_response_headers(resp, false, false, &mut out);
-        assert!(std::str::from_utf8(&out)
-            .unwrap()
-            .contains("Content-Length: 5\r\n"));
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\n"
+        );
     }
 
     #[test]
