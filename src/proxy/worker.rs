@@ -223,6 +223,7 @@ pub(crate) struct ConnectionState {
     /// Set on every backend socket this connection opens.
     backend_keepalive: socket2::TcpKeepalive,
     /// Reused across keepalive responses to avoid per-response heap allocation.
+    /// Allocated by the first response read, which sizes it.
     header_buf: Vec<u8>,
     /// Reused header-assembly scratch: outgoing request block during the send
     /// phase, sanitized response block during the response phase.
@@ -288,7 +289,7 @@ impl ConnectionState {
             client_header_timeout: cfg.client_header_timeout,
             connect_timeout: cfg.connect_timeout,
             backend_keepalive: tcp_keepalive(cfg.tcp_keepalive_time),
-            header_buf: Vec::with_capacity(1024),
+            header_buf: Vec::new(),
             scratch_buf: Vec::with_capacity(1024),
             filter_buf: Vec::new(),
             idle_body_timeout: idle_opt(cfg.idle_body_timeout),
