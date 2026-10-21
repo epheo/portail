@@ -1586,13 +1586,15 @@ async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) 
         // Check before reading: a swallowed interim response leaves the next
         // response's bytes already buffered.
         if let Some(header_end) = find_header_end(header_buf) {
-            let status = parse_response_status(&header_buf[..header_end]);
+            // A malformed status line is returned as final, for the caller
+            // to refuse.
+            let status = head_status(&header_buf[..header_end]).unwrap_or(0);
 
             // Interim responses are proxy-consumed: the proxy answers
             // 100-continue itself (Expect never reaches the backend), and
             // relaying other 1xx mid-exchange would confuse clients that
             // already got a 100. 1xx has no body, so everything past the
-            // block belongs to the next response. 101 is not interim here —
+            // block belongs to the next response. 101 is not interim here:
             // the caller dispatches it (upgrade accept or reject).
             if (100..200).contains(&status) && status != 101 {
                 interim_seen += 1;
@@ -1634,9 +1636,8 @@ fn frame_response(
     is_head_request: bool,
     expect_upgrade: bool,
 ) -> Option<ResponseFraming> {
-    let head = &header_buf[..header_end];
-    let parsed = parse_response_head(head)?;
-    let status = parse_response_status(head);
+    let parsed = parse_response_head(&header_buf[..header_end])?;
+    let status = parsed.status;
     // RFC 7230 3.3: responses to HEAD have no message body regardless
     // of the response's Content-Length / Transfer-Encoding. Forcing
     // no_body here keeps `forward_response_body` from blocking on
@@ -2746,6 +2747,41 @@ mod connection_tests {
         );
     }
 
+    /// Framing hangs on the status: read as 204, `2040` dropped the body
+    /// a lenient client then waited for.
+    #[tokio::test]
+    async fn malformed_backend_status_line_gets_a_502() {
+        for status_line in [
+            "HTTP/1.1 2040 OK",
+            "HTTP/1.1 20 OK",
+            "HTTP/1.1  200 OK",
+            "HTTP/1.1 200\tOK",
+            "http/1.1 200 OK",
+            "HTTP/2 200 OK",
+            "HTTP/1.1 abc OK",
+            "ICY 200 OK",
+        ] {
+            let reply = format!("{status_line}\r\nContent-Length: 5\r\n\r\nhello");
+            let addr = closing_backend(reply.as_bytes()).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert_eq!(
+                out,
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway",
+                "{status_line}"
+            );
+        }
+        // A reason phrase is optional, its SP too.
+        for status_line in ["HTTP/1.1 200", "HTTP/1.1 200 ", "HTTP/1.0 200 OK"] {
+            let reply = format!("{status_line}\r\nContent-Length: 5\r\n\r\nhello");
+            let addr = closing_backend(reply.as_bytes()).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert!(out.starts_with(&format!("{status_line}\r\n")), "{out}");
+            assert!(out.ends_with("\r\n\r\nhello"), "{out}");
+        }
+    }
+
     #[test]
     fn local_reply_announces_close_exactly_when_closing() {
         let bytes = |status, location, close, head| {
@@ -2813,6 +2849,7 @@ pub(crate) enum BodyFraming {
 /// body ends, and the client would take the rest as the next response.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResponseHead {
+    pub(crate) status: u16,
     pub(crate) body: BodyFraming,
     /// Any Transfer-Encoding overrides Content-Length, which must then not
     /// be forwarded either.
@@ -2822,17 +2859,14 @@ pub(crate) struct ResponseHead {
 }
 
 /// `None` when a recipient could frame the head differently than this
-/// reading: a Content-Length other than one `1*DIGIT` value (repeated lines
-/// must agree), Transfer-Encoding on HTTP/1.0, or a line a client could
-/// split or name otherwise (bare CR, obs-fold, whitespace or a CTL in a
-/// field name). Lines are split exactly as the sanitizer splits them.
+/// reading: a status line other than `HTTP/1.x SP 3DIGIT [SP reason]`, a
+/// Content-Length other than one `1*DIGIT` value (repeated lines must
+/// agree), Transfer-Encoding on HTTP/1.0, or a line a client could split or
+/// name otherwise (bare CR, obs-fold, whitespace or a CTL in a field name).
+/// Lines are split exactly as the sanitizer splits them.
 pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
     let mut lines = header_lines(head);
-    let status_line = lines.next()?;
-    if memchr::memchr(b'\r', status_line).is_some() {
-        return None;
-    }
-    let is_http10 = status_line.starts_with(b"HTTP/1.0");
+    let (status, is_http10) = parse_status_line(lines.next()?)?;
     let mut content_length: Option<usize> = None;
     let (mut transfer_encoded, mut chunked_last) = (false, false);
     let (mut close, mut keep_alive) = (false, false);
@@ -2880,38 +2914,35 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
         (false, Some(n)) => BodyFraming::Length(n),
     };
     Some(ResponseHead {
+        status,
         body,
         transfer_encoded,
         backend_close: close || (is_http10 && !keep_alive),
     })
 }
 
-/// Content-Length the engine frames this head's body by: `None` when there
-/// is none, Transfer-Encoding overrides it, or the head is malformed.
-pub(crate) fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    match parse_response_head(headers)?.body {
-        BodyFraming::Length(n) => Some(n),
-        BodyFraming::Chunked | BodyFraming::Close => None,
+/// The status code and whether the version is HTTP/1.0, from a status line
+/// without its CRLF. `HTTP/1.x SP 3DIGIT`, then nothing or SP and a reason.
+/// No code below 100: a client may read one as interim, so bodiless.
+fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
+    let [b'H', b'T', b'T', b'P', b'/', b'1', b'.', minor, b' ', d0 @ b'1'..=b'9', d1, d2, reason @ ..] =
+        line
+    else {
+        return None;
+    };
+    if !(minor.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit())
+        || !matches!(reason, [] | [b' ', ..])
+        || memchr::memchr(b'\r', reason).is_some()
+    {
+        return None;
     }
+    let status = u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
+    Some((status, *minor == b'0'))
 }
 
-/// Whether the engine frames this head's body as chunked.
-pub(crate) fn is_chunked_transfer(headers: &[u8]) -> bool {
-    parse_response_head(headers).is_some_and(|h| h.body == BodyFraming::Chunked)
-}
-
-/// Parse the 3-digit status code from a response status line
-/// ("HTTP/1.1 200 ..."). Returns 0 when unparseable.
-pub(crate) fn parse_response_status(headers: &[u8]) -> u16 {
-    if headers.len() < 12 {
-        return 0;
-    }
-    let s = &headers[9..12];
-    if s.iter().all(|b| b.is_ascii_digit()) {
-        (s[0] - b'0') as u16 * 100 + (s[1] - b'0') as u16 * 10 + (s[2] - b'0') as u16
-    } else {
-        0
-    }
+/// The status of a head whose status line is well-formed.
+fn head_status(head: &[u8]) -> Option<u16> {
+    parse_status_line(header_lines(head).next()?).map(|(status, _)| status)
 }
 
 #[cfg(test)]
@@ -3151,28 +3182,38 @@ mod tests {
         assert!(!close(b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n\r\n"));
     }
 
-    /// The h2 bridge frames the engine's output with these; they must agree
-    /// with the engine's own reading.
     #[test]
-    fn bridge_helpers_follow_the_engine_reading() {
-        let te =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 3\r\n\r\n";
-        assert!(is_chunked_transfer(te));
-        assert_eq!(parse_content_length(te), None);
-        let cl = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
-        assert!(!is_chunked_transfer(cl));
-        assert_eq!(parse_content_length(cl), Some(3));
-    }
-
-    #[test]
-    fn response_status_parsing() {
-        assert_eq!(parse_response_status(b"HTTP/1.1 200 OK\r\n\r\n"), 200);
-        assert_eq!(
-            parse_response_status(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
-            101
-        );
-        assert_eq!(parse_response_status(b"HTTP/1.0 304 Not Modified\r\n"), 304);
-        assert_eq!(parse_response_status(b"HTTP/1.1 abc\r\n"), 0);
-        assert_eq!(parse_response_status(b"short"), 0);
+    fn status_line_is_version_code_then_an_optional_reason() {
+        for (line, want) in [
+            (&b"HTTP/1.1 200 OK"[..], Some((200, false))),
+            (b"HTTP/1.1 101 Switching Protocols", Some((101, false))),
+            (b"HTTP/1.0 304 Not Modified", Some((304, true))),
+            (b"HTTP/1.1 200", Some((200, false))),
+            (b"HTTP/1.1 200 ", Some((200, false))),
+            (b"HTTP/1.1 999 Request denied", Some((999, false))),
+            (b"HTTP/1.1 2040 OK", None),
+            (b"HTTP/1.1 20 OK", None),
+            (b"HTTP/1.1 099 Early", None),
+            (b"HTTP/1.1  200 OK", None),
+            (b"HTTP/1.1 200\tOK", None),
+            (b"HTTP/1.1 200 O\rK", None),
+            (b"http/1.1 200 OK", None),
+            (b"HTTP/2 200 OK", None),
+            (b"HTTP/1.x 200 OK", None),
+            (b"HTTP/1.1 abc", None),
+            (b"short", None),
+        ] {
+            assert_eq!(
+                parse_status_line(line),
+                want,
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        // The head's own status, and the one interim detection reads.
+        let head = b"HTTP/1.1 304 Not Modified\r\nETag: x\r\n\r\n";
+        assert_eq!(parse_response_head(head).unwrap().status, 304);
+        assert_eq!(head_status(head), Some(304));
+        assert_eq!(head_status(b"HTTP/1.1 1000 X\r\n\r\n"), None);
     }
 }
