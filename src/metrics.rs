@@ -214,6 +214,7 @@ type LabeledFamily = Mutex<BTreeMap<String, Arc<AtomicU64>>>;
 static HOST_REQUESTS: OnceLock<LabeledFamily> = OnceLock::new();
 static BACKEND_CONNECT_ERRORS: OnceLock<LabeledFamily> = OnceLock::new();
 static BACKEND_CONNECT_TIMEOUTS: OnceLock<LabeledFamily> = OnceLock::new();
+static BACKEND_SEND_ERRORS: OnceLock<LabeledFamily> = OnceLock::new();
 
 fn family_counter(family: &'static OnceLock<LabeledFamily>, key: &str) -> Arc<AtomicU64> {
     let mut map = match family.get_or_init(Default::default).lock() {
@@ -249,6 +250,13 @@ pub fn record_backend_connect_error(backend: &str) {
 /// backend.
 pub fn record_backend_connect_timeout(backend: &str) {
     family_counter(&BACKEND_CONNECT_TIMEOUTS, backend).fetch_add(1, Relaxed);
+}
+
+/// Attribute a request whose send to a freshly connected backend failed
+/// (client saw 502) to the configured backend. The connect succeeded, so
+/// it is no connect error.
+pub fn record_backend_send_error(backend: &str) {
+    family_counter(&BACKEND_SEND_ERRORS, backend).fetch_add(1, Relaxed);
 }
 
 /// Prometheus label values must escape backslash, double-quote and newline.
@@ -317,6 +325,9 @@ pub struct ListenerStats {
     pub upstream_connect_errors: Counter,
     /// Backend connects that timed out (client saw 504) for this listener's requests.
     pub upstream_connect_timeouts: Counter,
+    /// Requests whose send to a freshly connected backend failed (client
+    /// saw 502), for this listener.
+    pub upstream_send_errors: Counter,
     /// 1 while the accept loop is alive, 0 once it has exited. This is the
     /// outside-observable answer to "is anything listening on this port" —
     /// the signal that was missing every time a gateway VIP refused while
@@ -373,7 +384,7 @@ fn render_listeners(out: &mut String) {
     // UDP listeners render zeros for the TCP-only series; a constant zero
     // costs nothing and keeps the schema uniform across protos.
     type Get = fn(&ListenerStats) -> u64;
-    let series: [(&str, &str, &str, Get); 8] = [
+    let series: [(&str, &str, &str, Get); 9] = [
         (
             "listener_accepted_total",
             "Connections accepted (TCP) or datagrams received (UDP) per listener",
@@ -417,6 +428,12 @@ fn render_listeners(out: &mut String) {
             |s| s.upstream_connect_timeouts.get(),
         ),
         (
+            "listener_upstream_send_errors_total",
+            "Requests whose send to a freshly connected backend failed (client saw 502) per listener",
+            "counter",
+            |s| s.upstream_send_errors.get(),
+        ),
+        (
             "listener_up",
             "Listener accept-loop liveness (1 = accepting)",
             "gauge",
@@ -445,7 +462,7 @@ pub fn render(ready: bool) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(16384);
     render_counters(&mut out);
-    let labeled: [(&'static OnceLock<LabeledFamily>, &str, &str, &str); 3] = [
+    let labeled: [(&'static OnceLock<LabeledFamily>, &str, &str, &str); 4] = [
         (
             &HOST_REQUESTS,
             "http_requests_total",
@@ -463,6 +480,12 @@ pub fn render(ready: bool) -> String {
             "upstream_connect_timeouts_total",
             "backend",
             "Backend connects that timed out (client saw 504), by configured backend",
+        ),
+        (
+            &BACKEND_SEND_ERRORS,
+            "upstream_send_errors_total",
+            "backend",
+            "Requests whose send to a freshly connected backend failed (client saw 502), by configured backend",
         ),
     ];
     for (family, name, label, help) in labeled {
@@ -580,6 +603,15 @@ mod tests {
     }
 
     #[test]
+    fn backend_send_errors_render_by_backend() {
+        record_backend_send_error("send.test:8080");
+        record_backend_send_error("send.test:8080");
+        let text = render(true);
+        assert!(text.contains("# TYPE portail_upstream_send_errors_total counter"));
+        assert!(text.contains("portail_upstream_send_errors_total{backend=\"send.test:8080\"} 2"));
+    }
+
+    #[test]
     fn request_histograms_render_in_scrape() {
         REQUEST_DURATION.observe(std::time::Duration::from_millis(2));
         UPSTREAM_TTFB.observe(std::time::Duration::from_millis(1));
@@ -595,6 +627,7 @@ mod tests {
         stats.accepted.add(3);
         stats.http_requests.add(2);
         stats.upstream_connect_errors.inc();
+        stats.upstream_send_errors.add(4);
         let text = render(true);
         assert!(text.contains("portail_listener_accepted_total{proto=\"tcp\",port=\"8123\"} 3"));
         assert!(text.contains("portail_listener_up{proto=\"tcp\",port=\"8123\"} 1"));
@@ -603,6 +636,9 @@ mod tests {
         );
         assert!(text.contains(
             "portail_listener_upstream_connect_errors_total{proto=\"tcp\",port=\"8123\"} 1"
+        ));
+        assert!(text.contains(
+            "portail_listener_upstream_send_errors_total{proto=\"tcp\",port=\"8123\"} 4"
         ));
         assert!(text.contains("portail_listener_active_connections{proto=\"tcp\",port=\"8123\"} 0"));
 

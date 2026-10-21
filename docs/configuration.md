@@ -45,8 +45,10 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   (connections, backend pool, DNS refresh, health transitions, reconciles,
   and `portail_http_requests_rejected_total` for request heads refused with
   `400` as malformed or ambiguous; those are logged at debug level only),
-  `portail_http_requests_total{host=...}` and
-  `portail_upstream_connect_{errors,timeouts}_total{backend=...}` families,
+  `portail_http_requests_total{host=...}`,
+  `portail_upstream_connect_{errors,timeouts}_total{backend=...}` and
+  `portail_upstream_send_errors_total{backend=...}` (a request a freshly
+  connected backend did not take) families,
   per-listener `portail_listener_*{proto=...,port=...}` series including
   `portail_listener_up`, and two latency histograms:
   `portail_request_duration_seconds` (headers-complete to response flushed,
