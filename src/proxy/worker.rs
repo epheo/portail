@@ -39,27 +39,28 @@ use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
 /// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
-/// Returns 0 when the client closes first.
+/// Returns `Some(0)` when the client closes first, `None` when the head
+/// outgrows `buf`.
 async fn read_remaining_headers(
     client: &mut Connection,
     buf: &mut [u8],
     already_read: usize,
-) -> Result<usize> {
+) -> std::io::Result<Option<usize>> {
     let mut total = already_read;
     loop {
         if total >= buf.len() {
-            return Err(anyhow::anyhow!("Request headers exceed buffer size"));
+            return Ok(None);
         }
         let n = client.read(&mut buf[total..]).await?;
         if n == 0 {
             // Never parse a truncated head: the proxy's own headers would be
             // appended to its unterminated last line, which could hide them
             // (e.g. inside a client header's value).
-            return Ok(0);
+            return Ok(Some(0));
         }
         total += n;
         if find_header_end(&buf[..total]).is_some() {
-            return Ok(total);
+            return Ok(Some(total));
         }
     }
 }
@@ -908,8 +909,9 @@ fn may_open_request(data: &[u8]) -> bool {
 /// budget. The budget starts once a request's first bytes have arrived — the
 /// idle wait between keepalive requests is intentionally unbounded. Sends
 /// `431` when the block outgrows the buffer and `408` when the client is too
-/// slow, then errors out to close the connection. Returns 0 when the client
-/// closed before the head ended: nothing is forwarded or answered.
+/// slow, then errors out to close the connection, as a client I/O error
+/// does with no reply. Returns 0 when the client closed before the head
+/// ended: nothing is forwarded or answered.
 async fn complete_headers(
     client: &mut Connection,
     buf: &mut [u8],
@@ -918,13 +920,16 @@ async fn complete_headers(
 ) -> Result<usize> {
     let budget = state.client_header_timeout;
     match tokio::time::timeout(budget, read_remaining_headers(client, buf, already_read)).await {
-        Ok(Ok(total)) => Ok(total),
-        Ok(Err(e)) => {
+        Ok(Ok(Some(total))) => Ok(total),
+        Ok(Ok(None)) => {
             // The rest of the head may still be on its way.
             state.refused(431);
             let _ = send_error_response(client, 431).await;
-            Err(e)
+            Err(anyhow::anyhow!("Request headers exceed buffer size"))
         }
+        // A reset, or a TLS record that does not decode: the connection is
+        // gone or broken, so nothing could be answered.
+        Ok(Err(e)) => Err(e.into()),
         Err(_) => {
             // No linger: this client already used its whole budget.
             let _ = send_error_response(client, 408).await;
@@ -4640,6 +4645,34 @@ mod connection_tests {
         assert!(engine.await.unwrap().is_err());
         assert!(client.take_error().unwrap().is_none(), "reset");
         assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
+    }
+
+    /// A client whose connection fails mid head (a reset, a TLS record that
+    /// does not decode) outgrew nothing: no 431 is written, logged, or
+    /// lingered on.
+    #[tokio::test]
+    async fn a_client_error_mid_head_is_no_431() {
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(front.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (engine_end, _) = front.accept().await.unwrap();
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n";
+        let mut buf = vec![0u8; 65536];
+        buf[..head.len()].copy_from_slice(head);
+        let mut conn = Connection::Plain { inner: engine_end };
+        let mut state = conn_state(RouteTable::new(), false);
+        let read = complete_headers(&mut conn, &mut buf, head.len(), &mut state).await;
+        let err = read.unwrap_err();
+        let kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
+        assert_eq!(kind, Some(std::io::ErrorKind::ConnectionReset), "{err}");
+        assert_eq!(state.last_status, 0);
+        assert!(!state.linger);
     }
 
     /// A body cut short after its head went out must still reset: a clean
