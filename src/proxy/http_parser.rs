@@ -543,9 +543,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
             (14, b'h') if name.eq_ignore_ascii_case(b"http2-settings") => {
                 line_kind = LineKind::Strip;
             }
-            (9, b'f') | (15..=18, b'x') if is_forwarding_claim(name) => {
-                line_kind = LineKind::Strip;
-            }
+            _ if is_forwarding_claim(name) => line_kind = LineKind::Strip,
             _ => {}
         }
         if violation {
