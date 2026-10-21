@@ -154,6 +154,10 @@ pub(crate) fn merge_cert_refs_by_port(
 ) -> std::collections::HashMap<u16, Vec<CertificateRef>> {
     let mut merged: std::collections::HashMap<u16, Vec<CertificateRef>> =
         std::collections::HashMap::new();
+    // A listener bound on several addresses comes once per address. The
+    // hostname is part of the key: one Secret on two listeners serves two
+    // SNIs.
+    let mut seen = std::collections::HashSet::new();
     for listener_cfg in listener_configs {
         let Some(tls_cfg) = &listener_cfg.tls else {
             continue;
@@ -165,9 +169,14 @@ pub(crate) fn merge_cert_refs_by_port(
             continue;
         }
         let refs = merged.entry(listener_cfg.port).or_default();
-        // A listener bound on several addresses comes once per address.
         for r in &tls_cfg.certificate_refs {
-            if !refs.contains(r) {
+            let key = (
+                listener_cfg.port,
+                r.namespace.as_deref(),
+                r.name.as_str(),
+                r.hostname.as_deref(),
+            );
+            if seen.insert(key) {
                 refs.push(r.clone());
             }
         }
@@ -821,6 +830,7 @@ mod tests {
                     hostname: hostname.map(str::to_string),
                     cert_pem: Some(b"PEM-CERT".to_vec()),
                     key_pem: Some(b"PEM-KEY".to_vec()),
+                    namespace: None,
                 }],
             }),
             rate_limit: None,
@@ -893,6 +903,26 @@ mod tests {
             "Passthrough must not contribute"
         );
         assert!(!merged.contains_key(&80), "HTTP must not contribute");
+    }
+
+    /// Refs merge by their Secret's key and the hostname they serve, never
+    /// by comparing PEM bytes pairwise: one Secret seen twice merges once,
+    /// whatever bytes each copy carries.
+    #[test]
+    fn merged_refs_dedup_by_secret_key() {
+        let mut a = https_listener("a", 443, Some("a.example.org"), "cert");
+        a.tls.as_mut().unwrap().certificate_refs[0].namespace = Some("ns1".into());
+        let mut again = a.clone();
+        again.address = Some("10.0.0.2".into());
+        again.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(b"ROTATED".to_vec());
+        let mut other_ns = a.clone();
+        other_ns.tls.as_mut().unwrap().certificate_refs[0].namespace = Some("ns2".into());
+        let merged = merge_cert_refs_by_port(&[a, again, other_ns]);
+        let namespaces: Vec<_> = merged[&443]
+            .iter()
+            .map(|r| r.namespace.as_deref())
+            .collect();
+        assert_eq!(namespaces, vec![Some("ns1"), Some("ns2")]);
     }
 
     /// A listener bound on two addresses comes as two copies. Each added

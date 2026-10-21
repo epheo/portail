@@ -2207,6 +2207,7 @@ mod tests {
                     hostname: None,
                     cert_pem: Some(pem.to_vec()),
                     key_pem: Some(b"K".to_vec()),
+                    namespace: None,
                 }],
             });
             c
@@ -2342,6 +2343,7 @@ mod tests {
                                 hostname: Some(host.to_string()),
                                 cert_pem: Some(b"C".to_vec()),
                                 key_pem: Some(b"K".to_vec()),
+                                namespace: None,
                             }],
                         }),
                         rate_limit: None,

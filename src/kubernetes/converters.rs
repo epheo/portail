@@ -113,6 +113,7 @@ fn convert_listener(
                             .unwrap_or((None, None));
                         CertificateRef {
                             name: r.name.clone(),
+                            namespace: Some(secret_ns.to_string()),
                             hostname: l.hostname.clone(),
                             cert_pem,
                             key_pem,

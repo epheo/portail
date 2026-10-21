@@ -98,6 +98,11 @@ pub enum TlsMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CertificateRef {
     pub name: String,
+    /// The Secret's namespace in Kubernetes mode: with `name`, the key a
+    /// port's merged refs are told apart by. `None` in a file config,
+    /// whose names are files in one directory.
+    #[serde(skip)]
+    pub namespace: Option<String>,
     /// The listener hostname associated with this cert (for SNI routing).
     /// e.g. "*.desku.be", "example.org", etc.
     #[serde(skip_serializing_if = "Option::is_none")]
