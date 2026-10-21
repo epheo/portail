@@ -5,27 +5,55 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// Everything the child wrote to stdout and stderr, interleaved.
+type Captured = Arc<Mutex<Vec<u8>>>;
 
 /// Piped child output must be drained or a full pipe (64 KiB) blocks the
 /// process: a tokio worker stuck in write(2) on stderr wedged the h2 e2e
 /// tests, because the h2 crate's per-frame debug traces outgrow the buffer.
-fn drain_child_pipes(child: &mut Child) {
-    if let Some(mut out) = child.stdout.take() {
-        thread::spawn(move || {
-            let _ = std::io::copy(&mut out, &mut std::io::sink());
-        });
+/// Kept rather than discarded, so a test can assert on the logs.
+fn drain_child_pipes(child: &mut Child) -> (Captured, Vec<thread::JoinHandle<()>>) {
+    let captured = Captured::default();
+    let mut readers = Vec::new();
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as _),
+        child.stderr.take().map(|p| Box::new(p) as _),
+    ];
+    for mut pipe in pipes.into_iter().flatten() {
+        let captured = captured.clone();
+        readers.push(thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                captured.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        }));
     }
-    if let Some(mut err) = child.stderr.take() {
-        thread::spawn(move || {
-            let _ = std::io::copy(&mut err, &mut std::io::sink());
-        });
-    }
+    (captured, readers)
 }
+
+/// kubeconfig for a cluster whose apiserver is `{server}`, with no credentials.
+const KUBECONFIG: &str = "apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: http://{server}
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+current-context: test
+users:
+- name: test
+  user: {}
+";
 
 /// Minimal TCP backend that accepts connections and writes canned HTTP responses.
 pub struct TestBackend {
@@ -321,13 +349,94 @@ pub fn tcp_roundtrip(addr: SocketAddr, data: &[u8], timeout: Duration) -> std::i
 /// Handle to a running Portail subprocess. Kills on drop.
 pub struct PortailProcess {
     child: Child,
+    // The --config file, or the kubeconfig in Kubernetes mode.
     _config_file: tempfile::NamedTempFile,
     // Held so the --cert-dir outlives the process (TLS tests only).
     _cert_dir: Option<tempfile::TempDir>,
     pub proxy_addr: SocketAddr,
+    output: Captured,
+    readers: Vec<thread::JoinHandle<()>>,
 }
 
 impl PortailProcess {
+    /// Send SIGTERM, as kubelet does to stop a pod.
+    pub fn terminate(&self) {
+        // SAFETY: kill(2) on our own child's pid; no memory is involved.
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+    }
+
+    /// Wait up to `timeout` for the process to exit. On exit, the output
+    /// is complete: the pipe readers are joined.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                for reader in self.readers.drain(..) {
+                    let _ = reader.join();
+                }
+                return Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The process logs so far (stdout and stderr).
+    pub fn output(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    /// Spawn in Kubernetes mode against the apiserver at `apiserver`
+    /// (`None`: a kubeconfig path that does not exist, so no cluster is
+    /// found). Returns at once: no port is bound without a Gateway, and
+    /// the admin endpoint on `admin_port` may never come up.
+    pub fn start_kubernetes(apiserver: Option<SocketAddr>, admin_port: u16) -> Self {
+        let kubeconfig = tempfile::Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("create kubeconfig");
+        let kubeconfig_path = match apiserver {
+            Some(server) => {
+                let yaml = KUBECONFIG.replace("{server}", &server.to_string());
+                std::fs::write(kubeconfig.path(), yaml).expect("write kubeconfig");
+                kubeconfig.path().to_path_buf()
+            }
+            None => kubeconfig.path().with_extension("missing"),
+        };
+
+        let binary = cargo_bin_path();
+        let mut child = unsafe {
+            Command::new(&binary)
+                .arg("--kubernetes")
+                .arg("--readiness-port")
+                .arg(admin_port.to_string())
+                .env("KUBECONFIG", &kubeconfig_path)
+                // Never the in-cluster config of a CI pod.
+                .env_remove("KUBERNETES_SERVICE_HOST")
+                .env_remove("KUBERNETES_SERVICE_PORT")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
+        };
+        let (output, readers) = drain_child_pipes(&mut child);
+
+        Self {
+            child,
+            _config_file: kubeconfig,
+            _cert_dir: None,
+            proxy_addr: SocketAddr::from(([127, 0, 0, 1], admin_port)),
+            output,
+            readers,
+        }
+    }
+
     /// Build a test config and spawn Portail.
     /// `routes` maps (hostname, path_prefix) → backend SocketAddr.
     pub fn spawn(routes: &[(&str, &str, SocketAddr)], proxy_port: u16) -> Self {
@@ -362,7 +471,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
-        drain_child_pipes(&mut child);
+        let (output, readers) = drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -401,6 +510,8 @@ impl PortailProcess {
             _config_file: config_file,
             _cert_dir: None,
             proxy_addr,
+            output,
+            readers,
         }
     }
 
@@ -444,7 +555,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
-        drain_child_pipes(&mut child);
+        let (output, readers) = drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -464,6 +575,8 @@ impl PortailProcess {
             _config_file: config_file,
             _cert_dir: None,
             proxy_addr,
+            output,
+            readers,
         }
     }
 
@@ -548,7 +661,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
-        drain_child_pipes(&mut child);
+        let (output, readers) = drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -573,6 +686,8 @@ impl PortailProcess {
             _config_file: config_file,
             _cert_dir: None,
             proxy_addr,
+            output,
+            readers,
         }
     }
 
@@ -667,7 +782,7 @@ impl PortailProcess {
                 .spawn()
                 .unwrap_or_else(|e| panic!("Failed to spawn {:?}: {}", binary, e))
         };
-        drain_child_pipes(&mut child);
+        let (output, readers) = drain_child_pipes(&mut child);
 
         let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
 
@@ -693,6 +808,8 @@ impl PortailProcess {
             _config_file: config_file,
             _cert_dir: Some(cert_dir),
             proxy_addr,
+            output,
+            readers,
         }
     }
 }
@@ -734,6 +851,18 @@ impl Drop for PortailProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Whether something accepts connections on `addr` within `timeout`.
+pub fn wait_for_listener(addr: SocketAddr, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 /// Send a raw HTTP request and return the full response bytes.

@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use helpers::{
     extract_body, extract_status, http_request, http_request_keepalive, http_request_timeout,
-    tcp_roundtrip, InspectingBackend, PortailProcess, TcpEchoBackend, TestBackend,
+    tcp_roundtrip, wait_for_listener, InspectingBackend, PortailProcess, TcpEchoBackend,
+    TestBackend,
 };
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
@@ -1941,4 +1942,30 @@ fn test_stalled_backend_body_reaped_by_idle_timeout() {
 
     unstall.store(true, std::sync::atomic::Ordering::Relaxed);
     handle.join().unwrap();
+}
+
+/// Kubernetes mode: the controller holds the data plane as long as it
+/// runs, so the drain must not need to own it. An apiserver that never
+/// answers keeps the controller, and its handle, alive across the SIGTERM.
+#[test]
+fn test_sigterm_drains_in_kubernetes_mode() {
+    // Listening but never accepting: every apiserver request hangs.
+    let apiserver = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut proxy = PortailProcess::start_kubernetes(Some(apiserver.local_addr().unwrap()), 25081);
+    assert!(
+        wait_for_listener(proxy.proxy_addr, Duration::from_secs(5)),
+        "admin endpoint never came up:\n{}",
+        proxy.output()
+    );
+
+    proxy.terminate();
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("no exit within 10s of SIGTERM");
+    assert!(status.success(), "{status}:\n{}", proxy.output());
+    let output = proxy.output();
+    assert!(
+        output.contains("Data plane shutdown complete"),
+        "drain skipped:\n{output}"
+    );
 }

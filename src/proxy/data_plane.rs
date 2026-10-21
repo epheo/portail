@@ -94,6 +94,47 @@ pub struct DataPlane {
 /// Maximum time to wait for in-flight connections on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Stops a [`DataPlane`] and waits out its connections, without access to
+/// the data plane itself (see [`DataPlane::drain_handle`]).
+pub struct Drain {
+    shutdown: CancellationToken,
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl Drain {
+    /// Stop every accept loop, then wait up to `DRAIN_TIMEOUT` for the
+    /// in-flight connections to finish.
+    pub async fn run(self) {
+        info!("Data plane shutting down, draining in-flight connections");
+        self.shutdown.cancel();
+
+        let active = self.active_connections;
+        let drain_result = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            loop {
+                let count = active.load(Ordering::Acquire);
+                if count == 0 {
+                    break;
+                }
+                info!("Waiting for {} in-flight connection(s) to drain", count);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await;
+
+        match drain_result {
+            Ok(()) => info!("All connections drained"),
+            Err(_) => {
+                let remaining = active.load(Ordering::Acquire);
+                warn!(
+                    "Drain timeout after {:?}: {} connections still active",
+                    DRAIN_TIMEOUT, remaining
+                );
+            }
+        }
+        info!("Data plane shutdown complete");
+    }
+}
+
 /// Idle backend connections retained per backend identity, in whichever pool
 /// scope is configured. Not user-tunable today.
 const DEFAULT_MAX_IDLE_PER_BACKEND: usize = 64;
@@ -634,43 +675,14 @@ impl DataPlane {
         );
     }
 
-    /// Signal shutdown and wait for in-flight connections to drain (up to 30s).
-    pub async fn shutdown(self) {
-        info!("Data plane shutting down — draining in-flight connections");
-        self.shutdown.cancel();
-
-        // Wait for active connections to drain, with timeout
-        let active = self.active_connections.clone();
-        let drain_result = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            loop {
-                let count = active.load(Ordering::Acquire);
-                if count == 0 {
-                    break;
-                }
-                info!("Waiting for {} in-flight connection(s) to drain", count);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        })
-        .await;
-
-        match drain_result {
-            Ok(()) => info!("All connections drained"),
-            Err(_) => {
-                let remaining = active.load(Ordering::Acquire);
-                warn!(
-                    "Drain timeout after {:?}: {} connections still active",
-                    DRAIN_TIMEOUT, remaining
-                );
-            }
+    /// The handle that drains this data plane. Take it before sharing the
+    /// data plane: the controller holds a clone for as long as it runs, so
+    /// a drain that had to own the data plane would never run.
+    pub fn drain_handle(&self) -> Drain {
+        Drain {
+            shutdown: self.shutdown.clone(),
+            active_connections: self.active_connections.clone(),
         }
-
-        for (_endpoint, slot) in self.listener_tasks {
-            if let ListenerSlot::Running(handle, _) = slot {
-                let _ = handle.await;
-            }
-        }
-
-        info!("Data plane shutdown complete");
     }
 
     /// Check if all the specified (address, port) endpoints are bound with a
