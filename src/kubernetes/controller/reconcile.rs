@@ -661,17 +661,17 @@ impl Served {
 
 pub(super) type GatewayConfigs = HashMap<(String, String), Served>;
 
-/// Drop the configs of Gateways no longer in the store.
+/// Drop the configs of Gateways no longer in the store, and the network
+/// IPs no Gateway names.
 fn retain_live_gateways(ctx: &ControllerCtx, configs: &mut GatewayConfigs) {
-    let live: HashSet<(String, String)> = ctx
-        .cache
-        .gateways
-        .state()
+    let gateways = ctx.cache.gateways.state();
+    let live: HashSet<(String, String)> = gateways
         .iter()
         .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
         .collect();
     configs.retain(|k, _| live.contains(k));
     ctx.route_verdicts.retain(|k| live.contains(k));
+    ctx.network_ips.retain_named(&gateways);
 }
 
 /// What the data plane runs: the route table's config, and the listeners
@@ -1560,6 +1560,99 @@ mod tests {
             let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 2, &network).await;
             assert_eq!(programmed["status"], "True", "{programmed}");
             assert!(accepts(&ip), "still bound");
+        });
+    }
+
+    fn nad_unreadable(api: &MockApi) {
+        api.reply_to(
+            NAD_UDN_A,
+            500,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "InternalError", "code": 500,
+                "message": "etcdserver: request timed out",
+            }),
+        );
+    }
+
+    /// The Programmed condition of Gateway `name`'s last status write.
+    fn gateway_programmed(api: &MockApi, name: &str) -> serde_json::Value {
+        let patch = api.status_patch("gateways", name).unwrap();
+        let conditions = patch["status"]["conditions"].as_array().unwrap();
+        conditions
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .unwrap()
+            .clone()
+    }
+
+    /// A network dropped from spec.addresses forgets its IP. It was kept,
+    /// and a failed read of the network once re-added bound that IP: an
+    /// answer from a spec the Gateway no longer had.
+    #[test]
+    fn a_dropped_network_forgets_its_ip() {
+        alone("a_dropped_network_forgets_its_ip", async {
+            // Accepting a probe builds a backend pool: rustls needs its provider.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let Some(ip) = local_ipv4() else {
+                return; // no address off loopback to name
+            };
+            let port = free_port();
+            let accepts = |addr: &str| std::net::TcpStream::connect((addr, port)).is_ok();
+            let api = MockApi::default();
+            api.reply_to(NAD_UDN_A, 200, nad_udn_a(&format!("{ip}/32")));
+            let mut cluster = TestCluster::default();
+            let ctx = cluster.ctx(api.client());
+            let gw = gateway_on("gw", port);
+            let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+
+            let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 1, &network).await;
+            assert_eq!(programmed["status"], "True", "{programmed}");
+            assert!(accepts(&ip));
+            let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 2, &[]).await;
+            assert_eq!(programmed["status"], "True", "{programmed}");
+
+            nad_unreadable(&api);
+            reconcile_with(&api, &mut cluster, &ctx, &gw, 3, &network).await;
+            assert_eq!(gateway_programmed(&api, "gw")["reason"], "AddressNotUsable");
+            assert!(!accepts(&ip), "bound on a forgotten answer");
+        });
+    }
+
+    /// Unscoped mode: a deleted Gateway's networks go with it. They were
+    /// kept for the life of the process, and a Gateway created again under
+    /// its name bound the old IP on a failed read.
+    #[test]
+    fn a_deleted_gateway_forgets_its_networks() {
+        alone("a_deleted_gateway_forgets_its_networks", async {
+            // Accepting a probe builds a backend pool: rustls needs its provider.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let Some(ip) = local_ipv4() else {
+                return; // no address off loopback to name
+            };
+            let port = free_port();
+            let accepts = |addr: &str| std::net::TcpStream::connect((addr, port)).is_ok();
+            let api = MockApi::default();
+            api.reply_to(NAD_UDN_A, 200, nad_udn_a(&format!("{ip}/32")));
+            let mut cluster = TestCluster::default();
+            let ctx = cluster.ctx(api.client());
+            let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+            let gw = with_addresses(gateway_on("gw", port), 1, &network);
+            apply(&mut cluster.gateways, gw.clone());
+            reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+            assert!(accepts(&ip));
+
+            cluster
+                .gateways
+                .apply_watcher_event(&kube::runtime::watcher::Event::Delete(gw.clone()));
+            prune_deleted_gateways(&ctx).await;
+
+            nad_unreadable(&api);
+            apply(&mut cluster.gateways, gw.clone());
+            api.clear();
+            reconcile(Arc::new(gw), ctx).await.unwrap();
+            assert_eq!(gateway_programmed(&api, "gw")["reason"], "AddressNotUsable");
+            assert!(!accepts(&ip), "bound on a deleted Gateway's answer");
         });
     }
 

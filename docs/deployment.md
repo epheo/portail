@@ -67,6 +67,7 @@ kubectl apply -k examples/kubernetes/multi-network/http-single-namespace/
 Each UDN gets its own Gateway with a `portail.epheo.eu/Network` address naming it. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
 portail reads the network's NetworkAttachmentDefinition (the base ClusterRole allows it) and binds the pod's IP on that network.
 A NetworkAttachmentDefinition that cannot be read keeps the network's last IP, while the pod has it; only a network with no IP on the pod, or none at all, unbinds.
+That last IP is forgotten once no Gateway names the network: dropped from `spec.addresses`, or its Gateway deleted.
 Each Gateway's listeners bind its own addresses only: a network with no IP on the pod unbinds that Gateway alone.
 One portail serving several Gateways routes by port: Gateways sharing a port are not isolated from each other.
 

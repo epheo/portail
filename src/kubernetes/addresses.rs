@@ -9,7 +9,7 @@ use kube::api::Api;
 use kube::Client;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use gateway_api::gateways::Gateway;
 
@@ -182,6 +182,30 @@ pub(crate) fn discover_usable_addresses() -> UsableAddresses {
 /// The last local IP each network resolved to, by (namespace, network).
 #[derive(Default)]
 pub(crate) struct NetworkIps(Mutex<HashMap<(String, String), String>>);
+
+impl NetworkIps {
+    /// Keep only the networks some Gateway of `gateways` names. A dropped
+    /// entry left its IP for a later failed read of a re-added network to
+    /// bind, and unscoped mode kept one per network ever named.
+    pub(crate) fn retain_named(&self, gateways: &[Arc<Gateway>]) {
+        let named: HashSet<(String, String)> = gateways
+            .iter()
+            .flat_map(|gw| {
+                let ns = gw.namespace().unwrap_or_else(|| "default".to_string());
+                gw.spec
+                    .addresses
+                    .iter()
+                    .flatten()
+                    .filter(|a| a.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE))
+                    .map(move |a| (ns.clone(), a.value.clone().unwrap_or_default()))
+            })
+            .collect();
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| named.contains(key));
+    }
+}
 
 /// Resolve `portail.epheo.eu/Network` entries in `spec.addresses` to local IPs.
 /// Reads each named NetworkAttachmentDefinition for its subnet and matches it
@@ -396,6 +420,29 @@ mod tests {
             compute_bind_addresses(&config.addresses, &usable),
             Some(vec!["192.168.10.3".to_string()])
         );
+    }
+
+    /// Only the networks some Gateway still names keep their last IP.
+    #[test]
+    fn network_ips_keep_only_named_networks() {
+        let ips = NetworkIps::default();
+        for (ns, network) in [
+            ("default", "udn-a"),
+            ("default", "udn-b"),
+            ("gone", "udn-a"),
+        ] {
+            ips.0
+                .lock()
+                .unwrap()
+                .insert((ns.into(), network.into()), "192.168.10.3".into());
+        }
+        let gw = gateway_with_addresses(&[(NETWORK_ADDRESS_TYPE, "udn-a"), ("IPAddress", "udn-b")]);
+        ips.retain_named(&[Arc::new(gw)]);
+        let kept: Vec<_> = ips.0.lock().unwrap().keys().cloned().collect();
+        assert_eq!(kept, vec![("default".to_string(), "udn-a".to_string())]);
+
+        ips.retain_named(&[]);
+        assert!(ips.0.lock().unwrap().is_empty());
     }
 
     /// An unresolved Network name never falls back to every interface.
