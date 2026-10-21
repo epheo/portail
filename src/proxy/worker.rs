@@ -1076,7 +1076,7 @@ impl Framing {
     /// `None` when the chunked body read so far is malformed: settled before
     /// the request is dispatched, so it costs no backend connection.
     fn of(read: &[u8], meta: &RequestMeta) -> Option<Self> {
-        let header_end = find_header_end(read).unwrap_or(read.len());
+        let header_end = meta.head_len;
         let tail = &read[header_end..];
         let (end, chunked) = if let Some(cl) = meta.content_length {
             (header_end + tail.len().min(cl), None)
