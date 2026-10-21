@@ -283,6 +283,7 @@ pub(super) fn validate_gateway(
             ls.resolved_refs_message = "All references resolved".into();
         }
 
+        // Reconcile turns this False again while the listener is not bound.
         if ls.accepted && ls.resolved_refs {
             ls.programmed = true;
             ls.programmed_reason = "Programmed".into();

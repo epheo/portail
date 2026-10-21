@@ -193,11 +193,12 @@ fn observed_policies(
 
 /// Open data-plane TCP listeners for this Gateway's ports. Called after the
 /// per-Gateway config is built so ListenerConfig has resolved TLS cert data.
+/// Returns the bind errors, keyed by published port.
 fn ensure_data_plane_listeners(
     ctx: &ControllerCtx,
     listeners: &[crate::config::ListenerConfig],
     bind_addresses: &[String],
-) {
+) -> Vec<(u16, String)> {
     info!(
         "Ensuring data plane listeners for ports: {:?}",
         listeners.iter().map(|l| l.port).collect::<Vec<_>>()
@@ -216,8 +217,49 @@ fn ensure_data_plane_listeners(
             for (port, err) in &errors {
                 warn!("Failed to bind port {}: {}", port, err);
             }
+            errors
         }
-        Err(e) => warn!("Failed to lock data plane: {}", e),
+        Err(e) => {
+            warn!("Failed to lock data plane: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Listener Programmed follows the data plane: an accepted listener whose
+/// socket has no live accept loop is not ready for traffic. Gateway API
+/// v1.4.1 ListenerReasonPending: the listener is "not yet online and ready
+/// to accept client traffic".
+fn apply_bind_state(
+    ctx: &ControllerCtx,
+    statuses: &mut HashMap<String, status::ListenerStatus>,
+    listeners: &[crate::config::ListenerConfig],
+    bind: Option<&[String]>,
+    bind_errors: &[(u16, String)],
+) {
+    let Ok(dp) = ctx.data_plane.lock() else {
+        return;
+    };
+    for l in listeners {
+        let Some(ls) = statuses.get_mut(&l.name).filter(|ls| ls.programmed) else {
+            continue;
+        };
+        let message = match bind {
+            None => "Not bound: no address of this Gateway is on the pod".to_string(),
+            Some(bind) => {
+                let endpoints = required_endpoints(std::slice::from_ref(l), bind);
+                if dp.is_ready_for_endpoints(&endpoints) {
+                    continue;
+                }
+                match bind_errors.iter().find(|(port, _)| *port == l.port) {
+                    Some((_, err)) => format!("Listener port not bound: {}", err),
+                    None => "Listener port not bound yet".to_string(),
+                }
+            }
+        };
+        ls.programmed = false;
+        ls.programmed_reason = "Pending".into();
+        ls.programmed_message = message;
     }
 }
 
@@ -576,6 +618,8 @@ struct DataPlaneState {
     ready: bool,
     rebuilt: bool,
     build_error: Option<String>,
+    /// From this pass's binds, keyed by published port.
+    bind_errors: Vec<(u16, String)>,
 }
 
 /// Bring the data plane in line with `effective_config`. The gate is
@@ -620,15 +664,16 @@ async fn apply_data_plane(
                 ready: true,
                 rebuilt: false,
                 build_error: applied.build_error.clone(),
+                bind_errors: Vec::new(),
             };
         }
     }
 
-    match &bind {
+    let bind_errors = match &bind {
         Some(bind) => ensure_data_plane_listeners(ctx, &effective_config.gateway.listeners, bind),
         // Nothing may bind: close what is open instead of binding the wildcard.
         None => ensure_data_plane_listeners(ctx, &[], &[]),
-    }
+    };
     let ready = is_ready();
     // Store the truth in BOTH directions: readiness must also drop when a
     // required endpoint has no live accept loop and the rebind above failed,
@@ -646,6 +691,7 @@ async fn apply_data_plane(
             ready,
             rebuilt: false,
             build_error: applied.build_error,
+            bind_errors,
         };
     }
 
@@ -678,6 +724,7 @@ async fn apply_data_plane(
         ready,
         rebuilt: true,
         build_error,
+        bind_errors,
     }
 }
 
@@ -753,7 +800,8 @@ pub(super) async fn reconcile(
         .await;
     }
 
-    let (listener_statuses, accepted_cond) = validate_gateway(&gateway, &gw_ns, &resolved_certs);
+    let (mut listener_statuses, accepted_cond) =
+        validate_gateway(&gateway, &gw_ns, &resolved_certs);
 
     let mut usable = discover_usable_addresses();
     resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
@@ -846,6 +894,13 @@ pub(super) async fn reconcile(
     };
 
     let dp = apply_data_plane(&ctx, &effective_config, &usable, &required).await;
+    apply_bind_state(
+        &ctx,
+        &mut listener_statuses,
+        &config.gateway.listeners,
+        bind_addresses.as_deref(),
+        &dp.bind_errors,
+    );
     match &dp.build_error {
         Some(e) if dp.rebuilt => error!(
             "Failed to build route table for Gateway {}/{}: {}",
@@ -1157,6 +1212,51 @@ mod tests {
             .status_patch("ratelimitpolicies", "p")
             .expect("our stale ancestor is removed");
         assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
+    }
+
+    /// Listener conditions of the first `status_patch` for `gw`, by type.
+    fn listener_conditions(patch: &serde_json::Value) -> HashMap<String, serde_json::Value> {
+        patch["status"]["listeners"][0]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["type"].as_str().unwrap().to_string(), c.clone()))
+            .collect()
+    }
+
+    /// A listener whose port cannot be bound is not Programmed. It used to
+    /// report Programmed=True from the spec alone.
+    #[tokio::test]
+    async fn unbound_listener_is_not_programmed() {
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].port = held.local_addr().unwrap().port().into();
+        apply(&mut cluster.gateways, gw.clone());
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        let patch = api.status_patch("gateways", "gw").unwrap();
+        let programmed = &listener_conditions(&patch)["Programmed"];
+        assert_eq!(programmed["status"], "False", "{programmed}");
+        assert_eq!(programmed["reason"], "Pending");
+        assert!(
+            programmed["message"]
+                .as_str()
+                .unwrap()
+                .contains("not bound"),
+            "{programmed}"
+        );
+
+        // Once the port frees up, the bind retry programs it.
+        drop(held);
+        let gw = testkit::with_gateway_status(gw, &patch);
+        apply(&mut cluster.gateways, gw.clone());
+        api.clear();
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        let patch = api.status_patch("gateways", "gw").unwrap();
+        assert_eq!(listener_conditions(&patch)["Programmed"]["status"], "True");
     }
 
     /// A write computed from a stale read is refused (409), not applied
