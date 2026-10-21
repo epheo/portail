@@ -56,6 +56,40 @@ impl<'a> RewrittenPath<'a> {
     }
 }
 
+/// The X-Forwarded-For and X-Forwarded-Proto lines of every request on a
+/// client connection, formatted once: its peer and its scheme are fixed.
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardedLines {
+    bytes: [u8; Self::CAP],
+    len: u8,
+}
+
+impl ForwardedLines {
+    /// Longest IP text: six IPv6 groups with their colons, then a dotted
+    /// IPv4 tail.
+    const IP_TEXT_MAX: usize = 6 * 5 + 15;
+    const CAP: usize =
+        b"X-Forwarded-For: \r\nX-Forwarded-Proto: https\r\n".len() + Self::IP_TEXT_MAX;
+
+    pub(crate) fn new(client_ip: std::net::IpAddr, is_tls: bool) -> Self {
+        use std::io::Write;
+        let mut bytes = [0u8; Self::CAP];
+        let mut rest = &mut bytes[..];
+        let proto = if is_tls { "https" } else { "http" };
+        let written = write!(
+            rest,
+            "X-Forwarded-For: {client_ip}\r\nX-Forwarded-Proto: {proto}\r\n"
+        );
+        debug_assert!(written.is_ok(), "{client_ip} outgrew IP_TEXT_MAX");
+        let len = (Self::CAP - rest.len()) as u8;
+        Self { bytes, len }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 /// Assemble the outgoing request header block into `out` (reused scratch):
 /// copies `raw` minus the parser-recorded hop-by-hop spans via bulk gap
 /// copies, then appends X-Forwarded-For / X-Forwarded-Proto and, for upgrade
@@ -70,8 +104,7 @@ pub(crate) fn assemble_forward_headers(
     spans: &StripSpans,
     upgrade_span: Option<(u32, u32)>,
     keep_upgrade: bool,
-    client_ip: std::net::IpAddr,
-    is_tls: bool,
+    forwarded: &ForwardedLines,
     out: &mut Vec<u8>,
 ) {
     out.clear();
@@ -106,7 +139,7 @@ pub(crate) fn assemble_forward_headers(
         cursor = ue;
     }
     out.extend_from_slice(&raw[cursor..terminator_start]);
-    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, forwarded, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -117,8 +150,7 @@ pub(crate) fn assemble_forward_headers_slow(
     raw: &[u8],
     path: Option<&[u8]>,
     keep_upgrade: bool,
-    client_ip: std::net::IpAddr,
-    is_tls: bool,
+    forwarded: &ForwardedLines,
     out: &mut Vec<u8>,
 ) {
     // Pass 1: collect nominated tokens from every Connection header,
@@ -179,24 +211,14 @@ pub(crate) fn assemble_forward_headers_slow(
             out.extend_from_slice(b"\r\n");
         }
     }
-    append_forward_headers(out, client_ip, is_tls, keep_upgrade);
+    append_forward_headers(out, forwarded, keep_upgrade);
     out.extend_from_slice(b"\r\n");
 }
 
-fn append_forward_headers(
-    out: &mut Vec<u8>,
-    client_ip: std::net::IpAddr,
-    is_tls: bool,
-    keep_upgrade: bool,
-) {
-    use std::io::Write;
+fn append_forward_headers(out: &mut Vec<u8>, forwarded: &ForwardedLines, keep_upgrade: bool) {
     // A fresh X-Forwarded-For line: multiple XFF headers concatenate as one
     // list, which avoids locating and splicing an existing header.
-    out.extend_from_slice(b"X-Forwarded-For: ");
-    let _ = write!(out, "{}", client_ip);
-    out.extend_from_slice(b"\r\nX-Forwarded-Proto: ");
-    out.extend_from_slice(if is_tls { b"https" } else { b"http" });
-    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(forwarded.as_bytes());
     if keep_upgrade {
         out.extend_from_slice(b"Connection: upgrade\r\n");
     }
@@ -784,6 +806,27 @@ mod tests {
         crate::proxy::http_parser::extract_routing_info(req).unwrap()
     }
 
+    fn fwd(is_tls: bool) -> ForwardedLines {
+        ForwardedLines::new("10.1.2.3".parse().unwrap(), is_tls)
+    }
+
+    #[test]
+    fn forwarded_lines_fit_every_peer() {
+        for ip in [
+            "10.1.2.3",
+            "255.255.255.255",
+            "::ffff:255.255.255.255",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "::1",
+        ] {
+            let lines = ForwardedLines::new(ip.parse().unwrap(), true);
+            assert_eq!(
+                std::str::from_utf8(lines.as_bytes()).unwrap(),
+                format!("X-Forwarded-For: {ip}\r\nX-Forwarded-Proto: https\r\n")
+            );
+        }
+    }
+
     #[test]
     fn test_assemble_strips_hop_by_hop_and_appends_forwarding() {
         let req = b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\nTE: trailers\r\nAccept: */*\r\n\r\n";
@@ -798,8 +841,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             false,
-            "10.1.2.3".parse().unwrap(),
-            false,
+            &fwd(false),
             &mut out,
         );
         let s = std::str::from_utf8(&out).unwrap();
@@ -827,8 +869,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             true,
-            "10.1.2.3".parse().unwrap(),
-            true,
+            &fwd(true),
             &mut out,
         );
         let s = std::str::from_utf8(&out).unwrap();
@@ -846,8 +887,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             false,
-            "10.1.2.3".parse().unwrap(),
-            false,
+            &fwd(false),
             &mut out,
         );
         let s = std::str::from_utf8(&out).unwrap();
@@ -861,14 +901,7 @@ mod tests {
         assert!(info.strip_spans.needs_slow_path);
 
         let mut out = Vec::new();
-        assemble_forward_headers_slow(
-            req,
-            None,
-            false,
-            "10.1.2.3".parse().unwrap(),
-            false,
-            &mut out,
-        );
+        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(!s.to_ascii_lowercase().contains("x-internal"));
         assert!(!s.to_ascii_lowercase().contains("connection:"));
@@ -880,9 +913,8 @@ mod tests {
     fn test_assemble_slow_path_keeps_upgrade_for_upgrade_requests() {
         // An extra Connection token diverts a WebSocket to the slow path.
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, X-Foo\r\nX-Foo: 1\r\nSec-WebSocket-Key: k\r\n\r\n";
-        let ip = "10.1.2.3".parse().unwrap();
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, true, ip, false, &mut out);
+        assemble_forward_headers_slow(req, None, true, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Upgrade: websocket\r\n"), "{s}");
         assert!(s.ends_with("Connection: upgrade\r\n\r\n"), "{s}");
@@ -891,7 +923,7 @@ mod tests {
         assert!(s.contains("Sec-WebSocket-Key: k\r\n"));
 
         // Not an upgrade: the Upgrade line goes with the other nominated ones.
-        assemble_forward_headers_slow(req, None, false, ip, false, &mut out);
+        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap().to_ascii_lowercase();
         assert!(!s.contains("upgrade"), "{s}");
     }
@@ -900,14 +932,7 @@ mod tests {
     fn test_assemble_slow_path_replaces_client_forwarded_proto() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto: https\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(
-            req,
-            None,
-            false,
-            "10.1.2.3".parse().unwrap(),
-            false,
-            &mut out,
-        );
+        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert_eq!(s.matches("X-Forwarded-Proto").count(), 1, "{s}");
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
@@ -1005,14 +1030,7 @@ mod tests {
     fn test_assemble_slow_path_drops_client_forwarding_claims() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nForwarded: for=6.6.6.6;proto=https\r\nX-Forwarded-Host: evil\r\nx-forwarded-port: 443\r\nX-Forwarded-Ssl: on\r\nX-FORWARDED-SCHEME: https\r\nX-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Hostname: kept\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(
-            req,
-            None,
-            false,
-            "10.1.2.3".parse().unwrap(),
-            false,
-            &mut out,
-        );
+        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         let lower = s.to_ascii_lowercase();
         for name in [
@@ -1036,14 +1054,7 @@ mod tests {
         // as a second request while the proxy relays it as this one's body.
         let req = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: keep-alive, Content-Length, HOST, Transfer-Encoding, X-Internal\r\nX-Internal: s\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(
-            req,
-            None,
-            false,
-            "10.1.2.3".parse().unwrap(),
-            false,
-            &mut out,
-        );
+        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Content-Length: 5\r\n"), "{s}");
         assert!(s.contains("Host: h\r\n"), "{s}");
