@@ -167,10 +167,10 @@ fn append_forward_headers(
     }
 }
 
-/// The origin-form target and the authority of an absolute-form request
-/// (`raw` is its head, `path_span` the parser's path within it). `None` for
-/// any other form, at one byte compare when the path starts the target, as
-/// it does in the common origin-form request.
+/// The path and the authority of an absolute-form request (`raw` is its
+/// head, `path_span` the parser's path within it). `None` for any other
+/// form, at one byte compare when the path starts the target, as it does in
+/// the common origin-form request.
 pub(crate) fn absolute_form_target(
     raw: &[u8],
     path_span: Option<(u32, u32)>,
@@ -191,23 +191,27 @@ pub(crate) fn absolute_form_target(
                 .is_some_and(|t| t.eq_ignore_ascii_case(s))
         })?
         .len();
-    // The parser held everything up to '/' to host[:port].
+    // The parser held everything up to '/' to host[:port], so the query,
+    // if any, comes after the path.
     let rest = &target[scheme_len..];
     let authority_len = memchr::memchr(b'/', rest).unwrap_or(rest.len());
-    let origin = match &rest[authority_len..] {
-        // RFC 9112 3.2.1: an empty path is sent as "/".
-        b"" => &b"/"[..],
-        path_and_query => path_and_query,
+    let path_and_query = &rest[authority_len..];
+    let path = match memchr::memchr(b'?', path_and_query) {
+        Some(query) => &path_and_query[..query],
+        None => path_and_query,
     };
-    Some((origin, std::str::from_utf8(&rest[..authority_len]).ok()?))
+    // RFC 9112 3.2.1: an empty path is sent as "/".
+    let path = if path.is_empty() { &b"/"[..] } else { path };
+    Some((path, std::str::from_utf8(&rest[..authority_len]).ok()?))
 }
 
 /// Rewrite an absolute-form request head into `out` for an origin server
-/// (RFC 9112 3.2.1): `target` replaces the request-target, and `authority`
-/// replaces the client's Host, or is added where an HTTP/1.0 client sent
-/// none (3.2.2). Filters then act on it as on any origin-form request.
-pub(crate) fn to_origin_form(head: &[u8], target: &[u8], authority: &str, out: &mut Vec<u8>) {
-    rewrite_request_head(head, Some(target), None, Some(authority), out);
+/// (RFC 9112 3.2.1): `path` replaces the request-target up to its query,
+/// and `authority` replaces the client's Host, or is added where an
+/// HTTP/1.0 client sent none (3.2.2). Filters then act on it as on any
+/// origin-form request.
+pub(crate) fn to_origin_form(head: &[u8], path: &[u8], authority: &str, out: &mut Vec<u8>) {
+    rewrite_request_head(head, Some(path), None, Some(authority), out);
 }
 
 /// Request-target bounds within a request line: between its first two SPs.
@@ -596,12 +600,12 @@ pub(crate) fn apply_request_header_modifications(
     rewrite_request_head(header_region, path, header_mods, rewrite_hostname, out);
 }
 
-/// The request line with `target` in place of its own, then the header
-/// lines through `apply_header_mods_inner`, into `out` (cleared first).
-/// Shared by URLRewrite paths and the origin-form rewrite.
+/// The request line with `path` in place of its target's path, then the
+/// header lines through `apply_header_mods_inner`, into `out` (cleared
+/// first). Shared by URLRewrite paths and the origin-form rewrite.
 fn rewrite_request_head(
     header_region: &[u8],
-    target: Option<&[u8]>,
+    path: Option<&[u8]>,
     header_mods: Option<&HeaderModifications<'_>>,
     rewrite_hostname: Option<&str>,
     out: &mut Vec<u8>,
@@ -609,16 +613,27 @@ fn rewrite_request_head(
     out.clear();
     out.reserve(header_region.len() + 256);
     let (first_line, rest) = split_first_line(header_region);
-    match target.and_then(|t| Some((t, target_bounds(first_line)?))) {
-        Some((target, (start, end))) => {
-            out.extend_from_slice(&first_line[..start]);
-            out.extend_from_slice(target);
-            out.extend_from_slice(&first_line[end..]);
-        }
+    match path {
+        Some(path) => put_request_line(first_line, path, out),
         None => out.extend_from_slice(first_line),
     }
     out.extend_from_slice(b"\r\n");
     apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
+}
+
+/// Request line `line` (no CRLF) into `out`, with `path` in place of all
+/// its target holds before the query. The query stays as sent: a path
+/// modifier replaces the path only (HTTPPathModifier). The parser let no
+/// '?' into an absolute-form authority, so such a target leaves origin-form.
+fn put_request_line(line: &[u8], path: &[u8], out: &mut Vec<u8>) {
+    let Some((start, end)) = target_bounds(line) else {
+        out.extend_from_slice(line);
+        return;
+    };
+    let query = memchr::memchr(b'?', &line[start..end]).map_or(end, |q| start + q);
+    out.extend_from_slice(&line[..start]);
+    out.extend_from_slice(path);
+    out.extend_from_slice(&line[query..]);
 }
 
 /// Apply response header modifications into `out` (cleared first), including
@@ -771,11 +786,11 @@ mod tests {
     }
 
     #[test]
-    fn test_absolute_form_target_splits_origin_form_from_authority() {
+    fn test_absolute_form_target_splits_path_from_authority() {
         for (req, want) in [
             (
                 &b"GET http://a.test:8080/p?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
-                Some((&b"/p?q=1"[..], "a.test:8080")),
+                Some((&b"/p"[..], "a.test:8080")),
             ),
             (
                 b"GET http://a.test/ HTTP/1.1\r\nHost: a.test\r\n\r\n",
@@ -805,7 +820,7 @@ mod tests {
         let mut out = Vec::new();
         to_origin_form(
             b"GET http://a.test:8080/p?q HTTP/1.1\r\nhost: a.test\r\nAccept: */*\r\n\r\n",
-            b"/p?q",
+            b"/p",
             "a.test:8080",
             &mut out,
         );
@@ -1012,6 +1027,43 @@ mod tests {
 
         assert!(result_str.starts_with("GET /new/path HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: example.com"));
+    }
+
+    /// A path modifier replaces the path only (HTTPPathModifier): the
+    /// query goes on as sent.
+    #[test]
+    fn test_url_rewrite_keeps_the_query() {
+        let mut out = Vec::new();
+        for (path, head, line) in [
+            (
+                RewrittenPath::Full("/new".to_string()),
+                &b"GET /old?a=1&b=%2F HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+                "GET /new?a=1&b=%2F HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::PrefixReplaced("/v2/x".to_string()),
+                b"GET /v1/x?a HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /v2/x?a HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::Full("/new".to_string()),
+                b"GET /old? HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /new? HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::Full("/new".to_string()),
+                b"GET /old HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /new HTTP/1.1\r\n",
+            ),
+        ] {
+            let rewrite = URLRewrite {
+                hostname: None,
+                path: Some(path),
+            };
+            apply_request_header_modifications(head, None, Some(&rewrite), &mut out);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(s.starts_with(line), "{s}");
+        }
     }
 
     #[test]

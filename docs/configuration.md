@@ -87,6 +87,12 @@ slower than the request rate sheds lines, counted in
 `portail_access_log_dropped_total`. Requests aborted mid-response (client
 gone, backend died with headers already sent) produce no line.
 
+## Request Paths
+
+URLRewrite and RequestRedirect path modifiers replace the path only. The
+query string is kept as sent, in the forwarded request and in a
+redirect's `Location`.
+
 ## Rate Limiting
 
 Per-client token bucket, attached per listener. Clients are keyed by source

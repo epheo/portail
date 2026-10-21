@@ -3038,6 +3038,28 @@ mod connection_tests {
         assert!(seen.contains("\r\nHost: p.test:8080\r\n"), "{seen}");
     }
 
+    #[tokio::test]
+    async fn a_path_rewrite_keeps_the_query() {
+        for request in [
+            "GET /v1/users?id=7&x HTTP/1.1\r\nHost: p.test\r\n\r\n",
+            "GET http://p.test/v1/users?id=7&x HTTP/1.1\r\nHost: p.test\r\n\r\n",
+        ] {
+            let rewrite = vec![HttpFilter::URLRewrite {
+                hostname: None,
+                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+            }];
+            let seen = forwarded_head(
+                |addr| filtered_route("p.test", "/v1", rewrite, addr),
+                request,
+            )
+            .await;
+            assert!(
+                seen.starts_with("GET /v2/users?id=7&x HTTP/1.1\r\n"),
+                "{request:?}: {seen}"
+            );
+        }
+    }
+
     /// The authority's Host is replaced by a `set Host`, never doubled.
     #[tokio::test]
     async fn absolute_form_takes_a_set_host() {

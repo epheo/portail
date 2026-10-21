@@ -244,6 +244,7 @@ fn analyze_http_request<'a>(
             rule,
             request_info.host,
             request_info.path,
+            request_info.query_string,
             is_tls,
             server_port,
         ) {
@@ -291,6 +292,7 @@ fn build_redirect(
     rule: &HttpRouteRule,
     request_host: &str,
     request_path: &str,
+    query: &str,
     is_tls: bool,
     server_port: u16,
 ) -> Option<(u16, String)> {
@@ -319,6 +321,7 @@ fn build_redirect(
                 hostname.as_deref().unwrap_or(request_host),
                 *port,
                 &redirect_path,
+                query,
                 default_scheme,
                 server_port,
             );
@@ -342,15 +345,19 @@ fn subslice_span(base: &[u8], sub: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// The redirect's path replaces the request's path only (HTTPPathModifier):
+/// a non-empty `query` follows it as sent.
 fn build_redirect_location(
     scheme: Option<&str>,
     hostname: &str,
     port: Option<u16>,
     path: &str,
+    query: &str,
     default_scheme: &str,
     incoming_port: u16,
 ) -> String {
     let final_scheme = scheme.unwrap_or(default_scheme);
+    let query_mark = if query.is_empty() { "" } else { "?" };
     let scheme_changed = scheme.is_some() && final_scheme != default_scheme;
 
     // Determine effective port:
@@ -368,9 +375,9 @@ fn build_redirect_location(
         Some(p)
             if !((final_scheme == "http" && p == 80) || (final_scheme == "https" && p == 443)) =>
         {
-            format!("{}://{}:{}{}", final_scheme, hostname, p, path)
+            format!("{final_scheme}://{hostname}:{p}{path}{query_mark}{query}")
         }
-        _ => format!("{}://{}{}", final_scheme, hostname, path),
+        _ => format!("{final_scheme}://{hostname}{path}{query_mark}{query}"),
     }
 }
 
@@ -859,6 +866,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A redirect path replaces the request's path only (HTTPPathModifier):
+    /// the query follows it as sent.
+    #[test]
+    fn redirect_keeps_the_query() {
+        let sel = BackendSelector::new();
+        for (path, target, want) in [
+            (None, "/old/x?a=1&b", "https://r.test/old/x?a=1&b"),
+            (
+                Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+                "/old/x?a=1",
+                "https://r.test/new/x?a=1",
+            ),
+            (
+                Some(URLRewritePath::ReplaceFullPath("/full".to_string())),
+                "/old/x?a=1",
+                "https://r.test/full?a=1",
+            ),
+            (None, "/old/x", "https://r.test/old/x"),
+        ] {
+            let redirect = HttpFilter::RequestRedirect {
+                scheme: Some("https".to_string()),
+                hostname: None,
+                port: None,
+                path,
+                status_code: 302,
+            };
+            let rt = build_route_table(
+                "r.test",
+                "/old",
+                PathMatchType::Prefix,
+                8001,
+                vec![redirect],
+            );
+            let req = make_request("GET", target, "r.test");
+            match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+                RoutingResult::LocalReply(LocalReply {
+                    location: Some(location),
+                    ..
+                }) => assert_eq!(location, want, "{target}"),
+                _ => panic!("expected a redirect for {target}"),
+            }
+        }
     }
 
     #[test]
