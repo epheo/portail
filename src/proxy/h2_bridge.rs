@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -98,8 +98,22 @@ pub(crate) struct H2Ctx {
 struct LingeringClose<S> {
     inner: S,
     budget: Duration,
-    /// Armed once the stream is shut down.
+    /// Armed by the first shutdown poll, before the inner shutdown: a client
+    /// that stops reading holds the close_notify write as long as it likes.
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The inner shutdown is done; only the linger is left.
+    shut: bool,
+}
+
+impl<S> LingeringClose<S> {
+    fn new(inner: S, budget: Duration) -> Self {
+        Self {
+            inner,
+            budget,
+            deadline: None,
+            shut: false,
+        }
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for LingeringClose<S> {
@@ -139,9 +153,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
-        if this.deadline.is_none() {
-            ready!(Pin::new(&mut this.inner).poll_shutdown(cx))?;
-            this.deadline = Some(Box::pin(tokio::time::sleep(this.budget)));
+        let budget = this.budget;
+        let deadline = this
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
+        if !this.shut {
+            if Pin::new(&mut this.inner).poll_shutdown(cx)?.is_pending() {
+                return deadline.as_mut().poll(cx).map(Ok);
+            }
+            this.shut = true;
         }
         // What still comes is dropped: the size only sets reads per wake.
         let mut discard = [0u8; 4096];
@@ -151,12 +171,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
                 Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
                 // EOF or an error: the client is done.
                 Poll::Ready(_) => return Poll::Ready(Ok(())),
-                Poll::Pending => {
-                    return match &mut this.deadline {
-                        Some(deadline) => deadline.as_mut().poll(cx).map(Ok),
-                        None => Poll::Ready(Ok(())),
-                    };
-                }
+                Poll::Pending => return deadline.as_mut().poll(cx).map(Ok),
             }
         }
     }
@@ -164,11 +179,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
 
 /// Serve one ALPN-negotiated h2 client connection until it closes.
 pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
-    let io = LingeringClose {
-        inner: tls_stream,
-        budget: ctx.cfg.client_header_timeout,
-        deadline: None,
-    };
+    let io = LingeringClose::new(tls_stream, ctx.cfg.client_header_timeout);
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
@@ -864,5 +875,63 @@ mod tests {
     #[test]
     fn response_mapping_rejects_unparseable_status() {
         assert!(build_h2_response(b"garbage\r\n\r\n", 0, false).is_err());
+    }
+
+    /// A server TLS stream and its client, past the handshake; `None`
+    /// without openssl.
+    async fn tls_pair() -> Option<(
+        ServerTlsStream<TcpStream>,
+        tokio_rustls::client::TlsStream<TcpStream>,
+    )> {
+        let (cert_pem, key_pem) = crate::proxy::tls::test_util::generate_test_cert("h2.test")?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = crate::config::CertificateRef {
+            name: "h2".to_string(),
+            cert_pem: Some(cert_pem),
+            key_pem: Some(key_pem),
+            ..Default::default()
+        };
+        let server_cfg =
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("h2.test").unwrap();
+        let (server, client) = tokio::join!(
+            async { acceptor.accept(listener.accept().await.unwrap().0).await },
+            async {
+                connector
+                    .connect(sni, TcpStream::connect(addr).await.unwrap())
+                    .await
+            },
+        );
+        Some((server.unwrap(), client.unwrap()))
+    }
+
+    /// A client that stops reading leaves close_notify no room to go out:
+    /// the close budget bounds that write, as it bounds the linger after.
+    #[tokio::test]
+    async fn a_close_notify_the_client_never_reads_is_bounded() {
+        let Some((server, _client)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        let budget = Duration::from_millis(300);
+        let mut io = LingeringClose::new(server, budget);
+        let chunk = [0u8; 64 * 1024];
+        while tokio::time::timeout(budget, io.write(&chunk)).await.is_ok() {}
+
+        let started = std::time::Instant::now();
+        let closed = tokio::time::timeout(budget * 10, io.shutdown()).await;
+        assert!(
+            closed.is_ok(),
+            "close_notify held the close past its budget"
+        );
+        assert!(started.elapsed() >= budget, "{:?}", started.elapsed());
     }
 }
