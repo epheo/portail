@@ -492,24 +492,54 @@ pub(crate) async fn handle_connection(
     }
 
     let mut buf = vec![0u8; 65536];
+    let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
+    if let Ok(Handoff::Tcp { backend_addr, len }) = served {
+        return handle_tcp_connection(
+            client,
+            backend_addr,
+            &buf[..len],
+            Arc::clone(&state.health),
+            state.connect_timeout,
+            &state.backend_keepalive,
+            state.idle_body_timeout,
+            "TCP",
+        )
+        .await;
+    }
+    close_gracefully(&mut client, state.client_header_timeout).await;
+    served.map(drop)
+}
 
-    let mut n = idle_read(&mut client, &mut buf, &state.drain).await?;
-    n = sniff_first_request(
-        &mut client,
-        &mut buf,
-        n,
-        state.client_header_timeout,
-        !tcp_route,
-    )
-    .await;
+/// Where [`serve_http`] leaves the connection.
+enum Handoff {
+    /// The HTTP exchanges are over: the connection closes.
+    Close,
+    /// Not HTTP: the connection goes to a TCP route, `buf[..len]` first.
+    Tcp {
+        backend_addr: SocketAddr,
+        len: usize,
+    },
+}
+
+/// Serve requests until the connection must close, or turns out to be
+/// opaque TCP. Every exit comes back to `handle_connection`, which owns the
+/// one close.
+async fn serve_http(
+    client: &mut Connection,
+    buf: &mut [u8],
+    state: &mut ConnectionState,
+    tcp_route: bool,
+) -> Result<Handoff> {
+    let mut n = idle_read(client, buf, &state.drain).await?;
+    n = sniff_first_request(client, buf, n, state.client_header_timeout, !tcp_route).await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
     if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
-        n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
+        n = complete_headers(client, buf, n, state.client_header_timeout).await?;
     }
     if n == 0 {
-        return Ok(());
+        return Ok(Handoff::Close);
     }
 
     loop {
@@ -540,17 +570,10 @@ pub(crate) async fn handle_connection(
         // sent to the backend or lost.
         let pending: Option<Vec<u8>> = match result {
             RoutingResult::TcpForward { backend_addr } => {
-                return handle_tcp_connection(
-                    client,
+                return Ok(Handoff::Tcp {
                     backend_addr,
-                    &buf[..n],
-                    Arc::clone(&state.health),
-                    state.connect_timeout,
-                    &state.backend_keepalive,
-                    state.idle_body_timeout,
-                    "TCP",
-                )
-                .await;
+                    len: n,
+                });
             }
             RoutingResult::HttpForward {
                 backend,
@@ -575,8 +598,8 @@ pub(crate) async fn handle_connection(
                         reusable: keep_open(&state.drain, meta.local_reply_reusable),
                         head: meta.is_head,
                     };
-                    if !send_local_reply(&mut client, &reply, access).await? {
-                        return Ok(());
+                    if !send_local_reply(client, &reply, access).await? {
+                        return Ok(Handoff::Close);
                     }
                     pipelined_tail(&buf[..n])
                 } else {
@@ -584,35 +607,27 @@ pub(crate) async fn handle_connection(
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
                     let backend_addr = backend.socket_addr;
-                    let (ka, leftover) = proxy_http_request(
-                        &mut client,
-                        &mut buf,
-                        n,
-                        backend,
-                        rule,
-                        &meta,
-                        &mut state,
-                    )
-                    .await?;
+                    let (ka, leftover) =
+                        proxy_http_request(client, buf, n, backend, rule, &meta, state).await?;
                     if !meta.is_upgrade {
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
                     crate::access_log::emit(access, state.last_status, Some(backend_addr));
                     if !keep_open(&state.drain, ka && meta.keepalive) {
-                        return Ok(());
+                        return Ok(Handoff::Close);
                     }
                     leftover
                 }
             }
             RoutingResult::LocalReply(mut reply) => {
                 reply.reusable = keep_open(&state.drain, reply.reusable);
-                if !send_local_reply(&mut client, &reply, access).await? {
-                    return Ok(());
+                if !send_local_reply(client, &reply, access).await? {
+                    return Ok(Handoff::Close);
                 }
                 pipelined_tail(&buf[..n])
             }
             RoutingResult::UdpForward { .. } | RoutingResult::CloseConnection => {
-                return Ok(());
+                return Ok(Handoff::Close);
             }
         };
 
@@ -626,7 +641,7 @@ pub(crate) async fn handle_connection(
             buf[..bytes.len()].copy_from_slice(&bytes);
             n = bytes.len();
         } else {
-            n = idle_read(&mut client, &mut buf, &state.drain).await?;
+            n = idle_read(client, buf, &state.drain).await?;
         }
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
@@ -638,13 +653,13 @@ pub(crate) async fn handle_connection(
             }
             match &buf[..n] {
                 // Between requests: as unbounded as the idle wait.
-                [] if skip > 0 => n = idle_read(&mut client, &mut buf, &state.drain).await?,
+                [] if skip > 0 => n = idle_read(client, buf, &state.drain).await?,
                 // Inside an empty line: as bounded as a request head.
                 [b'\r'] => {
                     let rest = client.read(&mut buf[1..]);
                     match tokio::time::timeout(state.client_header_timeout, rest).await {
                         Ok(Ok(read)) if read > 0 => n += read,
-                        _ => return Ok(()),
+                        _ => return Ok(Handoff::Close),
                     }
                 }
                 _ => break,
@@ -654,15 +669,27 @@ pub(crate) async fn handle_connection(
         // (frames held back from a refused upgrade) close it. They must not
         // reach TCP routing, nor wait out the header budget for a 408.
         if n == 0 || !may_open_request(&buf[..n]) {
-            return Ok(());
+            return Ok(Handoff::Close);
         }
         if find_header_end(&buf[..n]).is_none() {
-            n = complete_headers(&mut client, &mut buf, n, state.client_header_timeout).await?;
+            n = complete_headers(client, buf, n, state.client_header_timeout).await?;
         }
         if n == 0 || !is_http_request(&buf[..n]) {
-            return Ok(());
+            return Ok(Handoff::Close);
         }
     }
+}
+
+/// End a connection with one graceful shutdown: close_notify then FIN over
+/// TLS, where strict clients (OpenSSL 3, rustls) read a bare FIN as a
+/// truncation attack. Bounded by `budget`: a client that stopped reading
+/// cannot hold the close. A connection `reset_on_drop` armed keeps its
+/// reset, which a clean close would turn into a complete-looking response.
+async fn close_gracefully(client: &mut Connection, budget: Duration) {
+    if client_socket(client).is_some_and(marked_for_reset) {
+        return;
+    }
+    let _ = tokio::time::timeout(budget, client.shutdown()).await;
 }
 
 /// Relay a connection on a TCP-only port to its route, before the client
@@ -1124,10 +1151,8 @@ async fn proxy_http_request(
     match body_result {
         Ok(BodyEnd::Complete) => {}
         Ok(BodyEnd::Closed) => {
-            // Close-delimited: our clean close is how the client learns the
-            // body ended. Over TLS that takes close_notify, not just a FIN:
-            // strict clients read a bare FIN as a truncation attack.
-            idle_guarded(state.idle_body_timeout, client.shutdown()).await?;
+            // Close-delimited: the connection's graceful close, which
+            // follows, is how the client learns the body ended.
             return Ok((false, None));
         }
         Ok(BodyEnd::Broken) => {
@@ -2102,13 +2127,25 @@ async fn forward_response_body(
 /// complete; a reset is an error for every framing. The h2 bridge's in-memory
 /// pipe has no reset: it relies on the CL or chunked framing to spot the cut.
 fn reset_on_drop(client: &Connection) {
-    let tcp = match client {
-        Connection::Plain { inner } => inner,
-        Connection::Tls { inner } => inner.get_ref().0,
-        Connection::ClientTls { .. } | Connection::Mem { .. } => return,
-    };
-    // Zero linger: close() discards unsent data and resets without blocking.
-    let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
+    if let Some(tcp) = client_socket(client) {
+        // Zero linger: close() discards unsent data and resets without blocking.
+        let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
+    }
+}
+
+/// Whether [`reset_on_drop`] armed `tcp`. Read back from the socket, so
+/// every caller of it, present or future, is covered.
+fn marked_for_reset(tcp: &TcpStream) -> bool {
+    matches!(socket2::SockRef::from(tcp).linger(), Ok(Some(linger)) if linger.is_zero())
+}
+
+/// The client's TCP socket; `None` for the h2 bridge's in-memory pipe.
+fn client_socket(client: &Connection) -> Option<&TcpStream> {
+    match client {
+        Connection::Plain { inner } => Some(inner),
+        Connection::Tls { inner } => Some(inner.get_ref().0),
+        Connection::ClientTls { .. } | Connection::Mem { .. } => None,
+    }
 }
 
 /// Zero means disabled in the config; the streaming loops branch on Option.
@@ -2859,6 +2896,15 @@ mod connection_tests {
     /// A backend nothing should reach: the test holds the listener.
     async fn idle_backend() -> TcpListener {
         TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    /// A backend address that refuses connections. The socket is bound but
+    /// not listening; held, it keeps a parallel test from taking the port.
+    fn refusing_backend() -> (tokio::net::TcpSocket, SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
     }
 
     /// Call once the engine task has finished: any connect it made is
@@ -3838,14 +3884,14 @@ mod connection_tests {
         }
     }
 
-    /// Over TLS only close_notify tells a strict client (OpenSSL 3, rustls)
-    /// that a close-delimited body ended rather than was cut.
-    #[tokio::test]
-    async fn close_delimited_body_over_tls_ends_with_close_notify() {
-        let Some((cert_pem, key_pem)) = crate::proxy::tls::test_util::generate_test_cert("a.test")
-        else {
-            return; // openssl unavailable
-        };
+    type TlsClient = tokio_rustls::client::TlsStream<TcpStream>;
+
+    /// A TLS client connection to the engine serving `rt`, over a real
+    /// socket. `None` when openssl is unavailable.
+    async fn tls_client(
+        rt: RouteTable,
+    ) -> Option<(TlsClient, tokio::task::JoinHandle<Result<()>>)> {
+        let (cert_pem, key_pem) = crate::proxy::tls::test_util::generate_test_cert("a.test")?;
         let cert = crate::config::CertificateRef {
             name: "a".to_string(),
             cert_pem: Some(cert_pem),
@@ -3856,13 +3902,12 @@ mod connection_tests {
             crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
                 .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-        let addr = closing_backend(b"HTTP/1.1 200 OK\r\n\r\nall of it").await;
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front_addr = front.local_addr().unwrap();
         let engine = tokio::spawn(async move {
             let (tcp, peer) = front.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let state = conn_state(routes(addr), true);
+            let state = conn_state(rt, true);
             handle_connection(Connection::Tls { inner: tls }, peer, state).await
         });
 
@@ -3872,20 +3917,99 @@ mod connection_tests {
             .with_no_client_auth();
         let tcp = TcpStream::connect(front_addr).await.unwrap();
         let sni = rustls::pki_types::ServerName::try_from("a.test").unwrap();
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
             .connect(sni, tcp)
             .await
             .unwrap();
-        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
-            .await
-            .unwrap();
+        Some((tls, engine))
+    }
+
+    /// Everything until the engine closes. The read fails when the close
+    /// came without close_notify: a strict client (OpenSSL 3, rustls) reads
+    /// a bare FIN as a truncation attack.
+    async fn tls_read_to_end(tls: &mut TlsClient) -> (std::io::Result<usize>, String) {
         let mut out = Vec::new();
         let read = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out))
             .await
             .expect("engine never closed the connection");
-        let out = String::from_utf8_lossy(&out);
+        (read, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Over TLS only close_notify tells a strict client that a
+    /// close-delimited body ended rather than was cut.
+    #[tokio::test]
+    async fn close_delimited_body_over_tls_ends_with_close_notify() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\n\r\nall of it").await;
+        let Some((mut tls, engine)) = tls_client(routes(addr)).await else {
+            return;
+        };
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (read, out) = tls_read_to_end(&mut tls).await;
         assert!(read.is_ok(), "{read:?} after {out:?}");
         assert!(out.ends_with("Connection: close\r\n\r\nall of it"), "{out}");
+        engine.await.unwrap().unwrap();
+    }
+
+    /// Whatever ends a TLS connection, the close carries close_notify.
+    #[tokio::test]
+    async fn every_tls_close_sends_close_notify() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (_socket, refused) = refusing_backend();
+        for (backend, request, status) in [
+            (
+                addr,
+                "GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n",
+                "200",
+            ),
+            (addr, "GET / HTTP/1.1\r\n\r\n", "400"),
+            (
+                addr,
+                "POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 2\r\n\r\nhi",
+                "404",
+            ),
+            (refused, "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "502"),
+        ] {
+            let Some((mut tls, engine)) = tls_client(routes(backend)).await else {
+                return;
+            };
+            tls.write_all(request.as_bytes()).await.unwrap();
+            let (read, out) = tls_read_to_end(&mut tls).await;
+            assert!(read.is_ok(), "{request:?}: {read:?} after {out:?}");
+            assert!(out.starts_with(&format!("HTTP/1.1 {status} ")), "{out}");
+            let _ = engine.await.unwrap();
+        }
+
+        // The client ends a kept-open connection: its close_notify is answered.
+        let Some((mut tls, engine)) = tls_client(routes(addr)).await else {
+            return;
+        };
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = vec![0u8; REFUSED.len()];
+        tls.read_exact(&mut head).await.unwrap();
+        tls.shutdown().await.unwrap();
+        let (read, out) = tls_read_to_end(&mut tls).await;
+        assert!(read.is_ok(), "{read:?} after {out:?}");
+        engine.await.unwrap().unwrap();
+    }
+
+    /// A body cut short after its head went out must still reset: a clean
+    /// close_notify would pass it off as complete.
+    #[tokio::test]
+    async fn a_truncated_tls_response_still_resets() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial").await;
+        let Some((mut tls, engine)) = tls_client(routes(addr)).await else {
+            return;
+        };
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (read, out) = tls_read_to_end(&mut tls).await;
+        let kind = read.as_ref().map_err(std::io::Error::kind);
+        assert_eq!(kind, Err(std::io::ErrorKind::ConnectionReset), "{out}");
         engine.await.unwrap().unwrap();
     }
 

@@ -96,13 +96,9 @@ fn https_request(
     tls.write_all(request)
         .map_err(|e| format!("write: {}", e))?;
     let mut resp = Vec::new();
-    match tls.read_to_end(&mut resp) {
-        Ok(_) => {}
-        // Close without close_notify after a complete response is fine here;
-        // the framing assertions below still hold.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !resp.is_empty() => {}
-        Err(e) => return Err(format!("read: {}", e)),
-    }
+    // Strict like OpenSSL 3: a close without close_notify fails the read.
+    tls.read_to_end(&mut resp)
+        .map_err(|e| format!("read: {} after {:?}", e, String::from_utf8_lossy(&resp)))?;
     let presented = verifier
         .0
         .lock()
@@ -203,4 +199,32 @@ fn test_sni_without_matching_cert_fails_handshake() {
         https_request(addr, "unknown.example.test", req).is_err(),
         "handshake must fail for SNI with no matching cert"
     );
+}
+
+/// Replies the proxy writes itself close with close_notify too.
+#[test]
+fn test_local_replies_close_with_close_notify() {
+    let Some((cert, key)) = generate_test_cert("a.example.test") else {
+        eprintln!("openssl unavailable; skipping TLS e2e");
+        return;
+    };
+    let backend = TestBackend::spawn("unused");
+    let port = 25084;
+    let _proxy = PortailProcess::spawn_with_tls(
+        &[("cert-a", "a.example.test", &cert, &key)],
+        &[("a.example.test", backend.addr)],
+        port,
+    );
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    for (request, status) in [
+        (
+            &b"GET / HTTP/1.1\r\nHost: nope.example.test\r\nConnection: close\r\n\r\n"[..],
+            404,
+        ),
+        (b"GET / HTTP/1.1\r\n\r\n", 400),
+    ] {
+        let (resp, _) = https_request(addr, "a.example.test", request).expect("https");
+        assert_eq!(extract_status(&resp), Some(status));
+    }
 }
