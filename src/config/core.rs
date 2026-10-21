@@ -235,7 +235,7 @@ impl PortailConfig {
                                 port,
                                 listener_hostname
                             );
-                            route_table.add_http_route_for_listener(
+                            route_table.push_http_route_for_listener(
                                 port,
                                 listener_hostname,
                                 hostname,
@@ -246,6 +246,7 @@ impl PortailConfig {
                 }
             }
         }
+        route_table.sort_http_routes();
 
         self.convert_l4_routes(&mut route_table, &self.tcp_routes, false);
         self.convert_l4_routes(&mut route_table, &self.udp_routes, true);

@@ -16,8 +16,9 @@ impl ListenerScope {
         }
     }
 
-    /// Add a route to this listener scope.
-    fn add_route(&mut self, route_host: &str, mut rule: HttpRouteRule) {
+    /// Append a route to its host entry, unordered: the caller sorts the
+    /// returned entry, or every entry once after a batch.
+    fn push_route(&mut self, route_host: &str, mut rule: HttpRouteRule) -> &mut HostEntry {
         // Pre-compute metadata to avoid per-request work
         rule.has_filters =
             !rule.filters.is_empty() || rule.backends.iter().any(|b| !b.filters.is_empty());
@@ -44,8 +45,7 @@ impl ListenerScope {
                 .catch_all_http_routes
                 .get_or_insert_with(|| Vec::with_capacity(8));
             host_entry.push(rule);
-            RouteTable::sort_rules(host_entry);
-            return;
+            return host_entry;
         }
 
         // Wildcard hosts (*.example.com) are stored by their parent domain
@@ -56,9 +56,15 @@ impl ListenerScope {
         };
 
         let host_entry = map.entry(key).or_insert_with(|| Vec::with_capacity(8));
-
         host_entry.push(rule);
-        RouteTable::sort_rules(host_entry);
+        host_entry
+    }
+
+    fn host_entries_mut(&mut self) -> impl Iterator<Item = &mut HostEntry> {
+        self.http_routes
+            .values_mut()
+            .chain(self.wildcard_http_routes.values_mut())
+            .chain(self.catch_all_http_routes.iter_mut())
     }
 }
 
@@ -120,22 +126,55 @@ impl RouteTable {
         route_host: &str,
         rule: HttpRouteRule,
     ) {
+        let host_entry = self
+            .scope_mut(listener_port, listener_hostname)
+            .push_route(route_host, rule);
+        Self::sort_rules(host_entry);
+    }
+
+    /// [`Self::add_http_route_for_listener`] for a batch: entries stay
+    /// unordered until [`Self::sort_http_routes`] runs once after the last
+    /// push. Sorting per insert made a table build quadratic in rules per host.
+    pub(crate) fn push_http_route_for_listener(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+        route_host: &str,
+        rule: HttpRouteRule,
+    ) {
+        self.scope_mut(listener_port, listener_hostname)
+            .push_route(route_host, rule);
+    }
+
+    /// Order every host entry by match precedence. The sort is stable, so
+    /// equal rules keep their push order.
+    pub(crate) fn sort_http_routes(&mut self) {
+        for scope in self.listener_scopes.values_mut().flatten() {
+            for host_entry in scope.host_entries_mut() {
+                Self::sort_rules(host_entry);
+            }
+        }
+    }
+
+    fn scope_mut(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+    ) -> &mut ListenerScope {
         // Scopes store lowercase hostnames (see ListenerScope::new), so
         // normalize before matching an existing scope.
         let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
         let scopes = self.listener_scopes.entry(listener_port).or_default();
-        let scope = match scopes
-            .iter_mut()
-            .find(|s| s.listener_hostname == normalized)
+        match scopes
+            .iter()
+            .position(|s| s.listener_hostname == normalized)
         {
-            Some(s) => s,
+            Some(i) => &mut scopes[i],
             None => {
                 scopes.push(ListenerScope::new(listener_port, normalized));
                 scopes.last_mut().unwrap()
             }
-        };
-
-        scope.add_route(route_host, rule);
+        }
     }
 
     /// Convenience: add an HTTP route to a default catch-all scope on port 0.
@@ -329,5 +368,61 @@ impl Backend {
                 action: BackendAction::Forward,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every host entry as (path, insertion tag), keyed for comparison.
+    fn entries(table: &RouteTable) -> Vec<(String, Vec<(String, u64)>)> {
+        let mut out = Vec::new();
+        for scope in table.listener_scopes.values().flatten() {
+            let keyed = scope
+                .http_routes
+                .iter()
+                .chain(scope.wildcard_http_routes.iter())
+                .map(|(k, v)| (k.clone(), v))
+                .chain(scope.catch_all_http_routes.iter().map(|v| ("*".into(), v)));
+            for (key, rules) in keyed {
+                let rules = rules
+                    .iter()
+                    .map(|r| (r.path.clone(), r.request_timeout.unwrap().as_secs()))
+                    .collect();
+                out.push((key, rules));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// One sort after the batch gives the order a sort per insert gave,
+    /// ties included.
+    #[test]
+    fn batch_push_then_one_sort_matches_ordered_inserts() {
+        let paths = ["/", "/a", "/a/b", "/b", "/a/b/c", "/c", "/a", "/"];
+        let mut ordered = RouteTable::new();
+        let mut batch = RouteTable::new();
+        for (tag, path) in paths.iter().enumerate() {
+            for host in ["x.example.com", "*.example.com", "*"] {
+                let mut rule = HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    path.to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                rule.request_timeout = Some(Duration::from_secs(tag as u64));
+                ordered.add_http_route_for_listener(80, None, host, rule.clone());
+                batch.push_http_route_for_listener(80, None, host, rule);
+            }
+        }
+        batch.sort_http_routes();
+        let ordered = entries(&ordered);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].1[0], ("/a/b/c".to_string(), 4));
+        assert_eq!(entries(&batch), ordered);
     }
 }
