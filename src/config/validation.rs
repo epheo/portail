@@ -396,7 +396,7 @@ impl L4RouteRule {
         for (i, backend_ref) in self.backend_refs.iter().enumerate() {
             backend_ref
                 .validate()
-                .map_err(|e| anyhow!("Backend ref {}: {}", i, e))?;
+                .map_err(|e| anyhow!("backendRef {}: {}", i, e))?;
         }
 
         Ok(())

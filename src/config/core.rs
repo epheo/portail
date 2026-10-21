@@ -503,7 +503,7 @@ impl PortailConfig {
                 continue;
             }
 
-            // Standard DNS-based resolution — resolve to every A-record (STRICT_DNS):
+            // Standard DNS-based resolution resolves to every A-record (STRICT_DNS):
             // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
             // FQDN to one VIP. The existing weighted selection load-balances across the
             // resulting flat entries.
