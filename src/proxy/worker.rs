@@ -1401,9 +1401,14 @@ async fn forward_response_headers(
 
     // Hop-by-hop response headers never reach the client (RFC 7230 6.1);
     // the proxy owns the client-side Connection header.
+    // The head's own Content-Length, even where no body follows (HEAD, 304).
+    let content_length = match head.body {
+        BodyFraming::Length(n) => Some(n),
+        BodyFraming::Chunked | BodyFraming::Close => None,
+    };
     sanitize_response_headers(
         &header_buf[..resp_header_end],
-        framing.transfer_encoded,
+        content_length,
         client_close || framing.close_delimited(),
         scratch,
     );
@@ -1548,15 +1553,11 @@ fn tee_mirror_chunk(mirror_body: &mut Option<Vec<u8>>, overflow: &mut bool, chun
 /// when to stop reading from the backend, and whether its EOF ends the body or
 /// truncates it.
 struct ResponseFraming {
-    /// Response status code (0 when the status line is unparseable).
     status: u16,
     /// The backend announced it will close this connection (Connection:
     /// close, or an HTTP/1.0 response without keep-alive). Such a conn must
     /// not return to the pool: the next write would fail and burn the retry.
     backend_close: bool,
-    /// The head carries Transfer-Encoding, which overrides Content-Length:
-    /// the sanitizer then drops every Content-Length line.
-    transfer_encoded: bool,
     /// `Some` iff the body is framed by Content-Length.
     content_length: Option<usize>,
     no_body: bool,
@@ -1673,7 +1674,6 @@ fn frame_response(
     let mut framing = ResponseFraming {
         status,
         backend_close: parsed.backend_close,
-        transfer_encoded: parsed.body == BodyFraming::Chunked,
         content_length: None,
         no_body,
         body_bytes_already_forwarded: 0,
@@ -2810,9 +2810,10 @@ mod connection_tests {
         }
 
         // Repeated lines agreeing on one value frame by it, and reach the
-        // client as one: some clients (llhttp) refuse any repeat.
+        // client as one canonical line: some clients (llhttp) refuse any
+        // repeat.
         let addr = closing_backend(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: 1\r\ncontent-length: 05\r\n\r\nhello",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 05\r\nX-A: 1\r\nContent-Length: 5\r\n\r\nhello",
         )
         .await;
         let (mut client, _task) = serve(routes(addr));
@@ -3145,7 +3146,6 @@ mod tests {
         ResponseFraming {
             status: 200,
             backend_close: false,
-            transfer_encoded: chunked,
             content_length,
             no_body: false,
             body_bytes_already_forwarded: 0,
@@ -3201,7 +3201,6 @@ mod tests {
         let framing = frame_response(parsed, head, head.len(), false, false);
         assert!(framing.chunked.is_some());
         assert_eq!(framing.content_length, None);
-        assert!(framing.transfer_encoded);
     }
 
     fn head_framing(fields: &str) -> Option<BodyFraming> {
