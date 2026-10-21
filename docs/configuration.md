@@ -140,7 +140,9 @@ Listener rate limits apply to routes bound to that listener via
 listener scoping and are never limited. Policy edits keep per-client state:
 a throttled crawler stays throttled across a rate change. Observability:
 `portail_rate_limited_total`, `portail_listener_rate_limited_total`, and
-`status: 429` access-log lines.
+`status: 429` access-log lines. A limited request counts there only:
+`portail_http_requests_total` and `portail_listener_http_requests_total`
+count requests dispatched to a backend.
 
 ## Route Attachment
 

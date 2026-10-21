@@ -671,10 +671,6 @@ async fn serve_http(
                 rule,
                 meta,
             } => {
-                // Per-vhost sample (rule carries its route hostname's registry
-                // slot) + the per-listener aggregate.
-                rule.requests.fetch_add(1, Ordering::Relaxed);
-                state.listener_stats.http_requests.inc();
                 let limited = rule
                     .limiter
                     .as_ref()
@@ -695,6 +691,11 @@ async fn serve_http(
                     }
                     pipelined_tail(&buf[..n])
                 } else {
+                    // After the limiter: a 429 is no dispatch. Per-vhost sample
+                    // (the rule carries its route hostname's registry slot) +
+                    // the per-listener aggregate.
+                    rule.requests.fetch_add(1, Ordering::Relaxed);
+                    state.listener_stats.http_requests.inc();
                     // proxy_http_request owns all timing for the request lifecycle —
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
@@ -4074,6 +4075,55 @@ mod connection_tests {
         assert!(!first.contains("Connection: close"), "{out}");
         assert!(second.ends_with("no"), "{out}");
         assert!(delivered(&mut rx).await.starts_with("GET /second "));
+    }
+
+    /// The request counters count dispatches to a backend: a 429 counts
+    /// only as limited.
+    #[tokio::test]
+    async fn a_limited_request_counts_only_as_limited() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let rule = |limiter| {
+            let mut rule = HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![Backend {
+                    socket_addr: addr,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
+                }],
+            );
+            rule.limiter = limiter;
+            rule
+        };
+        let mut rt = RouteTable::new();
+        // An empty bucket that never refills: every request is limited.
+        let empty = crate::rate_limit::limiter_for(0, "limited-count-test", 0, 0);
+        rt.add_http_route("limited.count.test", rule(Some(empty)));
+        rt.add_http_route("free.count.test", rule(None));
+        let state = conn_state(rt, false);
+        let stats = Arc::clone(&state.listener_stats);
+        let (mut client, _task) = serve_state(state);
+        let out = exchange(
+            &mut client,
+            b"GET / HTTP/1.1\r\nHost: limited.count.test\r\n\r\nGET / HTTP/1.1\r\nHost: free.count.test\r\n\r\n",
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("no"), "{out}");
+        assert_eq!(stats.rate_limited.get(), 1);
+        assert_eq!(stats.http_requests.get(), 1);
+        let host_count = |host| crate::metrics::host_requests_counter(host).load(Ordering::Relaxed);
+        assert_eq!(host_count("limited.count.test"), 0);
+        assert_eq!(host_count("free.count.test"), 1);
     }
 
     #[tokio::test]
