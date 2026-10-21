@@ -1,8 +1,12 @@
 name: Release
 
+# A push to main publishes the :main image only. A release is a vX.Y.Z tag
+# on a commit whose versions already say X.Y.Z (scripts/release.sh); CI
+# never commits to main.
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
 
 env:
   REGISTRY: ghcr.io
@@ -17,8 +21,8 @@ jobs:
     name: Gateway API Conformance
     uses: ./.github/workflows/conformance.yml
 
-  release:
-    name: Release
+  publish:
+    name: Publish
     needs: [check, conformance]
     runs-on: ubuntu-latest
     permissions:
@@ -26,54 +30,39 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Determine next version
-        id: version
+      - name: Image tags
+        id: tags
         run: |
-          LATEST=$(git tag -l 'v*.*.*' | sort -V | tail -1)
-          if [ -z "$LATEST" ]; then
-            NEXT="v0.1.3"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "${{ github.ref_type }}" = tag ]; then
+            TAG="${{ github.ref_name }}"
+            BARE="${TAG#v}"
+            # The tag must name the version the binary and the conformance
+            # report already carry, or `portail --version` would disagree
+            # with the image.
+            CARGO=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+            CONFORMANCE=$(sed -n 's/.*portailVersion *= *"\(v[^"]*\)".*/\1/p' conformance/conformance_test.go)
+            if [ "$CARGO" != "$BARE" ] || [ "$CONFORMANCE" != "$TAG" ]; then
+              echo "::error::tag $TAG but Cargo.toml says $CARGO and conformance says $CONFORMANCE; run scripts/release.sh $BARE first"
+              exit 1
+            fi
+            {
+              echo "release=$TAG"
+              echo "list<<EOF"
+              echo "$IMAGE:$BARE"
+              echo "$IMAGE:${BARE%.*}"
+              echo "$IMAGE:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           else
-            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
-            NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            {
+              echo "list<<EOF"
+              echo "$IMAGE:main"
+              echo "$IMAGE:sha-${{ github.sha }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           fi
-          BARE="${NEXT#v}"
-          MINOR="${BARE%.*}"
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "version_bare=$BARE" >> "$GITHUB_OUTPUT"
-          echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
-          echo "Next release: $NEXT (bare: $BARE, minor: $MINOR)"
-
-      # Keep the in-tree versions matching the tag so `portail --version` and
-      # the conformance report agree with the published image. The bump commit
-      # is what gets tagged and built; GITHUB_TOKEN pushes do not retrigger
-      # workflows, so this cannot loop.
-      - name: Sync versions with tag
-        run: |
-          BARE="${{ steps.version.outputs.version_bare }}"
-          NEXT="${{ steps.version.outputs.version }}"
-          sed -i "s/^version = \".*\"/version = \"${BARE}\"/" Cargo.toml
-          sed -i "/^name = \"portail\"$/{n;s/^version = \".*\"/version = \"${BARE}\"/}" Cargo.lock
-          sed -i "s/\(portailVersion *= *\)\"v[^\"]*\"/\1\"${NEXT}\"/" conformance/conformance_test.go
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.toml Cargo.lock conformance/conformance_test.go
-            git commit -m "Release ${NEXT}"
-            git push origin main
-          fi
-
-      - name: Create tag and GitHub Release
-        run: |
-          git tag ${{ steps.version.outputs.version }}
-          git push origin ${{ steps.version.outputs.version }}
-          gh release create ${{ steps.version.outputs.version }} \
-            --title "${{ steps.version.outputs.version }}" \
-            --generate-notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -91,11 +80,12 @@ jobs:
           context: .
           file: Containerfile
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version_bare }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.minor }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: GitHub Release
+        if: steps.tags.outputs.release != ''
+        run: gh release create "${{ steps.tags.outputs.release }}" --title "${{ steps.tags.outputs.release }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
