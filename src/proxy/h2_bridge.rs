@@ -334,19 +334,10 @@ async fn forward_response(
         }
     };
 
-    // The engine framed its output by this same reading.
+    // The engine framed its output by this same reading, which admits no
+    // transfer coding but the chunked framing removed here: h2 carries none.
     let head = worker::parse_response_head(&acc[..header_end])
         .ok_or_else(|| anyhow!("engine sent a malformed response head"))?;
-    // h2 has no transfer codings (RFC 9113 8.2.2): a body still coded once
-    // de-chunked would reach the client as bytes nothing declares.
-    if head.other_codings {
-        debug!("Refusing a transfer-coded response on h2");
-        let resp = http::Response::builder().status(502).body(()).unwrap();
-        respond
-            .send_response(resp, true)
-            .map_err(|e| anyhow!("h2 send_response: {}", e))?;
-        return Ok(());
-    }
     let status = head.status;
     let (chunked, content_length) = match head.body {
         BodyFraming::Chunked => (true, None),

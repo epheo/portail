@@ -439,7 +439,8 @@ async fn test_h2_chunked_response_with_content_length_is_clean() {
 }
 
 /// h2 has no transfer codings: a body still coded once the chunked framing
-/// is removed would reach the client as bytes nothing declares.
+/// is removed would reach the client as bytes nothing declares. The engine
+/// refuses such a head for every client, and the bridge relays its 502.
 #[tokio::test]
 async fn test_h2_other_transfer_codings_get_502() {
     for (offset, te, body) in [

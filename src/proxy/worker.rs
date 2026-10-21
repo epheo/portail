@@ -1664,7 +1664,7 @@ fn frame_response(
     let mut framing = ResponseFraming {
         status,
         backend_close: parsed.backend_close,
-        transfer_encoded: parsed.transfer_encoded,
+        transfer_encoded: parsed.body == BodyFraming::Chunked,
         content_length: None,
         no_body,
         body_bytes_already_forwarded: 0,
@@ -2677,50 +2677,52 @@ mod connection_tests {
         );
     }
 
-    /// Codings before the final chunked do not change the framing, and the
-    /// Content-Length beside them neither ends the body nor reaches the client.
+    /// The Content-Length beside chunked neither ends the body nor reaches
+    /// the client.
     #[tokio::test]
-    async fn final_chunked_coding_frames_the_response() {
-        for te in [
-            "Transfer-Encoding: gzip, chunked\r\n",
-            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
-        ] {
-            let reply =
-                format!("HTTP/1.1 200 OK\r\n{te}Content-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
-            let (addr, _rx) = backend(reply.as_bytes()).await;
-            let (mut client, _task) = serve(routes(addr));
-            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
-            assert_eq!(
-                out,
-                format!("HTTP/1.1 200 OK\r\n{te}\r\n5\r\nhello\r\n0\r\n\r\n"),
-                "{te}"
-            );
-        }
+    async fn chunked_frames_the_response_over_content_length() {
+        let (addr, _rx) = backend(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked \r\nContent-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked \r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        );
     }
 
-    /// No final chunked: only the backend's close ends the body, so the
-    /// client connection closes after it and says so.
+    /// For h1 and h2 clients alike, and whether a body follows or not: the
+    /// h2 bridge, which cannot carry a coding, relays this 502.
     #[tokio::test]
-    async fn other_transfer_codings_are_read_to_the_backend_close() {
-        for te in [
-            "Transfer-Encoding: identity\r\n",
-            "Transfer-Encoding: chunked, gzip\r\n",
-            "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
+    async fn any_transfer_encoding_but_one_chunked_gets_a_502() {
+        let get = &b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n"[..];
+        let head = &b"HEAD / HTTP/1.1\r\nHost: a.test\r\n\r\n"[..];
+        for (te, request) in [
+            ("Transfer-Encoding: gzip, chunked\r\n", get),
+            (
+                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+                get,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+                get,
+            ),
+            ("Transfer-Encoding: identity\r\n", get),
+            ("Transfer-Encoding: ,chunked\r\n", get),
+            ("Transfer-Encoding: \r\n", get),
+            ("Transfer-Encoding: gzip\r\n", head),
         ] {
-            let reply = format!("HTTP/1.1 200 OK\r\n{te}Content-Length: 2\r\n\r\nhello");
+            let reply = format!("HTTP/1.1 200 OK\r\n{te}\r\n5\r\nhello\r\n0\r\n\r\n");
             let addr = closing_backend(reply.as_bytes()).await;
-            let (mut client, task) = serve(routes(addr));
-            client
-                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET /2 HTTP/1.1\r\nHost: a.test\r\n\r\n")
-                .await
-                .unwrap();
-            let out = read_until_closed(&mut client).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, request).await;
             assert_eq!(
                 out,
-                format!("HTTP/1.1 200 OK\r\n{te}Connection: close\r\n\r\nhello"),
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway",
                 "{te}"
             );
-            task.await.unwrap().unwrap();
         }
     }
 
@@ -2907,11 +2909,10 @@ mod connection_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyFraming {
     Length(usize),
-    /// The final transfer coding is chunked; codings before it do not
-    /// change where the body ends.
+    /// `Transfer-Encoding: chunked`, the one coding a response may carry.
     Chunked,
-    /// Ends at the backend's close: neither header, or a Transfer-Encoding
-    /// whose final coding is not chunked.
+    /// Ends at the backend's close: neither Transfer-Encoding nor
+    /// Content-Length.
     Close,
 }
 
@@ -2921,13 +2922,9 @@ pub(crate) enum BodyFraming {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResponseHead {
     pub(crate) status: u16,
+    /// Chunked overrides a Content-Length, which must then not be
+    /// forwarded either.
     pub(crate) body: BodyFraming,
-    /// Any Transfer-Encoding overrides Content-Length, which must then not
-    /// be forwarded either.
-    pub(crate) transfer_encoded: bool,
-    /// A transfer coding besides one lone chunked: the body stays coded
-    /// once de-chunked, which only HTTP/1.1 can declare.
-    pub(crate) other_codings: bool,
     /// An explicit Connection: close, or HTTP/1.0 without keep-alive.
     pub(crate) backend_close: bool,
 }
@@ -2935,14 +2932,15 @@ pub(crate) struct ResponseHead {
 /// `None` when a recipient could frame the head differently than this
 /// reading: a status line other than `HTTP/1.x SP 3DIGIT [SP reason]`, a
 /// Content-Length other than one `1*DIGIT` value (repeated lines must
-/// agree), Transfer-Encoding on HTTP/1.0, or a line a client could split or
-/// name otherwise (bare CR, no colon, a field name that is no token, which
-/// covers obs-fold). Lines are split exactly as the sanitizer splits them.
+/// agree), a Transfer-Encoding other than one `chunked` line or on HTTP/1.0,
+/// or a line a client could split or name otherwise (bare CR, no colon, a
+/// field name that is no token, which covers obs-fold). Lines are split
+/// exactly as the sanitizer splits them.
 pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
     let mut lines = header_lines(head);
     let (status, is_http10) = parse_status_line(lines.next()?)?;
     let mut content_length: Option<usize> = None;
-    let (mut transfer_encoded, mut chunked_last, mut codings) = (false, false, 0u32);
+    let mut chunked = false;
     let (mut close, mut keep_alive) = (false, false);
 
     for line in lines {
@@ -2961,13 +2959,12 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
             }
             content_length = Some(n);
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            transfer_encoded = true;
-            for coding in value.split(|&b| b == b',').map(trim_ows) {
-                if !coding.is_empty() {
-                    codings += 1;
-                    chunked_last = coding.eq_ignore_ascii_case(b"chunked");
-                }
+            // The request parser's rule: a coding, list or repeat is where
+            // readers disagree on the body's end, and h2 carries none.
+            if chunked || !trim_ows(value).eq_ignore_ascii_case(b"chunked") {
+                return None;
             }
+            chunked = true;
         } else if name.eq_ignore_ascii_case(b"connection") {
             for token in value.split(|&b| b == b',').map(trim_ows) {
                 close |= token.eq_ignore_ascii_case(b"close");
@@ -2978,19 +2975,17 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
 
     // RFC 9112 6.1: HTTP/1.0 has no transfer codings, so its framing is
     // faulty whatever the rest of the head says.
-    if transfer_encoded && is_http10 {
+    if chunked && is_http10 {
         return None;
     }
-    let body = match (transfer_encoded, content_length) {
-        (true, _) if chunked_last => BodyFraming::Chunked,
-        (true, _) | (false, None) => BodyFraming::Close,
+    let body = match (chunked, content_length) {
+        (true, _) => BodyFraming::Chunked,
         (false, Some(n)) => BodyFraming::Length(n),
+        (false, None) => BodyFraming::Close,
     };
     Some(ResponseHead {
         status,
         body,
-        transfer_encoded,
-        other_codings: transfer_encoded && !(codings == 1 && chunked_last),
         backend_close: close || (is_http10 && !keep_alive),
     })
 }
@@ -3180,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn response_framing_follows_the_final_transfer_coding() {
+    fn response_framing_is_chunked_a_length_or_the_close() {
         use BodyFraming::{Chunked, Close, Length};
         for (fields, want) in [
             ("Content-Length: 5\r\n", Length(5)),
@@ -3188,29 +3183,33 @@ mod tests {
             ("Content-Length: 007\r\n", Length(7)),
             ("", Close),
             ("Transfer-Encoding: chunked\r\n", Chunked),
+            ("Transfer-Encoding: \tChunked \r\n", Chunked),
             (
                 "Transfer-Encoding: CHUNKED\r\nContent-Length: 9\r\n",
                 Chunked,
             ),
-            ("Transfer-Encoding: gzip, chunked\r\n", Chunked),
-            (
-                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
-                Chunked,
-            ),
-            ("Transfer-Encoding: chunked, \r\n", Chunked),
-            ("Transfer-Encoding: chunked, gzip\r\n", Close),
-            (
-                "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
-                Close,
-            ),
-            (
-                "Transfer-Encoding: identity\r\nContent-Length: 5\r\n",
-                Close,
-            ),
-            ("Transfer-Encoding: chunked;x=1\r\n", Close),
-            ("Transfer-Encoding: \r\nContent-Length: 5\r\n", Close),
         ] {
             assert_eq!(head_framing(fields), Some(want), "{fields:?}");
+        }
+    }
+
+    /// The request parser's rule: one line, its value `chunked`. Codings,
+    /// lists and repeats are where readers disagree on where a body ends.
+    #[test]
+    fn transfer_encoding_is_one_chunked_or_malformed() {
+        for fields in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked, chunked\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Transfer-Encoding: identity\r\nContent-Length: 5\r\n",
+            "Transfer-Encoding: chunked;x=1\r\n",
+            "Transfer-Encoding: ,chunked\r\n",
+            "Transfer-Encoding: chunked, \r\n",
+            "Transfer-Encoding: \r\nContent-Length: 5\r\n",
+        ] {
+            assert_eq!(head_framing(fields), None, "{fields:?}");
         }
     }
 
@@ -3247,33 +3246,6 @@ mod tests {
         let head = b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(parse_response_head(head), None);
         assert_eq!(parse_response_head(b"HTTP/1.1 200 OK\rX\r\n\r\n"), None);
-    }
-
-    /// The h2 bridge refuses what this flags: it can only remove chunked.
-    #[test]
-    fn only_a_lone_chunked_leaves_the_body_uncoded() {
-        let coded = |fields: &str| {
-            parse_response_head(format!("HTTP/1.1 200 OK\r\n{fields}\r\n").as_bytes())
-                .unwrap()
-                .other_codings
-        };
-        for fields in [
-            "Content-Length: 5\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "Transfer-Encoding: Chunked, \r\n",
-        ] {
-            assert!(!coded(fields), "{fields:?}");
-        }
-        for fields in [
-            "Transfer-Encoding: gzip, chunked\r\n",
-            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
-            "Transfer-Encoding: identity\r\n",
-            "Transfer-Encoding: chunked, gzip\r\n",
-            "Transfer-Encoding: chunked, chunked\r\n",
-            "Transfer-Encoding: \r\n",
-        ] {
-            assert!(coded(fields), "{fields:?}");
-        }
     }
 
     #[test]
