@@ -186,6 +186,9 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 - The fd limit is read after startup raises the soft limit to the hard one.
 - The default scales with it, as Kubernetes mode cannot set this option.
 - A fixed default would cut off UDP workloads larger than it.
+- The shared budget lets a flood on one UDP listener take every session slot.
+- Set `udpMaxSessions` to isolate listeners: each gets that many slots of its own.
+- Their caps then add up: keep the sum within a quarter of the fd limit.
 
 ## HTTP/2
 
