@@ -141,6 +141,26 @@ a throttled crawler stays throttled across a rate change. Observability:
 `portail_rate_limited_total`, `portail_listener_rate_limited_total`, and
 `status: 429` access-log lines.
 
+## Route Attachment
+
+A route is served on exactly the listeners its status attaches it to.
+
+Kubernetes mode:
+
+- A parentRef attaches to the listeners it selects (by `sectionName`, `port`, or all) that admit the route: `allowedRoutes` namespaces and kinds, hostname intersection, and a protocol portail serves.
+- A parentRef without `namespace` names a Gateway in the route's own namespace.
+- Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by namespace/name.
+- A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
+- TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.
+- An invalid backendRef (`RefNotPermitted`, `BackendNotFound`, `InvalidKind`) keeps its weight. Its share of HTTP requests gets `500`; its share of TCP and TLS passthrough connections is closed, of UDP datagrams dropped.
+
+Standalone mode:
+
+- A parentRef without `sectionName` or `port` selects every listener, for TCP and UDP routes too.
+- A TCP route can also attach to a TLS listener, as the fallback for passthrough connections no TLS route matches.
+- Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
+- TCP and UDP routes use their first rule only.
+
 ## Performance Options
 
 The `performance` block of a config file (all durations accept `"30s"`-style
