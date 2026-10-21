@@ -623,9 +623,10 @@ pub struct PerformanceConfig {
     /// keepalive requests. Defaults to 30s — the same order as nginx
     /// `client_header_timeout` (60s) and typical haproxy
     /// `timeout http-request` settings (5–30s).
-    /// Also bounds each connection's close: the TLS close_notify and, after
-    /// a reply the proxy wrote itself, the wait for the client to finish
-    /// sending.
+    /// Also bounds each connection's close: the TLS close_notify, and the
+    /// read-off of what a client still sends after a closing reply. That
+    /// read also ends once the client sends nothing new for
+    /// [`crate::proxy::worker::LINGER_IDLE`].
     #[serde(default = "default_client_header_timeout", with = "human_duration")]
     pub client_header_timeout: Duration,
 

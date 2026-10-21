@@ -165,7 +165,8 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 - The header budget starts at a request's first bytes.
 - Idle keepalive waits stay unbounded.
 - It also bounds each connection's close, TLS close_notify included.
-- After a reply the proxy wrote itself, it bounds the wait for the client to finish sending.
+- A closing reply reads off what the client still sends, for up to `clientHeaderTimeout`.
+- That read stops after 5s with nothing new from the client.
 
 `idleBodyTimeout`:
 
