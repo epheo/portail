@@ -133,7 +133,7 @@ values; defaults shown):
 |--------|---------|-------------|
 | `backendTimeout` | `30s` | Backend connect timeout |
 | `clientHeaderTimeout` | `30s` | Max time for a client TLS handshake, or to finish a request's header block once its first bytes arrive (slow-loris guard). Does not bound idle keepalive waits |
-| `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming; reaps peers that stay connected but stop transferring. `0s` disables |
+| `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming, and on an L4 relay once one direction has closed; reaps peers that stay connected but stop transferring. `0s` disables |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
 | `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4 | Concurrent UDP sessions per listener socket; a datagram that would open one more is dropped and counted in `portail_udp_session_overflow_drops_total`. Each session holds an fd (plus a task, a 64KiB reply buffer and an ephemeral port), and spoofed source addresses cost nothing to send from. Unset, each listener may use a quarter of the fd budget, read after startup raises the soft limit to the hard one, leaving the rest for TCP. A fixed default would cut off UDP workloads larger than it, and Kubernetes mode cannot override it |

@@ -7,7 +7,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -529,6 +529,7 @@ pub(crate) async fn handle_connection(
                     Arc::clone(&state.health),
                     state.connect_timeout,
                     &state.backend_keepalive,
+                    state.idle_body_timeout,
                     "TCP",
                 )
                 .await;
@@ -664,6 +665,7 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
         Arc::clone(&state.health),
         state.connect_timeout,
         &state.backend_keepalive,
+        state.idle_body_timeout,
         "TCP",
     )
     .await
@@ -2165,18 +2167,20 @@ async fn handle_tls_passthrough(
         health,
         cfg.connect_timeout,
         &tcp_keepalive(cfg.tcp_keepalive_time),
+        idle_opt(cfg.idle_body_timeout),
         "TLS passthrough",
     )
     .await
 }
 
 async fn handle_tcp_connection(
-    mut client: Connection,
+    client: Connection,
     backend_addr: SocketAddr,
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
     keepalive: &socket2::TcpKeepalive,
+    idle: Option<Duration>,
     ctx: &'static str,
 ) -> Result<()> {
     let mut backend = match connect_tcp(backend_addr, connect_timeout, keepalive).await {
@@ -2202,10 +2206,95 @@ async fn handle_tcp_connection(
     if !initial_data.is_empty() {
         backend.write_all(initial_data).await?;
     }
-    // Errors from copy_bidirectional are expected when either side closes;
-    // don't propagate — the data transfer is best-effort once started.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    relay_l4(client, backend, idle).await;
     Ok(())
+}
+
+/// Per-direction copy buffer of the L4 relay: the 8 KiB each side got from
+/// `tokio::io::copy_bidirectional`, which it replaces.
+const L4_COPY_BUF: usize = 8 * 1024;
+
+/// Copy both ways until both directions end. While both are open the relay
+/// is unbounded, like any idle TCP session; once one side has finished, the
+/// other must make progress within `idle` (None: unbounded), or a peer that
+/// never closes would pin the task and both fds forever. Errors on either
+/// side end both: the transfer is best-effort once started.
+async fn relay_l4<A, B>(a: A, b: B, idle: Option<Duration>)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut a_rd, mut a_wr) = tokio::io::split(a);
+    let (mut b_rd, mut b_wr) = tokio::io::split(b);
+    let start = tokio::time::Instant::now();
+    let progress = AtomicU64::new(0);
+    let a_to_b = pump(&mut a_rd, &mut b_wr, start, &progress);
+    let b_to_a = pump(&mut b_rd, &mut a_wr, start, &progress);
+    tokio::pin!(a_to_b, b_to_a);
+    let a_done = tokio::select! {
+        done = &mut a_to_b => if done.is_ok() { true } else { return },
+        done = &mut b_to_a => if done.is_ok() { false } else { return },
+    };
+    if a_done {
+        finish_half(b_to_a, idle, start, &progress).await;
+    } else {
+        finish_half(a_to_b, idle, start, &progress).await;
+    }
+}
+
+/// Drive the direction still open until it ends, or until `idle` passes
+/// without progress.
+async fn finish_half<F: std::future::Future>(
+    mut half: std::pin::Pin<&mut F>,
+    idle: Option<Duration>,
+    start: tokio::time::Instant,
+    progress: &AtomicU64,
+) {
+    let Some(idle) = idle else {
+        half.await;
+        return;
+    };
+    let stalled_at = || start + Duration::from_nanos(progress.load(Ordering::Relaxed)) + idle;
+    loop {
+        if tokio::time::timeout_at(stalled_at(), half.as_mut())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Progress made while waiting pushed the deadline out.
+        if stalled_at() <= tokio::time::Instant::now() {
+            return;
+        }
+    }
+}
+
+/// One direction of an L4 relay: copy until EOF, then pass the half-close
+/// on. Every completed step stamps `progress` (nanos since `start`), the
+/// clock `finish_half` reads.
+async fn pump<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    start: tokio::time::Instant,
+    progress: &AtomicU64,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let stamp = || progress.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let mut buf = vec![0u8; L4_COPY_BUF];
+    loop {
+        let n = rd.read(&mut buf).await?;
+        stamp();
+        if n == 0 {
+            return wr.shutdown().await;
+        }
+        wr.write_all(&buf[..n]).await?;
+        // TLS holds written records until flushed.
+        wr.flush().await?;
+        stamp();
+    }
 }
 
 /// Answer a request the proxy handles itself (redirect, 404, 429, 500, 503)
@@ -3236,6 +3325,96 @@ mod connection_tests {
             let out = exchange(&mut client, rest.as_bytes()).await;
             assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{first:?}: {out}");
         }
+    }
+
+    /// A TCP backend running `serve` on each connection.
+    async fn l4_backend<F, Fut>(serve: F) -> SocketAddr
+    where
+        F: Fn(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(serve(sock));
+            }
+        });
+        addr
+    }
+
+    /// The engine on a TCP-only port relaying to `backend`.
+    fn serve_l4(
+        backend: SocketAddr,
+        idle: Option<Duration>,
+    ) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        let mut state = conn_state(tcp_route(backend), false);
+        state.idle_body_timeout = idle;
+        serve_state(state)
+    }
+
+    const IDLE: Duration = Duration::from_millis(200);
+
+    /// Once one side has finished, a peer that never closes pinned the
+    /// relay, its task and both fds forever.
+    #[tokio::test]
+    async fn half_closed_l4_relay_ends_after_the_idle_budget() {
+        // The client is done; the backend never answers nor closes.
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task) = serve_l4(silent, Some(IDLE));
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "relay pinned after the client's FIN");
+
+        // The backend is done; the client never closes.
+        let done = l4_backend(|mut sock| async move {
+            let _ = sock.write_all(b"bye").await;
+            let _ = sock.shutdown().await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task) = serve_l4(done, Some(IDLE));
+        client.read_exact(&mut [0u8; 3]).await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "relay pinned after the backend's FIN");
+    }
+
+    /// The bound is on a stalled half, not on how long it runs; with both
+    /// sides open, or the budget disabled, the relay stays unbounded.
+    #[tokio::test]
+    async fn l4_relay_bounds_only_a_stalled_half() {
+        let trickle = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            for _ in 0..5 {
+                tokio::time::sleep(IDLE / 2).await;
+                if sock.write_all(b"x").await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        let (mut client, _task) = serve_l4(trickle, Some(IDLE));
+        assert_eq!(exchange(&mut client, b"GO").await, "xxxxx");
+
+        let (mut client, task) = serve_l4(banner_backend(b"").await, Some(IDLE));
+        tokio::time::sleep(IDLE * 3).await;
+        assert!(!task.is_finished(), "relay cut with both sides open");
+        assert_eq!(exchange(&mut client, b"ping").await, "ping");
+
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task) = serve_l4(silent, None);
+        client.shutdown().await.unwrap();
+        tokio::time::sleep(IDLE * 3).await;
+        assert!(!task.is_finished(), "relay cut with the budget disabled");
     }
 
     /// Bytes no method can open still close at once, not after the header
