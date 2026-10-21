@@ -1344,37 +1344,39 @@ mod tests {
 
     /// A listener whose port cannot be bound is not Programmed. It used to
     /// report Programmed=True from the spec alone.
-    #[tokio::test]
-    async fn unbound_listener_is_not_programmed() {
-        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let api = MockApi::default();
-        let mut cluster = TestCluster::default();
-        let mut gw = testkit::gateway("gw", 1);
-        gw.spec.listeners[0].port = held.local_addr().unwrap().port().into();
-        apply(&mut cluster.gateways, gw.clone());
-        let ctx = cluster.ctx(api.client());
+    #[test]
+    fn unbound_listener_is_not_programmed() {
+        alone("unbound_listener_is_not_programmed", async {
+            let held = std::net::TcpListener::bind(("0.0.0.0", free_port())).unwrap();
+            let api = MockApi::default();
+            let mut cluster = TestCluster::default();
+            let mut gw = testkit::gateway("gw", 1);
+            gw.spec.listeners[0].port = held.local_addr().unwrap().port().into();
+            apply(&mut cluster.gateways, gw.clone());
+            let ctx = cluster.ctx(api.client());
 
-        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
-        let patch = api.status_patch("gateways", "gw").unwrap();
-        let programmed = &listener_conditions(&patch)["Programmed"];
-        assert_eq!(programmed["status"], "False", "{programmed}");
-        assert_eq!(programmed["reason"], "Pending");
-        assert!(
-            programmed["message"]
-                .as_str()
-                .unwrap()
-                .contains("not bound"),
-            "{programmed}"
-        );
+            reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+            let patch = api.status_patch("gateways", "gw").unwrap();
+            let programmed = &listener_conditions(&patch)["Programmed"];
+            assert_eq!(programmed["status"], "False", "{programmed}");
+            assert_eq!(programmed["reason"], "Pending");
+            assert!(
+                programmed["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not bound"),
+                "{programmed}"
+            );
 
-        // Once the port frees up, the bind retry programs it.
-        drop(held);
-        let gw = testkit::with_gateway_status(gw, &patch);
-        apply(&mut cluster.gateways, gw.clone());
-        api.clear();
-        reconcile(Arc::new(gw), ctx).await.unwrap();
-        let patch = api.status_patch("gateways", "gw").unwrap();
-        assert_eq!(listener_conditions(&patch)["Programmed"]["status"], "True");
+            // Once the port frees up, the bind retry programs it.
+            drop(held);
+            let gw = testkit::with_gateway_status(gw, &patch);
+            apply(&mut cluster.gateways, gw.clone());
+            api.clear();
+            reconcile(Arc::new(gw), ctx).await.unwrap();
+            let patch = api.status_patch("gateways", "gw").unwrap();
+            assert_eq!(listener_conditions(&patch)["Programmed"]["status"], "True");
+        });
     }
 
     /// This host's first IPv4 address off loopback: one a Gateway can name.
