@@ -215,7 +215,9 @@ impl TestCluster {
             last_applied: Arc::new(std::sync::Mutex::new(None)),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            named_ports: Default::default(),
+            named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(
+                std::time::Duration::from_secs(super::RESYNC_SECS),
+            )),
             pending_watches: Arc::new(super::PendingWatches::new(
                 std::time::Instant::now() + std::time::Duration::from_secs(super::RESYNC_SECS),
             )),

@@ -14,6 +14,7 @@ use kube::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use super::converters::backend_dns_name;
 use crate::config::{HttpRouteFilter, PortailConfig};
@@ -47,21 +48,32 @@ pub(crate) struct NamedTargetPortReq {
 }
 
 /// The port numbers a Service's EndpointSlices publish, by port name, read
-/// once per Service version and DNS epoch.
-#[derive(Default)]
+/// once per Service version and DNS epoch, and again once `ttl` has passed.
 pub(crate) struct NamedPortCache {
     /// Bumped on every DNS refresh swap; an entry from an older epoch is stale.
     epoch: AtomicU64,
+    /// With DNS refresh off no epoch moves: a read taken while the Service
+    /// had no pods would otherwise stand for good.
+    ttl: Duration,
     entries: Mutex<HashMap<(String, String), CachedPorts>>,
 }
 
 struct CachedPorts {
     service_version: Option<String>,
     epoch: u64,
+    read_at: tokio::time::Instant,
     ports: HashMap<String, u16>,
 }
 
 impl NamedPortCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// DNS refresh saw the resolved backends change: pods came or went, and
     /// a named port's number lives on the pods. Returns whether anything was
     /// cached, so whether a re-read is worth a reconcile.
@@ -77,7 +89,11 @@ impl NamedPortCache {
         let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries
             .get(&(req.ns.clone(), req.svc.clone()))
-            .filter(|c| c.epoch == epoch && c.service_version == req.service_version)
+            .filter(|c| {
+                c.epoch == epoch
+                    && c.service_version == req.service_version
+                    && c.read_at.elapsed() < self.ttl
+            })
             .map(|c| c.ports.clone())
     }
 
@@ -88,6 +104,7 @@ impl NamedPortCache {
             CachedPorts {
                 service_version: req.service_version.clone(),
                 epoch,
+                read_at: tokio::time::Instant::now(),
                 ports,
             },
         );
@@ -325,8 +342,9 @@ fn slice_ports(slices: &[EndpointSlice]) -> HashMap<String, u16> {
 /// targetPort; on a miss or API error it leaves the service-port fallback seeded
 /// by [`resolve_services`] in place and warns. Never fatal.
 ///
-/// A read is cached until the Service changes or DNS refresh sees pods
-/// change ([`NamedPortCache::dns_changed`]); passes in between read nothing.
+/// A read is cached until the Service changes, DNS refresh sees pods change
+/// ([`NamedPortCache::dns_changed`]) or the cache's ttl passes; passes in
+/// between read nothing.
 pub(crate) async fn resolve_named_target_ports(
     client: &Client,
     cache: &NamedPortCache,

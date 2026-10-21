@@ -301,7 +301,9 @@ pub async fn run_controller(
         last_applied: Arc::new(std::sync::Mutex::new(None)),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        named_ports: Arc::new(NamedPortCache::default()),
+        // A stale read lasts as long as before the cache: every requeue
+        // listed the slices again.
+        named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
         pending_watches,
         started: std::time::Instant::now(),
     });

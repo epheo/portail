@@ -1484,6 +1484,66 @@ mod tests {
         assert_eq!(endpoint_slice_lists(&api), 1, "the pods changed");
     }
 
+    /// With DNS refresh off, a read taken before the Service had pods kept
+    /// the service port forever. It now expires at the resync interval.
+    #[tokio::test]
+    async fn named_target_port_read_expires_at_the_resync_interval() {
+        let slices = |ports: serde_json::Value| {
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{
+                    "metadata": {"name": "db-1"},
+                    "addressType": "IPv4",
+                    "endpoints": [],
+                    "ports": ports,
+                }],
+            })
+        };
+        const SLICES: &str = "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices";
+        let api = MockApi::default();
+        api.reply_to(SLICES, 200, slices(serde_json::json!([])));
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        apply(
+            &mut cluster.services,
+            testkit::service("db", "web", 80, serde_json::json!("http")),
+        );
+        apply(
+            &mut cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "db", 80),
+        );
+        let ctx = cluster.ctx(api.client());
+        let target_port = |ctx: &ControllerCtx| {
+            ctx.published
+                .load_full()
+                .unwrap()
+                .config
+                .headless_target_ports[&("db.default.svc".to_string(), 80)]
+        };
+
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(target_port(&ctx), 80, "no pods yet: the service port");
+
+        api.reply_to(
+            SLICES,
+            200,
+            slices(serde_json::json!([{"name": "web", "port": 8080}])),
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(super::super::RESYNC_SECS - 1)).await;
+        api.clear();
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 0, "still fresh");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reconcile(Arc::new(gw), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 1, "expired");
+        assert_eq!(target_port(&ctx), 8080);
+    }
+
     /// Unscoped mode: deleting the last Gateway closes its listener and
     /// empties the table. Deletion ran no reconcile, so they served on.
     #[tokio::test]

@@ -243,7 +243,7 @@ values; defaults shown):
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
 | `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4, shared | Concurrent UDP sessions per listener socket |
-| `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window). In Kubernetes mode a change also re-reads the named `targetPort`s of headless backends |
+| `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window). In Kubernetes mode a change also re-reads the named `targetPort`s of headless backends; they are re-read every 10 minutes regardless |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
 | `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
 
