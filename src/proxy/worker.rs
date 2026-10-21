@@ -1334,34 +1334,42 @@ fn backend_metric_label(backend: &crate::routing::Backend) -> String {
     }
 }
 
-/// Record a backend failure (spawning a health probe if this newly trips the
-/// backend unhealthy) and send `code` to the client. Returns `Ok((false, None))`
-/// — the client connection is not reusable. Centralizes the failure boilerplate
-/// the connect and send-retry paths would otherwise repeat per error arm; log
-/// wording stays caller-side.
-async fn fail_backend(
+/// A backend connect that failed (`502`) or timed out (`504`): counted as
+/// one, then answered as [`fail_backend`] does.
+async fn fail_connect(
     state: &mut ConnectionState,
-    backend_label: &str,
+    backend_ref: &crate::routing::Backend,
     client: &mut Connection,
-    addr: std::net::SocketAddr,
     code: u16,
-) -> Result<(bool, Option<Vec<u8>>)> {
+) -> Result<()> {
+    let label = backend_metric_label(backend_ref);
     match code {
         504 => {
-            crate::metrics::record_backend_connect_timeout(backend_label);
+            crate::metrics::record_backend_connect_timeout(&label);
             state.listener_stats.upstream_connect_timeouts.inc();
         }
         _ => {
-            crate::metrics::record_backend_connect_error(backend_label);
+            crate::metrics::record_backend_connect_error(&label);
             state.listener_stats.upstream_connect_errors.inc();
         }
     }
+    fail_backend(state, client, backend_ref.socket_addr, code).await
+}
+
+/// Record a backend failure (spawning a health probe if this newly trips the
+/// backend unhealthy) and send `code` to the client, whose connection then
+/// closes. Log wording stays caller-side.
+async fn fail_backend(
+    state: &mut ConnectionState,
+    client: &mut Connection,
+    addr: SocketAddr,
+    code: u16,
+) -> Result<()> {
     if state.health.record_failure(addr) {
         HealthRegistry::spawn_probe(Arc::clone(&state.health), addr);
     }
     state.refused(code);
-    send_error_response(client, code).await?;
-    Ok((false, None))
+    send_error_response(client, code).await
 }
 
 /// Answer a connect the proxy could not make for want of its own fds or
@@ -1422,26 +1430,12 @@ async fn connect_to_backend(
         }
         Ok(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
-            fail_backend(
-                state,
-                &backend_metric_label(backend_ref),
-                client,
-                backend_addr,
-                502,
-            )
-            .await?;
+            fail_connect(state, backend_ref, client, 502).await?;
             Ok(None)
         }
         Err(_) => {
             warn!("Backend {} connect timeout", backend_addr);
-            fail_backend(
-                state,
-                &backend_metric_label(backend_ref),
-                client,
-                backend_addr,
-                504,
-            )
-            .await?;
+            fail_connect(state, backend_ref, client, 504).await?;
             Ok(None)
         }
     }
@@ -1590,14 +1584,7 @@ async fn send_request_with_retry(
         }
         Err(e) => {
             warn!("Backend {} send failed: {}", backend_addr, e);
-            fail_backend(
-                state,
-                &backend_metric_label(backend_ref),
-                client,
-                backend_addr,
-                502,
-            )
-            .await?;
+            fail_backend(state, client, backend_addr, 502).await?;
             return Ok(None);
         }
     }
@@ -1660,14 +1647,7 @@ async fn resend_on_fresh(
                 "Backend {} fresh-conn acquire failed after pool retry: {}",
                 backend_addr, e2
             );
-            fail_backend(
-                state,
-                &backend_metric_label(backend_ref),
-                client,
-                backend_addr,
-                502,
-            )
-            .await?;
+            fail_connect(state, backend_ref, client, 502).await?;
             return Ok(None);
         }
         Err(_) => {
@@ -1675,14 +1655,7 @@ async fn resend_on_fresh(
                 "Backend {} fresh-conn acquire timeout after pool retry",
                 backend_addr
             );
-            fail_backend(
-                state,
-                &backend_metric_label(backend_ref),
-                client,
-                backend_addr,
-                504,
-            )
-            .await?;
+            fail_connect(state, backend_ref, client, 504).await?;
             return Ok(None);
         }
     };
@@ -1692,14 +1665,7 @@ async fn resend_on_fresh(
             "Backend {} send failed on fresh conn after pool retry: {}",
             backend_addr, e2
         );
-        fail_backend(
-            state,
-            &backend_metric_label(backend_ref),
-            client,
-            backend_addr,
-            502,
-        )
-        .await?;
+        fail_backend(state, client, backend_addr, 502).await?;
         return Ok(None);
     }
     Ok(Some(backend))
@@ -3440,6 +3406,82 @@ mod connection_tests {
             let out = exchange(&mut client, GET_A).await;
             assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
         });
+    }
+
+    /// Accepts, reads nothing, and resets each connection `after` it.
+    async fn resetting_backend(after: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    let _ = socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO));
+                });
+            }
+        });
+        addr
+    }
+
+    /// The connect succeeded: a request the fresh conn then fails to send
+    /// is a backend failure and a 502, but no connect error. On a conn
+    /// fresh from the pool's miss, and on the one replacing a dead pooled
+    /// conn.
+    #[tokio::test]
+    async fn a_send_failure_on_a_fresh_conn_is_no_connect_error() {
+        // Late enough that the connect is done: a reset during it is a
+        // connect failure.
+        let addr = resetting_backend(Duration::from_millis(100)).await;
+        // More than any socket buffer takes: still sending at the reset.
+        let large = vec![b'x'; 16 << 20];
+        for (from_pool, body) in [(false, &[][..]), (true, &large[..])] {
+            let mut state = conn_state(routes(addr), false);
+            let backend_ref = Backend {
+                socket_addr: addr,
+                weight: 1,
+                filters: vec![],
+                use_tls: false,
+                server_name: String::new(),
+            };
+            // A conn whose peer is gone: the first write fails.
+            let (dead, _) = tokio::io::duplex(1);
+            let dead = Connection::Mem {
+                inner: dead,
+                aborted: Default::default(),
+            };
+            let (engine, mut client) = tokio::io::duplex(64 * 1024);
+            let mut engine = Connection::Mem {
+                inner: engine,
+                aborted: Default::default(),
+            };
+            state.scratch_buf.extend_from_slice(GET_A);
+            let headers_len = state.scratch_buf.len();
+            let sent = send_request_with_retry(
+                &mut engine,
+                &mut state,
+                &backend_ref,
+                dead,
+                from_pool,
+                headers_len,
+                body,
+                Duration::from_secs(5),
+                std::time::Instant::now(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(sent.is_none());
+            drop(engine);
+            let out = read_until_closed(&mut client).await;
+            assert!(out.starts_with("HTTP/1.1 502 "), "{out}");
+            let connect_errors = state.listener_stats.upstream_connect_errors.get();
+            assert_eq!(connect_errors, 0, "from_pool={from_pool}");
+            // One failure was recorded: the rest of the threshold trips it.
+            for _ in 2..crate::proxy::health::FAILURE_THRESHOLD {
+                assert!(!state.health.record_failure(addr));
+            }
+            assert!(state.health.record_failure(addr), "from_pool={from_pool}");
+        }
     }
 
     /// Only a TCP route on the engine's port.
