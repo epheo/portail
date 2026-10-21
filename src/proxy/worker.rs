@@ -32,7 +32,8 @@ use crate::proxy::http_parser::{
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
-    analyze_request, analyze_tcp_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
+    analyze_request, analyze_tcp_request, client_done, is_http_request, LocalReply, RequestMeta,
+    RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
@@ -243,10 +244,9 @@ pub(crate) struct ConnectionState {
     /// The connection closes after a reply while the client may still be
     /// sending: the close reads off what comes instead of resetting on it.
     linger: bool,
-    /// The client asked to close (`Connection: close`, or HTTP/1.0 without
-    /// keep-alive) and all of its request is in: it sends nothing more, so
-    /// a closing reply has nothing to linger for. Only ever set for a
-    /// connection's last request.
+    /// This request's client sends nothing more (see [`client_done`]), so a
+    /// closing reply has nothing to linger for. Reset as each request
+    /// starts: nothing is known yet of its client.
     client_done: bool,
     /// `reset_on_drop` armed the client: the close must not undo it. Kept
     /// here rather than read back off the socket, a syscall every close
@@ -723,6 +723,7 @@ async fn serve_http(
         // Explicitly drop the route table guard before reading the next request.
         // This allows old route tables to be freed between keepalive iterations.
         drop(route_table);
+        state.client_done = false;
 
         if let Some(bytes) = pending {
             // Replay pipelined bytes as the start of the next request. They
@@ -777,8 +778,8 @@ async fn serve_http(
 /// response.
 ///
 /// `state.linger` follows a reply after which the connection closes, unless
-/// the client asked to close and sent all of its request. Closing on bytes
-/// still arriving makes the kernel reset: an upload then fails its send
+/// the client is done (see [`client_done`]). Closing on bytes still
+/// arriving makes the kernel reset: an upload then fails its send
 /// instead of reading the reply, and a pipelined request can destroy the
 /// reply not read yet. As nginx's lingering_close does, what still arrives
 /// is read and dropped until the client closes or falls silent for
@@ -1038,11 +1039,13 @@ async fn proxy_http_request(
         (None, Some(stream)) => stream.is_terminated(),
         (None, None) => true,
     };
-    // A client that asked to close is done once all of its request is in:
-    // already, or once the relay below is through. An upgrade's client may
-    // stream the new protocol whatever it asked.
-    let client_closes = !meta.keepalive && !meta.is_upgrade;
-    state.client_done = client_closes && body_held;
+    // Settled again once the relay below is through.
+    state.client_done = client_done(
+        meta.keepalive,
+        meta.is_upgrade,
+        body_held,
+        leftover.is_some(),
+    );
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (backend, from_pool) =
@@ -1138,10 +1141,7 @@ async fn proxy_http_request(
     // final response has gone out yet (at most the interim 100), so a 400
     // is still well-formed.
     let (mirror_body, relay_leftover, answered_early) = match relay {
-        RequestBody::Complete { mirror, leftover } => {
-            state.client_done = client_closes;
-            (mirror, leftover, false)
-        }
+        RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
         // A backend may answer before it has the whole body (a 413, a 401)
         // and stop reading it; RFC 9112 9.5 has the client watch for that.
         // The rest of the client's body stays unread: the close reads it off.
@@ -1167,6 +1167,10 @@ async fn proxy_http_request(
     };
     if relay_leftover.is_some() {
         leftover = relay_leftover;
+    }
+    if !answered_early {
+        // All of the request is in.
+        state.client_done = client_done(meta.keepalive, meta.is_upgrade, true, leftover.is_some());
     }
 
     // Both are Some iff has_mirrors: pairing them here keeps any fallback to
@@ -4413,6 +4417,42 @@ mod connection_tests {
         assert!(client.take_error().unwrap().is_none(), "reset");
         drop(client);
         engine.await.unwrap().unwrap();
+    }
+
+    /// A client that asked to close yet sent past its request may still be
+    /// sending: whatever answers it, the close reads off what it pipelined.
+    /// Closed on that unread, the kernel would reset, and a reset can
+    /// destroy the reply not read yet.
+    #[tokio::test]
+    async fn a_client_sending_past_its_close_is_not_done() {
+        let (addr, _rx) = backend(REFUSED).await;
+        // Past the engine's 64 KiB buffer, and within one more of it.
+        let pipelined = b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n".repeat(2048);
+        for (host, reply) in [
+            (
+                "nope.test",
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found",
+            ),
+            (
+                "a.test",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno",
+            ),
+        ] {
+            let (mut client, engine) = tcp_client(conn_state(routes(addr), false)).await;
+            let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            client
+                .write_all(&[head.as_bytes(), &pipelined].concat())
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            let read = client.read_to_end(&mut out).await;
+            let out = String::from_utf8_lossy(&out);
+            assert!(read.is_ok(), "{host}: {read:?} after {out}");
+            assert_eq!(out, reply);
+            assert!(client.take_error().unwrap().is_none(), "{host}: reset");
+            drop(client);
+            engine.await.unwrap().unwrap();
+        }
     }
 
     /// The proxy closes after a proxied response for its own reasons (a

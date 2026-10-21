@@ -72,6 +72,9 @@ pub struct HttpRequestInfo<'a> {
     pub keepalive: bool,
     /// Raw header bytes for lazy header matching (zero-copy)
     pub header_data: &'a [u8],
+    /// Bytes of the head, its empty line included: what follows is a body
+    /// or the next request. Only meaningful without `header_violation`.
+    pub head_len: usize,
     /// Content-Length of the request body (None if header absent)
     pub content_length: Option<usize>,
     /// Whether Transfer-Encoding: chunked is present
@@ -592,6 +595,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         query_string,
         keepalive: explicit_keepalive.unwrap_or(!is_http10),
         header_data,
+        head_len: pos + 2,
         content_length,
         is_chunked,
         // RFC 7230 6.7: an upgrade is only requested when Connection also

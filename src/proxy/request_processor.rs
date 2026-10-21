@@ -42,8 +42,8 @@ pub struct RequestMeta {
     /// Whether the connection may stay open if the proxy answers this
     /// request itself (429); see `local_reply_reusable`.
     pub local_reply_reusable: bool,
-    /// Whether the client sends nothing past this head, so a closing reply
-    /// the proxy writes itself (429) need not linger; see `client_done`.
+    /// [`client_done`] for a reply the proxy writes itself (429), which
+    /// reads nothing past what came with the head.
     pub client_done: bool,
 }
 
@@ -54,7 +54,7 @@ pub struct LocalReply {
     pub location: Option<String>,
     /// Whether the connection stays open afterwards; see `local_reply_reusable`.
     pub reusable: bool,
-    /// The client sends nothing more (see `client_done`): a reply that
+    /// The client sends nothing more (see [`client_done`]): a reply that
     /// closes has nothing to read off first.
     pub client_done: bool,
     /// Answering HEAD: the reply must not carry its body, or a client on a
@@ -94,12 +94,14 @@ fn local_reply_reusable(info: &HttpRequestInfo<'_>) -> bool {
     info.keepalive && head_is_whole(info)
 }
 
-/// Whether the client sends nothing past this head: it asked to close
-/// (`Connection: close`, or HTTP/1.0 without keep-alive) and the head is
-/// the whole request. Any other client may still be sending, a pipelined
-/// request included, when the connection closes.
-fn client_done(info: &HttpRequestInfo<'_>) -> bool {
-    !info.keepalive && head_is_whole(info)
+/// Whether the client sends nothing more on its connection, the one rule
+/// behind every closing reply's linger. It must have asked to close
+/// (`Connection: close`, or HTTP/1.0 without keep-alive), its request must
+/// be all in, and no byte past it seen: a client sending past its request
+/// may send more, whatever it asked. An upgrade's client may stream the
+/// new protocol.
+pub fn client_done(keepalive: bool, is_upgrade: bool, request_in: bool, seen_past: bool) -> bool {
+    !keepalive && !is_upgrade && request_in && !seen_past
 }
 
 pub fn analyze_request<'a>(
@@ -197,7 +199,13 @@ fn analyze_http_request<'a>(
         }
     };
     let reusable = local_reply_reusable(&request_info);
-    let client_done = client_done(&request_info);
+    // A reply the proxy writes itself reads no body.
+    let client_done = client_done(
+        request_info.keepalive,
+        request_info.is_upgrade,
+        head_is_whole(&request_info),
+        request_data.len() > request_info.head_len,
+    );
     let is_head = request_info.method.eq_ignore_ascii_case("HEAD");
     let reply = |status, location| {
         Ok(RoutingResult::LocalReply(LocalReply {
@@ -1053,6 +1061,11 @@ mod tests {
                 true,
             ),
             (
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\nGET /",
+                false,
+                false,
+            ),
+            (
                 b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n",
                 false,
                 false,
@@ -1070,8 +1083,8 @@ mod tests {
 
     /// Only a client that asked to close, with nothing left to send, is
     /// done: a keep-alive client may pipeline its next request, a body or
-    /// upgrade tail may follow, and a head too malformed to frame tells
-    /// nothing.
+    /// upgrade tail may follow, bytes already past the head show it still
+    /// sending, and a head too malformed to frame tells nothing.
     #[test]
     fn local_reply_knows_whether_the_client_is_done() {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
@@ -1109,6 +1122,11 @@ mod tests {
                 false,
             ),
             (b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false),
+            (
+                b"GET / HTTP/1.1\r\nHost: nope.test\r\nConnection: close\r\n\r\nGET / HTTP/1.1\r\n",
+                false,
+            ),
+            (b"GET / HTTP/1.0\r\nHost: nope.test\r\n\r\n\r\n", false),
         ] {
             let text = String::from_utf8_lossy(req);
             assert_eq!(client_done(req), want, "{text}");
