@@ -32,7 +32,7 @@ use crate::proxy::http_parser::{
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
-    analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
+    analyze_request, analyze_tcp_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
@@ -460,6 +460,18 @@ pub(crate) async fn handle_connection(
 ) -> Result<()> {
     client.set_nodelay(true)?;
 
+    // Server-speaks-first protocols (MySQL, SMTP, FTP, IMAP, POP3) send
+    // nothing before the backend's banner. With no HTTP route to tell
+    // apart there is nothing to sniff, and waiting for the client's first
+    // bytes would deadlock them.
+    let tcp_only = {
+        let rt = state.routes.load();
+        rt.has_tcp_route(state.server_port) && !rt.has_http_routes(state.server_port)
+    };
+    if tcp_only {
+        return forward_to_tcp_route(client, &state).await;
+    }
+
     let mut buf = vec![0u8; 65536];
 
     let mut n = client.read(&mut buf).await?;
@@ -623,6 +635,30 @@ pub(crate) async fn handle_connection(
             return Ok(());
         }
     }
+}
+
+/// Relay a connection on a TCP-only port to its route, before the client
+/// has sent anything.
+async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Result<()> {
+    let routed = analyze_tcp_request(
+        &state.routes.load(),
+        &state.selector,
+        state.server_port,
+        &state.health,
+    )?;
+    let RoutingResult::TcpForward { backend_addr } = routed else {
+        return Ok(()); // the router logged why
+    };
+    handle_tcp_connection(
+        client,
+        backend_addr,
+        &[],
+        Arc::clone(&state.health),
+        state.connect_timeout,
+        &state.backend_keepalive,
+        "TCP",
+    )
+    .await
 }
 
 /// Byte length of the empty lines (CRLF pairs) opening `data`.
@@ -3115,6 +3151,55 @@ mod connection_tests {
         });
     }
 
+    /// Only a TCP route on the engine's port.
+    fn tcp_route(backend: SocketAddr) -> RouteTable {
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(
+            8080,
+            vec![Backend {
+                socket_addr: backend,
+                weight: 1,
+                filters: vec![],
+                use_tls: false,
+                server_name: String::new(),
+            }],
+        );
+        rt
+    }
+
+    /// Sends `banner` on accept, as MySQL or SMTP do, then echoes until EOF.
+    async fn banner_backend(banner: &'static [u8]) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.split();
+                    if wr.write_all(banner).await.is_ok() {
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// MySQL, SMTP, FTP, IMAP and POP3 clients send nothing before the
+    /// server's banner: the proxy waiting for their first bytes to sniff
+    /// deadlocked them.
+    #[tokio::test]
+    async fn tcp_only_port_connects_before_the_client_speaks() {
+        const BANNER: &[u8] = b"220 smtp.test ESMTP\r\n";
+        let (mut client, _task) = serve(tcp_route(banner_backend(BANNER).await));
+        let mut banner = [0u8; BANNER.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut banner))
+            .await
+            .expect("no banner")
+            .unwrap();
+        assert_eq!(banner, BANNER);
+        assert_eq!(exchange(&mut client, b"QUIT\r\n").await, "QUIT\r\n");
+    }
+
     #[tokio::test]
     async fn refused_upgrade_closes_on_held_tunnel_frames() {
         let (addr, _rx) = backend(REFUSED).await;
@@ -3195,18 +3280,9 @@ mod connection_tests {
     #[tokio::test]
     async fn empty_lines_before_opaque_bytes_stay_for_tcp_routing() {
         let (tcp, mut rx) = backend(REFUSED).await;
-        let mut rt = RouteTable::new();
-        rt.add_tcp_route(
-            8080,
-            vec![Backend {
-                socket_addr: tcp,
-                weight: 1,
-                filters: vec![],
-                use_tls: false,
-                server_name: String::new(),
-            }],
-        );
-        let (mut client, _task) = serve(rt);
+        // HTTP routes too: a TCP-only port relays without sniffing at all.
+        let http = idle_backend().await;
+        let (mut client, _task) = serve(routes_with_tcp(http.local_addr().unwrap(), tcp));
         let input = [b"\r\n", OPAQUE].concat();
         let out = exchange(&mut client, &input).await;
         assert_eq!(out.as_bytes(), REFUSED);
