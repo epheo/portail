@@ -15,6 +15,7 @@ use std::time::Duration;
 use helpers::{extract_body, extract_status, generate_test_cert, PortailProcess, TestBackend};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 
@@ -109,10 +110,8 @@ fn https_request(
 }
 
 fn pem_to_der(pem: &[u8]) -> Vec<u8> {
-    rustls_pemfile::certs(&mut &pem[..])
-        .next()
+    CertificateDer::from_pem_slice(pem)
         .expect("cert in PEM")
-        .expect("valid PEM")
         .as_ref()
         .to_vec()
 }
