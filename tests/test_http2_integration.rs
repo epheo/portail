@@ -1108,6 +1108,8 @@ async fn test_h2_drain_finishes_streams_accepted_around_the_goaway() {
     tokio::time::timeout(Duration::from_secs(10), exchange)
         .await
         .expect("h2 connection still open after the drain");
+    // Closing in turn, as clients do: the proxy reads until it sees this.
+    drop(tls);
 
     assert_eq!(goaway, Some(0), "no GOAWAY, or not NO_ERROR");
     for (id, s) in [1, 3].iter().zip(&streams) {
