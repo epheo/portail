@@ -674,6 +674,16 @@ impl PortailProcess {
         Self::spawn_config_args(config, proxy_port, &[])
     }
 
+    /// Spawn with extra CLI args.
+    pub fn spawn_with_args(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        extra_args: &[&str],
+    ) -> Self {
+        let config = build_test_config_with_tcp(routes, proxy_port, &[]);
+        Self::spawn_config_args(config, proxy_port, extra_args)
+    }
+
     /// Spawn with at most `limit` open fds, soft and hard: portail raises
     /// only the soft limit, so this one holds.
     pub fn spawn_with_fd_limit(

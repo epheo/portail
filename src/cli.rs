@@ -1,4 +1,5 @@
 use clap::{ArgAction, Parser};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 /// Command-line interface for Portail Gateway Controller
@@ -90,6 +91,14 @@ pub struct Args {
     /// Readiness reports ready once listeners are up.
     #[arg(long, value_name = "PORT")]
     pub metrics_port: Option<u16>,
+
+    /// Bind address of the admin endpoint (/livez, /readyz, /metrics), both modes
+    ///
+    /// Default 0.0.0.0, every interface: kubelet probes reach the pod IP,
+    /// so a loopback bind would fail readiness. The pod IP (downward API
+    /// status.podIP) keeps /metrics off public VIP and Multus interfaces.
+    #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+    pub admin_address: IpAddr,
 
     /// Write a JSON access log line per HTTP response to PATH ("-" = stdout)
     ///
@@ -225,6 +234,16 @@ mod tests {
     #[test]
     fn test_validate_only_conflicts_with_check_config() {
         assert!(Args::try_parse_from(["portail", "--validate-only", "--check-config"]).is_err());
+    }
+
+    #[test]
+    fn test_admin_address_defaults_to_every_interface() {
+        let any: IpAddr = "0.0.0.0".parse().unwrap();
+        assert_eq!(parse(&["portail"]).admin_address, any);
+        let pod_ip: IpAddr = "10.128.0.7".parse().unwrap();
+        let args = parse(&["portail", "--admin-address", "10.128.0.7"]);
+        assert_eq!(args.admin_address, pod_ip);
+        assert!(Args::try_parse_from(["portail", "--admin-address", "pod-ip"]).is_err());
     }
 
     #[test]

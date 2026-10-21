@@ -2016,6 +2016,24 @@ fn test_accept_backs_off_when_out_of_fds() {
     assert_eq!(extract_status(&response), Some(200));
 }
 
+/// The admin endpoint answers on its bind address only, so /metrics can
+/// stay off public VIP and Multus interfaces (here: 127.0.0.2, not .1).
+#[test]
+fn test_admin_endpoint_binds_its_address() {
+    let backend = TestBackend::spawn("ok");
+    let _proxy = PortailProcess::spawn_with_args(
+        &[("localhost", "/", backend.addr)],
+        25089,
+        &["--metrics-port", "25090", "--admin-address", "127.0.0.2"],
+    );
+    let admin: std::net::SocketAddr = "127.0.0.2:25090".parse().unwrap();
+    assert!(wait_for_listener(admin, Duration::from_secs(5)));
+    let livez = http_request(admin, b"GET /livez HTTP/1.1\r\n\r\n").expect("/livez");
+    assert_eq!(extract_status(&livez), Some(200));
+    let other: std::net::SocketAddr = "127.0.0.1:25090".parse().unwrap();
+    assert!(std::net::TcpStream::connect(other).is_err());
+}
+
 /// A controller that stops, here because no cluster config exists, must
 /// take the process down for kubelet to restart it, not leave the pod
 /// NotReady forever while /livez still answers 200.

@@ -11,6 +11,7 @@
 | `--manage-gateway-status <BOOL>` | Manage Gateway lifecycle status (Accepted/Programmed/addresses). Set `false` under portail-operator, which owns those; portail then reports only listener and route status (default: `true`) |
 | `--readiness-port <PORT>` | Port for the `/livez` + `/readyz` + `/metrics` admin endpoint in Kubernetes mode (default: `19099`) |
 | `--metrics-port <PORT>` | Serve the same admin endpoint in standalone mode (off by default) |
+| `--admin-address <IP>` | Bind address of the admin endpoint, both modes (default: `0.0.0.0`, every interface). Kubelet probes reach the pod IP, so loopback would fail readiness; the pod IP keeps `/metrics` off public VIP and Multus interfaces |
 | `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
 | `--http2` | Enable HTTP/2 on TLS-terminate listeners (off by default; see HTTP/2 section) |
 | `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
@@ -51,6 +52,19 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   upgrade tunnels excluded) and `portail_upstream_ttfb_seconds` (route match
   to backend response headers: connect, request forward, backend
   processing). Buckets are fixed, 10us to 60s.
+
+The endpoint listens on every interface unless `--admin-address` names one.
+On a pod carrying a Gateway VIP or a Multus interface, the pod IP keeps
+kubelet probes working while those interfaces stop exposing `/metrics`:
+
+```yaml
+args: ["--admin-address=$(POD_IP)"]
+env:
+- name: POD_IP
+  valueFrom:
+    fieldRef:
+      fieldPath: status.podIP
+```
 
 ## Access Logs
 

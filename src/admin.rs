@@ -17,6 +17,7 @@
 //! `Programmed` condition (derived from readiness) stays meaningful.
 
 use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,19 +73,19 @@ fn metrics_response(ready: bool) -> Vec<u8> {
     resp
 }
 
-/// Run the management HTTP server until shutdown: `/metrics` scrapes, any
-/// other path is the readiness probe.
-pub async fn serve(port: u16, ready: Arc<AtomicBool>, shutdown: CancellationToken) {
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+/// Run the management HTTP server on `addr` until shutdown: `/metrics`
+/// scrapes, any other path is the readiness probe.
+pub async fn serve(addr: SocketAddr, ready: Arc<AtomicBool>, shutdown: CancellationToken) {
+    let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            warn!("Admin endpoint failed to bind :{}: {}", port, e);
+            warn!("Admin endpoint failed to bind {}: {}", addr, e);
             return;
         }
     };
     info!(
-        "Admin endpoint listening on :{} (/livez, /readyz, /metrics)",
-        port
+        "Admin endpoint listening on {} (/livez, /readyz, /metrics)",
+        addr
     );
 
     let mut backoff = AcceptBackoff::default();
