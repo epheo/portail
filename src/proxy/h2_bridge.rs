@@ -49,7 +49,9 @@ const MAX_CONCURRENT_STREAMS: u32 = 128;
 const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
 
 /// Per-direction duplex buffer; matches the engine's read buffer so a
-/// typical exchange crosses in one hop.
+/// typical exchange crosses in one hop, and a body that comes whole with its
+/// head stays replayable on a stale pooled conn. Grown on demand, it costs
+/// only the bytes in flight.
 const DUPLEX_BUF: usize = 64 * 1024;
 
 /// Upload window per stream: h2's 64 KiB default caps an upload at 64 KiB
