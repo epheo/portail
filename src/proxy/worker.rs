@@ -2854,6 +2854,9 @@ pub(crate) struct ResponseHead {
     /// Any Transfer-Encoding overrides Content-Length, which must then not
     /// be forwarded either.
     pub(crate) transfer_encoded: bool,
+    /// A transfer coding besides one lone chunked: the body stays coded
+    /// once de-chunked, which only HTTP/1.1 can declare.
+    pub(crate) other_codings: bool,
     /// An explicit Connection: close, or HTTP/1.0 without keep-alive.
     pub(crate) backend_close: bool,
 }
@@ -2868,7 +2871,7 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
     let mut lines = header_lines(head);
     let (status, is_http10) = parse_status_line(lines.next()?)?;
     let mut content_length: Option<usize> = None;
-    let (mut transfer_encoded, mut chunked_last) = (false, false);
+    let (mut transfer_encoded, mut chunked_last, mut codings) = (false, false, 0u32);
     let (mut close, mut keep_alive) = (false, false);
 
     for line in lines {
@@ -2892,6 +2895,7 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
             transfer_encoded = true;
             for coding in value.split(|&b| b == b',').map(trim_ows) {
                 if !coding.is_empty() {
+                    codings += 1;
                     chunked_last = coding.eq_ignore_ascii_case(b"chunked");
                 }
             }
@@ -2917,6 +2921,7 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
         status,
         body,
         transfer_encoded,
+        other_codings: transfer_encoded && !(codings == 1 && chunked_last),
         backend_close: close || (is_http10 && !keep_alive),
     })
 }
@@ -3166,6 +3171,33 @@ mod tests {
         let head = b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(parse_response_head(head), None);
         assert_eq!(parse_response_head(b"HTTP/1.1 200 OK\rX\r\n\r\n"), None);
+    }
+
+    /// The h2 bridge refuses what this flags: it can only remove chunked.
+    #[test]
+    fn only_a_lone_chunked_leaves_the_body_uncoded() {
+        let coded = |fields: &str| {
+            parse_response_head(format!("HTTP/1.1 200 OK\r\n{fields}\r\n").as_bytes())
+                .unwrap()
+                .other_codings
+        };
+        for fields in [
+            "Content-Length: 5\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: Chunked, \r\n",
+        ] {
+            assert!(!coded(fields), "{fields:?}");
+        }
+        for fields in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Transfer-Encoding: chunked, chunked\r\n",
+            "Transfer-Encoding: \r\n",
+        ] {
+            assert!(coded(fields), "{fields:?}");
+        }
     }
 
     #[test]
