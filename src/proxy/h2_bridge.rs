@@ -51,6 +51,14 @@ const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
 /// typical exchange crosses in one hop.
 const DUPLEX_BUF: usize = 64 * 1024;
 
+/// Upload window per stream: h2's 64 KiB default caps an upload at 64 KiB
+/// per round trip; 2 MiB carries 200 Mbit/s at 80 ms.
+const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+
+/// Upload window per connection: two streams' worth, so one stalled upload
+/// leaves a full window to the connection's other streams.
+const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
 /// Size of each response read from the duplex.
 const RESP_READ: usize = 16 * 1024;
 
@@ -82,6 +90,8 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
         .handshake(tls_stream);
     // The h2 preface + SETTINGS is this protocol's header-read phase; it
     // gets the same slow-loris budget as an h1 header block.
@@ -341,9 +351,6 @@ async fn pump_request_body(
     while let Some(data) = progress("h2 bridge", idle, body.data()).await? {
         let data = data.map_err(|e| anyhow!("h2 request body: {}", e))?;
         let n = data.len();
-        // Release the flow-control window for every received byte, empty
-        // frames included, before deciding whether to forward.
-        let _ = body.flow_control().release_capacity(n);
         // A zero-length interior DATA frame (legal, END_STREAM unset) carries
         // no body bytes; re-framed as a chunk it would be "0\r\n\r\n" -- the
         // chunked terminator -- truncating the body mid-stream. Skip it; the
@@ -362,6 +369,9 @@ async fn pump_request_body(
         } else {
             io.write_all(&data).await.is_ok()
         };
+        // Window goes back only once the engine's pipe took the bytes, so h2
+        // buffers at most one window past what the engine drained.
+        let _ = body.flow_control().release_capacity(n);
         // A closed engine half ends the exchange; its response is buffered.
         if !write_ok {
             return Ok(());
