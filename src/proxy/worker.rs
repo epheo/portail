@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use bytes::BufMut;
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -40,30 +41,68 @@ use crate::proxy::request_processor::{
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
-/// Continue reading from `client` into `buf` starting at offset `already_read`
-/// until the full HTTP headers (\r\n\r\n) are found or the buffer fills.
-/// Returns `Some(0)` when the client closes first, `None` when the head
-/// outgrows `buf`.
+/// Read what the client has sent into `buf`'s spare room, as one read with
+/// room up to `CLIENT_BUF` would: a read that fills the room grows the
+/// buffer and goes on with what has already arrived, without waiting.
+/// Returns the bytes read, 0 at EOF. `buf` must be below its cap.
+async fn read_head(client: &mut Connection, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    use futures::FutureExt;
+    let start = buf.len();
+    let mut room = head_room(buf);
+    let mut read = client.read_buf(&mut (&mut *buf).limit(room)).await?;
+    while read == room && buf.len() < CLIENT_BUF {
+        room = head_room(buf);
+        match client.read_buf(&mut (&mut *buf).limit(room)).now_or_never() {
+            Some(Ok(n)) => read = n,
+            // Nothing more yet. After an error, the bytes already read
+            // still count: the next read ends the connection.
+            None | Some(Err(_)) => break,
+        }
+    }
+    Ok(buf.len() - start)
+}
+
+/// Spare room for the next head read, doubling the buffer when it is full,
+/// never past `CLIENT_BUF`.
+fn head_room(buf: &mut Vec<u8>) -> usize {
+    if buf.len() == buf.capacity() {
+        let grown = (2 * buf.capacity()).clamp(CLIENT_BUF_INITIAL, CLIENT_BUF);
+        buf.reserve_exact(grown - buf.len());
+    }
+    buf.capacity().min(CLIENT_BUF) - buf.len()
+}
+
+/// Read up to `CLIENT_BUF` of a body into `buf`, emptied first: every body
+/// read gets the buffer's full size, however small the head was.
+async fn read_body_chunk<R>(conn: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    buf.clear();
+    buf.reserve_exact(CLIENT_BUF);
+    conn.read_buf(&mut (&mut *buf).limit(CLIENT_BUF)).await
+}
+
+/// Continue reading from `client` into `buf` until the full HTTP headers
+/// (\r\n\r\n) are found or the buffer reaches its cap. Returns
+/// `Some(false)` when the client closes first, `None` when the head
+/// outgrows `CLIENT_BUF`.
 async fn read_remaining_headers(
     client: &mut Connection,
-    buf: &mut [u8],
-    already_read: usize,
-) -> std::io::Result<Option<usize>> {
-    let mut total = already_read;
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
     loop {
-        if total >= buf.len() {
+        if buf.len() >= CLIENT_BUF {
             return Ok(None);
         }
-        let n = client.read(&mut buf[total..]).await?;
-        if n == 0 {
+        if read_head(client, buf).await? == 0 {
             // Never parse a truncated head: the proxy's own headers would be
             // appended to its unterminated last line, which could hide them
             // (e.g. inside a client header's value).
-            return Ok(Some(0));
+            return Ok(Some(false));
         }
-        total += n;
-        if has_header_end(&buf[..total]) {
-            return Ok(Some(total));
+        if has_header_end(buf) {
+            return Ok(Some(true));
         }
     }
 }
@@ -654,9 +693,14 @@ async fn serve_tls_connection(
     let _ = handle_connection(conn, peer, state).await;
 }
 
-/// A client connection's buffer: the largest request head, and the most
-/// a lingering close reads off. The h2 bridge's close reads off no more.
+/// The most a client connection's buffer holds: the largest request head,
+/// one body read, and the most a lingering close reads off. The h2
+/// bridge's close reads off no more.
 pub(crate) const CLIENT_BUF: usize = 64 * 1024;
+
+/// A client connection's buffer to start with: room for a typical request
+/// head. Allocated at the first read and never zeroed; it grows on need.
+const CLIENT_BUF_INITIAL: usize = 4 * 1024;
 
 pub(crate) async fn handle_connection(
     mut client: Connection,
@@ -678,13 +722,13 @@ pub(crate) async fn handle_connection(
         return forward_to_tcp_route(client, &state).await;
     }
 
-    let mut buf = vec![0u8; CLIENT_BUF];
+    let mut buf = Vec::new();
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
-    if let Ok(Handoff::Tcp { backend_addr, len }) = served {
+    if let Ok(Handoff::Tcp { backend_addr }) = served {
         return handle_tcp_connection(
             client,
             backend_addr,
-            &buf[..len],
+            &buf,
             Arc::clone(&state.health),
             state.connect_timeout,
             &state.backend_keepalive,
@@ -701,11 +745,8 @@ pub(crate) async fn handle_connection(
 enum Handoff {
     /// The HTTP exchanges are over: the connection closes.
     Close,
-    /// Not HTTP: the connection goes to a TCP route, `buf[..len]` first.
-    Tcp {
-        backend_addr: SocketAddr,
-        len: usize,
-    },
+    /// Not HTTP: the connection goes to a TCP route, `buf` first.
+    Tcp { backend_addr: SocketAddr },
 }
 
 /// Serve requests until the connection must close, or turns out to be
@@ -713,22 +754,23 @@ enum Handoff {
 /// one close.
 async fn serve_http(
     client: &mut Connection,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     state: &mut ConnectionState,
     tcp_route: bool,
 ) -> Result<Handoff> {
     // Lives as long as the requests: dropping it ends the wait on the token.
     let drained = std::pin::pin!(state.drain.clone().cancelled_owned());
     DrainWatch::arm(&state.drain_watch, drained);
-    let mut n = idle_read(client, buf, &state.drain_watch).await?;
-    n = sniff_first_request(client, buf, n, state.client_header_timeout, !tcp_route).await;
+    idle_read(client, buf, &state.drain_watch).await?;
+    sniff_first_request(client, buf, state.client_header_timeout, !tcp_route).await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
-    if is_http_request(&buf[..n]) && !has_header_end(&buf[..n]) {
-        n = complete_headers(client, buf, n, state).await?;
+    if is_http_request(buf) && !has_header_end(buf) && !complete_headers(client, buf, state).await?
+    {
+        return Ok(Handoff::Close);
     }
-    if n == 0 {
+    if buf.is_empty() {
         return Ok(Handoff::Close);
     }
     // The backend budget's timer, kept across this connection's requests:
@@ -742,7 +784,7 @@ async fn serve_http(
         // Copied out now because the response phase reuses buf as scratch;
         // None whenever access logging is off.
         let access = crate::access_log::capture(
-            &buf[..n],
+            buf,
             request_started,
             state.peer_ip,
             state.server_port,
@@ -752,7 +794,7 @@ async fn serve_http(
         let result = analyze_request(
             &route_table,
             &state.selector,
-            &buf[..n],
+            buf,
             state.server_port,
             &state.health,
             state.is_tls,
@@ -763,10 +805,7 @@ async fn serve_http(
         // sent to the backend or lost.
         let pending: Option<Vec<u8>> = match result {
             RoutingResult::TcpForward { backend_addr } => {
-                return Ok(Handoff::Tcp {
-                    backend_addr,
-                    len: n,
-                });
+                return Ok(Handoff::Tcp { backend_addr });
             }
             RoutingResult::HttpForward {
                 backend,
@@ -791,8 +830,8 @@ async fn serve_http(
                     if !send_local_reply(client, state, &reply, access).await? {
                         return Ok(Handoff::Close);
                     }
-                    pipelined_tail(&buf[..n])
-                } else if let Some(framing) = Framing::of(&buf[..n], &meta) {
+                    pipelined_tail(buf)
+                } else if let Some(framing) = Framing::of(buf, &meta) {
                     // After the limiter and the framing: a 429 or a malformed
                     // body is no dispatch. Per-vhost sample (the rule carries
                     // its route hostname's registry slot) + the per-listener
@@ -838,7 +877,7 @@ async fn serve_http(
                 if !send_local_reply(client, state, &reply, access).await? {
                     return Ok(Handoff::Close);
                 }
-                pipelined_tail(&buf[..n])
+                pipelined_tail(buf)
             }
             RoutingResult::UdpForward { .. } | RoutingResult::CloseConnection => {
                 return Ok(Handoff::Close);
@@ -850,30 +889,31 @@ async fn serve_http(
         drop(route_table);
         state.client_done = false;
 
+        buf.clear();
         if let Some(bytes) = pending {
             // Replay pipelined bytes as the start of the next request. They
-            // came out of `buf` via a single read, so they always fit.
-            buf[..bytes.len()].copy_from_slice(&bytes);
-            n = bytes.len();
+            // came out of `buf`, so they fit its cap.
+            buf.extend_from_slice(&bytes);
         } else {
-            n = idle_read(client, buf, &state.drain_watch).await?;
+            idle_read(client, buf, &state.drain_watch).await?;
         }
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
         loop {
-            let skip = empty_lines_len(&buf[..n]);
+            let skip = empty_lines_len(buf);
             if skip > 0 {
-                buf.copy_within(skip..n, 0);
-                n -= skip;
+                buf.drain(..skip);
             }
-            match &buf[..n] {
+            match &buf[..] {
                 // Between requests: as unbounded as the idle wait.
-                [] if skip > 0 => n = idle_read(client, buf, &state.drain_watch).await?,
+                [] if skip > 0 => {
+                    idle_read(client, buf, &state.drain_watch).await?;
+                }
                 // Inside an empty line: as bounded as a request head.
                 [b'\r'] => {
-                    let rest = client.read(&mut buf[1..]);
+                    let rest = read_head(client, buf);
                     match tokio::time::timeout(state.client_header_timeout, rest).await {
-                        Ok(Ok(read)) if read > 0 => n += read,
+                        Ok(Ok(read)) if read > 0 => {}
                         _ => return Ok(Handoff::Close),
                     }
                 }
@@ -883,13 +923,13 @@ async fn serve_http(
         // The connection is HTTP by now: bytes that cannot open a request
         // (frames held back from a refused upgrade) close it. They must not
         // reach TCP routing, nor wait out the header budget for a 408.
-        if n == 0 || !may_open_request(&buf[..n]) {
+        if buf.is_empty() || !may_open_request(buf) {
             return Ok(Handoff::Close);
         }
-        if !has_header_end(&buf[..n]) {
-            n = complete_headers(client, buf, n, state).await?;
+        if !has_header_end(buf) && !complete_headers(client, buf, state).await? {
+            return Ok(Handoff::Close);
         }
-        if n == 0 || !is_http_request(&buf[..n]) {
+        if !is_http_request(buf) {
             return Ok(Handoff::Close);
         }
     }
@@ -908,14 +948,14 @@ async fn serve_http(
 /// instead of reading the reply, and a pipelined request can destroy the
 /// reply not read yet. As nginx's lingering_close does, what still arrives
 /// is read and dropped until the client closes or falls silent for
-/// `LINGER_IDLE`, up to one `buf` of it. A drain's close after a reply
+/// `LINGER_IDLE`, up to `CLIENT_BUF` of it. A drain's close after a reply
 /// lingers too, so a client keeping its socket open holds the drain that
 /// long. An idle connection, no reply just written, closes at once: there
 /// is no reply for a reset to destroy.
 ///
 /// All of it within the client header budget: a client that stops reading,
 /// or never stops sending, cannot hold the close.
-async fn close_connection(client: &mut Connection, buf: &mut [u8], state: &ConnectionState) {
+async fn close_connection(client: &mut Connection, buf: &mut Vec<u8>, state: &ConnectionState) {
     let tls = match client {
         Connection::Plain { .. } => false,
         Connection::Tls { .. } => true,
@@ -937,13 +977,20 @@ async fn close_connection(client: &mut Connection, buf: &mut [u8], state: &Conne
 /// silent this long is done. nginx's lingering_timeout default.
 pub(crate) const LINGER_IDLE: Duration = Duration::from_secs(5);
 
-/// Read and drop what the client still sends, up to one `buf` of it, until
-/// it closes, falls silent for `LINGER_IDLE`, or `deadline` passes.
-async fn read_off(client: &mut Connection, buf: &mut [u8], deadline: tokio::time::Instant) {
+/// Read and drop what the client still sends, up to `CLIENT_BUF` of it,
+/// until it closes, falls silent for `LINGER_IDLE`, or `deadline` passes.
+/// `buf` is not grown for it: the connection is going.
+async fn read_off(client: &mut Connection, buf: &mut Vec<u8>, deadline: tokio::time::Instant) {
     let mut discarded = 0;
-    while discarded < buf.len() {
+    while discarded < CLIENT_BUF {
+        buf.clear();
+        let room = buf
+            .capacity()
+            .max(CLIENT_BUF_INITIAL)
+            .min(CLIENT_BUF - discarded);
         let idle = deadline.min(tokio::time::Instant::now() + LINGER_IDLE);
-        match tokio::time::timeout_at(idle, client.read(&mut buf[discarded..])).await {
+        let mut spare = (&mut *buf).limit(room);
+        match tokio::time::timeout_at(idle, client.read_buf(&mut spare)).await {
             Ok(Ok(read)) if read > 0 => discarded += read,
             _ => return,
         }
@@ -980,13 +1027,13 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
 /// would (0).
 async fn idle_read(
     client: &mut Connection,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     drain: &DrainWatch,
 ) -> std::io::Result<usize> {
     tokio::select! {
         // A request already sent is served: its reply announces the close.
         biased;
-        read = client.read(buf) => read,
+        read = read_head(client, buf) => read,
         () = drain.wait() => Ok(0),
     }
 }
@@ -1003,33 +1050,32 @@ fn empty_lines_len(data: &[u8]) -> usize {
 /// routing the bytes stay as sent. A read ending inside them waits for
 /// more; with `await_method` so does one ending inside a method ("GET",
 /// "PROPF"), for a port no TCP route serves, where sniffed as opaque it
-/// would close unanswered. Returns the length of the data now in `buf`.
+/// would close unanswered.
 async fn sniff_first_request(
     client: &mut Connection,
-    buf: &mut [u8],
-    mut n: usize,
+    buf: &mut Vec<u8>,
     budget: Duration,
     await_method: bool,
-) -> usize {
+) {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let skip = empty_lines_len(&buf[..n]);
-        let rest = &buf[skip..n];
+        let skip = empty_lines_len(buf);
+        let rest = &buf[skip..];
         if is_http_request(rest) {
             if skip > 0 {
-                buf.copy_within(skip..n, 0);
+                buf.drain(..skip);
             }
-            return n - skip;
+            return;
         }
         let undecided = rest == b"\r"
             || (skip > 0 && rest.is_empty())
             || (await_method && may_open_request(rest));
-        if !undecided || n == buf.len() {
-            return n;
+        if !undecided || buf.len() >= CLIENT_BUF {
+            return;
         }
-        match tokio::time::timeout_at(deadline, client.read(&mut buf[n..])).await {
-            Ok(Ok(read)) if read > 0 => n += read,
-            _ => return n,
+        match tokio::time::timeout_at(deadline, read_head(client, buf)).await {
+            Ok(Ok(read)) if read > 0 => {}
+            _ => return,
         }
     }
 }
@@ -1048,17 +1094,16 @@ fn may_open_request(data: &[u8]) -> bool {
 /// idle wait between keepalive requests is intentionally unbounded. Sends
 /// `431` when the block outgrows the buffer and `408` when the client is too
 /// slow, then errors out to close the connection, as a client I/O error
-/// does with no reply. Returns 0 when the client closed before the head
-/// ended: nothing is forwarded or answered.
+/// does with no reply. Returns false when the client closed before the
+/// head ended: nothing is forwarded or answered.
 async fn complete_headers(
     client: &mut Connection,
-    buf: &mut [u8],
-    already_read: usize,
+    buf: &mut Vec<u8>,
     state: &mut ConnectionState,
-) -> Result<usize> {
+) -> Result<bool> {
     let budget = state.client_header_timeout;
-    match tokio::time::timeout(budget, read_remaining_headers(client, buf, already_read)).await {
-        Ok(Ok(Some(total))) => Ok(total),
+    match tokio::time::timeout(budget, read_remaining_headers(client, buf)).await {
+        Ok(Ok(Some(complete))) => Ok(complete),
         Ok(Ok(None)) => {
             // The rest of the head may still be on its way.
             state.refused(431);
@@ -1143,7 +1188,7 @@ impl Framing {
 #[allow(clippy::too_many_arguments)]
 async fn proxy_http_request(
     client: &mut Connection,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     framing: Framing,
     backend_ref: &crate::routing::Backend,
     rule: &HttpRouteRule,
@@ -2083,7 +2128,7 @@ enum RequestBody {
 async fn relay_request_body(
     client: &mut Connection,
     backend: &mut Connection,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     header_end: usize,
     request_end: usize,
     content_length: Option<usize>,
@@ -2109,7 +2154,7 @@ async fn relay_request_body(
     if let Some(cl) = content_length {
         let mut remaining = cl.saturating_sub(body_in_initial);
         while remaining > 0 {
-            let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
+            let n = idle_guarded(idle, read_body_chunk(client, buf)).await?;
             if n == 0 {
                 return Ok(RequestBody::Truncated);
             }
@@ -2129,7 +2174,7 @@ async fn relay_request_body(
         }
     } else if let Some(mut stream) = chunked {
         while !stream.is_terminated() && !stream.is_broken() {
-            let n = idle_guarded(idle, client.read(&mut buf[..])).await?;
+            let n = idle_guarded(idle, read_body_chunk(client, buf)).await?;
             if n == 0 {
                 return Ok(RequestBody::Truncated);
             }
@@ -2395,7 +2440,7 @@ enum BodyEnd {
 async fn forward_response_body(
     backend: &mut Connection,
     client: &mut Connection,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     framing: &mut ResponseFraming,
     idle: Option<Duration>,
 ) -> Result<BodyEnd> {
@@ -2419,7 +2464,7 @@ async fn forward_response_body(
 
     let mut body_bytes_forwarded = framing.body_bytes_already_forwarded;
     loop {
-        let n = idle_guarded(idle, backend.read(buf)).await?;
+        let n = idle_guarded(idle, read_body_chunk(backend, buf)).await?;
         if n == 0 {
             return Ok(if framing.close_delimited() {
                 BodyEnd::Closed
@@ -3895,12 +3940,18 @@ mod connection_tests {
 
     /// A pooled conn can also die after the probe, as the request reaches
     /// the backend. Nothing was answered, so an idempotent request whose
-    /// body the proxy still holds is replayed once on a fresh conn.
+    /// body the proxy still holds is replayed once on a fresh conn. A body
+    /// sent whole with its head is held, even past the buffer's first read.
     #[tokio::test]
     async fn idempotent_request_is_replayed_once_when_a_pooled_conn_dies_unanswered() {
         let put = b"PUT / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nhi";
+        let body = "x".repeat(2 * CLIENT_BUF_INITIAL);
+        let big_put = format!(
+            "PUT / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
         for script in [then_close, then_reset] {
-            for request in [GET_A, put] {
+            for request in [GET_A, put, big_put.as_bytes()] {
                 let (mut client, _task) = serve(routes(scripted_backend(script).await));
                 client.write_all(GET_A).await.unwrap();
                 assert_eq!(response(&mut client).await, OK);
@@ -3917,6 +3968,23 @@ mod connection_tests {
             client.write_all(GET_A).await.unwrap();
             let out = response(&mut client).await;
             assert!(out.ends_with("\r\n\r\na.test"), "{out}");
+        }
+    }
+
+    /// The buffer starts small but the head cap stays put: a head ending
+    /// exactly at it is read whole, one byte more is a 431.
+    #[tokio::test]
+    async fn a_head_may_fill_the_read_buffer_but_not_outgrow_it() {
+        for (past_cap, status) in [(0, "404"), (1, "431")] {
+            let (mut client, _task) = serve(RouteTable::new());
+            let start = "GET / HTTP/1.1\r\nHost: a.test\r\nX-Pad: ";
+            let pad = "p".repeat(CLIENT_BUF + past_cap - start.len() - 4);
+            // The engine stops reading at a 431: the last byte may not land.
+            let _ = client
+                .write_all(format!("{start}{pad}\r\n\r\n").as_bytes())
+                .await;
+            let reply = response(&mut client).await;
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
         }
     }
 
@@ -5361,7 +5429,7 @@ mod connection_tests {
                 std::future::pending::<()>().await;
             });
             let started = tokio::time::Instant::now();
-            read_off(&mut engine, &mut [0u8; 64 * 1024], started + budget).await;
+            read_off(&mut engine, &mut Vec::new(), started + budget).await;
             assert_eq!(started.elapsed(), lingered, "{sends} sends");
             sender.abort();
         }
@@ -5420,11 +5488,10 @@ mod connection_tests {
         drop(client);
 
         let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n";
-        let mut buf = vec![0u8; 65536];
-        buf[..head.len()].copy_from_slice(head);
+        let mut buf = head.to_vec();
         let mut conn = Connection::Plain { inner: engine_end };
         let mut state = conn_state(RouteTable::new(), false);
-        let read = complete_headers(&mut conn, &mut buf, head.len(), &mut state).await;
+        let read = complete_headers(&mut conn, &mut buf, &mut state).await;
         let err = read.unwrap_err();
         let kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
         assert_eq!(kind, Some(std::io::ErrorKind::ConnectionReset), "{err}");
@@ -5961,7 +6028,7 @@ mod tests {
         content_length: Option<usize>,
         chunked: Option<ChunkedStream>,
     ) -> RequestBody {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = Vec::new();
         relay_request_body(
             client,
             backend,
@@ -6044,7 +6111,7 @@ mod tests {
         let (mut client, mut client_peer) = mem_pair();
         backend_peer.write_all(wire).await.unwrap();
         drop(backend_peer);
-        let mut buf = vec![0u8; 4096];
+        let mut buf = Vec::new();
         let end = forward_response_body(&mut backend, &mut client, &mut buf, &mut framing, None)
             .await
             .unwrap();
