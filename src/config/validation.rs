@@ -341,14 +341,19 @@ impl ParentRef {
 /// wrong. Everything both paths share is `compile_http_route`'s.
 impl HttpRouteRule {
     fn validate(&self) -> Result<()> {
-        // backend_refs can be empty when a redirect filter is present
-        if self.backend_refs.is_empty() && !self.redirects() {
+        // A redirect rule never forwards: compile and the table build skip
+        // its backendRefs, and so does this check.
+        let forwards_to = if self.redirects() {
+            &[][..]
+        } else if self.backend_refs.is_empty() {
             return Err(anyhow!(
                 "HTTP route rule must have at least one backend_ref (or a RequestRedirect filter)"
             ));
-        }
+        } else {
+            &self.backend_refs[..]
+        };
 
-        for (i, backend_ref) in self.backend_refs.iter().enumerate() {
+        for (i, backend_ref) in forwards_to.iter().enumerate() {
             backend_ref
                 .validate()
                 .map_err(|e| anyhow!("backendRef {}: {}", i, e))?;
@@ -1149,5 +1154,33 @@ mod tests {
             }) => assert_eq!(location, "https://example.com/a"),
             _ => panic!("expected the redirect"),
         }
+    }
+
+    /// A redirect rule's backendRefs are never resolved or checked, at
+    /// compile and in the table build. The file check still rejected one
+    /// it found malformed, and with it the whole file.
+    #[test]
+    fn a_redirect_rules_backend_refs_go_unchecked() {
+        let redirect = HttpRouteFilter::RequestRedirect {
+            config: RequestRedirectConfig {
+                scheme: Some("https".to_string()),
+                hostname: None,
+                port: None,
+                path: None,
+                status_code: 301,
+            },
+        };
+        let malformed = BackendRef {
+            name: String::new(),
+            port: 0,
+            weight: 2_000_000,
+            ..default_backend()
+        };
+        let cfg = config_with_rule(make_rule(vec![redirect], vec![malformed.clone()]));
+        cfg.validate().unwrap();
+        cfg.to_route_table_strict().unwrap();
+
+        let forwards = config_with_rule(make_rule(vec![], vec![malformed]));
+        assert!(forwards.validate().is_err(), "a forwarding rule's are");
     }
 }
