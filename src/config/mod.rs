@@ -1,3 +1,4 @@
+pub(crate) mod compile;
 pub mod core;
 pub mod examples;
 pub mod parsing;
