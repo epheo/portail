@@ -176,10 +176,9 @@ pub async fn run_controller(
     // --- Secondary resources ---
     // Each resource gets a reflector (store + stream). The stream feeds into
     // Controller::watches_stream() with a mapper that targets affected Gateway(s).
-    // This is the standard kube-rs/controller-runtime pattern: secondary resource
-    // events go through a separate path unaffected by the primary predicate_filter.
+    // No watch is predicate-filtered: status-only events (our own writes
+    // included) reach reconcile, which absorbs them.
 
-    // CRD reflectors — generation-filtered to ignore status-only changes.
     // HTTPRoute is required (GA); TCP/TLS/UDPRoute are experimental (optional).
     // All route watches stay CLUSTER-WIDE and unconditional: a route in any
     // namespace, of any kind, may parentRef this Gateway and must get a status
@@ -206,7 +205,6 @@ pub async fn run_controller(
     // GatewayClass status is owned by portail-operator now; portail no longer
     // runs its own GatewayClass controller.
 
-    // Core resource reflectors — no generation filter (core types don't reliably set it).
     // The Namespace watch is opened only when a listener uses
     // `allowedRoutes: Selector` (the only consumer of namespace labels).
     let (store_namespaces, namespace_stream) = create_reflector_gated(
@@ -308,9 +306,6 @@ pub async fn run_controller(
     );
 
     // --- Gateway controller ---
-    // Primary: Gateway stream with generation predicate (breaks feedback loop).
-    // Secondary: watches_stream() per resource type with targeted mappers.
-    //
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
     // Secret → map to Gateways referencing it in TLS config (targeted)
     // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
@@ -323,8 +318,8 @@ pub async fn run_controller(
         // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
         // No predicate_filter here: it caches generation per object key and never
         // clears on delete, so delete+recreate with the same name (common in
-        // conformance tests) would be suppressed. The status feedback loop is
-        // already broken by the primary Gateway stream's predicate filter.
+        // conformance tests) would be suppressed. The echo of our own status
+        // writes is absorbed by the reconcile fingerprint short-circuit.
         .watches_stream(http_route_stream, move |route: HTTPRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw1)
         })
