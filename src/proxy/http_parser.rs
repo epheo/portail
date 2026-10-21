@@ -41,7 +41,7 @@ pub struct StripSpans {
 
 impl StripSpans {
     #[inline]
-    fn push(&mut self, start: usize, end: usize) {
+    pub(crate) fn push(&mut self, start: usize, end: usize) {
         if (self.len as usize) < MAX_STRIP_SPANS {
             self.spans[self.len as usize] = (start as u32, end as u32);
             self.len += 1;
@@ -189,6 +189,17 @@ pub(crate) fn is_forwarding_claim(name: &[u8]) -> bool {
 /// RFC 9110 5.6.2 token: what a field name or a method must be.
 pub(crate) fn is_token(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&b| is(b, TCHAR))
+}
+
+#[inline(always)]
+pub(crate) fn is_tchar(b: u8) -> bool {
+    is(b, TCHAR)
+}
+
+/// End of the run of field-value bytes (`is_field_value_byte`) from `pos`.
+#[inline(always)]
+pub(crate) fn field_value_end(data: &[u8], pos: usize) -> usize {
+    scan(data, pos, VALUE, 0x20, VALUE_HOLES)
 }
 
 /// RFC 9110 5.5: any byte but a CTL other than HTAB. obs-text (0x80-0xFF)

@@ -25,11 +25,12 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
     absolute_form_target, apply_request_header_modifications, apply_response_header_mods,
     assemble_forward_headers, assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods,
-    extract_url_rewrite, header_lines, sanitize_response_headers, to_origin_form,
-    HeaderModifications, MIRROR_BODY_MAX,
+    extract_url_rewrite, header_lines, is_hop_by_hop_response_header, sanitize_response_headers,
+    to_origin_form, HeaderModifications, ResponseCuts, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{
-    find_header_end, is_field_value_byte, is_token, parse_digits, trim_ows,
+    field_value_end, find_header_end, is_field_value_byte, is_tchar, is_token, parse_digits,
+    trim_ows,
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
@@ -1949,8 +1950,8 @@ async fn forward_response_headers(
             return Ok(HeaderPhase::ErrorSent(504));
         }
     };
-    let (resp_header_end, head) = match read {
-        HeadRead::Head(end, head) => (end, head),
+    let (resp_header_end, head, cuts) = match read {
+        HeadRead::Head(end, head, cuts) => (end, head, cuts),
         HeadRead::Malformed => {
             warn!("Backend sent a response head with ambiguous framing; rejecting");
             send_error_response(client, 502).await?;
@@ -2006,6 +2007,7 @@ async fn forward_response_headers(
     sanitize_response_headers(
         &header_buf[..resp_header_end],
         content_length,
+        cuts.as_ref(),
         !keep,
         scratch,
     );
@@ -2212,7 +2214,7 @@ const MAX_INTERIM_RESPONSES: u32 = 8;
 enum HeadRead {
     /// The final (non-interim) head and where it ends: `header_buf` holds
     /// `[headers..header_end][same-read body tail...]`.
-    Head(usize, ResponseHead),
+    Head(usize, ResponseHead, Option<ResponseCuts>),
     /// A head, interim ones included, a recipient could frame differently
     /// (see `parse_response_head`).
     Malformed,
@@ -2247,30 +2249,30 @@ async fn read_response_head(
     loop {
         // Check before reading: a swallowed interim response leaves the next
         // response's bytes already buffered.
-        if let Some(header_end) = find_header_end(header_buf) {
-            let Some(head) = parse_response_head(&header_buf[..header_end]) else {
-                return Ok(HeadRead::Malformed);
-            };
-
-            // Interim responses are proxy-consumed: the proxy answers
-            // 100-continue itself (Expect never reaches the backend), and
-            // relaying other 1xx mid-exchange would confuse clients that
-            // already got a 100. 1xx has no body, so everything past the
-            // block belongs to the next response. 101 is not interim here:
-            // the caller dispatches it (upgrade accept or reject).
-            if (100..200).contains(&head.status) && head.status != 101 {
-                interim_seen += 1;
-                if interim_seen > MAX_INTERIM_RESPONSES {
-                    return Err(anyhow::anyhow!(
-                        "backend sent more than {} interim 1xx responses",
-                        MAX_INTERIM_RESPONSES
-                    ));
+        match scan_response_head(header_buf) {
+            HeadScan::Partial => {}
+            HeadScan::Malformed => return Ok(HeadRead::Malformed),
+            HeadScan::Head(header_end, head, cuts) => {
+                // Interim responses are proxy-consumed: the proxy answers
+                // 100-continue itself (Expect never reaches the backend), and
+                // relaying other 1xx mid-exchange would confuse clients that
+                // already got a 100. 1xx has no body, so everything past the
+                // block belongs to the next response. 101 is not interim here:
+                // the caller dispatches it (upgrade accept or reject).
+                if (100..200).contains(&head.status) && head.status != 101 {
+                    interim_seen += 1;
+                    if interim_seen > MAX_INTERIM_RESPONSES {
+                        return Err(anyhow::anyhow!(
+                            "backend sent more than {} interim 1xx responses",
+                            MAX_INTERIM_RESPONSES
+                        ));
+                    }
+                    debug!("Swallowing backend interim {} response", head.status);
+                    header_buf.drain(..header_end);
+                    continue;
                 }
-                debug!("Swallowing backend interim {} response", head.status);
-                header_buf.drain(..header_end);
-                continue;
+                return Ok(HeadRead::Head(header_end, head, cuts));
             }
-            return Ok(HeadRead::Head(header_end, head));
         }
 
         if header_buf.len() > RESPONSE_HEADER_CAP {
@@ -5579,6 +5581,152 @@ pub(crate) struct ResponseHead {
     pub(crate) backend_close: bool,
 }
 
+/// What [`scan_response_head`] found at the front of a buffer.
+pub(crate) enum HeadScan {
+    /// No blank line ends a head yet.
+    Partial,
+    /// A whole head a recipient could frame differently (see
+    /// [`parse_response_head`]).
+    Malformed,
+    /// A head and where it ends; with the sanitizer's cuts when its lines
+    /// were regular.
+    Head(usize, ResponseHead, Option<ResponseCuts>),
+}
+
+/// The head at the front of `data`, read exactly as `find_header_end` then
+/// [`parse_response_head`] read it. A regular head (every line ended by
+/// CRLF, none empty) takes one pass that also records the sanitizer's
+/// cuts; anything else goes through those two.
+pub(crate) fn scan_response_head(data: &[u8]) -> HeadScan {
+    if let Some(scan) = scan_regular_head(data) {
+        return scan;
+    }
+    let Some(end) = find_header_end(data) else {
+        return HeadScan::Partial;
+    };
+    match parse_response_head(&data[..end]) {
+        Some(head) => HeadScan::Head(end, head, None),
+        None => HeadScan::Malformed,
+    }
+}
+
+/// How a regular line ends.
+enum LineEnd {
+    /// At the CR of its CRLF.
+    Cr(usize),
+    /// Past the end of the data so far.
+    Partial,
+    /// A bare CR or LF: only the two-pass reading decides such a head.
+    Irregular,
+}
+
+/// The CR ending the line whose value starts at `pos`. Other CTLs are value
+/// bytes to `parse_response_head`, so they are passed over.
+#[inline(always)]
+fn line_end(data: &[u8], mut pos: usize) -> LineEnd {
+    loop {
+        pos = field_value_end(data, pos);
+        match data.get(pos..pos + 2) {
+            Some(b"\r\n") => return LineEnd::Cr(pos),
+            Some([b'\r' | b'\n', _]) => return LineEnd::Irregular,
+            Some(_) => pos += 1,
+            None => return LineEnd::Partial,
+        }
+    }
+}
+
+/// [`scan_response_head`]'s one pass. `None` for any head but a regular,
+/// well-formed one, or a regular start of one (`Partial`): no "\r\n\r\n"
+/// can hide in a run of CRLF-ended lines but at their blank line.
+fn scan_regular_head(data: &[u8]) -> Option<HeadScan> {
+    let status_end = match line_end(data, 0) {
+        LineEnd::Cr(cr) => cr,
+        LineEnd::Partial => return Some(HeadScan::Partial),
+        LineEnd::Irregular => return None,
+    };
+    let (status, is_http10) = parse_status_line(&data[..status_end])?;
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    let (mut close, mut keep_alive) = (false, false);
+    let mut cuts = ResponseCuts::default();
+
+    let mut pos = status_end + 2;
+    loop {
+        match data.get(pos..pos + 2) {
+            Some(b"\r\n") => break,
+            Some([b'\r' | b'\n', _]) => return None,
+            Some(_) => {}
+            None => return Some(HeadScan::Partial),
+        }
+        let start = pos;
+        while data.get(pos).is_some_and(|&b| is_tchar(b)) {
+            pos += 1;
+        }
+        match data.get(pos) {
+            Some(b':') if pos > start => {}
+            None => return Some(HeadScan::Partial),
+            Some(_) => return None,
+        }
+        let colon = pos;
+        let cr = match line_end(data, colon + 1) {
+            LineEnd::Cr(cr) => cr,
+            LineEnd::Partial => return Some(HeadScan::Partial),
+            LineEnd::Irregular => return None,
+        };
+        pos = cr + 2;
+        let (name, value) = (&data[start..colon], &data[colon + 1..cr]);
+        match (name.len(), name[0] | 0x20) {
+            (14, b'c') if name.eq_ignore_ascii_case(b"content-length") => {
+                let digits = trim_ows(value);
+                let n = parse_digits(digits)?;
+                match content_length {
+                    None => {
+                        let at = digits.as_ptr() as usize - data.as_ptr() as usize;
+                        let zeros = digits.iter().take_while(|&&b| b == b'0').count();
+                        let from = at + zeros.min(digits.len() - 1);
+                        let to = at + digits.len();
+                        cuts.length = Some(((start as u32, pos as u32), (from as u32, to as u32)));
+                    }
+                    Some(seen) if seen != n => return None,
+                    Some(_) => cuts.strip.push(start, pos),
+                }
+                content_length = Some(n);
+            }
+            (17, b't') if name.eq_ignore_ascii_case(b"transfer-encoding") => {
+                if chunked || !trim_ows(value).eq_ignore_ascii_case(b"chunked") {
+                    return None;
+                }
+                chunked = true;
+            }
+            (10, b'c') if name.eq_ignore_ascii_case(b"connection") => {
+                for token in value.split(|&b| b == b',').map(trim_ows) {
+                    close |= token.eq_ignore_ascii_case(b"close");
+                    keep_alive |= token.eq_ignore_ascii_case(b"keep-alive");
+                }
+                cuts.strip.push(start, pos);
+            }
+            _ if is_hop_by_hop_response_header(name) => cuts.strip.push(start, pos),
+            _ => {}
+        }
+    }
+
+    if chunked && is_http10 {
+        return None;
+    }
+    let body = match (chunked, content_length) {
+        (true, _) => BodyFraming::Chunked,
+        (false, Some(n)) => BodyFraming::Length(n),
+        (false, None) => BodyFraming::Close,
+    };
+    let head = ResponseHead {
+        status,
+        body,
+        backend_close: close || (is_http10 && !keep_alive),
+    };
+    let cuts = (!cuts.strip.needs_slow_path).then_some(cuts);
+    Some(HeadScan::Head(pos + 2, head, cuts))
+}
+
 /// `None` when a recipient could frame the head differently than this
 /// reading: a status line other than `HTTP/1.x SP 3DIGIT [SP reason]`, a
 /// Content-Length other than one `1*DIGIT` value (repeated lines must
@@ -5937,6 +6085,126 @@ mod tests {
         let head = b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(parse_response_head(head), None);
         assert_eq!(parse_response_head(b"HTTP/1.1 200 OK\rX\r\n\r\n"), None);
+    }
+
+    /// The two-pass reading `scan_response_head` must equal: `Partial` is
+    /// `None`, `Malformed` is `Some((end, None))`.
+    fn two_pass(data: &[u8]) -> Option<(usize, Option<ResponseHead>)> {
+        let end = find_header_end(data)?;
+        Some((end, parse_response_head(&data[..end])))
+    }
+
+    fn sanitized(head: &[u8], parsed: &ResponseHead, cuts: Option<&ResponseCuts>) -> Vec<u8> {
+        let content_length = match parsed.body {
+            BodyFraming::Length(n) => Some(n),
+            BodyFraming::Chunked | BodyFraming::Close => None,
+        };
+        let mut out = Vec::new();
+        for close in [false, true] {
+            sanitize_response_headers(head, content_length, cuts, close, &mut out);
+            out.push(b'|');
+        }
+        out
+    }
+
+    /// Every prefix of random heads, regular or not, reads the same through
+    /// the one pass as through the two, and its cuts sanitize to the same
+    /// bytes as the line-by-line copy.
+    #[test]
+    fn one_pass_head_scan_reads_as_the_two_passes() {
+        let status: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\n",
+            b"HTTP/1.0 200 OK\r\n",
+            b"HTTP/1.1 204\r\n",
+            b"HTTP/1.1 100 Continue\r\n",
+            b"HTTP/1.1 200 O\x00K\r\n",
+            b"HTTP/1.1 200 OK\n",
+            b"HTTP/2 200\r\n",
+            b"\r\n",
+            b"\n",
+        ];
+        let pieces: &[&[u8]] = &[
+            b"Content-Length: 5\r\n",
+            b"content-length:  005 \r\n",
+            b"Content-Length: 0\r\n",
+            b"Content-Length: 000\r\n",
+            b"Content-Length: 6\r\n",
+            b"Content-Length: 5, 5\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"transfer-encoding: \tChunked\r\n",
+            b"Transfer-Encoding: gzip\r\n",
+            b"Connection: close\r\n",
+            b"connection: keep-alive, Upgrade\r\n",
+            b"Keep-Alive: timeout=5\r\n",
+            b"Proxy-Connection: x\r\n",
+            b"TE: trailers\r\n",
+            b"Trailer: X\r\n",
+            b"Upgrade: h2c\r\n",
+            b"Server: x\r\n",
+            b"X-A: \x00\x7f\xff\tv \r\n",
+            b"X-B:\r\n",
+            b"X(A): 1\r\n",
+            b": x\r\n",
+            b"X-A 1\r\n",
+            b" folded\r\n",
+            b"X-A: 1\n",
+            b"X-A: 1\r\r\n",
+            b"X-A: 1\rX\r\n",
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b"ok",
+        ];
+        let mut rng = fastrand::Rng::with_seed(9112);
+        let (mut regular, mut irregular) = (0, 0);
+        for _ in 0..20_000 {
+            let mut data = status[rng.usize(..status.len())].to_vec();
+            for _ in 0..rng.usize(0..12) {
+                data.extend_from_slice(pieces[rng.usize(..pieces.len())]);
+            }
+            if rng.bool() {
+                data.extend_from_slice(b"\r\n");
+            }
+            for len in 0..=data.len() {
+                let data = &data[..len];
+                let want = two_pass(data);
+                match scan_response_head(data) {
+                    HeadScan::Partial => assert_eq!(want, None, "{data:?}"),
+                    HeadScan::Malformed => assert!(matches!(want, Some((_, None))), "{data:?}"),
+                    HeadScan::Head(end, head, cuts) => {
+                        assert_eq!(want, Some((end, Some(head))), "{data:?}");
+                        if cuts.is_some() {
+                            regular += 1;
+                        } else {
+                            irregular += 1;
+                        }
+                        assert_eq!(
+                            sanitized(&data[..end], &head, cuts.as_ref()),
+                            sanitized(&data[..end], &head, None),
+                            "{data:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Both paths ran.
+        assert!(regular > 1000 && irregular > 1000, "{regular} {irregular}");
+    }
+
+    #[test]
+    fn a_regular_head_is_cut_in_one_pass() {
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\ncontent-length: 02\r\nConnection: keep-alive\r\nETag: x\r\n\r\nok";
+        let HeadScan::Head(end, head, Some(cuts)) = scan_response_head(wire) else {
+            panic!("not read as a regular head");
+        };
+        assert_eq!(end, wire.len() - 2);
+        assert_eq!(head.body, BodyFraming::Length(2));
+        let mut out = Vec::new();
+        sanitize_response_headers(&wire[..end], Some(2), Some(&cuts), true, &mut out);
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nETag: x\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]
