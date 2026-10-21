@@ -670,6 +670,7 @@ async fn serve_http(
                         status: 429,
                         location: None,
                         reusable: keep_open(&state.drain, meta.local_reply_reusable),
+                        read_whole: meta.read_whole,
                         head: meta.is_head,
                     };
                     if !send_local_reply(client, state, &reply, access).await? {
@@ -2448,11 +2449,12 @@ where
 
 /// Answer a request the proxy handles itself (redirect, 404, 429, 500, 503)
 /// and access-log it. Returns whether the connection stays open; the reply
-/// announces `Connection: close` exactly when it does not, and the close
-/// then lingers: a reply that closes is one sent without reading the whole
-/// request. Staying open matters most for 429: a throttled client's next
-/// request would otherwise cost a fresh TLS handshake, more of our CPU than
-/// the refused request.
+/// announces `Connection: close` exactly when it does not. The close
+/// lingers only while some of the request may still be on the wire, never
+/// for a drain or the client's own `Connection: close`: a client keeping
+/// its socket open would hold the close for nothing. Staying open matters
+/// most for 429: a throttled client's next request would otherwise cost a
+/// fresh TLS handshake, more of our CPU than the refused request.
 async fn send_local_reply(
     client: &mut Connection,
     state: &mut ConnectionState,
@@ -2461,7 +2463,7 @@ async fn send_local_reply(
 ) -> Result<bool> {
     let location = reply.location.as_deref();
     let bytes = local_reply_bytes(reply.status, location, !reply.reusable, reply.head);
-    state.linger = !reply.reusable;
+    state.linger = !reply.read_whole;
     client.write_all(&bytes).await?;
     client.flush().await?;
     crate::access_log::emit(access, reply.status, None);
@@ -4180,6 +4182,44 @@ mod connection_tests {
             assert!(client.take_error().unwrap().is_none(), "{host}: reset");
             assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
         }
+    }
+
+    /// A local reply that closes for the drain, or for the client's own
+    /// Connection: close, has read the whole request: nothing is left to
+    /// read off, so a client keeping its socket open cannot hold the close.
+    #[tokio::test]
+    async fn a_closing_reply_to_a_whole_request_does_not_linger() {
+        let budget = Duration::from_secs(2);
+        let state = |drain: &CancellationToken| {
+            let mut state = conn_state(RouteTable::new(), false);
+            state.client_header_timeout = budget;
+            state.drain = drain.clone();
+            state
+        };
+        let closed_at_once = |engine: tokio::task::JoinHandle<Result<()>>| async move {
+            let ended = tokio::time::timeout(budget / 2, engine).await;
+            ended.expect("the close lingered").unwrap().unwrap();
+        };
+
+        let (mut client, engine) = tcp_client(state(&CancellationToken::new())).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: nope.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = read_one_reply(&mut client).await;
+        assert!(reply.contains("\r\nConnection: close\r\n"), "{reply}");
+        closed_at_once(engine).await;
+
+        // The drain starts while the head arrives.
+        let drain = CancellationToken::new();
+        let (mut client, engine) = tcp_client(state(&drain)).await;
+        client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drain.cancel();
+        client.write_all(b"Host: nope.test\r\n\r\n").await.unwrap();
+        let reply = read_one_reply(&mut client).await;
+        assert!(reply.contains("\r\nConnection: close\r\n"), "{reply}");
+        closed_at_once(engine).await;
     }
 
     /// Lingering is bounded: by the header budget for a client that sends
