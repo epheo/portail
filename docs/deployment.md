@@ -84,6 +84,12 @@ See: `examples/kubernetes/multi-network/`
 ghcr.io/epheo/portail:latest
 ```
 
+Tags:
+- `X.Y.Z` and `X.Y`: releases; `latest` is the last release.
+- `main` and `sha-<commit>`: every commit on main, between releases.
+
+A release is a `vX.Y.Z` tag on main, made after `scripts/release.sh X.Y.Z` set the versions in a merged commit.
+
 Build from source (compiles inside the build stage):
 
 ```bash
