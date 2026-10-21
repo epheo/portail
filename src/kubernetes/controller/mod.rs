@@ -5,6 +5,8 @@
 //! listener/Gateway condition computation).
 
 mod reconcile;
+#[cfg(test)]
+mod testkit;
 mod validate;
 mod watch;
 
@@ -94,15 +96,11 @@ struct ControllerCtx {
     /// Flipped to true once the data plane has bound this instance's listener
     /// ports. Surfaced via the readiness endpoint for the pod's readinessProbe.
     ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Fingerprint of the last reconcile pass that was fully applied — config
-    /// built + route table swapped + every status PATCH accepted. When a new
-    /// pass computes the same fingerprint, the rebuild and all status writes
-    /// are skipped: this is what keeps a permanently-unaccepted route (or our
-    /// own status-write watch echoes) from re-running regex compilation, DNS
-    /// resolution, and N apiserver PATCHes on every requeue. Keyed per
-    /// Gateway: a single shared slot meant that in unscoped mode two
-    /// Gateways' alternating passes never matched and re-applied forever.
-    last_applied: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
+    /// The data plane's last apply: the effective config's fingerprint and
+    /// its build outcome. A pass with the same fingerprint and live
+    /// listeners skips the bind and the rebuild, so watch echoes and
+    /// requeues do not re-run regex compilation and DNS resolution.
+    last_applied: Arc<std::sync::Mutex<Option<reconcile::Applied>>>,
     /// Serializes the apply section of reconcile (merge → ensure → table
     /// build → swap → status). kube-rs reconciles different Gateways
     /// concurrently in unscoped mode, and interleaved passes could publish a
@@ -146,8 +144,9 @@ pub async fn run_controller(
     // per key and never clears on delete, so deleting and recreating a Gateway
     // with the same name (recreates restart at generation 1) would be
     // suppressed and the recreated Gateway never reconciled. Status-only watch
-    // echoes of our own writes are instead absorbed by the reconcile
-    // fingerprint short-circuit, which skips the rebuild and all PATCHes.
+    // echoes of our own writes are instead absorbed by reconcile: the
+    // data-plane fingerprint skips the rebuild, and status that already
+    // matches the store is not written.
     //
     // When `gateway_scope` is set (operator-managed Deployments), narrow the
     // watch to that single Gateway via namespace + `metadata.name` field
@@ -263,7 +262,7 @@ pub async fn run_controller(
         performance_config,
         manage_gateway_status,
         ready,
-        last_applied: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        last_applied: Arc::new(std::sync::Mutex::new(None)),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         started: std::time::Instant::now(),
@@ -321,7 +320,7 @@ pub async fn run_controller(
         // No predicate_filter here: it caches generation per object key and never
         // clears on delete, so delete+recreate with the same name (common in
         // conformance tests) would be suppressed. The echo of our own status
-        // writes is absorbed by the reconcile fingerprint short-circuit.
+        // writes finds nothing to write.
         .watches_stream(http_route_stream, move |route: HTTPRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw1)
         })
@@ -388,8 +387,8 @@ pub async fn run_controller(
 /// in 5s so a status write that raced an unsynced reflector cache (or a
 /// missed watch event) heals well inside the conformance 60s accept-gate.
 /// A route held permanently not-Accepted only pays this fast cadence once:
-/// the next pass sees an unchanged fingerprint, skips the rebuild and status
-/// writes, and drops to the `skip_requeue_secs` cadence.
+/// the next pass finds nothing to rebuild or write and drops to the
+/// `skip_requeue_secs` cadence.
 fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
         600
@@ -398,9 +397,8 @@ fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     }
 }
 
-/// Requeue cadence after a short-circuited reconcile (fingerprint unchanged):
-/// nothing was rebuilt or written, so the fast heal cadence has nothing to
-/// heal — back off to a periodic re-check instead.
+/// Requeue cadence after a reconcile that rebuilt and wrote nothing: the
+/// fast heal cadence has nothing to heal, so back off to a periodic re-check.
 fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
         600

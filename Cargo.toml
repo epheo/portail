@@ -58,6 +58,8 @@ hyper = "0.14"
 libc = "0.2"
 rewrk-core = "0.1.3"
 tempfile = "3"
+# service_fn for a mock kube Client in controller tests; kube already builds tower.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "routing_bench"
