@@ -835,7 +835,7 @@ fn collect_routes<R: GatewayRoute>(
         let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
         // Group/kind (core Service only), cross-namespace ReferenceGrant,
-        // and service existence — one checker for forward and mirror refs.
+        // and service existence: one checker for forward and mirror refs.
         let check_ref =
             |backend_name: &str, group: &str, ref_kind: &str| -> Option<(&'static str, String)> {
                 if (!group.is_empty() && group != "core")
