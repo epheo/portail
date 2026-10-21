@@ -409,26 +409,50 @@ impl DataPlane {
             .insert(endpoint, ListenerSlot::Running(handle, cancel));
     }
 
-    /// Dynamically add TCP/UDP listeners for new ports. Called by the K8s
-    /// controller when new Gateway ports are discovered. One listener per
-    /// (address, port); accept work is distributed by the Tokio runtime.
-    /// Builds TLS acceptors from in-memory cert data when listeners use
-    /// HTTPS/TLS. For already-bound ports, updates the TLS config via
-    /// `DynamicTlsAcceptor` hot-reload. Returns `(ports_opened, errors)`.
-    pub fn add_tcp_listeners(
+    /// The (address, bound port) endpoints `listener_configs` bind: each
+    /// listener on each of `addresses`, or, with none, on its own address
+    /// or every interface. A wildcard endpoint stands for the specific ones
+    /// on its port: it already takes their traffic, routing is port-keyed,
+    /// and Linux refuses a specific bind beside a listening wildcard.
+    fn desired_endpoints(
+        listener_configs: &[ListenerConfig],
+        addresses: &[String],
+    ) -> std::collections::HashSet<(Option<String>, u16)> {
+        let mut desired: std::collections::HashSet<(Option<String>, u16)> = listener_configs
+            .iter()
+            .flat_map(|lc| {
+                let bound_port = lc.target_port.unwrap_or(lc.port);
+                let addrs: Vec<Option<String>> = if addresses.is_empty() {
+                    vec![lc.address.clone()]
+                } else {
+                    addresses.iter().cloned().map(Some).collect()
+                };
+                addrs.into_iter().map(move |addr| (addr, bound_port))
+            })
+            .collect();
+        let wildcard_ports: std::collections::HashSet<u16> = desired
+            .iter()
+            .filter(|(addr, _)| addr.is_none())
+            .map(|(_, port)| *port)
+            .collect();
+        desired.retain(|(addr, port)| addr.is_none() || !wildcard_ports.contains(port));
+        desired
+    }
+
+    /// Reap dead accept loops, and close the endpoints `listener_configs` x
+    /// `addresses` no longer wants: a listener removed from the spec, or a
+    /// wildcard whose port moved to specific addresses (or the reverse).
+    /// Returns the closed loops. Each releases its socket as it exits, and
+    /// until then a bind overlapping it fails: await them first to rebind
+    /// in the same pass.
+    pub fn close_unwanted(
         &mut self,
         listener_configs: &[ListenerConfig],
         addresses: &[String],
-        routes: Arc<ArcSwap<RouteTable>>,
-        performance_config: &crate::config::PerformanceConfig,
-    ) -> (usize, Vec<(u16, String)>) {
-        let mut opened = 0usize;
-        let mut errors = Vec::new();
-
-        // Reap finished accept loops before anything else: a finished task
-        // means its socket is gone (the listener lives inside the task), so
-        // the endpoint must stop counting as bound — the bind loop below
-        // then re-opens it this same pass.
+    ) -> Vec<JoinHandle<()>> {
+        // A finished task means its socket is gone (the listener lives
+        // inside the task), so the endpoint must stop counting as bound;
+        // the bind loop then re-opens it this same pass.
         self.listener_tasks.retain(|(addr, bound_port), slot| {
             if slot.alive() {
                 true
@@ -442,50 +466,29 @@ impl DataPlane {
             }
         });
 
-        // If addresses are specified, bind each listener to each address.
-        // Otherwise, bind to the listener's own address (or 0.0.0.0).
-        let bind_addrs: Vec<Option<&str>> = if addresses.is_empty() {
-            vec![None]
-        } else {
-            addresses.iter().map(|a| Some(a.as_str())).collect()
-        };
-
-        // Tear down endpoints the spec no longer wants — without this, a
-        // listener removed from the Gateway kept its port serving until pod
-        // restart. Desired = the same (effective_addr, bound_port) product
-        // the bind loop below computes. A wildcard socket stays as long as
-        // ANY listener still wants its port: routing is port-keyed, it
-        // already serves every address, and replacing it with an
-        // address-specific bind would dark the port for a pass (cancel is
-        // async, the socket closes when the task observes it).
-        let desired: std::collections::HashSet<(Option<String>, u16)> = listener_configs
-            .iter()
-            .flat_map(|lc| {
-                let bound_port = lc.target_port.unwrap_or(lc.port);
-                bind_addrs
-                    .iter()
-                    .map(move |ba| (ba.or(lc.address.as_deref()).map(String::from), bound_port))
+        let desired = Self::desired_endpoints(listener_configs, addresses);
+        let closing = self
+            .listener_tasks
+            // Pre-start sockets (standalone mode) are never managed here.
+            .extract_if(|endpoint, slot| {
+                !desired.contains(endpoint) && !matches!(slot, ListenerSlot::Pending)
             })
-            .collect();
-        let desired_ports: std::collections::HashSet<u16> =
-            desired.iter().map(|(_, p)| *p).collect();
-        self.listener_tasks.retain(|endpoint, slot| {
-            let keep = desired.contains(endpoint)
-                || (endpoint.0.is_none() && desired_ports.contains(&endpoint.1))
-                // Pre-start sockets (standalone mode) are never managed here.
-                || matches!(slot, ListenerSlot::Pending);
-            if !keep {
+            .filter_map(|(endpoint, slot)| {
                 info!(
                     "Listener {}:{} no longer in spec; closing",
                     endpoint.0.as_deref().unwrap_or("*"),
                     endpoint.1
                 );
-                if let ListenerSlot::Running(_, cancel) = slot {
-                    cancel.cancel();
+                match slot {
+                    ListenerSlot::Running(handle, cancel) => {
+                        cancel.cancel();
+                        Some(handle)
+                    }
+                    ListenerSlot::Pending => None,
                 }
-            }
-            keep
-        });
+            })
+            .collect();
+
         // Drop TLS state for ports no longer configured, so a re-added port
         // rebuilds its ServerConfig from current certs instead of a stale one.
         let live_ports: std::collections::HashSet<u16> =
@@ -493,6 +496,39 @@ impl DataPlane {
         self.tls_configs.retain(|port, _| live_ports.contains(port));
         self.tls_cert_hashes
             .retain(|port, _| live_ports.contains(port));
+        closing
+    }
+
+    /// Dynamically add TCP/UDP listeners for new ports. Called by the K8s
+    /// controller when new Gateway ports are discovered. One listener per
+    /// (address, port); accept work is distributed by the Tokio runtime.
+    /// Builds TLS acceptors from in-memory cert data when listeners use
+    /// HTTPS/TLS. For already-bound ports, updates the TLS config via
+    /// `DynamicTlsAcceptor` hot-reload. Returns `(ports_opened, errors)`.
+    ///
+    /// Closes what is no longer wanted first, as [`Self::close_unwanted`]
+    /// does: a bind overlapping a socket closed this call can fail until
+    /// its accept loop exits, and the next call retries it.
+    pub fn add_tcp_listeners(
+        &mut self,
+        listener_configs: &[ListenerConfig],
+        addresses: &[String],
+        routes: Arc<ArcSwap<RouteTable>>,
+        performance_config: &crate::config::PerformanceConfig,
+    ) -> (usize, Vec<(u16, String)>) {
+        let mut opened = 0usize;
+        let mut errors = Vec::new();
+
+        self.close_unwanted(listener_configs, addresses);
+        let desired = Self::desired_endpoints(listener_configs, addresses);
+
+        // If addresses are specified, bind each listener to each address.
+        // Otherwise, bind to the listener's own address (or 0.0.0.0).
+        let bind_addrs: Vec<Option<&str>> = if addresses.is_empty() {
+            vec![None]
+        } else {
+            addresses.iter().map(|a| Some(a.as_str())).collect()
+        };
 
         // Reconcile per-port TLS state FIRST, gated by the cheap fingerprint:
         // build_server_config (full PEM parse + key load for every ref) runs
@@ -544,15 +580,9 @@ impl DataPlane {
             for &bind_addr in &bind_addrs {
                 let effective_addr = bind_addr.or(listener_cfg.address.as_deref());
                 let endpoint = (effective_addr.map(String::from), bound_port);
-                if self.endpoint_alive(&endpoint) {
-                    continue; // Endpoint already bound with a live accept loop
-                }
-                // A wildcard socket we already hold serves every address on
-                // the port (routing is port-keyed); an additional
-                // address-specific bind adds nothing and, depending on the
-                // platform's overlap rules, can fail EADDRINUSE against our
-                // own wildcard socket.
-                if endpoint.0.is_some() && self.endpoint_alive(&(None, bound_port)) {
+                // Already bound, or a specific address the port's wildcard
+                // stands for.
+                if self.endpoint_alive(&endpoint) || !desired.contains(&endpoint) {
                     continue;
                 }
 
@@ -696,8 +726,9 @@ impl DataPlane {
         required.iter().all(|ep| {
             self.endpoint_alive(ep)
                 // A wildcard socket on the port already accepts traffic for
-                // any specific address; routing is keyed on the port. The
-                // reverse does NOT hold: a required wildcard bind is not
+                // any specific address; routing is keyed on the port. It is
+                // still open only while the spec wants it (close_unwanted).
+                // The reverse does NOT hold: a required wildcard bind is not
                 // satisfied by an address-specific one.
                 || (ep.0.is_some() && self.endpoint_alive(&(None, ep.1)))
         })
@@ -770,6 +801,27 @@ fn create_udp_socket(
     socket.bind(&addr.into())?;
 
     Ok(socket.into())
+}
+
+#[cfg(test)]
+pub(crate) mod test_ports {
+    use std::hash::BuildHasher;
+
+    /// A port free on every interface, below the ephemeral range. The
+    /// kernel hands ephemeral ports to this process's client sockets, and
+    /// one took a wildcard port between its probe and its bind.
+    pub(crate) fn wildcard() -> u16 {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        let first_ephemeral: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+        let unprivileged = 1024..first_ephemeral;
+        let len = unprivileged.len();
+        // Tests running beside this one start elsewhere.
+        let start = std::hash::RandomState::new().hash_one(()) as usize;
+        (0..len)
+            .map(|i| unprivileged.start + ((start + i) % len) as u16)
+            .find(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_ok())
+            .expect("a free port below the ephemeral range")
+    }
 }
 
 #[cfg(test)]
@@ -1051,37 +1103,105 @@ mod tests {
         );
     }
 
-    /// A wildcard bind on a port covers every specific address: readiness
-    /// treats (Some(addr), port) as served by (None, port), and the bind loop
-    /// must not attempt an address-specific re-bind (which can EADDRINUSE
-    /// against our own wildcard socket, keeping Programmed=False forever).
-    #[tokio::test]
-    async fn wildcard_bind_covers_specific_addresses() {
-        let listeners = vec![ListenerConfig {
+    fn http_listener(port: u16, address: Option<&str>) -> ListenerConfig {
+        ListenerConfig {
             name: "http".into(),
             protocol: P::HTTP,
-            port: 23445,
+            port,
             target_port: None,
             hostname: None,
-            address: None, // wildcard
+            address: address.map(str::to_string),
             interface: None,
             tls: None,
             rate_limit: None,
-        }];
+        }
+    }
+
+    fn free_port() -> u16 {
+        test_ports::wildcard()
+    }
+
+    fn accepts(addr: &str, port: u16) -> bool {
+        std::net::TcpStream::connect((addr, port)).is_ok()
+    }
+
+    /// Moves `dp` to one listener on `addresses` as the controller does:
+    /// close, wait for the closed accept loops, bind. Binds again while a
+    /// test beside this one still holds the port, as `bind_until` does.
+    async fn rebind(
+        dp: &mut DataPlane,
+        listeners: &[ListenerConfig],
+        addresses: &[String],
+        routes: &Arc<ArcSwap<RouteTable>>,
+        perf: &crate::config::PerformanceConfig,
+    ) {
+        for accept_loop in dp.close_unwanted(listeners, addresses) {
+            accept_loop.await.unwrap();
+        }
+        for _ in 0..200 {
+            if dp
+                .add_tcp_listeners(listeners, addresses, routes.clone(), perf)
+                .0
+                == 1
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("listener not bound on {addresses:?}");
+    }
+
+    /// A listener that gains a specific address leaves the wildcard for
+    /// it, and goes back when it loses it. The wildcard stayed bound while
+    /// its port was still wanted, exposed on every interface, and counted
+    /// as ready for the specific address, which was never bound.
+    #[tokio::test]
+    async fn wildcard_gives_way_to_a_specific_address_and_back() {
+        // Accepting a probe builds a backend pool: rustls needs its provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = free_port();
+        let listeners = vec![http_listener(port, None)];
+        let (wildcard, specific) = ((None, port), (Some("127.0.0.1".to_string()), port));
         let perf = test_perf();
-        let mut dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        // Same port, now with a concrete bind address (e.g. a Gateway
-        // spec.addresses entry): the wildcard already serves it.
-        let (opened, errors) =
-            dp.add_tcp_listeners(&listeners, &["127.0.0.1".to_string()], routes, &perf);
-        assert_eq!((opened, errors.len()), (0, 0), "no re-bind, no error");
+        rebind(&mut dp, &listeners, &[], &routes, &perf).await;
+        assert!(accepts("127.0.0.2", port));
 
-        assert!(dp.is_ready_for_endpoints(&[(Some("127.0.0.1".to_string()), 23445)]));
-        assert!(dp.is_ready_for_endpoints(&[(None, 23445)]));
-        // The reverse is not satisfied: specific never covers wildcard.
-        assert!(!dp.is_ready_for_endpoints(&[(None, 23446)]));
+        rebind(&mut dp, &listeners, &["127.0.0.1".into()], &routes, &perf).await;
+        assert!(dp.is_ready_for_endpoints(std::slice::from_ref(&specific)));
+        assert!(!dp.is_ready_for_endpoints(std::slice::from_ref(&wildcard)));
+        assert!(accepts("127.0.0.1", port));
+        assert!(!accepts("127.0.0.2", port), "the wildcard is closed");
+
+        rebind(&mut dp, &listeners, &[], &routes, &perf).await;
+        assert!(dp.is_ready_for_endpoints(&[wildcard]));
+        assert!(accepts("127.0.0.2", port));
+    }
+
+    /// A wildcard the spec wants stands for the specific addresses on its
+    /// port, whatever the listener order: a specific bind beside it fails
+    /// EADDRINUSE. The specific listener used to bind first and the
+    /// wildcard then failed.
+    #[tokio::test]
+    async fn a_wanted_wildcard_stands_for_specific_addresses() {
+        // Accepting a probe builds a backend pool: rustls needs its provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = free_port();
+        let listeners = vec![
+            http_listener(port, Some("127.0.0.1")),
+            http_listener(port, None),
+        ];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes, &perf);
+        assert_eq!((opened, errors), (0, vec![]), "nothing left to bind");
+        assert!(dp.is_ready_for_endpoints(&[(None, port), (Some("127.0.0.1".to_string()), port)]));
+        assert!(accepts("127.0.0.2", port));
     }
 
     /// A dead accept loop must drop out of readiness and be rebound by the

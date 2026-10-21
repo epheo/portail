@@ -196,7 +196,7 @@ fn observed_policies(
 /// Open data-plane TCP listeners for this Gateway's ports. Called after the
 /// per-Gateway config is built so ListenerConfig has resolved TLS cert data.
 /// Returns the bind errors, keyed by published port.
-fn ensure_data_plane_listeners(
+async fn ensure_data_plane_listeners(
     ctx: &ControllerCtx,
     listeners: &[crate::config::ListenerConfig],
     bind_addresses: &[String],
@@ -205,6 +205,19 @@ fn ensure_data_plane_listeners(
         "Ensuring data plane listeners for ports: {:?}",
         listeners.iter().map(|l| l.port).collect::<Vec<_>>()
     );
+    let closing = match ctx.data_plane.lock() {
+        Ok(mut dp) => dp.close_unwanted(listeners, bind_addresses),
+        Err(e) => {
+            warn!("Failed to lock data plane: {}", e);
+            return Vec::new();
+        }
+    };
+    // A listener moving between the wildcard and a specific address binds
+    // once its old socket is gone, in this pass: the port is dark until
+    // then, and the next pass is seconds away.
+    for accept_loop in closing {
+        let _ = accept_loop.await;
+    }
     match ctx.data_plane.lock() {
         Ok(mut dp) => {
             let (opened, errors) = dp.add_tcp_listeners(
@@ -731,9 +744,11 @@ async fn apply_data_plane(
     }
 
     let bind_errors = match &bind {
-        Some(bind) => ensure_data_plane_listeners(ctx, &effective_config.gateway.listeners, bind),
+        Some(bind) => {
+            ensure_data_plane_listeners(ctx, &effective_config.gateway.listeners, bind).await
+        }
         // Nothing may bind: close what is open instead of binding the wildcard.
-        None => ensure_data_plane_listeners(ctx, &[], &[]),
+        None => ensure_data_plane_listeners(ctx, &[], &[]).await,
     };
     let ready = is_ready();
     // Store the truth in BOTH directions: readiness must also drop when a
@@ -1317,6 +1332,136 @@ mod tests {
         reconcile(Arc::new(gw), ctx).await.unwrap();
         let patch = api.status_patch("gateways", "gw").unwrap();
         assert_eq!(listener_conditions(&patch)["Programmed"]["status"], "True");
+    }
+
+    /// This host's first IPv4 address off loopback: one a Gateway can name.
+    fn local_ipv4() -> Option<String> {
+        discover_usable_addresses()
+            .interface_ips
+            .into_iter()
+            .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+    }
+
+    fn free_port() -> u16 {
+        crate::proxy::data_plane::test_ports::wildcard()
+    }
+
+    fn with_addresses(mut gw: Gateway, generation: i64, addrs: &[(&str, &str)]) -> Gateway {
+        gw.metadata.generation = Some(generation);
+        gw.spec.addresses = Some(
+            addrs
+                .iter()
+                .map(|(kind, value)| gateway_api::gateways::GatewayAddresses {
+                    r#type: Some(kind.to_string()),
+                    value: Some(value.to_string()),
+                })
+                .collect(),
+        );
+        gw
+    }
+
+    /// Reconciles `gw` as its `generation`-th spec, with `addrs` for
+    /// spec.addresses; returns its first listener's Programmed condition.
+    async fn reconcile_with(
+        api: &MockApi,
+        cluster: &mut TestCluster,
+        ctx: &Arc<ControllerCtx>,
+        gw: &Gateway,
+        generation: i64,
+        addrs: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let gw = with_addresses(gw.clone(), generation, addrs);
+        apply(&mut cluster.gateways, gw.clone());
+        api.clear();
+        reconcile(Arc::new(gw), ctx.clone()).await.unwrap();
+        let patch = api.status_patch("gateways", "gw").unwrap();
+        listener_conditions(&patch)["Programmed"].clone()
+    }
+
+    /// Runs `test` in a process of its own, on a current-thread runtime.
+    /// These tests close a socket and bind an overlapping one in one pass,
+    /// and a child another test spawns holds this process's sockets until
+    /// its exec.
+    fn alone(name: &str, test: impl std::future::Future<Output = ()>) {
+        if crate::proxy::test_util::in_own_process(module_path!(), name) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test);
+        }
+    }
+
+    /// A Gateway named `name` with its one listener on `port`.
+    fn gateway_on(name: &str, port: u16) -> Gateway {
+        let mut gw = testkit::gateway(name, 1);
+        gw.spec.listeners[0].port = port.into();
+        gw
+    }
+
+    /// A Gateway that gains a local address moves its listener off the
+    /// wildcard in one pass. The wildcard stayed bound beside the address:
+    /// open on every interface, while Programmed.
+    #[test]
+    fn a_listener_leaves_the_wildcard_for_an_address_in_one_pass() {
+        alone(
+            "a_listener_leaves_the_wildcard_for_an_address_in_one_pass",
+            async {
+                // Accepting a probe builds a backend pool: rustls needs its provider.
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                let Some(ip) = local_ipv4() else {
+                    return; // no address off loopback to name
+                };
+                let port = free_port();
+                let accepts = |addr: &str| std::net::TcpStream::connect((addr, port)).is_ok();
+                let api = MockApi::default();
+                let mut cluster = TestCluster::default();
+                let ctx = cluster.ctx(api.client());
+                let gw = gateway_on("gw", port);
+
+                let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 1, &[]).await;
+                assert_eq!(programmed["status"], "True", "{programmed}");
+                assert!(accepts("127.0.0.1"));
+
+                let address = [("IPAddress", ip.as_str())];
+                let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 2, &address).await;
+                assert_eq!(programmed["status"], "True", "{programmed}");
+                assert!(accepts(&ip));
+                assert!(!accepts("127.0.0.1"), "the wildcard is closed");
+            },
+        );
+    }
+
+    /// And back. The wildcard bind failed against the specific socket,
+    /// still open until its accept loop saw the cancel, and the port stayed
+    /// dark until a later pass.
+    #[test]
+    fn a_listener_leaves_an_address_for_the_wildcard_in_one_pass() {
+        alone(
+            "a_listener_leaves_an_address_for_the_wildcard_in_one_pass",
+            async {
+                // Accepting a probe builds a backend pool: rustls needs its provider.
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                let Some(ip) = local_ipv4() else {
+                    return; // no address off loopback to name
+                };
+                let port = free_port();
+                let accepts = |addr: &str| std::net::TcpStream::connect((addr, port)).is_ok();
+                let api = MockApi::default();
+                let mut cluster = TestCluster::default();
+                let ctx = cluster.ctx(api.client());
+                let gw = gateway_on("gw", port);
+
+                let address = [("IPAddress", ip.as_str())];
+                let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 1, &address).await;
+                assert_eq!(programmed["status"], "True", "{programmed}");
+                assert!(!accepts("127.0.0.1"));
+
+                let programmed = reconcile_with(&api, &mut cluster, &ctx, &gw, 2, &[]).await;
+                assert_eq!(programmed["status"], "True", "{programmed}");
+                assert!(accepts("127.0.0.1"), "the wildcard is bound in this pass");
+            },
+        );
     }
 
     fn endpoint_slice_lists(api: &MockApi) -> usize {
