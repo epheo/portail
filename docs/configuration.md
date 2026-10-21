@@ -177,7 +177,7 @@ Kubernetes mode:
 - A parentRef attaches to the listeners it selects (by `sectionName`, `port`, or all) that admit the route: `allowedRoutes` namespaces and kinds, hostname intersection, and a protocol portail serves.
 - A parentRef without `namespace` names a Gateway in the route's own namespace.
 - A `Conflicted` listener, not distinct from another on its port, is not served: nothing binds, no route attaches, and a parentRef naming it reports `NoMatchingParent`.
-- HTTPS and TLS listeners can share a port if their hostnames differ: one socket serves both, by SNI. Any other two protocols on one port are `ProtocolConflict`.
+- HTTPS and TLS listeners can share a port if their hostnames differ: one socket serves both, by SNI (see [Shared TLS Ports](#shared-tls-ports)). Any other two protocols on one port are `ProtocolConflict`.
 - A TLS listener is served in `Passthrough` mode only: TLSRoute is passthrough here, and an HTTPS listener terminates. A TLS listener in `Terminate` mode reports `Accepted=False` with reason `UnsupportedProtocol`, binds nothing and takes no route.
 - A listener portail does not serve (an unsupported protocol, TLS `Terminate`) conflicts with no other: it is rejected alone.
 - Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
@@ -410,3 +410,16 @@ portail --config config.yaml --cert-dir /path/to/certs
 ```
 
 The default cert directory is `certs`, relative to the working directory.
+
+### Shared TLS Ports
+
+HTTPS and TLS passthrough listeners on one port share one socket:
+
+- The ClientHello's SNI selects one listener, by Gateway API precedence across HTTPS and TLS alike: exact hostname, then the longest wildcard, then the listener without a hostname.
+- A wildcard covers any depth: `*.example.com` takes `a.b.example.com`.
+- An HTTPS listener terminates with its own certificate and routes HTTP by `Host`; a TLS passthrough listener forwards the raw stream by its TLS routes.
+- No SNI, or an SNI no listener names: the listener without a hostname takes it; with none, the connection closes, counted in `portail_listener_tls_handshake_failures_total`.
+- A TLS route matches within its listener only: its hostnames outside the listener's are ignored, and a route without hostnames takes the listener's.
+- A TLS route without parentRefs (a config built without validation) serves every passthrough listener, after that listener's own routes.
+- Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
+- A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
