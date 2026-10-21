@@ -934,11 +934,11 @@ async fn complete_headers(
 }
 
 /// Proxy a single HTTP request to a backend and forward the response.
-/// Returns `(keep, leftover)`: `keep` when the response went out whole and
-/// its head announced keep-alive, which the client may already act on;
-/// `leftover` holds any bytes read past this request's body (a pipelined
-/// next request), which the keepalive loop replays instead of reading from
-/// the socket again.
+/// Returns `(keep, leftover)`: `keep` when the response went out whole, its
+/// head announced keep-alive, which the client may already act on, and the
+/// backend kept to its framing; `leftover` holds any bytes read past this
+/// request's body (a pipelined next request), which the keepalive loop
+/// replays instead of reading from the socket again.
 ///
 /// Owns all timing for the request lifecycle. Two timeouts come in from the rule:
 ///
@@ -1327,9 +1327,11 @@ async fn proxy_http_request(
 
     // Overshoot (bytes past the framing end) poisons the conn: the excess was
     // dropped here but whatever else follows would desync the next response.
+    // A backend framing that wrong may have framed this response wrong too:
+    // the client connection takes no other response after it.
     if framing.overshoot {
         warn!(
-            "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
+            "Backend {} sent bytes past the response framing end; excess dropped, backend and client connections closed",
             backend_addr
         );
     }
@@ -1355,6 +1357,7 @@ async fn proxy_http_request(
         );
     }
 
+    let keep = keep && framing_clean;
     if !keep {
         state.close_after_reply();
     }
@@ -1732,7 +1735,8 @@ async fn resend_on_fresh(
 /// under, or the error status this helper already wrote to the client.
 enum HeaderPhase {
     /// `keep`: the head told the client the connection stays open, which
-    /// holds once the body is through, whatever starts meanwhile.
+    /// holds once the body is through, whatever drain starts meanwhile.
+    /// Only a backend overshooting its framing in the body breaks it.
     Proxied {
         framing: ResponseFraming,
         keep: bool,
@@ -1833,8 +1837,9 @@ async fn forward_response_headers(
         BodyFraming::Chunked | BodyFraming::Close => None,
     };
     // Decided only now that the head is in: a drain that started while
-    // the backend worked is still announced.
-    let keep = keep_open(drain, keepalive) && !framing.close_delimited();
+    // the backend worked is still announced, as is the close an overshoot
+    // that came with the head forces.
+    let keep = keep_open(drain, keepalive) && !framing.close_delimited() && !framing.overshoot;
     sanitize_response_headers(
         &header_buf[..resp_header_end],
         content_length,
@@ -4426,6 +4431,52 @@ mod connection_tests {
             drop(client);
             engine.await.unwrap().unwrap();
         }
+    }
+
+    /// A backend that sends bytes past its response's framing may have
+    /// framed the response itself wrong: the client connection closes after
+    /// it too. The head announces it when the excess came along; otherwise
+    /// the head said keep-alive, and the close reads off the request the
+    /// client pipelined meanwhile.
+    #[tokio::test]
+    async fn backend_overshoot_closes_the_client_connection() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA").await;
+        let (mut client, task) = serve(routes(addr));
+        client.write_all(GET_A).await.unwrap();
+        assert_eq!(
+            read_until_closed(&mut client).await,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        );
+        task.await.unwrap().unwrap();
+
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        const NEXT: &[u8] = b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = conn_state(routes(listener.local_addr().unwrap()), false);
+        let (mut client, engine) = tcp_client(state).await;
+        client.write_all(GET_A).await.unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+        while find_header_end(&seen).is_none() {
+            let n = sock.read(&mut chunk).await.unwrap();
+            seen.extend_from_slice(&chunk[..n]);
+        }
+        sock.write_all(HEAD).await.unwrap();
+        let mut head = vec![0u8; HEAD.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, HEAD);
+        client.write_all(NEXT).await.unwrap();
+        sock.write_all(b"okEXTRA").await.unwrap();
+
+        let mut out = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("the client connection stayed open");
+        let out = String::from_utf8_lossy(&out);
+        assert!(read.is_ok(), "{read:?} after {out}");
+        assert_eq!(out, "ok");
+        drop(client);
+        engine.await.unwrap().unwrap();
     }
 
     /// Reads a request head, answers `reply` without reading the body, and
