@@ -61,6 +61,7 @@ const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 
 /// Upload window per connection: two streams' worth, so one stalled upload
 /// leaves a full window to the connection's other streams.
+/// Two stalled uploads hold all of it: h2 shares one window per connection.
 const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// Size of each response read from the duplex.
