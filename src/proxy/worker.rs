@@ -781,9 +781,11 @@ async fn serve_http(
 /// still arriving makes the kernel reset: an upload then fails its send
 /// instead of reading the reply, and a pipelined request can destroy the
 /// reply not read yet. As nginx's lingering_close does, what still arrives
-/// is read and dropped until the client closes, up to one `buf` of it.
-/// Closing an idle connection, no reply just written, never lingers: its
-/// keep-alive client may hold the socket open, and would hold the drain.
+/// is read and dropped until the client closes or falls silent for
+/// `LINGER_IDLE`, up to one `buf` of it. A drain's close after a reply
+/// lingers too, so a client keeping its socket open holds the drain that
+/// long. An idle connection, no reply just written, closes at once: there
+/// is no reply for a reset to destroy.
 ///
 /// All of it within the client header budget: a client that stops reading,
 /// or never stops sending, cannot hold the close.
@@ -800,12 +802,22 @@ async fn close_connection(client: &mut Connection, buf: &mut [u8], state: &Conne
     }
     let deadline = tokio::time::Instant::now() + state.client_header_timeout;
     let shutdown = tokio::time::timeout_at(deadline, client.shutdown()).await;
-    if !state.linger || !matches!(shutdown, Ok(Ok(()))) {
-        return;
+    if state.linger && matches!(shutdown, Ok(Ok(()))) {
+        read_off(client, buf, deadline).await;
     }
+}
+
+/// How long a lingering close waits for the client's next bytes: a client
+/// silent this long is done. nginx's lingering_timeout default.
+pub const LINGER_IDLE: Duration = Duration::from_secs(5);
+
+/// Read and drop what the client still sends, up to one `buf` of it, until
+/// it closes, falls silent for `LINGER_IDLE`, or `deadline` passes.
+async fn read_off(client: &mut Connection, buf: &mut [u8], deadline: tokio::time::Instant) {
     let mut discarded = 0;
     while discarded < buf.len() {
-        match tokio::time::timeout_at(deadline, client.read(&mut buf[discarded..])).await {
+        let idle = deadline.min(tokio::time::Instant::now() + LINGER_IDLE);
+        match tokio::time::timeout_at(idle, client.read(&mut buf[discarded..])).await {
             Ok(Ok(read)) if read > 0 => discarded += read,
             _ => return,
         }
@@ -4596,9 +4608,9 @@ mod connection_tests {
         uploader.abort();
     }
 
-    /// Lingering is bounded: by the header budget for a client that sends
-    /// nothing more and never closes, and by one buffer's worth of bytes
-    /// for a client that keeps sending.
+    /// Lingering is bounded: by the header budget, here below LINGER_IDLE,
+    /// for a client that sends nothing more and never closes, and by one
+    /// buffer's worth of bytes for a client that keeps sending.
     #[tokio::test]
     async fn a_lingering_close_is_bounded() {
         let head = b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 999999999\r\n\r\n";
@@ -4626,6 +4638,60 @@ mod connection_tests {
         engine.await.unwrap().unwrap();
         assert!(started.elapsed() < budget / 2, "{:?}", started.elapsed());
         sender.await.unwrap();
+    }
+
+    /// A client told to close that keeps its socket open, as urllib3 and
+    /// HttpURLConnection pools do, held its fd and task, and a drain, for
+    /// the whole header budget. Silent for LINGER_IDLE, it is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_lingering_close_ends_once_the_client_falls_silent() {
+        let budget = LINGER_IDLE * 6;
+        let mut state = conn_state(RouteTable::new(), false);
+        state.client_header_timeout = budget;
+        let (mut client, engine) = tcp_client(state).await;
+        let started = tokio::time::Instant::now();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 9\r\n\r\n")
+            .await
+            .unwrap();
+        engine.await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= LINGER_IDLE && elapsed < budget, "{elapsed:?}");
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.starts_with("HTTP/1.1 404 "), "{out}");
+    }
+
+    /// While the client keeps sending, the close reads on: until it falls
+    /// silent for LINGER_IDLE, or the close budget runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_lingering_close_reads_while_the_client_sends() {
+        let budget = LINGER_IDLE * 6;
+        let every = LINGER_IDLE / 2;
+        for (sends, lingered) in [
+            (0, LINGER_IDLE),
+            (4, every * 4 + LINGER_IDLE),
+            (usize::MAX, budget),
+        ] {
+            let (engine, mut client) = tokio::io::duplex(64 * 1024);
+            let mut engine = Connection::Mem {
+                inner: engine,
+                aborted: Default::default(),
+            };
+            let sender = tokio::spawn(async move {
+                for _ in 0..sends {
+                    tokio::time::sleep(every).await;
+                    let _ = client.write_all(b"x").await;
+                }
+                // Never closes.
+                std::future::pending::<()>().await;
+            });
+            let started = tokio::time::Instant::now();
+            read_off(&mut engine, &mut [0u8; 64 * 1024], started + budget).await;
+            assert_eq!(started.elapsed(), lingered, "{sends} sends");
+            sender.abort();
+        }
     }
 
     /// A client that used its whole header budget gets its 408 and the close
