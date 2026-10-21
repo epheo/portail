@@ -218,9 +218,6 @@ impl TestCluster {
             named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(
                 std::time::Duration::from_secs(super::RESYNC_SECS),
             )),
-            pending_watches: Arc::new(super::PendingWatches::new(
-                std::time::Instant::now() + std::time::Duration::from_secs(super::RESYNC_SECS),
-            )),
             started: std::time::Instant::now(),
         })
     }

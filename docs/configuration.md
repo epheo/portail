@@ -142,8 +142,9 @@ A `sectionName`-scoped policy overrides a Gateway-wide one for its listener;
 among policies of equal scope the oldest wins (GEP-713 conflict rule) and
 later ones report `Conflicted` in `status.ancestors`. The policy must live
 in the Gateway's namespace. Without the CRD installed, nothing changes.
-A CRD installed later is watched within ten minutes, without a restart;
-the same holds for TCPRoute, TLSRoute and UDPRoute.
+A CRD installed later is watched without a restart, within ten minutes:
+API discovery is read every ten minutes while a CRD is missing.
+The same holds for TCPRoute, TLSRoute and UDPRoute.
 
 Standalone mode — the same parameters on a listener:
 

@@ -3,7 +3,7 @@
 //! the operator-provided `WatchShape` that decides which gate-able watches a
 //! scoped data plane opens at all.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
@@ -57,8 +57,8 @@ where
 
 /// Like `create_reflector`, for a CRD that may not be installed. When API
 /// discovery does not serve it, the store stays empty and the stream waits
-/// until [`PendingWatches::recheck`] finds it served, so a CRD installed
-/// after startup is watched without a restart.
+/// until [`PendingWatches::recheck_every`] finds it served, so a CRD
+/// installed after startup is watched without a restart.
 pub(super) async fn create_optional_reflector<K>(
     api: Api<K>,
     client: &Client,
@@ -122,36 +122,42 @@ struct PendingWatch {
 
 /// Optional-CRD watches waiting for their CRD. Discovery is readable by
 /// every authenticated client, so the recheck needs no RBAC.
+#[derive(Default)]
 pub(super) struct PendingWatches {
     watches: std::sync::Mutex<Vec<(PendingWatch, tokio::sync::oneshot::Sender<()>)>>,
-    next_check: std::sync::Mutex<Instant>,
 }
 
 impl PendingWatches {
-    pub fn new(first_check: Instant) -> Self {
-        Self {
-            watches: Default::default(),
-            next_check: std::sync::Mutex::new(first_check),
-        }
-    }
-
     fn add(&self, watch: PendingWatch, start: tokio::sync::oneshot::Sender<()>) {
         let mut watches = self.watches.lock().unwrap_or_else(|p| p.into_inner());
         watches.push((watch, start));
     }
 
-    /// Start the watches whose CRD discovery now serves. Runs from
-    /// reconcile, at most once per safety-net requeue interval: no new
-    /// timer, and a quiet cluster still rechecks on its periodic requeue.
-    pub async fn recheck(&self, client: &Client) {
-        let now = Instant::now();
-        {
-            let mut next = self.next_check.lock().unwrap_or_else(|p| p.into_inner());
-            if now < *next {
-                return;
+    fn is_empty(&self) -> bool {
+        self.watches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    /// Recheck every `interval` until no watch waits. Its own timer, not
+    /// reconcile's: a cluster with no Gateway of ours never reconciles.
+    pub async fn recheck_every(
+        self,
+        client: Client,
+        interval: Duration,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        while !self.is_empty() {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => self.recheck(&client).await,
             }
-            *next = now + Duration::from_secs(super::RESYNC_SECS);
         }
+    }
+
+    /// Start the watches whose CRD discovery now serves.
+    async fn recheck(&self, client: &Client) {
         let waiting: Vec<(String, String)> = self
             .watches
             .lock()
@@ -584,55 +590,71 @@ mod tests {
             .any(|r| r.path.starts_with(&watch_path))
     }
 
-    /// A CRD installed after startup is watched from the next recheck; it
-    /// used to stay ignored until a restart.
-    #[tokio::test]
+    const RECHECK: Duration = Duration::from_secs(super::super::RESYNC_SECS);
+
+    /// Lets in-process requests and the tasks they wake run to completion
+    /// without moving the paused clock.
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A CRD installed after startup is watched from the next recheck, on
+    /// the recheck's own timer. Rechecks ran inside reconcile only: with
+    /// no Gateway to reconcile, never.
+    #[tokio::test(start_paused = true)]
     async fn optional_crd_installed_later_starts_its_watch() {
         use gateway_api::experimental::tcproutes::TCPRoute;
         let api = MockApi::default();
         discovery_serves_tcproutes(&api, false);
         let client = api.client();
-        let pending = PendingWatches::new(Instant::now());
+        let pending = PendingWatches::default();
         let (_store, stream) =
             create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
                 .await;
         let driver = tokio::spawn(stream.for_each(|_| async {}));
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let rechecks = tokio::spawn(pending.recheck_every(client, RECHECK, shutdown.clone()));
+        settle().await;
         assert!(!tcproutes_watched(&api), "no watch before the CRD exists");
 
         discovery_serves_tcproutes(&api, true);
-        pending.recheck(&client).await;
-        let started = tokio::time::timeout(Duration::from_secs(5), async {
-            while !tcproutes_watched(&api) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        driver.abort();
+        tokio::time::sleep(RECHECK).await;
+        settle().await;
         assert!(
-            started.is_ok(),
+            tcproutes_watched(&api),
             "the watch starts once discovery serves the CRD"
         );
+        assert!(rechecks.is_finished(), "nothing waits: rechecks stop");
+        driver.abort();
     }
 
-    /// Discovery is read at most once per safety-net interval.
-    #[tokio::test]
-    async fn recheck_waits_for_the_resync_interval() {
+    /// Discovery is read once per resync interval while a CRD is missing.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_is_read_once_per_interval() {
         use gateway_api::experimental::tcproutes::TCPRoute;
         let api = MockApi::default();
         discovery_serves_tcproutes(&api, false);
         let client = api.client();
-        let pending = PendingWatches::new(Instant::now());
+        let pending = PendingWatches::default();
         let _reflector =
             create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
                 .await;
         assert_eq!(discovery_reads(&api), 1, "the startup check");
-        pending.recheck(&client).await;
-        assert_eq!(discovery_reads(&api), 2, "due at once");
-        pending.recheck(&client).await;
-        assert_eq!(discovery_reads(&api), 2, "not again before the interval");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let rechecks = tokio::spawn(pending.recheck_every(client, RECHECK, shutdown.clone()));
+
+        tokio::time::sleep(RECHECK - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(discovery_reads(&api), 1, "not before the interval");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(discovery_reads(&api), 2, "once at the interval");
+
+        shutdown.cancel();
+        settle().await;
+        assert!(rechecks.is_finished());
     }
 
     #[test]

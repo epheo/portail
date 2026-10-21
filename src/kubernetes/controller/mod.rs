@@ -115,7 +115,6 @@ struct ControllerCtx {
     gateway_configs:
         Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
     named_ports: Arc<NamedPortCache>,
-    pending_watches: Arc<PendingWatches>,
     /// When the controller came up — cold-start latency context for the
     /// "Data plane ready" log line and the not-ready watchdog.
     started: std::time::Instant,
@@ -212,9 +211,7 @@ pub async fn run_controller(
     // routes, and stays cluster-wide and ungated for the same reason routes
     // do: a policy in any namespace may target this Gateway and must get an
     // ancestor status, which requires observing it.
-    let pending_watches = Arc::new(PendingWatches::new(
-        std::time::Instant::now() + Duration::from_secs(RESYNC_SECS),
-    ));
+    let pending_watches = PendingWatches::default();
     let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector) = tokio::join!(
         create_optional_reflector(
             Api::<TCPRoute>::all(client.clone()),
@@ -241,6 +238,11 @@ pub async fn run_controller(
     let (store_tls_routes, tls_route_stream) = tls_reflector;
     let (store_udp_routes, udp_route_stream) = udp_reflector;
     let (store_rate_limit_policies, policy_stream) = policy_reflector;
+    tokio::spawn(pending_watches.recheck_every(
+        client.clone(),
+        Duration::from_secs(RESYNC_SECS),
+        shutdown.clone(),
+    ));
     // GatewayClass status is owned by portail-operator now; portail no longer
     // runs its own GatewayClass controller.
 
@@ -304,7 +306,6 @@ pub async fn run_controller(
         // A stale read lasts as long as before the cache: every requeue
         // listed the slices again.
         named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
-        pending_watches,
         started: std::time::Instant::now(),
     });
 

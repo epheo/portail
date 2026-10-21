@@ -795,7 +795,6 @@ pub(super) async fn reconcile(
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
     debug!("Reconciling Gateway {}/{}", gw_ns, gw_name);
-    ctx.pending_watches.recheck(&ctx.client).await;
 
     // Scoped mode trusts portail-operator: it only provisions a Deployment for
     // Gateways whose class references this controller. Unscoped mode watches
