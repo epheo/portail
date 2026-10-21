@@ -242,6 +242,10 @@ pub(crate) struct ConnectionState {
     /// The proxy answered itself and closes while the client may still be
     /// sending: the close reads off what comes instead of resetting on it.
     linger: bool,
+    /// `reset_on_drop` armed the client: the close must not undo it. Kept
+    /// here rather than read back off the socket, a syscall every close
+    /// would pay.
+    reset: bool,
 }
 
 impl ConnectionState {
@@ -277,6 +281,7 @@ impl ConnectionState {
             last_status: 0,
             drain,
             linger: false,
+            reset: false,
         }
     }
 
@@ -574,13 +579,7 @@ pub(crate) async fn handle_connection(
         )
         .await;
     }
-    close_connection(
-        &mut client,
-        &mut buf,
-        state.client_header_timeout,
-        state.linger,
-    )
-    .await;
+    close_connection(&mut client, &mut buf, &state).await;
     served.map(drop)
 }
 
@@ -757,29 +756,33 @@ async fn serve_http(
 
 /// End a connection with one graceful shutdown: close_notify then FIN over
 /// TLS, where strict clients (OpenSSL 3, rustls) read a bare FIN as a
-/// truncation attack. A connection `reset_on_drop` armed keeps its reset,
-/// which a clean close would turn into a complete-looking response.
+/// truncation attack. Plain TCP that does not linger needs none: dropping
+/// the socket sends the same FIN. A connection `reset_on_drop` armed keeps
+/// its reset, which a clean close would turn into a complete-looking
+/// response.
 ///
-/// `linger` follows a reply the proxy wrote before the client was done
-/// sending. Closing on unread bytes makes the kernel reset, and a client
-/// still uploading then fails its send instead of reading the reply. As
-/// nginx's lingering_close does, what still arrives is read and dropped
-/// until the client closes, up to one `buf` of it.
+/// `state.linger` follows a reply the proxy wrote before the client was
+/// done sending. Closing on unread bytes makes the kernel reset, and a
+/// client still uploading then fails its send instead of reading the
+/// reply. As nginx's lingering_close does, what still arrives is read and
+/// dropped until the client closes, up to one `buf` of it.
 ///
-/// All of it within `budget`: a client that stops reading, or never stops
-/// sending, cannot hold the close.
-async fn close_connection(client: &mut Connection, buf: &mut [u8], budget: Duration, linger: bool) {
-    // The h2 bridge's pipe has no reset to avoid, and its stream must see
-    // the end at once: dropping the pipe is the close.
-    let Some(tcp) = client_socket(client) else {
-        return;
+/// All of it within the client header budget: a client that stops reading,
+/// or never stops sending, cannot hold the close.
+async fn close_connection(client: &mut Connection, buf: &mut [u8], state: &ConnectionState) {
+    let tls = match client {
+        Connection::Plain { .. } => false,
+        Connection::Tls { .. } => true,
+        // The h2 bridge's pipe has no reset to avoid, and its stream must
+        // see the end at once: dropping the pipe is the close.
+        Connection::Mem { .. } | Connection::ClientTls { .. } => return,
     };
-    if marked_for_reset(tcp) {
+    if state.reset || !(tls || state.linger) {
         return;
     }
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = tokio::time::Instant::now() + state.client_header_timeout;
     let shutdown = tokio::time::timeout_at(deadline, client.shutdown()).await;
-    if !linger || !matches!(shutdown, Ok(Ok(()))) {
+    if !state.linger || !matches!(shutdown, Ok(Ok(()))) {
         return;
     }
     let mut discarded = 0;
@@ -1234,7 +1237,7 @@ async fn proxy_http_request(
                         "Response body from backend {} exceeded request timeout; resetting client connection",
                         backend_addr
                     );
-                    reset_on_drop(client);
+                    reset_on_drop(client, state);
                     return Ok((false, None));
                 }
             }
@@ -1263,17 +1266,17 @@ async fn proxy_http_request(
                 "Backend {} sent malformed chunked framing; resetting client connection",
                 backend_addr
             );
-            reset_on_drop(client);
+            reset_on_drop(client, state);
             return Ok((false, None));
         }
         Ok(BodyEnd::Truncated) => {
             debug!("Backend {} closed mid response body", backend_addr);
-            reset_on_drop(client);
+            reset_on_drop(client, state);
             return Ok((false, None));
         }
         Err(_e) => {
             debug!("Response body from backend {} failed: {}", backend_addr, _e);
-            reset_on_drop(client);
+            reset_on_drop(client, state);
             return Ok((false, None));
         }
     }
@@ -2196,8 +2199,10 @@ async fn forward_response_body(
 /// Make dropping `client` send RST instead of FIN, for a response cut short
 /// after its headers went out. A FIN would pass a close-delimited body off as
 /// complete; a reset is an error for every framing. The h2 bridge's pipe has
-/// no reset: it is told, and resets the stream.
-fn reset_on_drop(client: &Connection) {
+/// no reset: it is told, and resets the stream. `state` records it for the
+/// close, which must not undo it.
+fn reset_on_drop(client: &Connection, state: &mut ConnectionState) {
+    state.reset = true;
     if let Connection::Mem { aborted, .. } = client {
         aborted.store(true, Ordering::Release);
     }
@@ -2205,12 +2210,6 @@ fn reset_on_drop(client: &Connection) {
         // Zero linger: close() discards unsent data and resets without blocking.
         let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
     }
-}
-
-/// Whether [`reset_on_drop`] armed `tcp`. Read back from the socket, so
-/// every caller of it, present or future, is covered.
-fn marked_for_reset(tcp: &TcpStream) -> bool {
-    matches!(socket2::SockRef::from(tcp).linger(), Ok(Some(linger)) if linger.is_zero())
 }
 
 /// The client's TCP socket; `None` for the h2 bridge's in-memory pipe.
@@ -4306,6 +4305,34 @@ mod connection_tests {
         let kind = read.as_ref().map_err(std::io::Error::kind);
         assert_eq!(kind, Err(std::io::ErrorKind::ConnectionReset), "{out}");
         engine.await.unwrap().unwrap();
+    }
+
+    /// Over plain TCP too, a body cut short resets, while one that ends at
+    /// the backend's close ends with the client's FIN.
+    #[tokio::test]
+    async fn a_truncated_plain_response_resets_and_a_closed_one_ends() {
+        for (reply, ends) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial"[..],
+                false,
+            ),
+            (b"HTTP/1.1 200 OK\r\n\r\nall of it", true),
+        ] {
+            let addr = closing_backend(reply).await;
+            let (mut client, engine) = tcp_client(conn_state(routes(addr), false)).await;
+            client.write_all(GET_A).await.unwrap();
+            let mut out = Vec::new();
+            let read = client.read_to_end(&mut out).await;
+            let out = String::from_utf8_lossy(&out);
+            match read {
+                Ok(_) => assert!(ends && out.ends_with("all of it"), "{out}"),
+                Err(e) => {
+                    assert!(!ends, "{e}: {out}");
+                    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+            }
+            engine.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
