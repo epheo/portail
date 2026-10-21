@@ -221,18 +221,20 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
 /// The status line is copied untouched.
 ///
 /// Framing is the caller's reading of the head (`worker::parse_response_head`),
-/// never re-derived here. `transfer_encoded` drops every Content-Length line:
-/// Transfer-Encoding overrides it (RFC 9112 6.3), and a client that framed
-/// by it would read past this body into the next response. Otherwise only
-/// the first is kept: the reading made repeats agree, and some clients
-/// (llhttp) refuse any repeat. The proxy owns the client-side Connection
-/// header: `client_close` appends its own close announcement.
+/// never re-derived here. `content_length` is that reading's value: the
+/// first Content-Length line becomes `Content-Length: <n>` and the others
+/// go, since some clients (llhttp) refuse any repeat. `None` drops them all:
+/// Transfer-Encoding overrides them (RFC 9112 6.3), and a client framing by
+/// one would read past this body into the next response. The proxy owns the
+/// client-side Connection header: `client_close` appends its own close
+/// announcement.
 pub(crate) fn sanitize_response_headers(
     raw: &[u8],
-    transfer_encoded: bool,
+    content_length: Option<usize>,
     client_close: bool,
     out: &mut Vec<u8>,
 ) {
+    use std::io::Write;
     out.clear();
     out.reserve(raw.len() + 24);
     let mut lines = header_lines(raw);
@@ -240,18 +242,19 @@ pub(crate) fn sanitize_response_headers(
         out.extend_from_slice(status_line);
         out.extend_from_slice(b"\r\n");
     }
-    let mut drop_content_length = transfer_encoded;
+    let mut content_length = content_length;
     for line in lines {
-        let keep = match memchr::memchr(b':', line) {
+        match memchr::memchr(b':', line) {
             Some(p) if line[..p].eq_ignore_ascii_case(b"content-length") => {
-                !std::mem::replace(&mut drop_content_length, true)
+                if let Some(n) = content_length.take() {
+                    let _ = write!(out, "Content-Length: {n}\r\n");
+                }
             }
-            Some(p) => !is_hop_by_hop_response_header(&line[..p]),
-            None => true,
-        };
-        if keep {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
+            Some(p) if is_hop_by_hop_response_header(&line[..p]) => {}
+            _ => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+            }
         }
     }
     if client_close {
@@ -886,7 +889,7 @@ mod tests {
         let resp =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, false, false, &mut out);
+        sanitize_response_headers(resp, Some(2), false, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 2\r\n"));
@@ -895,25 +898,26 @@ mod tests {
         assert!(!s.to_ascii_lowercase().contains("keep-alive"));
         assert!(s.ends_with("\r\n\r\n"));
 
-        sanitize_response_headers(resp, false, true, &mut out);
+        sanitize_response_headers(resp, Some(2), true, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.ends_with("Connection: close\r\n\r\n"));
     }
 
     #[test]
-    fn test_sanitize_transfer_encoded_response_drops_every_content_length() {
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: gzip, chunked\r\ncontent-length: 5\r\nServer: x\r\n\r\n";
+    fn test_sanitize_forwards_one_canonical_content_length_or_none() {
+        // Under Transfer-Encoding, none.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\ncontent-length: 5\r\nServer: x\r\n\r\n";
         let mut out = Vec::new();
-        sanitize_response_headers(resp, true, false, &mut out);
+        sanitize_response_headers(resp, None, false, &mut out);
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nServer: x\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: x\r\n\r\n"
         );
 
-        // Content-Length alone is the framing and stays, once.
+        // Else one, where the first was, with the value framed by.
         let resp =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\ncontent-length: 5\r\n\r\n";
-        sanitize_response_headers(resp, false, false, &mut out);
+            b"HTTP/1.1 200 OK\r\ncontent-length:  05\r\nServer: x\r\nContent-Length: 5\r\n\r\n";
+        sanitize_response_headers(resp, Some(5), false, &mut out);
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\n"
