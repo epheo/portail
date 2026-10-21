@@ -42,9 +42,9 @@ pub struct RequestMeta {
     /// Whether the connection may stay open if the proxy answers this
     /// request itself (429); see `local_reply_reusable`.
     pub local_reply_reusable: bool,
-    /// Whether a reply the proxy writes itself (429) leaves none of this
-    /// request on the wire; see `head_is_whole`.
-    pub read_whole: bool,
+    /// Whether the client sends nothing past this head, so a closing reply
+    /// the proxy writes itself (429) need not linger; see `client_done`.
+    pub client_done: bool,
 }
 
 /// A response the proxy writes itself instead of forwarding the request.
@@ -54,9 +54,9 @@ pub struct LocalReply {
     pub location: Option<String>,
     /// Whether the connection stays open afterwards; see `local_reply_reusable`.
     pub reusable: bool,
-    /// Nothing of the request is left on the wire (see `head_is_whole`):
-    /// a reply that closes has nothing to read off first.
-    pub read_whole: bool,
+    /// The client sends nothing more (see `client_done`): a reply that
+    /// closes has nothing to read off first.
+    pub client_done: bool,
     /// Answering HEAD: the reply must not carry its body, or a client on a
     /// kept-open connection would read it as the next response.
     pub head: bool,
@@ -92,6 +92,14 @@ fn head_is_whole(info: &HttpRequestInfo<'_>) -> bool {
 /// body bytes would be parsed as the next request.
 fn local_reply_reusable(info: &HttpRequestInfo<'_>) -> bool {
     info.keepalive && head_is_whole(info)
+}
+
+/// Whether the client sends nothing past this head: it asked to close
+/// (`Connection: close`, or HTTP/1.0 without keep-alive) and the head is
+/// the whole request. Any other client may still be sending, a pipelined
+/// request included, when the connection closes.
+fn client_done(info: &HttpRequestInfo<'_>) -> bool {
+    !info.keepalive && head_is_whole(info)
 }
 
 pub fn analyze_request<'a>(
@@ -168,7 +176,7 @@ fn analyze_http_request<'a>(
         status: 400,
         location: None,
         reusable: false,
-        read_whole: false,
+        client_done: false,
         head: false,
     });
     // Counted, logged at debug only: the client picks how many it sends.
@@ -189,14 +197,14 @@ fn analyze_http_request<'a>(
         }
     };
     let reusable = local_reply_reusable(&request_info);
-    let read_whole = head_is_whole(&request_info);
+    let client_done = client_done(&request_info);
     let is_head = request_info.method.eq_ignore_ascii_case("HEAD");
     let reply = |status, location| {
         Ok(RoutingResult::LocalReply(LocalReply {
             status,
             location,
             reusable,
-            read_whole,
+            client_done,
             head: is_head,
         }))
     };
@@ -252,7 +260,7 @@ fn analyze_http_request<'a>(
             upgrade_span: request_info.upgrade_span,
             expect_continue: request_info.expect_continue,
             local_reply_reusable: reusable,
-            read_whole,
+            client_done,
         },
     })
 }
@@ -1033,11 +1041,11 @@ mod tests {
     fn forwarded_request_carries_the_local_reply_rule_for_429() {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
-        for (req, reusable, read_whole) in [
+        for (req, reusable, client_done) in [
             (
                 &b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
                 true,
-                true,
+                false,
             ),
             (
                 b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
@@ -1053,23 +1061,24 @@ mod tests {
             match analyze_request(&rt, &sel, req, 8080, &health(), false).unwrap() {
                 RoutingResult::HttpForward { meta, .. } => {
                     assert_eq!(meta.local_reply_reusable, reusable);
-                    assert_eq!(meta.read_whole, read_whole);
+                    assert_eq!(meta.client_done, client_done);
                 }
                 _ => panic!("expected HttpForward"),
             }
         }
     }
 
-    /// Only a body or an upgrade leaves some of a request on the wire, and
-    /// a head too malformed to frame: a closing reply lingers for nothing
-    /// else.
+    /// Only a client that asked to close, with nothing left to send, is
+    /// done: a keep-alive client may pipeline its next request, a body or
+    /// upgrade tail may follow, and a head too malformed to frame tells
+    /// nothing.
     #[test]
-    fn local_reply_knows_whether_the_request_was_read_whole() {
+    fn local_reply_knows_whether_the_client_is_done() {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
-        let read_whole = |req: &[u8]| match analyze_request(&rt, &sel, req, 8080, &health(), false)
+        let client_done = |req: &[u8]| match analyze_request(&rt, &sel, req, 8080, &health(), false)
         {
-            Ok(RoutingResult::LocalReply(r)) => r.read_whole,
+            Ok(RoutingResult::LocalReply(r)) => r.client_done,
             _ => panic!("expected a locally answered request"),
         };
         for (req, want) in [
@@ -1079,25 +1088,30 @@ mod tests {
             ),
             (b"GET / HTTP/1.0\r\nHost: nope.test\r\n\r\n", true),
             (
-                b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 0\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 true,
             ),
+            (b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n", false),
             (
-                b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 44\r\n\r\n",
+                b"GET / HTTP/1.0\r\nHost: nope.test\r\nConnection: keep-alive\r\n\r\n",
                 false,
             ),
             (
-                b"POST / HTTP/1.1\r\nHost: nope.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: nope.test\r\nContent-Length: 44\r\nConnection: close\r\n\r\n",
                 false,
             ),
             (
-                b"GET /ws HTTP/1.1\r\nHost: nope.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                b"POST / HTTP/1.0\r\nHost: nope.test\r\nContent-Length: 44\r\n\r\n",
                 false,
             ),
-            (b"GET / HTTP/1.1\r\n\r\n", false),
+            (
+                b"GET /ws HTTP/1.1\r\nHost: nope.test\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n\r\n",
+                false,
+            ),
+            (b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false),
         ] {
             let text = String::from_utf8_lossy(req);
-            assert_eq!(read_whole(req), want, "{text}");
+            assert_eq!(client_done(req), want, "{text}");
         }
     }
 
