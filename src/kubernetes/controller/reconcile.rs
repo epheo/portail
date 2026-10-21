@@ -206,7 +206,7 @@ async fn ensure_data_plane_listeners(
         binds.iter().map(|l| l.port).collect::<Vec<_>>()
     );
     let closing = match ctx.data_plane.lock() {
-        Ok(mut dp) => dp.close_unwanted(binds, &[]),
+        Ok(mut dp) => dp.close_unwanted(binds),
         Err(e) => {
             warn!("Failed to lock data plane: {}", e);
             return Vec::new();
@@ -221,7 +221,7 @@ async fn ensure_data_plane_listeners(
     match ctx.data_plane.lock() {
         Ok(mut dp) => {
             let (opened, errors) =
-                dp.add_tcp_listeners(binds, &[], ctx.routes.clone(), &ctx.performance_config);
+                dp.add_tcp_listeners(binds, ctx.routes.clone(), &ctx.performance_config);
             if opened > 0 {
                 info!("Opened {} new port(s)", opened);
             }
