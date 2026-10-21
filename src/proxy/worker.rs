@@ -1421,6 +1421,19 @@ async fn fail_connect(
     fail_backend(state, client, backend_ref.socket_addr, code).await
 }
 
+/// A request that failed to send on a freshly connected backend conn: a
+/// send error, not a connect error, then answered `502` as [`fail_backend`]
+/// does.
+async fn fail_send(
+    state: &mut ConnectionState,
+    backend_ref: &crate::routing::Backend,
+    client: &mut Connection,
+) -> Result<()> {
+    crate::metrics::record_backend_send_error(&backend_metric_label(backend_ref));
+    state.listener_stats.upstream_send_errors.inc();
+    fail_backend(state, client, backend_ref.socket_addr, 502).await
+}
+
 /// Record a backend failure (spawning a health probe if this newly trips the
 /// backend unhealthy) and send `code` to the client, whose connection then
 /// closes. Log wording stays caller-side.
@@ -1649,7 +1662,7 @@ async fn send_request_with_retry(
         }
         Err(e) => {
             warn!("Backend {} send failed: {}", backend_addr, e);
-            fail_backend(state, client, backend_addr, 502).await?;
+            fail_send(state, backend_ref, client).await?;
             return Ok(None);
         }
     }
@@ -1730,7 +1743,7 @@ async fn resend_on_fresh(
             "Backend {} send failed on fresh conn after pool retry: {}",
             backend_addr, e2
         );
-        fail_backend(state, client, backend_addr, 502).await?;
+        fail_send(state, backend_ref, client).await?;
         return Ok(None);
     }
     Ok(Some(backend))
@@ -3513,11 +3526,11 @@ mod connection_tests {
     }
 
     /// The connect succeeded: a request the fresh conn then fails to send
-    /// is a backend failure and a 502, but no connect error. On a conn
-    /// fresh from the pool's miss, and on the one replacing a dead pooled
-    /// conn.
+    /// is a backend failure, a 502 and a send error, but no connect error.
+    /// On a conn fresh from the pool's miss, and on the one replacing a
+    /// dead pooled conn.
     #[tokio::test]
-    async fn a_send_failure_on_a_fresh_conn_is_no_connect_error() {
+    async fn a_send_failure_on_a_fresh_conn_is_a_send_error() {
         // Late enough that the connect is done: a reset during it is a
         // connect failure.
         let addr = resetting_backend(Duration::from_millis(100)).await;
@@ -3565,12 +3578,17 @@ mod connection_tests {
             assert!(out.starts_with("HTTP/1.1 502 "), "{out}");
             let connect_errors = state.listener_stats.upstream_connect_errors.get();
             assert_eq!(connect_errors, 0, "from_pool={from_pool}");
+            let send_errors = state.listener_stats.upstream_send_errors.get();
+            assert_eq!(send_errors, 1, "from_pool={from_pool}");
             // One failure was recorded: the rest of the threshold trips it.
             for _ in 2..crate::proxy::health::FAILURE_THRESHOLD {
                 assert!(!state.health.record_failure(addr));
             }
             assert!(state.health.record_failure(addr), "from_pool={from_pool}");
         }
+        let scrape = crate::metrics::render(true);
+        let series = format!("portail_upstream_send_errors_total{{backend=\"{addr}\"}} 2\n");
+        assert!(scrape.contains(&series), "{scrape}");
     }
 
     /// Only a TCP route on the engine's port.
