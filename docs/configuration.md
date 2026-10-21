@@ -426,4 +426,5 @@ HTTPS and TLS passthrough listeners on one port share one socket:
 - Connections rotate over a TLS route's backends per route, whatever SNI each sent under it.
 - Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
 - A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
+- A port already serving whose certificates all fail on a later pass, with the same listeners and Secrets, keeps serving the last good ones: a bad rotation does not take HTTPS down. The failure is logged each pass until fixed. In Kubernetes mode a deleted Secret, or one a ReferenceGrant no longer permits, fails the same way; the listener reports `ResolvedRefs=False` meanwhile. A pass that also changes the port's listeners or Secrets keeps none.
 - An HTTPS listener whose own certificates fail to load closes the connections its SNI selects, even while its siblings' load: no other listener's certificate answers for its hostname.

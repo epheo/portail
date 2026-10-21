@@ -33,6 +33,8 @@ pub(crate) type PortPlan = Arc<ArcSwapOption<TlsPlan>>;
 struct BuiltConfig {
     /// Of the certs it was built from: a pass with the same certs reuses it.
     fingerprint: u64,
+    /// The refs it was built for: a failed rebuild of the same refs keeps it.
+    refs: HashSet<tls::CertKey>,
     /// The refs whose certs loaded.
     loaded: HashSet<tls::CertKey>,
     config: Arc<rustls::ServerConfig>,
@@ -213,8 +215,12 @@ pub(crate) fn merge_cert_refs_by_port(
 /// The terminating config is rebuilt only when its port's merged certs
 /// changed (`built`, kept for ports with HTTPS listeners only). Failures
 /// come back per port so construction can hard-fail while the reconcile
-/// path retries next pass; such a port terminates nothing meanwhile. An
-/// HTTPS listener none of whose certs is in the config refuses its SNI
+/// path retries next pass.
+///
+/// A rebuild that loads no cert keeps the last good config when the
+/// port's refs are the same ones (a bad Secret rotation), else the port
+/// terminates nothing: certs must not outlive their listener. An HTTPS
+/// listener none of whose certs is in the config refuses its SNI
 /// ([`TlsKind::NoCert`]).
 fn plan_ports(
     listener_configs: &[ListenerConfig],
@@ -233,20 +239,30 @@ fn plan_ports(
         {
             continue;
         }
+        let keys: HashSet<tls::CertKey> = refs.iter().map(tls::cert_key).collect();
         match tls::build_terminating(&refs, cert_dir, http2) {
             Ok((config, loaded)) => {
                 built.insert(
                     port,
                     BuiltConfig {
                         fingerprint,
+                        refs: keys,
                         loaded,
                         config: Arc::new(config),
                     },
                 );
             }
             Err(e) => {
-                built.remove(&port);
-                errors.push((port, format!("TLS config build failed: {}", e)));
+                // Its fingerprint stays the old one: the next pass
+                // retries, and reports again.
+                let rotation = built.get(&port).is_some_and(|b| b.refs == keys);
+                let kept = if rotation {
+                    "; serving the last good certificates"
+                } else {
+                    built.remove(&port);
+                    ""
+                };
+                errors.push((port, format!("TLS config build failed: {}{}", e, kept)));
             }
         }
     }
@@ -1320,6 +1336,56 @@ mod tests {
         assert_eq!(pass, (0, vec![]), "the socket stays");
         let after = presented(port, Some("app.example.org")).await;
         assert!(after.is_err(), "the deleted listener's cert: {after:?}");
+    }
+
+    /// A Secret rotated to certs that fail to load keeps its port serving
+    /// the last good ones, and the failure is still reported each pass.
+    /// The port dropped its config and refused every handshake until the
+    /// Secret was fixed. A pass that also changes the port's listeners
+    /// keeps nothing: those certs could outlive their listener.
+    #[tokio::test]
+    async fn a_bad_cert_rotation_keeps_the_last_good_certs() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(good), Some(fixed)) = (
+            crate::proxy::tls::test_util::generate_test_cert("app.example.org"),
+            crate::proxy::tls::test_util::generate_test_cert("app.example.org"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let listener = https_with_cert(port, Some("app.example.org"), &good);
+        let rotated_bad = https_listener("web", port, Some("app.example.org"), "cert");
+        let mut dp = serve(std::slice::from_ref(&listener), RouteTable::new()).await;
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let sni = Some("app.example.org");
+        assert_eq!(presented(port, sni).await, Ok(der(&good.0)));
+
+        for _ in 0..2 {
+            let (opened, errors) =
+                ensure(&mut dp, std::slice::from_ref(&rotated_bad), &routes, &perf).await;
+            assert_eq!(opened, 0);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].1.contains("last good"), "{errors:?}");
+            assert_eq!(presented(port, sni).await, Ok(der(&good.0)));
+        }
+
+        let fixed_listener = https_with_cert(port, Some("app.example.org"), &fixed);
+        let pass = ensure(&mut dp, &[fixed_listener], &routes, &perf).await;
+        assert_eq!(pass, (0, vec![]));
+        assert_eq!(presented(port, sni).await, Ok(der(&fixed.0)));
+
+        let mut renamed_bad = rotated_bad.clone();
+        renamed_bad.hostname = Some("new.example.org".into());
+        renamed_bad.tls.as_mut().unwrap().certificate_refs[0].hostname =
+            renamed_bad.hostname.clone();
+        let (_, errors) = ensure(&mut dp, &[renamed_bad], &routes, &perf).await;
+        assert!(!errors[0].1.contains("last good"), "{errors:?}");
+        for sni in [sni, Some("new.example.org")] {
+            assert!(presented(port, sni).await.is_err(), "{sni:?}");
+        }
     }
 
     /// An HTTPS listener whose certs failed alone, beside listeners whose
