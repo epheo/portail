@@ -228,6 +228,20 @@ impl RouteTable {
         ))
     }
 
+    /// Whether any HTTP route can match on `server_port`: its own scopes or
+    /// the any-port (0) ones, as `find_http_route` searches them.
+    pub fn has_http_routes(&self, server_port: u16) -> bool {
+        [server_port, 0].iter().any(|port| {
+            self.listener_scopes
+                .get(port)
+                .is_some_and(|s| !s.is_empty())
+        })
+    }
+
+    pub fn has_tcp_route(&self, server_port: u16) -> bool {
+        self.tcp_routes.contains_key(&server_port)
+    }
+
     #[inline(always)]
     pub fn find_tcp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
         if let Some(backend_list) = self.tcp_routes.get(&server_port) {

@@ -348,7 +348,7 @@ pub fn analyze_udp_request(
     )
 }
 
-fn analyze_tcp_request(
+pub(crate) fn analyze_tcp_request(
     routes: &RouteTable,
     backend_selector: &BackendSelector,
     server_port: u16,

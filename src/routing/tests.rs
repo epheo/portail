@@ -1115,3 +1115,17 @@ fn test_hostnames_intersect() {
     assert!(!hostnames_intersect("*.example.com", "*.other.com"));
     assert!(!hostnames_intersect("*.example.com", "*.badexample.com"));
 }
+
+/// What decides a port's sniff: its TCP route, and HTTP routes in its own
+/// scopes or the any-port (0) ones.
+#[test]
+fn port_route_kinds_include_the_any_port_scope() {
+    let mut rt = RouteTable::new();
+    rt.add_tcp_route(25, vec![backend(2525)]);
+    rt.add_http_route_for_listener(80, None, "a.test", rule(PathMatchType::Prefix, "/", vec![]));
+    assert!(rt.has_tcp_route(25) && !rt.has_http_routes(25));
+    assert!(rt.has_http_routes(80) && !rt.has_tcp_route(80));
+
+    rt.add_http_route("b.test", rule(PathMatchType::Prefix, "/", vec![]));
+    assert!(rt.has_http_routes(25));
+}
