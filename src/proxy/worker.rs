@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
-use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
+use crate::proxy::backend_pool::{connect_tcp, BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
@@ -107,6 +107,15 @@ impl WorkerConfig {
 pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const TCP_KEEPALIVE_RETRIES: u32 = 5;
 
+/// The keepalive accepted sockets get, for backend sockets: a dead backend
+/// pins an idle client's task and both fds as surely as a dead client.
+pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
+    socket2::TcpKeepalive::new()
+        .with_time(time)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES)
+}
+
 /// RAII in-flight-connection counter. One guard lives inside each spawned
 /// per-connection task; `DataPlane::shutdown` polls the shared count and
 /// drains until it reaches zero (or the drain timeout expires). Drop-based so
@@ -154,6 +163,8 @@ pub(crate) struct ConnectionState {
     /// Backend connect budget for raw TCP forwarding (HTTP connects go
     /// through the pool, which carries its own copy).
     connect_timeout: Duration,
+    /// Set on every backend socket this connection opens.
+    backend_keepalive: socket2::TcpKeepalive,
     /// Reused across keepalive responses to avoid per-response heap allocation.
     header_buf: Vec<u8>,
     /// Reused header-assembly scratch: outgoing request block during the send
@@ -198,6 +209,7 @@ impl ConnectionState {
             peer_ip,
             client_header_timeout: cfg.client_header_timeout,
             connect_timeout: cfg.connect_timeout,
+            backend_keepalive: tcp_keepalive(cfg.tcp_keepalive_time),
             header_buf: Vec::with_capacity(1024),
             scratch_buf: Vec::with_capacity(1024),
             filter_buf: Vec::new(),
@@ -291,7 +303,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                             let selector = selector.clone();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
-                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, cfg.client_header_timeout, cfg.connect_timeout).await;
+                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
                             });
                         } else if let Some(acceptor) = acceptor {
                             let selector = selector.clone();
@@ -372,16 +384,8 @@ async fn serve_tls_connection(
         };
 
     if should_passthrough {
-        let _ = handle_tls_passthrough(
-            tcp_stream,
-            server_port,
-            routes,
-            health,
-            selector,
-            cfg.client_header_timeout,
-            cfg.connect_timeout,
-        )
-        .await;
+        let _ =
+            handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
         return;
     }
 
@@ -502,6 +506,7 @@ pub(crate) async fn handle_connection(
                     &buf[..n],
                     Arc::clone(&state.health),
                     state.connect_timeout,
+                    &state.backend_keepalive,
                     "TCP",
                 )
                 .await;
@@ -1117,9 +1122,12 @@ async fn connect_to_backend(
     let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
     match tokio::time::timeout(
         connect_budget,
-        state
-            .pool
-            .acquire(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
+        state.pool.acquire(
+            backend_addr,
+            backend_ref.use_tls,
+            &backend_ref.server_name,
+            &state.backend_keepalive,
+        ),
     )
     .await
     {
@@ -1307,9 +1315,12 @@ async fn send_request_with_retry(
     );
     let mut backend = match tokio::time::timeout(
         fresh_budget,
-        state
-            .pool
-            .acquire_fresh(backend_addr, backend_ref.use_tls, &backend_ref.server_name),
+        state.pool.acquire_fresh(
+            backend_addr,
+            backend_ref.use_tls,
+            &backend_ref.server_name,
+            &state.backend_keepalive,
+        ),
     )
     .await
     {
@@ -1920,9 +1931,9 @@ async fn handle_tls_passthrough(
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
-    peek_timeout: Duration,
-    connect_timeout: Duration,
+    cfg: &WorkerConfig,
 ) -> Result<()> {
+    let peek_timeout = cfg.client_header_timeout;
     let hostname = match tls::peek_sni(&client, peek_timeout).await {
         Some(h) => h,
         None => {
@@ -1951,7 +1962,8 @@ async fn handle_tls_passthrough(
         backend_addr,
         &[],
         health,
-        connect_timeout,
+        cfg.connect_timeout,
+        &tcp_keepalive(cfg.tcp_keepalive_time),
         "TLS passthrough",
     )
     .await
@@ -1963,23 +1975,12 @@ async fn handle_tcp_connection(
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
+    keepalive: &socket2::TcpKeepalive,
     ctx: &'static str,
 ) -> Result<()> {
-    let connect_result =
-        tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr)).await;
-
-    match connect_result {
-        Ok(Ok(mut backend)) => {
-            health.record_success(backend_addr);
-            backend.set_nodelay(true)?;
-            if !initial_data.is_empty() {
-                backend.write_all(initial_data).await?;
-            }
-            // Errors from copy_bidirectional are expected when either side closes;
-            // don't propagate — the data transfer is best-effort once started.
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
-        }
-        Ok(Err(e)) => {
+    let mut backend = match connect_tcp(backend_addr, connect_timeout, keepalive).await {
+        Ok(backend) => backend,
+        Err(e) => {
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
             }
@@ -1990,17 +1991,14 @@ async fn handle_tcp_connection(
                 e
             ));
         }
-        Err(_) => {
-            if health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(health, backend_addr);
-            }
-            return Err(anyhow::anyhow!(
-                "{} connect to {} timed out",
-                ctx,
-                backend_addr
-            ));
-        }
+    };
+    health.record_success(backend_addr);
+    if !initial_data.is_empty() {
+        backend.write_all(initial_data).await?;
     }
+    // Errors from copy_bidirectional are expected when either side closes;
+    // don't propagate — the data transfer is best-effort once started.
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
     Ok(())
 }
 
@@ -2539,6 +2537,67 @@ mod connection_tests {
             }],
         );
         rt
+    }
+
+    /// Keepalive time, interval and retries of the socket in this process
+    /// whose local address is `local`: the proxy end of a backend connection,
+    /// as the backend saw its peer. `None` when keepalive is off.
+    fn keepalive_of(local: SocketAddr) -> Option<(Duration, Duration, u32)> {
+        use std::os::fd::FromRawFd;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse() else {
+                continue;
+            };
+            // A dup, so a test closing `fd` meanwhile cannot pull it away.
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                continue;
+            }
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+            let sock = socket2::SockRef::from(&owned);
+            if sock.local_addr().ok().and_then(|a| a.as_socket()) != Some(local) {
+                continue;
+            }
+            return sock.keepalive().unwrap().then(|| {
+                (
+                    sock.tcp_keepalive_time().unwrap(),
+                    sock.tcp_keepalive_interval().unwrap(),
+                    sock.tcp_keepalive_retries().unwrap(),
+                )
+            });
+        }
+        panic!("no socket bound to {local}");
+    }
+
+    /// A backend that vanishes without FIN or RST would otherwise pin an
+    /// idle client's task and both fds forever, as a dead client once did.
+    #[tokio::test]
+    async fn backend_sockets_get_the_client_keepalive() {
+        let want = Some((
+            Duration::from_secs(60),
+            TCP_KEEPALIVE_INTERVAL,
+            TCP_KEEPALIVE_RETRIES,
+        ));
+
+        // Checked once the first bytes arrive: the proxy sends them only
+        // after setting the socket up, while accept returns before.
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, _task) = serve(routes(http.local_addr().unwrap()));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (mut pooled, proxy_end) = http.accept().await.unwrap();
+        pooled.read_exact(&mut [0u8; 4]).await.unwrap();
+        assert_eq!(keepalive_of(proxy_end), want, "pooled HTTP backend");
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused = http.local_addr().unwrap();
+        let (mut client, _task) = serve(routes_with_tcp(unused, tcp.local_addr().unwrap()));
+        client.write_all(OPAQUE).await.unwrap();
+        let (mut relayed, proxy_end) = tcp.accept().await.unwrap();
+        relayed.read_exact(&mut [0u8; 4]).await.unwrap();
+        assert_eq!(keepalive_of(proxy_end), want, "L4 backend");
     }
 
     #[tokio::test]

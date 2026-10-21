@@ -21,6 +21,7 @@ use crate::metrics::METRICS;
 use crate::proxy::tls::Connection;
 use anyhow::Result;
 use dashmap::DashMap;
+use socket2::TcpKeepalive;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,20 +66,37 @@ fn take_live(conns: &mut Vec<Connection>) -> Option<Connection> {
     None
 }
 
+/// Open a TCP connection to a backend within `timeout`, Nagle off. The
+/// keepalive is the one accepted sockets get: a backend that vanishes
+/// without FIN or RST would otherwise park an idle client's task and both
+/// fds forever. Shared by the pool and the L4 relay.
+pub(crate) async fn connect_tcp(
+    addr: SocketAddr,
+    timeout: Duration,
+    keepalive: &TcpKeepalive,
+) -> Result<TcpStream> {
+    let tcp = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
+        .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
+    tcp.set_nodelay(true)?;
+    // _-prefixed: debug! compiles out in release builds.
+    if let Err(_e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(keepalive) {
+        debug!("TCP keepalive setup failed for backend {}: {}", addr, _e);
+    }
+    Ok(tcp)
+}
+
 async fn connect_new(
     tls_connector: &tokio_rustls::TlsConnector,
     connect_timeout: Duration,
     addr: SocketAddr,
     use_tls: bool,
     server_name: &str,
+    keepalive: &TcpKeepalive,
 ) -> Result<Connection> {
     debug!("Pool miss: connecting to {} (tls={})", addr, use_tls);
-    let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
-
-    tcp.set_nodelay(true)?;
+    let tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
     METRICS.upstream_connects_total.inc();
 
     if use_tls {
@@ -124,11 +142,15 @@ impl BackendPool {
     /// zone (before any client bytes are read for the body or written): the
     /// probe is best-effort and a backend can close a pooled conn between the
     /// probe and our write.
+    ///
+    /// `keepalive` comes per call, not per pool: the process-wide pool
+    /// serves every listener, each with its own config.
     pub async fn acquire(
         &mut self,
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool)> {
         if let Some(conns) = self.pools.get_mut(&(addr, use_tls)) {
             if let Some(conn) = take_live(conns) {
@@ -144,6 +166,7 @@ impl BackendPool {
             addr,
             use_tls,
             server_name,
+            keepalive,
         )
         .await?;
         Ok((conn, false))
@@ -156,6 +179,7 @@ impl BackendPool {
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<Connection> {
         connect_new(
             &self.tls_connector,
@@ -163,6 +187,7 @@ impl BackendPool {
             addr,
             use_tls,
             server_name,
+            keepalive,
         )
         .await
     }
@@ -205,6 +230,7 @@ impl SharedBackendPool {
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool)> {
         // Shard lock held only for the sync pop+probe loop, never across await.
         if let Some(mut entry) = self
@@ -224,6 +250,7 @@ impl SharedBackendPool {
             addr,
             use_tls,
             server_name,
+            keepalive,
         )
         .await?;
         Ok((conn, false))
@@ -234,6 +261,7 @@ impl SharedBackendPool {
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<Connection> {
         connect_new(
             &self.tls_connector,
@@ -241,6 +269,7 @@ impl SharedBackendPool {
             addr,
             use_tls,
             server_name,
+            keepalive,
         )
         .await
     }
@@ -273,10 +302,11 @@ impl PoolHandle {
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool)> {
         match self {
-            PoolHandle::PerConn(p) => p.acquire(addr, use_tls, server_name).await,
-            PoolHandle::Shared(p) => p.acquire(addr, use_tls, server_name).await,
+            PoolHandle::PerConn(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
+            PoolHandle::Shared(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
         }
     }
 
@@ -285,10 +315,11 @@ impl PoolHandle {
         addr: SocketAddr,
         use_tls: bool,
         server_name: &str,
+        keepalive: &TcpKeepalive,
     ) -> Result<Connection> {
         match self {
-            PoolHandle::PerConn(p) => p.acquire_fresh(addr, use_tls, server_name).await,
-            PoolHandle::Shared(p) => p.acquire_fresh(addr, use_tls, server_name).await,
+            PoolHandle::PerConn(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
+            PoolHandle::Shared(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
         }
     }
 

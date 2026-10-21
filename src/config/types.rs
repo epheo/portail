@@ -638,6 +638,8 @@ pub struct PerformanceConfig {
     /// to 60s — same order as Go's net/http server default (15s); the probe
     /// cadence after this idle threshold is fixed (see
     /// `worker::TCP_KEEPALIVE_INTERVAL`), giving ~2min total reap latency.
+    /// Backend sockets get the same keepalive: a backend that vanishes pins
+    /// a client's task and fds just the same.
     #[serde(default = "default_tcp_keepalive_time", with = "human_duration")]
     pub tcp_keepalive_time: Duration,
 
