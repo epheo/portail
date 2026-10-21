@@ -134,11 +134,26 @@ impl AcceptBackoff {
     const MAX: Duration = Duration::from_secs(1);
 
     /// The pause owed after `error`; `None` when only the connection being
-    /// accepted failed (aborted while queued), which leaves the listener
-    /// healthy.
+    /// accepted failed, which leaves the listener healthy: aborted while
+    /// queued, or a network error Linux accept(2) passes on from it, which
+    /// its man page says to retry at once like EAGAIN.
     pub(crate) fn after(&mut self, error: &std::io::Error) -> Option<Duration> {
         use std::io::ErrorKind::{ConnectionAborted, ConnectionReset};
-        if matches!(error.kind(), ConnectionAborted | ConnectionReset) {
+        if matches!(error.kind(), ConnectionAborted | ConnectionReset)
+            || matches!(
+                error.raw_os_error(),
+                Some(
+                    libc::ENETDOWN
+                        | libc::EPROTO
+                        | libc::ENOPROTOOPT
+                        | libc::EHOSTDOWN
+                        | libc::ENONET
+                        | libc::EHOSTUNREACH
+                        | libc::EOPNOTSUPP
+                        | libc::ENETUNREACH
+                )
+            )
+        {
             return None;
         }
         let delay = self.delay.map_or(Self::FIRST, |d| (d * 2).min(Self::MAX));
@@ -4445,6 +4460,29 @@ mod tests {
         // Only that connection failed: retried at once, schedule kept.
         let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
         assert_eq!(backoff.after(&aborted), None);
+        assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(10)));
+    }
+
+    /// Linux accept(2) returns the queued connection's pending network
+    /// error; its man page says to retry those at once, like EAGAIN.
+    #[test]
+    fn accept_retries_a_queued_connections_network_error_at_once() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let mut backoff = AcceptBackoff::default();
+        assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(5)));
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(backoff.after(&error), None, "{error}");
+        }
         assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(10)));
     }
 
