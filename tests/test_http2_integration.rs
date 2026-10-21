@@ -255,6 +255,54 @@ fn spawn_raw_backend(response: String) -> SocketAddr {
     addr
 }
 
+/// Backend that reads one content-length request and answers with how many
+/// body bytes it got.
+fn spawn_counting_backend() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind counting backend");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut seen, mut buf) = (Vec::new(), vec![0u8; 64 * 1024]);
+                let (head_end, declared) = loop {
+                    match s.read(&mut buf) {
+                        Ok(n @ 1..) => seen.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                    if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+                        let declared = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (end + 4, declared);
+                    }
+                };
+                let mut got = seen.len() - head_end;
+                while got < declared {
+                    match s.read(&mut buf) {
+                        Ok(n @ 1..) => got += n,
+                        _ => break,
+                    }
+                }
+                let body = got.to_string();
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            });
+        }
+    });
+    addr
+}
+
 /// What a [`spawn_holding_backend`] connection just did.
 #[derive(Debug, PartialEq)]
 enum BackendConn {
@@ -707,4 +755,82 @@ async fn test_h2_reset_mid_body_releases_the_backend_exchange() {
     stream.send_reset(h2::Reason::CANCEL);
     // Far sooner than the 300s idle-body budget that ends it otherwise.
     assert_eq!(next_backend_event(&mut events).await, BackendConn::Closed);
+}
+
+/// h2's default 64 KiB windows cap an upload at 64 KiB per round trip. The
+/// bridge advertises more, which a client sees as send capacity.
+#[tokio::test]
+async fn test_h2_upload_window_exceeds_the_default() {
+    let (backend, _events) = spawn_holding_backend(b"");
+    let Some(_proxy) = spawn_h2_proxy(h2_port(42), backend) else {
+        return;
+    };
+    let tls = tls_connect(h2_port(42), &[b"h2"]).await;
+    // The client's own send buffer must not be what caps the capacity.
+    let (sr, conn) = h2::client::Builder::new()
+        .max_send_buffer_size(16 << 20)
+        .handshake::<_, Bytes>(tls)
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut s = sr.ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{}/upload", SNI))
+        .body(())
+        .unwrap();
+    let (_resp, mut body) = s.send_request(req, false).expect("send_request");
+    body.reserve_capacity(16 << 20);
+    let mut capacity = 0;
+    while capacity < 1 << 20 {
+        let grown = std::future::poll_fn(|cx| body.poll_capacity(cx));
+        capacity = tokio::time::timeout(std::time::Duration::from_secs(5), grown)
+            .await
+            .unwrap_or_else(|_| panic!("upload capacity stuck at {capacity} bytes"))
+            .expect("stream open")
+            .expect("capacity");
+    }
+}
+
+/// An upload past both windows completes: window comes back as the engine
+/// drains, not just once.
+#[tokio::test]
+async fn test_h2_upload_past_the_windows_arrives_whole() {
+    let Some(_proxy) = spawn_h2_proxy(h2_port(43), spawn_counting_backend()) else {
+        return;
+    };
+    let sr = h2_handshake(tls_connect(h2_port(43), &[b"h2"]).await).await;
+    let mut s = sr.ready().await.expect("h2 ready");
+    const SIZE: usize = 5 << 20;
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri(format!("https://{}/upload", SNI))
+        .header("content-length", SIZE)
+        .body(())
+        .unwrap();
+    let (resp, mut body) = s.send_request(req, false).expect("send_request");
+    let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+    let mut sent = 0;
+    while sent < SIZE {
+        body.reserve_capacity(SIZE - sent);
+        // poll_capacity reports only growth: spend what is left first.
+        let mut granted = body.capacity();
+        if granted == 0 {
+            let grown = std::future::poll_fn(|cx| body.poll_capacity(cx));
+            granted = tokio::time::timeout(std::time::Duration::from_secs(5), grown)
+                .await
+                .unwrap_or_else(|_| panic!("upload stalled after {sent} bytes"))
+                .expect("stream open")
+                .expect("capacity");
+        }
+        let take = granted.min(chunk.len()).min(SIZE - sent);
+        body.send_data(chunk.slice(..take), sent + take == SIZE)
+            .expect("send_data");
+        sent += take;
+    }
+    let (status, got) = read_response(resp.await.expect("h2 response")).await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&got), SIZE.to_string());
 }
