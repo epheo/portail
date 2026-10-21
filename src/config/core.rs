@@ -547,10 +547,13 @@ fn rule_filters(
         match f {
             CompiledFilter::Ready(filter) => out.push(filter.clone()),
             CompiledFilter::Mirror { backend, fraction } => {
-                // Mirrors go to one endpoint: the first address.
+                // Copies go to one endpoint (HTTPRequestMirrorFilter.backendRef).
+                // The smallest address, not the resolver's first: records
+                // reordered between lookups would change the table and its
+                // DNS signature, and the refresh would swap on every tick.
                 if let Some(&backend_addr) = resolver
                     .addrs(&backend.name, backend.port, "RequestMirror")?
-                    .and_then(<[_]>::first)
+                    .and_then(|addrs| addrs.iter().min())
                 {
                     out.push(crate::routing::HttpFilter::RequestMirror {
                         backend_addr,
@@ -1522,6 +1525,46 @@ mod tests {
             .find_http_route("x.example.com", "GET", "/b", &[], "", 8080)
             .unwrap();
         assert_eq!(live.backends.len(), 2);
+    }
+
+    /// The DNS refresh swaps the table when its signature changes, and the
+    /// signature counts mirror addresses: a resolver that only reorders a
+    /// mirror's records must not change it.
+    #[test]
+    fn a_mirror_keeps_its_address_when_dns_reorders_records() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["m.example.com"],
+                "rules": [{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "filters":[{"type":"RequestMirror","requestMirror":{"backendRef":{"name":"mirror.svc","port":9999}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let build = |order: [[u8; 4]; 2]| {
+            let mut lookup = |name: &str, port| -> anyhow::Result<Vec<std::net::SocketAddr>> {
+                Ok(match name.parse::<std::net::IpAddr>() {
+                    Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+                    Err(_) => order.map(|ip| (ip, port).into()).to_vec(),
+                })
+            };
+            config
+                .build_route_table(super::BuildPolicy::Lenient, &mut lookup)
+                .unwrap()
+        };
+        let one = build([[10, 0, 0, 2], [10, 0, 0, 1]]);
+        let other = build([[10, 0, 0, 1], [10, 0, 0, 2]]);
+        assert_eq!(one.dns_signature(), other.dns_signature());
+        let rule = one
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(
+            matches!(&rule.filters[..], [crate::routing::HttpFilter::RequestMirror { backend_addr, .. }]
+                if *backend_addr == ([10, 0, 0, 1], 9999).into()),
+            "{:?}",
+            rule.filters
+        );
     }
 
     /// A mirror DNS cannot resolve used to fail the whole lenient build, so
