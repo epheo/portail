@@ -94,6 +94,8 @@ struct Resolver<'a, 'l> {
     policy: BuildPolicy,
     lookup: &'a mut Lookup<'l>,
     seen: HashMap<(String, u16), Option<Vec<SocketAddr>>>,
+    endpoint_overrides: &'a HashMap<(String, u16), Vec<(String, u16)>>,
+    headless_target_ports: &'a HashMap<(String, u16), u16>,
 }
 
 impl Resolver<'_, '_> {
@@ -131,15 +133,62 @@ impl Resolver<'_, '_> {
         Ok(found.as_deref())
     }
 
-    /// One backend per address of each ref, at the ref's weight. An invalid
+    /// Every address backend `name:port` dials, each with the name it goes
+    /// by (a TLS backend's SNI). Every route kind and mirror reaches a
+    /// Service through here, so all heed what DNS cannot say: an ExternalName
+    /// Service is its external name, and a headless one's pods listen on its
+    /// targetPort, as DNS returns their IPs but no port.
+    fn endpoints(
+        &mut self,
+        name: &str,
+        port: u16,
+        what: &str,
+        mut each: impl FnMut(SocketAddr, &str),
+    ) -> Result<()> {
+        let key = (name.to_string(), port);
+        let overrides = self.endpoint_overrides;
+        if let Some(targets) = overrides.get(&key).filter(|t| !t.is_empty()) {
+            // An endpoint is one target: its first address.
+            for (host, target_port) in targets {
+                if let Some(&addr) = self.addrs(host, *target_port, what)?.and_then(<[_]>::first) {
+                    each(addr, host);
+                }
+            }
+            return Ok(());
+        }
+        // A ClusterIP Service has no entry: kube-proxy maps its service port.
+        let connect_port = self
+            .headless_target_ports
+            .get(&key)
+            .copied()
+            .unwrap_or(port);
+        if let Some(addrs) = self.addrs(name, connect_port, what)? {
+            tracing::debug!(
+                "        {} backend {}:{} -> {} address(es) on port {}",
+                what,
+                name,
+                port,
+                addrs.len(),
+                connect_port
+            );
+            for &addr in addrs {
+                each(addr, name);
+            }
+        }
+        Ok(())
+    }
+
+    /// One backend per endpoint of each ref, at the ref's weight. An invalid
     /// ref is never looked up: it keeps its weight as a rejecting stand-in.
     fn backends(&mut self, refs: &[BackendRef], what: &str) -> Result<Vec<Backend>> {
         let mut backends = Vec::new();
         for br in refs {
             if br.invalid {
                 backends.push(Backend::rejecting(br.weight));
-            } else if let Some(addrs) = self.addrs(&br.name, br.port, what)? {
-                backends.extend(addrs.iter().map(|&a| backend_at(a, br.weight, &br.name)));
+            } else {
+                self.endpoints(&br.name, br.port, what, |addr, name| {
+                    backends.push(backend_at(addr, br.weight, name))
+                })?;
             }
         }
         Ok(backends)
@@ -187,6 +236,8 @@ impl PortailConfig {
             policy,
             lookup,
             seen: HashMap::new(),
+            endpoint_overrides: &self.endpoint_overrides,
+            headless_target_ports: &self.headless_target_ports,
         };
         let mut route_table = routing::RouteTable::new();
 
@@ -464,71 +515,18 @@ impl PortailConfig {
                 continue;
             }
 
-            let override_key = (backend_ref.name.clone(), backend_ref.port);
-            let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
+            let app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
                 self.app_protocol_overrides
-                    .get(&override_key)
-                    .map(|s| s.as_str())
+                    .get(&(backend_ref.name.clone(), backend_ref.port))
+                    .map(String::as_str)
             });
-            let backend_use_tls = effective_app_protocol == Some("https");
-            let mut push = |addr: SocketAddr, server_name: &str| {
-                let mut backend = backend_at(addr, backend_ref.weight, server_name);
+            let use_tls = app_protocol == Some("https");
+            resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
+                let mut backend = backend_at(addr, backend_ref.weight, name);
                 backend.filters = backend_filters.clone();
-                backend.use_tls = backend_use_tls;
+                backend.use_tls = use_tls;
                 backends.push(backend);
-            };
-
-            if let Some(endpoints) = self
-                .endpoint_overrides
-                .get(&override_key)
-                .filter(|e| !e.is_empty())
-            {
-                tracing::debug!(
-                    "        Headless backend {}:{} -> {} pod endpoints",
-                    backend_ref.name,
-                    backend_ref.port,
-                    endpoints.len()
-                );
-                // An endpoint is one target: its first address.
-                for (host, target_port) in endpoints {
-                    if let Some(&addr) = resolver
-                        .addrs(host, *target_port, "HTTP")?
-                        .and_then(<[_]>::first)
-                    {
-                        push(addr, host);
-                    }
-                }
-                continue;
-            }
-
-            // Standard DNS-based resolution resolves to every A-record (STRICT_DNS):
-            // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
-            // FQDN to one VIP. The existing weighted selection load-balances across the
-            // resulting flat entries.
-            //
-            // Port: a headless Service has no VIP, so DNS returns pod IPs and we must
-            // connect on the Service's targetPort, not the service port (DNS carries no
-            // port). For ClusterIP the FQDN resolves to the VIP and the service port is
-            // correct (kube-proxy maps it), so there is no override and we keep the ref's
-            // port.
-            let connect_port = self
-                .headless_target_ports
-                .get(&override_key)
-                .copied()
-                .unwrap_or(backend_ref.port);
-            if let Some(addrs) = resolver.addrs(&backend_ref.name, connect_port, "HTTP")? {
-                tracing::debug!(
-                    "        Backend: {}:{} weight={} tls={} -> {} address(es)",
-                    backend_ref.name,
-                    backend_ref.port,
-                    backend_ref.weight,
-                    backend_use_tls,
-                    addrs.len()
-                );
-                for &addr in addrs {
-                    push(addr, &backend_ref.name);
-                }
-            }
+            })?;
         }
         Ok(backends)
     }
@@ -549,10 +547,11 @@ fn rule_filters(
                 // The smallest address, not the resolver's first: records
                 // reordered between lookups would change the table and its
                 // DNS signature, and the refresh would swap on every tick.
-                if let Some(&backend_addr) = resolver
-                    .addrs(&backend.name, backend.port, "RequestMirror")?
-                    .and_then(|addrs| addrs.iter().min())
-                {
+                let mut smallest: Option<SocketAddr> = None;
+                resolver.endpoints(&backend.name, backend.port, "RequestMirror", |addr, _| {
+                    smallest = Some(smallest.map_or(addr, |s| s.min(addr)));
+                })?;
+                if let Some(backend_addr) = smallest {
                     out.push(crate::routing::HttpFilter::RequestMirror {
                         backend_addr,
                         fraction: *fraction,
@@ -1588,5 +1587,81 @@ mod tests {
             err.starts_with("RequestMirror backend dead.svc:9999 failed to resolve"),
             "{err}"
         );
+    }
+
+    /// Backend `name:5432` behind a TCP, a UDP and a TLS passthrough route,
+    /// and mirrored from an HTTP route.
+    fn l4_and_mirror_config(name: &str) -> PortailConfig {
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"h","protocol":"HTTP","port":8080}},
+                {{"name":"t","protocol":"TCP","port":5432}},
+                {{"name":"u","protocol":"UDP","port":5353}},
+                {{"name":"p","protocol":"TLS","port":8443,"tls":{{"mode":"Passthrough"}}}}]}},
+            "httpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"h"}}],"hostnames":["m.example.com"],
+                "rules":[{{"filters":[{{"type":"RequestMirror","requestMirror":{{"backendRef":{{"name":"{name}","port":5432}}}}}}],
+                          "backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}],
+            "udpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"u"}}],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}],
+            "tlsRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"p"}}],"hostnames":["s.example.com"],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}]
+        }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// The addresses each route kind of [`l4_and_mirror_config`] dials.
+    fn dialed(config: &PortailConfig) -> Vec<(&'static str, Vec<std::net::SocketAddr>)> {
+        let (built, _) = build_with_fake_dns(config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        let addrs = |b: &[crate::routing::Backend]| b.iter().map(|b| b.socket_addr).collect();
+        let rule = rt
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        let mirror = rule
+            .filters
+            .iter()
+            .filter_map(|f| match f {
+                crate::routing::HttpFilter::RequestMirror { backend_addr, .. } => {
+                    Some(*backend_addr)
+                }
+                _ => None,
+            })
+            .collect();
+        vec![
+            ("TCP", addrs(rt.find_tcp_backends(5432).unwrap())),
+            ("UDP", addrs(rt.find_udp_backends(5353).unwrap())),
+            ("TLS", addrs(&rt.tls_routes[&8443]["s.example.com"])),
+            ("mirror", mirror),
+        ]
+    }
+
+    /// Only HTTP backends heeded the Service facts DNS cannot give: L4
+    /// routes and mirrors dialed a headless Service's pods on the service
+    /// port, and looked an ExternalName Service's own name up.
+    #[test]
+    fn every_route_kind_and_mirrors_reach_a_service_alike() {
+        let pod = |last: u8, port| std::net::SocketAddr::from(([10, 0, 0, last], port));
+
+        let mut headless = l4_and_mirror_config("multi.svc");
+        headless
+            .headless_target_ports
+            .insert(("multi.svc".to_string(), 5432), 15432);
+        for (kind, addrs) in dialed(&headless) {
+            let want = match kind {
+                "mirror" => vec![pod(1, 15432)],
+                _ => vec![pod(1, 15432), pod(2, 15432)],
+            };
+            assert_eq!(addrs, want, "{kind}");
+        }
+
+        let mut external = l4_and_mirror_config("ext.default.svc");
+        external.endpoint_overrides.insert(
+            ("ext.default.svc".to_string(), 5432),
+            vec![("multi.svc".to_string(), 5432)],
+        );
+        for (kind, addrs) in dialed(&external) {
+            assert_eq!(addrs, vec![pod(1, 5432)], "{kind}");
+        }
     }
 }
