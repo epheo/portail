@@ -119,6 +119,17 @@ fn a_routed_request_allocates_nothing() {
 }
 
 #[test]
+fn a_refused_dot_segment_allocates_nothing() {
+    let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
+    let req = b"GET /public/..;/api HTTP/1.1\r\nHost: a.test\r\n\r\n";
+    let n = allocations(|| {
+        let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+        assert!(matches!(result, RoutingResult::LocalReply(r) if r.status == 400));
+    });
+    assert_eq!(n, 0);
+}
+
+#[test]
 fn a_path_to_normalize_allocates_once() {
     let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
     let req = b"GET /public/%2e%2e/api/./users?page=2 HTTP/1.1\r\nHost: a.test\r\n\r\n";

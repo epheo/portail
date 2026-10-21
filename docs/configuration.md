@@ -98,6 +98,11 @@ the route on `/admin`, never past it:
 - A `..` above the root stops there: `/../a` becomes `/a`.
 - Nothing else changes: empty segments stay (`//` is not merged), no
   other escape is decoded (`%2F` stays as sent), the query is untouched.
+- A `.` or `..` segment with path parameters (`/public/..;/admin`) gets
+  `400` and closes the connection, counted in
+  `portail_http_requests_rejected_total`: Tomcat, Jetty and Spring drop
+  the parameters and resolve it, RFC 3986 does not. Parameters on any
+  other segment (`/a;jsessionid=1`) pass.
 - Access logs keep the path as the client sent it.
 
 URLRewrite and RequestRedirect path modifiers replace the path only. The

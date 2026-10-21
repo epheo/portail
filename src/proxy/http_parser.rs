@@ -614,31 +614,40 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
 /// A backend resolving `/public/../admin` serves `/admin`, so matching the
 /// raw path let it past the rule guarding `/admin`.
 ///
+/// `None` for a "." or ".." segment with path parameters (`/..;x/`): RFC
+/// 3986 keeps it, while Tomcat, Jetty and Spring drop the parameters and
+/// resolve it, so no one path would be both routed and served. The caller
+/// refuses the request.
+///
 /// Nothing else changes: empty segments stay, no other escape is decoded
 /// (`%2F` stays), and a `..` above the root stops there. Borrowed unless a
 /// dot-segment is found; a path without '.' or '%' costs one memchr2.
 #[inline]
-pub fn normalize_path(path: &str) -> Cow<'_, str> {
+pub fn normalize_path(path: &str) -> Option<Cow<'_, str>> {
     let bytes = path.as_bytes();
     // A dot-segment opens a segment, so it follows a '/'; asterisk-form "*"
     // has no segments.
     if bytes.first() != Some(&b'/') {
-        return Cow::Borrowed(path);
+        return Some(Cow::Borrowed(path));
     }
     let mut from = 1;
     while let Some(i) = memchr::memchr2(b'.', b'%', &bytes[from..]) {
         let at = from + i;
-        if bytes[at - 1] == b'/' && dot_segment(&bytes[at..]).is_some() {
-            return Cow::Owned(remove_dot_segments(path));
+        if bytes[at - 1] == b'/' {
+            match dot_segment(&bytes[at..]) {
+                Some(Dots::Segment(_)) => return remove_dot_segments(path).map(Cow::Owned),
+                Some(Dots::WithParams) => return None,
+                None => {}
+            }
         }
         from = at + 1;
     }
-    Cow::Borrowed(path)
+    Some(Cow::Borrowed(path))
 }
 
 /// `normalize_path`'s rewrite, for a path known to hold a dot-segment.
 #[cold]
-fn remove_dot_segments(path: &str) -> String {
+fn remove_dot_segments(path: &str) -> Option<String> {
     // Output never outgrows the input: segments only drop.
     let mut out = String::with_capacity(path.len());
     let mut segments = path[1..].split('/').peekable();
@@ -649,27 +658,36 @@ fn remove_dot_segments(path: &str) -> String {
                 out.push_str(segment);
                 continue;
             }
-            Some(1) => {}
-            Some(_) => out.truncate(out.rfind('/').unwrap_or(0)),
+            Some(Dots::WithParams) => return None,
+            Some(Dots::Segment(1)) => {}
+            Some(Dots::Segment(_)) => out.truncate(out.rfind('/').unwrap_or(0)),
         }
         // A trailing dot-segment leaves the path ending in '/'.
         if segments.peek().is_none() {
             out.push('/');
         }
     }
-    out
+    Some(out)
 }
 
-/// 1 for a "." segment and 2 for "..", each dot written '.', `%2e` or
-/// `%2E`, when one opens `segment`; `None` for any other segment.
+/// One or two dots opening a segment, each written '.', `%2e` or `%2E`.
+enum Dots {
+    /// The whole segment: "." (1) or ".." (2).
+    Segment(usize),
+    /// Before path parameters: `.;x` or `..;x`.
+    WithParams,
+}
+
+/// The dots opening `segment`; `None` for any other segment.
 #[inline]
-fn dot_segment(segment: &[u8]) -> Option<usize> {
+fn dot_segment(segment: &[u8]) -> Option<Dots> {
     let (mut at, mut dots) = (0, 0);
     while dots <= 2 {
         match &segment[at..] {
             [b'.', ..] => at += 1,
             [b'%', b'2', b'e' | b'E', ..] => at += 3,
-            [] | [b'/', ..] => return (dots > 0).then_some(dots),
+            [] | [b'/', ..] => return (dots > 0).then_some(Dots::Segment(dots)),
+            [b';', ..] => return (dots > 0).then_some(Dots::WithParams),
             _ => return None,
         }
         dots += 1;
@@ -743,8 +761,10 @@ mod tests {
             ("/a/%2F../b", "/a/%2F../b"),
             ("/a/%2e%2ex/b", "/a/%2e%2ex/b"),
             ("/a/./%2F", "/a/%2F"),
+            // Parameters on another segment are that segment's.
+            ("/a;v=1/../b;c", "/b;c"),
         ] {
-            assert_eq!(normalize_path(path), want, "{path}");
+            assert_eq!(normalize_path(path).as_deref(), Some(want), "{path}");
         }
     }
 
@@ -759,12 +779,33 @@ mod tests {
             "/a/..b/c.",
             "/a%20b/%41/%2",
             "/a/%2e%2ex",
+            "/a;jsessionid=1",
+            "/a/...;x",
+            "/a/;../b",
+            "/a/x.;y",
             "*",
         ] {
             assert!(
-                matches!(normalize_path(path), Cow::Borrowed(p) if p == path),
+                matches!(normalize_path(path), Some(Cow::Borrowed(p)) if p == path),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn dot_segments_with_path_parameters_are_refused() {
+        for path in [
+            "/public/..;/admin",
+            "/public/..;x=1/admin",
+            "/a/.;/b",
+            "/a/.;",
+            "/a/%2e%2E;v/b",
+            "/a/.%2e;/b",
+            // Past a dot-segment too, which the rewrite reads.
+            "/a/../b/..;",
+            "/a/./b/.;x/c",
+        ] {
+            assert!(normalize_path(path).is_none(), "{path}");
         }
     }
 
@@ -797,16 +838,25 @@ mod tests {
         path.replace("%2e", ".").replace("%2E", ".")
     }
 
+    /// And refused exactly when a segment, its dots decoded, is "." or ".."
+    /// before a ';'.
     #[test]
     fn normalization_matches_rfc_3986_with_encoded_dots_decoded() {
-        let alphabet = ["/", "a", ".", "%2e", "%2E"];
+        let alphabet = ["/", "a", ".", "%2e", "%2E", ";"];
         let mut rng = fastrand::Rng::with_seed(3986);
         for _ in 0..50_000 {
             let mut path = String::from("/");
             for _ in 0..rng.usize(0..10) {
                 path.push_str(alphabet[rng.usize(..alphabet.len())]);
             }
-            let got = normalize_path(&path);
+            let refused = decode_dots(&path)
+                .split('/')
+                .any(|s| matches!(s.split_once(';'), Some(("." | "..", _))));
+            let Some(got) = normalize_path(&path) else {
+                assert!(refused, "{path}");
+                continue;
+            };
+            assert!(!refused, "{path}");
             let want = rfc_remove_dot_segments(&decode_dots(&path));
             assert_eq!(decode_dots(&got), want, "{path}");
             assert_eq!(

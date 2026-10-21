@@ -244,7 +244,14 @@ fn analyze_http_request<'a>(
         }))
     };
 
-    let path = normalize_path(request_info.path);
+    let Some(path) = normalize_path(request_info.path) else {
+        METRICS.http_requests_rejected_total.inc();
+        debug!(
+            "Rejecting a dot-segment with path parameters on port {}",
+            server_port
+        );
+        return Ok(BAD_REQUEST);
+    };
     let Some(rule) = routes.find_http_route(
         request_info.host,
         request_info.method,
@@ -974,6 +981,43 @@ mod tests {
                 }
                 _ => panic!("expected HttpForward for {target}"),
             }
+        }
+    }
+
+    /// Tomcat, Jetty and Spring drop a segment's path parameters, then
+    /// resolve what is left: `/public/..;/admin`, routed by `/`, was served
+    /// `/admin` there. Ordinary path parameters still route.
+    #[test]
+    fn a_dot_segment_with_path_parameters_gets_a_counted_400() {
+        let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        let rejected = || METRICS.http_requests_rejected_total.get();
+        for target in [
+            "/public/..;/admin",
+            "/public/..;x=1/admin?q",
+            "/a/.;/b",
+            "/a/%2e%2E;v/b",
+            "/a/../b/..;",
+            "/.;",
+        ] {
+            let before = rejected();
+            let req = make_request("GET", target, "example.com");
+            assert_eq!(local_reply(&rt, &req), (400, false), "{target}");
+            assert!(rejected() > before, "{target}");
+        }
+        let sel = BackendSelector::new();
+        for target in [
+            "/a;jsessionid=1",
+            "/a/..b;x/c",
+            "/a/...;x",
+            "/a/;../b",
+            "/a/x.;y",
+        ] {
+            let req = make_request("GET", target, "example.com");
+            let routed = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+            assert!(
+                matches!(routed, RoutingResult::HttpForward { .. }),
+                "{target}"
+            );
         }
     }
 
