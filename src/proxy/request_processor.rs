@@ -11,7 +11,7 @@ use crate::logging::{debug, error};
 use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::{extract_routing_info, HttpRequestInfo};
-use crate::proxy::method::method_len;
+use crate::proxy::method::{is_idempotent, method_len};
 use crate::routing::{
     Backend, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
@@ -26,6 +26,8 @@ pub struct RequestMeta {
     /// response — otherwise `forward_response_body` would block reading bytes
     /// the backend (correctly) never sends.
     pub is_head: bool,
+    /// See [`crate::proxy::method::is_idempotent`].
+    pub idempotent: bool,
     pub keepalive: bool,
     /// Byte span of the parsed request path (query stripped) within the
     /// request buffer, so filters need not re-parse the request line. `None`
@@ -229,6 +231,7 @@ fn analyze_http_request<'a>(
             is_chunked: request_info.is_chunked,
             is_upgrade: request_info.is_upgrade,
             is_head,
+            idempotent: is_idempotent(request_info.method),
             keepalive: request_info.keepalive,
             path_span: subslice_span(request_data, request_info.path),
             strip_spans: request_info.strip_spans,

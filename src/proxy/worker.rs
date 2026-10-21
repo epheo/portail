@@ -772,6 +772,13 @@ async fn proxy_http_request(
     } else {
         None
     };
+    // The whole body came with the head, so the relay below reads nothing
+    // into `buf`: a replay can still send it from there.
+    let body_held = match (meta.content_length, &req_chunked) {
+        (Some(cl), _) => tail_len >= cl,
+        (None, Some(stream)) => stream.is_terminated(),
+        (None, None) => true,
+    };
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (backend, from_pool) =
@@ -793,7 +800,7 @@ async fn proxy_http_request(
     let headers_len = state.scratch_buf.len();
     let mirror_header_data: Option<Vec<u8>> = has_mirrors.then(|| state.scratch_buf.clone());
 
-    let mut backend = match send_request_with_retry(
+    let (mut backend, reused) = match send_request_with_retry(
         client,
         state,
         backend_ref,
@@ -810,6 +817,11 @@ async fn proxy_http_request(
         Some(b) => b,
         None => return Ok((false, None)),
     };
+    // A pooled conn the backend dropped after the probe, as this request
+    // reached it, shows only as a close before any response byte. Sending
+    // the request again is safe only when its method is idempotent (the
+    // backend may have acted before dying) and the proxy still holds it.
+    let mut replayable = reused && meta.idempotent && body_held;
 
     // Expect: 100-continue — the proxy answers on the backend's behalf. The
     // Expect header was stripped from the forwarded request (a compliant
@@ -863,6 +875,12 @@ async fn proxy_http_request(
     // is still well-formed.
     let (mirror_body, relay_leftover) = match relay {
         RequestBody::Complete { mirror, leftover } => (mirror, leftover),
+        RequestBody::BackendGone => {
+            warn!("Backend {} stopped taking the request body", backend_addr);
+            state.last_status = 502;
+            let _ = send_error_response(client, 502).await;
+            return Ok((false, None));
+        }
         incomplete => {
             if let RequestBody::Broken = incomplete {
                 warn!(
@@ -894,29 +912,60 @@ async fn proxy_http_request(
 
     // Forward response headers (SAFE→UNSAFE transition lives inside this call;
     // on timeout the helper emits a 504 — no client bytes written yet).
-    let header_budget = clamp_to_deadline(
-        backend_budget.saturating_sub(backend_phase_start.elapsed()),
-        total_deadline,
-    );
     let resp_mods = extract_response_mods(rule, backend_ref);
-    let mut framing = match forward_response_headers(
-        client,
-        &mut backend,
-        &mut state.header_buf,
-        &mut state.scratch_buf,
-        &mut state.filter_buf,
-        resp_mods.as_ref(),
-        header_budget,
-        meta.is_head,
-        meta.is_upgrade,
-        !meta.keepalive,
-    )
-    .await?
-    {
-        HeaderPhase::Proxied(f) => f,
-        HeaderPhase::ErrorSent(code) => {
-            state.last_status = code;
-            return Ok((false, None));
+    let mut framing = loop {
+        let header_budget = clamp_to_deadline(
+            backend_budget.saturating_sub(backend_phase_start.elapsed()),
+            total_deadline,
+        );
+        match forward_response_headers(
+            client,
+            &mut backend,
+            &mut state.header_buf,
+            &mut state.scratch_buf,
+            &mut state.filter_buf,
+            resp_mods.as_ref(),
+            header_budget,
+            meta.is_head,
+            meta.is_upgrade,
+            !meta.keepalive,
+        )
+        .await?
+        {
+            HeaderPhase::Proxied(f) => break f,
+            HeaderPhase::ErrorSent(code) => {
+                state.last_status = code;
+                return Ok((false, None));
+            }
+            HeaderPhase::Unanswered if replayable => {
+                replayable = false;
+                METRICS.pool_stale_retries_total.inc();
+                debug!(
+                    "Backend {} pool conn closed unanswered; replaying on a fresh conn",
+                    backend_addr
+                );
+                backend = match resend_on_fresh(
+                    client,
+                    state,
+                    backend_ref,
+                    headers_len,
+                    &buf[req_header_end..request_end],
+                    backend_budget,
+                    backend_phase_start,
+                    total_deadline,
+                )
+                .await?
+                {
+                    Some(b) => b,
+                    None => return Ok((false, None)),
+                };
+            }
+            HeaderPhase::Unanswered => {
+                warn!("Backend {} closed without answering", backend_addr);
+                state.last_status = 502;
+                send_error_response(client, 502).await?;
+                return Ok((false, None));
+            }
         }
     };
     crate::metrics::UPSTREAM_TTFB.observe(backend_phase_start.elapsed());
@@ -1109,8 +1158,8 @@ async fn fail_backend(
 /// which signals the connection is not reusable.
 ///
 /// `Ok(Some((conn, from_pool)))`: `from_pool == true` means the conn came from
-/// the idle pool and the caller may safely retry once with `acquire_fresh` if a
-/// subsequent SAFE-zone write to it fails (the probe is best-effort).
+/// the idle pool and the caller may retry once with `acquire_fresh` if the
+/// backend turns out to have dropped it (the probe is best-effort).
 async fn connect_to_backend(
     client: &mut Connection,
     state: &mut ConnectionState,
@@ -1278,8 +1327,9 @@ async fn write_with_tail(
 /// no backend observed them. The retry is unconditionally safe regardless
 /// of HTTP method.
 ///
-/// `Ok(Some(conn))` hands back the connection that accepted the request;
-/// `Ok(None)` means the failure was already answered to the client.
+/// `Ok(Some((conn, reused)))` hands back the connection that accepted the
+/// request, `reused` when it is still the pooled one; `Ok(None)` means the
+/// failure was already answered to the client.
 #[allow(clippy::too_many_arguments)]
 async fn send_request_with_retry(
     client: &mut Connection,
@@ -1292,10 +1342,10 @@ async fn send_request_with_retry(
     backend_budget: Duration,
     backend_phase_start: std::time::Instant,
     total_deadline: Option<std::time::Instant>,
-) -> Result<Option<Connection>> {
+) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     match write_with_tail(&mut backend, &mut state.scratch_buf, headers_len, body).await {
-        Ok(()) => return Ok(Some(backend)),
+        Ok(()) => return Ok(Some((backend, from_pool))),
         Err(_e) if from_pool => {
             // Pool entry died between probe and write. Reconnect once and
             // replay. Do NOT record_failure here: a stale pool entry is
@@ -1306,9 +1356,49 @@ async fn send_request_with_retry(
                 backend_addr, _e
             );
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            warn!("Backend {} send failed: {}", backend_addr, e);
+            fail_backend(
+                state,
+                &backend_metric_label(backend_ref),
+                client,
+                backend_addr,
+                502,
+            )
+            .await?;
+            return Ok(None);
+        }
     }
     drop(backend);
+    let fresh = resend_on_fresh(
+        client,
+        state,
+        backend_ref,
+        headers_len,
+        body,
+        backend_budget,
+        backend_phase_start,
+        total_deadline,
+    )
+    .await?;
+    Ok(fresh.map(|backend| (backend, false)))
+}
+
+/// Send the assembled request again on a brand-new connection, in place of
+/// a pooled one found dead. Unlike that stale entry, a failure here is the
+/// backend's: answered to the client and charged to its health (`Ok(None)`).
+#[allow(clippy::too_many_arguments)]
+async fn resend_on_fresh(
+    client: &mut Connection,
+    state: &mut ConnectionState,
+    backend_ref: &crate::routing::Backend,
+    headers_len: usize,
+    body: &[u8],
+    backend_budget: Duration,
+    backend_phase_start: std::time::Instant,
+    total_deadline: Option<std::time::Instant>,
+) -> Result<Option<Connection>> {
+    let backend_addr = backend_ref.socket_addr;
     let fresh_budget = clamp_to_deadline(
         backend_budget.saturating_sub(backend_phase_start.elapsed()),
         total_deadline,
@@ -1383,6 +1473,9 @@ async fn send_request_with_retry(
 enum HeaderPhase {
     Proxied(ResponseFraming),
     ErrorSent(u16),
+    /// The backend closed or reset before its first byte, and nothing was
+    /// written to the client: the caller replays or answers.
+    Unanswered,
 }
 
 /// Read response headers from the backend within `header_budget` and forward
@@ -1407,16 +1500,24 @@ async fn forward_response_headers(
     let read =
         match tokio::time::timeout(header_budget, read_response_head(backend, header_buf)).await {
             Ok(Ok(read)) => read,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                warn!("Backend response head failed: {}", e);
+                send_error_response(client, 502).await?;
+                return Ok(HeaderPhase::ErrorSent(502));
+            }
             Err(_) => {
                 send_error_response(client, 504).await?;
                 return Ok(HeaderPhase::ErrorSent(504));
             }
         };
-    let Some((resp_header_end, head)) = read else {
-        warn!("Backend sent a response head with ambiguous framing; rejecting");
-        send_error_response(client, 502).await?;
-        return Ok(HeaderPhase::ErrorSent(502));
+    let (resp_header_end, head) = match read {
+        HeadRead::Head(end, head) => (end, head),
+        HeadRead::Malformed => {
+            warn!("Backend sent a response head with ambiguous framing; rejecting");
+            send_error_response(client, 502).await?;
+            return Ok(HeaderPhase::ErrorSent(502));
+        }
+        HeadRead::Unanswered => return Ok(HeaderPhase::Unanswered),
     };
     let framing = frame_response(
         head,
@@ -1503,6 +1604,9 @@ enum RequestBody {
     /// Malformed chunked framing; nothing from the offending byte on was
     /// forwarded.
     Broken,
+    /// The backend stopped taking the body: closed, reset (a pooled conn it
+    /// had dropped) or stalled past the progress budget.
+    BackendGone,
 }
 
 /// Relay the request body from client to backend, optionally teeing into a mirror buffer.
@@ -1544,7 +1648,12 @@ async fn relay_request_body(
                 return Ok(RequestBody::Truncated);
             }
             let to_send = n.min(remaining);
-            idle_guarded(idle, backend.write_all(&buf[..to_send])).await?;
+            if idle_guarded(idle, backend.write_all(&buf[..to_send]))
+                .await
+                .is_err()
+            {
+                return Ok(RequestBody::BackendGone);
+            }
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..to_send]);
             remaining -= to_send;
             if to_send < n {
@@ -1564,7 +1673,12 @@ async fn relay_request_body(
             if stream.is_broken() {
                 break;
             }
-            idle_guarded(idle, backend.write_all(&buf[..consumed])).await?;
+            if idle_guarded(idle, backend.write_all(&buf[..consumed]))
+                .await
+                .is_err()
+            {
+                return Ok(RequestBody::BackendGone);
+            }
             tee_mirror_chunk(&mut mirror_body, &mut overflow, &buf[..consumed]);
             if consumed < n {
                 leftover = Some(buf[consumed..n].to_vec());
@@ -1649,25 +1763,35 @@ pub(crate) const RESPONSE_HEADER_CAP: usize = 65536;
 /// (100, 103), the cap only stops an infinite interim stream.
 const MAX_INTERIM_RESPONSES: u32 = 8;
 
+/// How reading a response head ended, short of an error.
+enum HeadRead {
+    /// The final (non-interim) head and where it ends: `header_buf` holds
+    /// `[headers..header_end][same-read body tail...]`.
+    Head(usize, ResponseHead),
+    /// A head, interim ones included, a recipient could frame differently
+    /// (see `parse_response_head`).
+    Malformed,
+    /// Closed or reset before a single byte.
+    Unanswered,
+}
+
 /// Phase 1: read response headers from the backend into `header_buf`. Performs
 /// NO writes to the client; aborting/timeout/error before this returns leaves the
 /// client wire untouched, so the caller can still emit a clean `504`.
-/// Returns the final (non-interim) head and where it ends: `header_buf` then
-/// holds `[headers..header_end][same-read body tail...]`. `None` when a head,
-/// interim ones included, is malformed (see `parse_response_head`).
 async fn read_response_head(
     backend: &mut Connection,
     header_buf: &mut Vec<u8>,
-) -> Result<Option<(usize, ResponseHead)>> {
+) -> Result<HeadRead> {
     header_buf.clear();
     let mut interim_seen = 0u32;
+    let mut answered = false;
 
     loop {
         // Check before reading: a swallowed interim response leaves the next
         // response's bytes already buffered.
         if let Some(header_end) = find_header_end(header_buf) {
             let Some(head) = parse_response_head(&header_buf[..header_end]) else {
-                return Ok(None);
+                return Ok(HeadRead::Malformed);
             };
 
             // Interim responses are proxy-consumed: the proxy answers
@@ -1688,7 +1812,7 @@ async fn read_response_head(
                 header_buf.drain(..header_end);
                 continue;
             }
-            return Ok(Some((header_end, head)));
+            return Ok(HeadRead::Head(header_end, head));
         }
 
         if header_buf.len() > RESPONSE_HEADER_CAP {
@@ -1698,11 +1822,11 @@ async fn read_response_head(
         // read_buf with little spare capacity degrades to tiny reads; keep a
         // full read's worth reserved (and spare > 0 makes Ok(0) mean EOF).
         header_buf.reserve(16 * 1024);
-        let n = backend.read_buf(header_buf).await?;
-        if n == 0 {
-            return Err(anyhow::anyhow!(
-                "backend closed before sending response headers"
-            ));
+        match backend.read_buf(header_buf).await {
+            Ok(1..) => answered = true,
+            Ok(0) | Err(_) if !answered => return Ok(HeadRead::Unanswered),
+            Ok(_) => return Err(anyhow::anyhow!("backend closed mid response head")),
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -2598,6 +2722,274 @@ mod connection_tests {
         let (mut relayed, proxy_end) = tcp.accept().await.unwrap();
         relayed.read_exact(&mut [0u8; 4]).await.unwrap();
         assert_eq!(keepalive_of(proxy_end), want, "L4 backend");
+    }
+
+    /// What a scripted backend does with a request head.
+    #[derive(Clone, Copy)]
+    enum Turn {
+        Answer,
+        /// Answer, then close: an idle timeout firing after the response.
+        AnswerThenClose,
+        /// Close without a byte: an idle timeout firing as the request lands.
+        Close,
+        Reset,
+    }
+
+    /// A backend's script: the turn for request `head` on connection `conn`,
+    /// both counted from 0.
+    type Script = fn(usize, usize) -> Turn;
+
+    /// Answers request 0 on each connection and drops the next unanswered.
+    fn then_close(_conn: usize, head: usize) -> Turn {
+        [Turn::Answer, Turn::Close][head.min(1)]
+    }
+
+    fn then_reset(_conn: usize, head: usize) -> Turn {
+        [Turn::Answer, Turn::Reset][head.min(1)]
+    }
+
+    /// Plays `script` on backend connection `conn`; returns how it must end.
+    async fn play<S>(sock: &mut S, script: Script, conn: usize, reply: &[u8]) -> Turn
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut seen, mut chunk, mut turn) = (Vec::new(), [0u8; 4096], 0);
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(n @ 1..) => seen.extend_from_slice(&chunk[..n]),
+                _ => return Turn::Close,
+            }
+            while let Some(end) = find_header_end(&seen) {
+                seen.drain(..end);
+                let act = script(conn, turn);
+                turn += 1;
+                if let Turn::Answer | Turn::AnswerThenClose = act {
+                    if sock.write_all(reply).await.is_err() {
+                        return Turn::Close;
+                    }
+                }
+                if !matches!(act, Turn::Answer) {
+                    return act;
+                }
+            }
+        }
+    }
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    /// Plain backend answering OK by `script`.
+    async fn scripted_backend(script: Script) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for conn in 0.. {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    if let Turn::Reset = play(&mut sock, script, conn, OK.as_bytes()).await {
+                        let _ = socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO));
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// TLS backend answering by `script` with the SNI the connection was
+    /// opened with as the body; closes with close_notify. `None` without
+    /// openssl.
+    async fn scripted_tls_backend(script: Script) -> Option<SocketAddr> {
+        static CERT: std::sync::OnceLock<Option<(Vec<u8>, Vec<u8>)>> = std::sync::OnceLock::new();
+        let (cert_pem, key_pem) = CERT
+            .get_or_init(|| crate::proxy::tls::test_util::generate_test_cert("backend.test"))
+            .clone()?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = crate::config::CertificateRef {
+            name: "backend".to_string(),
+            cert_pem: Some(cert_pem),
+            key_pem: Some(key_pem),
+            ..Default::default()
+        };
+        let server_cfg =
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for conn in 0.. {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let sni = tls.get_ref().1.server_name().unwrap_or("").to_owned();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{sni}",
+                        sni.len()
+                    );
+                    match play(&mut tls, script, conn, reply.as_bytes()).await {
+                        Turn::Reset => {
+                            let tcp = socket2::SockRef::from(tls.get_ref().0);
+                            let _ = tcp.set_linger(Some(Duration::ZERO));
+                        }
+                        _ => {
+                            let _ = tls.shutdown().await;
+                        }
+                    }
+                });
+            }
+        });
+        Some(addr)
+    }
+
+    /// Each (host, sni) proxies to the TLS backend at `addr` under that SNI.
+    fn tls_routes(addr: SocketAddr, hosts: &[(&str, &str)]) -> RouteTable {
+        let mut rt = RouteTable::new();
+        for (host, sni) in hosts {
+            rt.add_http_route(
+                host,
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![Backend {
+                        socket_addr: addr,
+                        weight: 1,
+                        filters: vec![],
+                        use_tls: true,
+                        server_name: sni.to_string(),
+                    }],
+                ),
+            );
+        }
+        rt
+    }
+
+    /// The next response on a kept-open client connection, by its
+    /// Content-Length; whatever arrived when the engine closes instead.
+    async fn response(client: &mut DuplexStream) -> String {
+        let (mut out, mut chunk) = (Vec::new(), [0u8; 4096]);
+        loop {
+            if let Some(end) = find_header_end(&out) {
+                let head = String::from_utf8_lossy(&out[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .split("\r\ncontent-length: ")
+                    .nth(1)
+                    .and_then(|v| v.split("\r\n").next()?.parse().ok())
+                    .unwrap_or(0);
+                if out.len() >= end + len {
+                    let resp = String::from_utf8_lossy(&out[..end + len]).into_owned();
+                    out.drain(..end + len);
+                    assert!(out.is_empty(), "unexpected bytes after {resp}");
+                    return resp;
+                }
+            }
+            let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut chunk));
+            match read.await.expect("no response").unwrap() {
+                0 => return String::from_utf8_lossy(&out).into_owned(),
+                n => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+    /// Node's https server closes an idle keep-alive conn after 5s with
+    /// close_notify and FIN. A pooled TLS conn was never probed, so every
+    /// request reusing one met EOF and the client was dropped unanswered.
+    #[tokio::test]
+    async fn pooled_tls_conn_the_backend_closed_is_not_reused() {
+        let Some(addr) = scripted_tls_backend(|_, _| Turn::AnswerThenClose).await else {
+            return; // openssl unavailable
+        };
+        let (mut client, _task) = serve(tls_routes(addr, &[("a.test", "a.test")]));
+        for _ in 0..2 {
+            client.write_all(GET_A).await.unwrap();
+            let out = response(&mut client).await;
+            assert!(out.ends_with("\r\n\r\na.test"), "{out}");
+            // The backend's close lands before the next request.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A pooled conn can also die after the probe, as the request reaches
+    /// the backend. Nothing was answered, so an idempotent request whose
+    /// body the proxy still holds is replayed once on a fresh conn.
+    #[tokio::test]
+    async fn idempotent_request_is_replayed_once_when_a_pooled_conn_dies_unanswered() {
+        let put = b"PUT / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nhi";
+        for script in [then_close, then_reset] {
+            for request in [GET_A, put] {
+                let (mut client, _task) = serve(routes(scripted_backend(script).await));
+                client.write_all(GET_A).await.unwrap();
+                assert_eq!(response(&mut client).await, OK);
+                client.write_all(request).await.unwrap();
+                assert_eq!(response(&mut client).await, OK);
+            }
+        }
+
+        let Some(addr) = scripted_tls_backend(then_close).await else {
+            return; // openssl unavailable
+        };
+        let (mut client, _task) = serve(tls_routes(addr, &[("a.test", "a.test")]));
+        for _ in 0..2 {
+            client.write_all(GET_A).await.unwrap();
+            let out = response(&mut client).await;
+            assert!(out.ends_with("\r\n\r\na.test"), "{out}");
+        }
+    }
+
+    /// The backend may have acted on a POST before dying, and a streamed
+    /// body is gone: no replay, but a 502 rather than a silent close.
+    #[tokio::test]
+    async fn unreplayable_request_on_a_pooled_conn_that_dies_unanswered_gets_a_502() {
+        const BAD_GATEWAY: &str =
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
+        let (mut client, _task) = serve(routes(scripted_backend(then_close).await));
+        client.write_all(GET_A).await.unwrap();
+        assert_eq!(response(&mut client).await, OK);
+        let post = b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nhi";
+        assert_eq!(exchange(&mut client, post).await, BAD_GATEWAY);
+
+        let (mut client, _task) = serve(routes(scripted_backend(then_close).await));
+        client.write_all(GET_A).await.unwrap();
+        assert_eq!(response(&mut client).await, OK);
+        client
+            .write_all(b"PUT / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nhi")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(exchange(&mut client, b"hi").await, BAD_GATEWAY);
+
+        // Replayed once only: the fresh conn dying too ends in a 502.
+        static CONNS: AtomicUsize = AtomicUsize::new(0);
+        let addr = scripted_backend(|conn, head| {
+            CONNS.fetch_max(conn + 1, Ordering::Relaxed);
+            [Turn::Answer, Turn::Close][usize::from(conn + head > 0)]
+        })
+        .await;
+        let (mut client, _task) = serve(routes(addr));
+        client.write_all(GET_A).await.unwrap();
+        assert_eq!(response(&mut client).await, OK);
+        assert_eq!(exchange(&mut client, GET_A).await, BAD_GATEWAY);
+        assert_eq!(CONNS.load(Ordering::Relaxed), 2);
+    }
+
+    /// No response byte has gone out while the head is read: whatever
+    /// breaks it, the client gets a 502, not a silent close.
+    #[tokio::test]
+    async fn backend_closing_mid_head_gets_a_502() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\nContent-Le").await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(&mut client, GET_A).await;
+        assert!(out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{out}");
     }
 
     #[tokio::test]

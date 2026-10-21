@@ -93,18 +93,46 @@ impl Connection {
         }
     }
 
-    /// Non-blocking probe for connection liveness (used by backend pool).
-    /// For plain TCP, delegates to TcpStream::try_read.
-    /// For TLS, returns WouldBlock — TLS connections cannot be probed without
-    /// consuming state, so we optimistically treat them as alive.
-    /// Mem never enters the pool; the arm exists for exhaustiveness.
-    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Connection::Plain { inner } => inner.try_read(buf),
-            Connection::Tls { .. } | Connection::ClientTls { .. } | Connection::Mem { .. } => {
-                Err(io::Error::new(io::ErrorKind::WouldBlock, "probe skipped"))
+    /// Whether an idle pooled connection can carry another request: the peer
+    /// has neither closed it nor sent a byte nobody asked for. TLS must also
+    /// hold no record it already read, such as a close_notify.
+    ///
+    /// The socket is peeked with a direct recv(MSG_PEEK | MSG_DONTWAIT):
+    /// tokio's try_read skips the syscall while its cached readiness says
+    /// idle, which a FIN not yet seen by the reactor leaves stale.
+    pub fn idle_and_open(&mut self) -> bool {
+        let tcp = match self {
+            Connection::Plain { inner } => &*inner,
+            Connection::Tls { inner } => {
+                let (tcp, tls) = inner.get_mut();
+                if tls_holds_input(&mut **tls) {
+                    return false;
+                }
+                &*tcp
             }
-        }
+            Connection::ClientTls { inner } => {
+                let (tcp, tls) = inner.get_mut();
+                if tls_holds_input(&mut **tls) {
+                    return false;
+                }
+                &*tcp
+            }
+            // Never pooled: the h2 bridge's pipe has no socket to peek.
+            Connection::Mem { .. } => return true,
+        };
+        let mut byte = [std::mem::MaybeUninit::uninit()];
+        let peek = socket2::SockRef::from(tcp)
+            .recv_with_flags(&mut byte, libc::MSG_PEEK | libc::MSG_DONTWAIT);
+        matches!(peek, Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+    }
+}
+
+/// Whether rustls holds records read off the socket but not yet consumed:
+/// plaintext a request would take as its response, or the peer's close.
+fn tls_holds_input<D>(tls: &mut rustls::ConnectionCommon<D>) -> bool {
+    match tls.process_new_packets() {
+        Ok(io) => io.plaintext_bytes_to_read() > 0 || io.peer_has_closed(),
+        Err(_) => true,
     }
 }
 
