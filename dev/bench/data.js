@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792546254659,
+  "lastUpdate": 1792593316556,
   "repoUrl": "https://github.com/epheo/portail",
   "entries": {
     "Benchmark": [
@@ -2146,6 +2146,462 @@ window.BENCHMARK_DATA = {
           {
             "name": "sniff_extension_method",
             "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_non_http",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "github@epheo.eu",
+            "name": "Thibaut Lapierre",
+            "username": "epheo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "86a9ca51fa64a5fe6293130d93779cfaeb830612",
+          "message": "Control-plane correctness: one attachment truth, one validation funnel, exact status, shared TLS ports (#17)\n\nControl-plane correctness, wave 2 of the v0.1.22 audit. Builds on\nv0.1.26.\nThe data plane now serves exactly what status says, every route is\nchecked once by one funnel, and status is exact and cheap.\n\n## Attachment has one source of truth\n- The reconciler emits the listeners each parentRef was accepted by; the\ntable no longer re-derives attachment from raw parentRefs. allowedRoutes\nnamespaces and kinds were bypassed before, and a ref to another\nnamespace's Gateway of the same name attached.\n- A parentRef without `namespace` means the route's own namespace.\n- TCP/UDP routes attach like HTTP routes: bare and port-only refs and\nevery parentRef work; the oldest route owns an L4 listener, later ones\nreport Conflicted.\n- An invalid backendRef keeps its weight and fails its share (HTTP 500,\nL4 close), per HTTPBackendRef.\n- Equally specific routes tie-break by creationTimestamp, then\n\"{namespace}/{name}\".\n- Conflicted listeners are not served; HTTPS and TLS passthrough share a\nport when their hostnames differ.\n\n## One validation funnel\n- One step checks and compiles each HTTP route (config/compile.rs) for\nfiles and Kubernetes alike; the table build consumes it, so each regex\ncompiles once.\n- One bad route is rejected alone (Accepted=False, UnsupportedValue or\nIncompatibleFilters); the rest of the table goes live. Before, it failed\nthe whole Gateway's build.\n- Regexes match the whole path, header or query value.\n- Mirror fractions are exact; a rule without matches matches every path;\nPathPrefix ignores a trailing slash.\n- Route checks are cached per route generation; a table build sorts once\n(4000 rules: 28 ms to 1 ms).\n\n## Request time\n- Dot-segments are removed before matching (RFC 3986 5.2.4, %2e counts\nas a dot), and the backend gets that path: /x/../admin no longer slips\npast the rule guarding /admin. A dot-segment with path parameters\n(/..;/) gets a 400.\n- URLRewrite and redirects keep the query string; a value's own query\njoins the request's with '&'.\n- 429s count only as rate-limited, not as dispatched; an h2 refused\nstream and a malformed chunked body count as rejected.\n- Route misses allocate nothing; L4 route misses log once per window.\n- Every route kind and mirrors reach headless Services on their\ntargetPort and ExternalName Services at all.\n\n## Controller status\n- Status is built without timestamps and written only where it differs\nfrom the store; spec bumps, wipes and recreations are healed.\n- A route or policy that moves away loses our status entry on the old\nGateway.\n- Listener Programmed follows the real bind; attachedRoutes counts\nattached routes that are not accepted.\n- portail.epheo.eu/Network addresses bind their resolved IP (they never\nbound before, so the wildcard served every network). A failed NAD read\nkeeps the last IP; listeners move between the wildcard and a specific\naddress in one pass.\n- API load is scoped to the backends this Gateway routes to; named\ntargetPorts resolve by Service port name and are cached; optional CRDs\ninstalled later get their watch without a restart.\n- Config and route table publish as one pair; reflector caches drop\nmanagedFields.\n- RBAC examples: status verbs are patch only, gatewayclasses/status\ndropped, NAD get added.\n\n## Shared TLS ports\n- Each TLS port serves by a plan published per pass and read per\nconnection: mode and cert changes need no rebind, and a deleted\nlistener's cert stops being served.\n- SNI selects a listener by precedence across HTTPS and TLS (exact,\nwildcard, catch-all); no SNI goes to the catch-all.\n- TLS routes match only within their listener. A bad cert rotation keeps\nthe last good certs; a listener whose own certs failed refuses its SNI.\n- A TLS listener in Terminate mode is rejected (UnsupportedProtocol):\nTLSRoute is served as passthrough only.\n\n## Behavior changes\n- Routes may stop being served where their status already said they were\nnot attached (allowedRoutes, other-namespace refs, conflicted\nlisteners).\n- An invalid backendRef's share fails instead of moving to the valid\nbackends.\n- Regexes are full matches; paths with dot-segments route and forward\nnormalized; /..;/ is a 400.\n- File configs: conflicting protocols on one port, a mirror with both\npercent and fraction, and repeated filters fail to load; a redirect\nbeside backendRefs loads with a warning.\n- portail_http_requests_total no longer counts 429s.\n- Network addresses now bind; an unresolved one binds nothing (never the\nwildcard).\n- Status writes are fewer and exact; reconcile_runs_total means rebuilt\nor wrote status.\n\n## Evidence\n- Tests: lib 607 (472 on v0.1.26); integration: parser 69, proxy 45, h2\n24, tls 3, udp 5, hot-path allocations 7. Every commit builds.\n- Replay of the 15 smuggling scenarios: unchanged, all closed.\n- cargo deny: ok.\n- Throughput A/B vs v0.1.26, 3 interleaved rounds: neutral (no-filter 1\nbackend 469.6k vs 468.7k req/s, 4 backends 456.1k vs 455.2k, filter\n465.3k vs 463.5k); p50 and p99 unchanged. Churn neutral.\n- Instructions per request: +1.8% (path normalization and the added\nchecks); cycles within 0.5%.\n- Criterion: routing benches were rewritten with opaque inputs (old\nbodies let the compiler hoist lookups), so their numbers moved with the\nbodies; parse benches flagged by the gate are a layout artifact of the\nbench binary (rebuilt without the added bench group they match v0.1.26).\n- Peer review: /code-review xhigh on the integrated wave, then high and\nthree medium rounds on the fix packages; every finding triaged.\n\n## Deferred\n- A cert made unusable by a revoked ReferenceGrant keeps serving when\nevery cert on its port fails (as today); fixed by the controller split,\nwhich sends certs explicitly.\n- TCP and UDP listeners on one (address, port) cannot both bind yet.\n- Legacy unscoped mode still merges Gateways by port.",
+          "timestamp": "2026-10-21T16:10:33+02:00",
+          "tree_id": "e5178564695808cc92c07d3559cb32cea74355a4",
+          "url": "https://github.com/epheo/portail/commit/86a9ca51fa64a5fe6293130d93779cfaeb830612"
+        },
+        "date": 1792593315853,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "e2e_http_request_processing",
+            "value": 346,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_auth_request",
+            "value": 65,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_product_search",
+            "value": 65,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_health_check_processing",
+            "value": 29,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_404_route_processing",
+            "value": 46,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "throughput_simulation_1000_requests",
+            "value": 196914,
+            "range": "± 11223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_simple_get",
+            "value": 50,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_auth",
+            "value": 64,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_cookies",
+            "value": 60,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_complex_path",
+            "value": 63,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_request_weighted_backends",
+            "value": 78,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_clean",
+            "value": 87,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_dotted",
+            "value": 93,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_dot_segments",
+            "value": 134,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_redirect_prefix_with_query",
+            "value": 182,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "url_rewrite_prefix",
+            "value": 28,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "url_rewrite_full_path",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_redirect_full_value_query",
+            "value": 217,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple",
+            "value": 28,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical",
+            "value": 56,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex",
+            "value": 143,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple_repeated",
+            "value": 27,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical_repeated",
+            "value": 55,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex_repeated",
+            "value": 143,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_malformed_request",
+            "value": 32,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/100",
+            "value": 35,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/500",
+            "value": 87,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/1000",
+            "value": 165,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/2000",
+            "value": 309,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/4000",
+            "value": 602,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/GET",
+            "value": 28,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/POST",
+            "value": 33,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PUT",
+            "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/DELETE",
+            "value": 29,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PATCH",
+            "value": 29,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/HEAD",
+            "value": 28,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/OPTIONS",
+            "value": 30,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/0",
+            "value": 26,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/1",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/2",
+            "value": 39,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/3",
+            "value": 30,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/4",
+            "value": 31,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/clean",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dotted",
+            "value": 6,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dot_segments",
+            "value": 46,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dot_segment_params",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation",
+            "value": 38,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation_test",
+            "value": 38,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/100",
+            "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/1000",
+            "value": 28,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/10000",
+            "value": 30,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_miss/unknown_host",
+            "value": 28,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_miss/unrouted_path",
+            "value": 41,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_simple",
+            "value": 21,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_complex",
+            "value": 18,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tcp_route_lookup",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tls_sni_listener_select",
+            "value": 34,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tls_route_resolve_wildcard",
+            "value": 62,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "udp_route_miss",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_selection/l4_round_robin_100",
+            "value": 69,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_selection/http_weighted_4",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_table_creation",
+            "value": 137,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_creation",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "add_http_route",
+            "value": 379,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_regex_hit",
+            "value": 43,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_regex_miss",
+            "value": 33,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "http_route_lookup_shared_scope",
+            "value": 20,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "http_route_lookup_own_and_shared",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_table_build_1000_rules",
+            "value": 915850,
+            "range": "± 46170",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_common_method",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_extension_method",
+            "value": 7,
             "range": "± 0",
             "unit": "ns/iter"
           },
