@@ -89,7 +89,7 @@ pub(crate) enum CompiledFilter<'a> {
     /// Its address is DNS's to decide, at table build.
     Mirror {
         backend: &'a BackendRef,
-        mirror_percent: u32,
+        fraction: routing::Fraction,
     },
 }
 
@@ -387,7 +387,7 @@ fn compile_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError>
     // Every config path reaches the wire through here: no CR/LF or framing
     // header gets past, validate() or not.
     super::wire::check_filter(f).map_err(RouteError::unsupported)?;
-    Ok(table_filter(f))
+    table_filter(f)
 }
 
 fn compile_backend_filters(b: &BackendRef) -> Result<Vec<routing::HttpFilter>, RouteError> {
@@ -415,17 +415,17 @@ fn compile_backend_filter(f: &HttpRouteFilter) -> Result<routing::HttpFilter, Ro
         return Err(unsupported());
     }
     super::wire::check_filter(f).map_err(RouteError::unsupported)?;
-    match table_filter(f) {
+    match table_filter(f)? {
         CompiledFilter::Ready(filter) => Ok(filter),
         CompiledFilter::Mirror { .. } => Err(unsupported()),
     }
 }
 
 /// A checked filter in the table's form.
-fn table_filter(f: &HttpRouteFilter) -> CompiledFilter<'_> {
+fn table_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError> {
     use std::sync::Arc;
 
-    CompiledFilter::Ready(match f {
+    Ok(CompiledFilter::Ready(match f {
         HttpRouteFilter::RequestHeaderModifier { config } => {
             routing::HttpFilter::RequestHeaderModifier {
                 add: Arc::new(config.add.clone()),
@@ -454,22 +454,28 @@ fn table_filter(f: &HttpRouteFilter) -> CompiledFilter<'_> {
             path: config.path.as_ref().map(routing::URLRewritePath::from),
         },
         HttpRouteFilter::RequestMirror { config } => {
-            // Fraction takes precedence over percent per Gateway API spec.
-            // If neither is set, mirror 100% of requests.
-            let mirror_percent = if let Some(ref frac) = config.fraction {
-                if frac.denominator > 0 {
-                    ((frac.numerator as u64 * 100) / frac.denominator as u64).min(100) as u32
-                } else {
-                    100
-                }
-            } else {
-                config.percent.unwrap_or(100).min(100)
-            };
-            return CompiledFilter::Mirror {
+            return Ok(CompiledFilter::Mirror {
                 backend: &config.backend_ref,
-                mirror_percent,
-            };
+                fraction: mirror_fraction(config)?,
+            })
         }
+    }))
+}
+
+/// Gateway API v1.4.1 bounds: percent 0 to 100, or a fraction whose
+/// denominator is at least 1 and whose numerator is no larger. Neither
+/// set mirrors every request; the fraction wins when both are.
+fn mirror_fraction(config: &RequestMirrorConfig) -> Result<routing::Fraction, RouteError> {
+    let (numerator, denominator) = match (&config.fraction, config.percent) {
+        (Some(f), _) => (f.numerator, f.denominator),
+        (None, Some(percent)) => (percent, 100),
+        (None, None) => return Ok(routing::Fraction::ALL),
+    };
+    routing::Fraction::new(numerator, denominator).ok_or_else(|| {
+        RouteError::unsupported(format!(
+            "RequestMirror share {}/{} is not a fraction of requests: the denominator must be at least 1 and the numerator no larger",
+            numerator, denominator
+        ))
     })
 }
 
@@ -505,5 +511,39 @@ mod tests {
         assert!(!re.is_match("/x/v2") && !re.is_match("/api/x"));
         assert!(compile_regex("^/a.*$", "path").unwrap().is_match("/abc"));
         assert!(compile_regex("(?i)/api", "path").unwrap().is_match("/API"));
+    }
+
+    fn mirror(percent: Option<u32>, fraction: Option<(u32, u32)>) -> RequestMirrorConfig {
+        RequestMirrorConfig {
+            backend_ref: serde_json::from_str(r#"{"name":"m.svc","port":80}"#).unwrap(),
+            percent,
+            fraction: fraction.map(|(numerator, denominator)| MirrorFraction {
+                numerator,
+                denominator,
+            }),
+        }
+    }
+
+    /// The CRD rejects these shares; a file config used to clamp them to
+    /// 100%, and a zero denominator left nothing to draw from.
+    #[test]
+    fn a_mirror_share_outside_the_spec_bounds_is_rejected() {
+        for config in [
+            mirror(Some(101), None),
+            mirror(None, Some((3, 2))),
+            mirror(None, Some((0, 0))),
+        ] {
+            let err = mirror_fraction(&config).unwrap_err();
+            assert_eq!(err.reason, RejectReason::UnsupportedValue);
+            assert!(
+                err.message.starts_with("RequestMirror share"),
+                "{}",
+                err.message
+            );
+        }
+        let edge = |p, f| mirror_fraction(&mirror(p, f)).unwrap();
+        assert_eq!(edge(Some(0), None), routing::Fraction::new(0, 100).unwrap());
+        assert_eq!(edge(Some(100), None), routing::Fraction::new(1, 1).unwrap());
+        assert_eq!(edge(None, Some((7, 7))), routing::Fraction::ALL);
     }
 }

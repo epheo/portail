@@ -497,8 +497,8 @@ mod tests {
     use super::*;
     use crate::proxy::health::HealthRegistry;
     use crate::routing::{
-        Backend, BackendSelector, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, RouteTable,
-        URLRewritePath,
+        Backend, BackendSelector, Fraction, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType,
+        RouteTable, URLRewritePath,
     };
     use std::sync::Arc;
 
@@ -781,7 +781,7 @@ mod tests {
             8001,
             vec![HttpFilter::RequestMirror {
                 backend_addr: "127.0.0.1:9999".parse().unwrap(),
-                mirror_percent: 100,
+                fraction: Fraction::ALL,
             }],
         );
         let sel = BackendSelector::new();
@@ -795,14 +795,14 @@ mod tests {
                 .filter_map(|f| match f {
                     HttpFilter::RequestMirror {
                         backend_addr,
-                        mirror_percent,
-                    } => Some((*backend_addr, *mirror_percent)),
+                        fraction,
+                    } => Some((*backend_addr, *fraction)),
                     _ => None,
                 })
                 .collect();
             assert_eq!(mirrors.len(), 1);
             assert_eq!(mirrors[0].0, "127.0.0.1:9999".parse().unwrap());
-            assert_eq!(mirrors[0].1, 100);
+            assert_eq!(mirrors[0].1, Fraction::ALL);
         } else {
             panic!("expected HttpForward");
         }
@@ -818,11 +818,11 @@ mod tests {
             vec![
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9998".parse().unwrap(),
-                    mirror_percent: 50,
+                    fraction: Fraction::new(1, 2).unwrap(),
                 },
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9999".parse().unwrap(),
-                    mirror_percent: 100,
+                    fraction: Fraction::ALL,
                 },
             ],
         );
@@ -837,14 +837,14 @@ mod tests {
                 .filter_map(|f| match f {
                     HttpFilter::RequestMirror {
                         backend_addr,
-                        mirror_percent,
-                    } => Some((*backend_addr, *mirror_percent)),
+                        fraction,
+                    } => Some((*backend_addr, *fraction)),
                     _ => None,
                 })
                 .collect();
             assert_eq!(mirrors.len(), 2);
-            assert_eq!(mirrors[0].1, 50);
-            assert_eq!(mirrors[1].1, 100);
+            assert_eq!(mirrors[0].1, Fraction::new(1, 2).unwrap());
+            assert_eq!(mirrors[1].1, Fraction::ALL);
         } else {
             panic!("expected HttpForward");
         }

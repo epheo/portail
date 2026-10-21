@@ -430,28 +430,24 @@ pub(crate) const MIRROR_BODY_MAX: usize = 1024 * 1024; // 1 MB
 /// mirrors are shed instead of accumulating 5s × RPS tasks of buffered bodies.
 static MIRROR_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
 
-/// Fire-and-forget mirror dispatch with percentage-based filtering and timeout.
+/// Fire-and-forget mirror dispatch with fraction-based sampling and timeout.
 ///
 /// Iterates rule filters looking for `RequestMirror` variants.
-/// For each target, rolls a random number to decide whether to mirror based on
-/// the configured percentage. Spawned tasks are bounded by a total 5s timeout
+/// For each target, draws against the configured fraction to decide whether
+/// to mirror. Spawned tasks are bounded by a total 5s timeout
 /// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends,
 /// and by `MIRROR_PERMITS` in flight.
 pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
     for filter in filters {
-        let (addr, percent) = match filter {
+        let (addr, fraction) = match filter {
             HttpFilter::RequestMirror {
                 backend_addr,
-                mirror_percent,
-            } => (*backend_addr, *mirror_percent),
+                fraction,
+            } => (*backend_addr, *fraction),
             _ => continue,
         };
 
-        // Probabilistic dispatch: skip if random roll exceeds configured percent
-        if percent == 0 {
-            continue;
-        }
-        if percent < 100 && fastrand::u32(0..100) >= percent {
+        if !fraction.sample() {
             continue;
         }
 

@@ -436,6 +436,19 @@ mod tests {
         assert_eq!(entries(&batch), ordered);
     }
 
+    #[test]
+    fn mirror_fraction_samples_its_exact_share() {
+        fastrand::seed(7);
+        let hits = |f: Fraction| (0..1_000_000).filter(|_| f.sample()).count();
+        let thousandth = hits(Fraction::new(1, 1000).unwrap());
+        assert!((800..1200).contains(&thousandth), "{thousandth}");
+        assert_eq!(hits(Fraction::ALL), 1_000_000);
+        assert_eq!(hits(Fraction::new(0, 100).unwrap()), 0);
+        assert_eq!(Fraction::new(50, 100), Fraction::new(1, 2));
+        assert_eq!(Fraction::new(0, 0), None);
+        assert_eq!(Fraction::new(2, 1), None);
+    }
+
     /// A mirror the build dropped for a DNS miss comes back only through a
     /// signature change once it resolves.
     #[test]
@@ -444,7 +457,7 @@ mod tests {
             let filters = mirror
                 .map(|addr| HttpFilter::RequestMirror {
                     backend_addr: addr.parse().unwrap(),
-                    mirror_percent: 100,
+                    fraction: Fraction::ALL,
                 })
                 .into_iter()
                 .collect();

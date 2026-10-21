@@ -529,9 +529,46 @@ pub enum HttpFilter {
     },
     RequestMirror {
         backend_addr: std::net::SocketAddr,
-        /// Percentage of requests to mirror (0–100). Default 100 = mirror all.
-        mirror_percent: u32,
+        fraction: Fraction,
     },
+}
+
+/// Share of requests a mirror copies, exact: whole percents turned 1/1000
+/// into 0%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fraction {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl Fraction {
+    pub const ALL: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    /// `None` outside the Gateway API bounds: a denominator of at least 1
+    /// and a numerator no larger. Reduced, so equal shares compare equal.
+    pub fn new(numerator: u32, denominator: u32) -> Option<Self> {
+        if denominator == 0 || numerator > denominator {
+            return None;
+        }
+        let (mut gcd, mut rest) = (numerator, denominator);
+        while rest != 0 {
+            (gcd, rest) = (rest, gcd % rest);
+        }
+        Some(Self {
+            numerator: numerator / gcd,
+            denominator: denominator / gcd,
+        })
+    }
+
+    /// One draw: true `numerator` times in `denominator`, on average.
+    #[inline]
+    pub fn sample(self) -> bool {
+        self.numerator == self.denominator
+            || (self.numerator > 0 && fastrand::u32(0..self.denominator) < self.numerator)
+    }
 }
 
 #[derive(Debug, Clone)]

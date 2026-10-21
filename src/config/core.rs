@@ -546,10 +546,7 @@ fn rule_filters(
     for f in filters {
         match f {
             CompiledFilter::Ready(filter) => out.push(filter.clone()),
-            CompiledFilter::Mirror {
-                backend,
-                mirror_percent,
-            } => {
+            CompiledFilter::Mirror { backend, fraction } => {
                 // Mirrors go to one endpoint: the first address.
                 if let Some(&backend_addr) = resolver
                     .addrs(&backend.name, backend.port, "RequestMirror")?
@@ -557,7 +554,7 @@ fn rule_filters(
                 {
                     out.push(crate::routing::HttpFilter::RequestMirror {
                         backend_addr,
-                        mirror_percent: *mirror_percent,
+                        fraction: *fraction,
                     });
                 }
             }
@@ -1065,11 +1062,11 @@ mod tests {
         assert_eq!(rule.filters.len(), 1);
         if let crate::routing::HttpFilter::RequestMirror {
             backend_addr,
-            mirror_percent,
+            fraction,
         } = &rule.filters[0]
         {
             assert_eq!(backend_addr.port(), 9999);
-            assert_eq!(*mirror_percent, 100); // default when no percent/fraction specified
+            assert_eq!(*fraction, crate::routing::Fraction::ALL); // default when no percent/fraction specified
         } else {
             panic!("expected RequestMirror filter");
         }
@@ -1336,6 +1333,42 @@ mod tests {
         assert!(found("h.example.com", "/", b"x-v: v1\r\n", "q=v1"));
         assert!(!found("h.example.com", "/", b"x-v: xv1x\r\n", "q=v1"));
         assert!(!found("h.example.com", "/", b"x-v: v1\r\n", "q=v1x"));
+    }
+
+    /// Rounded to whole percents, fraction 1/1000 became 0%: it never mirrored.
+    #[test]
+    fn mirror_fraction_reaches_the_table_exact() {
+        let fraction = |mirror: &str| {
+            let json = format!(
+                r#"{{
+                "gateway": {{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":8080}}]}},
+                "httpRoutes": [{{"hostnames":["m.example.com"],
+                    "rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],
+                               "filters":[{{"type":"RequestMirror","requestMirror":{{"backendRef":{{"name":"127.0.0.1","port":9999}}{mirror}}}}}],
+                               "backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}]
+            }}"#
+            );
+            let config: PortailConfig = serde_json::from_str(&json).unwrap();
+            let rt = config.to_route_table().unwrap();
+            let rule = rt
+                .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+                .unwrap();
+            match &rule.filters[..] {
+                [crate::routing::HttpFilter::RequestMirror { fraction, .. }] => *fraction,
+                other => panic!("{other:?}"),
+            }
+        };
+        let exact = crate::routing::Fraction::new;
+        assert_eq!(
+            fraction(r#","fraction":{"numerator":1,"denominator":1000}"#),
+            exact(1, 1000).unwrap()
+        );
+        assert_eq!(
+            fraction(r#","fraction":{"numerator":1}"#),
+            exact(1, 100).unwrap()
+        );
+        assert_eq!(fraction(r#","percent":25"#), exact(25, 100).unwrap());
+        assert_eq!(fraction(""), crate::routing::Fraction::ALL);
     }
 
     /// IP literals resolve to themselves, `multi.svc` to two pods, any other
