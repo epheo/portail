@@ -4,6 +4,22 @@ use gateway_api::gateways::*;
 use gateway_api::referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo};
 use kube::core::ObjectMeta;
 
+/// A pass that remembers no verdict, as every test but the cache's wants.
+fn reconcile_to_config(
+    gateway: &Gateway,
+    snapshot: &ClusterSnapshot,
+    cert_data: &CertData,
+    services: &ServiceState,
+) -> Result<ReconcileResult> {
+    super::reconcile_to_config(
+        gateway,
+        snapshot,
+        cert_data,
+        services,
+        &RouteVerdicts::default(),
+    )
+}
+
 fn default_ns_labels() -> HashMap<String, BTreeMap<String, String>> {
     let mut m = HashMap::new();
     m.insert("default".to_string(), BTreeMap::new());
@@ -1989,6 +2005,54 @@ fn test_bad_regex_route_is_rejected_alone() {
     let mut config = result.config.clone();
     fixup_backends_for_test(&mut config);
     assert!(config.to_route_table().is_ok());
+}
+
+/// Acceptance compiled every route's regexes on every pass, status echoes
+/// and requeues included. A verdict now stands while the route's
+/// generation does, and leaves with the route.
+#[test]
+fn a_route_verdict_stands_until_its_generation_moves() {
+    let mut route = route_with_rule(
+        "r",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/a.*"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    route.metadata.uid = Some("r-uid".to_string());
+    route.metadata.generation = Some(1);
+    let verdicts = RouteVerdicts::default();
+    let pass = |routes: Vec<HTTPRoute>| {
+        let snapshot = test_snapshot(routes, vec![], vec![], vec![], &default_ns_labels(), vec![]);
+        super::reconcile_to_config(
+            &test_gateway(),
+            &snapshot,
+            &HashMap::new(),
+            &empty_services(),
+            &verdicts,
+        )
+        .unwrap()
+    };
+    let gateway = ("default".to_string(), "test-gw".to_string());
+
+    assert!(pass(vec![route.clone()]).route_status[0].accepted);
+    // A planted verdict stands in for the check: the pass reports it.
+    verdicts
+        .0
+        .lock()
+        .unwrap()
+        .get_mut(&gateway)
+        .unwrap()
+        .insert(
+            "r-uid".to_string(),
+            (1, Err(RouteError::unsupported("planted"))),
+        );
+    let ra = &pass(vec![route.clone()]).route_status[0];
+    assert!(!ra.accepted);
+    assert_eq!(ra.message, "Conversion failed: planted");
+
+    route.metadata.generation = Some(2);
+    assert!(pass(vec![route]).route_status[0].accepted, "checked again");
+    pass(vec![]);
+    assert!(verdicts.0.lock().unwrap()[&gateway].is_empty());
 }
 
 /// A route that fails its check still reports ResolvedRefs from its refs.

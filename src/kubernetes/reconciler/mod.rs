@@ -65,6 +65,7 @@ pub(crate) trait GatewayRoute: Sized {
     fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
     fn route_namespace(&self) -> &str;
     fn identity(&self) -> (&str, Option<i64>);
+    fn uid(&self) -> Option<&str>;
     fn creation_timestamp(&self) -> Option<&Time>;
     /// Default covers the hostname-less kinds (TCP/UDP).
     fn hostnames(&self) -> &[String] {
@@ -129,6 +130,9 @@ macro_rules! impl_gateway_route {
                     self.metadata.name.as_deref().unwrap_or("unknown"),
                     self.metadata.generation,
                 )
+            }
+            fn uid(&self) -> Option<&str> {
+                self.metadata.uid.as_deref()
             }
             fn creation_timestamp(&self) -> Option<&Time> {
                 self.metadata.creation_timestamp.as_ref()
@@ -262,6 +266,57 @@ pub struct RouteAcceptance {
     pub listener_names: Vec<String>,
 }
 
+type Verdict = Result<(), RouteError>;
+
+/// Route check verdicts per Gateway, by route uid, with the generation they
+/// were taken at. The check compiles every regex of a route; a pass whose
+/// routes did not change (a status echo, a requeue) takes the verdict
+/// instead. The table build still compiles for the table.
+#[derive(Default)]
+pub(crate) struct RouteVerdicts(
+    std::sync::Mutex<HashMap<(String, String), HashMap<String, (i64, Verdict)>>>,
+);
+
+impl RouteVerdicts {
+    fn take(&self, gateway: &(String, String)) -> HashMap<String, (i64, Verdict)> {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.remove(gateway).unwrap_or_default()
+    }
+
+    fn put(&self, gateway: (String, String), verdicts: HashMap<String, (i64, Verdict)>) {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.insert(gateway, verdicts);
+    }
+
+    /// Forget the Gateways `live` rejects.
+    pub fn retain(&self, live: impl Fn(&(String, String)) -> bool) {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.retain(|gateway, _| live(gateway));
+    }
+}
+
+/// One pass's verdicts: the last pass's while a route's generation stands,
+/// a new check otherwise. A route the pass does not see drops out.
+struct Checks {
+    last: HashMap<String, (i64, Verdict)>,
+    now: HashMap<String, (i64, Verdict)>,
+}
+
+impl Checks {
+    fn verdict<R: GatewayRoute>(&mut self, route: &R, config: &R::Config) -> Verdict {
+        let (Some(uid), (_, Some(generation))) = (route.uid(), route.identity()) else {
+            return R::check(config);
+        };
+        let verdict = match self.last.remove(uid) {
+            Some((taken_at, verdict)) if taken_at == generation => verdict,
+            _ => R::check(config),
+        };
+        self.now
+            .insert(uid.to_string(), (generation, verdict.clone()));
+        verdict
+    }
+}
+
 /// Convert Kubernetes Gateway API resources into a PortailConfig.
 /// This reuses all existing validation, conversion, hostname intersection,
 /// and regex compilation logic via `to_route_table()`.
@@ -270,6 +325,7 @@ pub(crate) fn reconcile_to_config(
     snapshot: &ClusterSnapshot,
     cert_data: &CertData,
     services: &ServiceState,
+    verdicts: &RouteVerdicts,
 ) -> Result<ReconcileResult> {
     let mut gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
@@ -316,14 +372,20 @@ pub(crate) fn reconcile_to_config(
         reference_grants: &snapshot.reference_grants,
         known_services: &services.known_services,
     };
+    let gateway_key = (gateway_ns.to_string(), gateway_name.to_string());
+    let mut checks = Checks {
+        last: verdicts.take(&gateway_key),
+        now: HashMap::new(),
+    };
     let http_route_configs =
-        collect_routes::<HTTPRoute>(&snapshot.http_routes, &cx, &mut route_status);
+        collect_routes::<HTTPRoute>(&snapshot.http_routes, &cx, &mut checks, &mut route_status);
     let tcp_route_configs =
-        collect_routes::<TCPRoute>(&snapshot.tcp_routes, &cx, &mut route_status);
+        collect_routes::<TCPRoute>(&snapshot.tcp_routes, &cx, &mut checks, &mut route_status);
     let tls_route_configs =
-        collect_routes::<TLSRoute>(&snapshot.tls_routes, &cx, &mut route_status);
+        collect_routes::<TLSRoute>(&snapshot.tls_routes, &cx, &mut checks, &mut route_status);
     let udp_route_configs =
-        collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut route_status);
+        collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut checks, &mut route_status);
+    verdicts.put(gateway_key, checks.now);
 
     Ok(ReconcileResult {
         config: PortailConfig {
@@ -639,6 +701,7 @@ fn precedence<R: GatewayRoute>(a: &R, b: &R) -> std::cmp::Ordering {
 fn collect_routes<R: GatewayRoute>(
     routes: &[Arc<R>],
     cx: &RouteCollectCtx,
+    checks: &mut Checks,
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<R::Config> {
     let kind = R::KIND;
@@ -764,7 +827,7 @@ fn collect_routes<R: GatewayRoute>(
         }
 
         let (mut config, converted) = route.convert();
-        let verdict = converted.and_then(|()| R::check(&config));
+        let verdict = converted.and_then(|()| checks.verdict(route, &config));
 
         let mut refs_resolved = true;
         let mut refs_messages = Vec::new();

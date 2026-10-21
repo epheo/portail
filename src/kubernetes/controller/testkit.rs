@@ -213,6 +213,7 @@ impl TestCluster {
             manage_gateway_status: true,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_applied: Arc::new(std::sync::Mutex::new(None)),
+            route_verdicts: Arc::default(),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(

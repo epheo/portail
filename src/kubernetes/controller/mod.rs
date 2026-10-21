@@ -36,6 +36,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::dns_refresh::Published;
+use crate::kubernetes::reconciler::RouteVerdicts;
 use crate::kubernetes::services::NamedPortCache;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
@@ -99,9 +100,11 @@ struct ControllerCtx {
     ready: Arc<std::sync::atomic::AtomicBool>,
     /// The data plane's last apply: the effective config's fingerprint and
     /// its build outcome. A pass with the same fingerprint and live
-    /// listeners skips the bind and the rebuild, so watch echoes and
-    /// requeues do not re-run regex compilation and DNS resolution.
+    /// listeners skips the bind and the rebuild: no table is built, so
+    /// nothing is resolved or compiled for one. Route acceptance compiles
+    /// apart, once per route generation: see `route_verdicts`.
     last_applied: Arc<std::sync::Mutex<Option<reconcile::Applied>>>,
+    route_verdicts: Arc<RouteVerdicts>,
     /// Serializes the apply section of reconcile (merge → ensure → table
     /// build → swap → status). kube-rs reconciles different Gateways
     /// concurrently in unscoped mode, and interleaved passes could publish a
@@ -301,6 +304,7 @@ pub async fn run_controller(
         manage_gateway_status,
         ready,
         last_applied: Arc::new(std::sync::Mutex::new(None)),
+        route_verdicts: Arc::default(),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         // A stale read lasts as long as before the cache: every requeue

@@ -618,6 +618,7 @@ fn retain_live_gateways(ctx: &ControllerCtx, configs: &mut GatewayConfigs) {
         .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
         .collect();
     configs.retain(|k, _| live.contains(k));
+    ctx.route_verdicts.retain(|k| live.contains(k));
 }
 
 /// What the data plane runs: the one Gateway's config in scoped mode, the
@@ -857,26 +858,31 @@ pub(super) async fn reconcile(
     resolve_network_addresses(&ctx.client, &gateway, &gw_ns, &mut usable).await;
 
     // Build per-Gateway config; bail out with a failing Programmed condition on error.
-    let mut result =
-        match reconcile_to_config(&gateway, &snapshot, &resolved_certs.valid, &services) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
-                let failure =
-                    status::GatewayCondition::invalid(format!("Reconciliation failed: {}", e));
-                let desired = status::desired_gateway_status(
-                    &gateway,
-                    &accepted_cond,
-                    &failure,
-                    &HashMap::new(),
-                    &listener_statuses,
-                    &usable,
-                    ctx.manage_gateway_status,
-                );
-                status::write_gateway_status(&ctx.client, &gateway, desired).await;
-                return Err(ReconcileError(e.to_string()));
-            }
-        };
+    let mut result = match reconcile_to_config(
+        &gateway,
+        &snapshot,
+        &resolved_certs.valid,
+        &services,
+        &ctx.route_verdicts,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to reconcile Gateway {}/{}: {}", gw_ns, gw_name, e);
+            let failure =
+                status::GatewayCondition::invalid(format!("Reconciliation failed: {}", e));
+            let desired = status::desired_gateway_status(
+                &gateway,
+                &accepted_cond,
+                &failure,
+                &HashMap::new(),
+                &listener_statuses,
+                &usable,
+                ctx.manage_gateway_status,
+            );
+            status::write_gateway_status(&ctx.client, &gateway, desired).await;
+            return Err(ReconcileError(e.to_string()));
+        }
+    };
 
     // Service metadata for the backends this Gateway routes to, and only
     // those: API reads and fingerprint churn then scale with the Gateway.
