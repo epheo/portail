@@ -292,8 +292,11 @@ impl PortailConfig {
                 );
             }
 
-            let matched_listeners =
-                find_listeners_for_route(&http_route.parent_refs, &self.gateway);
+            let matched_listeners: Vec<&ListenerConfig> =
+                find_listeners_for_route(&http_route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| takes_http_routes(l))
+                    .collect();
 
             // No parentRefs: route without gateway context (file-based
             // configs). One pseudo-scope on port 0 with no hostname
@@ -473,6 +476,13 @@ impl PortailConfig {
         }
         Ok(())
     }
+}
+
+/// HTTP routes serve on HTTP and HTTPS listeners only: on a TCP port with
+/// an HTTP route, the data plane waits for a request to sniff, and a
+/// server-speaks-first client (SMTP, MySQL) hangs.
+pub(crate) fn takes_http_routes(listener: &ListenerConfig) -> bool {
+    matches!(listener.protocol, Protocol::HTTP | Protocol::HTTPS)
 }
 
 /// Listeners a route's parentRefs select, for every route kind in both
@@ -716,6 +726,41 @@ mod tests {
         assert_eq!(backend_port(5432), 7001);
         assert_eq!(backend_port(6379), 7001);
         assert!(rt.find_tcp_backends(8080).is_none());
+    }
+
+    /// A parentRef without sectionName put an HTTP route on every listener,
+    /// TCP ones too: the TCP port then waited for a request to sniff, and a
+    /// server-speaks-first client hung.
+    #[test]
+    fn http_routes_attach_to_http_and_https_listeners_only() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "web", "protocol": "HTTP", "port": 8080},
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "dns", "protocol": "UDP", "port": 5353}
+            ]},
+            "httpRoutes": [{"parentRefs": [{"name": "g"}], "hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt.has_http_routes(8080));
+        assert!(!rt.has_http_routes(5432), "the TCP port must not sniff");
+        assert!(!rt.has_http_routes(5353));
+        assert!(rt.has_tcp_route(5432));
+
+        // Its only ref naming a TCP listener, the route attaches nowhere.
+        let mut on_tcp = config.clone();
+        on_tcp.http_routes[0].parent_refs[0].section_name = Some("db".to_string());
+        let err = on_tcp.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP route 0: parentRef (sectionName: Some(\"db\")"),
+            "{err}"
+        );
+        assert!(!on_tcp.to_route_table().unwrap().has_http_routes(5432));
     }
 
     #[test]

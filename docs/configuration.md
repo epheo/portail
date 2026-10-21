@@ -184,6 +184,7 @@ Kubernetes mode:
 Standalone mode:
 
 - A parentRef without `sectionName` or `port` selects every listener, for TCP and UDP routes too.
+- An HTTP route attaches to HTTP and HTTPS listeners only: on a TCP port it would hold back server-speaks-first clients.
 - A TCP route can also attach to a TLS listener, as the fallback for passthrough connections no TLS route matches.
 - Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
 - TCP and UDP routes use their first rule only.

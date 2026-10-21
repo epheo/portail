@@ -71,14 +71,14 @@ impl PortailConfig {
     /// scope). Only enforced on the file-config path — in Kubernetes mode
     /// route attachment failures are reported via route status instead.
     fn validate_parent_refs_resolve(&self) -> Result<()> {
-        fn check(
+        fn check<'a>(
             parent_refs: &[ParentRef],
-            listeners: &[ListenerConfig],
+            listeners: impl Iterator<Item = &'a ListenerConfig> + Clone,
             proto: &str,
             idx: usize,
         ) -> Result<()> {
             for pr in parent_refs {
-                let resolves = listeners.iter().any(|l| pr.selects(l));
+                let resolves = listeners.clone().any(|l| pr.selects(l));
                 if !resolves {
                     return Err(anyhow!(
                         "{} route {}: parentRef (sectionName: {:?}, port: {:?}) does not match any Gateway listener",
@@ -92,18 +92,21 @@ impl PortailConfig {
             Ok(())
         }
 
-        let listeners = &self.gateway.listeners;
+        let listeners = self.gateway.listeners.iter();
+        let http_listeners = listeners
+            .clone()
+            .filter(|l| super::core::takes_http_routes(l));
         for (i, r) in self.http_routes.iter().enumerate() {
-            check(&r.parent_refs, listeners, "HTTP", i)?;
+            check(&r.parent_refs, http_listeners.clone(), "HTTP", i)?;
         }
         for (i, r) in self.tcp_routes.iter().enumerate() {
-            check(&r.parent_refs, listeners, "TCP", i)?;
+            check(&r.parent_refs, listeners.clone(), "TCP", i)?;
         }
         for (i, r) in self.tls_routes.iter().enumerate() {
-            check(&r.parent_refs, listeners, "TLS", i)?;
+            check(&r.parent_refs, listeners.clone(), "TLS", i)?;
         }
         for (i, r) in self.udp_routes.iter().enumerate() {
-            check(&r.parent_refs, listeners, "UDP", i)?;
+            check(&r.parent_refs, listeners.clone(), "UDP", i)?;
         }
         Ok(())
     }
