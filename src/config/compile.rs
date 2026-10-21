@@ -137,8 +137,13 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
     check_filter_combination(&rule.filters)?;
     check_prefix_replacement(rule)?;
 
-    let backend_filters = rule
-        .backend_refs
+    // A redirect rule's backendRefs go unused: their filters are not checked.
+    let forwards_to = if rule.redirects() {
+        &[][..]
+    } else {
+        &rule.backend_refs[..]
+    };
+    let backend_filters = forwards_to
         .iter()
         .enumerate()
         .map(|(i, b)| {
@@ -252,11 +257,7 @@ fn check_prefix_replacement(rule: &HttpRouteRule) -> Result<(), RouteError> {
 /// failed the whole file at upgrade. The redirect answers; the backendRefs
 /// go unused.
 pub(crate) fn redirects_beside_backends(rule: &HttpRouteRule) -> bool {
-    !rule.backend_refs.is_empty()
-        && rule
-            .filters
-            .iter()
-            .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }))
+    !rule.backend_refs.is_empty() && rule.redirects()
 }
 
 fn compile_match(m: &HttpRouteMatch) -> Result<CompiledMatch, RouteError> {

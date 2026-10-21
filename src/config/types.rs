@@ -226,6 +226,16 @@ pub struct HttpRouteRule {
     pub timeouts: Option<HttpRouteTimeouts>,
 }
 
+impl HttpRouteRule {
+    /// A RequestRedirect answers the request itself: the rule never
+    /// forwards, and its backendRefs go unused in both modes.
+    pub fn redirects(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }))
+    }
+}
+
 /// Per-rule timeout configuration following Gateway API HTTPRouteTimeouts
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

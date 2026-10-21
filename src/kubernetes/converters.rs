@@ -183,7 +183,7 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> (HttpRouteRule, Option<
     // A filter this proxy cannot represent fails the route, never dropped
     // while the route serves without it.
     let mut first = None;
-    let filters = rule
+    let filters: Vec<HttpRouteFilter> = rule
         .filters
         .iter()
         .flatten()
@@ -197,10 +197,17 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> (HttpRouteRule, Option<
         })
         .collect();
 
+    // The CRD refuses backendRefs beside a redirect; a cluster that skips
+    // CEL can send them. Unused, they are left out: never checked for
+    // ResolvedRefs, resolved or probed.
+    let redirects = filters
+        .iter()
+        .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
     let backend_refs = rule
         .backend_refs
         .iter()
         .flatten()
+        .filter(|_| !redirects)
         .enumerate()
         .map(|(i, br)| {
             let (backend, err) = convert_http_backend_ref(br, ns);

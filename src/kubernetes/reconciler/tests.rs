@@ -1981,6 +1981,28 @@ fn rejection<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance
     ra
 }
 
+/// A redirect rule never forwards. A cluster that skips the CRD's CEL
+/// check can still send backendRefs beside it, and one naming no Service
+/// turned ResolvedRefs False (BackendNotFound). They are left out: never
+/// checked, resolved or probed.
+#[test]
+fn a_redirect_rule_leaves_its_backend_refs_out() {
+    let route = route_with_rule(
+        "redirect",
+        serde_json::json!({"filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"scheme": "https"}}
+        ], "backendRefs": [{"name": "ghost-svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![route]);
+    let ra = status_of(&result, "redirect");
+    assert!(ra.accepted, "{}", ra.message);
+    assert!(ra.refs_resolved, "{}: {}", ra.refs_reason, ra.refs_message);
+    assert!(result.config.http_routes[0].rules[0]
+        .backend_refs
+        .is_empty());
+    assert!(crate::kubernetes::services::referenced_backends(&result.config).is_empty());
+}
+
 /// Acceptance never compiled regexes: the route read Accepted, then failed
 /// the table build for the whole Gateway.
 #[test]

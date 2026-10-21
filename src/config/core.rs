@@ -547,6 +547,10 @@ impl PortailConfig {
     /// Backends of one compiled rule, resolved through `resolver`.
     fn rule_backends(&self, rule: &CompiledRule, resolver: &mut Resolver) -> Result<Vec<Backend>> {
         let mut backends = Vec::new();
+        // Not looked up, so not probed either: the redirect answers.
+        if rule.source.redirects() {
+            return Ok(backends);
+        }
         for (backend_ref, backend_filters) in
             rule.source.backend_refs.iter().zip(&rule.backend_filters)
         {
@@ -1597,6 +1601,30 @@ mod tests {
             .unwrap();
         assert_eq!(rule.backends.len(), 2);
         assert_eq!(rt.find_tcp_backends(5432).unwrap().len(), 2);
+    }
+
+    /// A redirect rule never forwards: its backendRefs are not looked up,
+    /// and it carries no backend for health to probe. A dead name beside a
+    /// redirect failed a strict build.
+    #[test]
+    fn a_redirect_rule_leaves_its_backend_refs_alone() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name":"g"}],
+                "hostnames": ["r.example.com"],
+                "rules": [{"filters":[{"type":"RequestRedirect","requestRedirect":{"scheme":"https"}}],
+                           "backendRefs":[{"name":"dead.svc","port":80}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, Vec::<String>::new());
+        let rule = rt
+            .find_http_route("r.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(rule.backends.is_empty());
     }
 
     #[test]

@@ -341,13 +341,8 @@ impl ParentRef {
 /// wrong. Everything both paths share is `compile_http_route`'s.
 impl HttpRouteRule {
     fn validate(&self) -> Result<()> {
-        let has_redirect = self
-            .filters
-            .iter()
-            .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }));
-
         // backend_refs can be empty when a redirect filter is present
-        if self.backend_refs.is_empty() && !has_redirect {
+        if self.backend_refs.is_empty() && !self.redirects() {
             return Err(anyhow!(
                 "HTTP route rule must have at least one backend_ref (or a RequestRedirect filter)"
             ));
