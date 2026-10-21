@@ -89,6 +89,17 @@ gone, backend died with headers already sent) produce no line.
 
 ## Request Paths
 
+Routes match the request path with its dot-segments removed (RFC 3986
+5.2.4), and the backend gets that same path, over HTTP/1 and HTTP/2 alike.
+A backend resolving `/public/../admin` to `/admin` is then reached through
+the route on `/admin`, never past it:
+
+- `.` and `..` segments are resolved; `%2e` and `%2E` count as a dot.
+- A `..` above the root stops there: `/../a` becomes `/a`.
+- Nothing else changes: empty segments stay (`//` is not merged), no
+  other escape is decoded (`%2F` stays as sent), the query is untouched.
+- Access logs keep the path as the client sent it.
+
 URLRewrite and RequestRedirect path modifiers replace the path only. The
 query string is kept as sent, in the forwarded request and in a
 redirect's `Location`.

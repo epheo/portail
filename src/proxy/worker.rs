@@ -1554,9 +1554,11 @@ fn build_outgoing_headers(
     state: &mut ConnectionState,
 ) {
     let raw = &buf[..req_header_end];
+    let normalized = meta.normalized_path.as_deref().map(str::as_bytes);
     if meta.strip_spans.needs_slow_path {
         assemble_forward_headers_slow(
             raw,
+            normalized,
             meta.is_upgrade,
             state.peer_ip,
             state.is_tls,
@@ -1565,6 +1567,7 @@ fn build_outgoing_headers(
     } else {
         assemble_forward_headers(
             raw,
+            normalized,
             &meta.strip_spans,
             meta.upgrade_span,
             meta.is_upgrade,
@@ -1577,20 +1580,16 @@ fn build_outgoing_headers(
     // The backend is an origin server, sent origin-form only (RFC 9112
     // 3.2.1). Before filters, so a URLRewrite or set Host meets the same
     // head as for an origin-form request.
-    if let Some((target, authority)) = absolute_form_target(raw, meta.path_span) {
-        to_origin_form(&state.scratch_buf, target, authority, &mut state.filter_buf);
+    if let Some((path, authority)) = absolute_form_target(raw, meta.path_span) {
+        let path = normalized.unwrap_or(path);
+        to_origin_form(&state.scratch_buf, path, authority, &mut state.filter_buf);
         std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
     }
 
     // has_filters already covers every backend's filters (see routing build).
     if rule.has_filters {
         let rule_mods = extract_header_mods(&rule.filters, false);
-        let request_path = meta
-            .path_span
-            .and_then(|(s, e)| raw.get(s as usize..e as usize))
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("/");
-        let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, request_path);
+        let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, meta.path(raw));
         let backend_mods = extract_header_mods(&backend_ref.filters, false);
         if rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some() {
             apply_request_header_modifications(
@@ -3036,6 +3035,73 @@ mod connection_tests {
         .await;
         assert!(seen.starts_with("GET /v2/users HTTP/1.1\r\n"), "{seen}");
         assert!(seen.contains("\r\nHost: p.test:8080\r\n"), "{seen}");
+    }
+
+    /// Routing matches the path a backend resolves dot-segments to, and the
+    /// backend gets that very path: the rule on `/admin` cannot be walked
+    /// around, whatever form the request comes in.
+    #[tokio::test]
+    async fn dot_segments_reach_the_rule_and_backend_of_their_path() {
+        let (_held, elsewhere) = refusing_backend();
+        let guarded = move |admin| {
+            let mut rt = filtered_route("a.test", "/admin", vec![], admin);
+            rt.add_http_route(
+                "a.test",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![Backend {
+                        socket_addr: elsewhere,
+                        weight: 1,
+                        filters: vec![],
+                        use_tls: false,
+                        server_name: String::new(),
+                        action: crate::routing::BackendAction::Forward,
+                    }],
+                ),
+            );
+            rt
+        };
+        for (request, line) in [
+            (
+                "GET /public/../admin?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin?x=1 HTTP/1.1\r\n",
+            ),
+            (
+                "GET /public/%2E%2e/admin/./users HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin/users HTTP/1.1\r\n",
+            ),
+            (
+                "GET http://a.test/x/../admin?x HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin?x HTTP/1.1\r\n",
+            ),
+            // A Connection-nominated header takes the slow assembly path.
+            (
+                "GET /x/../admin HTTP/1.1\r\nHost: a.test\r\nConnection: X-Foo\r\nX-Foo: 1\r\n\r\n",
+                "GET /admin HTTP/1.1\r\n",
+            ),
+        ] {
+            let seen = forwarded_head(guarded, request).await;
+            assert!(seen.starts_with(line), "{request:?}: {seen}");
+        }
+    }
+
+    /// A prefix rewrite replaces the prefix of the path routing matched.
+    #[tokio::test]
+    async fn a_path_rewrite_applies_to_the_normalized_path() {
+        let rewrite = vec![HttpFilter::URLRewrite {
+            hostname: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+        }];
+        let seen = forwarded_head(
+            |addr| filtered_route("p.test", "/v1", rewrite, addr),
+            "GET /v1/a/../b?q=1 HTTP/1.1\r\nHost: p.test\r\n\r\n",
+        )
+        .await;
+        assert!(seen.starts_with("GET /v2/b?q=1 HTTP/1.1\r\n"), "{seen}");
     }
 
     #[tokio::test]

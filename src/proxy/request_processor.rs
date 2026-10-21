@@ -5,18 +5,19 @@
 //! Works on byte slices — no I/O runtime dependency.
 
 use anyhow::Result;
+use std::borrow::Cow;
 use std::net::SocketAddr;
 
 use crate::logging::{debug, error};
 use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::http_parser::{extract_routing_info, HttpRequestInfo};
+use crate::proxy::http_parser::{extract_routing_info, normalize_path, HttpRequestInfo};
 use crate::proxy::method::{is_idempotent, method_len};
 use crate::routing::{
     Backend, BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
 };
 
-/// Stack-allocated request metadata — no heap allocation.
+/// Stack-allocated request metadata: only a normalized path is on the heap.
 pub struct RequestMeta {
     pub content_length: Option<usize>,
     pub is_chunked: bool,
@@ -29,10 +30,13 @@ pub struct RequestMeta {
     /// See [`crate::proxy::method::is_idempotent`].
     pub idempotent: bool,
     pub keepalive: bool,
-    /// Byte span of the parsed request path (query stripped) within the
+    /// Byte span of the client's request path (query stripped) within the
     /// request buffer, so filters need not re-parse the request line. `None`
     /// when the parser substituted a static default ("/").
     pub path_span: Option<(u32, u32)>,
+    /// The path routing matched, when `normalize_path` changed the
+    /// client's. `RequestMeta::path` returns whichever applies.
+    pub normalized_path: Option<String>,
     /// Hop-by-hop header spans recorded by the parser, skipped at forwarding.
     pub strip_spans: crate::proxy::http_parser::StripSpans,
     /// Upgrade header line span; kept only when `is_upgrade`.
@@ -45,6 +49,20 @@ pub struct RequestMeta {
     /// [`client_done`] for a reply the proxy writes itself (429), which
     /// reads nothing past what came with the head.
     pub client_done: bool,
+}
+
+impl RequestMeta {
+    /// The path routing matched, the one the backend must get. `head` is
+    /// the request buffer `path_span` indexes.
+    pub fn path<'a>(&'a self, head: &'a [u8]) -> &'a str {
+        if let Some(path) = &self.normalized_path {
+            return path;
+        }
+        self.path_span
+            .and_then(|(s, e)| head.get(s as usize..e as usize))
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("/")
+    }
 }
 
 /// A response the proxy writes itself instead of forwarding the request.
@@ -226,10 +244,11 @@ fn analyze_http_request<'a>(
         }))
     };
 
+    let path = normalize_path(request_info.path);
     let Some(rule) = routes.find_http_route(
         request_info.host,
         request_info.method,
-        request_info.path,
+        &path,
         request_info.header_data,
         request_info.query_string,
         server_port,
@@ -243,7 +262,7 @@ fn analyze_http_request<'a>(
         if let Some((status_code, location)) = build_redirect(
             rule,
             request_info.host,
-            request_info.path,
+            &path,
             request_info.query_string,
             is_tls,
             server_port,
@@ -276,6 +295,10 @@ fn analyze_http_request<'a>(
             idempotent: is_idempotent(request_info.method),
             keepalive: request_info.keepalive,
             path_span: subslice_span(request_data, request_info.path),
+            normalized_path: match path {
+                Cow::Owned(path) => Some(path),
+                Cow::Borrowed(_) => None,
+            },
             strip_spans: request_info.strip_spans,
             upgrade_span: request_info.upgrade_span,
             expect_continue: request_info.expect_continue,
@@ -909,6 +932,75 @@ mod tests {
                 }) => assert_eq!(location, want, "{target}"),
                 _ => panic!("expected a redirect for {target}"),
             }
+        }
+    }
+
+    /// Routing reads the path a backend resolves dot-segments to, so the
+    /// rule on `/admin` cannot be walked around.
+    #[test]
+    fn dot_segments_route_by_the_path_they_resolve_to() {
+        let mut rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
+        rt.add_http_route(
+            "example.com",
+            HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/admin".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![Backend {
+                    socket_addr: "127.0.0.1:8002".parse().unwrap(),
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                    action: BackendAction::Forward,
+                }],
+            ),
+        );
+        let sel = BackendSelector::new();
+        for (target, port, normalized) in [
+            ("/public/../admin", 8002, Some("/admin")),
+            ("/public/%2e%2E/admin/x?q=1", 8002, Some("/admin/x")),
+            ("/admin/../public", 8001, Some("/public")),
+            ("/admin/app.min.js", 8002, None),
+        ] {
+            let req = make_request("GET", target, "example.com");
+            match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+                RoutingResult::HttpForward { backend, meta, .. } => {
+                    assert_eq!(backend.socket_addr.port(), port, "{target}");
+                    assert_eq!(meta.normalized_path.as_deref(), normalized, "{target}");
+                    assert_eq!(meta.path(&req), normalized.unwrap_or(target), "{target}");
+                }
+                _ => panic!("expected HttpForward for {target}"),
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_takes_the_normalized_path() {
+        let redirect = HttpFilter::RequestRedirect {
+            scheme: None,
+            hostname: None,
+            port: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+            status_code: 301,
+        };
+        let rt = build_route_table(
+            "r.test",
+            "/old",
+            PathMatchType::Prefix,
+            8001,
+            vec![redirect],
+        );
+        let req = make_request("GET", "/x/../old/./a?q", "r.test");
+        let sel = BackendSelector::new();
+        match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+            RoutingResult::LocalReply(LocalReply {
+                location: Some(location),
+                ..
+            }) => assert_eq!(location, "http://r.test:8080/new/a?q"),
+            _ => panic!("expected a redirect"),
         }
     }
 

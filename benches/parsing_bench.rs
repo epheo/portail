@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use portail::proxy::http_parser::extract_routing_info;
+use portail::proxy::http_parser::{extract_routing_info, normalize_path};
+use std::hint::black_box;
 use std::time::Duration;
 
 fn parsing_benchmark(c: &mut Criterion) {
@@ -82,6 +83,17 @@ fn parsing_benchmark(c: &mut Criterion) {
         );
     }
     host_group.finish();
+
+    // Every request pays the check; only a dot-segment pays a rewrite.
+    let mut normalize_group = c.benchmark_group("normalize_path");
+    for (name, path) in [
+        ("clean", "/api/v1/users/12345/profile"),
+        ("dotted", "/static/js/vendor.min.js"),
+        ("dot_segments", "/static/../api/v1/./users/12345/profile"),
+    ] {
+        normalize_group.bench_function(name, |b| b.iter(|| normalize_path(black_box(path))));
+    }
+    normalize_group.finish();
 }
 
 fn memory_parsing_benchmark(c: &mut Criterion) {

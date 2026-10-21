@@ -3,6 +3,7 @@ use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::extract_routing_info;
 use portail::proxy::request_processor::analyze_request;
 use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
+use std::hint::black_box;
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
@@ -249,6 +250,46 @@ fn request_analysis(c: &mut Criterion) {
     });
 }
 
+/// `analyze_request` by path shape: only a dot-segment pays the rewrite
+/// path normalization makes before the route match.
+fn path_analysis(c: &mut Criterion) {
+    let mut table = RouteTable::new();
+    for path in ["/", "/admin", "/static"] {
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        table.add_http_route("app.api.com", make_rule(path, backend));
+    }
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+
+    for (name, request) in [
+        (
+            "e2e_analyze_path_clean",
+            &b"GET /admin/users/42/profile?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n"[..],
+        ),
+        (
+            "e2e_analyze_path_dotted",
+            b"GET /static/js/vendor.min.js?v=1.2 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n",
+        ),
+        (
+            "e2e_analyze_path_dot_segments",
+            b"GET /public/../admin/./users/42/profile?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n",
+        ),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                analyze_request(
+                    black_box(&table),
+                    &selector,
+                    black_box(request),
+                    black_box(80),
+                    &health,
+                    false,
+                )
+            })
+        });
+    }
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(1000))
@@ -262,6 +303,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = e2e_benches;
     config = config();
-    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis
+    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis, path_analysis
 }
 criterion_main!(e2e_benches);

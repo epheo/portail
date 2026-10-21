@@ -3,6 +3,7 @@
 
 use crate::logging::debug;
 use anyhow::{anyhow, Result};
+use std::borrow::Cow;
 
 /// Find the end of HTTP headers (\r\n\r\n boundary).
 /// Returns the position just past the double CRLF.
@@ -608,6 +609,74 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     })
 }
 
+/// The path to route and forward: `path` with its dot-segments removed as
+/// RFC 3986 5.2.4 does, where a dot may also be sent as `%2e` or `%2E`.
+/// A backend resolving `/public/../admin` serves `/admin`, so matching the
+/// raw path let it past the rule guarding `/admin`.
+///
+/// Nothing else changes: empty segments stay, no other escape is decoded
+/// (`%2F` stays), and a `..` above the root stops there. Borrowed unless a
+/// dot-segment is found; a path without '.' or '%' costs one memchr2.
+#[inline]
+pub fn normalize_path(path: &str) -> Cow<'_, str> {
+    let bytes = path.as_bytes();
+    // A dot-segment opens a segment, so it follows a '/'; asterisk-form "*"
+    // has no segments.
+    if bytes.first() != Some(&b'/') {
+        return Cow::Borrowed(path);
+    }
+    let mut from = 1;
+    while let Some(i) = memchr::memchr2(b'.', b'%', &bytes[from..]) {
+        let at = from + i;
+        if bytes[at - 1] == b'/' && dot_segment(&bytes[at..]).is_some() {
+            return Cow::Owned(remove_dot_segments(path));
+        }
+        from = at + 1;
+    }
+    Cow::Borrowed(path)
+}
+
+/// `normalize_path`'s rewrite, for a path known to hold a dot-segment.
+#[cold]
+fn remove_dot_segments(path: &str) -> String {
+    // Output never outgrows the input: segments only drop.
+    let mut out = String::with_capacity(path.len());
+    let mut segments = path[1..].split('/').peekable();
+    while let Some(segment) = segments.next() {
+        match dot_segment(segment.as_bytes()) {
+            None => {
+                out.push('/');
+                out.push_str(segment);
+                continue;
+            }
+            Some(1) => {}
+            Some(_) => out.truncate(out.rfind('/').unwrap_or(0)),
+        }
+        // A trailing dot-segment leaves the path ending in '/'.
+        if segments.peek().is_none() {
+            out.push('/');
+        }
+    }
+    out
+}
+
+/// 1 for a "." segment and 2 for "..", each dot written '.', `%2e` or
+/// `%2E`, when one opens `segment`; `None` for any other segment.
+#[inline]
+fn dot_segment(segment: &[u8]) -> Option<usize> {
+    let (mut at, mut dots) = (0, 0);
+    while dots <= 2 {
+        match &segment[at..] {
+            [b'.', ..] => at += 1,
+            [b'%', b'2', b'e' | b'E', ..] => at += 3,
+            [] | [b'/', ..] => return (dots > 0).then_some(dots),
+            _ => return None,
+        }
+        dots += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,5 +717,103 @@ mod tests {
         assert_eq!(trim_ows(b" \t a \t b \t "), b"a \t b");
         assert_eq!(trim_ows(b" \t "), b"");
         assert_eq!(trim_ows(b"\x0ba\r"), b"\x0ba\r");
+    }
+
+    #[test]
+    fn dot_segments_go_and_nothing_else_changes() {
+        for (path, want) in [
+            ("/public/../admin", "/admin"),
+            ("/public/%2e%2e/admin", "/admin"),
+            ("/public/%2E%2e/admin", "/admin"),
+            ("/public/.%2E/admin", "/admin"),
+            ("/a/./b", "/a/b"),
+            ("/a/%2e/b", "/a/b"),
+            ("/a/b/c/./../../g", "/a/g"),
+            ("/a/b/..", "/a/"),
+            ("/a/b/.", "/a/b/"),
+            ("/a/./", "/a/"),
+            // Above the root stops at it.
+            ("/..", "/"),
+            ("/../../a", "/a"),
+            ("/a/../../b", "/b"),
+            // Empty segments are segments: no slash is merged.
+            ("//a/./b", "//a/b"),
+            ("/a//../b", "/a/b"),
+            // No other escape is decoded, the segment it sits in stays.
+            ("/a/%2F../b", "/a/%2F../b"),
+            ("/a/%2e%2ex/b", "/a/%2e%2ex/b"),
+            ("/a/./%2F", "/a/%2F"),
+        ] {
+            assert_eq!(normalize_path(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn paths_without_dot_segments_are_borrowed() {
+        for path in [
+            "/",
+            "/api/v1/users",
+            "/static/app.min.js",
+            "/.well-known/acme-challenge/x",
+            "/a/.../b",
+            "/a/..b/c.",
+            "/a%20b/%41/%2",
+            "/a/%2e%2ex",
+            "*",
+        ] {
+            assert!(
+                matches!(normalize_path(path), Cow::Borrowed(p) if p == path),
+                "{path}"
+            );
+        }
+    }
+
+    /// RFC 3986 5.2.4 to the letter, over an absolute path: steps A and D
+    /// never apply, as the input always opens with '/'.
+    fn rfc_remove_dot_segments(path: &str) -> String {
+        let (mut input, mut output) = (path.to_string(), String::new());
+        let pop = |output: &mut String| output.truncate(output.rfind('/').unwrap_or(0));
+        while !input.is_empty() {
+            if input.starts_with("/./") {
+                input.replace_range(..3, "/");
+            } else if input == "/." {
+                input.replace_range(.., "/");
+            } else if input.starts_with("/../") {
+                input.replace_range(..4, "/");
+                pop(&mut output);
+            } else if input == "/.." {
+                input.replace_range(.., "/");
+                pop(&mut output);
+            } else {
+                let end = input[1..].find('/').map_or(input.len(), |i| i + 1);
+                output.push_str(&input[..end]);
+                input.replace_range(..end, "");
+            }
+        }
+        output
+    }
+
+    fn decode_dots(path: &str) -> String {
+        path.replace("%2e", ".").replace("%2E", ".")
+    }
+
+    #[test]
+    fn normalization_matches_rfc_3986_with_encoded_dots_decoded() {
+        let alphabet = ["/", "a", ".", "%2e", "%2E"];
+        let mut rng = fastrand::Rng::with_seed(3986);
+        for _ in 0..50_000 {
+            let mut path = String::from("/");
+            for _ in 0..rng.usize(0..10) {
+                path.push_str(alphabet[rng.usize(..alphabet.len())]);
+            }
+            let got = normalize_path(&path);
+            let want = rfc_remove_dot_segments(&decode_dots(&path));
+            assert_eq!(decode_dots(&got), want, "{path}");
+            assert_eq!(
+                matches!(got, Cow::Borrowed(_)),
+                want == decode_dots(&path),
+                "{path}"
+            );
+        }
     }
 }

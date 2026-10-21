@@ -104,10 +104,27 @@ fn a_404_allocates_nothing() {
 #[test]
 fn a_routed_request_allocates_nothing() {
     let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
-    let req = b"GET /api/v1/users?page=2 HTTP/1.1\r\nHost: a.test\r\n\r\n";
+    for req in [
+        &b"GET /api/v1/users?page=2 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
+        // Dots and escapes, but no dot-segment: nothing to normalize.
+        b"GET /api/.well-known/app.min.js?v=1.2 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        b"GET /api/a%20b/%2e%2ex HTTP/1.1\r\nHost: a.test\r\n\r\n",
+    ] {
+        let n = allocations(|| {
+            let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+            assert!(matches!(result, RoutingResult::HttpForward { .. }));
+        });
+        assert_eq!(n, 0, "{}", String::from_utf8_lossy(req));
+    }
+}
+
+#[test]
+fn a_path_to_normalize_allocates_once() {
+    let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
+    let req = b"GET /public/%2e%2e/api/./users?page=2 HTTP/1.1\r\nHost: a.test\r\n\r\n";
     let n = allocations(|| {
         let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
         assert!(matches!(result, RoutingResult::HttpForward { .. }));
     });
-    assert_eq!(n, 0);
+    assert!(n <= 1, "{n} allocations");
 }
