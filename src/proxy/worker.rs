@@ -26,7 +26,7 @@ use crate::proxy::http_filters::{
     absolute_form_target, apply_request_header_modifications, apply_response_header_mods,
     assemble_forward_headers, assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods,
     extract_url_rewrite, header_lines, is_hop_by_hop_response_header, sanitize_response_headers,
-    to_origin_form, HeaderModifications, ResponseCuts, MIRROR_BODY_MAX,
+    to_origin_form, ForwardedLines, HeaderModifications, ResponseCuts, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{
     field_value_end, find_header_end, has_header_end, is_field_value_byte, is_tchar, is_token,
@@ -212,6 +212,9 @@ pub(crate) struct ConnectionState {
     is_tls: bool,
     /// Client address for X-Forwarded-For.
     peer_ip: std::net::IpAddr,
+    /// Forwarding lines appended to every request this connection sends,
+    /// formatted at the first: many connections forward none.
+    forwarded: Option<ForwardedLines>,
     /// Budget for completing a request's header block once bytes arrive.
     client_header_timeout: Duration,
     /// Backend connect budget for raw TCP forwarding (HTTP connects go
@@ -281,6 +284,7 @@ impl ConnectionState {
             health,
             is_tls,
             peer_ip,
+            forwarded: None,
             client_header_timeout: cfg.client_header_timeout,
             connect_timeout: cfg.connect_timeout,
             backend_keepalive: tcp_keepalive(cfg.tcp_keepalive_time),
@@ -1678,13 +1682,16 @@ fn build_outgoing_headers(
 ) {
     let raw = &buf[..req_header_end];
     let normalized = meta.normalized_path.as_deref().map(str::as_bytes);
+    let (peer_ip, is_tls) = (state.peer_ip, state.is_tls);
+    let forwarded = state
+        .forwarded
+        .get_or_insert_with(|| ForwardedLines::new(peer_ip, is_tls));
     if meta.strip_spans.needs_slow_path {
         assemble_forward_headers_slow(
             raw,
             normalized,
             meta.is_upgrade,
-            state.peer_ip,
-            state.is_tls,
+            forwarded,
             &mut state.scratch_buf,
         );
     } else {
@@ -1694,8 +1701,7 @@ fn build_outgoing_headers(
             &meta.strip_spans,
             meta.upgrade_span,
             meta.is_upgrade,
-            state.peer_ip,
-            state.is_tls,
+            forwarded,
             &mut state.scratch_buf,
         );
     }
