@@ -314,32 +314,34 @@ pub async fn run_controller(
     // Each watches_stream closure captures an owned gateway store clone via move.
     let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
         std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
+    let [cn1, cn2, cn3, cn4, cn8] = std::array::from_fn::<_, 5, _>(|_| controller_name.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
-        // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
+        // Routes: targeted, to the Gateway(s) its parentRefs name and the
+        // ones its status says we reported on.
         // No predicate_filter here: it caches generation per object key and never
         // clears on delete, so delete+recreate with the same name (common in
         // conformance tests) would be suppressed. The echo of our own status
         // writes finds nothing to write.
         .watches_stream(http_route_stream, move |route: HTTPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw1)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw1, &cn1)
         })
         .watches_stream(tcp_route_stream, move |route: TCPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw2)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw2, &cn2)
         })
         .watches_stream(tls_route_stream, move |route: TLSRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw3)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw3, &cn3)
         })
         .watches_stream(udp_route_stream, move |route: UDPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw4)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw4, &cn4)
         })
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS
         .watches_stream(secret_stream, move |secret: Secret| {
             map_secret_to_gateways(&secret, &gw5)
         })
-        // RateLimitPolicy: targeted — the one Gateway its targetRef names.
+        // RateLimitPolicy: targeted like routes, by targetRef and status.
         .watches_stream(policy_stream, move |policy: RateLimitPolicy| {
-            map_policy_to_gateways(&policy, &gw8)
+            map_policy_to_gateways(&policy, &gw8, &cn8)
         })
         // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
         // These have complex multi-hop mappings; the 1s debounce coalesces bursts.

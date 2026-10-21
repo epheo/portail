@@ -8,10 +8,10 @@ use kube::api::Api;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
 use kube::runtime::{reflector, WatchStreamExt};
-use kube::ResourceExt;
 
 use gateway_api::gateways::Gateway;
 
+use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::parent_ref::ParentRefAccess;
 use crate::logging::warn;
 
@@ -84,56 +84,132 @@ where
 // Mapper functions: map secondary resource events to Gateway ObjectRef(s)
 // ---------------------------------------------------------------------------
 
-/// Map a route to the Gateway(s) it targets via parentRefs.
-pub(super) fn map_route_to_gateways<
-    R: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
->(
-    route: &R,
-    parent_refs: &Option<Vec<impl ParentRefAccess>>,
+/// The Gateways an object's status says `controller` reported on: route
+/// `status.parents` and policy `status.ancestors` entries carrying its
+/// controllerName.
+pub(super) trait StatusReports {
+    /// (namespace, name) of each such Gateway.
+    fn reported_gateways<'a>(
+        &'a self,
+        controller: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a;
+
+    fn reports(&self, controller: &str, gw_ns: &str, gw_name: &str) -> bool {
+        self.reported_gateways(controller)
+            .any(|gw| gw == (gw_ns, gw_name))
+    }
+}
+
+macro_rules! impl_route_status_reports {
+    ($($ty:ty),*) => {$(
+        impl StatusReports for $ty {
+            fn reported_gateways<'a>(
+                &'a self,
+                controller: &'a str,
+            ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+                let own_ns = self.metadata.namespace.as_deref().unwrap_or("default");
+                self.status
+                    .iter()
+                    .flat_map(|s| &s.parents)
+                    .filter(move |p| p.controller_name == controller)
+                    .map(move |p| {
+                        (
+                            p.parent_ref.namespace.as_deref().unwrap_or(own_ns),
+                            p.parent_ref.name.as_str(),
+                        )
+                    })
+            }
+        }
+    )*};
+}
+
+impl_route_status_reports!(
+    gateway_api::httproutes::HTTPRoute,
+    gateway_api::experimental::tcproutes::TCPRoute,
+    gateway_api::experimental::tlsroutes::TLSRoute,
+    gateway_api::experimental::udproutes::UDPRoute
+);
+
+impl StatusReports for RateLimitPolicy {
+    fn reported_gateways<'a>(
+        &'a self,
+        controller: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        self.status
+            .iter()
+            .flat_map(|s| &s.ancestors)
+            .filter(move |a| a.controller_name == controller)
+            .map(|a| {
+                (
+                    a.ancestor_ref.namespace.as_str(),
+                    a.ancestor_ref.name.as_str(),
+                )
+            })
+    }
+}
+
+/// The served Gateways among `candidates`. The store check is what makes
+/// scoped pods ignore objects for Gateways they do not serve.
+fn served<'a>(
+    candidates: impl Iterator<Item = (&'a str, &'a str)>,
     store: &Store<Gateway>,
 ) -> Vec<ObjectRef<Gateway>> {
-    let route_ns = route.namespace().unwrap_or_default();
-    let mut refs = Vec::new();
-    if let Some(prs) = parent_refs {
-        for pr in prs {
-            if pr
-                .ref_group()
-                .is_some_and(|g| g != "gateway.networking.k8s.io")
-            {
-                continue;
-            }
-            if pr.ref_kind().is_some_and(|k| k != "Gateway") {
-                continue;
-            }
-            let gw_ns = pr.ref_namespace().unwrap_or(&route_ns);
-            let obj_ref = ObjectRef::<Gateway>::new(pr.ref_name()).within(gw_ns);
-            if store.get(&obj_ref).is_some() {
-                refs.push(obj_ref);
-            }
+    let mut refs: Vec<ObjectRef<Gateway>> = Vec::new();
+    for (ns, name) in candidates {
+        let obj_ref = ObjectRef::<Gateway>::new(name).within(ns);
+        if store.get(&obj_ref).is_some() && !refs.contains(&obj_ref) {
+            refs.push(obj_ref);
         }
     }
     refs
 }
 
-/// Map a RateLimitPolicy to the Gateway its targetRef names (GEP-713 direct
-/// attachment is same-namespace, so the Gateway namespace is the policy's).
-/// The store-membership check is what makes scoped pods ignore policies for
-/// Gateways they do not serve, exactly like route parentRefs.
-pub(super) fn map_policy_to_gateways(
-    policy: &crate::kubernetes::crds::RateLimitPolicy,
+/// Map a route to the Gateway(s) it targets via parentRefs, and to those
+/// its status says we reported on: a parentRef moved away from a Gateway
+/// must reconcile that Gateway too, to stop serving the route and remove
+/// our entry.
+pub(super) fn map_route_to_gateways<R>(
+    route: &R,
+    parent_refs: &Option<Vec<impl ParentRefAccess>>,
     store: &Store<Gateway>,
+    controller: &str,
+) -> Vec<ObjectRef<Gateway>>
+where
+    R: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope> + StatusReports,
+{
+    let route_ns = route.meta().namespace.as_deref().unwrap_or_default();
+    let targeted = parent_refs
+        .iter()
+        .flatten()
+        .filter(|pr| {
+            pr.ref_group()
+                .is_none_or(|g| g == "gateway.networking.k8s.io")
+                && pr.ref_kind().is_none_or(|k| k == "Gateway")
+        })
+        .map(|pr| (pr.ref_namespace().unwrap_or(route_ns), pr.ref_name()));
+    served(targeted.chain(route.reported_gateways(controller)), store)
+}
+
+/// Map a RateLimitPolicy to the Gateway its targetRef names (GEP-713 direct
+/// attachment is same-namespace, so the Gateway namespace is the policy's),
+/// and to the Gateways its status says we reported on, for the same reason
+/// as routes.
+pub(super) fn map_policy_to_gateways(
+    policy: &RateLimitPolicy,
+    store: &Store<Gateway>,
+    controller: &str,
 ) -> Vec<ObjectRef<Gateway>> {
-    let ns = policy.namespace().unwrap_or_default();
+    let ns = policy.metadata.namespace.as_deref().unwrap_or_default();
     let t = &policy.spec.target_ref;
-    if t.kind != "Gateway" || !(t.group.is_empty() || t.group == "gateway.networking.k8s.io") {
-        return Vec::new();
-    }
-    let obj_ref = ObjectRef::<Gateway>::new(&t.name).within(&ns);
-    if store.get(&obj_ref).is_some() {
-        vec![obj_ref]
-    } else {
-        Vec::new()
-    }
+    let targeted = (t.kind == "Gateway"
+        && (t.group.is_empty() || t.group == "gateway.networking.k8s.io"))
+        .then_some((ns, t.name.as_str()));
+    served(
+        targeted
+            .into_iter()
+            .chain(policy.reported_gateways(controller)),
+        store,
+    )
 }
 
 /// Map a Secret to the Gateway(s) whose TLS certificateRefs name it.
@@ -299,7 +375,53 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::testkit::{self, apply, CONTROLLER};
     use super::*;
+
+    fn served_gateways(names: &[&str]) -> Store<Gateway> {
+        let mut writer = reflector::store::Writer::default();
+        for name in names {
+            apply(&mut writer, testkit::gateway(name, 1));
+        }
+        writer.as_reader()
+    }
+
+    fn names(refs: &[ObjectRef<Gateway>]) -> Vec<&str> {
+        refs.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// A route event reaches the Gateways its status says we reported on,
+    /// not only the ones its parentRefs name now: moving a parentRef away
+    /// must reconcile the Gateway it left.
+    #[test]
+    fn route_maps_to_named_and_reported_gateways() {
+        let store = served_gateways(&["a", "b", "c"]);
+        let mut route = testkit::http_route("r", &["b"], 1);
+        route.status = Some(
+            serde_json::from_value(serde_json::json!({ "parents": [
+                testkit::status_entry(CONTROLLER, "a", "parentRef"),
+                testkit::status_entry("example.com/other", "c", "parentRef"),
+                testkit::status_entry(CONTROLLER, "not-served-here", "parentRef"),
+            ]}))
+            .unwrap(),
+        );
+        let refs = map_route_to_gateways(&route, &route.spec.parent_refs, &store, CONTROLLER);
+        assert_eq!(names(&refs), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn policy_maps_to_target_and_reported_gateways() {
+        let store = served_gateways(&["a", "b"]);
+        let mut policy = testkit::rate_limit_policy("p", "b");
+        policy.status = Some(
+            serde_json::from_value(serde_json::json!({ "ancestors": [
+                testkit::status_entry(CONTROLLER, "a", "ancestorRef"),
+            ]}))
+            .unwrap(),
+        );
+        let refs = map_policy_to_gateways(&policy, &store, CONTROLLER);
+        assert_eq!(names(&refs), vec!["b", "a"]);
+    }
 
     #[test]
     fn cached_objects_drop_managed_fields_and_last_applied() {

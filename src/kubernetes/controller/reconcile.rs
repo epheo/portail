@@ -21,7 +21,10 @@ use crate::logging::{debug, error, info, warn};
 use crate::routing::RouteTable;
 
 use super::validate::{resolve_gateway_certs, validate_gateway};
-use super::{skip_requeue_secs, success_requeue_secs, ControllerCtx, ReconcileError};
+use super::watch::StatusReports;
+use super::{
+    skip_requeue_secs, success_requeue_secs, ControllerCtx, ReconcileError, ResourceCache,
+};
 use crate::kubernetes::addresses::{
     compute_bind_addresses, discover_usable_addresses, resolve_network_addresses,
     substitute_network_ips, unresolved_networks, UsableAddresses,
@@ -88,50 +91,101 @@ fn by_identity(a: &Observed, b: &Observed) -> std::cmp::Ordering {
     (a.kind, &a.namespace, &a.name).cmp(&(b.kind, &b.namespace, &b.name))
 }
 
-/// The snapshot routes' observed `status.parents`.
-fn observed_routes(snapshot: &ClusterSnapshot) -> Vec<Observed> {
-    fn push<R: GatewayRoute + kube::Resource>(out: &mut Vec<Observed>, routes: &[Arc<R>]) {
-        out.extend(routes.iter().map(|r| Observed {
-            kind: R::KIND,
-            namespace: r.route_namespace().to_string(),
-            name: r.identity().0.to_string(),
-            entries: status::ObservedEntries {
-                resource_version: r.meta().resource_version.clone(),
-                entries: r.status_parents_json(),
-            },
-        }));
+fn observed_route<R: GatewayRoute + kube::Resource>(r: &R) -> Observed {
+    Observed {
+        kind: R::KIND,
+        namespace: r.route_namespace().to_string(),
+        name: r.identity().0.to_string(),
+        entries: status::ObservedEntries {
+            resource_version: r.meta().resource_version.clone(),
+            entries: r.status_parents_json(),
+        },
     }
+}
+
+fn observed_policy(p: &RateLimitPolicy) -> Observed {
+    Observed {
+        kind: "RateLimitPolicy",
+        namespace: p.namespace().unwrap_or_default(),
+        name: p.name_any(),
+        entries: status::ObservedEntries {
+            resource_version: p.metadata.resource_version.clone(),
+            entries: p
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.ancestors
+                        .iter()
+                        .filter_map(|a| serde_json::to_value(a).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+    }
+}
+
+/// Every route this pass owes status: the snapshot's, which target this
+/// Gateway, and the store's routes whose status still carries our entry for
+/// it although they no longer do. Those get no entry, so ours is removed:
+/// Gateway API RouteParentStatus.controllerName, "Controllers should ensure
+/// that entries to status populated with their ControllerName are cleaned up
+/// when they are no longer necessary".
+fn observed_routes(
+    snapshot: &ClusterSnapshot,
+    cache: &ResourceCache,
+    controller: &str,
+    gw_name: &str,
+    gw_ns: &str,
+) -> Vec<Observed> {
+    fn push<R>(
+        out: &mut Vec<Observed>,
+        targeting: &[Arc<R>],
+        store: &Store<R>,
+        (controller, gw_name, gw_ns): (&str, &str, &str),
+    ) where
+        R: GatewayRoute + StatusReports + kube::Resource + Clone,
+        R::DynamicType: Default + Eq + std::hash::Hash + Clone,
+    {
+        out.extend(targeting.iter().map(|r| observed_route(&**r)));
+        out.extend(
+            store
+                .state()
+                .iter()
+                .filter(|r| {
+                    !route_targets_gateway(r.parent_refs(), r.route_namespace(), gw_name, gw_ns)
+                        && r.reports(controller, gw_ns, gw_name)
+                })
+                .map(|r| observed_route(&**r)),
+        );
+    }
+    let owner = (controller, gw_name, gw_ns);
     let mut out = Vec::new();
-    push(&mut out, &snapshot.http_routes);
-    push(&mut out, &snapshot.tcp_routes);
-    push(&mut out, &snapshot.tls_routes);
-    push(&mut out, &snapshot.udp_routes);
+    push(&mut out, &snapshot.http_routes, &cache.http_routes, owner);
+    push(&mut out, &snapshot.tcp_routes, &cache.tcp_routes, owner);
+    push(&mut out, &snapshot.tls_routes, &cache.tls_routes, owner);
+    push(&mut out, &snapshot.udp_routes, &cache.udp_routes, owner);
     out.sort_by(by_identity);
     out
 }
 
-/// The policies' observed `status.ancestors`.
-fn observed_policies(policies: &[Arc<RateLimitPolicy>]) -> Vec<Observed> {
-    let mut out: Vec<Observed> = policies
+/// Every policy this pass owes status: the snapshot's, which target this
+/// Gateway, and the ones still carrying our entry for it, as for routes.
+fn observed_policies(
+    targeting: &[Arc<RateLimitPolicy>],
+    store: &Store<RateLimitPolicy>,
+    controller: &str,
+    gw_name: &str,
+    gw_ns: &str,
+) -> Vec<Observed> {
+    let stale = store
+        .state()
+        .into_iter()
+        .filter(|p| !p.targets_gateway(gw_ns, gw_name) && p.reports(controller, gw_ns, gw_name));
+    let mut out: Vec<Observed> = targeting
         .iter()
-        .map(|p| Observed {
-            kind: "RateLimitPolicy",
-            namespace: p.namespace().unwrap_or_default(),
-            name: p.name_any(),
-            entries: status::ObservedEntries {
-                resource_version: p.metadata.resource_version.clone(),
-                entries: p
-                    .status
-                    .as_ref()
-                    .map(|s| {
-                        s.ancestors
-                            .iter()
-                            .filter_map(|a| serde_json::to_value(a).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            },
-        })
+        .cloned()
+        .chain(stale)
+        .map(|p| observed_policy(&p))
         .collect();
     out.sort_by(by_identity);
     out
@@ -849,7 +903,13 @@ pub(super) async fn reconcile(
         &gw_name,
         &gw_ns,
         &result.route_status,
-        &observed_routes(&snapshot),
+        &observed_routes(
+            &snapshot,
+            &ctx.cache,
+            &ctx.controller_name,
+            &gw_name,
+            &gw_ns,
+        ),
         programmed,
         &mut writes,
     )
@@ -859,7 +919,13 @@ pub(super) async fn reconcile(
         &gw_name,
         &gw_ns,
         &result.policy_status,
-        &observed_policies(&snapshot.rate_limit_policies),
+        &observed_policies(
+            &snapshot.rate_limit_policies,
+            &ctx.cache.rate_limit_policies,
+            &ctx.controller_name,
+            &gw_name,
+            &gw_ns,
+        ),
         &mut writes,
     )
     .await;
@@ -1038,6 +1104,59 @@ mod tests {
         assert!(observed_generations(&patch["status"])
             .iter()
             .all(|g| *g == 2));
+    }
+
+    /// A route whose parentRef moved to another Gateway loses our entry for
+    /// this one; another controller's entry stays. The route used to drop
+    /// out of this Gateway's snapshot, so Accepted=True stayed forever.
+    #[tokio::test]
+    async fn route_that_moved_away_loses_our_entry() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        let mut route = testkit::http_route("r", &["other-gw"], 2);
+        route.status = Some(
+            serde_json::from_value(serde_json::json!({ "parents": [
+                testkit::status_entry(testkit::CONTROLLER, "gw", "parentRef"),
+                testkit::status_entry("example.com/other", "gw", "parentRef"),
+            ]}))
+            .unwrap(),
+        );
+        apply(&mut cluster.http_routes, route);
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        let patch = api
+            .status_patch("httproutes", "r")
+            .expect("our stale entry is removed");
+        let parents = patch["status"]["parents"].as_array().unwrap();
+        assert_eq!(parents.len(), 1, "{parents:?}");
+        assert_eq!(parents[0]["controllerName"], "example.com/other");
+    }
+
+    /// Same for a RateLimitPolicy retargeted to another Gateway.
+    #[tokio::test]
+    async fn policy_that_moved_away_loses_our_ancestor() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        let mut policy = testkit::rate_limit_policy("p", "other-gw");
+        policy.status = Some(
+            serde_json::from_value(serde_json::json!({ "ancestors": [
+                testkit::status_entry(testkit::CONTROLLER, "gw", "ancestorRef"),
+            ]}))
+            .unwrap(),
+        );
+        apply(&mut cluster.policies, policy);
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        let patch = api
+            .status_patch("ratelimitpolicies", "p")
+            .expect("our stale ancestor is removed");
+        assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
     }
 
     /// A write computed from a stale read is refused (409), not applied

@@ -274,6 +274,50 @@ pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HTTPR
     }
 }
 
+/// One condition-bearing status entry by `controller` for Gateway `gw` in
+/// `default`: a route parent when `ref_field` is "parentRef", a policy
+/// ancestor when "ancestorRef".
+pub(super) fn status_entry(controller: &str, gw: &str, ref_field: &str) -> Value {
+    let mut entry = json!({
+        "controllerName": controller,
+        "conditions": [{
+            "type": "Accepted",
+            "status": "True",
+            "reason": "Accepted",
+            "message": "Accepted",
+            "lastTransitionTime": "2020-01-01T00:00:00Z",
+        }],
+    });
+    entry[ref_field] = json!({
+        "group": "gateway.networking.k8s.io",
+        "kind": "Gateway",
+        "name": gw,
+        "namespace": "default",
+    });
+    entry
+}
+
+/// A RateLimitPolicy in `default` targeting Gateway `gw`.
+pub(super) fn rate_limit_policy(name: &str, gw: &str) -> RateLimitPolicy {
+    use crate::kubernetes::crds::{PolicyTargetRef, RateLimitPolicySpec};
+    let mut policy = RateLimitPolicy::new(
+        name,
+        RateLimitPolicySpec {
+            target_ref: PolicyTargetRef {
+                group: "gateway.networking.k8s.io".into(),
+                kind: "Gateway".into(),
+                name: gw.into(),
+                section_name: None,
+            },
+            requests_per_second: 1,
+            burst: None,
+        },
+    );
+    policy.metadata.namespace = Some("default".into());
+    policy.metadata.resource_version = Some("1".into());
+    policy
+}
+
 /// `gw` as the store holds it once the apiserver applied `patch` (a
 /// server-side-apply body of ours).
 pub(super) fn with_gateway_status(mut gw: Gateway, patch: &Value) -> Gateway {
