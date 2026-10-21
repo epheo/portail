@@ -87,7 +87,7 @@ struct ControllerCtx {
     config_cell: Arc<ArcSwapOption<crate::config::PortailConfig>>,
     data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
-    /// When false, the operator owns Gateway/GatewayClass lifecycle status
+    /// When false, the operator owns Gateway lifecycle status
     /// (Accepted/Programmed/addresses); portail reports only listener + route status.
     manage_gateway_status: bool,
     /// Flipped to true once the data plane has bound this instance's listener

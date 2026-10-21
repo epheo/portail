@@ -30,7 +30,7 @@ pub struct Args {
     #[arg(action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// Display paths to example configuration files and exit
+    /// List the built-in example configurations and exit
     #[arg(long)]
     pub example_config: bool,
 
@@ -69,7 +69,7 @@ pub struct Args {
     #[arg(long)]
     pub print_crd: bool,
 
-    /// Manage Gateway/GatewayClass lifecycle status (set false under portail-operator)
+    /// Manage Gateway lifecycle status (set false under portail-operator)
     ///
     /// Covers Accepted/Programmed/addresses. Set false when running under
     /// portail-operator, which owns that status; portail then only reports

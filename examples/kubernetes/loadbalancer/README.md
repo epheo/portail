@@ -45,7 +45,9 @@ Create separate Gateways for each interface, each with its own Deployment and Se
 
 ## How isolation works
 
-Portail reconciles all Gateways for its GatewayClass. When `spec.addresses` is set, listeners bind to that specific IP. If the IP doesn't exist on the pod's interfaces, the Gateway gets `Programmed=False` and is effectively ignored. The network is the filter.
+Portail reconciles all Gateways for its GatewayClass.
+A LoadBalancer VIP in `spec.addresses` is not on any pod interface, so portail does not bind it: listeners bind all interfaces and the Service carries the VIP to them.
+Only an address already on a pod interface is bound specifically; a missing one does not set `Programmed=False`.
 
 ## Using NodePort or ClusterIP instead
 
