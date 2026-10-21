@@ -457,6 +457,7 @@ pub(crate) async fn handle_connection(
     let mut buf = vec![0u8; 65536];
 
     let mut n = client.read(&mut buf).await?;
+    n = skip_empty_lines_before_http(&mut client, &mut buf, n, state.client_header_timeout).await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
@@ -583,19 +584,23 @@ pub(crate) async fn handle_connection(
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
         loop {
-            let empty_lines = buf[..n]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .take_while(|pair| *pair == b"\r\n")
-                .count();
-            if empty_lines == 0 {
-                break;
+            let skip = empty_lines_len(&buf[..n]);
+            if skip > 0 {
+                buf.copy_within(skip..n, 0);
+                n -= skip;
             }
-            buf.copy_within(empty_lines * 2..n, 0);
-            n -= empty_lines * 2;
-            if n == 0 {
-                n = client.read(&mut buf).await?;
+            match &buf[..n] {
+                // Between requests: as unbounded as the idle wait.
+                [] if skip > 0 => n = client.read(&mut buf).await?,
+                // Inside an empty line: as bounded as a request head.
+                [b'\r'] => {
+                    let rest = client.read(&mut buf[1..]);
+                    match tokio::time::timeout(state.client_header_timeout, rest).await {
+                        Ok(Ok(read)) if read > 0 => n += read,
+                        _ => return Ok(()),
+                    }
+                }
+                _ => break,
             }
         }
         // The connection is HTTP by now: bytes that cannot open a request
@@ -609,6 +614,41 @@ pub(crate) async fn handle_connection(
         }
         if n == 0 || !is_http_request(&buf[..n]) {
             return Ok(());
+        }
+    }
+}
+
+/// Byte length of the empty lines (CRLF pairs) opening `data`.
+fn empty_lines_len(data: &[u8]) -> usize {
+    let pairs = data.as_chunks::<2>().0;
+    pairs.iter().take_while(|pair| *pair == b"\r\n").count() * 2
+}
+
+/// Empty lines before the first request-line are ignored too (RFC 9112
+/// 2.2), but only when an HTTP request follows: for TCP routing the bytes
+/// stay as sent. A read ending inside them is extended within `budget`
+/// before deciding. Returns the length of the data now in `buf`.
+async fn skip_empty_lines_before_http(
+    client: &mut Connection,
+    buf: &mut [u8],
+    mut n: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let skip = empty_lines_len(&buf[..n]);
+        let rest = &buf[skip..n];
+        if skip > 0 && is_http_request(rest) {
+            buf.copy_within(skip..n, 0);
+            return n - skip;
+        }
+        let inside = rest == b"\r" || (skip > 0 && rest.is_empty());
+        if !inside || n == buf.len() {
+            return n;
+        }
+        match tokio::time::timeout_at(deadline, client.read(&mut buf[n..])).await {
+            Ok(Ok(read)) if read > 0 => n += read,
+            _ => return n,
         }
     }
 }
@@ -2559,6 +2599,56 @@ mod connection_tests {
         client.read_exact(&mut head).await.unwrap();
         assert_eq!(head, REFUSED);
         let out = exchange(&mut client, UNROUTED).await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    /// Before the first request too, and across a read that ends inside an
+    /// empty line.
+    #[tokio::test]
+    async fn empty_lines_before_the_first_request_are_skipped() {
+        let (mut client, _task) = serve(RouteTable::new());
+        let out = exchange(&mut client, &[b"\r\n\r\n", UNROUTED].concat()).await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+
+        let (mut client, _task) = serve(RouteTable::new());
+        client.write_all(b"\r").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let out = exchange(&mut client, &[b"\n", UNROUTED].concat()).await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    /// Not followed by HTTP, the bytes reach the TCP route as sent.
+    #[tokio::test]
+    async fn empty_lines_before_opaque_bytes_stay_for_tcp_routing() {
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(
+            8080,
+            vec![Backend {
+                socket_addr: tcp,
+                weight: 1,
+                filters: vec![],
+                use_tls: false,
+                server_name: String::new(),
+            }],
+        );
+        let (mut client, _task) = serve(rt);
+        let input = [b"\r\n", OPAQUE].concat();
+        let out = exchange(&mut client, &input).await;
+        assert_eq!(out.as_bytes(), REFUSED);
+        assert_eq!(delivered(&mut rx).await.as_bytes(), input);
+    }
+
+    #[tokio::test]
+    async fn a_read_ending_inside_an_empty_line_waits_for_the_rest() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let post = &POST_THEN_CRLF[..POST_THEN_CRLF.len() - 1];
+        client.write_all(post).await.unwrap();
+        let mut head = vec![0u8; REFUSED.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, REFUSED);
+        let out = exchange(&mut client, &[b"\n", UNROUTED].concat()).await;
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
     }
 
