@@ -371,12 +371,17 @@ fn compile_regex(pattern: &str, what: &str) -> Result<regex::Regex, RouteError> 
     let invalid = |e: &dyn fmt::Display| {
         RouteError::unsupported(format!("Invalid {} regex '{}': {}", what, pattern, e))
     };
-    // Alone first: a stray ')' would close the anchoring group and turn an
-    // invalid pattern into a valid one.
-    regex_syntax::ast::parse::Parser::new()
+    // Parsed alone, then printed back: a stray ')' would close the anchoring
+    // group and turn an invalid pattern into a valid one, and a trailing
+    // (?x) comment would swallow it. The printed form has no comments.
+    let ast = regex_syntax::ast::parse::Parser::new()
         .parse(pattern)
         .map_err(|e| invalid(&e))?;
-    regex::Regex::new(&format!("^(?:{})$", pattern)).map_err(|e| invalid(&e))
+    let mut alone = String::with_capacity(pattern.len());
+    regex_syntax::ast::print::Printer::new()
+        .print(&ast, &mut alone)
+        .map_err(|e| invalid(&e))?;
+    regex::Regex::new(&format!("^(?:{})$", alone)).map_err(|e| invalid(&e))
 }
 
 fn compile_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError> {
@@ -523,6 +528,23 @@ mod tests {
         assert!(!re.is_match("/x/v2") && !re.is_match("/api/x"));
         assert!(compile_regex("^/a.*$", "path").unwrap().is_match("/abc"));
         assert!(compile_regex("(?i)/api", "path").unwrap().is_match("/API"));
+    }
+
+    /// Appended as text, the anchor's ")$" sat inside a trailing comment.
+    #[test]
+    fn an_extended_mode_comment_cannot_swallow_the_anchor() {
+        let re = compile_regex("(?x) /api  /v[0-9]+ # API versions", "path").unwrap();
+        assert!(re.is_match("/api/v2"));
+        assert!(!re.is_match("/api/v2/x") && !re.is_match("/api /v2"));
+
+        // Escaped whitespace and '#' stay literal in (?x).
+        let re = compile_regex(r"(?x) a\ b \# c # tail", "header match").unwrap();
+        assert!(re.is_match("a b#c"));
+        assert!(!re.is_match("ab#c"));
+        // Outside (?x), '#' and spaces are literal.
+        assert!(compile_regex("a #b", "query param match")
+            .unwrap()
+            .is_match("a #b"));
     }
 
     fn mirror(percent: Option<u32>, fraction: Option<(u32, u32)>) -> RequestMirrorConfig {
