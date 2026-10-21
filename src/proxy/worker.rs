@@ -1393,7 +1393,7 @@ async fn forward_response_headers(
         return Ok(HeaderPhase::Proxied(framing));
     }
 
-    // Hop-by-hop response headers never reach the client (RFC 7230 §6.1);
+    // Hop-by-hop response headers never reach the client (RFC 7230 6.1);
     // the proxy owns the client-side Connection header.
     sanitize_response_headers(
         &header_buf[..resp_header_end],
@@ -3014,7 +3014,6 @@ fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
     Some((status, *minor == b'0'))
 }
 
-/// The status of a head whose status line is well-formed.
 fn head_status(head: &[u8]) -> Option<u16> {
     parse_status_line(header_lines(head).next()?).map(|(status, _)| status)
 }

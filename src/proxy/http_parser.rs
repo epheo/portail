@@ -247,7 +247,8 @@ fn past_query_backslashes(data: &[u8], start: usize, mut end: usize) -> usize {
     end
 }
 
-/// Strip RFC 9110 5.6.3 OWS (SP and HTAB only) from both ends.
+/// Not `trim_ascii`: OWS is SP and HTAB only (RFC 9110 5.6.3), and a FF or
+/// CR at either end must fail the value, not vanish.
 #[inline(always)]
 pub(crate) fn trim_ows(mut v: &[u8]) -> &[u8] {
     while let [b' ' | b'\t', rest @ ..] = v {
