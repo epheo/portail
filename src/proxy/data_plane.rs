@@ -77,6 +77,8 @@ pub struct DataPlane {
     ready_flag: Option<Arc<AtomicBool>>,
     worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
+    /// Cloned into every UDP worker, the controller's too: a rebuilt one
+    /// would split the default session budget.
     udp_sessions: udp_worker::SessionLimits,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
@@ -564,7 +566,7 @@ impl DataPlane {
                             Ok(tokio_socket) => {
                                 let routes = routes.clone();
                                 let health = self.health.clone();
-                                let limits = self.udp_sessions;
+                                let limits = self.udp_sessions.clone();
                                 let socket = Arc::new(tokio_socket);
 
                                 self.spawn_listener_task(endpoint, |cancel| async move {
@@ -661,7 +663,7 @@ impl DataPlane {
             let socket = Arc::new(entry.socket);
             let routes = routes.clone();
             let health = self.health.clone();
-            let limits = self.udp_sessions;
+            let limits = self.udp_sessions.clone();
             let port = entry.port;
 
             self.spawn_listener_task((entry.address, entry.bound_port), |cancel| async move {

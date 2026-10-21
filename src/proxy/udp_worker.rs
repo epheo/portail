@@ -1,11 +1,12 @@
 //! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
-//! Sessions are identified by source address, capped per listener, moved off a
-//! backend that a route-table swap dropped, and expire after an idle timeout.
+//! Sessions are identified by source address, capped (per listener, or by one
+//! budget all listeners share), moved off a backend that a route-table swap
+//! dropped, and expire after an idle timeout.
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -20,11 +21,21 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
 
-/// Session bounds of one UDP listener socket.
-#[derive(Debug, Clone, Copy)]
+/// Session bounds of the UDP listener sockets. Clones share the default
+/// budget, so build one per process.
+#[derive(Debug, Clone)]
 pub struct SessionLimits {
     pub idle_timeout: Duration,
-    pub max_sessions: usize,
+    cap: SessionCap,
+}
+
+#[derive(Debug, Clone)]
+enum SessionCap {
+    /// `udpMaxSessions`, for each listener socket.
+    PerListener(usize),
+    /// The default, for all listener sockets together: the fds it was sized
+    /// from are the whole process's.
+    Shared(Arc<SessionBudget>),
 }
 
 impl SessionLimits {
@@ -37,14 +48,85 @@ impl SessionLimits {
     fn with_nofile(perf: &PerformanceConfig, nofile_soft: Option<u64>) -> Self {
         // The soft limit containers commonly start with.
         const UNKNOWN_NOFILE: u64 = 1024;
-        // A quarter of the fd budget per listener: each session holds one fd,
-        // and the rest stays for TCP, whose accept loops all fail at EMFILE.
-        let quarter = nofile_soft.unwrap_or(UNKNOWN_NOFILE) / 4;
-        let derived = usize::try_from(quarter).unwrap_or(usize::MAX).max(1);
+        let cap = match perf.udp_max_sessions {
+            Some(max) => SessionCap::PerListener(max),
+            None => {
+                // A quarter of the fd budget: each session holds one fd, and
+                // the rest stays for TCP, whose accept loops all fail at EMFILE.
+                let quarter = nofile_soft.unwrap_or(UNKNOWN_NOFILE) / 4;
+                let max = usize::try_from(quarter).unwrap_or(usize::MAX).max(1);
+                SessionCap::Shared(Arc::new(SessionBudget::new(max, true)))
+            }
+        };
         Self {
             idle_timeout: perf.udp_session_timeout,
-            max_sessions: perf.udp_max_sessions.unwrap_or(derived),
+            cap,
         }
+    }
+
+    /// The budget one listener socket opens its sessions against.
+    fn budget(&self) -> Arc<SessionBudget> {
+        match &self.cap {
+            SessionCap::PerListener(max) => Arc::new(SessionBudget::new(*max, false)),
+            SessionCap::Shared(budget) => Arc::clone(budget),
+        }
+    }
+}
+
+/// Sessions open against one cap. Counted as sessions open and close, never
+/// per datagram.
+#[derive(Debug)]
+struct SessionBudget {
+    max: usize,
+    open: AtomicUsize,
+    shared: bool,
+}
+
+impl SessionBudget {
+    fn new(max: usize, shared: bool) -> Self {
+        Self {
+            max,
+            open: AtomicUsize::new(0),
+            shared,
+        }
+    }
+
+    /// A slot for one more session, or `None` when all are taken.
+    fn take(self: &Arc<Self>) -> Option<SessionSlot> {
+        let mut open = self.open.load(Relaxed);
+        while open < self.max {
+            match self
+                .open
+                .compare_exchange_weak(open, open + 1, Relaxed, Relaxed)
+            {
+                Ok(_) => return Some(SessionSlot(Arc::clone(self))),
+                Err(now) => open = now,
+            }
+        }
+        None
+    }
+
+    fn full(&self) -> bool {
+        self.open.load(Relaxed) >= self.max
+    }
+
+    /// What a log line calls this cap.
+    fn name(&self) -> &'static str {
+        if self.shared {
+            "the session budget all UDP listeners share"
+        } else {
+            "udpMaxSessions"
+        }
+    }
+}
+
+/// One session's place in its budget, given back when the session goes.
+#[derive(Debug)]
+struct SessionSlot(Arc<SessionBudget>);
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Relaxed);
     }
 }
 
@@ -65,6 +147,7 @@ struct UdpSession {
     last_active: Arc<AtomicU64>,
     /// Route-table generation `backend_addr` was last found routed in.
     generation: u64,
+    _slot: SessionSlot,
 }
 
 impl Drop for UdpSession {
@@ -83,7 +166,8 @@ struct Sessions {
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     selector: BackendSelector,
-    limits: SessionLimits,
+    idle_timeout: Duration,
+    budget: Arc<SessionBudget>,
     epoch: Instant,
     map: HashMap<SocketAddr, UdpSession>,
     /// The table `generation` was taken from. Weak so a swapped-out table is
@@ -91,7 +175,7 @@ struct Sessions {
     /// same address cannot pass for it.
     seen: Weak<RouteTable>,
     generation: u64,
-    /// Reaching the cap was logged since the map last dropped below it.
+    /// Reaching the cap was logged since the budget last had room.
     full_logged: bool,
 }
 
@@ -104,9 +188,12 @@ pub async fn run_udp_worker(
     shutdown: CancellationToken,
     health: Arc<HealthRegistry>,
 ) {
+    let budget = limits.budget();
     info!(
-        "UDP listener on :{} started (up to {} sessions)",
-        server_port, limits.max_sessions
+        "UDP listener on :{} started (sessions capped at {} by {})",
+        server_port,
+        budget.max,
+        budget.name()
     );
 
     // Same per-port scrape identity as the TCP accept loops; `accepted`
@@ -119,7 +206,8 @@ pub async fn run_udp_worker(
         routes,
         health,
         selector: BackendSelector::new(),
-        limits,
+        idle_timeout: limits.idle_timeout,
+        budget,
         epoch: Instant::now(),
         map: HashMap::new(),
         seen: Weak::new(),
@@ -165,12 +253,12 @@ impl Sessions {
                 None
             } else {
                 self.map.remove(&client);
-                if self.map.len() >= self.limits.max_sessions {
+                let Some(slot) = self.budget.take() else {
                     self.overflow();
                     return;
-                }
+                };
                 match analyze_udp_request(&table, &self.selector, self.server_port, &self.health) {
-                    Ok(RoutingResult::UdpForward { backend_addr }) => Some(backend_addr),
+                    Ok(RoutingResult::UdpForward { backend_addr }) => Some((backend_addr, slot)),
                     Ok(_) => return,
                     Err(e) => {
                         warn!("UDP routing error for port {}: {}", self.server_port, e);
@@ -181,7 +269,9 @@ impl Sessions {
         };
         match new_backend {
             None => self.send(datagram, client, now).await,
-            Some(backend_addr) => self.open(datagram, client, backend_addr, now).await,
+            Some((backend_addr, slot)) => {
+                self.open(datagram, client, backend_addr, slot, now).await
+            }
         }
     }
 
@@ -227,6 +317,7 @@ impl Sessions {
         datagram: &[u8],
         client: SocketAddr,
         backend_addr: SocketAddr,
+        slot: SessionSlot,
         now: u64,
     ) {
         let backend_socket = match connect_backend(backend_addr).await {
@@ -256,6 +347,7 @@ impl Sessions {
                 reply_task,
                 last_active,
                 generation: self.generation,
+                _slot: slot,
             },
         );
     }
@@ -264,12 +356,12 @@ impl Sessions {
     /// sessions whose reply path died.
     fn reap(&mut self) {
         let now = millis_since(self.epoch);
-        let idle_ms = self.limits.idle_timeout.as_millis() as u64;
+        let idle_ms = self.idle_timeout.as_millis() as u64;
         self.map.retain(|_, s| {
             !s.reply_task.is_finished()
                 && now.saturating_sub(s.last_active.load(Relaxed)) <= idle_ms
         });
-        if self.map.len() < self.limits.max_sessions {
+        if !self.budget.full() {
             self.full_logged = false;
         }
     }
@@ -279,8 +371,10 @@ impl Sessions {
         if !self.full_logged {
             self.full_logged = true;
             warn!(
-                "UDP listener on :{} reached udpMaxSessions ({}): dropping datagrams that would open a session",
-                self.server_port, self.limits.max_sessions
+                "UDP listener on :{} reached {} ({}): dropping datagrams that would open a session",
+                self.server_port,
+                self.budget.name(),
+                self.budget.max
             );
         }
     }
@@ -366,7 +460,7 @@ mod tests {
     fn limits(idle_timeout: Duration, max_sessions: usize) -> SessionLimits {
         SessionLimits {
             idle_timeout,
-            max_sessions,
+            cap: SessionCap::PerListener(max_sessions),
         }
     }
 
@@ -416,7 +510,7 @@ mod tests {
     #[test]
     fn default_cap_is_a_quarter_of_the_fd_budget() {
         let perf = PerformanceConfig::default();
-        let cap = |nofile| SessionLimits::with_nofile(&perf, nofile).max_sessions;
+        let cap = |nofile| SessionLimits::with_nofile(&perf, nofile).budget().max;
         assert_eq!(cap(Some(1_048_576)), 262_144);
         assert_eq!(cap(Some(1_024)), 256);
         assert_eq!(cap(Some(3)), 1, "never zero");
@@ -434,7 +528,11 @@ mod tests {
             ..Default::default()
         };
         let limits = SessionLimits::with_nofile(&perf, Some(1_048_576));
-        assert_eq!(limits.max_sessions, 7);
+        assert_eq!(limits.budget().max, 7);
+        assert!(
+            !Arc::ptr_eq(&limits.budget(), &limits.budget()),
+            "udpMaxSessions is each listener's own"
+        );
     }
 
     #[tokio::test]
@@ -507,6 +605,46 @@ mod tests {
         );
     }
 
+    /// Unset, the cap is one budget for every UDP listener socket: a quarter
+    /// of the fd limit each let four sockets take every fd TCP needs.
+    #[tokio::test]
+    async fn default_cap_is_shared_by_all_listeners() {
+        let (a, _echo) = echo_backend("127.0.0.1:0", "a").await.unwrap();
+        let perf = PerformanceConfig {
+            udp_session_timeout: Duration::from_millis(400),
+            ..Default::default()
+        };
+        // Two sessions in all.
+        let limits = SessionLimits::with_nofile(&perf, Some(8));
+        let one = start_proxy(&[a], limits.clone()).await;
+        let two = start_proxy(&[a], limits.clone()).await;
+        let clients = [client().await, client().await, client().await];
+        assert_eq!(
+            roundtrip(&clients[0], one.addr, b"1").await.as_deref(),
+            Some("a:1")
+        );
+        assert_eq!(
+            roundtrip(&clients[1], two.addr, b"2").await.as_deref(),
+            Some("a:2")
+        );
+
+        let drops = METRICS.udp_session_overflow_drops_total.get();
+        let dropped = roundtrip_within(&clients[2], two.addr, b"3", Duration::from_millis(150));
+        assert_eq!(dropped.await, None, "a third session opened");
+        assert!(METRICS.udp_session_overflow_drops_total.get() > drops);
+
+        // Idle past the timeout plus a reaper period: both slots free up.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            roundtrip(&clients[2], two.addr, b"4").await.as_deref(),
+            Some("a:4")
+        );
+        assert_eq!(
+            roundtrip(&clients[0], two.addr, b"5").await.as_deref(),
+            Some("a:5")
+        );
+    }
+
     #[tokio::test]
     async fn dropping_a_session_aborts_its_reply_task() {
         let marker = Arc::new(());
@@ -521,6 +659,7 @@ mod tests {
             reply_task: task,
             last_active: Arc::new(AtomicU64::new(0)),
             generation: 0,
+            _slot: Arc::new(SessionBudget::new(1, false)).take().unwrap(),
         };
         drop(session);
         for _ in 0..10 {
