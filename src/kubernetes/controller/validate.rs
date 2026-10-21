@@ -7,9 +7,9 @@
 //! served never reaches `ResolvedRefs=True`. Resolution happens once; both
 //! the config build and the status conditions consume its result.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use gateway_api::gateways::Gateway;
+use gateway_api::gateways::{Gateway, GatewayListeners};
 use gateway_api::referencegrants::ReferenceGrant;
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::{ObjectRef, Store};
@@ -165,21 +165,7 @@ pub(super) fn validate_gateway(
     status::GatewayCondition,
 ) {
     let mut listener_statuses: HashMap<String, status::ListenerStatus> = HashMap::new();
-
-    // Detect protocol conflicts: same port, different protocols
-    let mut port_protocols: HashMap<i32, String> = HashMap::new();
-    let mut conflicted_ports: HashSet<i32> = HashSet::new();
-    for l in &gateway.spec.listeners {
-        match port_protocols.get(&l.port) {
-            Some(existing_proto) if *existing_proto != l.protocol => {
-                conflicted_ports.insert(l.port);
-            }
-            None => {
-                port_protocols.insert(l.port, l.protocol.clone());
-            }
-            _ => {}
-        }
-    }
+    let conflicts = listener_conflicts(&gateway.spec.listeners);
 
     let supported_protocols = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
 
@@ -191,15 +177,18 @@ pub(super) fn validate_gateway(
             ls.accepted = false;
             ls.accepted_reason = "UnsupportedProtocol".into();
             ls.accepted_message = format!("Protocol '{}' is not supported", listener.protocol);
-        } else if conflicted_ports.contains(&listener.port) {
+        } else if let Some(&reason) = conflicts.get(listener.name.as_str()) {
+            let message = if reason == "ProtocolConflict" {
+                "Listener port shared with another listener using different protocol"
+            } else {
+                "Listener not distinct from another on its port and protocol"
+            };
             ls.accepted = false;
-            ls.accepted_reason = "ProtocolConflict".into();
-            ls.accepted_message =
-                "Listener port conflicts with another listener using a different protocol".into();
+            ls.accepted_reason = reason.into();
+            ls.accepted_message = message.into();
             ls.conflicted = true;
-            ls.conflicted_reason = "ProtocolConflict".into();
-            ls.conflicted_message =
-                "Listener port shared with another listener using different protocol".into();
+            ls.conflicted_reason = reason.into();
+            ls.conflicted_message = message.into();
         } else {
             ls.accepted = true;
             ls.accepted_reason = "Accepted".into();
@@ -335,9 +324,57 @@ pub(super) fn validate_gateway(
             reason: "ListenersNotValid".to_string(),
             message: "All listeners are rejected due to conflicts or errors".to_string(),
         };
+    } else if cond.ok {
+        // Gateway API, Listener: a Gateway with Conflicted listeners MUST
+        // carry ListenersNotValid, accepted or not.
+        let mut rejected: Vec<String> = gateway
+            .spec
+            .listeners
+            .iter()
+            .filter_map(|l| {
+                let ls = listener_statuses.get(&l.name).filter(|ls| !ls.accepted)?;
+                Some(format!("{} ({})", l.name, ls.accepted_reason))
+            })
+            .collect();
+        if !rejected.is_empty() {
+            rejected.sort();
+            cond = status::GatewayCondition::ok(
+                "ListenersNotValid",
+                &format!(
+                    "Listeners not accepted: {}; the others are",
+                    rejected.join(", ")
+                ),
+            );
+        }
     }
 
     (listener_statuses, cond)
+}
+
+/// Listeners that are not distinct, with their Conflicted reason. Gateway
+/// API, Listener: listeners sharing a port need distinct protocols, or
+/// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
+/// indistinct listeners are rejected: the spec forbids picking a winner.
+fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
+    let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
+    for (i, a) in listeners.iter().enumerate() {
+        for b in listeners[i + 1..].iter().filter(|b| b.port == a.port) {
+            let reason = if a.protocol != b.protocol {
+                "ProtocolConflict"
+            } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
+                "HostnameConflict"
+            } else {
+                continue;
+            };
+            for l in [a, b] {
+                let slot = conflicts.entry(l.name.as_str()).or_insert(reason);
+                if reason == "ProtocolConflict" {
+                    *slot = reason;
+                }
+            }
+        }
+    }
+    conflicts
 }
 
 #[cfg(test)]
@@ -583,5 +620,49 @@ mod tests {
             !gw_cond.ok,
             "all listeners rejected -> Gateway not accepted"
         );
+    }
+
+    fn listener(name: &str, port: i32, protocol: &str, hostname: Option<&str>) -> GatewayListeners {
+        GatewayListeners {
+            name: name.into(),
+            port,
+            protocol: protocol.into(),
+            hostname: hostname.map(str::to_string),
+            tls: None,
+            allowed_routes: None,
+        }
+    }
+
+    /// Listeners sharing a port and protocol must differ by hostname, and
+    /// TCP and UDP have none: two on one port are both Conflicted. They
+    /// used to be accepted, and only protocol mismatches were caught.
+    #[test]
+    fn same_protocol_listeners_on_one_port_conflict() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners = vec![
+            listener("tcp-a", 5432, "TCP", None),
+            listener("tcp-b", 5432, "TCP", None),
+            listener("dns-a", 53, "UDP", None),
+            listener("dns-b", 53, "UDP", None),
+            listener("web", 80, "HTTP", Some("a.example.com")),
+            listener("web-dup", 80, "HTTP", Some("a.example.com")),
+            listener("web-other", 80, "HTTP", Some("b.example.com")),
+        ];
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        for name in ["tcp-a", "tcp-b", "dns-a", "dns-b", "web", "web-dup"] {
+            let ls = &listeners[name];
+            assert!(ls.conflicted && !ls.accepted, "{name}");
+            assert_eq!(ls.conflicted_reason, "HostnameConflict", "{name}");
+        }
+        assert!(listeners["web-other"].accepted, "distinct by hostname");
+
+        // Some listeners rejected: still Accepted, but ListenersNotValid.
+        assert!(gw_cond.ok);
+        assert_eq!(gw_cond.reason, "ListenersNotValid");
+        assert!(gw_cond.message.contains("tcp-a (HostnameConflict)"));
     }
 }

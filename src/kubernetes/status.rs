@@ -228,28 +228,19 @@ pub(crate) fn desired_gateway_status(
 
     let mut status = json!({ "listeners": listeners });
     if manage_conditions {
-        let accepted_reason = if accepted.ok {
-            "Accepted"
-        } else {
-            accepted.reason.as_str()
-        };
-        let programmed_reason = if programmed.ok {
-            "Programmed"
-        } else {
-            programmed.reason.as_str()
-        };
+        // Accepted=True may carry ListenersNotValid: some listeners rejected.
         status["conditions"] = json!([
             condition(
                 "Accepted",
                 accepted.ok,
-                accepted_reason,
+                &accepted.reason,
                 &accepted.message,
                 generation
             ),
             condition(
                 "Programmed",
                 programmed.ok,
-                programmed_reason,
+                &programmed.reason,
                 &programmed.message,
                 generation
             ),
