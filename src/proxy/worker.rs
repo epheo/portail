@@ -239,9 +239,14 @@ pub(crate) struct ConnectionState {
     /// connection's own child of the listener token, so the checks on
     /// every request lock nothing shared.
     drain: CancellationToken,
-    /// The proxy answered itself and closes while the client may still be
+    /// The connection closes after a reply while the client may still be
     /// sending: the close reads off what comes instead of resetting on it.
     linger: bool,
+    /// The client asked to close (`Connection: close`, or HTTP/1.0 without
+    /// keep-alive) and all of its request is in: it sends nothing more, so
+    /// a closing reply has nothing to linger for. Only ever set for a
+    /// connection's last request.
+    client_done: bool,
     /// `reset_on_drop` armed the client: the close must not undo it. Kept
     /// here rather than read back off the socket, a syscall every close
     /// would pay.
@@ -281,16 +286,23 @@ impl ConnectionState {
             last_status: 0,
             drain,
             linger: false,
+            client_done: false,
             reset: false,
         }
     }
 
+    /// The connection closes after a reply: a client still sending, a
+    /// pipelined request included, would get a reset that can destroy the
+    /// reply it has not read yet.
+    fn close_after_reply(&mut self) {
+        self.linger = !self.client_done;
+    }
+
     /// Record an error reply the proxy wrote itself, which always closes:
-    /// logged as `status`, and the close lingers, as the request it answers
-    /// may not be fully read.
+    /// logged as `status`, and closing as any reply does.
     fn refused(&mut self, status: u16) {
         self.last_status = status;
-        self.linger = true;
+        self.close_after_reply();
     }
 }
 
@@ -669,7 +681,7 @@ async fn serve_http(
                         status: 429,
                         location: None,
                         reusable: keep_open(&state.drain, meta.local_reply_reusable),
-                        read_whole: meta.read_whole,
+                        client_done: meta.client_done,
                         head: meta.is_head,
                     };
                     if !send_local_reply(client, state, &reply, access).await? {
@@ -763,11 +775,14 @@ async fn serve_http(
 /// its reset, which a clean close would turn into a complete-looking
 /// response.
 ///
-/// `state.linger` follows a reply the proxy wrote before the client was
-/// done sending. Closing on unread bytes makes the kernel reset, and a
-/// client still uploading then fails its send instead of reading the
-/// reply. As nginx's lingering_close does, what still arrives is read and
-/// dropped until the client closes, up to one `buf` of it.
+/// `state.linger` follows a reply after which the connection closes, unless
+/// the client asked to close and sent all of its request. Closing on bytes
+/// still arriving makes the kernel reset: an upload then fails its send
+/// instead of reading the reply, and a pipelined request can destroy the
+/// reply not read yet. As nginx's lingering_close does, what still arrives
+/// is read and dropped until the client closes, up to one `buf` of it.
+/// Closing an idle connection, no reply just written, never lingers: its
+/// keep-alive client may hold the socket open, and would hold the drain.
 ///
 /// All of it within the client header budget: a client that stops reading,
 /// or never stops sending, cannot hold the close.
@@ -1006,6 +1021,11 @@ async fn proxy_http_request(
         (None, Some(stream)) => stream.is_terminated(),
         (None, None) => true,
     };
+    // A client that asked to close is done once all of its request is in:
+    // already, or once the relay below is through. An upgrade's client may
+    // stream the new protocol whatever it asked.
+    let client_closes = !meta.keepalive && !meta.is_upgrade;
+    state.client_done = client_closes && body_held;
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
     let (backend, from_pool) =
@@ -1101,7 +1121,10 @@ async fn proxy_http_request(
     // final response has gone out yet (at most the interim 100), so a 400
     // is still well-formed.
     let (mirror_body, relay_leftover, answered_early) = match relay {
-        RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
+        RequestBody::Complete { mirror, leftover } => {
+            state.client_done = client_closes;
+            (mirror, leftover, false)
+        }
         // A backend may answer before it has the whole body (a 413, a 401)
         // and stop reading it; RFC 9112 9.5 has the client watch for that.
         // The rest of the client's body stays unread: the close reads it off.
@@ -1273,6 +1296,7 @@ async fn proxy_http_request(
         Ok(BodyEnd::Closed) => {
             // Close-delimited: the connection's graceful close, which
             // follows, is how the client learns the body ended.
+            state.close_after_reply();
             return Ok((false, None));
         }
         Ok(BodyEnd::Broken) => {
@@ -1331,6 +1355,9 @@ async fn proxy_http_request(
         );
     }
 
+    if !keep {
+        state.close_after_reply();
+    }
     Ok((keep, leftover))
 }
 
@@ -2494,12 +2521,10 @@ where
 
 /// Answer a request the proxy handles itself (redirect, 404, 429, 500, 503)
 /// and access-log it. Returns whether the connection stays open; the reply
-/// announces `Connection: close` exactly when it does not. The close
-/// lingers only while some of the request may still be on the wire, never
-/// for a drain or the client's own `Connection: close`: a client keeping
-/// its socket open would hold the close for nothing. Staying open matters
-/// most for 429: a throttled client's next request would otherwise cost a
-/// fresh TLS handshake, more of our CPU than the refused request.
+/// announces `Connection: close` exactly when it does not, and the close
+/// then lingers unless the client is done. Staying open matters most for
+/// 429: a throttled client's next request would otherwise cost a fresh TLS
+/// handshake, more of our CPU than the refused request.
 async fn send_local_reply(
     client: &mut Connection,
     state: &mut ConnectionState,
@@ -2508,7 +2533,7 @@ async fn send_local_reply(
 ) -> Result<bool> {
     let location = reply.location.as_deref();
     let bytes = local_reply_bytes(reply.status, location, !reply.reusable, reply.head);
-    state.linger = !reply.read_whole;
+    state.linger = !(reply.reusable || reply.client_done);
     client.write_all(&bytes).await?;
     client.flush().await?;
     crate::access_log::emit(access, reply.status, None);
@@ -4159,6 +4184,9 @@ mod connection_tests {
         let (read, out) = tls_read_to_end(&mut tls).await;
         assert!(read.is_ok(), "{read:?} after {out:?}");
         assert!(out.ends_with("Connection: close\r\n\r\nall of it"), "{out}");
+        // Done, as a client is once the close arrives: a lingering close
+        // waits for this.
+        drop(tls);
         engine.await.unwrap().unwrap();
     }
 
@@ -4275,42 +4303,129 @@ mod connection_tests {
         }
     }
 
-    /// A local reply that closes for the drain, or for the client's own
-    /// Connection: close, has read the whole request: nothing is left to
-    /// read off, so a client keeping its socket open cannot hold the close.
+    /// A client that asked to close, its request read whole, sends nothing
+    /// more: whatever the reply, the close does not wait on it, so a client
+    /// keeping its socket open cannot hold it.
     #[tokio::test]
-    async fn a_closing_reply_to_a_whole_request_does_not_linger() {
+    async fn a_closing_reply_to_a_client_done_does_not_linger() {
         let budget = Duration::from_secs(2);
-        let state = |drain: &CancellationToken| {
-            let mut state = conn_state(RouteTable::new(), false);
+        let (addr, _rx) = backend(REFUSED).await;
+        let (_socket, refused) = refusing_backend();
+        for (backend, request, status) in [
+            (
+                addr,
+                "GET / HTTP/1.1\r\nHost: nope.test\r\nConnection: close\r\n\r\n",
+                "404",
+            ),
+            (
+                addr,
+                "GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n",
+                "200",
+            ),
+            (addr, "GET / HTTP/1.0\r\nHost: a.test\r\n\r\n", "200"),
+            (
+                addr,
+                "POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+                "200",
+            ),
+            (
+                refused,
+                "GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n",
+                "502",
+            ),
+        ] {
+            let mut state = conn_state(routes(backend), false);
             state.client_header_timeout = budget;
-            state.drain = drain.clone();
-            state
-        };
-        let closed_at_once = |engine: tokio::task::JoinHandle<Result<()>>| async move {
+            let (mut client, engine) = tcp_client(state).await;
+            client.write_all(request.as_bytes()).await.unwrap();
+            let reply = read_one_reply(&mut client).await;
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
             let ended = tokio::time::timeout(budget / 2, engine).await;
-            ended.expect("the close lingered").unwrap().unwrap();
-        };
+            let ended = ended.unwrap_or_else(|_| panic!("{status} to {request:?} lingered"));
+            ended.unwrap().unwrap();
+        }
+    }
 
-        let (mut client, engine) = tcp_client(state(&CancellationToken::new())).await;
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: nope.test\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let reply = read_one_reply(&mut client).await;
-        assert!(reply.contains("\r\nConnection: close\r\n"), "{reply}");
-        closed_at_once(engine).await;
-
-        // The drain starts while the head arrives.
+    /// A drain closes a keep-alive client after the reply the proxy writes
+    /// itself, though its request was read whole: the requests it pipelined
+    /// behind, more than one read takes, land unread. Closed on them, the
+    /// kernel would reset, and a reset can destroy the reply not read yet.
+    #[tokio::test]
+    async fn a_drain_closing_a_pipelining_client_keeps_the_reply_intact() {
         let drain = CancellationToken::new();
-        let (mut client, engine) = tcp_client(state(&drain)).await;
+        let mut state = conn_state(RouteTable::new(), false);
+        state.drain = drain.clone();
+        let (mut client, engine) = tcp_client(state).await;
+        // The drain starts while the head arrives.
         client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         drain.cancel();
-        client.write_all(b"Host: nope.test\r\n\r\n").await.unwrap();
-        let reply = read_one_reply(&mut client).await;
-        assert!(reply.contains("\r\nConnection: close\r\n"), "{reply}");
-        closed_at_once(engine).await;
+        // Past the engine's 64 KiB buffer, and within one more of it.
+        let pipelined = b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n".repeat(2048);
+        let rest = [&b"Host: nope.test\r\n\r\n"[..], &pipelined].concat();
+        client.write_all(&rest).await.unwrap();
+
+        let mut out = Vec::new();
+        let read = client.read_to_end(&mut out).await;
+        let out = String::from_utf8_lossy(&out);
+        assert!(read.is_ok(), "{read:?} after {out}");
+        assert_eq!(
+            out,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found"
+        );
+        assert!(client.take_error().unwrap().is_none(), "reset");
+        drop(client);
+        engine.await.unwrap().unwrap();
+    }
+
+    /// The proxy closes after a proxied response for its own reasons (a
+    /// drain, a close-delimited body): the next request, pipelined while
+    /// the backend worked, lands unread. A reset on it can destroy the
+    /// response not read yet, and passes a close-delimited body off as cut.
+    #[tokio::test]
+    async fn a_proxied_response_that_closes_survives_a_pipelined_request() {
+        const NEXT: &[u8] = b"GET /next HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        for (draining, reply, body) in [
+            (
+                true,
+                REFUSED,
+                "\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno",
+            ),
+            (
+                false,
+                &b"HTTP/1.1 200 OK\r\n\r\nall of it"[..],
+                "\r\nConnection: close\r\n\r\nall of it",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let drain = CancellationToken::new();
+            let mut state = conn_state(routes(listener.local_addr().unwrap()), false);
+            state.drain = drain.clone();
+            let (mut client, engine) = tcp_client(state).await;
+            client.write_all(GET_A).await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+            while find_header_end(&seen).is_none() {
+                let n = sock.read(&mut chunk).await.unwrap();
+                seen.extend_from_slice(&chunk[..n]);
+            }
+            if draining {
+                drain.cancel();
+            }
+            client.write_all(NEXT).await.unwrap();
+            sock.write_all(reply).await.unwrap();
+            drop(sock);
+
+            let mut out = Vec::new();
+            let read = client.read_to_end(&mut out).await;
+            let out = String::from_utf8_lossy(&out);
+            assert!(read.is_ok(), "draining={draining}: {read:?} after {out}");
+            assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+            assert!(out.ends_with(body), "{out}");
+            assert!(client.take_error().unwrap().is_none(), "reset");
+            drop(client);
+            engine.await.unwrap().unwrap();
+        }
     }
 
     /// Reads a request head, answers `reply` without reading the body, and
@@ -4517,6 +4632,7 @@ mod connection_tests {
                     assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
                 }
             }
+            drop(client);
             engine.await.unwrap().unwrap();
         }
     }
