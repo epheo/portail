@@ -147,16 +147,35 @@ values; defaults shown):
 | Option | Default | Description |
 |--------|---------|-------------|
 | `backendTimeout` | `30s` | Backend connect timeout |
-| `clientHeaderTimeout` | `30s` | Max time for a client TLS handshake, or to finish a request's header block once its first bytes arrive (slow-loris guard). Also bounds each connection's close: the TLS close_notify and, after a reply the proxy wrote itself, the wait for the client to finish sending. Does not bound idle keepalive waits |
+| `clientHeaderTimeout` | `30s` | Slow-loris guard: max time for a TLS handshake or a request's header block |
 | `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming, and on an L4 relay once one direction has closed; reaps peers that stay connected but stop transferring. `0s` disables |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
-| `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4, shared | Concurrent UDP sessions per listener socket; a datagram that would open one more is dropped and counted in `portail_udp_session_overflow_drops_total`. Each session holds an fd (plus a task, a 64KiB reply buffer and an ephemeral port), and spoofed source addresses cost nothing to send from. Unset, all UDP listeners together may hold a quarter of the fd budget, read after startup raises the soft limit to the hard one, leaving the rest for TCP. A fixed default would cut off UDP workloads larger than it, and Kubernetes mode cannot override it |
+| `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4, shared | Concurrent UDP sessions per listener socket |
 | `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window) |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
 | `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
 
 In Kubernetes mode these are not read from a file; the defaults apply.
+
+`clientHeaderTimeout`:
+
+- The header budget starts at a request's first bytes.
+- Idle keepalive waits stay unbounded.
+- It also bounds each connection's close, TLS close_notify included.
+- After a reply the proxy wrote itself, it bounds the wait for the client to finish sending.
+
+`udpMaxSessions`:
+
+- A datagram that would open one more session is dropped.
+- Drops are counted in `portail_udp_session_overflow_drops_total`.
+- Each session holds an fd, a task, a 64KiB reply buffer and an ephemeral port.
+- Spoofed source addresses cost nothing to send from.
+- Unset, all UDP listeners share one budget, a quarter of the fd limit.
+- The other three quarters stay for TCP.
+- The fd limit is read after startup raises the soft limit to the hard one.
+- The default scales with it, as Kubernetes mode cannot set this option.
+- A fixed default would cut off UDP workloads larger than it.
 
 ## HTTP/2
 
