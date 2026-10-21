@@ -24,7 +24,7 @@
 //! backend answers or `clear()` drops the entry.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,12 +73,21 @@ impl BackendHealth {
 
 pub struct HealthRegistry {
     backends: DashMap<SocketAddr, BackendHealth>,
+    /// When false, `backends` is empty and the per-request calls skip it:
+    /// DashMap's `len()`/`is_empty()` read-lock every shard and `get()` locks
+    /// one. Raised after an insert and lowered before a clear, never the
+    /// reverse, so no entry outlives a lowered flag; a racing reader at worst
+    /// sees a just-inserted entry as untracked, i.e. healthy, as it was before
+    /// its first failure. Relaxed throughout: the flag publishes no data, the
+    /// map's own locks order the entries.
+    tracked: AtomicBool,
 }
 
 impl Default for HealthRegistry {
     fn default() -> Self {
         Self {
             backends: DashMap::new(),
+            tracked: AtomicBool::new(false),
         }
     }
 }
@@ -91,6 +100,7 @@ impl HealthRegistry {
     /// Remove all tracked backend health state.
     /// Called on config reload to prevent stale entries from blocking new backends.
     pub fn clear(&self) {
+        self.tracked.store(false, Ordering::Relaxed);
         self.backends.clear();
     }
 
@@ -98,6 +108,9 @@ impl HealthRegistry {
     /// Backends that have never failed are implicitly healthy (lazy registration).
     #[inline]
     pub fn is_healthy(&self, addr: &SocketAddr) -> bool {
+        if !self.tracked.load(Ordering::Relaxed) {
+            return true;
+        }
         match self.backends.get(addr) {
             None => true,
             Some(entry) => entry.status.load(Ordering::Acquire) == STATUS_HEALTHY,
@@ -105,11 +118,9 @@ impl HealthRegistry {
     }
 
     /// Called on successful `pool.acquire()` to reset failure state.
-    /// No-op (zero allocation, no DashMap access) if no backends have ever failed.
+    /// No-op (zero allocation, no DashMap access) while no backend is tracked.
     pub fn record_success(&self, addr: SocketAddr) {
-        // Fast path: if no backend has ever failed, skip the DashMap lookup entirely.
-        // DashMap::is_empty() is lock-free and O(1).
-        if self.backends.is_empty() {
+        if !self.tracked.load(Ordering::Relaxed) {
             return;
         }
         if let Some(entry) = self.backends.get(&addr) {
@@ -136,6 +147,11 @@ impl HealthRegistry {
             .backends
             .entry(addr)
             .or_insert_with(BackendHealth::healthy);
+        // After the insert, never before: see `tracked`. Loaded first so a
+        // failure storm does not keep invalidating the line every request reads.
+        if !self.tracked.load(Ordering::Relaxed) {
+            self.tracked.store(true, Ordering::Relaxed);
+        }
 
         let new_count = entry.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         warn!("Backend {} failure #{}", addr, new_count);
@@ -331,6 +347,58 @@ mod tests {
             .map(|e| e.consecutive_failures.load(Ordering::Relaxed))
             .unwrap_or(0);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_tracked_flag_follows_entries() {
+        let r = HealthRegistry::new();
+        let a = addr(8086);
+        r.record_success(a);
+        assert!(
+            !r.tracked.load(Ordering::Relaxed),
+            "a success alone tracks nothing"
+        );
+        r.record_failure(a);
+        assert!(r.tracked.load(Ordering::Relaxed));
+        r.clear();
+        assert!(!r.tracked.load(Ordering::Relaxed));
+        assert!(r.is_healthy(&a));
+    }
+
+    /// Whatever the interleaving, an entry left in the map must sit behind a
+    /// raised flag, or an unhealthy backend would read healthy indefinitely.
+    /// Each round races ONE failure against ONE clear, so no later failure
+    /// can re-raise the flag and mask a bad interleaving.
+    #[test]
+    fn test_no_entry_survives_behind_lowered_flag() {
+        use std::sync::Barrier;
+        const ROUNDS: usize = 20_000;
+        let r = Arc::new(HealthRegistry::new());
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+        let racer = |op: fn(&HealthRegistry)| {
+            let (r, start, done) = (Arc::clone(&r), Arc::clone(&start), Arc::clone(&done));
+            std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    start.wait();
+                    op(&r);
+                    done.wait();
+                }
+            })
+        };
+        let writer = racer(|r| {
+            r.record_failure(addr(8087));
+        });
+        let clearer = racer(HealthRegistry::clear);
+        for _ in 0..ROUNDS {
+            start.wait();
+            done.wait();
+            if !r.backends.is_empty() {
+                assert!(r.tracked.load(Ordering::Relaxed));
+            }
+        }
+        writer.join().unwrap();
+        clearer.join().unwrap();
     }
 
     #[test]
