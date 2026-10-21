@@ -29,8 +29,8 @@ use crate::proxy::http_filters::{
     to_origin_form, HeaderModifications, ResponseCuts, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{
-    field_value_end, find_header_end, is_field_value_byte, is_tchar, is_token, parse_digits,
-    trim_ows,
+    field_value_end, find_header_end, has_header_end, is_field_value_byte, is_tchar, is_token,
+    parse_digits, trim_ows,
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
@@ -62,7 +62,7 @@ async fn read_remaining_headers(
             return Ok(Some(0));
         }
         total += n;
-        if find_header_end(&buf[..total]).is_some() {
+        if has_header_end(&buf[..total]) {
             return Ok(Some(total));
         }
     }
@@ -707,7 +707,7 @@ async fn serve_http(
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
-    if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
+    if is_http_request(&buf[..n]) && !has_header_end(&buf[..n]) {
         n = complete_headers(client, buf, n, state).await?;
     }
     if n == 0 {
@@ -868,7 +868,7 @@ async fn serve_http(
         if n == 0 || !may_open_request(&buf[..n]) {
             return Ok(Handoff::Close);
         }
-        if find_header_end(&buf[..n]).is_none() {
+        if !has_header_end(&buf[..n]) {
             n = complete_headers(client, buf, n, state).await?;
         }
         if n == 0 || !is_http_request(&buf[..n]) {
