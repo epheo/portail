@@ -98,30 +98,32 @@ fn sni(use_tls: bool, server_name: &str) -> &str {
 /// Why a backend connection could not be opened.
 #[derive(Debug)]
 pub enum ConnectError {
-    /// The proxy itself ran out of fds, ephemeral ports or kernel memory.
-    /// The backend was never reached, so its health must not hear of it:
-    /// one exhausted proxy would otherwise eject healthy backends
-    /// route-wide.
+    /// The proxy itself ran out of fds or kernel memory. The backend was
+    /// never reached, so its health must not hear of it: one exhausted
+    /// proxy would otherwise eject healthy backends route-wide.
     Local(io::Error),
-    /// Refused, unreachable, timed out, or the TLS handshake failed.
+    /// Refused, unreachable, timed out, out of ports toward it, or the TLS
+    /// handshake failed.
     Backend(anyhow::Error),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Local(e) => write!(f, "proxy out of fds, ports or memory: {}", e),
+            ConnectError::Local(e) => write!(f, "proxy out of fds or memory: {}", e),
             ConnectError::Backend(e) => e.fmt(f),
         }
     }
 }
 
 /// Classify a socket error from opening a backend connection.
+///
+/// EADDRNOTAVAIL is not local: connect() returns it once the ephemeral
+/// ports toward that one ip:port are all taken (TIME_WAIT pile-up), while
+/// other backends stay reachable. Ejecting the backend moves its share.
 fn connect_error(addr: SocketAddr, e: io::Error) -> ConnectError {
     match e.raw_os_error() {
-        Some(libc::EMFILE | libc::ENFILE | libc::EADDRNOTAVAIL | libc::ENOBUFS | libc::ENOMEM) => {
-            ConnectError::Local(e)
-        }
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => ConnectError::Local(e),
         _ => ConnectError::Backend(anyhow::anyhow!("Backend connect failed {}: {}", addr, e)),
     }
 }
@@ -170,7 +172,7 @@ pub(crate) fn log_local_exhaustion(addr: SocketAddr, e: &io::Error) {
     let now = LOG_EPOCH.get_or_init(Instant::now).elapsed().as_secs();
     if let Some(suppressed) = THROTTLE.admit(now, LOCAL_EXHAUSTION_LOG_EVERY) {
         warn!(
-            "Backend {} not reached: proxy out of fds, ports or memory ({}); backend health untouched, {} similar suppressed",
+            "Backend {} not reached: proxy out of fds or memory ({}); backend health untouched, {} similar suppressed",
             addr, e, suppressed
         );
     }
@@ -511,20 +513,21 @@ mod tests {
         (client, server)
     }
 
+    /// EADDRNOTAVAIL is the backend's: the ports run out toward its ip:port
+    /// only, so ejecting it moves its share to backends still reachable.
     #[test]
-    fn running_out_of_fds_ports_or_memory_is_local() {
+    fn running_out_of_fds_or_memory_is_local() {
         let addr = "127.0.0.1:1".parse().unwrap();
         let class = |errno| connect_error(addr, io::Error::from_raw_os_error(errno));
-        for errno in [
-            libc::EMFILE,
-            libc::ENFILE,
-            libc::EADDRNOTAVAIL,
-            libc::ENOBUFS,
-            libc::ENOMEM,
-        ] {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
             assert!(matches!(class(errno), ConnectError::Local(_)), "{errno}");
         }
-        for errno in [libc::ECONNREFUSED, libc::EHOSTUNREACH, libc::ETIMEDOUT] {
+        for errno in [
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ETIMEDOUT,
+            libc::EADDRNOTAVAIL,
+        ] {
             assert!(matches!(class(errno), ConnectError::Backend(_)), "{errno}");
         }
     }
