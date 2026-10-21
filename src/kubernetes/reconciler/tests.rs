@@ -2643,3 +2643,153 @@ fn status_parents_json_matches_full_route_serialization() {
         .unwrap();
     assert_eq!(route.status_parents_json(), via_full);
 }
+
+// ---- Attachment: the table serves a route exactly where status attaches it ----
+
+use crate::routing::RouteTable;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+fn created(secs: i64) -> Option<Time> {
+    Some(Time(
+        k8s_openapi::chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+    ))
+}
+
+fn gw_listener(name: &str, port: i32, protocol: &str) -> GatewayListeners {
+    GatewayListeners {
+        name: name.to_string(),
+        port,
+        protocol: protocol.to_string(),
+        hostname: None,
+        tls: None,
+        allowed_routes: None,
+    }
+}
+
+/// `default/gw` with the given listeners.
+fn attach_gateway(listeners: Vec<GatewayListeners>) -> Gateway {
+    Gateway {
+        metadata: ObjectMeta {
+            name: Some("gw".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: GatewaySpec {
+            gateway_class_name: "portail".to_string(),
+            listeners,
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+fn http_parent(ns: Option<&str>, section: Option<&str>) -> HTTPRouteParentRefs {
+    HTTPRouteParentRefs {
+        name: "gw".to_string(),
+        namespace: ns.map(String::from),
+        section_name: section.map(String::from),
+        ..Default::default()
+    }
+}
+
+/// app.example.com, PathPrefix "/", backends as (name, namespace, port, weight).
+fn app_route(
+    name: &str,
+    ns: &str,
+    parent_refs: Vec<HTTPRouteParentRefs>,
+    backends: &[(&str, Option<&str>, i32, i32)],
+) -> HTTPRoute {
+    HTTPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            ..Default::default()
+        },
+        spec: HTTPRouteSpec {
+            parent_refs: Some(parent_refs),
+            hostnames: Some(vec!["app.example.com".to_string()]),
+            rules: Some(vec![HTTPRouteRules {
+                matches: Some(vec![HTTPRouteRulesMatches {
+                    path: Some(HTTPRouteRulesMatchesPath {
+                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                        value: Some("/".to_string()),
+                    }),
+                    ..Default::default()
+                }]),
+                backend_refs: Some(
+                    backends
+                        .iter()
+                        .map(|(svc, svc_ns, port, weight)| HTTPRouteRulesBackendRefs {
+                            name: svc.to_string(),
+                            namespace: svc_ns.map(String::from),
+                            port: Some(*port),
+                            weight: Some(*weight),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }]),
+        },
+        status: None,
+    }
+}
+
+/// The "127.0.0.1" Service exists in every namespace these tests use.
+fn loopback_services() -> ServiceState {
+    let mut services = empty_services();
+    for ns in ["other-ns", "db"] {
+        services
+            .known_services
+            .insert(("127.0.0.1".to_string(), ns.to_string()));
+    }
+    services
+}
+
+fn snapshot_of(http: Vec<HTTPRoute>, tcp: Vec<TCPRoute>, udp: Vec<UDPRoute>) -> ClusterSnapshot {
+    test_snapshot(http, tcp, vec![], udp, &default_ns_labels(), vec![])
+}
+
+/// Reconcile, then build the table the data plane would run.
+fn reconcile_table(gw: &Gateway, snapshot: &ClusterSnapshot) -> (ReconcileResult, RouteTable) {
+    let result = reconcile_to_config(gw, snapshot, &HashMap::new(), &loopback_services()).unwrap();
+    let mut config = result.config.clone();
+    fixup_backends_for_test(&mut config);
+    let table = config.to_route_table().unwrap();
+    (result, table)
+}
+
+/// config-routing #5: equally specific routes tie-broke by reflector order.
+/// Listener.allowedRoutes: the oldest Route wins, then namespace/name.
+#[test]
+fn equally_specific_http_routes_oldest_wins() {
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP")]);
+    let route = |name: &str, secs: i64, port: i32| {
+        let mut r = app_route(
+            name,
+            "default",
+            vec![http_parent(None, None)],
+            &[("127.0.0.1", None, port, 1)],
+        );
+        r.metadata.creation_timestamp = created(secs);
+        r
+    };
+    let winner = |routes: Vec<HTTPRoute>| {
+        let (_, table) = reconcile_table(&gw, &snapshot_of(routes, vec![], vec![]));
+        table
+            .find_http_route("app.example.com", "GET", "/", &[], "", 80)
+            .unwrap()
+            .backends[0]
+            .socket_addr
+            .port()
+    };
+
+    let (older, newer) = (route("older", 100, 8001), route("newer", 200, 8002));
+    assert_eq!(winner(vec![newer.clone(), older.clone()]), 8001);
+    assert_eq!(winner(vec![older, newer]), 8001);
+
+    // Same age: namespace/name decides.
+    let (a, b) = (route("a", 100, 8003), route("b", 100, 8004));
+    assert_eq!(winner(vec![b.clone(), a.clone()]), 8003);
+    assert_eq!(winner(vec![a, b]), 8003);
+}

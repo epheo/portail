@@ -10,6 +10,7 @@ use gateway_api::httproutes::*;
 use gateway_api::referencegrants::ReferenceGrant;
 
 use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 use crate::config::*;
 use crate::logging::warn;
@@ -59,6 +60,7 @@ pub(crate) trait GatewayRoute: Sized {
     fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
     fn route_namespace(&self) -> &str;
     fn identity(&self) -> (&str, Option<i64>);
+    fn creation_timestamp(&self) -> Option<&Time>;
     /// Default covers the hostname-less kinds (TCP/UDP).
     fn hostnames(&self) -> &[String] {
         &[]
@@ -112,6 +114,9 @@ macro_rules! impl_gateway_route {
                     self.metadata.name.as_deref().unwrap_or("unknown"),
                     self.metadata.generation,
                 )
+            }
+            fn creation_timestamp(&self) -> Option<&Time> {
+                self.metadata.creation_timestamp.as_ref()
             }
             fn convert(&self, gw: &str) -> Result<Self::Config> {
                 $cv(self, gw)
@@ -556,19 +561,34 @@ struct RouteCollectCtx<'a> {
     known_services: &'a HashSet<(String, String)>,
 }
 
+/// Gateway API precedence between routes whose matches tie: the oldest
+/// creationTimestamp, then namespace/name (Listener.allowedRoutes).
+fn precedence<R: GatewayRoute>(route: &R) -> (Option<&Time>, &str, &str) {
+    (
+        route.creation_timestamp(),
+        route.route_namespace(),
+        route.identity().0,
+    )
+}
+
 /// Generic route collection with namespace scoping and acceptance tracking.
+/// Configs come out in precedence order: the table keeps insertion order
+/// among equally specific rules.
 fn collect_routes<R: GatewayRoute>(
     routes: &[Arc<R>],
     cx: &RouteCollectCtx,
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<R::Config> {
     let kind = R::KIND;
-    let mut configs = Vec::new();
-    for route in routes {
-        if !route_targets_gateway(route.parent_refs(), cx.gateway_name, cx.gateway_ns) {
-            continue;
-        }
+    let mut ordered: Vec<&R> = routes
+        .iter()
+        .map(|r| &**r)
+        .filter(|r| route_targets_gateway(r.parent_refs(), cx.gateway_name, cx.gateway_ns))
+        .collect();
+    ordered.sort_by(|a, b| precedence(*a).cmp(&precedence(*b)));
 
+    let mut configs = Vec::new();
+    for route in ordered {
         let route_ns = route.route_namespace();
         let (name, generation) = route.identity();
 
