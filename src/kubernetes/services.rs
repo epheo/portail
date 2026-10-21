@@ -34,7 +34,10 @@ pub(crate) struct NamedTargetPortReq {
     ns: String,
     svc: String,
     service_port: u16,
-    port_name: String,
+    /// What the EndpointSlice port is named: slices carry the Service port's
+    /// name (Service.ports[].name), not the targetPort's. Empty when unnamed.
+    service_port_name: String,
+    target_port_name: String,
 }
 
 /// Resolve service metadata: known services set, ExternalName overrides,
@@ -97,7 +100,8 @@ pub(crate) fn resolve_services(
                         ns: svc_ns.to_string(),
                         svc: svc_name.to_string(),
                         service_port,
-                        port_name: name.clone(),
+                        service_port_name: sp.name.clone().unwrap_or_default(),
+                        target_port_name: name.clone(),
                     });
                     service_port
                 }
@@ -190,17 +194,18 @@ pub(crate) fn resolve_services(
     )
 }
 
-/// Pick the numeric value of a named port from a service's EndpointSlices.
+/// Pick the numeric value of a Service port from the Service's EndpointSlices,
+/// by the Service port's name ("" when unnamed: the slice omits it too).
 /// All slices of a Service share the same port mapping, so the first match wins.
 /// Returns `None` if no slice publishes a port with that name.
-fn pick_named_port(slices: &[EndpointSlice], port_name: &str) -> Option<u16> {
+fn pick_named_port(slices: &[EndpointSlice], service_port_name: &str) -> Option<u16> {
     slices
         .iter()
         .filter_map(|s| s.ports.as_ref())
         .flatten()
-        .find(|p| p.name.as_deref() == Some(port_name))
+        .find(|p| p.name.as_deref().unwrap_or_default() == service_port_name)
         .and_then(|p| p.port)
-        .map(|p| p as u16)
+        .and_then(|p| u16::try_from(p).ok())
 }
 
 /// Resolve headless *named* targetPorts via a one-shot, label-filtered
@@ -219,25 +224,25 @@ pub(crate) async fn resolve_named_target_ports(
         let lp = kube::api::ListParams::default()
             .labels(&format!("kubernetes.io/service-name={}", req.svc));
         match api.list(&lp).await {
-            Ok(list) => match pick_named_port(&list.items, &req.port_name) {
+            Ok(list) => match pick_named_port(&list.items, &req.service_port_name) {
                 Some(port) => {
                     let fqdn = format!("{}.{}.svc", req.svc, req.ns);
                     out.insert((fqdn, req.service_port), port);
                     debug!(
                         "Headless {}/{} port {} named targetPort {:?} -> {}",
-                        req.ns, req.svc, req.service_port, req.port_name, port
+                        req.ns, req.svc, req.service_port, req.target_port_name, port
                     );
                 }
                 None => warn!(
                     "Headless {}/{} port {}: named targetPort {:?} not found in \
                      EndpointSlices; using the service port",
-                    req.ns, req.svc, req.service_port, req.port_name
+                    req.ns, req.svc, req.service_port, req.target_port_name
                 ),
             },
             Err(e) => warn!(
                 "Headless {}/{} port {}: EndpointSlice list for named targetPort \
                  {:?} failed ({}); using the service port",
-                req.ns, req.svc, req.service_port, req.port_name, e
+                req.ns, req.svc, req.service_port, req.target_port_name, e
             ),
         }
     }
@@ -294,34 +299,86 @@ mod tests {
         assert_eq!(pick_named_port(&[empty, has], "http"), Some(3000));
     }
 
-    #[test]
-    fn resolve_services_defers_named_targetport() {
+    fn headless(
+        name: &str,
+        ns: &str,
+        port_name: Option<&str>,
+        port: i32,
+        target: IntOrString,
+    ) -> k8s_openapi::api::core::v1::Service {
         use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-
-        fn headless(name: &str, ns: &str, port: i32, target: IntOrString) -> Service {
-            Service {
-                metadata: ObjectMeta {
-                    name: Some(name.to_string()),
-                    namespace: Some(ns.to_string()),
-                    ..Default::default()
-                },
-                spec: Some(ServiceSpec {
-                    cluster_ip: Some("None".to_string()),
-                    ports: Some(vec![ServicePort {
-                        port,
-                        target_port: Some(target),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
+        Service {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
                 ..Default::default()
-            }
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: Some("None".to_string()),
+                ports: Some(vec![ServicePort {
+                    name: port_name.map(str::to_string),
+                    port,
+                    target_port: Some(target),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
+    }
 
+    /// EndpointSlice ports carry the Service port's name: a port `web` with
+    /// targetPort `http` publishes `web` with the container's number. The
+    /// lookup used the targetPort name, which only matched when both names
+    /// were the same.
+    #[test]
+    fn named_target_port_resolves_by_service_port_name() {
+        use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
+        let svc = headless(
+            "db",
+            "prod",
+            Some("web"),
+            80,
+            IntOrString::String("http".to_string()),
+        );
+        let (_, reqs) = resolve_services(&[std::sync::Arc::new(svc)]);
+        let slice = EndpointSlice {
+            ports: Some(vec![EndpointPort {
+                name: Some("web".to_string()),
+                port: Some(8080),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_named_port(&[slice], &reqs[0].service_port_name),
+            Some(8080)
+        );
+
+        // An unnamed Service port: the slice port is unnamed too.
+        let unnamed_slice = EndpointSlice {
+            ports: Some(vec![EndpointPort {
+                name: None,
+                port: Some(3000),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(pick_named_port(&[unnamed_slice], ""), Some(3000));
+    }
+
+    #[test]
+    fn resolve_services_defers_named_targetport() {
         // Named targetPort: emit a resolve request AND seed the service-port
         // fallback, so an absent/failed EndpointSlice list degrades to prior behavior.
-        let named = headless("db", "prod", 5432, IntOrString::String("pg".to_string()));
+        let named = headless(
+            "db",
+            "prod",
+            Some("postgres"),
+            5432,
+            IntOrString::String("pg".to_string()),
+        );
         let (state, reqs) = resolve_services(&[std::sync::Arc::new(named)]);
         assert_eq!(reqs.len(), 1);
         assert_eq!(
@@ -329,9 +386,10 @@ mod tests {
                 reqs[0].ns.as_str(),
                 reqs[0].svc.as_str(),
                 reqs[0].service_port,
-                reqs[0].port_name.as_str()
+                reqs[0].service_port_name.as_str(),
+                reqs[0].target_port_name.as_str()
             ),
-            ("prod", "db", 5432, "pg")
+            ("prod", "db", 5432, "postgres", "pg")
         );
         assert_eq!(
             state
@@ -342,7 +400,7 @@ mod tests {
         );
 
         // Numeric targetPort: resolved directly from the spec, no request emitted.
-        let numeric = headless("cache", "prod", 6379, IntOrString::Int(6380));
+        let numeric = headless("cache", "prod", None, 6379, IntOrString::Int(6380));
         let (state, reqs) = resolve_services(&[std::sync::Arc::new(numeric)]);
         assert!(reqs.is_empty());
         assert_eq!(
