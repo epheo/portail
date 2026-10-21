@@ -35,7 +35,9 @@ use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
     reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
 };
-use crate::kubernetes::services::{resolve_named_target_ports, resolve_services};
+use crate::kubernetes::services::{
+    referenced_backends, resolve_named_target_ports, resolve_services, retain_referenced,
+};
 use crate::kubernetes::status;
 
 /// Read all objects from a reflector store, cloning each. Only used for
@@ -788,17 +790,7 @@ pub(super) async fn reconcile(
         &snapshot.reference_grants,
         &ctx.cache.secrets,
     );
-    let (mut services, named_reqs) = resolve_services(&snapshot.services);
-    // A headless Service with a *named* targetPort needs endpoint data the Service
-    // spec lacks; resolve those with a one-shot EndpointSlice list (no watch).
-    if !named_reqs.is_empty() {
-        resolve_named_target_ports(
-            &ctx.client,
-            &named_reqs,
-            &mut services.headless_target_ports,
-        )
-        .await;
-    }
+    let (services, mut named_reqs) = resolve_services(&snapshot.services);
 
     let (mut listener_statuses, accepted_cond) =
         validate_gateway(&gateway, &gw_ns, &resolved_certs);
@@ -827,6 +819,22 @@ pub(super) async fn reconcile(
                 return Err(ReconcileError(e.to_string()));
             }
         };
+
+    // Service metadata for the backends this Gateway routes to, and only
+    // those: API reads and fingerprint churn then scale with the Gateway.
+    let referenced = referenced_backends(&result.config);
+    retain_referenced(&mut result.config, &referenced);
+    // A headless Service with a *named* targetPort needs endpoint data the Service
+    // spec lacks; resolve those with a one-shot EndpointSlice list (no watch).
+    named_reqs.retain(|req| referenced.contains(&req.backend()));
+    if !named_reqs.is_empty() {
+        resolve_named_target_ports(
+            &ctx.client,
+            &named_reqs,
+            &mut result.config.headless_target_ports,
+        )
+        .await;
+    }
 
     substitute_network_ips(&mut result.config.gateway.addresses, &usable);
     let bind_addresses = compute_bind_addresses(&result.config.gateway.addresses, &usable);
@@ -1257,6 +1265,92 @@ mod tests {
         reconcile(Arc::new(gw), ctx).await.unwrap();
         let patch = api.status_patch("gateways", "gw").unwrap();
         assert_eq!(listener_conditions(&patch)["Programmed"]["status"], "True");
+    }
+
+    fn endpoint_slice_lists(api: &MockApi) -> usize {
+        api.requests()
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.contains("/endpointslices"))
+            .count()
+    }
+
+    /// Services no route of this Gateway references cost nothing. A headless
+    /// one with a named targetPort cost an EndpointSlice LIST per pass, and
+    /// any change to one rebuilt the table and rewrote status, in every pod.
+    #[tokio::test]
+    async fn unreferenced_services_cost_nothing() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        let named = serde_json::json!("http");
+        apply(
+            &mut cluster.services,
+            testkit::service("elsewhere", "web", 80, named),
+        );
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 0);
+        let gw = testkit::with_gateway_status(gw, &api.status_patch("gateways", "gw").unwrap());
+        apply(&mut cluster.gateways, gw.clone());
+        let built = ctx.published.load_full().unwrap();
+
+        let mut changed = testkit::service("elsewhere", "web", 80, serde_json::json!(8080));
+        changed.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].app_protocol =
+            Some("https".into());
+        apply(&mut cluster.services, changed);
+        api.clear();
+        reconcile(Arc::new(gw), ctx.clone()).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&built, &ctx.published.load_full().unwrap()),
+            "an unrelated Service rebuilt the table"
+        );
+        assert!(api.requests().is_empty(), "{:?}", api.requests());
+    }
+
+    /// A referenced headless backend with a named targetPort connects on
+    /// the number its EndpointSlices publish.
+    #[tokio::test]
+    async fn referenced_named_target_port_is_resolved() {
+        let api = MockApi::default();
+        api.reply_to(
+            "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+            200,
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{
+                    "metadata": {"name": "db-1"},
+                    "addressType": "IPv4",
+                    "endpoints": [],
+                    "ports": [{"name": "web", "port": 8080}],
+                }],
+            }),
+        );
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        apply(
+            &mut cluster.services,
+            testkit::service("db", "web", 80, serde_json::json!("http")),
+        );
+        apply(
+            &mut cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "db", 80),
+        );
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw), ctx.clone()).await.unwrap();
+        let config = ctx.published.load_full().unwrap().config.clone();
+        assert_eq!(
+            config
+                .headless_target_ports
+                .get(&("db.default.svc".to_string(), 80)),
+            Some(&8080)
+        );
+        assert_eq!(endpoint_slice_lists(&api), 1);
     }
 
     /// A write computed from a stale read is refused (409), not applied

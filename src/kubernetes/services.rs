@@ -2,8 +2,9 @@
 //! about Services beyond their name: ExternalName endpoint overrides,
 //! appProtocol overrides, and headless service-port → targetPort mappings.
 //!
-//! Gateway-independent: computed once per reconcile pass from the Service
-//! reflector store, then threaded into `reconcile_to_config`.
+//! Computed once per reconcile pass from the Service reflector store and
+//! threaded into `reconcile_to_config`; the controller then keeps what this
+//! Gateway's routes reference ([`retain_referenced`]).
 
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -12,6 +13,7 @@ use kube::api::Api;
 use kube::Client;
 use std::collections::{HashMap, HashSet};
 
+use crate::config::PortailConfig;
 use crate::logging::{debug, info, warn};
 
 /// Resolved service metadata needed for route table construction.
@@ -192,6 +194,46 @@ pub(crate) fn resolve_services(
         },
         named_target_ports,
     )
+}
+
+impl NamedTargetPortReq {
+    /// The override-map key this request resolves.
+    pub fn backend(&self) -> (String, u16) {
+        (format!("{}.{}.svc", self.svc, self.ns), self.service_port)
+    }
+}
+
+/// (FQDN, port) of every backend a rule of `config` routes to: the keys the
+/// override maps are read with. Mirrors resolve their target directly.
+pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u16)> {
+    let http = config
+        .http_routes
+        .iter()
+        .flat_map(|r| &r.rules)
+        .flat_map(|rule| &rule.backend_refs);
+    let l4 = config
+        .tcp_routes
+        .iter()
+        .chain(&config.udp_routes)
+        .flat_map(|r| &r.rules)
+        .chain(config.tls_routes.iter().flat_map(|r| &r.rules))
+        .flat_map(|rule| &rule.backend_refs);
+    http.chain(l4).map(|b| (b.name.clone(), b.port)).collect()
+}
+
+/// Drop the override entries of Services `config` does not route to. The
+/// maps are fingerprinted, so an unrelated Service change would otherwise
+/// rebuild the table and rewrite status in every pod.
+pub(crate) fn retain_referenced(config: &mut PortailConfig, referenced: &HashSet<(String, u16)>) {
+    config
+        .endpoint_overrides
+        .retain(|k, _| referenced.contains(k));
+    config
+        .app_protocol_overrides
+        .retain(|k, _| referenced.contains(k));
+    config
+        .headless_target_ports
+        .retain(|k, _| referenced.contains(k));
 }
 
 /// Pick the numeric value of a Service port from the Service's EndpointSlices,

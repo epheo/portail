@@ -274,6 +274,33 @@ pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HTTPR
     }
 }
 
+/// `route` with one rule sending everything to Service `backend` in
+/// `default` on `port`.
+pub(super) fn with_backend(mut route: HTTPRoute, backend: &str, port: i32) -> HTTPRoute {
+    route.spec.rules = Some(vec![serde_json::from_value(json!({
+        "backendRefs": [{"name": backend, "port": port}],
+    }))
+    .unwrap()]);
+    route
+}
+
+/// A Service in `default` with one port; headless when `target` is a
+/// named targetPort.
+pub(super) fn service(name: &str, port_name: &str, port: i32, target: Value) -> Service {
+    let headless = target.is_string();
+    let mut svc: Service = serde_json::from_value(json!({
+        "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+        "spec": {
+            "ports": [{"name": port_name, "port": port, "targetPort": target}],
+        },
+    }))
+    .unwrap();
+    if headless {
+        svc.spec.as_mut().unwrap().cluster_ip = Some("None".into());
+    }
+    svc
+}
+
 /// One condition-bearing status entry by `controller` for Gateway `gw` in
 /// `default`: a route parent when `ref_field` is "parentRef", a policy
 /// ancestor when "ancestorRef".
