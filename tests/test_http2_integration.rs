@@ -976,3 +976,148 @@ async fn test_h2_truncated_or_broken_framed_bodies_are_reset() {
         assert_eq!(e.reason(), Some(h2::Reason::INTERNAL_ERROR), "{reply:?}");
     }
 }
+
+/// One h2 frame off the wire.
+struct RawFrame {
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: Vec<u8>,
+}
+
+/// The h2 frame types and flags the raw client uses (RFC 9113 6).
+const DATA: u8 = 0x0;
+const HEADERS: u8 = 0x1;
+const RST_STREAM: u8 = 0x3;
+const SETTINGS: u8 = 0x4;
+const PING: u8 = 0x6;
+const GOAWAY: u8 = 0x7;
+const END_STREAM: u8 = 0x1;
+const ACK: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+
+async fn write_raw_frame(
+    tls: &mut (impl tokio::io::AsyncWrite + Unpin),
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: &[u8],
+) {
+    let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+    frame.extend_from_slice(&[kind, flags]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    tls.write_all(&frame).await.expect("write frame");
+}
+
+/// `None` once the connection is closed.
+async fn read_raw_frame(tls: &mut (impl tokio::io::AsyncRead + Unpin)) -> Option<RawFrame> {
+    let mut head = [0u8; 9];
+    tls.read_exact(&mut head).await.ok()?;
+    let mut payload = vec![0u8; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+    tls.read_exact(&mut payload).await.ok()?;
+    Some(RawFrame {
+        kind: head[3],
+        flags: head[4],
+        stream: u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff,
+        payload,
+    })
+}
+
+/// A GET's header block in HPACK, static table only: :method GET and
+/// :scheme https indexed, :path and :authority as literals.
+fn raw_get(path: &str) -> Vec<u8> {
+    let mut block = vec![0x82, 0x87];
+    for (name_index, value) in [(4u8, path), (1, SNI)] {
+        block.push(name_index);
+        block.push(value.len() as u8);
+        block.extend_from_slice(value.as_bytes());
+    }
+    block
+}
+
+/// How a raw stream went: `:status 200` seen, its body, and its end:
+/// END_STREAM (Ok) or the RST_STREAM error code.
+#[derive(Debug, Default)]
+struct RawStream {
+    ok_status: bool,
+    body: Vec<u8>,
+    end: Option<Result<(), u32>>,
+}
+
+/// A drain with streams in flight: GOAWAY goes out, the stream in flight
+/// finishes, and so does one whose HEADERS crossed the GOAWAY on the wire,
+/// though its engine starts after the drain began. Then the connection
+/// closes. h2 accepts that stream: the first GOAWAY names no stream limit,
+/// and the final one waits for the PING ack, sent here after the HEADERS.
+#[tokio::test]
+async fn test_h2_drain_finishes_streams_accepted_around_the_goaway() {
+    let (backend, arrived) = spawn_slow_backend(Duration::from_secs(1));
+    let Some(mut proxy) = spawn_h2_proxy(h2_port(50), backend) else {
+        return;
+    };
+    let mut tls = tls_connect(h2_port(50), &[b"h2"]).await;
+    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    write_raw_frame(&mut tls, SETTINGS, 0, 0, &[]).await;
+    let get = raw_get("/slow");
+    write_raw_frame(&mut tls, HEADERS, END_STREAM | END_HEADERS, 1, &get).await;
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("request never reached the backend");
+
+    proxy.terminate();
+    let mut streams: [RawStream; 2] = Default::default();
+    let mut goaway = None;
+    let exchange = async {
+        while let Some(frame) = read_raw_frame(&mut tls).await {
+            match frame.kind {
+                SETTINGS if frame.flags & ACK == 0 => {
+                    write_raw_frame(&mut tls, SETTINGS, ACK, 0, &[]).await;
+                }
+                PING if frame.flags & ACK == 0 => {
+                    write_raw_frame(&mut tls, PING, ACK, 0, &frame.payload).await;
+                }
+                GOAWAY if goaway.is_none() => {
+                    goaway = Some(u32::from_be_bytes(frame.payload[4..8].try_into().unwrap()));
+                    let get = raw_get("/");
+                    write_raw_frame(&mut tls, HEADERS, END_STREAM | END_HEADERS, 3, &get).await;
+                }
+                HEADERS | DATA | RST_STREAM => {
+                    // Streams 1 and 3.
+                    let s = &mut streams[frame.stream as usize / 2];
+                    match frame.kind {
+                        // `:status 200` is static table entry 8.
+                        HEADERS => s.ok_status = frame.payload.first() == Some(&0x88),
+                        DATA => s.body.extend_from_slice(&frame.payload),
+                        _ => {
+                            let code = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                            s.end = Some(Err(code));
+                        }
+                    }
+                    if frame.kind != RST_STREAM && frame.flags & END_STREAM != 0 {
+                        s.end = Some(Ok(()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("h2 connection still open after the drain");
+
+    assert_eq!(goaway, Some(0), "no GOAWAY, or not NO_ERROR");
+    for (id, s) in [1, 3].iter().zip(&streams) {
+        assert!(
+            s.ok_status && s.body == b"ok" && s.end == Some(Ok(())),
+            "stream {id}: {s:?}"
+        );
+    }
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("no exit within 10s of SIGTERM");
+    assert!(status.success(), "{status}");
+}
