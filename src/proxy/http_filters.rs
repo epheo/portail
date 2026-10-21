@@ -676,24 +676,20 @@ fn apply_header_mods_inner(
         }
 
         if let Some(mods) = mods {
-            let name_str = match std::str::from_utf8(name) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Non-UTF8 header name: pass through unmodified
-                    out.extend_from_slice(line);
-                    out.extend_from_slice(b"\r\n");
-                    continue;
-                }
-            };
-
-            if mods.remove.iter().any(|r| r.eq_ignore_ascii_case(name_str)) {
+            // Compared as bytes: ASCII case folding leaves other bytes as
+            // they are, so a name that is no UTF-8 matches no configured one.
+            if mods
+                .remove
+                .iter()
+                .any(|r| r.as_bytes().eq_ignore_ascii_case(name))
+            {
                 continue;
             }
             if let Some((idx, set_header)) = mods
                 .set
                 .iter()
                 .enumerate()
-                .find(|(_, h)| h.name.eq_ignore_ascii_case(name_str))
+                .find(|(_, h)| h.name.as_bytes().eq_ignore_ascii_case(name))
             {
                 set_applied[idx] = true;
                 out.extend_from_slice(set_header.name.as_bytes());
@@ -1422,6 +1418,21 @@ mod tests {
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(!result_str.contains("X-Internal"));
         assert!(result_str.contains("Content-Length: 5"));
+    }
+
+    #[test]
+    fn test_header_mods_pass_a_non_utf8_name_through() {
+        let mods = HeaderModifications {
+            add: &[],
+            set: &[HttpHeader {
+                name: "X\u{ff}".to_string(),
+                value: "v".to_string(),
+            }],
+            remove: &["X\u{ff}".to_string()],
+        };
+        let mut out = Vec::new();
+        apply_response_header_mods(b"HTTP/1.1 200 OK\r\nX\xff: 1\r\n\r\n", &mods, &mut out);
+        assert_eq!(out, b"HTTP/1.1 200 OK\r\nX\xff: 1\r\nX\xc3\xbf: v\r\n\r\n");
     }
 
     #[test]
