@@ -423,10 +423,12 @@ pub fn analyze_udp_request(
     server_port: u16,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
+    static UNROUTABLE: L4Throttles = L4Throttles::new();
     analyze_l4_request(
         backend_selector,
         server_port,
         "UDP",
+        &UNROUTABLE,
         |port| routes.find_udp_backends(port),
         |addr| RoutingResult::UdpForward { backend_addr: addr },
         health,
@@ -439,31 +441,49 @@ pub(crate) fn analyze_tcp_request(
     server_port: u16,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
+    static UNROUTABLE: L4Throttles = L4Throttles::new();
     analyze_l4_request(
         backend_selector,
         server_port,
         "TCP",
+        &UNROUTABLE,
         |port| routes.find_tcp_backends(port),
         |addr| RoutingResult::TcpForward { backend_addr: addr },
         health,
     )
 }
 
+/// One log throttle per unroutable condition, for one protocol. A line
+/// names the port it met; the count it carries covers every port.
+struct L4Throttles {
+    no_route: LogThrottle,
+    no_backends: LogThrottle,
+    no_weight: LogThrottle,
+}
+
+impl L4Throttles {
+    const fn new() -> Self {
+        Self {
+            no_route: LogThrottle::new(),
+            no_backends: LogThrottle::new(),
+            no_weight: LogThrottle::new(),
+        }
+    }
+}
+
 fn analyze_l4_request<'a>(
     backend_selector: &BackendSelector,
     server_port: u16,
     proto: &str,
+    throttles: &L4Throttles,
     lookup: impl FnOnce(u16) -> Option<&'a Vec<Backend>>,
     make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
-    static NO_ROUTE: LogThrottle = LogThrottle::new();
-    static NO_BACKENDS: LogThrottle = LogThrottle::new();
-    static NO_WEIGHT: LogThrottle = LogThrottle::new();
     let unroutable = |throttle: &LogThrottle, condition: &str| {
         if let Some(suppressed) = throttle.admit_now() {
             error!(
-                "{} routing failed for port {}: {}; {} similar suppressed",
+                "{} routing failed for port {}: {}; {} more since the last such line, on any port",
                 proto, server_port, condition, suppressed
             );
         }
@@ -471,10 +491,10 @@ fn analyze_l4_request<'a>(
     };
 
     let Some(backend_list) = lookup(server_port) else {
-        return unroutable(&NO_ROUTE, "no route configured");
+        return unroutable(&throttles.no_route, "no route configured");
     };
     if backend_list.is_empty() {
-        return unroutable(&NO_BACKENDS, "no backends available");
+        return unroutable(&throttles.no_backends, "no backends available");
     }
 
     // Weighted round-robin among healthy backends, honoring per-backendRef
@@ -482,7 +502,7 @@ fn analyze_l4_request<'a>(
     let Some(selected_backend) =
         backend_selector.select_l4_backend(server_port as u64, backend_list, health)
     else {
-        return unroutable(&NO_WEIGHT, "no backend with positive weight");
+        return unroutable(&throttles.no_weight, "no backend with positive weight");
     };
     if selected_backend.action == BackendAction::Reject {
         debug!(
@@ -1400,6 +1420,32 @@ mod tests {
         ] {
             assert_eq!(log.matches(condition).count(), 1, "{log}");
         }
+    }
+
+    /// TCP and UDP shared one throttle per condition: a TCP miss silenced
+    /// the UDP line, and the next line counted both under one port. Each
+    /// protocol now has its own, and the count says it covers every port.
+    #[test]
+    fn l4_log_throttles_are_per_protocol() {
+        use crate::proxy::test_util::{in_own_process, Captured};
+        if !in_own_process(module_path!(), "l4_log_throttles_are_per_protocol") {
+            return;
+        }
+        let (log, _subscriber) = Captured::warnings();
+        let rt = RouteTable::new();
+        let sel = BackendSelector::new();
+        for port in [5432, 5433, 5434] {
+            analyze_tcp_request(&rt, &sel, port, &health()).unwrap();
+        }
+        analyze_udp_request(&rt, &sel, 5353, &health()).unwrap();
+        let log = log.text();
+        for line in [
+            "TCP routing failed for port 5432: no route configured; 0 more since the last such line, on any port",
+            "UDP routing failed for port 5353: no route configured; 0 more since the last such line, on any port",
+        ] {
+            assert_eq!(log.matches(line).count(), 1, "{log}");
+        }
+        assert_eq!(log.matches("routing failed").count(), 2, "{log}");
     }
 
     #[test]
