@@ -464,7 +464,6 @@ impl PortailConfig {
                 continue;
             }
 
-            // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
             let override_key = (backend_ref.name.clone(), backend_ref.port);
             let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
                 self.app_protocol_overrides
@@ -479,7 +478,6 @@ impl PortailConfig {
                 backends.push(backend);
             };
 
-            // Check if this backend has endpoint overrides (headless service)
             if let Some(endpoints) = self
                 .endpoint_overrides
                 .get(&override_key)
