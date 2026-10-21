@@ -1229,10 +1229,10 @@ mod tests {
         assert_eq!(result, vec!["api.example.com"]);
     }
 
+    /// The controller maps an ExternalName Service (FQDN, port) to its
+    /// external name: that name is dialed, and the FQDN never looked up.
     #[test]
     fn test_external_name_endpoint_override_resolves() {
-        // Simulate what the controller does for ExternalName services:
-        // endpoint_overrides maps (svc_fqdn, port) → (externalName, port)
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
@@ -1250,29 +1250,23 @@ mod tests {
         let mut config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
 
-        // Insert ExternalName override: svc FQDN → external DNS name
         config.endpoint_overrides.insert(
             ("external-api.default.svc".to_string(), 443),
-            vec![("httpbin.org".to_string(), 443)],
+            vec![("multi.svc".to_string(), 443)],
         );
 
-        // to_route_table should resolve "httpbin.org" via DNS
-        let rt = config.to_route_table();
-        assert!(
-            rt.is_ok(),
-            "ExternalName DNS resolution should succeed: {:?}",
-            rt.err()
-        );
-        let rt = rt.unwrap();
-
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["multi.svc:443"]);
         let rule = rt
             .find_http_route("proxy.example.com", "GET", "/", &[], "", 8080)
             .unwrap();
-        assert!(
-            !rule.backends.is_empty(),
-            "should have resolved ExternalName backend"
-        );
-        assert_eq!(rule.backends[0].socket_addr.port(), 443);
+        let dialed: Vec<_> = rule
+            .backends
+            .iter()
+            .map(|b| (b.socket_addr, b.server_name.as_str()))
+            .collect();
+        assert_eq!(dialed, vec![(([10, 0, 0, 1], 443).into(), "multi.svc")]);
     }
 
     /// One route whose regex does not compile used to fail the whole build:
