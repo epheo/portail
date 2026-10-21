@@ -7,6 +7,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -647,6 +648,9 @@ async fn serve_http(
     if n == 0 {
         return Ok(Handoff::Close);
     }
+    // The backend budget's timer, kept across this connection's requests:
+    // see `within`. A Sleep never reset or polled is not registered.
+    let mut budget_timer = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
 
     loop {
         // Loop top = this request's bytes are in buf (initial read or the
@@ -716,9 +720,11 @@ async fn serve_http(
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
                     let backend_addr = backend.socket_addr;
-                    let (keep, leftover) =
-                        proxy_http_request(client, buf, framing, backend, rule, &meta, state)
-                            .await?;
+                    let timer = budget_timer.as_mut();
+                    let (keep, leftover) = proxy_http_request(
+                        client, buf, framing, backend, rule, &meta, state, timer,
+                    )
+                    .await?;
                     if !meta.is_upgrade {
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
@@ -1049,6 +1055,9 @@ impl Framing {
 ///   corrupt framing and a synthetic terminator would fake a complete body.
 ///
 /// WebSocket upgrades skip the total deadline (long-lived stream).
+///
+/// `timer` is the connection's own, for the backend budget (see `within`).
+#[allow(clippy::too_many_arguments)]
 async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
@@ -1057,6 +1066,7 @@ async fn proxy_http_request(
     rule: &HttpRouteRule,
     meta: &RequestMeta,
     state: &mut ConnectionState,
+    mut timer: Pin<&mut tokio::time::Sleep>,
 ) -> Result<(bool, Option<Vec<u8>>)> {
     use std::time::Instant;
 
@@ -1073,6 +1083,7 @@ async fn proxy_http_request(
             .map(|d| Instant::now() + d)
     };
     let backend_phase_start = Instant::now();
+    let backend_deadline = deadline_after(backend_phase_start, backend_budget, total_deadline);
     // Cleared per request so an Err exit can never surface the previous
     // keepalive response's status to the access log.
     state.last_status = 0;
@@ -1106,12 +1117,11 @@ async fn proxy_http_request(
     });
 
     // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
-    let (backend, from_pool) =
-        match connect_to_backend(client, state, backend_ref, backend_budget, total_deadline).await?
-        {
-            Some(b) => b,
-            None => return Ok((false, None)),
-        };
+    let connect = connect_to_backend(client, state, backend_ref, timer.as_mut(), backend_deadline);
+    let (backend, from_pool) = match connect.await? {
+        Some(b) => b,
+        None => return Ok((false, None)),
+    };
 
     let has_mirrors = rule
         .filters
@@ -1248,12 +1258,7 @@ async fn proxy_http_request(
     let (mut framing, keep) = loop {
         // An early answer is one already here: a backend that only stalled
         // gets no fresh budget to answer in.
-        let header_budget = (!answered_early).then(|| {
-            clamp_to_deadline(
-                backend_budget.saturating_sub(backend_phase_start.elapsed()),
-                total_deadline,
-            )
-        });
+        let head_wait = (!answered_early).then_some((timer.as_mut(), backend_deadline));
         // With the body cut short, the connection neither tunnels nor
         // stays open.
         match forward_response_headers(
@@ -1263,7 +1268,7 @@ async fn proxy_http_request(
             &mut state.scratch_buf,
             &mut state.filter_buf,
             resp_mods.as_ref(),
-            header_budget,
+            head_wait,
             meta.is_head,
             meta.is_upgrade && !answered_early,
             meta.keepalive && !answered_early,
@@ -1541,7 +1546,7 @@ async fn refuse_locally(
     send_error_response(client, 503).await
 }
 
-/// Acquire a backend connection within `backend_budget` (clamped by `total_deadline`).
+/// Acquire a backend connection by `deadline`, on `timer` (see `within`).
 /// On a backend failure or timeout, records health failure and sends `502`/`504`
 /// to the client; on local exhaustion, a `503` (see [`ConnectError::Local`]).
 /// Returns `Ok(None)` when the caller should bail out (`return Ok(false)`),
@@ -1554,24 +1559,23 @@ async fn connect_to_backend(
     client: &mut Connection,
     state: &mut ConnectionState,
     backend_ref: &crate::routing::Backend,
-    backend_budget: Duration,
-    total_deadline: Option<std::time::Instant>,
+    timer: Pin<&mut tokio::time::Sleep>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     let (use_tls, server_name) = (backend_ref.use_tls, backend_ref.server_name.as_str());
     let acquired = match state.pool.take_idle(backend_addr, use_tls, server_name) {
-        Some(conn) => Ok(Ok((conn, true))),
+        Some(conn) => Some(Ok((conn, true))),
         None => {
-            let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
             let keepalive = &state.backend_keepalive;
             let connect = state
                 .pool
                 .acquire(backend_addr, use_tls, server_name, keepalive);
-            tokio::time::timeout(connect_budget, connect).await
+            within(timer, deadline, connect).await
         }
     };
     match acquired {
-        Ok(Ok(result)) => {
+        Some(Ok(result)) => {
             // Reset passive-failure state: without this, transient failures
             // accumulate over the process lifetime and eventually trip the
             // "consecutive"-failure threshold (the L4 paths already record
@@ -1579,16 +1583,16 @@ async fn connect_to_backend(
             state.health.record_success(backend_addr);
             Ok(Some(result))
         }
-        Ok(Err(ConnectError::Local(e))) => {
+        Some(Err(ConnectError::Local(e))) => {
             refuse_locally(state, client, backend_addr, &e).await?;
             Ok(None)
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
             fail_connect(state, backend_ref, client, 502).await?;
             Ok(None)
         }
-        Err(_) => {
+        None => {
             warn!("Backend {} connect timeout", backend_addr);
             fail_connect(state, backend_ref, client, 504).await?;
             Ok(None)
@@ -1841,11 +1845,12 @@ enum HeaderPhase {
     Unanswered,
 }
 
-/// Read response headers from the backend within `header_budget` and forward
-/// them to the client. This is the SAFE→UNSAFE transition: on entry no client
-/// bytes have been written and timeout → `504`; on success the client has the
-/// headers, and any later failure must reset the client connection instead.
-/// A `None` budget takes only a head that has already arrived.
+/// Read response headers from the backend, waiting on `head_wait`'s timer
+/// up to its deadline, and forward them to the client. This is the
+/// SAFE→UNSAFE transition: on entry no client bytes have been written and
+/// timeout → `504`; on success the client has the headers, and any later
+/// failure must reset the client connection instead. A `None` wait takes
+/// only a head that has already arrived.
 ///
 /// Returns `ErrorSent` when the caller should bail out (`return Ok(false)`).
 #[allow(clippy::too_many_arguments)]
@@ -1856,24 +1861,26 @@ async fn forward_response_headers(
     scratch: &mut Vec<u8>,
     filter_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
-    header_budget: Option<Duration>,
+    head_wait: Option<(Pin<&mut tokio::time::Sleep>, Option<tokio::time::Instant>)>,
     is_head_request: bool,
     expect_upgrade: bool,
     keepalive: bool,
     drain: &CancellationToken,
 ) -> Result<HeaderPhase> {
-    let read = match header_budget {
-        Some(budget) => tokio::time::timeout(budget, read_response_head(backend, header_buf)).await,
-        None => Ok(arrived_head(backend, header_buf).await),
+    let read = match head_wait {
+        Some((timer, deadline)) => {
+            within(timer, deadline, read_response_head(backend, header_buf)).await
+        }
+        None => Some(arrived_head(backend, header_buf).await),
     };
     let read = match read {
-        Ok(Ok(read)) => read,
-        Ok(Err(e)) => {
+        Some(Ok(read)) => read,
+        Some(Err(e)) => {
             warn!("Backend response head failed: {}", e);
             send_error_response(client, 502).await?;
             return Ok(HeaderPhase::ErrorSent(502));
         }
-        Err(_) => {
+        None => {
             send_error_response(client, 504).await?;
             return Ok(HeaderPhase::ErrorSent(504));
         }
@@ -2444,6 +2451,55 @@ fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> 
         Some(d) => budget.min(d.saturating_duration_since(std::time::Instant::now())),
         None => budget,
     }
+}
+
+/// `budget` after `start`, or `deadline` when sooner. `None`, no bound, when
+/// past the clock's range, as tokio's `timeout` takes such a budget.
+fn deadline_after(
+    start: std::time::Instant,
+    budget: Duration,
+    deadline: Option<std::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let end = match (start.checked_add(budget), deadline) {
+        (Some(end), Some(deadline)) => end.min(deadline),
+        (end, deadline) => end.or(deadline)?,
+    };
+    Some(tokio::time::Instant::from_std(end))
+}
+
+/// `fut`'s output, or `None` once `deadline` passes first; no deadline, no
+/// bound. tokio's `timeout_at` on a timer the connection keeps across its
+/// requests: a fresh tokio timer registers in the runtime's one timer wheel
+/// under its lock, and takes the lock again to cancel, on every request,
+/// while moving a registered timer to a later deadline takes none.
+async fn within<F: std::future::Future>(
+    mut timer: Pin<&mut tokio::time::Sleep>,
+    deadline: Option<tokio::time::Instant>,
+    fut: F,
+) -> Option<F::Output> {
+    use std::future::Future;
+    use std::task::Poll;
+    use tokio::task::coop::has_budget_remaining;
+    let Some(deadline) = deadline else {
+        return Some(fut.await);
+    };
+    timer.as_mut().reset(deadline);
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        let had_budget = has_budget_remaining();
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        // As timeout_at does: a future that spent the task's budget still
+        // has its deadline checked.
+        let expired = if had_budget && !has_budget_remaining() {
+            std::pin::pin!(tokio::task::coop::unconstrained(timer.as_mut())).poll(cx)
+        } else {
+            timer.as_mut().poll(cx)
+        };
+        expired.map(|()| None)
+    })
+    .await
 }
 
 /// L4 TLS passthrough of a connection whose ClientHello was peeked for its
@@ -3618,6 +3674,63 @@ mod connection_tests {
     }
 
     const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+    /// The backend budget times each request from its own start, whatever
+    /// the connection's last request left on its timer: a deadline still
+    /// pending, a later one, or one that passed while the connection idled.
+    #[tokio::test]
+    async fn the_backend_budget_runs_anew_for_each_request() {
+        const BUDGET: Duration = Duration::from_millis(300);
+        // Answers the first request of each connection, holds the rest.
+        let (addr, _delivered) = backend(OK.as_bytes()).await;
+        let routes = || {
+            let mut rt = RouteTable::new();
+            for (host, budget) in [("a.test", BUDGET), ("l.test", BUDGET * 20)] {
+                let backend = Backend {
+                    socket_addr: addr,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
+                };
+                let path = "/".to_string();
+                let mut rule = HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    path,
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![backend],
+                );
+                rule.backend_request_timeout = Some(budget);
+                rt.add_http_route(host, rule);
+            }
+            rt
+        };
+        let get_l: &[u8] = b"GET / HTTP/1.1\r\nHost: l.test\r\n\r\n";
+        for (first, idle) in [
+            (GET_A, Duration::ZERO),
+            (GET_A, BUDGET * 2 / 3),
+            (GET_A, BUDGET * 2),
+            (get_l, Duration::ZERO),
+        ] {
+            let (mut client, _task) = serve(routes());
+            client.write_all(first).await.unwrap();
+            assert_eq!(response(&mut client).await, OK);
+            tokio::time::sleep(idle).await;
+            let started = std::time::Instant::now();
+            client.write_all(GET_A).await.unwrap();
+            let out = response(&mut client).await;
+            let waited = started.elapsed();
+            assert!(out.starts_with("HTTP/1.1 504 "), "{out}");
+            let first = String::from_utf8_lossy(first);
+            assert!(
+                waited >= BUDGET && waited < BUDGET * 5,
+                "504 after {waited:?}, {idle:?} after {first}"
+            );
+        }
+    }
 
     /// Node's https server closes an idle keep-alive conn after 5s with
     /// close_notify and FIN. A pooled TLS conn was never probed, so every
