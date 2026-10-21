@@ -295,9 +295,14 @@ pub async fn run_controller(
     // swap the route table only when the resolved set changes. This is why the
     // cluster-wide EndpointSlice watch is unnecessary — DNS already publishes the
     // per-pod A-records, so pod churn is picked up here without an apiserver watch.
+    let health = match ctx.data_plane.lock() {
+        Ok(dp) => dp.health().clone(),
+        Err(poisoned) => poisoned.into_inner().health().clone(),
+    };
     crate::kubernetes::dns_refresh::spawn_dns_refresh(
         config_cell,
         ctx.routes.clone(),
+        health,
         ctx.performance_config.dns_refresh_interval,
         shutdown.clone(),
     );

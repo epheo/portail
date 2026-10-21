@@ -21,17 +21,20 @@
 //! attempts used to park the backend at 503 until the process restarted, even
 //! after it came back (a Service that gained its first endpoints hours later).
 //! The probe instead backs off to `PROBE_MAX_INTERVAL` and keeps going until the
-//! backend answers or `clear()` drops the entry.
+//! backend answers or a route-table swap prunes the entry, which aborts it.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::TcpStream;
+use tokio::task::AbortHandle;
 
 use crate::logging::{debug, info, warn};
+use crate::routing::RouteTable;
 
 // Status constants — module-private; callers use `is_healthy()` only.
 const STATUS_HEALTHY: u8 = 0;
@@ -43,8 +46,8 @@ const STATUS_PROBING: u8 = 2;
 pub const FAILURE_THRESHOLD: u32 = 3;
 /// Delay before the first probe; doubles after every failed probe.
 const PROBE_INITIAL_INTERVAL: Duration = Duration::from_secs(10);
-/// Backoff ceiling. One TCP connect per backend per five minutes is the cost of
-/// never abandoning a backend, including one that left the config for good.
+/// Backoff ceiling. One TCP connect per parked backend per five minutes is the
+/// cost of never abandoning one.
 const PROBE_MAX_INTERVAL: Duration = Duration::from_secs(300);
 /// Timeout for each individual probe TCP connect.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +63,9 @@ struct BackendHealth {
     /// Read with Acquire, written with Release to establish happens-before
     /// between probe success and subsequent `is_healthy` reads.
     status: AtomicU8,
+    /// Aborted when the entry leaves the map, so a pruned backend is not
+    /// probed forever and a recycled address starts without the old probe.
+    probe: Mutex<Option<AbortHandle>>,
 }
 
 impl BackendHealth {
@@ -67,6 +73,16 @@ impl BackendHealth {
         Self {
             consecutive_failures: AtomicU32::new(0),
             status: AtomicU8::new(STATUS_HEALTHY),
+            probe: Mutex::new(None),
+        }
+    }
+}
+
+impl Drop for BackendHealth {
+    fn drop(&mut self) {
+        let probe = self.probe.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(probe) = probe.take() {
+            probe.abort();
         }
     }
 }
@@ -75,11 +91,12 @@ pub struct HealthRegistry {
     backends: DashMap<SocketAddr, BackendHealth>,
     /// When false, `backends` is empty and the per-request calls skip it:
     /// DashMap's `len()`/`is_empty()` read-lock every shard and `get()` locks
-    /// one. Raised after an insert and lowered before a clear, never the
-    /// reverse, so no entry outlives a lowered flag; a racing reader at worst
-    /// sees a just-inserted entry as untracked, i.e. healthy, as it was before
-    /// its first failure. Relaxed throughout: the flag publishes no data, the
-    /// map's own locks order the entries.
+    /// one. Raised after every insert; lowered only by `prune` once the map is
+    /// empty, which then looks again and re-raises it for a racing insert. So
+    /// no entry outlives a lowered flag; a racing reader at worst sees a
+    /// just-inserted entry as untracked, i.e. healthy, as it was before its
+    /// first failure. Relaxed throughout: the flag publishes no data, the map's
+    /// own locks order the entries.
     tracked: AtomicBool,
 }
 
@@ -97,11 +114,25 @@ impl HealthRegistry {
         Self::default()
     }
 
-    /// Remove all tracked backend health state.
-    /// Called on config reload to prevent stale entries from blocking new backends.
-    pub fn clear(&self) {
-        self.tracked.store(false, Ordering::Relaxed);
-        self.backends.clear();
+    /// Drop the state of every backend `table` no longer routes to, aborting
+    /// its probe. Call after every swap of the live table: nothing else
+    /// removes an entry, so under pod churn the map and its probes grew without
+    /// bound, and a recycled pod IP inherited the old pod's ejection. Backends
+    /// that stay keep their state. A request still running on the previous
+    /// table can re-insert a pruned address; the next swap drops it again.
+    pub fn prune(&self, table: &RouteTable) {
+        if !self.tracked.load(Ordering::Relaxed) {
+            return;
+        }
+        let routed = routed_addrs(table);
+        self.backends.retain(|addr, _| routed.contains(addr));
+        if self.backends.is_empty() {
+            self.tracked.store(false, Ordering::Relaxed);
+            // Not redundant: see `tracked`.
+            if !self.backends.is_empty() {
+                self.tracked.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Returns `true` if the backend is considered healthy.
@@ -203,9 +234,19 @@ impl HealthRegistry {
     /// Call this only when [`record_failure`] returns `true`.
     pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr) {
         info!("Spawning recovery probe for backend {}", addr);
-        tokio::spawn(async move {
-            Self::run_probe(registry, addr).await;
-        });
+        let probe = tokio::spawn(Self::run_probe(Arc::clone(&registry), addr)).abort_handle();
+        match registry.backends.get(&addr) {
+            Some(entry) => {
+                let mut slot = entry.probe.lock().unwrap_or_else(PoisonError::into_inner);
+                // A probe from an earlier episode, still asleep after a passive
+                // recovery, would otherwise keep probing beside this one.
+                if let Some(stale) = slot.replace(probe) {
+                    stale.abort();
+                }
+            }
+            // Pruned since the failure that asked for this probe.
+            None => probe.abort(),
+        }
     }
 
     async fn run_probe(registry: Arc<Self>, addr: SocketAddr) {
@@ -215,8 +256,8 @@ impl HealthRegistry {
             tokio::time::sleep(interval).await;
             attempt += 1;
 
-            // `clear()` dropped the entry, or an in-flight request already
-            // recorded a passive success: nothing left to probe.
+            // Pruned (its abort may not have landed yet), or an in-flight
+            // request already recorded a passive success: nothing to probe.
             let still_probing = registry
                 .backends
                 .get(&addr)
@@ -269,9 +310,43 @@ impl HealthRegistry {
     }
 }
 
+/// Every backend address `table` routes to. Must cover each backend list
+/// `RouteTable::dns_signature` covers, or every swap would wipe the state of
+/// the backends it misses.
+fn routed_addrs(table: &RouteTable) -> HashSet<SocketAddr> {
+    let http = table.listener_scopes.values().flatten().flat_map(|scope| {
+        scope
+            .http_routes
+            .values()
+            .chain(scope.wildcard_http_routes.values())
+            .chain(scope.catch_all_http_routes.iter())
+            .flatten()
+            .flat_map(|rule| &rule.backends)
+    });
+    let l4 = table
+        .tcp_routes
+        .values()
+        .chain(table.udp_routes.values())
+        .chain(
+            table
+                .tls_routes
+                .values()
+                .flat_map(|by_host| by_host.values()),
+        )
+        .chain(
+            table
+                .wildcard_tls_routes
+                .values()
+                .flat_map(|by_host| by_host.values()),
+        )
+        .flatten();
+    http.chain(l4).map(|b| b.socket_addr).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::{Backend, HttpRouteRule, PathMatchType};
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{}", port).parse().unwrap()
@@ -360,14 +435,14 @@ mod tests {
         );
         r.record_failure(a);
         assert!(r.tracked.load(Ordering::Relaxed));
-        r.clear();
+        r.prune(&RouteTable::new());
         assert!(!r.tracked.load(Ordering::Relaxed));
         assert!(r.is_healthy(&a));
     }
 
     /// Whatever the interleaving, an entry left in the map must sit behind a
     /// raised flag, or an unhealthy backend would read healthy indefinitely.
-    /// Each round races ONE failure against ONE clear, so no later failure
+    /// Each round races ONE failure against ONE prune, so no later failure
     /// can re-raise the flag and mask a bad interleaving.
     #[test]
     fn test_no_entry_survives_behind_lowered_flag() {
@@ -389,7 +464,7 @@ mod tests {
         let writer = racer(|r| {
             r.record_failure(addr(8087));
         });
-        let clearer = racer(HealthRegistry::clear);
+        let pruner = racer(|r| r.prune(&RouteTable::new()));
         for _ in 0..ROUNDS {
             start.wait();
             done.wait();
@@ -398,7 +473,7 @@ mod tests {
             }
         }
         writer.join().unwrap();
-        clearer.join().unwrap();
+        pruner.join().unwrap();
     }
 
     #[test]
@@ -423,12 +498,107 @@ mod tests {
         assert!(r.record_failure(a));
     }
 
+    fn tcp_table(ports: &[u16]) -> RouteTable {
+        let mut t = RouteTable::new();
+        let backends = ports.iter().map(|&p| backend(p)).collect();
+        t.add_tcp_route(7000, backends);
+        t
+    }
+
+    fn backend(port: u16) -> Backend {
+        Backend::new("127.0.0.1".into(), port).unwrap()
+    }
+
+    #[test]
+    fn test_prune_drops_only_departed_backends() {
+        let r = HealthRegistry::new();
+        let (gone, kept) = (addr(8088), addr(8089));
+        park(&r, gone);
+        park(&r, kept);
+        r.prune(&tcp_table(&[8089]));
+        assert!(r.backends.get(&gone).is_none());
+        assert!(
+            !r.is_healthy(&kept),
+            "a surviving backend keeps its ejection"
+        );
+        assert!(r.tracked.load(Ordering::Relaxed));
+    }
+
+    /// A pod IP recycled to a new pod must not inherit the old pod's ejection.
+    #[test]
+    fn test_recycled_address_starts_healthy() {
+        let r = HealthRegistry::new();
+        let a = addr(8090);
+        park(&r, a);
+        r.prune(&tcp_table(&[]));
+        assert!(
+            !r.tracked.load(Ordering::Relaxed),
+            "an emptied map lowers the flag"
+        );
+        r.prune(&tcp_table(&[8090]));
+        assert!(r.is_healthy(&a));
+    }
+
+    #[test]
+    fn test_prune_keeps_backends_of_every_route_kind() {
+        let mut t = RouteTable::new();
+        for (host, port) in [
+            ("a.example.com", 8101),
+            ("*.example.net", 8102),
+            ("*", 8103),
+        ] {
+            t.add_http_route(
+                host,
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".into(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![backend(port)],
+                ),
+            );
+        }
+        t.add_tcp_route(7001, vec![backend(8104)]);
+        t.add_udp_route(7002, vec![backend(8105)]);
+        t.add_tls_route(7003, "b.example.com", vec![backend(8106)]);
+        t.add_tls_route(7003, "*.example.org", vec![backend(8107)]);
+
+        let r = HealthRegistry::new();
+        for port in 8101..=8108 {
+            park(&r, addr(port));
+        }
+        r.prune(&t);
+        for port in 8101..=8107 {
+            assert!(!r.is_healthy(&addr(port)), "backend on {} was pruned", port);
+        }
+        assert!(r.backends.get(&addr(8108)).is_none());
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn test_probe_stops_when_entry_cleared() {
+    async fn test_prune_aborts_probe() {
+        let r = Arc::new(HealthRegistry::new());
+        let a = addr(8091);
+        park(&r, a);
+        HealthRegistry::spawn_probe(Arc::clone(&r), a);
+        r.prune(&RouteTable::new());
+        // The sleeping probe holds the only other reference. Time cannot
+        // advance while this task keeps yielding, so only an abort frees it.
+        for _ in 0..10 {
+            if Arc::strong_count(&r) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("probe still running after its entry was pruned");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_stops_when_entry_pruned() {
         let r = Arc::new(HealthRegistry::new());
         let a = addr(8085);
         park(&r, a);
-        r.clear();
+        r.prune(&RouteTable::new());
         // Paused time auto-advances through the probe sleeps; the loop must
         // notice the missing entry and return instead of probing forever.
         tokio::time::timeout(
