@@ -285,7 +285,7 @@ impl Sessions {
             return false;
         }
         if session.generation != generation {
-            let routed = table.find_udp_backends(port).is_ok_and(|backends| {
+            let routed = table.find_udp_backends(port).is_some_and(|backends| {
                 backends
                     .iter()
                     .any(|b| b.weight > 0 && b.socket_addr == session.backend_addr)

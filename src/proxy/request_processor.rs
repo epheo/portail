@@ -447,19 +447,16 @@ fn analyze_l4_request<'a>(
     backend_selector: &BackendSelector,
     server_port: u16,
     proto: &str,
-    lookup: impl FnOnce(u16) -> Result<&'a Vec<Backend>>,
+    lookup: impl FnOnce(u16) -> Option<&'a Vec<Backend>>,
     make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
-    let backend_list = match lookup(server_port) {
-        Ok(list) => list,
-        Err(_) => {
-            error!(
-                "{} routing failed for port {}: no route configured",
-                proto, server_port
-            );
-            return Ok(RoutingResult::CloseConnection);
-        }
+    let Some(backend_list) = lookup(server_port) else {
+        error!(
+            "{} routing failed for port {}: no route configured",
+            proto, server_port
+        );
+        return Ok(RoutingResult::CloseConnection);
     };
 
     if backend_list.is_empty() {

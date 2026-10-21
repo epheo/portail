@@ -715,7 +715,7 @@ mod tests {
         let backend_port = |port| rt.find_tcp_backends(port).unwrap()[0].socket_addr.port();
         assert_eq!(backend_port(5432), 7001);
         assert_eq!(backend_port(6379), 7001);
-        assert!(rt.find_tcp_backends(8080).is_err());
+        assert!(rt.find_tcp_backends(8080).is_none());
     }
 
     #[test]

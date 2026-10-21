@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -231,12 +230,11 @@ impl RouteTable {
         self.tcp_routes.contains_key(&server_port)
     }
 
+    /// A miss carries nothing, as for `find_http_route`: a port with no
+    /// route meets one per connection.
     #[inline(always)]
-    pub fn find_tcp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
-        if let Some(backend_list) = self.tcp_routes.get(&server_port) {
-            return Ok(backend_list);
-        }
-        Err(anyhow!("No TCP route found for port {}", server_port))
+    pub fn find_tcp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
+        self.tcp_routes.get(&server_port)
     }
 
     /// Match rules: method first (fastest reject), then exact path before longest prefix,
@@ -308,12 +306,11 @@ impl RouteTable {
         None
     }
 
+    /// A miss carries nothing: a port with no route meets one per datagram,
+    /// spoofed ones included.
     #[inline(always)]
-    pub fn find_udp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
-        if let Some(backend_list) = self.udp_routes.get(&server_port) {
-            return Ok(backend_list);
-        }
-        Err(anyhow!("No UDP route found for port {}", server_port))
+    pub fn find_udp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
+        self.udp_routes.get(&server_port)
     }
 
     /// Look up the TLS-route backends for an SNI hostname on a port: exact

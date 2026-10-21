@@ -8,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use portail::proxy::health::HealthRegistry;
-use portail::proxy::request_processor::{analyze_request, RoutingResult};
+use portail::proxy::request_processor::{analyze_request, analyze_udp_request, RoutingResult};
 use portail::routing::{
     Backend, BackendAction, BackendSelector, HttpRouteRule, PathMatchType, RouteTable,
 };
@@ -116,6 +116,21 @@ fn a_routed_request_allocates_nothing() {
         });
         assert_eq!(n, 0, "{}", String::from_utf8_lossy(req));
     }
+}
+
+/// Once per datagram on a UDP port with no route, spoofed ones included,
+/// and once per connection on a TCP one.
+#[test]
+fn an_unrouted_l4_port_allocates_nothing() {
+    let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
+    let tls_hello = [0x16, 0x03, 0x01, 0x00, 0xf4, 0x01, 0x00, 0x00];
+    let n = allocations(|| {
+        let udp = analyze_udp_request(&rt, &sel, 5353, &health).unwrap();
+        let tcp = analyze_request(&rt, &sel, &tls_hello, 5432, &health, false).unwrap();
+        assert!(matches!(udp, RoutingResult::CloseConnection));
+        assert!(matches!(tcp, RoutingResult::CloseConnection));
+    });
+    assert_eq!(n, 0);
 }
 
 #[test]

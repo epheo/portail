@@ -3116,7 +3116,6 @@ fn tcp_route(
 fn tcp_backend_port(table: &RouteTable, port: u16) -> Option<u16> {
     table
         .find_tcp_backends(port)
-        .ok()
         .map(|b| b[0].socket_addr.port())
 }
 
