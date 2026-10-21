@@ -204,6 +204,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
 
     // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
+    let mut controller = None;
     if args.kubernetes {
         let k8s_routes = routes.clone();
         let controller_name = args.controller_name.clone();
@@ -226,23 +227,17 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
             shutdown_token.clone(),
         ));
 
-        tokio::spawn(async move {
-            if let Err(e) = kubernetes::controller::run_controller(
-                k8s_routes,
-                controller_name,
-                token,
-                k8s_data_plane,
-                k8s_perf,
-                manage_gateway_status,
-                ready_flag,
-                gateway_scope,
-                watch_shape,
-            )
-            .await
-            {
-                error!("Kubernetes controller failed: {}", e);
-            }
-        });
+        controller = Some(tokio::spawn(kubernetes::controller::run_controller(
+            k8s_routes,
+            controller_name,
+            token,
+            k8s_data_plane,
+            k8s_perf,
+            manage_gateway_status,
+            ready_flag,
+            gateway_scope,
+            watch_shape,
+        )));
         info!("Kubernetes Gateway API controller started");
     } else {
         // Standalone admin endpoint (/metrics + /readyz) is opt-in: there is
@@ -277,18 +272,39 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // ignored: every pod sat out its full terminationGracePeriod and died by
     // SIGKILL, holding its (host-network) ports for those 30s and stalling
     // every rollout behind EADDRINUSE retries.
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+    //
+    // A controller that stops on its own is a failure: the pod would sit
+    // NotReady forever while /livez answers, so the process exits non-zero
+    // for kubelet to restart it.
+    let controller_exit = async {
+        match controller {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    };
+    let failure = tokio::select! {
+        // Signals first: kube's own SIGTERM handling also ends the
+        // controller, and that is a shutdown, not a failure.
+        biased;
+        _ = tokio::signal::ctrl_c() => None,
+        _ = sigterm.recv() => None,
+        exit = controller_exit => Some(match exit {
+            Ok(Ok(())) => anyhow::anyhow!("Kubernetes controller stopped"),
+            Ok(Err(e)) => e.context("Kubernetes controller failed"),
+            Err(e) => anyhow::anyhow!("Kubernetes controller task failed: {}", e),
+        }),
+    };
+    match &failure {
+        None => info!("Received shutdown signal"),
+        Some(e) => error!("{:#}", e),
     }
-    info!("Received shutdown signal");
     shutdown_token.cancel();
 
     info!("Shutting down Portail");
     drain.run().await;
 
     info!("Portail shutdown complete");
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 /// Handle validation modes (--validate-only, --check-config). `config` is
