@@ -85,7 +85,7 @@ metrics! {
     pool_stale_discards_total: "Idle pool connections found dead at checkout and discarded",
     pool_overflow_drops_total: "Connections dropped at check-in because the pool was full",
     pool_stale_retries_total: "Requests replayed on a fresh connection after a pooled one died before answering",
-    udp_session_overflow_drops_total: "UDP datagrams dropped because their listener was at udpMaxSessions",
+    udp_session_overflow_drops_total: "UDP datagrams dropped because their listener was at its session cap",
     dns_refresh_swaps_total: "DNS refresh passes that installed a changed backend set",
     dns_refresh_superseded_total: "DNS refresh passes dropped because a reconcile swapped concurrently",
     dns_refresh_unchanged_total: "DNS refresh passes with an unchanged backend set",

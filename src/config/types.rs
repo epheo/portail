@@ -598,9 +598,9 @@ pub struct PerformanceConfig {
     /// Concurrent UDP sessions per listener socket; datagrams that would open
     /// one more are dropped. Each session holds an fd, a task, a 64KiB reply
     /// buffer and an ephemeral port, and a session per spoofed source address
-    /// costs an attacker nothing. Unset, each listener gets a quarter of the
-    /// fd budget (the `RLIMIT_NOFILE` soft limit), leaving the rest for TCP:
-    /// a fixed default would cut off UDP workloads larger than it, and
+    /// costs an attacker nothing. Unset, all listeners together get a quarter
+    /// of the fd budget (the `RLIMIT_NOFILE` soft limit), leaving the rest for
+    /// TCP: a fixed default would cut off UDP workloads larger than it, and
     /// Kubernetes mode cannot override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_max_sessions: Option<usize>,
