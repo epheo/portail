@@ -24,6 +24,13 @@ pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether `data` holds a whole head. A read that ends a bodyless request
+/// ends with its blank line, which spares the scan.
+#[inline]
+pub(crate) fn has_header_end(data: &[u8]) -> bool {
+    data.ends_with(b"\r\n\r\n") || find_header_end(data).is_some()
+}
+
 pub const MAX_STRIP_SPANS: usize = 8;
 
 /// Byte spans (start..end, CRLF inclusive) of hop-by-hop header lines,
@@ -726,6 +733,23 @@ mod tests {
         }
         check(VALUE, 0x20, VALUE_HOLES);
         check(TARGET, 0x21, TARGET_HOLES);
+    }
+
+    #[test]
+    fn a_head_is_whole_wherever_its_blank_line_sits() {
+        for data in [
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\n\r\nbody",
+            b"GET / HTTP/1.1\r\n\r",
+            b"\r\n\r\n",
+            b"",
+        ] {
+            assert_eq!(
+                has_header_end(data),
+                find_header_end(data).is_some(),
+                "{data:?}"
+            );
+        }
     }
 
     /// The config validator, the chunked observer and the h2 bridge judge
