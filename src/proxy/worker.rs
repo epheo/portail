@@ -25,7 +25,7 @@ use crate::proxy::http_filters::{
     extract_url_rewrite, header_lines, sanitize_response_headers, to_origin_form,
     HeaderModifications, MIRROR_BODY_MAX,
 };
-use crate::proxy::http_parser::{find_header_end, parse_digits, trim_ows};
+use crate::proxy::http_parser::{find_header_end, is_token, parse_digits, trim_ows};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::request_processor::{
     analyze_request, is_http_request, LocalReply, RequestMeta, RoutingResult,
@@ -2772,6 +2772,12 @@ mod connection_tests {
                 "{status_line}"
             );
         }
+        // A header line without a field name fails the same way.
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\nContent-Length 5\r\n\r\nhello").await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{out}");
+
         // A reason phrase is optional, its SP too.
         for status_line in ["HTTP/1.1 200", "HTTP/1.1 200 ", "HTTP/1.0 200 OK"] {
             let reply = format!("{status_line}\r\nContent-Length: 5\r\n\r\nhello");
@@ -2866,8 +2872,8 @@ pub(crate) struct ResponseHead {
 /// reading: a status line other than `HTTP/1.x SP 3DIGIT [SP reason]`, a
 /// Content-Length other than one `1*DIGIT` value (repeated lines must
 /// agree), Transfer-Encoding on HTTP/1.0, or a line a client could split or
-/// name otherwise (bare CR, obs-fold, whitespace or a CTL in a field name).
-/// Lines are split exactly as the sanitizer splits them.
+/// name otherwise (bare CR, no colon, a field name that is no token, which
+/// covers obs-fold). Lines are split exactly as the sanitizer splits them.
 pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
     let mut lines = header_lines(head);
     let (status, is_http10) = parse_status_line(lines.next()?)?;
@@ -2876,14 +2882,12 @@ pub(crate) fn parse_response_head(head: &[u8]) -> Option<ResponseHead> {
     let (mut close, mut keep_alive) = (false, false);
 
     for line in lines {
-        if matches!(line[0], b' ' | b'\t') || memchr::memchr(b'\r', line).is_some() {
+        if memchr::memchr(b'\r', line).is_some() {
             return None;
         }
-        let Some(colon) = memchr::memchr(b':', line) else {
-            continue;
-        };
+        let colon = memchr::memchr(b':', line)?;
         let (name, value) = (&line[..colon], &line[colon + 1..]);
-        if name.is_empty() || name.iter().any(|&b| b <= b' ' || b == 0x7f) {
+        if !is_token(name) {
             return None;
         }
         if name.eq_ignore_ascii_case(b"content-length") {
@@ -3166,6 +3170,14 @@ mod tests {
             "Content-Length: 5\r\r\n",
             "Transfer-Encoding: gzip,\r\n chunked\r\n",
             "X-A: 1\r\n\tContent-Length: 5\r\n",
+            // A line with no field name a client agrees on: forwarded, it
+            // could be read as anything, including a framing header.
+            "Content-Length 5\r\n",
+            "X-A\r\n",
+            "X(A): 1\r\n",
+            "X@A: 1\r\n",
+            "\"X\": 1\r\n",
+            "X\u{e9}: 1\r\n",
         ] {
             assert_eq!(head_framing(fields), None, "{fields:?}");
         }
