@@ -622,7 +622,7 @@ fn test_exact_beats_regex_precedence() {
 fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketAddr> {
     let selector = BackendSelector::new();
     let health = crate::proxy::health::HealthRegistry::new();
-    rt.resolve_tls_passthrough(Some(sni), port, &selector, &health)
+    rt.resolve_tls_passthrough(Some(sni), port, None, &selector, &health)
         .ok()
 }
 
@@ -656,7 +656,7 @@ fn passthrough_miss_tells_no_backends_from_no_weight() {
         crate::proxy::health::HealthRegistry::new(),
     );
     let miss = |sni| {
-        rt.resolve_tls_passthrough(Some(sni), 8443, &selector, &health)
+        rt.resolve_tls_passthrough(Some(sni), 8443, None, &selector, &health)
             .unwrap_err()
     };
     assert_eq!(miss("empty.example.com"), PassthroughMiss::NoBackends);
@@ -753,7 +753,7 @@ fn test_tls_passthrough_round_robins_backends() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .unwrap()
                 .port(),
         );
@@ -774,7 +774,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     mark_unhealthy(&health, 9001);
     for _ in 0..4 {
         let addr = rt
-            .resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
+            .resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
             .unwrap();
         assert_eq!(addr.port(), 9002);
     }
@@ -783,7 +783,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .expect("all-unhealthy must fail open")
                 .port(),
         );

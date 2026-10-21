@@ -413,28 +413,58 @@ impl PortailConfig {
         self.convert_l4_routes(&mut route_table, &self.tcp_routes, false, &mut resolver)?;
         self.convert_l4_routes(&mut route_table, &self.udp_routes, true, &mut resolver)?;
 
-        // Convert TLS routes (SNI-based), scoped to the ports of the TLS
-        // listeners their parentRefs attach to. Without parentRefs
-        // (file-based configs) they land in the any-port (0) scope.
-        for tls_route in &self.tls_routes {
-            let matched_listeners = find_listeners_for_route(&tls_route.parent_refs, &self.gateway);
-            let mut ports: Vec<u16> = matched_listeners
-                .iter()
-                .filter(|l| l.protocol == Protocol::TLS)
-                .map(|l| l.port)
+        // Convert TLS routes (SNI-based), each into the scope of every TLS
+        // passthrough listener its parentRefs attach to, its hostnames
+        // intersected with the listener's as an HTTP route's are
+        // (TLSRoute.hostnames: the others "MUST be ignored"). Without
+        // parentRefs, one shared scope (port 0) every passthrough listener
+        // searches after its own.
+        for (route_idx, tls_route) in self.tls_routes.iter().enumerate() {
+            let mut scopes: Vec<(u16, Option<&str>)> = if tls_route.parent_refs.is_empty() {
+                vec![(0, None)]
+            } else {
+                find_listeners_for_route(&tls_route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| l.is_tls_passthrough())
+                    .map(|l| (l.port, l.hostname.as_deref()))
+                    .collect()
+            };
+            scopes.sort_unstable();
+            scopes.dedup();
+            let scopes: Vec<(u16, Option<&str>, Vec<String>)> = scopes
+                .into_iter()
+                .filter_map(|(port, listener_hostname)| {
+                    let hostnames = if tls_route.hostnames.is_empty() {
+                        vec![listener_hostname.unwrap_or("*").to_string()]
+                    } else {
+                        intersect_hostnames(listener_hostname, &tls_route.hostnames)
+                    };
+                    if hostnames.is_empty() {
+                        tracing::warn!(
+                            "TLS route {} has no hostnames within listener {:?} on port {}, skipping",
+                            route_idx,
+                            listener_hostname,
+                            port
+                        );
+                        return None;
+                    }
+                    Some((port, listener_hostname, hostnames))
+                })
                 .collect();
-            ports.sort_unstable();
-            ports.dedup();
-            if tls_route.parent_refs.is_empty() {
-                ports.push(0);
+            if scopes.is_empty() {
+                continue;
             }
 
             for rule in &tls_route.rules {
                 let backends = resolver.backends(&rule.backend_refs, "TLS")?;
-
-                for hostname in &tls_route.hostnames {
-                    for &port in &ports {
-                        route_table.add_tls_route(port, hostname, backends.clone());
+                for (port, listener_hostname, hostnames) in &scopes {
+                    for hostname in hostnames {
+                        route_table.add_tls_route_for_listener(
+                            *port,
+                            *listener_hostname,
+                            hostname,
+                            backends.clone(),
+                        );
                     }
                 }
             }
@@ -853,6 +883,79 @@ mod tests {
                 .find_http_route("a.example.com", "GET", "/", &[], "", port)
                 .is_none());
         }
+    }
+
+    /// TLSRoute.hostnames: "any TLSRoute hostnames that do not match the
+    /// Listener hostname MUST be ignored". They went into the table as
+    /// they were. A route with no hostnames matches its listener's, and
+    /// went nowhere.
+    #[test]
+    fn a_tls_route_matches_only_within_its_listener() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "p", "protocol": "TLS", "port": 8443, "hostname": "*.example.com",
+                 "tls": {"mode": "Passthrough"}},
+                {"name": "q", "protocol": "TLS", "port": 9443, "hostname": "db.example.org",
+                 "tls": {"mode": "Passthrough"}}
+            ]},
+            "tlsRoutes": [
+                {"parentRefs": [{"name": "g", "sectionName": "p"}],
+                 "hostnames": ["a.example.com", "b.other.org"],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]},
+                {"parentRefs": [{"name": "g", "sectionName": "q"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        let resolve = |sni, port, listener| {
+            rt.resolve_tls_passthrough(Some(sni), port, listener, &selector, &health)
+                .map(|addr| addr.port())
+        };
+        assert_eq!(
+            resolve("a.example.com", 8443, Some("*.example.com")),
+            Ok(7001)
+        );
+        assert_eq!(
+            resolve("b.other.org", 8443, Some("*.example.com")),
+            Err(crate::routing::PassthroughMiss::NoRoute)
+        );
+        assert_eq!(
+            resolve("db.example.org", 9443, Some("db.example.org")),
+            Ok(7002)
+        );
+    }
+
+    /// A TLS route without parentRefs is one scope every passthrough
+    /// listener searches after its own, on any port.
+    #[test]
+    fn a_tls_route_without_parent_refs_serves_every_passthrough_listener() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "p", "protocol": "TLS", "port": 8443, "hostname": "*.example.com",
+                 "tls": {"mode": "Passthrough"}},
+                {"name": "q", "protocol": "TLS", "port": 9443, "tls": {"mode": "Passthrough"}}
+            ]},
+            "tlsRoutes": [{"hostnames": ["s.example.com"],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        for (port, listener) in [(8443, Some("*.example.com")), (9443, None)] {
+            let backend = rt
+                .resolve_tls_passthrough(Some("s.example.com"), port, listener, &selector, &health)
+                .map(|addr| addr.port());
+            assert_eq!(backend, Ok(7001), "{port}");
+        }
+        assert_eq!(rt.tls_scopes.values().flatten().count(), 1);
     }
 
     #[test]
@@ -1850,7 +1953,10 @@ mod tests {
         vec![
             ("TCP", addrs(rt.find_tcp_backends(5432).unwrap())),
             ("UDP", addrs(rt.find_udp_backends(5353).unwrap())),
-            ("TLS", addrs(&rt.tls_routes[&8443]["s.example.com"])),
+            (
+                "TLS",
+                addrs(&rt.tls_scopes[&8443][0].exact["s.example.com"]),
+            ),
             ("mirror", mirror),
         ]
     }

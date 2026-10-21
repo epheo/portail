@@ -329,15 +329,10 @@ fn routed_addrs(table: &RouteTable) -> HashSet<SocketAddr> {
         .chain(table.udp_routes.values())
         .chain(
             table
-                .tls_routes
+                .tls_scopes
                 .values()
-                .flat_map(|by_host| by_host.values()),
-        )
-        .chain(
-            table
-                .wildcard_tls_routes
-                .values()
-                .flat_map(|by_host| by_host.values()),
+                .flatten()
+                .flat_map(crate::routing::TlsScope::backends),
         )
         .flatten();
     http.chain(l4).map(|b| b.socket_addr).collect()

@@ -1115,7 +1115,12 @@ mod tests {
                 backend.local_addr().unwrap().port(),
             )
             .unwrap();
-            table.add_tls_route(port, "secure.example.org", vec![forward]);
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward],
+            );
             let routes = Arc::new(ArcSwap::from_pointee(table));
             let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
             bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
@@ -1351,7 +1356,12 @@ mod tests {
                 reversed,
             );
             let mut table = RouteTable::new();
-            table.add_tls_route(port, "secure.example.org", vec![forward]);
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward],
+            );
             let _dp = serve(&listeners, table).await;
             for sni in [None, Some("other.example.org")] {
                 assert_eq!(presented(port, sni).await, Ok(der(&cert.0)), "{sni:?}");
@@ -1396,13 +1406,44 @@ mod tests {
                 reversed,
             );
             let mut table = RouteTable::new();
-            table.add_tls_route(port, "secure.example.org", vec![forward.clone()]);
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward.clone()],
+            );
             table.add_tcp_route(port, vec![forward]);
             let _dp = serve(&listeners, table).await;
             for sni in [None, Some("other.example.org")] {
                 assert_eq!(hello_reaches(port, sni, &backend).await, None, "{sni:?}");
             }
         }
+    }
+
+    /// A TLS route without parentRefs serves passthrough listeners only:
+    /// on a port of HTTPS listeners alone it took any SNI it named from
+    /// them, and forwarded raw what they should have terminated.
+    #[tokio::test]
+    async fn a_tls_route_without_parent_refs_never_takes_an_https_port() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("s.example.com") else {
+            return; // openssl unavailable
+        };
+        let (backend, forward) = test_backend().await;
+        let port = free_port();
+        let mut table = RouteTable::new();
+        table.add_tls_route(0, "s.example.com", vec![forward]);
+        let _dp = serve(&[https_with_cert(port, None, &cert)], table).await;
+        assert_eq!(
+            presented(port, Some("s.example.com")).await,
+            Ok(der(&cert.0))
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, backend.accept())
+                .await
+                .is_err(),
+            "nothing forwarded"
+        );
     }
 
     /// A backend the test holds, and a route's forward to it.
@@ -1429,7 +1470,12 @@ mod tests {
             https_with_cert(port, Some("a.example.com"), &cert),
         ];
         let mut table = RouteTable::new();
-        table.add_tls_route(port, "*.example.com", vec![forward]);
+        table.add_tls_route_for_listener(
+            port,
+            Some("*.example.com"),
+            "*.example.com",
+            vec![forward],
+        );
         let _dp = serve(&listeners, table).await;
         assert_eq!(
             presented(port, Some("a.example.com")).await,

@@ -490,6 +490,7 @@ async fn serve_tls_connection(
             let _ = handle_tls_passthrough(
                 tcp_stream,
                 sni.as_deref(),
+                listener.hostname.as_deref(),
                 server_port,
                 routes,
                 health,
@@ -2442,10 +2443,13 @@ fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> 
 }
 
 /// L4 TLS passthrough of a connection whose ClientHello was peeked for its
-/// `sni` (lowercase): forward raw TCP to its route's backend.
+/// `sni` (lowercase), which selected the passthrough listener with
+/// hostname `listener`: forward raw TCP to its route's backend.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tls_passthrough(
     client: TcpStream,
     sni: Option<&str>,
+    listener: Option<&str>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
@@ -2454,7 +2458,7 @@ async fn handle_tls_passthrough(
 ) -> Result<()> {
     let route_table = routes.load();
     let backend_addr = route_table
-        .resolve_tls_passthrough(sni, server_port, &selector, &health)
+        .resolve_tls_passthrough(sni, server_port, listener, &selector, &health)
         .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
 
     // The peek consumed nothing, so the ClientHello is still on the socket:
@@ -3264,11 +3268,19 @@ mod connection_tests {
             let (server, _) = listener.accept().await.unwrap();
             let routes = Arc::clone(&routes);
             let (health, selector) = (Arc::default(), Arc::default());
-            let err =
-                handle_tls_passthrough(server, Some(sni), 8443, routes, health, selector, &cfg)
-                    .await
-                    .unwrap_err()
-                    .to_string();
+            let err = handle_tls_passthrough(
+                server,
+                Some(sni),
+                None,
+                8443,
+                routes,
+                health,
+                selector,
+                &cfg,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(err.contains(why), "{sni}: {err}");
         }
     }

@@ -3457,11 +3457,23 @@ fn https_and_tls_passthrough_share_a_port() {
         crate::proxy::health::HealthRegistry::new(),
     );
     let backend = table
-        .resolve_tls_passthrough(Some("secure.example.com"), 443, &selector, &health)
+        .resolve_tls_passthrough(
+            Some("secure.example.com"),
+            443,
+            Some("secure.example.com"),
+            &selector,
+            &health,
+        )
         .unwrap();
     assert_eq!(backend.port(), 7001);
     assert!(table
-        .resolve_tls_passthrough(Some("app.example.com"), 443, &selector, &health)
+        .resolve_tls_passthrough(
+            Some("app.example.com"),
+            443,
+            Some("secure.example.com"),
+            &selector,
+            &health
+        )
         .is_err());
 }
 
@@ -3656,7 +3668,7 @@ fn oldest_tls_route_owns_its_hostname() {
         let snapshot = test_snapshot(vec![], vec![], routes, vec![], &default_ns_labels(), vec![]);
         let (_, table) = reconcile_table(&gw, &snapshot);
         let backend = table
-            .resolve_tls_passthrough(Some("secure.example.com"), 6443, &selector, &health)
+            .resolve_tls_passthrough(Some("secure.example.com"), 6443, None, &selector, &health)
             .unwrap();
         assert_eq!(backend.port(), 7001);
     }

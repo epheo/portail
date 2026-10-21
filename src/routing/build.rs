@@ -75,8 +75,7 @@ impl RouteTable {
             any_port_http: None,
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
-            tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
-            wildcard_tls_routes: FnvHashMap::with_capacity_and_hasher(8, Default::default()),
+            tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
         }
     }
 
@@ -111,14 +110,10 @@ impl RouteTable {
             .values()
             .chain(self.udp_routes.values())
             .chain(
-                self.tls_routes
+                self.tls_scopes
                     .values()
-                    .flat_map(|by_host| by_host.values()),
-            )
-            .chain(
-                self.wildcard_tls_routes
-                    .values()
-                    .flat_map(|by_host| by_host.values()),
+                    .flatten()
+                    .flat_map(TlsScope::backends),
             )
             .flatten()
             .map(|b| b.socket_addr);
@@ -259,16 +254,50 @@ impl RouteTable {
         insert_first(&mut self.udp_routes, port, backends)
     }
 
-    /// Register a TLS passthrough route on a listener port. Port 0 means
-    /// any-port (file-based configs without gateway context). The first
-    /// registration of a hostname on a port wins, as for TCP.
+    /// [`Self::add_tls_route_for_listener`] on the port's listener without
+    /// a hostname. Port 0: every passthrough listener's shared routes.
     pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) -> bool {
-        let host_lower = hostname.to_ascii_lowercase();
-        let (by_port, host_key) = match host_lower.strip_prefix("*.") {
-            Some(parent) => (&mut self.wildcard_tls_routes, parent.to_string()),
-            None => (&mut self.tls_routes, host_lower),
+        self.add_tls_route_for_listener(port, None, hostname, backends)
+    }
+
+    /// Register a TLS passthrough route for `route_host` (`*` for any SNI,
+    /// and none) within the listener on `port` with `listener_hostname`.
+    /// The first registration of a hostname in a listener wins, as for TCP.
+    pub fn add_tls_route_for_listener(
+        &mut self,
+        port: u16,
+        listener_hostname: Option<&str>,
+        route_host: &str,
+        backends: Vec<Backend>,
+    ) -> bool {
+        let listener_hostname = listener_hostname.map(str::to_ascii_lowercase);
+        let scopes = self.tls_scopes.entry(port).or_default();
+        let scope = match scopes
+            .iter()
+            .position(|s| s.listener_hostname == listener_hostname)
+        {
+            Some(i) => &mut scopes[i],
+            None => {
+                scopes.push(TlsScope {
+                    listener_hostname,
+                    ..TlsScope::default()
+                });
+                scopes.last_mut().unwrap()
+            }
         };
-        insert_first(by_port.entry(port).or_default(), host_key, backends)
+        let host_lower = route_host.to_ascii_lowercase();
+        if host_lower == "*" {
+            if scope.catch_all.is_some() {
+                return false;
+            }
+            scope.catch_all = Some(backends);
+            return true;
+        }
+        let (by_host, host_key) = match host_lower.strip_prefix("*.") {
+            Some(parent) => (&mut scope.wildcard, parent.to_string()),
+            None => (&mut scope.exact, host_lower),
+        };
+        insert_first(by_host, host_key, backends)
     }
 }
 
