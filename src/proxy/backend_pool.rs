@@ -35,12 +35,20 @@ use tokio::net::TcpStream;
 
 /// Client TLS connector that skips certificate verification.
 /// Backend services in k8s typically use self-signed certs.
-fn new_tls_connector() -> Arc<tokio_rustls::TlsConnector> {
-    let client_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    Arc::new(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
+///
+/// One per process, built on the first TLS connect: it holds no config, and
+/// building it was most of a churned connection's allocations. Its session
+/// cache goes with it, so backend sessions resume across client connections,
+/// as the process-wide pool's already did.
+fn tls_connector() -> &'static tokio_rustls::TlsConnector {
+    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
+    CONNECTOR.get_or_init(|| {
+        let client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(client_config))
+    })
 }
 
 /// Idle conns to one backend address. One addr can be reachable both plain
@@ -235,7 +243,6 @@ pub(crate) async fn connect_tcp(
 }
 
 async fn connect_new(
-    tls_connector: &tokio_rustls::TlsConnector,
     connect_timeout: Duration,
     addr: SocketAddr,
     use_tls: bool,
@@ -251,7 +258,7 @@ async fn connect_new(
             .unwrap_or_else(|_| {
                 rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
             });
-        let tls_stream = tls_connector.connect(domain, tcp).await.map_err(|e| {
+        let tls_stream = tls_connector().connect(domain, tcp).await.map_err(|e| {
             ConnectError::Backend(anyhow::anyhow!(
                 "Backend TLS handshake failed {}: {}",
                 addr,
@@ -270,7 +277,6 @@ pub struct BackendPool {
     pools: FnvHashMap<SocketAddr, IdleConns>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
-    tls_connector: Arc<tokio_rustls::TlsConnector>,
 }
 
 impl BackendPool {
@@ -279,7 +285,6 @@ impl BackendPool {
             pools: FnvHashMap::default(),
             max_idle_per_backend,
             connect_timeout,
-            tls_connector: new_tls_connector(),
         }
     }
 
@@ -318,15 +323,7 @@ impl BackendPool {
         }
 
         METRICS.pool_misses_total.inc();
-        let conn = connect_new(
-            &self.tls_connector,
-            self.connect_timeout,
-            addr,
-            use_tls,
-            server_name,
-            keepalive,
-        )
-        .await?;
+        let conn = connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await?;
         Ok((conn, false))
     }
 
@@ -339,15 +336,7 @@ impl BackendPool {
         server_name: &str,
         keepalive: &TcpKeepalive,
     ) -> Result<Connection, ConnectError> {
-        connect_new(
-            &self.tls_connector,
-            self.connect_timeout,
-            addr,
-            use_tls,
-            server_name,
-            keepalive,
-        )
-        .await
+        connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await
     }
 
     pub fn release(
@@ -374,7 +363,6 @@ pub struct SharedBackendPool {
     pools: DashMap<SocketAddr, IdleConns, FnvBuildHasher>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
-    tls_connector: Arc<tokio_rustls::TlsConnector>,
 }
 
 impl SharedBackendPool {
@@ -383,7 +371,6 @@ impl SharedBackendPool {
             pools: DashMap::default(),
             max_idle_per_backend,
             connect_timeout,
-            tls_connector: new_tls_connector(),
         }
     }
 
@@ -414,15 +401,7 @@ impl SharedBackendPool {
         }
 
         METRICS.pool_misses_total.inc();
-        let conn = connect_new(
-            &self.tls_connector,
-            self.connect_timeout,
-            addr,
-            use_tls,
-            server_name,
-            keepalive,
-        )
-        .await?;
+        let conn = connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await?;
         Ok((conn, false))
     }
 
@@ -433,15 +412,7 @@ impl SharedBackendPool {
         server_name: &str,
         keepalive: &TcpKeepalive,
     ) -> Result<Connection, ConnectError> {
-        connect_new(
-            &self.tls_connector,
-            self.connect_timeout,
-            addr,
-            use_tls,
-            server_name,
-            keepalive,
-        )
-        .await
+        connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await
     }
 
     pub fn release(&self, addr: SocketAddr, use_tls: bool, server_name: &str, conn: Connection) {
@@ -668,8 +639,6 @@ mod tests {
             sock.write_all(b"pong").await.unwrap();
             let _ = sock.read_to_end(&mut Vec::new()).await;
         });
-        // The pool's TLS client config needs one, even for plain backends.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut pool = BackendPool::new(4, Duration::from_secs(2));
         let keepalive = TcpKeepalive::new();
         let (mut conn, _) = pool.acquire(addr, false, "", &keepalive).await.unwrap();
@@ -721,7 +690,7 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
         let (local, remote) = pair().await;
         let sni = rustls::pki_types::ServerName::try_from("b.test").unwrap();
-        let (client, server) = tokio::join!(new_tls_connector().connect(sni, local), async {
+        let (client, server) = tokio::join!(tls_connector().connect(sni, local), async {
             acceptor.accept(remote).await
         });
         let (mut client, mut server) = (client.unwrap(), server.unwrap());

@@ -3012,8 +3012,6 @@ mod connection_tests {
     }
 
     fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
-        // The pool's TLS client config needs one, even for plain backends.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cfg = WorkerConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
