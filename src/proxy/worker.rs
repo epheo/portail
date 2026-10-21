@@ -578,6 +578,24 @@ pub(crate) async fn handle_connection(
         } else {
             n = client.read(&mut buf).await?;
         }
+        // RFC 9112 2.2: empty lines before a request-line are ignored. An
+        // old client ends a POST body with a CRLF its length leaves out.
+        loop {
+            let empty_lines = buf[..n]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take_while(|pair| *pair == b"\r\n")
+                .count();
+            if empty_lines == 0 {
+                break;
+            }
+            buf.copy_within(empty_lines * 2..n, 0);
+            n -= empty_lines * 2;
+            if n == 0 {
+                n = client.read(&mut buf).await?;
+            }
+        }
         // The connection is HTTP by now: bytes that cannot open a request
         // (frames held back from a refused upgrade) close it. They must not
         // reach TCP routing, nor wait out the header budget for a 408.
@@ -2502,6 +2520,52 @@ mod connection_tests {
             task.await.unwrap().unwrap();
             assert_never_connected(&tcp).await;
         }
+    }
+
+    const POST_THEN_CRLF: &[u8] =
+        b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nhi\r\n";
+    const UNROUTED: &[u8] = b"GET / HTTP/1.1\r\nHost: nope.test\r\n\r\n";
+
+    /// RFC 9112 2.2: an empty line before a request-line is ignored. Old
+    /// clients end a POST body with a CRLF its Content-Length leaves out.
+    #[tokio::test]
+    async fn empty_lines_before_a_request_line_are_skipped() {
+        for crlfs in ["", "\r\n\r\n"] {
+            let (addr, _rx) = backend(REFUSED).await;
+            let (mut client, _task) = serve(routes(addr));
+            let input = [POST_THEN_CRLF, crlfs.as_bytes(), UNROUTED].concat();
+            let out = exchange(&mut client, &input).await;
+            assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+            assert!(
+                out.contains("HTTP/1.1 404 Not Found\r\n"),
+                "{crlfs:?}: {out}"
+            );
+        }
+
+        // The CRLF alone ends a read: the next request still gets an answer.
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        client.write_all(POST_THEN_CRLF).await.unwrap();
+        let mut head = vec![0u8; REFUSED.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, REFUSED);
+        let out = exchange(&mut client, UNROUTED).await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    /// Only CRLF is an empty line here, never a bare LF.
+    #[tokio::test]
+    async fn a_bare_lf_before_a_request_line_closes() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let (mut client, _task) = serve(routes(addr));
+        let input = [
+            &b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nhi\n"[..],
+            UNROUTED,
+        ]
+        .concat();
+        client.write_all(&input).await.unwrap();
+        let out = read_until_closed(&mut client).await;
+        assert_eq!(out, std::str::from_utf8(REFUSED).unwrap());
     }
 
     /// A read can end inside the method: that is still a request.
