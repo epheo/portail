@@ -233,6 +233,25 @@ fn spawn_chunked_backend_with_bogus_cl(parts: &[&str]) -> SocketAddr {
     addr
 }
 
+/// Backend that answers one request with `response` verbatim, then closes.
+fn spawn_raw_backend(response: String) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind raw backend");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let response = response.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(response.as_bytes());
+            });
+        }
+    });
+    addr
+}
+
 /// Cert + portail with `--http2`, one TestBackend route. `None` = no openssl.
 fn spawn_h2_proxy(port: u16, backend_addr: SocketAddr) -> Option<PortailProcess> {
     let (cert, key) = generate_test_cert(SNI)?;
@@ -417,6 +436,27 @@ async fn test_h2_chunked_response_with_content_length_is_clean() {
     let (status, body) = h2_get(&sr, &format!("https://{}/", SNI)).await;
     assert_eq!(status, 200);
     assert_eq!(body, b"aabbcc");
+}
+
+/// h2 has no transfer codings: a body still coded once the chunked framing
+/// is removed would reach the client as bytes nothing declares.
+#[tokio::test]
+async fn test_h2_other_transfer_codings_get_502() {
+    for (offset, te, body) in [
+        (13, "gzip, chunked", "5\r\nhello\r\n0\r\n\r\n"),
+        (14, "identity", "hello"),
+        (15, "chunked, gzip", "hello"),
+    ] {
+        let backend = spawn_raw_backend(format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: {te}\r\n\r\n{body}"
+        ));
+        let Some(_proxy) = spawn_h2_proxy(h2_port(offset), backend) else {
+            return;
+        };
+        let sr = h2_handshake(tls_connect(h2_port(offset), &[b"h2"]).await).await;
+        let (status, _) = h2_get(&sr, &format!("https://{}/", SNI)).await;
+        assert_eq!(status, 502, "{te}");
+    }
 }
 
 #[tokio::test]
