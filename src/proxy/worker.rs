@@ -2209,9 +2209,12 @@ async fn forward_response_body(
 
 /// Make dropping `client` send RST instead of FIN, for a response cut short
 /// after its headers went out. A FIN would pass a close-delimited body off as
-/// complete; a reset is an error for every framing. The h2 bridge's in-memory
-/// pipe has no reset: it relies on the CL or chunked framing to spot the cut.
+/// complete; a reset is an error for every framing. The h2 bridge's pipe has
+/// no reset: it is told, and resets the stream.
 fn reset_on_drop(client: &Connection) {
+    if let Connection::Mem { aborted, .. } = client {
+        aborted.store(true, Ordering::Release);
+    }
     if let Some(tcp) = client_socket(client) {
         // Zero linger: close() discards unsent data and resets without blocking.
         let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
@@ -2768,7 +2771,10 @@ mod connection_tests {
         let (client, engine) = tokio::io::duplex(64 * 1024);
         let peer = "127.0.0.1:40000".parse().unwrap();
         let task = tokio::spawn(handle_connection(
-            Connection::Mem { inner: engine },
+            Connection::Mem {
+                inner: engine,
+                aborted: Default::default(),
+            },
             peer,
             state,
         ));
@@ -4502,7 +4508,13 @@ mod tests {
     /// An engine-side connection plus the peer end a test drives.
     fn mem_pair() -> (Connection, tokio::io::DuplexStream) {
         let (engine, peer) = tokio::io::duplex(64 * 1024);
-        (Connection::Mem { inner: engine }, peer)
+        (
+            Connection::Mem {
+                inner: engine,
+                aborted: Default::default(),
+            },
+            peer,
+        )
     }
 
     async fn relay(

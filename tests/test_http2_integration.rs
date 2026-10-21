@@ -303,6 +303,70 @@ fn spawn_counting_backend() -> SocketAddr {
     addr
 }
 
+/// Backend that answers each request head with `reply`, then resets the
+/// connection rather than closing it.
+fn spawn_resetting_backend(reply: &'static [u8]) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind resetting backend");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut seen, mut buf) = (Vec::new(), [0u8; 4096]);
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(n @ 1..) => seen.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                }
+                let _ = s.write_all(reply);
+                // Zero linger: the close below sends RST, not FIN.
+                let _ = socket2::SockRef::from(&s).set_linger(Some(std::time::Duration::ZERO));
+            });
+        }
+    });
+    addr
+}
+
+/// GET / and read the response to its end: the status, the body bytes that
+/// arrived, and how the stream ended (Ok on END_STREAM, the error on a
+/// reset). No status when the reset came first: h2 drops a head still
+/// queued when its stream is reset.
+async fn h2_get_to_end(
+    sr: &h2::client::SendRequest<Bytes>,
+) -> (Option<u16>, Vec<u8>, Result<(), h2::Error>) {
+    let exchange = async {
+        let mut s = sr.clone().ready().await.expect("h2 ready");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{}/", SNI))
+            .body(())
+            .unwrap();
+        let (resp, _) = s.send_request(req, true).expect("send_request");
+        let resp = match resp.await {
+            Ok(resp) => resp,
+            Err(e) => return (None, Vec::new(), Err(e)),
+        };
+        let status = Some(resp.status().as_u16());
+        let mut body = resp.into_body();
+        let mut got = Vec::new();
+        while let Some(chunk) = body.data().await {
+            match chunk {
+                Ok(chunk) => {
+                    got.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+                Err(e) => return (status, got, Err(e)),
+            }
+        }
+        (status, got, Ok(()))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+        .await
+        .expect("response never ended")
+}
+
 /// What a [`spawn_holding_backend`] connection just did.
 #[derive(Debug, PartialEq)]
 enum BackendConn {
@@ -833,4 +897,82 @@ async fn test_h2_upload_past_the_windows_arrives_whole() {
     let (status, got) = read_response(resp.await.expect("h2 response")).await;
     assert_eq!(status, 200);
     assert_eq!(String::from_utf8_lossy(&got), SIZE.to_string());
+}
+
+/// Only the backend's close ends a close-delimited body, so an exchange the
+/// engine cut short must reach the client as a reset, as an h1 client gets
+/// one: END_STREAM would pass the cut body off as complete.
+#[tokio::test]
+async fn test_h2_close_delimited_body_cut_by_timeout_is_reset() {
+    let (backend, _events) = spawn_holding_backend(b"HTTP/1.1 200 OK\r\n\r\npartial");
+    let Some((cert, key)) = generate_test_cert(SNI) else {
+        return;
+    };
+    let _proxy = PortailProcess::spawn_with_tls_rule(
+        &[("h2test", SNI, &cert, &key)],
+        &[(SNI, backend)],
+        h2_port(44),
+        &["--http2"],
+        r#", "timeouts": {"request": "1s"}"#,
+    );
+    let sr = h2_handshake(tls_connect(h2_port(44), &[b"h2"]).await).await;
+    let (status, body, end) = h2_get_to_end(&sr).await;
+    // The head left a second before the cut: it reached the client.
+    assert_eq!(status, Some(200));
+    assert_eq!(body, b"partial");
+    let e = end.expect_err("a body cut by the request timeout ended cleanly");
+    assert_eq!(e.reason(), Some(h2::Reason::INTERNAL_ERROR), "{e}");
+}
+
+#[tokio::test]
+async fn test_h2_close_delimited_body_cut_by_backend_reset_is_reset() {
+    let backend = spawn_resetting_backend(b"HTTP/1.1 200 OK\r\n\r\npartial");
+    let Some(_proxy) = spawn_h2_proxy(h2_port(45), backend) else {
+        return;
+    };
+    let sr = h2_handshake(tls_connect(h2_port(45), &[b"h2"]).await).await;
+    let (status, _, end) = h2_get_to_end(&sr).await;
+    assert!(matches!(status, None | Some(200)), "{status:?}");
+    let e = end.expect_err("a body cut by a backend reset ended cleanly");
+    assert_eq!(e.reason(), Some(h2::Reason::INTERNAL_ERROR), "{e}");
+}
+
+/// The backend's own close still ends a close-delimited body cleanly.
+#[tokio::test]
+async fn test_h2_close_delimited_body_ends_cleanly() {
+    let backend = spawn_raw_backend("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nall of it".into());
+    let Some(_proxy) = spawn_h2_proxy(h2_port(46), backend) else {
+        return;
+    };
+    let sr = h2_handshake(tls_connect(h2_port(46), &[b"h2"]).await).await;
+    let (status, body, end) = h2_get_to_end(&sr).await;
+    assert_eq!(status, Some(200));
+    assert_eq!(body, b"all of it");
+    end.expect("a complete close-delimited body was reset");
+}
+
+/// A body cut short of its declared framing, or broken mid-way, is reset.
+#[tokio::test]
+async fn test_h2_truncated_or_broken_framed_bodies_are_reset() {
+    for (offset, reply) in [
+        (47, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial"),
+        (
+            48,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\npartial\r\n",
+        ),
+        (
+            49,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\npartial\r\nzz\r\n",
+        ),
+    ] {
+        let backend = spawn_raw_backend(reply.to_string());
+        let Some(_proxy) = spawn_h2_proxy(h2_port(offset), backend) else {
+            return;
+        };
+        let sr = h2_handshake(tls_connect(h2_port(offset), &[b"h2"]).await).await;
+        let (status, _, end) = h2_get_to_end(&sr).await;
+        assert!(matches!(status, None | Some(200)), "{reply:?}: {status:?}");
+        let e = end.expect_err(reply);
+        assert_eq!(e.reason(), Some(h2::Reason::INTERNAL_ERROR), "{reply:?}");
+    }
 }

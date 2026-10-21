@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -26,12 +27,14 @@ pin_project! {
     /// Supports plain TCP, server-side TLS (for accepting client connections),
     /// client-side TLS (for connecting to HTTPS backends), and the in-memory
     /// pipe the h2 bridge uses to replay each h2 stream through the engine.
+    /// A pipe has no reset: the engine sets `aborted` where it would reset a
+    /// socket, and the bridge resets the stream.
     #[project = ConnectionProj]
     pub enum Connection {
         Plain { #[pin] inner: TcpStream },
         Tls { #[pin] inner: ServerTlsStream<TcpStream> },
         ClientTls { #[pin] inner: ClientTlsStream<TcpStream> },
-        Mem { #[pin] inner: tokio::io::DuplexStream },
+        Mem { #[pin] inner: tokio::io::DuplexStream, aborted: Arc<AtomicBool> },
     }
 }
 
@@ -45,7 +48,7 @@ impl AsyncRead for Connection {
             ConnectionProj::Plain { inner } => inner.poll_read(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_read(cx, buf),
             ConnectionProj::ClientTls { inner } => inner.poll_read(cx, buf),
-            ConnectionProj::Mem { inner } => inner.poll_read(cx, buf),
+            ConnectionProj::Mem { inner, .. } => inner.poll_read(cx, buf),
         }
     }
 }
@@ -60,7 +63,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_write(cx, buf),
             ConnectionProj::Tls { inner } => inner.poll_write(cx, buf),
             ConnectionProj::ClientTls { inner } => inner.poll_write(cx, buf),
-            ConnectionProj::Mem { inner } => inner.poll_write(cx, buf),
+            ConnectionProj::Mem { inner, .. } => inner.poll_write(cx, buf),
         }
     }
 
@@ -69,7 +72,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_flush(cx),
             ConnectionProj::Tls { inner } => inner.poll_flush(cx),
             ConnectionProj::ClientTls { inner } => inner.poll_flush(cx),
-            ConnectionProj::Mem { inner } => inner.poll_flush(cx),
+            ConnectionProj::Mem { inner, .. } => inner.poll_flush(cx),
         }
     }
 
@@ -78,7 +81,7 @@ impl AsyncWrite for Connection {
             ConnectionProj::Plain { inner } => inner.poll_shutdown(cx),
             ConnectionProj::Tls { inner } => inner.poll_shutdown(cx),
             ConnectionProj::ClientTls { inner } => inner.poll_shutdown(cx),
-            ConnectionProj::Mem { inner } => inner.poll_shutdown(cx),
+            ConnectionProj::Mem { inner, .. } => inner.poll_shutdown(cx),
         }
     }
 }
