@@ -374,12 +374,12 @@ fn handle_example_config_mode(_args: &Args) -> Result<()> {
     println!("To use an example configuration:");
     println!("  1. Copy an example file to your desired location");
     println!("  2. Edit the configuration to match your environment");
-    println!("  3. Run: cargo run -- --config path/to/config.yaml");
+    println!("  3. Run: portail --config path/to/config.yaml");
 
     println!();
     println!("To generate example configurations:");
-    println!("  cargo run -- --generate-config minimal --output minimal.yaml");
-    println!("  cargo run -- --generate-config development --output development.json");
+    println!("  portail --generate-config minimal --output minimal.yaml");
+    println!("  portail --generate-config development --output development.json");
 
     Ok(())
 }
