@@ -171,9 +171,47 @@ fn config() -> Criterion {
         .with_plots()
 }
 
+/// A file config with one host and the given rules, as JSON.
+fn route_config(rules: &[String]) -> portail::config::PortailConfig {
+    let json = format!(
+        r#"{{"gateway":{{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":443}}]}},
+            "httpRoutes":[{{"hostnames":["api.com"],"rules":[{}]}}]}}"#,
+        rules.join(",")
+    );
+    serde_json::from_str(&json).unwrap()
+}
+
+fn config_benchmark(c: &mut Criterion) {
+    // A regex path match is a full match (the pattern compiles anchored).
+    let regex_table = route_config(&[
+        r#"{"matches":[{"path":{"type":"RegularExpression","value":"/api/v[0-9]+/users/[0-9]+"}}],"backendRefs":[{"name":"127.0.0.1","port":8080}]}"#.to_string(),
+    ])
+    .to_route_table()
+    .unwrap();
+    for (name, path) in [
+        ("path_matching_regex_hit", "/api/v2/users/42"),
+        ("path_matching_regex_miss", "/web/static/app/index.html"),
+    ] {
+        c.bench_function(name, |b| b.iter(|| lookup(&regex_table, "api.com", path)));
+    }
+
+    // Control plane, not per request: one host's rules sort once per build.
+    let many_rules: Vec<String> = (0..1000)
+        .map(|i| {
+            format!(
+                r#"{{"matches":[{{"path":{{"type":"PathPrefix","value":"/p{i}"}}}}],"backendRefs":[{{"name":"127.0.0.1","port":8080}}]}}"#
+            )
+        })
+        .collect();
+    let many = route_config(&many_rules);
+    c.bench_function("route_table_build_1000_rules", |b| {
+        b.iter(|| black_box(&many).to_route_table().unwrap())
+    });
+}
+
 criterion_group! {
     name = routing_benches;
     config = config();
-    targets = routing_benchmark, memory_benchmark
+    targets = routing_benchmark, memory_benchmark, config_benchmark
 }
 criterion_main!(routing_benches);
