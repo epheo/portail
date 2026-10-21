@@ -21,13 +21,12 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      - gatewayclasses/status
       - gateways/status
       - httproutes/status
       - tcproutes/status
       - tlsroutes/status
       - udproutes/status
-    verbs: ["get", "patch", "update"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["namespaces", "secrets", "services"]
     verbs: ["get", "list", "watch"]
@@ -38,13 +37,18 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["portail.epheo.eu"]
     resources: ["ratelimitpolicies/status"]
-    verbs: ["get", "patch", "update"]
-  # get/list only (NO watch): a one-shot, label-filtered read to resolve a
+    verbs: ["patch"]
+  # list only (NO watch): a one-shot, label-filtered read to resolve a
   # headless Service's named targetPort to its numeric value. Not a watch —
   # backend pod churn is tracked via DNS (STRICT_DNS), not EndpointSlices.
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["get", "list"]
+    verbs: ["list"]
+  # A portail.epheo.eu/Network Gateway address names a
+  # NetworkAttachmentDefinition; its subnet picks the local IP to bind.
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
