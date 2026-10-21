@@ -45,6 +45,7 @@ impl PortailConfig {
         }
 
         self.validate_port_conflicts()?;
+        self.validate_port_protocols()?;
         self.validate_parent_refs_resolve()?;
         self.performance.validate()?;
 
@@ -74,6 +75,41 @@ impl PortailConfig {
             }
         }
 
+        Ok(())
+    }
+
+    /// Listeners on one published port share its routes and what it
+    /// serves, plain or TLS, whatever address each binds: their protocols
+    /// must be one family, as the Kubernetes path marks them
+    /// (ProtocolConflict). HTTPS and TLS passthrough share one. UDP rides
+    /// its own socket family and reads no TLS plan.
+    fn validate_port_protocols(&self) -> Result<()> {
+        fn family(protocol: &Protocol) -> Option<&'static str> {
+            match protocol {
+                Protocol::HTTP => Some("HTTP"),
+                Protocol::HTTPS | Protocol::TLS => Some("TLS"),
+                Protocol::TCP => Some("TCP"),
+                Protocol::UDP => None,
+            }
+        }
+        let mut first_on_port: std::collections::HashMap<u16, &ListenerConfig> =
+            std::collections::HashMap::new();
+        for listener in &self.gateway.listeners {
+            let Some(own) = family(&listener.protocol) else {
+                continue;
+            };
+            let first = *first_on_port.entry(listener.port).or_insert(listener);
+            if family(&first.protocol) != Some(own) {
+                return Err(anyhow!(
+                    "Protocol conflict: {:?} listener '{}' and {:?} listener '{}' share port {}; only HTTPS and TLS listeners share a port across protocols",
+                    first.protocol,
+                    first.name,
+                    listener.protocol,
+                    listener.name,
+                    listener.port,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -858,6 +894,58 @@ mod tests {
             listener_on("b", 8080, None, Some("127.0.0.2")),
         ]);
         assert!(cfg.validate().is_ok());
+    }
+
+    /// Listeners on one port share its routes and what it serves, plain or
+    /// TLS, whatever address each binds. An HTTPS listener turned the port
+    /// TLS, and an HTTP listener beside it on another address answered
+    /// every plain request with a failed handshake.
+    #[test]
+    fn listeners_on_one_port_share_a_protocol_family() {
+        let on = |name: &str, protocol: Protocol, address: &str| {
+            let tls = match protocol {
+                Protocol::HTTPS => Some(TlsConfig {
+                    mode: TlsMode::Terminate,
+                    certificate_refs: vec![CertificateRef {
+                        name: "c".to_string(),
+                        ..Default::default()
+                    }],
+                }),
+                Protocol::TLS => Some(TlsConfig {
+                    mode: TlsMode::Passthrough,
+                    certificate_refs: vec![],
+                }),
+                _ => None,
+            };
+            ListenerConfig {
+                protocol,
+                tls,
+                hostname: Some(format!("{name}.example.com")),
+                ..listener_on(name, 8443, None, Some(address))
+            }
+        };
+        use Protocol::{HTTP, HTTPS, TCP, TLS, UDP};
+        for (a, b) in [
+            (HTTP, HTTPS),
+            (HTTPS, HTTP),
+            (HTTP, TLS),
+            (TCP, HTTPS),
+            (HTTP, TCP),
+        ] {
+            let cfg = config_with_listeners(vec![
+                on("a", a.clone(), "127.0.0.1"),
+                on("b", b.clone(), "127.0.0.2"),
+            ]);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("Protocol conflict"), "{a:?} {b:?}: {err}");
+        }
+        for (a, b) in [(HTTPS, TLS), (TLS, HTTPS), (HTTPS, HTTPS), (TCP, UDP)] {
+            let cfg = config_with_listeners(vec![
+                on("a", a.clone(), "127.0.0.1"),
+                on("b", b.clone(), "127.0.0.2"),
+            ]);
+            assert!(cfg.validate().is_ok(), "{a:?} {b:?}");
+        }
     }
 
     /// Published-port collision resolved by distinct targetPorts is legal.

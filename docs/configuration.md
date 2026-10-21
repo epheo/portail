@@ -192,6 +192,7 @@ Standalone mode:
 - A TCP route can also attach to a TLS listener, as the fallback for passthrough connections no TLS route matches.
 - Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
 - TCP and UDP routes use their first rule only.
+- Listeners on one port share its routes, whatever address each binds: HTTP, TCP, and HTTPS with TLS are three families, and two families on one port fail the load (`Protocol conflict`).
 
 ## HTTPRoute Rules
 
