@@ -551,12 +551,57 @@ mod tests {
         assert!(Connection::Plain { inner: local }.idle_and_open());
     }
 
+    /// The FIN wakes the reactor, so the gated peek runs and sees it.
     #[tokio::test]
     async fn probe_half_closed_returns_stale() {
         let (local, mut remote) = pair().await;
         remote.shutdown().await.unwrap();
         settle().await;
+        let before = peek_syscalls();
         assert!(!Connection::Plain { inner: local }.idle_and_open());
+        assert_eq!(peek_syscalls(), before + 1);
+    }
+
+    fn peek_syscalls() -> usize {
+        crate::proxy::tls::PEEK_SYSCALLS.with(|n| n.get())
+    }
+
+    /// A pooled conn quiet since its response costs no probe syscall: the
+    /// request path is at its minimum of four, and a fifth on every reuse
+    /// costs real throughput.
+    #[tokio::test]
+    async fn quiet_pooled_conn_is_reused_without_a_syscall() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.read_exact(&mut [0u8; 4]).await.unwrap();
+            sock.write_all(b"pong").await.unwrap();
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+        });
+        // The pool's TLS client config needs one, even for plain backends.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut pool = BackendPool::new(4, Duration::from_secs(2));
+        let keepalive = TcpKeepalive::new();
+        let (mut conn, _) = pool.acquire(addr, false, "", &keepalive).await.unwrap();
+        conn.write_all(b"ping").await.unwrap();
+        // Read as the engine does, with room to spare: a short read tells
+        // tokio the socket is drained.
+        let (mut pong, mut got) = ([0u8; 64], 0);
+        while got < 4 {
+            got += conn.read(&mut pong[got..]).await.unwrap();
+        }
+        pool.release(addr, false, "", conn);
+
+        let before = peek_syscalls();
+        let (_, reused) = pool.acquire(addr, false, "", &keepalive).await.unwrap();
+        assert!(reused);
+        assert_eq!(
+            peek_syscalls(),
+            before,
+            "probing a quiet conn made a syscall"
+        );
     }
 
     /// An idle HTTP backend never speaks first: the conn is poisoned.
@@ -683,7 +728,13 @@ mod tests {
             return; // openssl unavailable
         };
         settle().await;
+        let before = peek_syscalls();
         assert!(conn.idle_and_open());
+        assert_eq!(
+            peek_syscalls(),
+            before,
+            "probing a quiet conn made a syscall"
+        );
     }
 
     /// Node's https server ends an idle keep-alive conn with close_notify
