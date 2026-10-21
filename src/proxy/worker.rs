@@ -186,6 +186,11 @@ pub(crate) struct ConnectionState {
     /// keepalive loop can access-log it without threading a value through
     /// every early return. 0 = no response written yet.
     last_status: u16,
+    /// Cancelled when the data plane drains: the idle wait between
+    /// requests ends, and the exchange in flight is the last one. This
+    /// connection's own child of the listener token, so the checks on
+    /// every request lock nothing shared.
+    drain: CancellationToken,
 }
 
 impl ConnectionState {
@@ -200,6 +205,7 @@ impl ConnectionState {
         peer_ip: std::net::IpAddr,
         cfg: &WorkerConfig,
         listener_stats: Arc<ListenerStats>,
+        drain: CancellationToken,
     ) -> Self {
         Self {
             server_port,
@@ -218,8 +224,14 @@ impl ConnectionState {
             idle_body_timeout: idle_opt(cfg.idle_body_timeout),
             listener_stats,
             last_status: 0,
+            drain,
         }
     }
+}
+
+/// Whether a connection may take another request after this one.
+fn keep_open(drain: &CancellationToken, reusable: bool) -> bool {
+    reusable && !drain.is_cancelled()
 }
 
 /// Pool handle for one client connection: the process-wide shared pool when
@@ -311,6 +323,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                             let selector = selector.clone();
                             let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
+                            let drain = shutdown.child_token();
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
                                 serve_tls_connection(
@@ -324,6 +337,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                     selector,
                                     shared_pool,
                                     listener_stats,
+                                    drain,
                                 )
                                 .await;
                             });
@@ -338,6 +352,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                 peer.ip(),
                                 &cfg,
                                 listener_stats.clone(),
+                                shutdown.child_token(),
                             );
                             tokio::spawn(async move {
                                 let _guard = conn_guard;
@@ -373,6 +388,7 @@ async fn serve_tls_connection(
     selector: Arc<BackendSelector>,
     shared_pool: Option<Arc<SharedBackendPool>>,
     listener_stats: Arc<ListenerStats>,
+    drain: CancellationToken,
 ) {
     // Peek ClientHello for SNI to decide dispatch mode, waiting out
     // fragmented hellos.
@@ -433,6 +449,7 @@ async fn serve_tls_connection(
                 cfg,
                 listener_stats,
                 peer,
+                drain,
             },
         )
         .await;
@@ -449,6 +466,7 @@ async fn serve_tls_connection(
         peer.ip(),
         &cfg,
         listener_stats,
+        drain,
     );
     let _ = handle_connection(conn, peer, state).await;
 }
@@ -475,7 +493,7 @@ pub(crate) async fn handle_connection(
 
     let mut buf = vec![0u8; 65536];
 
-    let mut n = client.read(&mut buf).await?;
+    let mut n = idle_read(&mut client, &mut buf, &state.drain).await?;
     n = sniff_first_request(
         &mut client,
         &mut buf,
@@ -554,7 +572,7 @@ pub(crate) async fn handle_connection(
                     let reply = LocalReply {
                         status: 429,
                         location: None,
-                        reusable: meta.local_reply_reusable,
+                        reusable: keep_open(&state.drain, meta.local_reply_reusable),
                         head: meta.is_head,
                     };
                     if !send_local_reply(&mut client, &reply, access).await? {
@@ -580,13 +598,14 @@ pub(crate) async fn handle_connection(
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
                     crate::access_log::emit(access, state.last_status, Some(backend_addr));
-                    if !ka || !meta.keepalive {
+                    if !keep_open(&state.drain, ka && meta.keepalive) {
                         return Ok(());
                     }
                     leftover
                 }
             }
-            RoutingResult::LocalReply(reply) => {
+            RoutingResult::LocalReply(mut reply) => {
+                reply.reusable = keep_open(&state.drain, reply.reusable);
                 if !send_local_reply(&mut client, &reply, access).await? {
                     return Ok(());
                 }
@@ -607,7 +626,7 @@ pub(crate) async fn handle_connection(
             buf[..bytes.len()].copy_from_slice(&bytes);
             n = bytes.len();
         } else {
-            n = client.read(&mut buf).await?;
+            n = idle_read(&mut client, &mut buf, &state.drain).await?;
         }
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
@@ -619,7 +638,7 @@ pub(crate) async fn handle_connection(
             }
             match &buf[..n] {
                 // Between requests: as unbounded as the idle wait.
-                [] if skip > 0 => n = client.read(&mut buf).await?,
+                [] if skip > 0 => n = idle_read(&mut client, &mut buf, &state.drain).await?,
                 // Inside an empty line: as bounded as a request head.
                 [b'\r'] => {
                     let rest = client.read(&mut buf[1..]);
@@ -669,6 +688,22 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
         "TCP",
     )
     .await
+}
+
+/// The wait for a connection's next request, its first included: unbounded,
+/// as long idle is legitimate there, until a drain ends it like an EOF
+/// would (0).
+async fn idle_read(
+    client: &mut Connection,
+    buf: &mut [u8],
+    drain: &CancellationToken,
+) -> std::io::Result<usize> {
+    tokio::select! {
+        // A request already sent is served: its reply announces the close.
+        biased;
+        read = client.read(buf) => read,
+        () = drain.cancelled() => Ok(0),
+    }
 }
 
 /// Byte length of the empty lines (CRLF pairs) opening `data`.
@@ -984,7 +1019,8 @@ async fn proxy_http_request(
             header_budget,
             meta.is_head,
             meta.is_upgrade,
-            !meta.keepalive,
+            meta.keepalive,
+            &state.drain,
         )
         .await?
         {
@@ -1574,7 +1610,8 @@ async fn forward_response_headers(
     header_budget: Duration,
     is_head_request: bool,
     expect_upgrade: bool,
-    client_close: bool,
+    keepalive: bool,
+    drain: &CancellationToken,
 ) -> Result<HeaderPhase> {
     let read =
         match tokio::time::timeout(header_budget, read_response_head(backend, header_buf)).await {
@@ -1637,10 +1674,12 @@ async fn forward_response_headers(
         BodyFraming::Length(n) => Some(n),
         BodyFraming::Chunked | BodyFraming::Close => None,
     };
+    // Decided only now that the head is in: a drain that started while
+    // the backend worked is still announced.
     sanitize_response_headers(
         &header_buf[..resp_header_end],
         content_length,
-        client_close || framing.close_delimited(),
+        !keep_open(drain, keepalive) || framing.close_delimited(),
         scratch,
     );
     let headers: &mut Vec<u8> = if let Some(mods) = resp_mods {
@@ -2590,6 +2629,7 @@ mod connection_tests {
             "127.0.0.1".parse().unwrap(),
             &cfg,
             Arc::new(ListenerStats::default()),
+            CancellationToken::new(),
         )
     }
 
@@ -2607,6 +2647,16 @@ mod connection_tests {
             state,
         ));
         (client, task)
+    }
+
+    /// `serve`, with the connection draining once `drain` is cancelled.
+    fn serve_draining(
+        rt: RouteTable,
+        drain: CancellationToken,
+    ) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        let mut state = conn_state(rt, false);
+        state.drain = drain;
+        serve_state(state)
     }
 
     /// Send `input`, half-close, and collect everything until the engine
@@ -3584,6 +3634,65 @@ mod connection_tests {
         assert_eq!(head, REFUSED);
         let out = exchange(&mut client, b"T / HTTP/1.1\r\nHost: nope.test\r\n\r\n").await;
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_drain_closes_an_idle_keepalive_connection() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let drain = CancellationToken::new();
+        let (mut client, task) = serve_draining(routes(addr), drain.clone());
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = vec![0u8; REFUSED.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, REFUSED);
+        drain.cancel();
+        assert_eq!(read_until_closed(&mut client).await, "");
+        task.await.unwrap().unwrap();
+    }
+
+    /// Before its first request too: a connection that has sent nothing yet
+    /// (a browser's preconnect) must not hold the drain.
+    #[tokio::test]
+    async fn a_drain_closes_a_connection_that_has_not_spoken() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let drain = CancellationToken::new();
+        let (mut client, task) = serve_draining(routes(addr), drain.clone());
+        drain.cancel();
+        assert_eq!(read_until_closed(&mut client).await, "");
+        task.await.unwrap().unwrap();
+    }
+
+    /// The exchange in flight when the drain starts is the last one: its
+    /// response announces the close, and a pipelined request is not read.
+    #[tokio::test]
+    async fn a_drain_lets_the_exchange_in_flight_finish_then_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let drain = CancellationToken::new();
+        let (mut client, task) =
+            serve_draining(routes(listener.local_addr().unwrap()), drain.clone());
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET / HTTP/1.1\r\nHost: nope.test\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+        while find_header_end(&seen).is_none() {
+            let n = sock.read(&mut chunk).await.unwrap();
+            seen.extend_from_slice(&chunk[..n]);
+        }
+        drain.cancel();
+        sock.write_all(REFUSED).await.unwrap();
+        let out = read_until_closed(&mut client).await;
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"
+        );
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

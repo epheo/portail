@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use helpers::{
     extract_body, extract_status, http_request, http_request_keepalive, http_request_timeout,
-    tcp_roundtrip, wait_for_listener, InspectingBackend, PortailProcess, TcpEchoBackend,
-    TestBackend,
+    read_one_response, spawn_slow_backend, tcp_roundtrip, wait_for_listener, InspectingBackend,
+    PortailProcess, TcpEchoBackend, TestBackend,
 };
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
@@ -1968,4 +1968,62 @@ fn test_sigterm_drains_in_kubernetes_mode() {
         output.contains("Data plane shutdown complete"),
         "drain skipped:\n{output}"
     );
+}
+
+/// SIGTERM: idle connections close at once (keepalive, or one that has not
+/// sent its first request yet), an in-flight exchange finishes and
+/// announces the close, and the process exits well inside the 30s drain
+/// window instead of waiting out the idle clients.
+#[test]
+fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
+    let (backend, arrived) = spawn_slow_backend(Duration::from_secs(1));
+    let mut proxy = PortailProcess::spawn(&[("localhost", "/", backend)], 25082);
+    let connect = || {
+        let s = std::net::TcpStream::connect(proxy.proxy_addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+
+    // First, so it is accepted by the time the later exchanges are done.
+    let mut silent = connect();
+    let mut idle = connect();
+    idle.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let first = read_one_response(&mut idle).expect("first response");
+    assert_eq!(extract_status(&first), Some(200));
+
+    let mut busy = connect();
+    busy.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request never reached the backend");
+
+    let sigterm = std::time::Instant::now();
+    proxy.terminate();
+
+    for conn in [&mut idle, &mut silent] {
+        let mut rest = Vec::new();
+        conn.read_to_end(&mut rest)
+            .expect("idle connection not closed by the drain");
+        assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
+    }
+    assert!(
+        sigterm.elapsed() < Duration::from_secs(1),
+        "idle close took {:?}",
+        sigterm.elapsed()
+    );
+
+    let mut response = Vec::new();
+    busy.read_to_end(&mut response)
+        .expect("in-flight connection not closed after its response");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
+    assert!(response.ends_with("\r\n\r\nok"), "{response}");
+
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("no exit within 10s of SIGTERM");
+    assert!(status.success(), "{status}");
 }
