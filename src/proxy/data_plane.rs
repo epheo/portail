@@ -201,6 +201,10 @@ fn build_port_acceptors(
 /// per-port acceptor (merged certs), Passthrough gets SNI forwarding.
 /// `None` means the port's config build failed and the listener must not
 /// bind — it could never handshake.
+///
+/// Passthrough takes the port's acceptor too: the first listener on a port
+/// binds its one socket, and a passthrough-only socket would drop the SNIs
+/// an HTTPS sibling terminates.
 fn listener_tls_dispatch(
     listener_cfg: &ListenerConfig,
     port_acceptors: &std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
@@ -214,7 +218,7 @@ fn listener_tls_dispatch(
                 .map(|acceptor| (Some(acceptor.clone()), false))
         }
         (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
-            Some((None, true))
+            Some((port_acceptors.get(&listener_cfg.port).cloned(), true))
         }
         _ => Some((None, false)),
     }
@@ -1035,6 +1039,85 @@ mod tests {
                 host,
                 hs.err()
             );
+        }
+    }
+
+    /// A passthrough listener and an HTTPS one on a port share its socket,
+    /// whichever comes first: SNI picks forwarding or termination. Listed
+    /// first, the passthrough listener bound a socket that dropped every
+    /// SNI its HTTPS sibling serves.
+    #[tokio::test]
+    async fn https_and_passthrough_share_a_socket_in_either_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.example.org")
+        else {
+            return; // openssl unavailable
+        };
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+                .with_no_client_auth(),
+        );
+        let perf = test_perf();
+        for passthrough_first in [true, false] {
+            let port = free_port();
+            let mut https = https_listener("web", port, Some("app.example.org"), "cert");
+            https.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(cert.clone());
+            https.tls.as_mut().unwrap().certificate_refs[0].key_pem = Some(key.clone());
+            let mut passthrough = https_listener("db", port, Some("secure.example.org"), "-");
+            passthrough.protocol = P::TLS;
+            passthrough.tls = Some(TlsConfig {
+                mode: TM::Passthrough,
+                certificate_refs: vec![],
+            });
+            let listeners = if passthrough_first {
+                vec![passthrough, https]
+            } else {
+                vec![https, passthrough]
+            };
+            let mut table = RouteTable::new();
+            let forward = crate::routing::Backend::new(
+                "127.0.0.1".into(),
+                backend.local_addr().unwrap().port(),
+            )
+            .unwrap();
+            table.add_tls_route(port, "secure.example.org", vec![forward]);
+            let routes = Arc::new(ArcSwap::from_pointee(table));
+            let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+            bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let sni = rustls::pki_types::ServerName::try_from("app.example.org").unwrap();
+            let connector = tokio_rustls::TlsConnector::from(client_cfg.clone());
+            let hs = connector.connect(sni, tcp).await;
+            assert!(
+                hs.is_ok(),
+                "{passthrough_first}: terminated: {:?}",
+                hs.err()
+            );
+
+            let name = rustls::pki_types::ServerName::try_from("secure.example.org").unwrap();
+            let mut hello = Vec::new();
+            rustls::ClientConnection::new(client_cfg.clone(), name)
+                .unwrap()
+                .write_tls(&mut hello)
+                .unwrap();
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            client.write_all(&hello).await.unwrap();
+            let (mut forwarded, _) = tokio::time::timeout(Duration::from_secs(5), backend.accept())
+                .await
+                .expect("passthrough reached the backend")
+                .unwrap();
+            let mut got = vec![0u8; hello.len()];
+            forwarded.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, hello, "{passthrough_first}: passed through as sent");
         }
     }
 
