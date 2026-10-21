@@ -17,7 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::config::PerformanceConfig;
 use crate::logging::{debug, info, warn};
 use crate::metrics::METRICS;
-use crate::proxy::backend_pool::{log_local_exhaustion, out_of_fds_or_memory};
+use crate::proxy::backend_pool::{log_local_exhaustion, out_of_fds_or_memory, LogThrottle};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
@@ -321,20 +321,12 @@ impl Sessions {
         let backend_socket = match connect_backend(backend_addr).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                if out_of_own_resources(&e) {
-                    log_local_exhaustion(backend_addr, &e);
-                } else {
-                    warn!("UDP backend socket to {} failed: {}", backend_addr, e);
-                }
+                log_open_failure(backend_addr, "backend socket", &e);
                 return;
             }
         };
         if let Err(e) = backend_socket.send(datagram).await {
-            if out_of_own_resources(&e) {
-                log_local_exhaustion(backend_addr, &e);
-            } else {
-                warn!("UDP initial send to {} failed: {}", backend_addr, e);
-            }
+            log_open_failure(backend_addr, "initial send", &e);
             return;
         }
         let last_active = Arc::new(AtomicU64::new(now));
@@ -388,10 +380,26 @@ impl Sessions {
 
 /// Whether a session failed to open for want of the proxy's own fds, memory
 /// or ports: the bind takes its port from the host's range, whatever the
-/// backend, and fails EADDRINUSE once none is left. Every datagram from a
-/// new source then fails alike, at packet rate under a spoofed flood.
+/// backend, and fails EADDRINUSE once none is left.
 fn out_of_own_resources(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::EADDRINUSE) || out_of_fds_or_memory(e)
+}
+
+/// Log a session that failed to open at `step`, at most once per window:
+/// every datagram from a new source fails alike, at packet rate under a
+/// spoofed flood. The proxy short of its own resources is worded apart from
+/// a refusal toward the backend (ENETUNREACH from routing, EPERM or EACCES
+/// from a firewall).
+fn log_open_failure(backend: SocketAddr, step: &str, e: &std::io::Error) {
+    static THROTTLE: LogThrottle = LogThrottle::new();
+    if out_of_own_resources(e) {
+        log_local_exhaustion(backend, e);
+    } else if let Some(suppressed) = THROTTLE.admit_now() {
+        warn!(
+            "UDP {} to {} failed: {}; {} similar suppressed",
+            step, backend, e, suppressed
+        );
+    }
 }
 
 /// A socket connected to `backend`, bound in the backend's address family:
@@ -718,6 +726,26 @@ mod tests {
         }
     }
 
+    impl Captured {
+        /// Warnings this thread logs until the guard drops.
+        fn warnings() -> (Self, tracing::subscriber::DefaultGuard) {
+            let log = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     /// Out of fds, every datagram from a new source fails to open its
     /// session, and a spoofed flood sends those at packet rate: one line
     /// per window, not one per datagram.
@@ -727,16 +755,7 @@ mod tests {
         if !in_own_process(module_path!(), "running_out_of_fds_logs_once_per_window") {
             return;
         }
-        let log = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer({
-                let log = log.clone();
-                move || log.clone()
-            })
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (log, _subscriber) = Captured::warnings();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -759,8 +778,41 @@ mod tests {
             );
             a
         });
-        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let log = log.text();
         assert_eq!(log.matches(&backend.to_string()).count(), 1, "{log}");
+    }
+
+    /// A route or firewall refusing the backend (ENETUNREACH, EPERM; here
+    /// EACCES, a broadcast address without SO_BROADCAST) fails every new
+    /// source's session alike: one line per window too, worded apart from
+    /// the proxy's own shortage.
+    #[test]
+    fn failing_toward_the_backend_logs_once_per_window() {
+        use crate::proxy::test_util::in_own_process;
+        if !in_own_process(
+            module_path!(),
+            "failing_toward_the_backend_logs_once_per_window",
+        ) {
+            return;
+        }
+        let (log, _subscriber) = Captured::warnings();
+        let backend: SocketAddr = "127.255.255.255:9".parse().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let proxy = start_proxy(&[backend], limits(Duration::from_secs(30), 16)).await;
+            for client in [client().await, client().await, client().await] {
+                let wait = Duration::from_millis(100);
+                let dropped = roundtrip_within(&client, proxy.addr, b"x", wait);
+                assert_eq!(dropped.await, None);
+            }
+        });
+        let log = log.text();
+        assert_eq!(log.matches(&backend.to_string()).count(), 1, "{log}");
+        assert!(log.contains("UDP backend socket to "), "{log}");
+        assert!(!log.contains("out of its own resources"), "{log}");
     }
 
     #[tokio::test]
