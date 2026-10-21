@@ -574,10 +574,13 @@ pub(crate) async fn handle_connection(
         )
         .await;
     }
-    // An error can leave a reply the proxy wrote (408, 431) or the
-    // client's bytes unread: it closes as a closing reply does.
-    let linger = state.linger || served.is_err();
-    close_connection(&mut client, &mut buf, state.client_header_timeout, linger).await;
+    close_connection(
+        &mut client,
+        &mut buf,
+        state.client_header_timeout,
+        state.linger,
+    )
+    .await;
     served.map(drop)
 }
 
@@ -607,7 +610,7 @@ async fn serve_http(
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
     if is_http_request(&buf[..n]) && find_header_end(&buf[..n]).is_none() {
-        n = complete_headers(client, buf, n, state.client_header_timeout).await?;
+        n = complete_headers(client, buf, n, state).await?;
     }
     if n == 0 {
         return Ok(Handoff::Close);
@@ -743,7 +746,7 @@ async fn serve_http(
             return Ok(Handoff::Close);
         }
         if find_header_end(&buf[..n]).is_none() {
-            n = complete_headers(client, buf, n, state.client_header_timeout).await?;
+            n = complete_headers(client, buf, n, state).await?;
         }
         if n == 0 || !is_http_request(&buf[..n]) {
             return Ok(Handoff::Close);
@@ -890,15 +893,19 @@ async fn complete_headers(
     client: &mut Connection,
     buf: &mut [u8],
     already_read: usize,
-    budget: Duration,
+    state: &mut ConnectionState,
 ) -> Result<usize> {
+    let budget = state.client_header_timeout;
     match tokio::time::timeout(budget, read_remaining_headers(client, buf, already_read)).await {
         Ok(Ok(total)) => Ok(total),
         Ok(Err(e)) => {
+            // The rest of the head may still be on its way.
+            state.refused(431);
             let _ = send_error_response(client, 431).await;
             Err(e)
         }
         Err(_) => {
+            // No linger: this client already used its whole budget.
             let _ = send_error_response(client, 408).await;
             Err(anyhow::anyhow!("client header read timed out"))
         }
@@ -4205,6 +4212,43 @@ mod connection_tests {
         engine.await.unwrap().unwrap();
         assert!(started.elapsed() < budget / 2, "{:?}", started.elapsed());
         sender.await.unwrap();
+    }
+
+    /// A client that used its whole header budget gets its 408 and the close
+    /// at once: a linger would hold a slow loris's fd and task for another
+    /// budget.
+    #[tokio::test]
+    async fn a_408_closes_without_lingering() {
+        let budget = Duration::from_millis(500);
+        let mut state = conn_state(RouteTable::new(), false);
+        state.client_header_timeout = budget;
+        let (mut client, engine) = tcp_client(state).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(engine.await.unwrap().is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < budget + budget / 2, "{elapsed:?}");
+        let reply = read_one_reply(&mut client).await;
+        assert!(reply.starts_with("HTTP/1.1 408 "), "{reply}");
+    }
+
+    /// A head that outgrows the buffer may still be on its way: its 431
+    /// closes as any closing reply does, reading off what comes.
+    #[tokio::test]
+    async fn a_431_lingers_while_the_client_still_sends() {
+        let (mut client, engine) = tcp_client(conn_state(RouteTable::new(), false)).await;
+        let pad = format!("X-Pad: {}\r\n", "p".repeat(1022));
+        let head = format!("GET / HTTP/1.1\r\nHost: a.test\r\n{}", pad.repeat(80));
+        client.write_all(head.as_bytes()).await.unwrap();
+        let reply = read_one_reply(&mut client).await;
+        assert!(reply.starts_with("HTTP/1.1 431 "), "{reply}");
+        client.shutdown().await.unwrap();
+        assert!(engine.await.unwrap().is_err());
+        assert!(client.take_error().unwrap().is_none(), "reset");
+        assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
     }
 
     /// A body cut short after its head went out must still reset: a clean
