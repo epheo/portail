@@ -34,6 +34,7 @@ impl PortailConfig {
 
         self.validate_port_conflicts()?;
         self.validate_parent_refs_resolve()?;
+        self.performance.validate()?;
 
         Ok(())
     }
@@ -186,6 +187,18 @@ impl GatewayConfig {
                 .map_err(|e| anyhow!("Listener {}: {}", i, e))?;
         }
 
+        Ok(())
+    }
+}
+
+impl PerformanceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.udp_session_timeout.is_zero() {
+            return Err(anyhow!("udpSessionTimeout must be greater than 0"));
+        }
+        if self.udp_max_sessions == 0 {
+            return Err(anyhow!("udpMaxSessions must be at least 1"));
+        }
         Ok(())
     }
 }
@@ -1172,6 +1185,29 @@ mod tests {
         assert!(config_with_rule(make_rule(vec![], vec![backend]))
             .validate()
             .is_ok());
+    }
+
+    // --- performance bounds -------------------------------------------------
+
+    /// A zero timeout made the UDP reaper call `interval(0)`, which panics,
+    /// and panic = abort takes the whole pod down.
+    #[test]
+    fn test_zero_udp_session_timeout_rejected() {
+        let json = r#"{
+          "gateway": {"name": "gw", "listeners": [{"name": "dns", "protocol": "UDP", "port": 5353}]},
+          "performance": {"udpSessionTimeout": "0s"}
+        }"#;
+        let cfg: PortailConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("udpSessionTimeout"), "{}", err);
+    }
+
+    #[test]
+    fn test_zero_udp_max_sessions_rejected() {
+        let mut cfg = config_with_listeners(vec![listener_on("http", 8080, None, None)]);
+        cfg.performance.udp_max_sessions = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("udpMaxSessions"), "{}", err);
     }
 
     // --- Unknown fields in rule-level config are rejected at parse time ------

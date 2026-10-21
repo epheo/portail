@@ -77,7 +77,7 @@ pub struct DataPlane {
     ready_flag: Option<Arc<AtomicBool>>,
     worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
-    udp_session_timeout: Duration,
+    udp_sessions: udp_worker::SessionLimits,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
     /// Per-port dynamic TLS acceptors for hot-reload support.
@@ -300,7 +300,7 @@ impl DataPlane {
                 DEFAULT_MAX_IDLE_PER_BACKEND,
             ),
             health,
-            udp_session_timeout: performance_config.udp_session_timeout,
+            udp_sessions: udp_worker::SessionLimits::from_perf(performance_config),
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             tls_configs: std::collections::HashMap::new(),
@@ -523,17 +523,12 @@ impl DataPlane {
                             Ok(tokio_socket) => {
                                 let routes = routes.clone();
                                 let health = self.health.clone();
-                                let session_timeout = self.udp_session_timeout;
+                                let limits = self.udp_sessions;
                                 let socket = Arc::new(tokio_socket);
 
                                 self.spawn_listener_task(endpoint, |cancel| async move {
                                     udp_worker::run_udp_worker(
-                                        socket,
-                                        port,
-                                        routes,
-                                        session_timeout,
-                                        cancel,
-                                        health,
+                                        socket, port, routes, limits, cancel, health,
                                     )
                                     .await;
                                 });
@@ -625,12 +620,11 @@ impl DataPlane {
             let socket = Arc::new(entry.socket);
             let routes = routes.clone();
             let health = self.health.clone();
-            let session_timeout = self.udp_session_timeout;
+            let limits = self.udp_sessions;
             let port = entry.port;
 
             self.spawn_listener_task((entry.address, entry.bound_port), |cancel| async move {
-                udp_worker::run_udp_worker(socket, port, routes, session_timeout, cancel, health)
-                    .await;
+                udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
             });
         }
 

@@ -1,25 +1,77 @@
 //! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
-//! Sessions are identified by source address and expire after a configurable timeout.
+//! Sessions are identified by source address, capped per listener, moved off a
+//! backend that a route-table swap dropped, and expire after an idle timeout.
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::PerformanceConfig;
 use crate::logging::{debug, info, warn};
+use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::request_processor::{analyze_udp_request, RoutingResult};
 use crate::routing::{BackendSelector, RouteTable};
 
+/// Session bounds of one UDP listener socket.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionLimits {
+    pub idle_timeout: Duration,
+    pub max_sessions: usize,
+}
+
+impl SessionLimits {
+    pub fn from_perf(perf: &PerformanceConfig) -> Self {
+        Self {
+            idle_timeout: perf.udp_session_timeout,
+            max_sessions: perf.udp_max_sessions,
+        }
+    }
+}
+
 struct UdpSession {
+    backend_addr: SocketAddr,
     backend_socket: Arc<UdpSocket>,
-    _backend_task: JoinHandle<()>,
-    last_active: Arc<std::sync::atomic::AtomicU64>,
+    reply_task: JoinHandle<()>,
+    /// Milliseconds since the worker epoch at the last datagram either way.
+    last_active: Arc<AtomicU64>,
+    /// Route-table generation `backend_addr` was last found routed in.
+    generation: u64,
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        // Whatever removes a session, its reply task must not live on holding
+        // the backend socket's fd and port until it idles out.
+        self.reply_task.abort();
+    }
+}
+
+/// Session table of one listener socket. Only its recv loop touches it, so
+/// it needs no locking.
+struct Sessions {
+    listener: Arc<UdpSocket>,
+    server_port: u16,
+    routes: Arc<ArcSwap<RouteTable>>,
+    health: Arc<HealthRegistry>,
+    selector: BackendSelector,
+    limits: SessionLimits,
+    epoch: Instant,
+    map: HashMap<SocketAddr, UdpSession>,
+    /// The table `generation` was taken from. Weak so a swapped-out table is
+    /// freed, while its allocation stays pinned: a new table allocated at the
+    /// same address cannot pass for it.
+    seen: Weak<RouteTable>,
+    generation: u64,
+    /// Reaching the cap was logged since the map last dropped below it.
+    full_logged: bool,
 }
 
 /// Run a UDP recv_from loop on a single socket, dispatching datagrams to per-session backends.
@@ -27,7 +79,7 @@ pub async fn run_udp_worker(
     socket: Arc<UdpSocket>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    session_timeout: Duration,
+    limits: SessionLimits,
     shutdown: CancellationToken,
     health: Arc<HealthRegistry>,
 ) {
@@ -37,38 +89,24 @@ pub async fn run_udp_worker(
     // counts datagrams here since UDP has no connections.
     let (listener_stats, _up_guard) = crate::metrics::register_listener("udp", server_port);
 
-    let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
-    let selector = BackendSelector::new();
+    let mut sessions = Sessions {
+        listener: Arc::clone(&socket),
+        server_port,
+        routes,
+        health,
+        selector: BackendSelector::new(),
+        limits,
+        epoch: Instant::now(),
+        map: HashMap::new(),
+        seen: Weak::new(),
+        generation: 0,
+        full_logged: false,
+    };
     let mut buf = vec![0u8; 65536];
 
-    // Use a monotonic epoch for last_active tracking (shared between main loop and reaper)
-    let epoch = Instant::now();
-
-    // Reaper task: periodically remove expired sessions
-    let reaper_sessions = sessions.clone();
-    let reaper_shutdown = shutdown.clone();
-    let _reaper = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(session_timeout / 2);
-        loop {
-            tokio::select! {
-                biased;
-                _ = reaper_shutdown.cancelled() => break,
-                _ = interval.tick() => {
-                    let now = epoch.elapsed().as_secs();
-                    let timeout_secs = session_timeout.as_secs();
-                    reaper_sessions.retain(|_addr, session: &mut UdpSession| {
-                        let last = session.last_active.load(std::sync::atomic::Ordering::Relaxed);
-                        if now.saturating_sub(last) > timeout_secs {
-                            session._backend_task.abort();
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
-            }
-        }
-    });
+    // Floored: interval(0) panics, and panic = abort takes the pod down.
+    let mut reap = tokio::time::interval((limits.idle_timeout / 2).max(Duration::from_millis(1)));
+    reap.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -77,121 +115,372 @@ pub async fn run_udp_worker(
                 info!("UDP listener on :{} shutting down", server_port);
                 break;
             }
-            result = socket.recv_from(&mut buf) => {
-                match result {
-                    Ok((n, client_addr)) => {
-                        listener_stats.accepted.inc();
-                        let now_secs = epoch.elapsed().as_secs();
+            _ = reap.tick() => sessions.reap(),
+            result = socket.recv_from(&mut buf) => match result {
+                Ok((n, client_addr)) => {
+                    listener_stats.accepted.inc();
+                    sessions.forward(&buf[..n], client_addr).await;
+                }
+                Err(e) => warn!("UDP listener on :{} recv_from error: {}", server_port, e),
+            },
+        }
+    }
+}
 
-                        // Update last_active or create new session. Clone the
-                        // socket and drop the DashMap guard BEFORE awaiting:
-                        // holding a shard guard across an await can block the
-                        // reaper's `retain` on that shard — and with it the
-                        // executor thread the reaper runs on.
-                        if let Some(session) = sessions.get(&client_addr) {
-                            session.last_active.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            let backend_socket = session.backend_socket.clone();
-                            drop(session);
-                            if let Err(_e) = backend_socket.send(&buf[..n]).await {
-                                debug!("UDP send to backend failed for {}: {}", client_addr, _e);
-                                sessions.remove(&client_addr);
-                            }
-                            continue;
-                        }
-
-                        // New session — route lookup
-                        let decision = {
-                            let route_table = routes.load();
-                            match analyze_udp_request(&route_table, &selector, server_port, &health) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    warn!("UDP routing error for port {}: {}", server_port, e);
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let backend_addr = match decision {
-                            RoutingResult::UdpForward { backend_addr } => backend_addr,
-                            _ => continue,
-                        };
-
-                        // Create connected backend socket
-                        let backend_socket = match UdpSocket::bind("0.0.0.0:0").await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("UDP backend socket bind failed: {}", e);
-                                continue;
-                            }
-                        };
-                        if let Err(e) = backend_socket.connect(backend_addr).await {
-                            warn!("UDP backend connect to {} failed: {}", backend_addr, e);
-                            continue;
-                        }
-
-                        let backend_socket = Arc::new(backend_socket);
-
-                        // Forward the first datagram
-                        if let Err(e) = backend_socket.send(&buf[..n]).await {
-                            warn!("UDP initial send to {} failed: {}", backend_addr, e);
-                            continue;
-                        }
-
-                        let last_active = Arc::new(std::sync::atomic::AtomicU64::new(now_secs));
-
-                        // Spawn backend→client forwarding task
-                        let listener_socket = socket.clone();
-                        let backend_rx = backend_socket.clone();
-                        let task_last_active = last_active.clone();
-                        let task_timeout = session_timeout;
-                        let backend_task = tokio::spawn(async move {
-                            let mut reply_buf = vec![0u8; 65536];
-                            loop {
-                                match tokio::time::timeout(task_timeout, backend_rx.recv(&mut reply_buf)).await {
-                                    Ok(Ok(n)) => {
-                                        task_last_active.store(
-                                            epoch.elapsed().as_secs(),
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        if listener_socket.send_to(&reply_buf[..n], client_addr).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Ok(Err(_)) => break,
-                                    Err(_) => {
-                                        // No backend reply within a window. Exit
-                                        // only if the client has gone quiet too —
-                                        // a silent backend must not kill the reply
-                                        // path of a session the client is still
-                                        // actively using (the reaper collects the
-                                        // session once both sides idle out).
-                                        let last = task_last_active
-                                            .load(std::sync::atomic::Ordering::Relaxed);
-                                        let idle = epoch.elapsed().as_secs().saturating_sub(last);
-                                        if idle > task_timeout.as_secs() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                        sessions.insert(client_addr, UdpSession {
-                            backend_socket,
-                            _backend_task: backend_task,
-                            last_active,
-                        });
-                    }
+impl Sessions {
+    async fn forward(&mut self, datagram: &[u8], client: SocketAddr) {
+        let now = millis_since(self.epoch);
+        let new_backend = {
+            // A table guard must not be held across an await.
+            let table = self.routes.load();
+            if !std::ptr::eq(Arc::as_ptr(&table), self.seen.as_ptr()) {
+                self.seen = Arc::downgrade(&table);
+                self.generation += 1;
+            }
+            if self.reusable(&table, client) {
+                None
+            } else {
+                self.map.remove(&client);
+                if self.map.len() >= self.limits.max_sessions {
+                    self.overflow();
+                    return;
+                }
+                match analyze_udp_request(&table, &self.selector, self.server_port, &self.health) {
+                    Ok(RoutingResult::UdpForward { backend_addr }) => Some(backend_addr),
+                    Ok(_) => return,
                     Err(e) => {
-                        warn!("UDP listener on :{} recv_from error: {}", server_port, e);
+                        warn!("UDP routing error for port {}: {}", self.server_port, e);
+                        return;
                     }
                 }
             }
+        };
+        match new_backend {
+            None => self.send(datagram, client, now).await,
+            Some(backend_addr) => self.open(datagram, client, backend_addr, now).await,
         }
     }
 
-    // Cleanup: abort all session tasks
-    for entry in sessions.iter() {
-        entry.value()._backend_task.abort();
+    /// Whether `client`'s session can carry its next datagram: its reply path
+    /// is alive, and its backend is still routed. Checked once per table
+    /// generation, so a swap that keeps the backend keeps the client on it.
+    fn reusable(&mut self, table: &RouteTable, client: SocketAddr) -> bool {
+        let (generation, port) = (self.generation, self.server_port);
+        let Some(session) = self.map.get_mut(&client) else {
+            return false;
+        };
+        if session.reply_task.is_finished() {
+            return false;
+        }
+        if session.generation != generation {
+            let routed = table.find_udp_backends(port).is_ok_and(|backends| {
+                backends
+                    .iter()
+                    .any(|b| b.weight > 0 && b.socket_addr == session.backend_addr)
+            });
+            if !routed {
+                return false;
+            }
+            session.generation = generation;
+        }
+        true
+    }
+
+    async fn send(&mut self, datagram: &[u8], client: SocketAddr, now: u64) {
+        let Some(session) = self.map.get(&client) else {
+            return;
+        };
+        session.last_active.store(now, Relaxed);
+        let sent = session.backend_socket.send(datagram).await;
+        if let Err(e) = sent {
+            debug!("UDP send to backend failed for {}: {}", client, e);
+            self.map.remove(&client);
+        }
+    }
+
+    async fn open(
+        &mut self,
+        datagram: &[u8],
+        client: SocketAddr,
+        backend_addr: SocketAddr,
+        now: u64,
+    ) {
+        let backend_socket = match connect_backend(backend_addr).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!("UDP backend socket to {} failed: {}", backend_addr, e);
+                return;
+            }
+        };
+        if let Err(e) = backend_socket.send(datagram).await {
+            warn!("UDP initial send to {} failed: {}", backend_addr, e);
+            return;
+        }
+        let last_active = Arc::new(AtomicU64::new(now));
+        let reply_task = tokio::spawn(relay_replies(
+            Arc::clone(&self.listener),
+            Arc::clone(&backend_socket),
+            client,
+            Arc::clone(&last_active),
+            self.epoch,
+        ));
+        self.map.insert(
+            client,
+            UdpSession {
+                backend_addr,
+                backend_socket,
+                reply_task,
+                last_active,
+                generation: self.generation,
+            },
+        );
+    }
+
+    /// The one expiry mechanism: drops sessions idle past the timeout, and
+    /// sessions whose reply path died.
+    fn reap(&mut self) {
+        let now = millis_since(self.epoch);
+        let idle_ms = self.limits.idle_timeout.as_millis() as u64;
+        self.map.retain(|_, s| {
+            !s.reply_task.is_finished()
+                && now.saturating_sub(s.last_active.load(Relaxed)) <= idle_ms
+        });
+        if self.map.len() < self.limits.max_sessions {
+            self.full_logged = false;
+        }
+    }
+
+    fn overflow(&mut self) {
+        METRICS.udp_session_overflow_drops_total.inc();
+        if !self.full_logged {
+            self.full_logged = true;
+            warn!(
+                "UDP listener on :{} reached udpMaxSessions ({}): dropping datagrams that would open a session",
+                self.server_port, self.limits.max_sessions
+            );
+        }
+    }
+}
+
+/// A socket connected to `backend`, bound in the backend's address family:
+/// an IPv4 socket cannot reach an IPv6 backend.
+async fn connect_backend(backend: SocketAddr) -> std::io::Result<UdpSocket> {
+    let local: SocketAddr = match backend {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = UdpSocket::bind(local).await?;
+    socket.connect(backend).await?;
+    Ok(socket)
+}
+
+/// Backend-to-client half of a session. No timeout of its own: a backend
+/// that stays silent must not end a session its client still uses, and the
+/// reaper aborts this task with its session.
+async fn relay_replies(
+    listener: Arc<UdpSocket>,
+    backend: Arc<UdpSocket>,
+    client: SocketAddr,
+    last_active: Arc<AtomicU64>,
+    epoch: Instant,
+) {
+    let mut buf = vec![0u8; 65536];
+    while let Ok(n) = backend.recv(&mut buf).await {
+        last_active.store(millis_since(epoch), Relaxed);
+        if listener.send_to(&buf[..n], client).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn millis_since(epoch: Instant) -> u64 {
+    epoch.elapsed().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::Backend;
+
+    /// Replies "{tag}:{payload}" to every datagram.
+    async fn echo_backend(bind: &str, tag: &'static str) -> Option<(SocketAddr, JoinHandle<()>)> {
+        let socket = UdpSocket::bind(bind).await.ok()?;
+        let addr = socket.local_addr().ok()?;
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let mut reply = format!("{}:", tag).into_bytes();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        Some((addr, task))
+    }
+
+    fn udp_table(port: u16, backends: &[SocketAddr]) -> RouteTable {
+        let mut t = RouteTable::new();
+        let backends = backends
+            .iter()
+            .map(|b| Backend::new(b.ip().to_string(), b.port()).unwrap())
+            .collect();
+        t.add_udp_route(port, backends);
+        t
+    }
+
+    struct Proxy {
+        addr: SocketAddr,
+        routes: Arc<ArcSwap<RouteTable>>,
+        shutdown: CancellationToken,
+    }
+
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    fn limits(idle_timeout: Duration, max_sessions: usize) -> SessionLimits {
+        SessionLimits {
+            idle_timeout,
+            max_sessions,
+        }
+    }
+
+    async fn start_proxy(backends: &[SocketAddr], limits: SessionLimits) -> Proxy {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(udp_table(addr.port(), backends)));
+        let shutdown = CancellationToken::new();
+        tokio::spawn(run_udp_worker(
+            socket,
+            addr.port(),
+            Arc::clone(&routes),
+            limits,
+            shutdown.clone(),
+            Arc::new(HealthRegistry::new()),
+        ));
+        Proxy {
+            addr,
+            routes,
+            shutdown,
+        }
+    }
+
+    async fn client() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    async fn roundtrip(client: &UdpSocket, proxy: SocketAddr, payload: &[u8]) -> Option<String> {
+        roundtrip_within(client, proxy, payload, Duration::from_millis(500)).await
+    }
+
+    async fn roundtrip_within(
+        client: &UdpSocket,
+        proxy: SocketAddr,
+        payload: &[u8],
+        wait: Duration,
+    ) -> Option<String> {
+        client.send_to(payload, proxy).await.ok()?;
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(wait, client.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
+    #[tokio::test]
+    async fn ipv6_backend_is_reachable() {
+        let Some((backend, _echo)) = echo_backend("[::1]:0", "v6").await else {
+            return; // no IPv6 loopback here
+        };
+        let proxy = start_proxy(&[backend], limits(Duration::from_secs(30), 16)).await;
+        let client = client().await;
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"hi").await.as_deref(),
+            Some("v6:hi")
+        );
+    }
+
+    /// A session must leave a backend the route table dropped, and only then:
+    /// a swap that keeps its backend keeps the session.
+    #[tokio::test]
+    async fn session_follows_route_table_swap() {
+        let (a, _ea) = echo_backend("127.0.0.1:0", "a").await.unwrap();
+        let (b, _eb) = echo_backend("127.0.0.1:0", "b").await.unwrap();
+        let proxy = start_proxy(&[a], limits(Duration::from_secs(30), 16)).await;
+        let port = proxy.addr.port();
+        let client = client().await;
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"1").await.as_deref(),
+            Some("a:1")
+        );
+
+        // A fresh session would round-robin onto b here.
+        proxy.routes.store(Arc::new(udp_table(port, &[a, b])));
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"2").await.as_deref(),
+            Some("a:2")
+        );
+
+        proxy.routes.store(Arc::new(udp_table(port, &[b])));
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"3").await.as_deref(),
+            Some("b:3")
+        );
+    }
+
+    #[tokio::test]
+    async fn new_clients_dropped_at_session_cap() {
+        let (a, _echo) = echo_backend("127.0.0.1:0", "a").await.unwrap();
+        let proxy = start_proxy(&[a], limits(Duration::from_millis(400), 1)).await;
+        let (first, second) = (client().await, client().await);
+        assert_eq!(
+            roundtrip(&first, proxy.addr, b"1").await.as_deref(),
+            Some("a:1")
+        );
+
+        // Waits well under the idle timeout, so the first session is still up.
+        let drops = METRICS.udp_session_overflow_drops_total.get();
+        let dropped = roundtrip_within(&second, proxy.addr, b"2", Duration::from_millis(150));
+        assert_eq!(dropped.await, None);
+        assert!(METRICS.udp_session_overflow_drops_total.get() > drops);
+        assert_eq!(
+            roundtrip(&first, proxy.addr, b"3").await.as_deref(),
+            Some("a:3"),
+            "the established session keeps working"
+        );
+
+        // Idle past the timeout plus a reaper period: the slot frees up.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            roundtrip(&second, proxy.addr, b"4").await.as_deref(),
+            Some("a:4")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_aborts_its_reply_task() {
+        let marker = Arc::new(());
+        let held = Arc::clone(&marker);
+        let task = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        });
+        let session = UdpSession {
+            backend_addr: "127.0.0.1:9".parse().unwrap(),
+            backend_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            reply_task: task,
+            last_active: Arc::new(AtomicU64::new(0)),
+            generation: 0,
+        };
+        drop(session);
+        for _ in 0..10 {
+            if Arc::strong_count(&marker) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("reply task outlived its session");
     }
 }

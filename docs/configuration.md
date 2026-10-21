@@ -135,7 +135,8 @@ values; defaults shown):
 | `clientHeaderTimeout` | `30s` | Max time for a client TLS handshake, or to finish a request's header block once its first bytes arrive (slow-loris guard). Does not bound idle keepalive waits |
 | `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming; reaps peers that stay connected but stop transferring. `0s` disables |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket; reaps peers that vanished without FIN/RST before they pin fds forever |
-| `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions |
+| `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
+| `udpMaxSessions` | `1024` | Concurrent UDP sessions per listener socket; a datagram that would open one more is dropped and counted in `portail_udp_session_overflow_drops_total`. Each session holds an fd, a task, a 64KiB reply buffer and an ephemeral port, and spoofed source addresses cost nothing to send from. The default is Envoy's default `max_connections` circuit breaker, which also bounds its UDP sessions |
 | `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window) |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
 | `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
