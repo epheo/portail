@@ -281,13 +281,20 @@ fn test_backend_dns_name_with_namespace() {
     );
 }
 
+/// `test_http_route` moved to `ns`, its parentRef still naming default/test-gw.
+fn route_from_ns(ns: &str) -> HTTPRoute {
+    let mut route = test_http_route();
+    route.metadata.namespace = Some(ns.to_string());
+    route.spec.parent_refs.as_mut().unwrap()[0].namespace = Some("default".to_string());
+    route
+}
+
 #[test]
 fn test_namespace_scoping_same() {
     let mut gw = test_gateway();
     gw.metadata.namespace = Some("default".to_string());
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("other-ns".to_string());
+    let route = route_from_ns("other-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert("other-ns".to_string(), BTreeMap::new());
@@ -318,8 +325,7 @@ fn test_namespace_scoping_all() {
         kinds: None,
     });
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("other-ns".to_string());
+    let route = route_from_ns("other-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert("other-ns".to_string(), BTreeMap::new());
@@ -351,8 +357,7 @@ fn test_namespace_scoping_selector() {
         kinds: None,
     });
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("prod-ns".to_string());
+    let route = route_from_ns("prod-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert(
@@ -2757,6 +2762,45 @@ fn reconcile_table(gw: &Gateway, snapshot: &ClusterSnapshot) -> (ReconcileResult
     fixup_backends_for_test(&mut config);
     let table = config.to_route_table().unwrap();
     (result, table)
+}
+
+fn from_all_namespaces() -> Option<GatewayListenersAllowedRoutes> {
+    Some(GatewayListenersAllowedRoutes {
+        namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+            from: Some(GatewayListenersAllowedRoutesNamespacesFrom::All),
+            selector: None,
+        }),
+        kinds: None,
+    })
+}
+
+fn app_served_on(table: &RouteTable, port: u16) -> bool {
+    table
+        .find_http_route("app.example.com", "GET", "/", &[], "", port)
+        .is_ok()
+}
+
+/// An unset parentRef namespace is the route's own: a route in other-ns
+/// naming "gw" targets other-ns/gw, never default/gw, even where default/gw
+/// admits every namespace.
+#[test]
+fn parent_ref_without_namespace_targets_the_routes_namespace() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(None, None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert!(
+        result.route_status.is_empty(),
+        "no status on a Gateway the route does not target"
+    );
+    assert!(!app_served_on(&table, 8080));
 }
 
 /// config-routing #5: equally specific routes tie-broke by reflector order.

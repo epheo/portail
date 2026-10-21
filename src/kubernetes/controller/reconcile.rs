@@ -53,7 +53,7 @@ where
     store
         .state()
         .into_iter()
-        .filter(|r| route_targets_gateway(r.parent_refs(), gw_name, gw_ns))
+        .filter(|r| route_targets_gateway(r.parent_refs(), r.route_namespace(), gw_name, gw_ns))
         .collect()
 }
 

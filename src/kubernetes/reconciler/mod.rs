@@ -583,7 +583,14 @@ fn collect_routes<R: GatewayRoute>(
     let mut ordered: Vec<&R> = routes
         .iter()
         .map(|r| &**r)
-        .filter(|r| route_targets_gateway(r.parent_refs(), cx.gateway_name, cx.gateway_ns))
+        .filter(|r| {
+            route_targets_gateway(
+                r.parent_refs(),
+                r.route_namespace(),
+                cx.gateway_name,
+                cx.gateway_ns,
+            )
+        })
         .collect();
     ordered.sort_by(|a, b| precedence(*a).cmp(&precedence(*b)));
 
@@ -607,7 +614,9 @@ fn collect_routes<R: GatewayRoute>(
             .as_ref()
             .map(|refs| {
                 refs.iter()
-                    .filter(|pr| parent_ref_matches_gateway(*pr, cx.gateway_name, cx.gateway_ns))
+                    .filter(|pr| {
+                        parent_ref_matches_gateway(*pr, route_ns, cx.gateway_name, cx.gateway_ns)
+                    })
                     .map(|pr| {
                         (
                             pr.ref_section_name().map(String::from),
