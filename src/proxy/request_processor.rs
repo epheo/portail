@@ -336,22 +336,25 @@ fn build_redirect(
             status_code,
         } = filter
         {
-            let redirect_path = match path {
-                Some(URLRewritePath::ReplaceFullPath(value)) => value.clone(),
-                Some(URLRewritePath::ReplacePrefixMatch(value)) => {
-                    crate::proxy::http_filters::join_prefix_path(
-                        value,
-                        crate::proxy::http_filters::prefix_remainder(&rule.path, request_path),
-                    )
+            let (redirect_path, value_query) = match path {
+                Some(URLRewritePath::ReplaceFullPath(value)) => {
+                    (Cow::Borrowed(value.path.as_str()), value.query.as_deref())
                 }
-                None => request_path.to_string(),
+                Some(URLRewritePath::ReplacePrefixMatch(value)) => (
+                    Cow::Owned(crate::proxy::http_filters::join_prefix_path(
+                        &value.path,
+                        crate::proxy::http_filters::prefix_remainder(&rule.path, request_path),
+                    )),
+                    value.query.as_deref(),
+                ),
+                None => (Cow::Borrowed(request_path), None),
             };
             let default_scheme = if is_tls { "https" } else { "http" };
             let location = build_redirect_location(
                 scheme.as_deref(),
                 hostname.as_deref().unwrap_or(request_host),
                 *port,
-                &redirect_path,
+                (&redirect_path, value_query),
                 query,
                 default_scheme,
                 server_port,
@@ -377,22 +380,27 @@ fn subslice_span(base: &[u8], sub: &str) -> Option<(u32, u32)> {
 }
 
 /// The redirect's path replaces the request's path only (HTTPPathModifier):
-/// a non-empty `query` follows it, after the path's own query if it has
-/// one.
+/// a non-empty `query` follows it, after the query its value carries if
+/// any (`path.1`).
 fn build_redirect_location(
     scheme: Option<&str>,
     hostname: &str,
     port: Option<u16>,
-    path: &str,
+    (path, value_query): (&str, Option<&str>),
     query: &str,
     default_scheme: &str,
     incoming_port: u16,
 ) -> String {
     let final_scheme = scheme.unwrap_or(default_scheme);
-    let query_mark = if query.is_empty() {
-        ""
-    } else {
-        crate::proxy::http_filters::query_separator(path.as_bytes())
+    let (query_mark, value_query, glue) = match value_query {
+        None if query.is_empty() => ("", "", ""),
+        None => ("?", "", ""),
+        Some(value_query) if query.is_empty() => ("?", value_query, ""),
+        Some(value_query) => (
+            "?",
+            value_query,
+            crate::proxy::http_filters::query_glue(value_query),
+        ),
     };
     let scheme_changed = scheme.is_some() && final_scheme != default_scheme;
 
@@ -411,9 +419,9 @@ fn build_redirect_location(
         Some(p)
             if !((final_scheme == "http" && p == 80) || (final_scheme == "https" && p == 443)) =>
         {
-            format!("{final_scheme}://{hostname}:{p}{path}{query_mark}{query}")
+            format!("{final_scheme}://{hostname}:{p}{path}{query_mark}{value_query}{glue}{query}")
         }
-        _ => format!("{final_scheme}://{hostname}{path}{query_mark}{query}"),
+        _ => format!("{final_scheme}://{hostname}{path}{query_mark}{value_query}{glue}{query}"),
     }
 }
 
@@ -581,7 +589,7 @@ mod tests {
                 scheme: None,
                 hostname: None,
                 port: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
                 status_code: 302,
             }],
             vec![Backend {
@@ -621,7 +629,7 @@ mod tests {
             8001,
             vec![HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplaceFullPath("/new".to_string())),
+                path: Some(URLRewritePath::ReplaceFullPath("/new".into())),
             }],
         );
         let sel = BackendSelector::new();
@@ -633,7 +641,7 @@ mod tests {
                 crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/old")
                     .unwrap();
             assert!(
-                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath::Full(ref p)) if p == "/new")
+                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath { path: ref p, .. }) if p == "/new")
             );
         } else {
             panic!("expected HttpForward");
@@ -649,7 +657,7 @@ mod tests {
             8001,
             vec![HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
             }],
         );
         let sel = BackendSelector::new();
@@ -664,7 +672,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/v2/users")
+                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath { path: ref p, .. }) if p == "/v2/users")
             );
         } else {
             panic!("expected HttpForward");
@@ -680,7 +688,7 @@ mod tests {
             8001,
             vec![HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
             }],
         );
         let sel = BackendSelector::new();
@@ -692,7 +700,7 @@ mod tests {
                 crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/v1")
                     .unwrap();
             assert!(
-                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/v2")
+                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath { path: ref p, .. }) if p == "/v2")
             );
         } else {
             panic!("expected HttpForward");
@@ -708,7 +716,7 @@ mod tests {
             8001,
             vec![HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/api".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/api".into())),
             }],
         );
         let sel = BackendSelector::new();
@@ -723,7 +731,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath::PrefixReplaced(ref p)) if p == "/api/users"),
+                matches!(rewrite.path, Some(crate::proxy::http_filters::RewrittenPath { path: ref p, .. }) if p == "/api/users"),
                 "expected /api/users, got {:?}",
                 rewrite.path
             );
@@ -769,7 +777,7 @@ mod tests {
             vec![
                 HttpFilter::URLRewrite {
                     hostname: None,
-                    path: Some(URLRewritePath::ReplaceFullPath("/new".to_string())),
+                    path: Some(URLRewritePath::ReplaceFullPath("/new".into())),
                 },
                 HttpFilter::RequestHeaderModifier {
                     add: Arc::new(vec![HttpHeader {
@@ -927,12 +935,12 @@ mod tests {
         for (path, target, want) in [
             (None, "/old/x?a=1&b", "https://r.test/old/x?a=1&b"),
             (
-                Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+                Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
                 "/old/x?a=1",
                 "https://r.test/new/x?a=1",
             ),
             (
-                Some(URLRewritePath::ReplaceFullPath("/full".to_string())),
+                Some(URLRewritePath::ReplaceFullPath("/full".into())),
                 "/old/x?a=1",
                 "https://r.test/full?a=1",
             ),
@@ -940,30 +948,31 @@ mod tests {
             // A value's own query comes first, then the request's after a
             // '&'. It made two: /login?next=home?a=1.
             (
-                Some(URLRewritePath::ReplaceFullPath(
-                    "/login?next=home".to_string(),
-                )),
+                Some(URLRewritePath::ReplaceFullPath("/login?next=home".into())),
                 "/old/x?a=1",
                 "https://r.test/login?next=home&a=1",
             ),
             (
-                Some(URLRewritePath::ReplaceFullPath(
-                    "/login?next=home".to_string(),
-                )),
+                Some(URLRewritePath::ReplaceFullPath("/login?next=home".into())),
                 "/old/x",
                 "https://r.test/login?next=home",
             ),
             (
-                Some(URLRewritePath::ReplacePrefixMatch(
-                    "/new?src=gw".to_string(),
-                )),
+                Some(URLRewritePath::ReplacePrefixMatch("/new?src=gw".into())),
                 "/old/x?a=1",
                 "https://r.test/new/x?src=gw&a=1",
             ),
             (
-                Some(URLRewritePath::ReplaceFullPath("/login?".to_string())),
+                Some(URLRewritePath::ReplaceFullPath("/login?".into())),
                 "/old/x?a=1",
                 "https://r.test/login?a=1",
+            ),
+            // A value's query already ending in '&' takes the request's as
+            // is: it made /login?next=home&&a=1.
+            (
+                Some(URLRewritePath::ReplaceFullPath("/login?next=home&".into())),
+                "/old/x?a=1",
+                "https://r.test/login?next=home&a=1",
             ),
         ] {
             let redirect = HttpFilter::RequestRedirect {
@@ -1076,7 +1085,7 @@ mod tests {
             scheme: None,
             hostname: None,
             port: None,
-            path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+            path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
             status_code: 301,
         };
         let rt = build_route_table(

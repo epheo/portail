@@ -1458,10 +1458,7 @@ mod tests {
             let rule = rt.find_http_route("p.example.com", "GET", path, &[], "", 8080)?;
             let rewrite =
                 crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, path)?;
-            match rewrite.path? {
-                crate::proxy::http_filters::RewrittenPath::PrefixReplaced(p) => Some(p),
-                crate::proxy::http_filters::RewrittenPath::Full(p) => panic!("{p}"),
-            }
+            rewrite.path.map(|p| p.path)
         };
         // The ReplacePrefixMatch table of Gateway API v1.4.1, prefix /foo/.
         assert_eq!(rewrite("/foo/bar").as_deref(), Some("/xyz/bar"));

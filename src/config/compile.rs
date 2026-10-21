@@ -510,9 +510,11 @@ fn mirror_fraction(config: &RequestMirrorConfig) -> Result<routing::Fraction, Ro
 impl From<&HttpURLRewritePath> for routing::URLRewritePath {
     fn from(p: &HttpURLRewritePath) -> Self {
         match p {
-            HttpURLRewritePath::ReplaceFullPath { value } => Self::ReplaceFullPath(value.clone()),
+            HttpURLRewritePath::ReplaceFullPath { value } => {
+                Self::ReplaceFullPath(value.as_str().into())
+            }
             HttpURLRewritePath::ReplacePrefixMatch { value } => {
-                Self::ReplacePrefixMatch(value.clone())
+                Self::ReplacePrefixMatch(value.as_str().into())
             }
         }
     }

@@ -572,8 +572,34 @@ impl Fraction {
 
 #[derive(Debug, Clone)]
 pub enum URLRewritePath {
-    ReplaceFullPath(String),
-    ReplacePrefixMatch(String),
+    ReplaceFullPath(PathValue),
+    ReplacePrefixMatch(PathValue),
+}
+
+/// A path modifier value, split once when its rule compiles: a request
+/// never scans it. Gateway API v1.4.1 HTTPPathModifier bounds the value by
+/// length only, so it may carry a query, which comes before the request's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathValue {
+    pub path: String,
+    /// After the value's first '?', when it has one: `Some("")` for a
+    /// bare '?'.
+    pub query: Option<Arc<str>>,
+}
+
+impl From<&str> for PathValue {
+    fn from(value: &str) -> Self {
+        match value.split_once('?') {
+            Some((path, query)) => Self {
+                path: path.to_string(),
+                query: Some(query.into()),
+            },
+            None => Self {
+                path: value.to_string(),
+                query: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

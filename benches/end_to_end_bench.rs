@@ -291,8 +291,8 @@ fn path_analysis(c: &mut Criterion) {
 }
 
 /// Path modifiers per request: a redirect's Location (prefix join plus
-/// the query join), and a URLRewrite's prefix join. A value may carry a
-/// query of its own, so both look for its '?'.
+/// the query join), and a URLRewrite's prefix join. A value's own query
+/// was split off when its rule compiled: no request scans the value.
 fn path_modifiers(c: &mut Criterion) {
     use portail::proxy::http_filters::extract_url_rewrite;
     use portail::routing::{HttpFilter, URLRewritePath};
@@ -302,7 +302,7 @@ fn path_modifiers(c: &mut Criterion) {
         scheme: Some("https".to_string()),
         hostname: None,
         port: None,
-        path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
         status_code: 302,
     };
     table.add_http_route(
@@ -334,10 +334,44 @@ fn path_modifiers(c: &mut Criterion) {
 
     let rewrite = [HttpFilter::URLRewrite {
         hostname: None,
-        path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
     }];
     c.bench_function("url_rewrite_prefix", |b| {
         b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
+    });
+
+    // A full-path redirect whose value carries a query, joined with the
+    // request's: the '&' decision reads the value's last byte only.
+    let mut table = RouteTable::new();
+    let redirect = HttpFilter::RequestRedirect {
+        scheme: None,
+        hostname: None,
+        port: None,
+        path: Some(URLRewritePath::ReplaceFullPath("/login?next=home".into())),
+        status_code: 302,
+    };
+    table.add_http_route(
+        "app.api.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/old".to_string(),
+            vec![],
+            vec![],
+            vec![redirect],
+            vec![],
+        ),
+    );
+    c.bench_function("e2e_analyze_redirect_full_value_query", |b| {
+        b.iter(|| {
+            analyze_request(
+                black_box(&table),
+                &selector,
+                black_box(&request[..]),
+                black_box(80),
+                &health,
+                false,
+            )
+        })
     });
 }
 

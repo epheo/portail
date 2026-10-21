@@ -3059,7 +3059,7 @@ mod connection_tests {
     async fn absolute_form_takes_a_path_prefix_rewrite() {
         let rewrite = vec![HttpFilter::URLRewrite {
             hostname: None,
-            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
         }];
         let seen = forwarded_head(
             |addr| filtered_route("p.test", "/v1", rewrite, addr),
@@ -3127,7 +3127,7 @@ mod connection_tests {
     async fn a_path_rewrite_applies_to_the_normalized_path() {
         let rewrite = vec![HttpFilter::URLRewrite {
             hostname: None,
-            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
         }];
         let seen = forwarded_head(
             |addr| filtered_route("p.test", "/v1", rewrite, addr),
@@ -3145,7 +3145,7 @@ mod connection_tests {
         ] {
             let rewrite = vec![HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
             }];
             let seen = forwarded_head(
                 |addr| filtered_route("p.test", "/v1", rewrite, addr),

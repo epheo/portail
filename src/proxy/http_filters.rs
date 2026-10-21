@@ -26,10 +26,22 @@ pub struct URLRewrite {
     pub path: Option<RewrittenPath>,
 }
 
+/// A path modifier applied to one request: its new path, and the query its
+/// value carries ([`crate::routing::PathValue`]), which goes before the
+/// request's.
 #[derive(Debug, Clone)]
-pub enum RewrittenPath {
-    Full(String),
-    PrefixReplaced(String),
+pub struct RewrittenPath {
+    pub path: String,
+    pub query: Option<std::sync::Arc<str>>,
+}
+
+#[cfg(test)]
+impl RewrittenPath {
+    /// The path a full-path value gives, its query split off as a rule's is.
+    pub(crate) fn from_value(value: &str) -> Self {
+        let crate::routing::PathValue { path, query } = value.into();
+        Self { path, query }
+    }
 }
 
 /// Assemble the outgoing request header block into `out` (reused scratch):
@@ -63,7 +75,7 @@ pub(crate) fn assemble_forward_headers(
     if let Some(path) = path {
         // No span covers the request line: the gaps resume at its CRLF.
         cursor = memchr::memchr(b'\r', raw).unwrap_or(0);
-        put_request_line(&raw[..cursor], path, out);
+        put_request_line(&raw[..cursor], path, None, out);
     }
     let mut upgrade_pending = strip_upgrade;
     for (s, e) in spans.iter() {
@@ -126,7 +138,7 @@ pub(crate) fn assemble_forward_headers_slow(
             // Request line is never a header.
             first = false;
             match path {
-                Some(path) => put_request_line(line, path, out),
+                Some(path) => put_request_line(line, path, None, out),
                 None => out.extend_from_slice(line),
             }
             out.extend_from_slice(b"\r\n");
@@ -222,7 +234,7 @@ pub(crate) fn absolute_form_target(
 /// HTTP/1.0 client sent none (3.2.2). Filters then act on it as on any
 /// origin-form request.
 pub(crate) fn to_origin_form(head: &[u8], path: &[u8], authority: &str, out: &mut Vec<u8>) {
-    rewrite_request_head(head, Some(path), None, Some(authority), out);
+    rewrite_request_head(head, Some((path, None)), None, Some(authority), out);
 }
 
 /// Request-target bounds within a request line: between its first two SPs.
@@ -355,10 +367,9 @@ pub(crate) fn prefix_remainder<'a>(rule_path: &str, request_path: &'a str) -> &'
 }
 
 /// Join a prefix replacement with the remaining suffix from the original path.
-/// Avoids double-slash: `/` + `/three` is `/three`, not `//three`. A query in
-/// the replacement follows the joined path: `/new?a` + `/x` is `/new/x?a`.
+/// Avoids double-slash: `/` + `/three` is `/three`, not `//three`. The
+/// value's query, split off when its rule compiled, follows the joined path.
 pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
-    let (prefix, query) = prefix.split_at(prefix.find('?').unwrap_or(prefix.len()));
     // Strip trailing slash from prefix if suffix starts with slash
     let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
         &prefix[..prefix.len() - 1]
@@ -366,8 +377,7 @@ pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
         prefix
     };
     let needs_slash = !prefix.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty();
-    let mut result =
-        String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash) + query.len());
+    let mut result = String::with_capacity(prefix.len() + suffix.len() + usize::from(needs_slash));
     result.push_str(prefix);
     if needs_slash {
         result.push('/');
@@ -376,7 +386,6 @@ pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     if result.is_empty() {
         result.push('/');
     }
-    result.push_str(query);
     result
 }
 
@@ -409,10 +418,14 @@ pub fn extract_url_rewrite(
     for filter in filters {
         if let HttpFilter::URLRewrite { hostname, path } = filter {
             let rewritten_path = path.as_ref().map(|p| match p {
-                URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
-                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
-                    join_prefix_path(value, prefix_remainder(rule_path, request_path)),
-                ),
+                URLRewritePath::ReplaceFullPath(value) => RewrittenPath {
+                    path: value.path.clone(),
+                    query: value.query.clone(),
+                },
+                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath {
+                    path: join_prefix_path(&value.path, prefix_remainder(rule_path, request_path)),
+                    query: value.query.clone(),
+                },
             });
             return Some(URLRewrite {
                 hostname: hostname.clone(),
@@ -604,19 +617,20 @@ pub(crate) fn apply_request_header_modifications(
     url_rewrite: Option<&URLRewrite>,
     out: &mut Vec<u8>,
 ) {
-    let path = url_rewrite.and_then(|r| r.path.as_ref()).map(|p| match p {
-        RewrittenPath::Full(p) | RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
-    });
+    let path = url_rewrite
+        .and_then(|r| r.path.as_ref())
+        .map(|p| (p.path.as_bytes(), p.query.as_deref()));
     let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
     rewrite_request_head(header_region, path, header_mods, rewrite_hostname, out);
 }
 
 /// The request line with `path` in place of its target's path, then the
 /// header lines through `apply_header_mods_inner`, into `out` (cleared
-/// first). Shared by URLRewrite paths and the origin-form rewrite.
+/// first). Shared by URLRewrite paths and the origin-form rewrite. `path`
+/// carries the query of the value it came from, if any.
 fn rewrite_request_head(
     header_region: &[u8],
-    path: Option<&[u8]>,
+    path: Option<(&[u8], Option<&str>)>,
     header_mods: Option<&HeaderModifications<'_>>,
     rewrite_hostname: Option<&str>,
     out: &mut Vec<u8>,
@@ -625,7 +639,7 @@ fn rewrite_request_head(
     out.reserve(header_region.len() + 256);
     let (first_line, rest) = split_first_line(header_region);
     match path {
-        Some(path) => put_request_line(first_line, path, out),
+        Some((path, value_query)) => put_request_line(first_line, path, value_query, out),
         None => out.extend_from_slice(first_line),
     }
     out.extend_from_slice(b"\r\n");
@@ -635,10 +649,10 @@ fn rewrite_request_head(
 /// Request line `line` (no CRLF) into `out`, with `path` in place of all
 /// its target holds before the query. The query stays: path normalization
 /// and path modifiers (HTTPPathModifier) change the path only. A modifier
-/// value with a query of its own takes the request's after it
-/// ([`query_separator`]). The parser let no '?' into an absolute-form
+/// value's own query (`value_query`) comes first, the request's after it
+/// ([`query_glue`]). The parser let no '?' into an absolute-form
 /// authority, so such a target leaves origin-form.
-fn put_request_line(line: &[u8], path: &[u8], out: &mut Vec<u8>) {
+fn put_request_line(line: &[u8], path: &[u8], value_query: Option<&str>, out: &mut Vec<u8>) {
     let Some((start, end)) = target_bounds(line) else {
         out.extend_from_slice(line);
         return;
@@ -646,27 +660,30 @@ fn put_request_line(line: &[u8], path: &[u8], out: &mut Vec<u8>) {
     let query = memchr::memchr(b'?', &line[start..end]).map_or(end, |q| start + q);
     out.extend_from_slice(&line[..start]);
     out.extend_from_slice(path);
-    match query_separator(path) {
+    match value_query {
         // As sent, a bare '?' included.
-        "?" => out.extend_from_slice(&line[query..end]),
-        sep if end > query + 1 => {
-            out.extend_from_slice(sep.as_bytes());
-            out.extend_from_slice(&line[query + 1..end]);
+        None => out.extend_from_slice(&line[query..end]),
+        Some(value_query) => {
+            out.push(b'?');
+            out.extend_from_slice(value_query.as_bytes());
+            if end > query + 1 {
+                out.extend_from_slice(query_glue(value_query).as_bytes());
+                out.extend_from_slice(&line[query + 1..end]);
+            }
         }
-        _ => {}
     }
     out.extend_from_slice(&line[end..]);
 }
 
-/// What goes between a path modifier's value and the request's query,
-/// when the request has one. A value may carry a query (Gateway API
-/// v1.4.1 bounds it by length only): it comes first, then the request's,
-/// after a '&'.
-pub(crate) fn query_separator(value: &[u8]) -> &'static str {
-    match memchr::memchr(b'?', value) {
-        None => "?",
-        Some(mark) if mark + 1 == value.len() => "",
-        Some(_) => "&",
+/// What goes between a path modifier value's query and the request's
+/// non-empty one: a '&', unless the value's is empty or already ends in one.
+/// Gateway API v1.4.1 bounds the value by length only, so it may carry a
+/// query.
+pub(crate) fn query_glue(value_query: &str) -> &'static str {
+    if value_query.is_empty() || value_query.ends_with('&') {
+        ""
+    } else {
+        "&"
     }
 }
 
@@ -1070,13 +1087,13 @@ mod tests {
         let rewrite = extract_url_rewrite(
             &[HttpFilter::URLRewrite {
                 hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
+                path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
             }],
             r"^/a$|^/much-longer-alternative$",
             "/a",
         )
         .unwrap();
-        assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/new"));
+        assert!(matches!(rewrite.path, Some(RewrittenPath { path: ref p, .. }) if p == "/new"));
     }
 
     #[test]
@@ -1084,7 +1101,7 @@ mod tests {
         let headers = b"GET /old/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: None,
-            path: Some(RewrittenPath::Full("/new/path".to_string())),
+            path: Some(RewrittenPath::from_value("/new/path")),
         };
         let mut result = Vec::new();
         apply_request_header_modifications(headers, None, Some(&rewrite), &mut result);
@@ -1101,22 +1118,22 @@ mod tests {
         let mut out = Vec::new();
         for (path, head, line) in [
             (
-                RewrittenPath::Full("/new".to_string()),
+                RewrittenPath::from_value("/new"),
                 &b"GET /old?a=1&b=%2F HTTP/1.1\r\nHost: h\r\n\r\n"[..],
                 "GET /new?a=1&b=%2F HTTP/1.1\r\n",
             ),
             (
-                RewrittenPath::PrefixReplaced("/v2/x".to_string()),
+                RewrittenPath::from_value("/v2/x"),
                 b"GET /v1/x?a HTTP/1.1\r\nHost: h\r\n\r\n",
                 "GET /v2/x?a HTTP/1.1\r\n",
             ),
             (
-                RewrittenPath::Full("/new".to_string()),
+                RewrittenPath::from_value("/new"),
                 b"GET /old? HTTP/1.1\r\nHost: h\r\n\r\n",
                 "GET /new? HTTP/1.1\r\n",
             ),
             (
-                RewrittenPath::Full("/new".to_string()),
+                RewrittenPath::from_value("/new"),
                 b"GET /old HTTP/1.1\r\nHost: h\r\n\r\n",
                 "GET /new HTTP/1.1\r\n",
             ),
@@ -1141,7 +1158,7 @@ mod tests {
             let rewrite = extract_url_rewrite(
                 &[HttpFilter::URLRewrite {
                     hostname: None,
-                    path: Some(URLRewritePath::ReplacePrefixMatch(value.to_string())),
+                    path: Some(URLRewritePath::ReplacePrefixMatch(value.into())),
                 }],
                 "/old",
                 path,
@@ -1150,22 +1167,22 @@ mod tests {
         };
         for (path, target, want) in [
             (
-                RewrittenPath::Full("/login?next=home".to_string()),
+                RewrittenPath::from_value("/login?next=home"),
                 "/old?a=1&b",
                 "/login?next=home&a=1&b",
             ),
             (
-                RewrittenPath::Full("/login?next=home".to_string()),
+                RewrittenPath::from_value("/login?next=home"),
                 "/old",
                 "/login?next=home",
             ),
             (
-                RewrittenPath::Full("/login?next=home".to_string()),
+                RewrittenPath::from_value("/login?next=home"),
                 "/old?",
                 "/login?next=home",
             ),
             (
-                RewrittenPath::Full("/login?".to_string()),
+                RewrittenPath::from_value("/login?"),
                 "/old?a=1",
                 "/login?a=1",
             ),
@@ -1175,6 +1192,18 @@ mod tests {
                 "/new/x?src=gw&a=1",
             ),
             (prefix("/?src=gw", "/old/x"), "/old/x", "/x?src=gw"),
+            // A value's query already ending in '&' takes the request's
+            // as is: it made /login?next=home&&a=1.
+            (
+                RewrittenPath::from_value("/login?next=home&"),
+                "/old?a=1",
+                "/login?next=home&a=1",
+            ),
+            (
+                prefix("/new?src=gw&", "/old/x"),
+                "/old/x?a=1",
+                "/new/x?src=gw&a=1",
+            ),
         ] {
             let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
             let rewrite = URLRewrite {
@@ -1207,7 +1236,7 @@ mod tests {
         let headers = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: Some("new.com".to_string()),
-            path: Some(RewrittenPath::Full("/new".to_string())),
+            path: Some(RewrittenPath::from_value("/new")),
         };
         let mods = HeaderModifications {
             add: &[HttpHeader {
