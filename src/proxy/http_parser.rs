@@ -162,6 +162,26 @@ fn is(b: u8, class: u8) -> bool {
     CLASS[b as usize] & class != 0
 }
 
+/// A forwarding header no client may send: the proxy sets X-Forwarded-Proto
+/// itself and none of the others, so a client's word on its scheme, host or
+/// port would reach the backend as vouched for. X-Forwarded-For is appended
+/// to instead. One predicate for the span parser and the by-name strip
+/// paths; the (length, first byte) dispatch keeps other names at one compare.
+#[inline(always)]
+pub(crate) fn is_forwarding_claim(name: &[u8]) -> bool {
+    match (name.len(), name.first().map(|b| b | 0x20)) {
+        (9, Some(b'f')) => name.eq_ignore_ascii_case(b"forwarded"),
+        (15, Some(b'x')) => name.eq_ignore_ascii_case(b"x-forwarded-ssl"),
+        (16, Some(b'x')) => {
+            name.eq_ignore_ascii_case(b"x-forwarded-host")
+                || name.eq_ignore_ascii_case(b"x-forwarded-port")
+        }
+        (17, Some(b'x')) => name.eq_ignore_ascii_case(b"x-forwarded-proto"),
+        (18, Some(b'x')) => name.eq_ignore_ascii_case(b"x-forwarded-scheme"),
+        _ => false,
+    }
+}
+
 /// RFC 9110 5.6.2 token: what a field name or a method must be.
 pub(crate) fn is_token(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&b| is(b, TCHAR))
@@ -522,23 +542,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
             (14, b'h') if name.eq_ignore_ascii_case(b"http2-settings") => {
                 line_kind = LineKind::Strip;
             }
-            // The proxy appends its own X-Forwarded-Proto and sets none of the
-            // others: a client's word on the scheme, host or port it used
-            // would reach the backend as if the proxy vouched for it.
-            (9, b'f') if name.eq_ignore_ascii_case(b"forwarded") => line_kind = LineKind::Strip,
-            (15, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-ssl") => {
-                line_kind = LineKind::Strip;
-            }
-            (16, b'x')
-                if name.eq_ignore_ascii_case(b"x-forwarded-host")
-                    || name.eq_ignore_ascii_case(b"x-forwarded-port") =>
-            {
-                line_kind = LineKind::Strip;
-            }
-            (17, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-proto") => {
-                line_kind = LineKind::Strip;
-            }
-            (18, b'x') if name.eq_ignore_ascii_case(b"x-forwarded-scheme") => {
+            (9, b'f') | (15..=18, b'x') if is_forwarding_claim(name) => {
                 line_kind = LineKind::Strip;
             }
             _ => {}
