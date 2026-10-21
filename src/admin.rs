@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::{info, warn};
+use crate::proxy::worker::AcceptBackoff;
 
 const READY_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
 const NOT_READY_503: &[u8] =
@@ -86,14 +87,25 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, shutdown: CancellationToke
         port
     );
 
+    let mut backoff = AcceptBackoff::default();
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             accept = listener.accept() => {
                 let (mut stream, _peer) = match accept {
-                    Ok(v) => v,
-                    Err(_) => continue,
+                    Ok(v) => {
+                        backoff.reset();
+                        v
+                    }
+                    Err(e) => {
+                        if let Some(pause) = backoff.after(&e) {
+                            warn!("Admin endpoint accept error: {}; retrying in {:?}", e, pause);
+                            // Cut short by a shutdown, which the loop then sees.
+                            let _ = tokio::time::timeout(pause, shutdown.cancelled()).await;
+                        }
+                        continue;
+                    }
                 };
                 let is_ready = ready.load(Ordering::Acquire);
                 tokio::spawn(async move {

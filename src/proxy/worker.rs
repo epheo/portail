@@ -119,6 +119,38 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
         .with_retries(TCP_KEEPALIVE_RETRIES)
 }
 
+/// Pause before retrying a failed accept(). EMFILE, ENFILE, ENOBUFS and
+/// ENOMEM leave the listener readable, so an immediate retry fails the same
+/// way: the loop spins a core and logs every turn until resources free up.
+#[derive(Default)]
+pub(crate) struct AcceptBackoff {
+    delay: Option<Duration>,
+}
+
+impl AcceptBackoff {
+    // Go net/http's schedule: a blip costs a few ms, a sustained shortage
+    // one retry (and one log line) a second.
+    const FIRST: Duration = Duration::from_millis(5);
+    const MAX: Duration = Duration::from_secs(1);
+
+    /// The pause owed after `error`; `None` when only the connection being
+    /// accepted failed (aborted while queued), which leaves the listener
+    /// healthy.
+    pub(crate) fn after(&mut self, error: &std::io::Error) -> Option<Duration> {
+        use std::io::ErrorKind::{ConnectionAborted, ConnectionReset};
+        if matches!(error.kind(), ConnectionAborted | ConnectionReset) {
+            return None;
+        }
+        let delay = self.delay.map_or(Self::FIRST, |d| (d * 2).min(Self::MAX));
+        self.delay = Some(delay);
+        Some(delay)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.delay = None;
+    }
+}
+
 /// RAII in-flight-connection counter. One guard lives inside each spawned
 /// per-connection task; `data_plane::Drain::run` polls the shared count and
 /// drains until it reaches zero (or the drain timeout expires). Drop-based so
@@ -303,6 +335,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
         .with_interval(TCP_KEEPALIVE_INTERVAL)
         .with_retries(TCP_KEEPALIVE_RETRIES);
 
+    let mut backoff = AcceptBackoff::default();
     loop {
         tokio::select! {
             biased;
@@ -313,6 +346,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, peer)) => {
+                        backoff.reset();
                         // _-prefixed: debug! compiles out in release builds.
                         if let Err(_e) =
                             socket2::SockRef::from(&tcp_stream).set_tcp_keepalive(&keepalive)
@@ -375,7 +409,16 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                         }
                     }
                     Err(e) => {
-                        warn!("Listener on :{} accept error: {}", server_port, e);
+                        if let Some(pause) = backoff.after(&e) {
+                            warn!(
+                                "Listener on :{} accept error: {}; retrying in {:?}",
+                                server_port, e, pause
+                            );
+                            // Cut short by a shutdown, which the loop then sees.
+                            let _ = tokio::time::timeout(pause, shutdown.cancelled()).await;
+                        } else {
+                            debug!("Listener on :{} accept error: {}", server_port, e);
+                        }
                     }
                 }
             }
@@ -4424,6 +4467,22 @@ fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_backoff_doubles_to_a_cap_and_resets_on_success() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let mut backoff = AcceptBackoff::default();
+        let pauses: Vec<u128> = (0..10)
+            .map(|_| backoff.after(&emfile).unwrap().as_millis())
+            .collect();
+        assert_eq!(pauses, [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        backoff.reset();
+        assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(5)));
+        // Only that connection failed: retried at once, schedule kept.
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(backoff.after(&aborted), None);
+        assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(10)));
+    }
 
     #[test]
     fn backend_conn_pooling_policy() {

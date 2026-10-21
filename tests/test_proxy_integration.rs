@@ -1970,6 +1970,52 @@ fn test_sigterm_drains_in_kubernetes_mode() {
     );
 }
 
+/// Out of fds, accept() fails at once and the listener stays readable: the
+/// data-plane and admin accept loops must back off rather than spin a core
+/// (and log every retry).
+#[test]
+fn test_accept_backs_off_when_out_of_fds() {
+    let backend = TestBackend::spawn("ok");
+    let proxy = PortailProcess::spawn_with_fd_limit(
+        &[("localhost", "/", backend.addr)],
+        25087,
+        32,
+        &["--metrics-port", "25088"],
+    );
+    let admin: std::net::SocketAddr = "127.0.0.1:25088".parse().unwrap();
+    assert!(wait_for_listener(admin, Duration::from_secs(5)));
+
+    // Idle connections, each pinning one proxy fd, until accept() fails;
+    // then one for the admin endpoint, which has none left either.
+    let mut clients: Vec<_> = (0..64)
+        .map(|_| std::net::TcpStream::connect(proxy.proxy_addr).expect("connect"))
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !proxy.output().contains("accept error") {
+        assert!(std::time::Instant::now() < deadline, "fds never ran out");
+        thread::sleep(Duration::from_millis(20));
+    }
+    clients.push(std::net::TcpStream::connect(admin).expect("connect admin"));
+    let cpu = proxy.cpu_time();
+    // Long enough for a spinning loop to burn a core and log thousands of
+    // errors, and for the backoff to reach its cap.
+    thread::sleep(Duration::from_millis(1500));
+    let cpu = proxy.cpu_time() - cpu;
+    let errors = proxy.output().matches("accept error").count();
+    assert!(errors > 0, "fds never ran out:\n{}", proxy.output());
+    assert!(errors < 40, "{errors} accept errors logged in 1.5s");
+    assert!(cpu < Duration::from_millis(300), "{cpu:?} of CPU in 1.5s");
+
+    // Serving again once fds free up.
+    drop(clients);
+    let response = http_request(
+        proxy.proxy_addr,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("no response after fds freed up");
+    assert_eq!(extract_status(&response), Some(200));
+}
+
 /// A controller that stops, here because no cluster config exists, must
 /// take the process down for kubelet to restart it, not leave the pod
 /// NotReady forever while /livez still answers 200.
