@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use pin_project_lite::pin_project;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
@@ -229,19 +230,37 @@ fn parse_pem_cert_and_key(
     Vec<rustls::pki_types::CertificateDer<'static>>,
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| anyhow!("Failed to parse certificate PEM: {}", e))?;
+        .map_err(|e| anyhow!("Failed to parse certificate PEM: {}", pem_error(e)))?;
 
     if certs.is_empty() {
         return Err(anyhow!("No certificates found in PEM data"));
     }
 
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| anyhow!("No private key found in PEM data"))?;
+    let key = match rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => return Err(anyhow!("No private key found in PEM data")),
+        Err(e) => return Err(anyhow!("Failed to parse private key PEM: {}", pem_error(e))),
+    };
 
     Ok((certs, key))
+}
+
+/// pki-types prints these byte fields as number lists; the message lands in
+/// Gateway status, so render them as text.
+fn pem_error(e: pem::Error) -> String {
+    match e {
+        pem::Error::MissingSectionEnd { end_marker } => format!(
+            "section end {:?} missing",
+            String::from_utf8_lossy(&end_marker)
+        ),
+        pem::Error::IllegalSectionStart { line } => format!(
+            "illegal section start: {:?}",
+            String::from_utf8_lossy(&line)
+        ),
+        e => e.to_string(),
+    }
 }
 
 fn load_cert_and_key(
