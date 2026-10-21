@@ -90,6 +90,11 @@ fn parsing_benchmark(c: &mut Criterion) {
         ("clean", "/api/v1/users/12345/profile"),
         ("dotted", "/static/js/vendor.min.js"),
         ("dot_segments", "/static/../api/v1/./users/12345/profile"),
+        // Refused: the scan stops at the segment, nothing is rewritten.
+        (
+            "dot_segment_params",
+            "/static/..;/api/v1/users/12345/profile",
+        ),
     ] {
         normalize_group.bench_function(name, |b| b.iter(|| normalize_path(black_box(path))));
     }

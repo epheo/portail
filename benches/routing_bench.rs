@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use portail::proxy::health::HealthRegistry;
+use portail::proxy::request_processor::analyze_udp_request;
 use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
 use std::hint::black_box;
 use std::time::Duration;
@@ -107,6 +108,12 @@ fn routing_benchmark(c: &mut Criterion) {
     // weighted round robin itself.
     let selector = BackendSelector::new();
     let health = HealthRegistry::new();
+
+    // What each datagram of a flood at a port with no route costs: the
+    // lookup miss and the throttled log line.
+    c.bench_function("udp_route_miss", |b| {
+        b.iter(|| analyze_udp_request(black_box(&tcp_table), &selector, black_box(9999), &health))
+    });
     let mut selection = c.benchmark_group("backend_selection");
 
     let l4_backends: Vec<Backend> = (0..100)
