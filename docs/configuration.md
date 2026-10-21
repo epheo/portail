@@ -206,7 +206,7 @@ Filters:
 
 - Only `RequestMirror` may appear more than once in one filter list.
 - `RequestRedirect` and `URLRewrite` cannot share a rule.
-- `RequestRedirect` and `backendRefs` cannot share a rule.
+- A `RequestRedirect` rule never forwards: `backendRefs` beside it are unused. The HTTPRoute CRD refuses them; a config file loads with a warning.
 - A `URLRewrite` hostname and a `RequestHeaderModifier` that sets `Host` cannot share a rule.
 - `ReplacePrefixMatch` needs every match of its rule to be a `PathPrefix`.
 - A path modifier replaces the path only: the request keeps its query. A `replaceFullPath` or `replacePrefixMatch` value with a query of its own puts it first: `/login?next=home` on `/old?a=1` gives `/login?next=home&a=1`.

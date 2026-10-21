@@ -629,15 +629,10 @@ fn test_response_header_modifier_e2e() {
 fn test_request_redirect_e2e() {
     let port = proxy_port(25);
     let filter = r#"{"type": "RequestRedirect", "requestRedirect": {"hostname": "other.com", "statusCode": 301}}"#;
-    // The helper always adds a backendRef, and a redirect may not have one.
+    // The helper adds a backendRef beside the redirect: unused, as a
+    // redirect never forwards, and the config loads.
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let config =
-        helpers::build_test_config_with_filters(&[("localhost", "/", dead_addr, filter)], port)
-            .replace(
-                r#""backendRefs": [{"name": "127.0.0.1", "port": 1}]"#,
-                r#""backendRefs": []"#,
-            );
-    let proxy = PortailProcess::spawn_config(config, port);
+    let proxy = PortailProcess::spawn_with_filters(&[("localhost", "/", dead_addr, filter)], port);
 
     let request = b"GET /page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = http_request(proxy.proxy_addr, request).expect("should get redirect");

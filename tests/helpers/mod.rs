@@ -670,7 +670,7 @@ impl PortailProcess {
     }
 
     /// Spawn from a ready config string and wait for the proxy port.
-    pub fn spawn_config(config: String, proxy_port: u16) -> Self {
+    fn spawn_config(config: String, proxy_port: u16) -> Self {
         Self::spawn_config_args(config, proxy_port, &[])
     }
 

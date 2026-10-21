@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 
 use super::types::*;
+use crate::logging::warn;
 
 impl PortailConfig {
     /// Validate the entire configuration for consistency and correctness
@@ -12,6 +13,17 @@ impl PortailConfig {
             route
                 .validate()
                 .map_err(|e| anyhow!("HTTP route {}: {}", i, e))?;
+            for (j, _) in route
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| super::compile::redirects_beside_backends(r))
+            {
+                warn!(
+                    "HTTP route {} rule {}: backendRefs unused: a RequestRedirect rule never forwards",
+                    i, j
+                );
+            }
         }
 
         for (i, route) in self.tcp_routes.iter().enumerate() {
@@ -1102,5 +1114,45 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<PortailConfig>(json).unwrap_err();
         assert!(err.to_string().contains("backendRef"), "{}", err);
+    }
+
+    /// A redirect beside backendRefs failed the whole config file, one the
+    /// integration test helper wrote itself. The redirect answers, and the
+    /// load says the backendRefs go unused.
+    #[test]
+    fn a_redirect_beside_backend_refs_loads_with_a_warning() {
+        use crate::proxy::request_processor::{analyze_request, LocalReply, RoutingResult};
+        let redirect = HttpRouteFilter::RequestRedirect {
+            config: RequestRedirectConfig {
+                scheme: Some("https".to_string()),
+                hostname: None,
+                port: None,
+                path: None,
+                status_code: 301,
+            },
+        };
+        let cfg = config_with_rule(make_rule(vec![redirect], vec![default_backend()]));
+        let (log, _guard) = crate::proxy::test_util::Captured::warnings();
+        cfg.validate().unwrap();
+        assert!(
+            log.text().contains(
+                "HTTP route 0 rule 0: backendRefs unused: a RequestRedirect rule never forwards"
+            ),
+            "{}",
+            log.text()
+        );
+
+        let rt = cfg.to_route_table_strict().unwrap();
+        let request = b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let health = crate::proxy::health::HealthRegistry::new();
+        let selector = crate::routing::BackendSelector::new();
+        match analyze_request(&rt, &selector, request, 8080, &health, false).unwrap() {
+            RoutingResult::LocalReply(LocalReply {
+                status: 301,
+                location: Some(location),
+                ..
+            }) => assert_eq!(location, "https://example.com/a"),
+            _ => panic!("expected the redirect"),
+        }
     }
 }
