@@ -246,7 +246,9 @@ async fn connect_new(
                 e
             ))
         })?;
-        Ok(Connection::ClientTls { inner: tls_stream })
+        Ok(Connection::ClientTls {
+            inner: Box::new(tls_stream),
+        })
     } else {
         Ok(Connection::Plain { inner: tcp })
     }
@@ -681,7 +683,10 @@ mod tests {
         server.write_all(b"x").await.unwrap();
         server.flush().await.unwrap();
         client.read_exact(&mut [0u8; 1]).await.unwrap();
-        Some((Connection::ClientTls { inner: client }, server))
+        let client = Connection::ClientTls {
+            inner: Box::new(client),
+        };
+        Some((client, server))
     }
 
     /// TLS server greeting each connection with one byte, which a client

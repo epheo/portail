@@ -30,11 +30,13 @@ pin_project! {
     /// pipe the h2 bridge uses to replay each h2 stream through the engine.
     /// A pipe has no reset: the engine sets `aborted` where it would reset a
     /// socket, and the bridge resets the stream.
+    /// The TLS streams are boxed: rustls keeps over a KB of state inline, and
+    /// a backend connection moves through the pool by value on every request.
     #[project = ConnectionProj]
     pub enum Connection {
         Plain { #[pin] inner: TcpStream },
-        Tls { #[pin] inner: ServerTlsStream<TcpStream> },
-        ClientTls { #[pin] inner: ClientTlsStream<TcpStream> },
+        Tls { #[pin] inner: Box<ServerTlsStream<TcpStream>> },
+        ClientTls { #[pin] inner: Box<ClientTlsStream<TcpStream>> },
         Mem { #[pin] inner: tokio::io::DuplexStream, aborted: Arc<AtomicBool> },
     }
 }
@@ -756,6 +758,14 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every move of a Connection copies the whole enum: no variant may
+    /// outgrow a plain socket.
+    #[test]
+    fn a_connection_is_a_socket_and_its_tag() {
+        let tag = std::mem::align_of::<Connection>();
+        assert!(std::mem::size_of::<Connection>() <= std::mem::size_of::<TcpStream>() + tag);
+    }
 
     #[test]
     fn test_extract_sni_valid_client_hello() {

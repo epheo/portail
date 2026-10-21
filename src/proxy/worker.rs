@@ -555,7 +555,9 @@ async fn serve_tls_connection(
         .await;
         return;
     }
-    let conn = Connection::Tls { inner: tls_stream };
+    let conn = Connection::Tls {
+        inner: Box::new(tls_stream),
+    };
     let state = ConnectionState::new(
         server_port,
         routes,
@@ -4512,7 +4514,10 @@ mod connection_tests {
             let (tcp, peer) = front.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
             let state = conn_state(rt, true);
-            handle_connection(Connection::Tls { inner: tls }, peer, state).await
+            let tls = Connection::Tls {
+                inner: Box::new(tls),
+            };
+            handle_connection(tls, peer, state).await
         });
 
         let client_cfg = rustls::ClientConfig::builder()
