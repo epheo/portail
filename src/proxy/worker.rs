@@ -460,22 +460,30 @@ pub(crate) async fn handle_connection(
 ) -> Result<()> {
     client.set_nodelay(true)?;
 
+    let (tcp_route, http_routes) = {
+        let rt = state.routes.load();
+        let port = state.server_port;
+        (rt.has_tcp_route(port), rt.has_http_routes(port))
+    };
     // Server-speaks-first protocols (MySQL, SMTP, FTP, IMAP, POP3) send
     // nothing before the backend's banner. With no HTTP route to tell
     // apart there is nothing to sniff, and waiting for the client's first
     // bytes would deadlock them.
-    let tcp_only = {
-        let rt = state.routes.load();
-        rt.has_tcp_route(state.server_port) && !rt.has_http_routes(state.server_port)
-    };
-    if tcp_only {
+    if tcp_route && !http_routes {
         return forward_to_tcp_route(client, &state).await;
     }
 
     let mut buf = vec![0u8; 65536];
 
     let mut n = client.read(&mut buf).await?;
-    n = skip_empty_lines_before_http(&mut client, &mut buf, n, state.client_header_timeout).await;
+    n = sniff_first_request(
+        &mut client,
+        &mut buf,
+        n,
+        state.client_header_timeout,
+        !tcp_route,
+    )
+    .await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
     // TCP/binary data (no \r\n\r\n expected) passes through immediately.
@@ -667,26 +675,34 @@ fn empty_lines_len(data: &[u8]) -> usize {
     pairs.iter().take_while(|pair| *pair == b"\r\n").count() * 2
 }
 
-/// Empty lines before the first request-line are ignored too (RFC 9112
-/// 2.2), but only when an HTTP request follows: for TCP routing the bytes
-/// stay as sent. A read ending inside them is extended within `budget`
-/// before deciding. Returns the length of the data now in `buf`.
-async fn skip_empty_lines_before_http(
+/// Extend a first read until the sniff can tell HTTP from opaque bytes,
+/// within `budget`. Empty lines before the first request-line are ignored
+/// too (RFC 9112 2.2), but only when an HTTP request follows: for TCP
+/// routing the bytes stay as sent. A read ending inside them waits for
+/// more; with `await_method` so does one ending inside a method ("GET",
+/// "PROPF"), for a port no TCP route serves, where sniffed as opaque it
+/// would close unanswered. Returns the length of the data now in `buf`.
+async fn sniff_first_request(
     client: &mut Connection,
     buf: &mut [u8],
     mut n: usize,
     budget: Duration,
+    await_method: bool,
 ) -> usize {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         let skip = empty_lines_len(&buf[..n]);
         let rest = &buf[skip..n];
-        if skip > 0 && is_http_request(rest) {
-            buf.copy_within(skip..n, 0);
+        if is_http_request(rest) {
+            if skip > 0 {
+                buf.copy_within(skip..n, 0);
+            }
             return n - skip;
         }
-        let inside = rest == b"\r" || (skip > 0 && rest.is_empty());
-        if !inside || n == buf.len() {
+        let undecided = rest == b"\r"
+            || (skip > 0 && rest.is_empty())
+            || (await_method && may_open_request(rest));
+        if !undecided || n == buf.len() {
             return n;
         }
         match tokio::time::timeout_at(deadline, client.read(&mut buf[n..])).await {
@@ -3198,6 +3214,43 @@ mod connection_tests {
             .unwrap();
         assert_eq!(banner, BANNER);
         assert_eq!(exchange(&mut client, b"QUIT\r\n").await, "QUIT\r\n");
+    }
+
+    /// A first segment too short for the sniff ("GET", "PROPF") went to TCP
+    /// routing, which a port without a TCP route cannot serve: closed
+    /// unanswered.
+    #[tokio::test]
+    async fn http_port_waits_for_a_method_cut_short() {
+        let (addr, _rx) = backend(REFUSED).await;
+        for (first, rest) in [
+            ("GET", " / HTTP/1.1\r\nHost: a.test\r\n\r\n"),
+            ("G", "ET / HTTP/1.1\r\nHost: a.test\r\n\r\n"),
+            (
+                "\r\nPROPF",
+                "IND / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 0\r\n\r\n",
+            ),
+        ] {
+            let (mut client, _task) = serve(routes(addr));
+            client.write_all(first.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let out = exchange(&mut client, rest.as_bytes()).await;
+            assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{first:?}: {out}");
+        }
+    }
+
+    /// Bytes no method can open still close at once, not after the header
+    /// budget.
+    #[tokio::test]
+    async fn http_port_closes_on_opaque_bytes_without_waiting() {
+        let (addr, _rx) = backend(REFUSED).await;
+        for opaque in [&b"\x16\x03\x01\x02\x00"[..], b"GET1", b"get / HTTP/1.1\r\n"] {
+            let (mut client, task) = serve(routes(addr));
+            client.write_all(opaque).await.unwrap();
+            let started = tokio::time::Instant::now();
+            assert_eq!(read_until_closed(&mut client).await, "");
+            task.await.unwrap().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1), "{opaque:?}");
+        }
     }
 
     #[tokio::test]
