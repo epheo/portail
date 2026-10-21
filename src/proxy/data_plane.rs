@@ -406,6 +406,7 @@ impl DataPlane {
                         bound_port,
                         listener_cfg.address.as_deref(),
                         listener_cfg.interface.as_deref(),
+                        &worker::tcp_keepalive(performance_config.tcp_keepalive_time),
                     )?;
                     let tokio_listener = TcpListener::from_std(std_listener)?;
 
@@ -691,6 +692,7 @@ impl DataPlane {
             endpoint.1,
             endpoint.0.as_deref(),
             listener_cfg.interface.as_deref(),
+            &worker::tcp_keepalive(performance_config.tcp_keepalive_time),
         )
         .map_err(|e| format!("TCP bind: {}", e))?;
         let tokio_listener =
@@ -800,10 +802,11 @@ impl DataPlane {
     }
 }
 
-fn create_tcp_listener(
+pub(crate) fn create_tcp_listener(
     port: u16,
     bind_addr: Option<&str>,
     interface: Option<&str>,
+    client_keepalive: &socket2::TcpKeepalive,
 ) -> Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -823,6 +826,12 @@ fn create_tcp_listener(
     // graceful restart waits up to net.ipv4.tcp_fin_timeout (60s by default)
     // per port before it can accept again.
     socket.set_reuse_address(true)?;
+    // Linux copies the keepalive to every socket accepted here. Set before
+    // listen(), so connections queued before the accept loop starts get it
+    // too; the loop sets it per socket on a listener without it.
+    if let Err(e) = socket.set_tcp_keepalive(client_keepalive) {
+        warn!("TCP keepalive setup failed for listener :{}: {}", port, e);
+    }
 
     if let Some(iface) = interface {
         socket.bind_device(Some(iface.as_bytes()))?;
