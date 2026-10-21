@@ -90,29 +90,111 @@ impl ForwardedLines {
     }
 }
 
+/// An absolute-form request sent on to an origin server (RFC 9112 3.2.1):
+/// its target's authority replaces the client's Host line, or follows the
+/// forwarding lines where an HTTP/1.0 client sent none (3.2.2). Filters
+/// then meet the same head as for an origin-form request.
+#[derive(Clone, Copy)]
+pub(crate) struct OriginForm<'a> {
+    pub(crate) authority: &'a [u8],
+    /// The client's Host line, CRLF included.
+    pub(crate) host_line: Option<(u32, u32)>,
+}
+
+impl<'a> OriginForm<'a> {
+    /// `None` unless `raw`, an accepted head, opens with an absolute-form
+    /// target; `path_span` is its path within `raw`, `None` where the parser
+    /// substituted "/". The common origin-form request costs one byte
+    /// compare: its path starts the target.
+    pub(crate) fn of(raw: &'a [u8], path_span: Option<(u32, u32)>) -> Option<Self> {
+        let path_start = path_span.map(|(s, _)| s as usize);
+        if path_start.is_some_and(|s| raw[s - 1] == b' ') {
+            return None;
+        }
+        let target = memchr::memchr(b' ', raw)? + 1;
+        // The parser admits origin-form, `*` and `http(s)://` targets only.
+        if matches!(raw.get(target), Some(b'/' | b'*') | None) {
+            return None;
+        }
+        let start = target
+            + if raw.get(target + 4) == Some(&b':') {
+                7
+            } else {
+                8
+            };
+        let end = match path_start {
+            Some(s) => s,
+            None => start + memchr::memchr(b' ', &raw[start..])?,
+        };
+        Some(Self {
+            authority: &raw[start..end],
+            host_line: host_line(raw),
+        })
+    }
+}
+
+/// Span of the Host line of `raw`, an accepted head: the parser took no
+/// space before a field's colon and no second Host.
+fn host_line(raw: &[u8]) -> Option<(u32, u32)> {
+    let mut start = memchr::memchr(b'\n', raw)? + 1;
+    while let Some(len) = memchr::memchr(b'\n', &raw[start..]) {
+        let end = start + len + 1;
+        if raw[start..end]
+            .get(..5)
+            .is_some_and(|n| n.eq_ignore_ascii_case(b"host:"))
+        {
+            return Some((start as u32, end as u32));
+        }
+        start = end;
+    }
+    None
+}
+
+fn put_host(authority: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(authority);
+    out.extend_from_slice(b"\r\n");
+}
+
 /// Assemble the outgoing request header block into `out` (reused scratch):
 /// copies `raw` minus the parser-recorded hop-by-hop spans via bulk gap
 /// copies, then appends X-Forwarded-For / X-Forwarded-Proto and, for upgrade
 /// requests, the Connection: upgrade the stripped original carried. A
-/// `path` takes the place of the request line's own, its query kept.
-/// One pass, no allocation after scratch warmup.
+/// `path` takes the place of the request line's own, its query kept, and
+/// `origin` the Host line. One pass, no allocation after scratch warmup.
 ///
 /// `raw` is the full header block ending with the blank-line CRLF.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_forward_headers(
     raw: &[u8],
     path: Option<&[u8]>,
     spans: &StripSpans,
     upgrade_span: Option<(u32, u32)>,
     keep_upgrade: bool,
+    origin: Option<OriginForm<'_>>,
     forwarded: &ForwardedLines,
     out: &mut Vec<u8>,
 ) {
     out.clear();
     out.reserve(raw.len() + 64);
     let terminator_start = raw.len().saturating_sub(2);
-    let strip_upgrade = match upgrade_span {
-        Some((s, e)) if !keep_upgrade => Some((s as usize, e as usize)),
-        _ => None,
+    let span = |(s, e): (u32, u32)| (s as usize, e as usize);
+    let strip_upgrade = upgrade_span.filter(|_| !keep_upgrade).map(span);
+    let host_line = origin.and_then(|o| o.host_line).map(span);
+    // The lines cut besides the spans, in head order.
+    let mut lines = match (strip_upgrade, host_line) {
+        (Some(u), Some(h)) if h < u => [host_line, strip_upgrade],
+        _ => [strip_upgrade, host_line],
+    }
+    .into_iter()
+    .flatten()
+    .peekable();
+    let cut = |cursor: usize, (s, e): (usize, usize), out: &mut Vec<u8>| {
+        out.extend_from_slice(&raw[cursor..s]);
+        if let Some(origin) = origin.filter(|_| Some((s, e)) == host_line) {
+            put_host(origin.authority, out);
+        }
+        e
     };
 
     // Both sources are in ascending parse order; merge while copying gaps.
@@ -122,24 +204,18 @@ pub(crate) fn assemble_forward_headers(
         cursor = memchr::memchr(b'\r', raw).unwrap_or(0);
         put_request_line(&raw[..cursor], path, None, out);
     }
-    let mut upgrade_pending = strip_upgrade;
     for (s, e) in spans.iter() {
-        if let Some((us, ue)) = upgrade_pending {
-            if us < s {
-                out.extend_from_slice(&raw[cursor..us]);
-                cursor = ue;
-                upgrade_pending = None;
-            }
+        while let Some(line) = lines.next_if(|&(ls, _)| ls < s) {
+            cursor = cut(cursor, line, out);
         }
         out.extend_from_slice(&raw[cursor..s]);
         cursor = e;
     }
-    if let Some((us, ue)) = upgrade_pending {
-        out.extend_from_slice(&raw[cursor..us]);
-        cursor = ue;
+    for line in lines {
+        cursor = cut(cursor, line, out);
     }
     out.extend_from_slice(&raw[cursor..terminator_start]);
-    append_forward_headers(out, forwarded, keep_upgrade);
+    append_forward_headers(out, forwarded, keep_upgrade, origin);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -150,6 +226,7 @@ pub(crate) fn assemble_forward_headers_slow(
     raw: &[u8],
     path: Option<&[u8]>,
     keep_upgrade: bool,
+    origin: Option<OriginForm<'_>>,
     forwarded: &ForwardedLines,
     out: &mut Vec<u8>,
 ) {
@@ -197,6 +274,10 @@ pub(crate) fn assemble_forward_headers_slow(
             }
         };
         let name = &line[..name_end];
+        if let Some(origin) = origin.filter(|_| name.eq_ignore_ascii_case(b"host")) {
+            put_host(origin.authority, out);
+            continue;
+        }
         // A real upgrade nominates Upgrade in its own Connection header;
         // stripping it as nominated would break every WebSocket that also
         // carries an extra token or many hop-by-hop lines.
@@ -211,64 +292,29 @@ pub(crate) fn assemble_forward_headers_slow(
             out.extend_from_slice(b"\r\n");
         }
     }
-    append_forward_headers(out, forwarded, keep_upgrade);
+    append_forward_headers(out, forwarded, keep_upgrade, origin);
     out.extend_from_slice(b"\r\n");
 }
 
-fn append_forward_headers(out: &mut Vec<u8>, forwarded: &ForwardedLines, keep_upgrade: bool) {
+fn append_forward_headers(
+    out: &mut Vec<u8>,
+    forwarded: &ForwardedLines,
+    keep_upgrade: bool,
+    origin: Option<OriginForm<'_>>,
+) {
     // A fresh X-Forwarded-For line: multiple XFF headers concatenate as one
     // list, which avoids locating and splicing an existing header.
     out.extend_from_slice(forwarded.as_bytes());
     if keep_upgrade {
         out.extend_from_slice(b"Connection: upgrade\r\n");
     }
-}
-
-/// The path and the authority of an absolute-form request (`raw` is its
-/// head, `path_span` the parser's path within it). `None` for any other
-/// form, at one byte compare when the path starts the target, as it does in
-/// the common origin-form request.
-pub(crate) fn absolute_form_target(
-    raw: &[u8],
-    path_span: Option<(u32, u32)>,
-) -> Option<(&[u8], &str)> {
-    if let Some((start, _)) = path_span {
-        if raw.get((start as usize).checked_sub(1)?) == Some(&b' ') {
-            return None;
-        }
+    if let Some(OriginForm {
+        authority,
+        host_line: None,
+    }) = origin
+    {
+        put_host(authority, out);
     }
-    let line = &raw[..memchr::memchr(b'\n', raw)?];
-    let (start, end) = target_bounds(line)?;
-    let target = &line[start..end];
-    let scheme_len = [&b"http://"[..], b"https://"]
-        .into_iter()
-        .find(|s| {
-            target
-                .get(..s.len())
-                .is_some_and(|t| t.eq_ignore_ascii_case(s))
-        })?
-        .len();
-    // The parser held everything up to '/' to host[:port], so the query,
-    // if any, comes after the path.
-    let rest = &target[scheme_len..];
-    let authority_len = memchr::memchr(b'/', rest).unwrap_or(rest.len());
-    let path_and_query = &rest[authority_len..];
-    let path = match memchr::memchr(b'?', path_and_query) {
-        Some(query) => &path_and_query[..query],
-        None => path_and_query,
-    };
-    // RFC 9112 3.2.1: an empty path is sent as "/".
-    let path = if path.is_empty() { &b"/"[..] } else { path };
-    Some((path, std::str::from_utf8(&rest[..authority_len]).ok()?))
-}
-
-/// Rewrite an absolute-form request head into `out` for an origin server
-/// (RFC 9112 3.2.1): `path` replaces the request-target up to its query,
-/// and `authority` replaces the client's Host, or is added where an
-/// HTTP/1.0 client sent none (3.2.2). Filters then act on it as on any
-/// origin-form request.
-pub(crate) fn to_origin_form(head: &[u8], path: &[u8], authority: &str, out: &mut Vec<u8>) {
-    rewrite_request_head(head, Some((path, None)), None, Some(authority), out);
 }
 
 /// Request-target bounds within a request line: between its first two SPs.
@@ -806,6 +852,50 @@ mod tests {
         crate::proxy::http_parser::extract_routing_info(req).unwrap()
     }
 
+    /// `path_span` as the request processor derives it from the parser:
+    /// `None` where the parser substituted "/".
+    fn path_span(req: &[u8]) -> Option<(u32, u32)> {
+        let path = parsed_spans(req).path.as_bytes();
+        let start = (path.as_ptr() as usize).checked_sub(req.as_ptr() as usize)?;
+        let end = start + path.len();
+        (end <= req.len()).then_some((start as u32, end as u32))
+    }
+
+    #[test]
+    fn test_origin_form_of_splits_the_authority_and_finds_host() {
+        let span = |req: &[u8], line: &[u8]| {
+            let at = req.windows(line.len()).position(|w| w == line).unwrap();
+            Some((at as u32, (at + line.len()) as u32))
+        };
+        for (req, want) in [
+            (
+                &b"GET http://a.test:8080/p?q=1 HTTP/1.1\r\nX: 1\r\nHOST: a.test\r\n\r\n"[..],
+                Some((&b"a.test:8080"[..], Some(&b"HOST: a.test\r\n"[..]))),
+            ),
+            (
+                b"GET http://a.test HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                Some((&b"a.test"[..], Some(&b"Host: a.test\r\n"[..]))),
+            ),
+            (
+                b"GET HTTPS://[::1] HTTP/1.0\r\nX-Host: y\r\n\r\n",
+                Some((&b"[::1]"[..], None)),
+            ),
+            // Origin-form, hostless or not, and asterisk-form stay as sent.
+            (b"GET /p?q HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
+            (b"GET /x HTTP/1.0\r\n\r\n", None),
+            (b"OPTIONS * HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
+        ] {
+            let got = OriginForm::of(req, path_span(req));
+            let want = want.map(|(authority, line)| (authority, line.and_then(|l| span(req, l))));
+            assert_eq!(
+                got.map(|o| (o.authority, o.host_line)),
+                want,
+                "{}",
+                String::from_utf8_lossy(req)
+            );
+        }
+    }
+
     fn fwd(is_tls: bool) -> ForwardedLines {
         ForwardedLines::new("10.1.2.3".parse().unwrap(), is_tls)
     }
@@ -841,6 +931,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             false,
+            None,
             &fwd(false),
             &mut out,
         );
@@ -869,6 +960,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             true,
+            None,
             &fwd(true),
             &mut out,
         );
@@ -887,6 +979,7 @@ mod tests {
             &info.strip_spans,
             info.upgrade_span,
             false,
+            None,
             &fwd(false),
             &mut out,
         );
@@ -901,7 +994,7 @@ mod tests {
         assert!(info.strip_spans.needs_slow_path);
 
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, false, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(!s.to_ascii_lowercase().contains("x-internal"));
         assert!(!s.to_ascii_lowercase().contains("connection:"));
@@ -914,7 +1007,7 @@ mod tests {
         // An extra Connection token diverts a WebSocket to the slow path.
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, X-Foo\r\nX-Foo: 1\r\nSec-WebSocket-Key: k\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, true, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, true, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Upgrade: websocket\r\n"), "{s}");
         assert!(s.ends_with("Connection: upgrade\r\n\r\n"), "{s}");
@@ -923,7 +1016,7 @@ mod tests {
         assert!(s.contains("Sec-WebSocket-Key: k\r\n"));
 
         // Not an upgrade: the Upgrade line goes with the other nominated ones.
-        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, false, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap().to_ascii_lowercase();
         assert!(!s.contains("upgrade"), "{s}");
     }
@@ -932,75 +1025,43 @@ mod tests {
     fn test_assemble_slow_path_replaces_client_forwarded_proto() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto: https\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, false, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert_eq!(s.matches("X-Forwarded-Proto").count(), 1, "{s}");
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
     }
 
-    /// `path_span` as the request processor derives it from the parser:
-    /// `None` where the parser substituted "/".
-    fn path_span(req: &[u8]) -> Option<(u32, u32)> {
-        let path = parsed_spans(req).path.as_bytes();
-        let start = (path.as_ptr() as usize).checked_sub(req.as_ptr() as usize)?;
-        let end = start + path.len();
-        (end <= req.len()).then_some((start as u32, end as u32))
-    }
-
     #[test]
-    fn test_absolute_form_target_splits_path_from_authority() {
+    fn test_assemble_sends_absolute_form_as_origin_form() {
         for (req, want) in [
             (
-                &b"GET http://a.test:8080/p?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
-                Some((&b"/p"[..], "a.test:8080")),
+                &b"GET http://a.test:8080/p?q HTTP/1.1\r\nhost: a.test\r\nKeep-Alive: 5\r\nAccept: */*\r\n\r\n"[..],
+                "GET /p?q HTTP/1.1\r\nHost: a.test:8080\r\nAccept: */*\r\nX-Forwarded-For: 10.1.2.3\r\nX-Forwarded-Proto: http\r\n\r\n",
             ),
+            // An HTTP/1.0 client may have sent no Host to replace.
             (
-                b"GET http://a.test/ HTTP/1.1\r\nHost: a.test\r\n\r\n",
-                Some((&b"/"[..], "a.test")),
+                b"GET http://a.test HTTP/1.0\r\nAccept: */*\r\n\r\n",
+                "GET / HTTP/1.0\r\nAccept: */*\r\nX-Forwarded-For: 10.1.2.3\r\nX-Forwarded-Proto: http\r\nHost: a.test\r\n\r\n",
             ),
-            (
-                b"GET HTTPS://[::1] HTTP/1.0\r\n\r\n",
-                Some((&b"/"[..], "[::1]")),
-            ),
-            // Origin-form, hostless or not, and asterisk-form stay as sent:
-            // routed by the empty host, the former gets no Host at all.
-            (b"GET /p?q HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
-            (b"GET /x HTTP/1.0\r\n\r\n", None),
-            (b"OPTIONS * HTTP/1.1\r\nHost: a.test\r\n\r\n", None),
         ] {
-            assert_eq!(
-                absolute_form_target(req, path_span(req)),
-                want,
-                "{}",
-                String::from_utf8_lossy(req)
+            let info = parsed_spans(req);
+            let origin = OriginForm::of(req, path_span(req));
+            let path = Some(info.path.as_bytes());
+            let mut out = Vec::new();
+            assemble_forward_headers(
+                req,
+                path,
+                &info.strip_spans,
+                info.upgrade_span,
+                false,
+                origin,
+                &fwd(false),
+                &mut out,
             );
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want);
+            assemble_forward_headers_slow(req, path, false, origin, &fwd(false), &mut out);
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want);
         }
-    }
-
-    #[test]
-    fn test_to_origin_form_moves_the_authority_to_host() {
-        let mut out = Vec::new();
-        to_origin_form(
-            b"GET http://a.test:8080/p?q HTTP/1.1\r\nhost: a.test\r\nAccept: */*\r\n\r\n",
-            b"/p",
-            "a.test:8080",
-            &mut out,
-        );
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            "GET /p?q HTTP/1.1\r\nHost: a.test:8080\r\nAccept: */*\r\n\r\n"
-        );
-        // An HTTP/1.0 client may have sent no Host to replace.
-        to_origin_form(
-            b"GET http://a.test HTTP/1.0\r\nAccept: */*\r\n\r\n",
-            b"/",
-            "a.test",
-            &mut out,
-        );
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            "GET / HTTP/1.0\r\nAccept: */*\r\nHost: a.test\r\n\r\n"
-        );
     }
 
     /// Like `set`, a URLRewrite hostname adds the Host it finds no line to
@@ -1030,7 +1091,7 @@ mod tests {
     fn test_assemble_slow_path_drops_client_forwarding_claims() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nForwarded: for=6.6.6.6;proto=https\r\nX-Forwarded-Host: evil\r\nx-forwarded-port: 443\r\nX-Forwarded-Ssl: on\r\nX-FORWARDED-SCHEME: https\r\nX-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Hostname: kept\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, false, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         let lower = s.to_ascii_lowercase();
         for name in [
@@ -1054,7 +1115,7 @@ mod tests {
         // as a second request while the proxy relays it as this one's body.
         let req = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: keep-alive, Content-Length, HOST, Transfer-Encoding, X-Internal\r\nX-Internal: s\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, None, false, &fwd(false), &mut out);
+        assemble_forward_headers_slow(req, None, false, None, &fwd(false), &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Content-Length: 5\r\n"), "{s}");
         assert!(s.contains("Host: h\r\n"), "{s}");

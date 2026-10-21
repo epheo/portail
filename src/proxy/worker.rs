@@ -23,10 +23,10 @@ use crate::proxy::backend_pool::{
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
-    absolute_form_target, apply_request_header_modifications, apply_response_header_mods,
-    assemble_forward_headers, assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods,
-    extract_url_rewrite, header_lines, is_hop_by_hop_response_header, sanitize_response_headers,
-    to_origin_form, ForwardedLines, HeaderModifications, ResponseCuts, MIRROR_BODY_MAX,
+    apply_request_header_modifications, apply_response_header_mods, assemble_forward_headers,
+    assemble_forward_headers_slow, dispatch_mirrors, extract_header_mods, extract_url_rewrite,
+    header_lines, is_hop_by_hop_response_header, sanitize_response_headers, ForwardedLines,
+    HeaderModifications, OriginForm, ResponseCuts, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{
     field_value_end, find_header_end, has_header_end, is_field_value_byte, is_tchar, is_token,
@@ -1681,7 +1681,13 @@ fn build_outgoing_headers(
     state: &mut ConnectionState,
 ) {
     let raw = &buf[..req_header_end];
-    let normalized = meta.normalized_path.as_deref().map(str::as_bytes);
+    // The backend is an origin server, sent origin-form only (RFC 9112
+    // 3.2.1).
+    let origin = OriginForm::of(raw, meta.path_span);
+    let path = match origin {
+        Some(_) => Some(meta.path(raw).as_bytes()),
+        None => meta.normalized_path.as_deref().map(str::as_bytes),
+    };
     let (peer_ip, is_tls) = (state.peer_ip, state.is_tls);
     let forwarded = state
         .forwarded
@@ -1689,30 +1695,23 @@ fn build_outgoing_headers(
     if meta.strip_spans.needs_slow_path {
         assemble_forward_headers_slow(
             raw,
-            normalized,
+            path,
             meta.is_upgrade,
+            origin,
             forwarded,
             &mut state.scratch_buf,
         );
     } else {
         assemble_forward_headers(
             raw,
-            normalized,
+            path,
             &meta.strip_spans,
             meta.upgrade_span,
             meta.is_upgrade,
+            origin,
             forwarded,
             &mut state.scratch_buf,
         );
-    }
-
-    // The backend is an origin server, sent origin-form only (RFC 9112
-    // 3.2.1). Before filters, so a URLRewrite or set Host meets the same
-    // head as for an origin-form request.
-    if let Some((path, authority)) = absolute_form_target(raw, meta.path_span) {
-        let path = normalized.unwrap_or(path);
-        to_origin_form(&state.scratch_buf, path, authority, &mut state.filter_buf);
-        std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
     }
 
     // has_filters already covers every backend's filters (see routing build).
