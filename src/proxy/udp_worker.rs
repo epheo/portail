@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::config::PerformanceConfig;
 use crate::logging::{debug, info, warn};
@@ -143,20 +143,14 @@ fn nofile_soft_limit() -> Option<u64> {
 struct UdpSession {
     backend_addr: SocketAddr,
     backend_socket: Arc<UdpSocket>,
-    reply_task: JoinHandle<()>,
+    /// Whatever removes a session, its reply task must not live on holding
+    /// the backend socket's fd and port until it idles out.
+    reply_task: AbortOnDropHandle<()>,
     /// Milliseconds since the worker epoch at the last datagram either way.
     last_active: Arc<AtomicU64>,
     /// Route-table generation `backend_addr` was last found routed in.
     generation: u64,
-    _slot: SessionSlot,
-}
-
-impl Drop for UdpSession {
-    fn drop(&mut self) {
-        // Whatever removes a session, its reply task must not live on holding
-        // the backend socket's fd and port until it idles out.
-        self.reply_task.abort();
-    }
+    slot: SessionSlot,
 }
 
 /// Session table of one listener socket. Only its recv loop touches it, so
@@ -253,8 +247,11 @@ impl Sessions {
             if self.reusable(&table, client) {
                 None
             } else {
-                self.map.remove(&client);
-                let Some(slot) = self.budget.take() else {
+                // A session moving to another backend keeps its slot: given
+                // back first, a listener sharing the budget could take it
+                // before this one does, dropping a live client as overflow.
+                let held = self.map.remove(&client).map(|old| old.slot);
+                let Some(slot) = held.or_else(|| self.budget.take()) else {
                     self.overflow();
                     return;
                 };
@@ -341,13 +338,13 @@ impl Sessions {
             return;
         }
         let last_active = Arc::new(AtomicU64::new(now));
-        let reply_task = tokio::spawn(relay_replies(
+        let reply_task = AbortOnDropHandle::new(tokio::spawn(relay_replies(
             Arc::clone(&self.listener),
             Arc::clone(&backend_socket),
             client,
             Arc::clone(&last_active),
             self.epoch,
-        ));
+        )));
         self.map.insert(
             client,
             UdpSession {
@@ -356,7 +353,7 @@ impl Sessions {
                 reply_task,
                 last_active,
                 generation: self.generation,
-                _slot: slot,
+                slot,
             },
         );
     }
@@ -436,6 +433,7 @@ fn millis_since(epoch: Instant) -> u64 {
 mod tests {
     use super::*;
     use crate::routing::Backend;
+    use tokio::task::JoinHandle;
 
     /// Replies "{tag}:{payload}" to every datagram.
     async fn echo_backend(bind: &str, tag: &'static str) -> Option<(SocketAddr, JoinHandle<()>)> {
@@ -662,6 +660,36 @@ mod tests {
         );
     }
 
+    /// A session moving to another backend keeps its slot. Given back and
+    /// taken again, it could go to a listener sharing the full budget in
+    /// between, and the live client was dropped as overflow.
+    #[tokio::test]
+    async fn a_rerouted_session_keeps_its_slot_in_a_full_shared_budget() {
+        let (a, _ea) = echo_backend("127.0.0.1:0", "a").await.unwrap();
+        let (b, _eb) = echo_backend("127.0.0.1:0", "b").await.unwrap();
+        // One session in all.
+        let limits = SessionLimits::with_nofile(&PerformanceConfig::default(), Some(4));
+        let budget = limits.budget();
+        let proxy = start_proxy(&[a], limits).await;
+        let client = client().await;
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"1").await.as_deref(),
+            Some("a:1")
+        );
+
+        // The rival's take, landed between the give-back and the take: no
+        // test can time it there, so it is counted up front.
+        budget.open.fetch_add(1, Relaxed);
+        let _rival = SessionSlot(Arc::clone(&budget));
+        proxy
+            .routes
+            .store(Arc::new(udp_table(proxy.addr.port(), &[b])));
+        assert_eq!(
+            roundtrip(&client, proxy.addr, b"2").await.as_deref(),
+            Some("b:2")
+        );
+    }
+
     /// A session's port comes from the host's range whatever the backend:
     /// none left is the proxy's own shortage, like fds.
     #[test]
@@ -746,10 +774,10 @@ mod tests {
         let session = UdpSession {
             backend_addr: "127.0.0.1:9".parse().unwrap(),
             backend_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-            reply_task: task,
+            reply_task: AbortOnDropHandle::new(task),
             last_active: Arc::new(AtomicU64::new(0)),
             generation: 0,
-            _slot: Arc::new(SessionBudget::new(1, false)).take().unwrap(),
+            slot: Arc::new(SessionBudget::new(1, false)).take().unwrap(),
         };
         drop(session);
         for _ in 0..10 {
