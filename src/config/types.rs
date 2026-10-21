@@ -61,6 +61,18 @@ pub struct ListenerConfig {
     pub rate_limit: Option<RateLimitSpec>,
 }
 
+impl ListenerConfig {
+    /// A TLS listener in Passthrough mode, the one TLS mode served: the
+    /// stream goes to a backend by SNI, raw.
+    pub fn is_tls_passthrough(&self) -> bool {
+        self.protocol == Protocol::TLS
+            && self
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.mode == TlsMode::Passthrough)
+    }
+}
+
 /// Token-bucket parameters, per client (IPv4 address / IPv6 /64).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

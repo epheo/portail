@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::request_processor::analyze_udp_request;
+use portail::proxy::tls::{TlsKind, TlsPlan};
 use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
 use std::hint::black_box;
 use std::time::Duration;
@@ -102,6 +103,16 @@ fn routing_benchmark(c: &mut Criterion) {
 
     c.bench_function("tcp_route_lookup", |b| {
         b.iter(|| black_box(&tcp_table).find_tcp_backends(black_box(8500)))
+    });
+
+    // Per TLS connection: the listener its SNI selects on a shared port,
+    // here a wildcard found two labels up, past an exact miss.
+    let mut plan = TlsPlan::default();
+    plan.add(Some("app.example.com"), TlsKind::Terminate);
+    plan.add(Some("*.example.com"), TlsKind::Passthrough);
+    plan.add(None, TlsKind::Terminate);
+    c.bench_function("tls_sni_listener_select", |b| {
+        b.iter(|| black_box(&plan).select(black_box(Some("a.db.example.com"))))
     });
 
     // Every backend healthy, as in steady state: what is timed is the

@@ -622,7 +622,7 @@ fn test_exact_beats_regex_precedence() {
 fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketAddr> {
     let selector = BackendSelector::new();
     let health = crate::proxy::health::HealthRegistry::new();
-    rt.resolve_tls_passthrough(sni, port, &selector, &health)
+    rt.resolve_tls_passthrough(Some(sni), port, &selector, &health)
         .ok()
 }
 
@@ -656,7 +656,7 @@ fn passthrough_miss_tells_no_backends_from_no_weight() {
         crate::proxy::health::HealthRegistry::new(),
     );
     let miss = |sni| {
-        rt.resolve_tls_passthrough(sni, 8443, &selector, &health)
+        rt.resolve_tls_passthrough(Some(sni), 8443, &selector, &health)
             .unwrap_err()
     };
     assert_eq!(miss("empty.example.com"), PassthroughMiss::NoBackends);
@@ -708,14 +708,14 @@ fn test_tls_route_scoped_to_listener_port() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(9443, "svc.example.com", vec![backend(9001)]);
 
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+    assert!(resolve_pt(&rt, "svc.example.com", 9443).is_some());
     assert_eq!(
         resolve_pt(&rt, "svc.example.com", 9443),
         Some("127.0.0.1:9001".parse().unwrap())
     );
 
     // Same SNI on a different port: no passthrough.
-    assert!(!rt.has_tls_passthrough_route("svc.example.com", 443));
+    assert!(!resolve_pt(&rt, "svc.example.com", 443).is_some());
     assert_eq!(resolve_pt(&rt, "svc.example.com", 443), None);
 }
 
@@ -724,8 +724,8 @@ fn test_tls_route_scoped_to_listener_port() {
 fn test_tls_route_any_port_scope_matches_all_ports() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(0, "svc.example.com", vec![backend(9001)]);
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 443));
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+    assert!(resolve_pt(&rt, "svc.example.com", 443).is_some());
+    assert!(resolve_pt(&rt, "svc.example.com", 9443).is_some());
 }
 
 /// Wildcard TLS matching walks up domain labels like the HTTP wildcard
@@ -735,7 +735,7 @@ fn test_tls_route_any_port_scope_matches_all_ports() {
 fn test_tls_wildcard_matches_multi_label_subdomain() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
-    assert!(rt.has_tls_passthrough_route("a.b.example.com", 8443));
+    assert!(resolve_pt(&rt, "a.b.example.com", 8443).is_some());
     assert_eq!(
         resolve_pt(&rt, "a.b.example.com", 8443),
         Some("127.0.0.1:9002".parse().unwrap())
@@ -753,7 +753,7 @@ fn test_tls_passthrough_round_robins_backends() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
                 .unwrap()
                 .port(),
         );
@@ -774,7 +774,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     mark_unhealthy(&health, 9001);
     for _ in 0..4 {
         let addr = rt
-            .resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            .resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
             .unwrap();
         assert_eq!(addr.port(), 9002);
     }
@@ -783,7 +783,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, &selector, &health)
                 .expect("all-unhealthy must fail open")
                 .port(),
         );

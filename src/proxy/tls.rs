@@ -8,7 +8,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use arc_swap::ArcSwap;
 use pin_project_lite::pin_project;
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -18,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
+#[cfg(test)]
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificateRef;
@@ -154,36 +154,102 @@ fn tls_holds_input<D>(tls: &mut rustls::ConnectionCommon<D>) -> bool {
     }
 }
 
-/// Dynamic TLS acceptor that supports hot-reloading certificates.
-/// Workers hold an `Arc<DynamicTlsAcceptor>` and call `accept()` per connection,
-/// which always reads the latest `ServerConfig` via `ArcSwap`.
-#[derive(Clone)]
-pub struct DynamicTlsAcceptor {
-    config: Arc<ArcSwap<ServerConfig>>,
+/// How a TLS listener serves the connections its SNI selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsKind {
+    /// HTTPS: handshake with the port's terminating config, then HTTP.
+    Terminate,
+    /// TLS Passthrough: forward the raw stream, ClientHello first.
+    Passthrough,
 }
 
-impl DynamicTlsAcceptor {
-    /// Create a new dynamic acceptor from an initial `ServerConfig`.
-    pub fn new(config: ServerConfig) -> Self {
-        Self {
-            config: Arc::new(ArcSwap::new(Arc::new(config))),
+/// The listener an SNI selects on a TLS port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsListener {
+    pub kind: TlsKind,
+    /// Lowercase; `None` for the port's catch-all. A passthrough
+    /// listener's TLS routes are scoped by it.
+    pub hostname: Option<Arc<str>>,
+}
+
+/// One TLS port's dispatch: the listener an SNI selects, by Gateway API
+/// precedence across HTTPS and TLS listeners alike (exact hostname, then
+/// the longest wildcard, then the listener without one), and the config
+/// that terminates for the HTTPS ones. Each pass builds it from the
+/// port's listeners alone and publishes it where the accept loop reads it
+/// per connection: a port changes mode, or sheds a listener's cert,
+/// without a rebind.
+#[derive(Debug, Default)]
+pub struct TlsPlan {
+    /// `None` with no HTTPS listener on the port, or certs that failed to
+    /// build: an SNI selecting an HTTPS listener is then closed.
+    pub terminate: Option<Arc<ServerConfig>>,
+    exact: HashMap<Box<str>, TlsListener>,
+    /// By parent domain: `*.example.com` under "example.com".
+    wildcard: HashMap<Box<str>, TlsListener>,
+    catch_all: Option<TlsListener>,
+    passes_through: bool,
+}
+
+impl TlsPlan {
+    /// Two listeners on one hostname are indistinct and the controller
+    /// accepts neither; merged Gateways can still bring both. HTTPS wins
+    /// then, whatever their order.
+    pub fn add(&mut self, hostname: Option<&str>, kind: TlsKind) {
+        self.passes_through |= kind == TlsKind::Passthrough;
+        let hostname = hostname.map(str::to_ascii_lowercase);
+        let listener = TlsListener {
+            kind,
+            hostname: hostname.as_deref().map(Arc::from),
+        };
+        let replaces = |held: Option<&TlsListener>| {
+            held.is_none_or(|held| held.kind == TlsKind::Passthrough && kind == TlsKind::Terminate)
+        };
+        match hostname.as_deref() {
+            None => {
+                if replaces(self.catch_all.as_ref()) {
+                    self.catch_all = Some(listener);
+                }
+            }
+            Some(host) => {
+                let (map, key) = match host.strip_prefix("*.") {
+                    Some(parent) => (&mut self.wildcard, parent),
+                    None => (&mut self.exact, host),
+                };
+                if replaces(map.get(key)) {
+                    map.insert(key.into(), listener);
+                }
+            }
         }
     }
 
-    /// Swap the TLS config with a new one. Takes effect on the next connection.
-    pub fn update(&self, config: ServerConfig) {
-        self.config.store(Arc::new(config));
+    /// The listener `sni` (lowercase) selects; with no SNI, the catch-all.
+    /// `None`: no listener takes it, and the connection closes.
+    pub fn select(&self, sni: Option<&str>) -> Option<&TlsListener> {
+        if let Some(sni) = sni {
+            if let Some(listener) = self.exact.get(sni) {
+                return Some(listener);
+            }
+            // The first parent found is the longest wildcard.
+            for parent in crate::routing::parent_domains(sni) {
+                if let Some(listener) = self.wildcard.get(parent) {
+                    return Some(listener);
+                }
+            }
+        }
+        self.catch_all.as_ref()
     }
 
-    /// Build a `TlsAcceptor` from the current config snapshot.
-    /// Called once per incoming TLS connection.
-    pub fn acceptor(&self) -> TlsAcceptor {
-        TlsAcceptor::from(self.config.load_full())
+    /// Whether some connection could be served: a config terminates, or a
+    /// passthrough listener forwards. A port that can serve none is not
+    /// bound.
+    pub fn serves(&self) -> bool {
+        self.terminate.is_some() || self.passes_through
     }
 }
 
-/// SNI-based certificate resolver.
-/// Selects the appropriate certificate based on the ClientHello server_name.
+/// SNI-based certificate resolver, by the precedence `TlsPlan::select`
+/// picks the HTTPS listener with: the cert served is that listener's.
 /// Returns None if no matching cert is found (no fallback to a default cert).
 #[derive(Debug)]
 struct SniCertResolver {
@@ -191,6 +257,11 @@ struct SniCertResolver {
     certs: HashMap<String, Arc<CertifiedKey>>,
     /// Wildcard: parent domain -> certified key (e.g. "example.com" matches "*.example.com")
     wildcard_certs: HashMap<String, Arc<CertifiedKey>>,
+    /// Catch-all certs by Secret name, after every listener hostname: a
+    /// file config's catch-all listener with several certs picks one by
+    /// SNI, and a Secret named like a host never takes that host from a
+    /// listener naming it.
+    by_name: HashMap<String, Arc<CertifiedKey>>,
     /// Fallback certificate (first loaded) — used only when there's a single cert
     /// or when the client provides no SNI at all.
     fallback: Option<Arc<CertifiedKey>>,
@@ -209,12 +280,15 @@ impl ResolvesServerCert for SniCertResolver {
             return Some(key.clone());
         }
 
-        // Wildcard: strip first label
-        if let Some(dot_pos) = sni_lower.find('.') {
-            let parent = &sni_lower[dot_pos + 1..];
+        // A wildcard covers any depth; the first parent found is the longest.
+        for parent in crate::routing::parent_domains(&sni_lower) {
             if let Some(key) = self.wildcard_certs.get(parent) {
                 return Some(key.clone());
             }
+        }
+
+        if let Some(key) = self.by_name.get(&sni_lower) {
+            return Some(key.clone());
         }
 
         // No exact or wildcard match — use fallback if available (catch-all listener).
@@ -338,6 +412,7 @@ pub fn build_server_config(
     // Load all valid cert refs, skipping any that fail
     let mut certs_map = HashMap::new();
     let mut wildcard_map = HashMap::new();
+    let mut by_name = HashMap::new();
     let mut fallback_key = None;
 
     for cert_ref in cert_refs {
@@ -368,12 +443,12 @@ pub fn build_server_config(
             // No hostname = catch-all listener. Set as fallback for unmatched SNI.
             // Also add by secret name for standalone mode.
             fallback_key = Some(certified_key.clone());
-            certs_map.insert(cert_ref.name.to_ascii_lowercase(), certified_key);
+            by_name.insert(cert_ref.name.to_ascii_lowercase(), certified_key);
         }
     }
 
     // If no certs loaded successfully, that's an error
-    if certs_map.is_empty() && wildcard_map.is_empty() {
+    if fallback_key.is_none() && certs_map.is_empty() && wildcard_map.is_empty() {
         return Err(anyhow!(
             "No valid certificates could be loaded from {} ref(s)",
             cert_refs.len()
@@ -383,6 +458,7 @@ pub fn build_server_config(
     let resolver = SniCertResolver {
         certs: certs_map,
         wildcard_certs: wildcard_map,
+        by_name,
         fallback: fallback_key,
     };
 
@@ -444,13 +520,23 @@ pub fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
     ClientHelloPeek::Complete(extract_sni_handshake(&buf[5..5 + record_len]))
 }
 
+/// What the peek at a TLS connection's first record found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Hello {
+    /// The SNI of a ClientHello read whole.
+    Sni(String),
+    /// A TLS handshake with no name to dispatch on: a ClientHello without
+    /// SNI, one spanning records, or a record past the peek window. The
+    /// port's catch-all listener decides.
+    Nameless,
+    /// Not TLS, closed, or not complete within the budget.
+    Unreadable,
+}
+
 /// Peek the client's first TLS record and extract SNI, waiting within
 /// `budget` for a fragmented ClientHello to finish arriving. Runs once per
 /// TLS connection before dispatch — never on the per-request path.
-///
-/// Returns None on timeout, non-TLS bytes, a hello without SNI, or a hello
-/// whose ClientHello spans multiple records (cannot be peeked whole).
-pub async fn peek_sni(stream: &tokio::net::TcpStream, budget: Duration) -> Option<String> {
+pub async fn peek_client_hello(stream: &tokio::net::TcpStream, budget: Duration) -> Hello {
     let deadline = tokio::time::Instant::now() + budget;
     let mut buf = [0u8; 16384];
     let mut last_n = 0usize;
@@ -459,22 +545,23 @@ pub async fn peek_sni(stream: &tokio::net::TcpStream, budget: Duration) -> Optio
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
-            return None;
+            return Hello::Unreadable;
         }
         let n = match tokio::time::timeout(remaining, stream.peek(&mut buf)).await {
             Ok(Ok(n)) => n,
-            _ => return None,
+            _ => return Hello::Unreadable,
         };
         if n == 0 {
-            return None;
+            return Hello::Unreadable;
         }
         match classify_client_hello(&buf[..n]) {
-            ClientHelloPeek::Complete(sni) => return sni,
-            ClientHelloPeek::NotTls => return None,
+            ClientHelloPeek::Complete(Some(sni)) => return Hello::Sni(sni),
+            ClientHelloPeek::Complete(None) => return Hello::Nameless,
+            ClientHelloPeek::NotTls => return Hello::Unreadable,
             ClientHelloPeek::Partial => {
                 if n == buf.len() {
                     // Record larger than the peek window; cannot complete.
-                    return None;
+                    return Hello::Nameless;
                 }
                 if n == last_n {
                     // peek() returns instantly while the tail is in flight;
@@ -688,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peek_sni_fragmented_hello() {
+    async fn test_peek_fragmented_hello() {
         use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -707,13 +794,13 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let sni = peek_sni(&stream, Duration::from_secs(2)).await;
-        assert_eq!(sni.as_deref(), Some("frag.test"));
+        let hello = peek_client_hello(&stream, Duration::from_secs(2)).await;
+        assert_eq!(hello, Hello::Sni("frag.test".into()));
         client.await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_peek_sni_rejects_non_tls_immediately() {
+    async fn test_peek_rejects_non_tls_immediately() {
         use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -726,10 +813,35 @@ mod tests {
 
         let (stream, _) = listener.accept().await.unwrap();
         let start = std::time::Instant::now();
-        assert_eq!(peek_sni(&stream, Duration::from_secs(5)).await, None);
+        assert_eq!(
+            peek_client_hello(&stream, Duration::from_secs(5)).await,
+            Hello::Unreadable
+        );
         // Must classify without waiting out the 5s budget; generous bound so
         // a loaded CI runner cannot flake it.
         assert!(start.elapsed() < Duration::from_secs(3));
+        client.await.unwrap();
+    }
+
+    /// A hello without SNI is a TLS handshake all the same: the port's
+    /// catch-all decides it, where a closed or non-TLS stream is closed.
+    #[tokio::test]
+    async fn a_hello_without_sni_is_nameless() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let record = build_tls_record(&build_client_hello(&[]));
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(&record).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            peek_client_hello(&stream, Duration::from_secs(2)).await,
+            Hello::Nameless
+        );
         client.await.unwrap();
     }
 
@@ -858,43 +970,128 @@ mod tests {
 
     use super::test_util::generate_test_cert;
 
+    /// Gateway API v1.4.1 GatewaySpec.listeners: exact hostname, then the
+    /// wildcard with the most dots, then the listener without one, across
+    /// HTTPS and TLS alike, in any listener order. A wildcard covers any
+    /// depth.
     #[test]
-    fn test_dynamic_tls_acceptor_hot_reload() {
-        // Test that DynamicTlsAcceptor can swap configs
-        let (cert_pem, key_pem) = match generate_test_cert("initial.example.com") {
-            Some(v) => v,
-            None => return, // openssl unavailable
-        };
-        let cert_ref = CertificateRef {
-            name: "initial".to_string(),
-            cert_pem: Some(cert_pem.clone()),
-            key_pem: Some(key_pem.clone()),
-            ..Default::default()
-        };
-        let config =
-            build_server_config(&[cert_ref], std::path::Path::new("/unused"), false).unwrap();
-        let dynamic = DynamicTlsAcceptor::new(config);
+    fn a_plan_selects_by_listener_precedence_in_any_order() {
+        use TlsKind::{Passthrough, Terminate};
+        let listeners = [
+            (Some("a.example.com"), Terminate),
+            (Some("*.example.com"), Passthrough),
+            (Some("*.b.example.com"), Terminate),
+            (None, Passthrough),
+        ];
+        let selected = |plan: &TlsPlan, sni| plan.select(sni).map(|l| (l.kind, l.hostname.clone()));
+        let at = |kind, host: Option<&str>| Some((kind, host.map(Arc::from)));
+        for reversed in [false, true] {
+            let mut plan = TlsPlan::default();
+            let mut ordered = listeners.to_vec();
+            if reversed {
+                ordered.reverse();
+            }
+            for (host, kind) in ordered {
+                plan.add(host, kind);
+            }
+            assert_eq!(
+                selected(&plan, Some("a.example.com")),
+                at(Terminate, Some("a.example.com"))
+            );
+            assert_eq!(
+                selected(&plan, Some("x.a.example.com")),
+                at(Passthrough, Some("*.example.com"))
+            );
+            assert_eq!(
+                selected(&plan, Some("x.y.b.example.com")),
+                at(Terminate, Some("*.b.example.com"))
+            );
+            assert_eq!(selected(&plan, Some("other.org")), at(Passthrough, None));
+            assert_eq!(selected(&plan, None), at(Passthrough, None));
+        }
 
-        // Can get an acceptor
-        let _acceptor1 = dynamic.acceptor();
+        let mut no_catch_all = TlsPlan::default();
+        no_catch_all.add(Some("a.example.com"), Terminate);
+        assert_eq!(no_catch_all.select(None), None);
+        assert_eq!(no_catch_all.select(Some("b.example.com")), None);
+        assert!(!no_catch_all.serves(), "no config terminates for it");
+    }
 
-        // Now swap to a new cert
-        let (cert_pem2, key_pem2) = match generate_test_cert("updated.example.com") {
-            Some(v) => v,
-            None => return,
-        };
-        let cert_ref2 = CertificateRef {
-            name: "updated".to_string(),
-            cert_pem: Some(cert_pem2),
-            key_pem: Some(key_pem2),
-            ..Default::default()
-        };
-        let new_config =
-            build_server_config(&[cert_ref2], std::path::Path::new("/unused"), false).unwrap();
-        dynamic.update(new_config);
+    /// Two listeners on one hostname (merged Gateways) go to HTTPS, in
+    /// either order.
+    #[test]
+    fn a_plan_gives_a_shared_hostname_to_https() {
+        for kinds in [
+            [TlsKind::Passthrough, TlsKind::Terminate],
+            [TlsKind::Terminate, TlsKind::Passthrough],
+        ] {
+            let mut plan = TlsPlan::default();
+            for kind in kinds {
+                plan.add(Some("A.example.com"), kind);
+            }
+            let listener = plan.select(Some("a.example.com")).unwrap();
+            assert_eq!(listener.kind, TlsKind::Terminate);
+            assert_eq!(listener.hostname.as_deref(), Some("a.example.com"));
+        }
+    }
 
-        // Can still get an acceptor (now using new config)
-        let _acceptor2 = dynamic.acceptor();
+    /// The cert a handshake gets follows the precedence the plan picks its
+    /// HTTPS listener by: a wildcard covers any depth (one label was
+    /// stripped, so a.b.wild.test found no cert), and a catch-all Secret
+    /// named like a host never takes it from a listener naming it.
+    #[tokio::test]
+    async fn the_cert_served_is_the_selected_listeners() {
+        let (Some(wild), Some(named)) = (
+            generate_test_cert("*.wild.test"),
+            generate_test_cert("named"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let refs = [
+            CertificateRef {
+                name: "wild".into(),
+                hostname: Some("*.wild.test".into()),
+                cert_pem: Some(wild.0.clone()),
+                key_pem: Some(wild.1),
+                ..Default::default()
+            },
+            CertificateRef {
+                name: "x.wild.test".into(),
+                cert_pem: Some(named.0.clone()),
+                key_pem: Some(named.1),
+                ..Default::default()
+            },
+        ];
+        let config = Arc::new(build_server_config(&refs, Path::new("/unused"), false).unwrap());
+        let der = |pem: &[u8]| {
+            rustls::pki_types::CertificateDer::from_pem_slice(pem)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        for (sni, want) in [
+            ("a.b.wild.test", der(&wild.0)),
+            ("x.wild.test", der(&wild.0)),
+            ("other.test", der(&named.0)),
+        ] {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let acceptor = TlsAcceptor::from(config.clone());
+            let server = tokio::spawn(async move { acceptor.accept(server).await.map(drop) });
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(
+                        crate::proxy::backend_pool::NoVerifier,
+                    ))
+                    .with_no_client_auth(),
+            ));
+            let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+            let tls = connector.connect(name, client).await.unwrap();
+            let presented = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+            assert_eq!(presented, want, "{sni}");
+            server.await.unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -929,10 +1126,6 @@ mod tests {
             result.err()
         );
 
-        // Verify DynamicTlsAcceptor can use it
-        let dynamic = DynamicTlsAcceptor::new(result.unwrap());
-        let _acceptor = dynamic.acceptor();
-
         // Now simulate hot-reload: add a 4th cert (conformance test adds its Own)
         let (cert4, key4) = match generate_test_cert("new-test.example.com") {
             Some(v) => v,
@@ -944,12 +1137,7 @@ mod tests {
             key_pem: Some(key4),
             ..Default::default()
         });
-        let new_config =
-            build_server_config(&all_refs, std::path::Path::new("/unused"), false).unwrap();
-        dynamic.update(new_config);
-
-        // Acceptor should work with the updated merged config
-        let _acceptor2 = dynamic.acceptor();
+        assert!(build_server_config(&all_refs, std::path::Path::new("/unused"), false).is_ok());
     }
 
     #[test]

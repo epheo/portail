@@ -35,7 +35,7 @@ use crate::proxy::request_processor::{
     analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
     RequestMeta, RoutingResult,
 };
-use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
+use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
@@ -332,8 +332,8 @@ pub struct ListenerCtx {
     pub server_port: u16,
     pub routes: Arc<ArcSwap<RouteTable>>,
     pub cfg: WorkerConfig,
-    pub tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
-    pub tls_passthrough: bool,
+    /// Read per connection: plain, or a TLS dispatch.
+    pub plan: crate::proxy::data_plane::PortPlan,
     pub health: Arc<HealthRegistry>,
     pub selector: Arc<BackendSelector>,
     pub active_connections: Arc<AtomicUsize>,
@@ -346,8 +346,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
         server_port,
         routes,
         cfg,
-        tls_acceptor,
-        tls_passthrough,
+        plan,
         health,
         selector,
         active_connections,
@@ -385,19 +384,11 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                             debug!("TCP keepalive setup failed for {}: {}", peer, _e);
                         }
                         let routes = routes.clone();
-                        let acceptor = tls_acceptor.clone();
                         let health = health.clone();
                         let conn_guard =
                             ConnGuard::new(active_connections.clone(), listener_stats.clone());
 
-                        if tls_passthrough && acceptor.is_none() {
-                            // Pure passthrough mode (no TLS termination cert available)
-                            let selector = selector.clone();
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
-                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
-                            });
-                        } else if let Some(acceptor) = acceptor {
+                        if let Some(tls) = plan.load_full() {
                             let selector = selector.clone();
                             let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
@@ -407,7 +398,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
-                                    acceptor,
+                                    tls,
                                     server_port,
                                     routes,
                                     cfg,
@@ -457,17 +448,16 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     }
 }
 
-/// One accepted connection on a TLS-terminate listener.
-///
-/// First check whether this SNI should be passed through instead of
-/// terminated — that handles HTTPS/Terminate and TLS/Passthrough listeners
-/// sharing one port. Otherwise handshake, then dispatch by ALPN: h2 goes to
-/// the bridge, all else stays on the h1 path.
+/// One accepted connection on a TLS port: its SNI selects a listener by
+/// the port's plan, read at accept. A passthrough listener forwards the raw
+/// stream; an HTTPS one handshakes, then dispatches by ALPN: h2 goes to the
+/// bridge, all else stays on the h1 path. A connection no listener takes,
+/// or one that is not TLS, closes as a failed handshake.
 #[allow(clippy::too_many_arguments)]
 async fn serve_tls_connection(
     tcp_stream: TcpStream,
     peer: SocketAddr,
-    acceptor: Arc<DynamicTlsAcceptor>,
+    plan: Arc<TlsPlan>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     cfg: WorkerConfig,
@@ -477,28 +467,49 @@ async fn serve_tls_connection(
     listener_stats: Arc<ListenerStats>,
     drain: CancellationToken,
 ) {
-    // Peek ClientHello for SNI to decide dispatch mode, waiting out
-    // fragmented hellos.
-    let should_passthrough =
-        match crate::proxy::tls::peek_sni(&tcp_stream, cfg.client_header_timeout).await {
-            Some(hostname) => {
-                let rt = routes.load();
-                rt.has_tls_passthrough_route(&hostname, server_port)
-            }
-            None => false,
-        };
-
-    if should_passthrough {
-        let _ =
-            handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
-        return;
+    let refuse = |why: &str| {
+        METRICS.tls_handshake_failures_total.inc();
+        listener_stats.tls_handshake_failures.inc();
+        debug!("TLS connection from {} closed: {}", peer, why);
+    };
+    // Waits out fragmented hellos.
+    let mut sni = match tls::peek_client_hello(&tcp_stream, cfg.client_header_timeout).await {
+        Hello::Sni(sni) => Some(sni),
+        Hello::Nameless => None,
+        Hello::Unreadable => return refuse("no ClientHello"),
+    };
+    // In place: the peek already allocated it.
+    if let Some(sni) = sni.as_mut() {
+        sni.make_ascii_lowercase();
     }
+    let Some(listener) = plan.select(sni.as_deref()) else {
+        return refuse("no listener takes its SNI");
+    };
+    let config = match listener.kind {
+        TlsKind::Passthrough => {
+            let _ = handle_tls_passthrough(
+                tcp_stream,
+                sni.as_deref(),
+                server_port,
+                routes,
+                health,
+                selector,
+                &cfg,
+            )
+            .await;
+            return;
+        }
+        TlsKind::Terminate => match &plan.terminate {
+            Some(config) => config.clone(),
+            None => return refuse("its listener's certs failed to load"),
+        },
+    };
 
     // Bound the handshake: a client that stalls mid-handshake would
     // otherwise pin this task (and its buffers) forever.
     let tls_stream = match tokio::time::timeout(
         cfg.client_header_timeout,
-        acceptor.acceptor().accept(tcp_stream),
+        tokio_rustls::TlsAcceptor::from(config).accept(tcp_stream),
     )
     .await
     {
@@ -2430,32 +2441,23 @@ fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> 
     }
 }
 
-/// L4 TLS passthrough: peek ClientHello for SNI, then forward raw TCP to backend.
+/// L4 TLS passthrough of a connection whose ClientHello was peeked for its
+/// `sni` (lowercase): forward raw TCP to its route's backend.
 async fn handle_tls_passthrough(
     client: TcpStream,
+    sni: Option<&str>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
     cfg: &WorkerConfig,
 ) -> Result<()> {
-    let peek_timeout = cfg.client_header_timeout;
-    let hostname = match tls::peek_sni(&client, peek_timeout).await {
-        Some(h) => h,
-        None => {
-            return Err(anyhow::anyhow!(
-                "TLS passthrough: no complete ClientHello with SNI within {:?}, cannot route",
-                peek_timeout
-            ))
-        }
-    };
-
     let route_table = routes.load();
     let backend_addr = route_table
-        .resolve_tls_passthrough(&hostname, server_port, &selector, &health)
-        .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI '{}': {}", hostname, miss))?;
+        .resolve_tls_passthrough(sni, server_port, &selector, &health)
+        .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
 
-    // peek_sni consumed nothing, so the ClientHello is still on the socket:
+    // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
     client.set_nodelay(true)?;
     handle_tcp_connection(
@@ -3262,11 +3264,60 @@ mod connection_tests {
             let (server, _) = listener.accept().await.unwrap();
             let routes = Arc::clone(&routes);
             let (health, selector) = (Arc::default(), Arc::default());
-            let err = handle_tls_passthrough(server, 8443, routes, health, selector, &cfg)
-                .await
-                .unwrap_err()
-                .to_string();
+            let err =
+                handle_tls_passthrough(server, Some(sni), 8443, routes, health, selector, &cfg)
+                    .await
+                    .unwrap_err()
+                    .to_string();
             assert!(err.contains(why), "{sni}: {err}");
+        }
+    }
+
+    /// A TLS connection no listener takes closes, counted as a failed
+    /// handshake: an SNI no listener names on a port without a catch-all, or
+    /// bytes that are not TLS. A passthrough socket dropped them uncounted.
+    #[tokio::test]
+    async fn an_unclaimed_tls_connection_closes_counted() {
+        let mut plan = TlsPlan::default();
+        plan.add(Some("named.test"), TlsKind::Passthrough);
+        let plan = Arc::new(plan);
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for first_bytes in [
+            client_hello("other.test"),
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&first_bytes).await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let stats = Arc::new(ListenerStats::default());
+            serve_tls_connection(
+                server,
+                peer,
+                Arc::clone(&plan),
+                8443,
+                Arc::clone(&routes),
+                cfg,
+                Arc::default(),
+                Arc::default(),
+                None,
+                Arc::clone(&stats),
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(stats.tls_handshake_failures.get(), 1);
+            let read = client.read(&mut [0u8; 1]).await;
+            assert!(!matches!(read, Ok(n) if n > 0), "closed unanswered");
         }
     }
 

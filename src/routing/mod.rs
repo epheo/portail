@@ -330,13 +330,12 @@ impl RouteTable {
         self.udp_routes.get(&server_port)
     }
 
-    /// Look up the TLS-route backends for an SNI hostname on a port: exact
-    /// hostname first, then wildcard walking up domain labels (matching the
-    /// HTTP wildcard semantics — `*.example.com` also covers
+    /// Look up the TLS-route backends for a lowercase SNI hostname on a
+    /// port: exact hostname first, then wildcard walking up domain labels
+    /// (matching the HTTP wildcard semantics — `*.example.com` also covers
     /// `a.b.example.com`), each within the connection's port scope and then
     /// the any-port (0) scope.
     fn tls_route_backends(&self, sni: &str, server_port: u16) -> Option<&Vec<Backend>> {
-        let sni_lower = sni.to_ascii_lowercase();
         let ports: &[u16] = if server_port == 0 {
             &[0]
         } else {
@@ -344,12 +343,12 @@ impl RouteTable {
         };
         for port in ports {
             if let Some(by_host) = self.tls_routes.get(port) {
-                if let Some(backends) = by_host.get(&sni_lower) {
+                if let Some(backends) = by_host.get(sni) {
                     return Some(backends);
                 }
             }
             if let Some(by_host) = self.wildcard_tls_routes.get(port) {
-                for parent in parent_domains(&sni_lower) {
+                for parent in parent_domains(sni) {
                     if let Some(backends) = by_host.get(parent) {
                         return Some(backends);
                     }
@@ -359,19 +358,20 @@ impl RouteTable {
         None
     }
 
-    /// Resolve a TLS passthrough connection to a backend address.
-    /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
-    /// back to port-based TCP routes. Selection is healthy weighted
-    /// round-robin, same as the L4 path. On `Err` the caller drops the
-    /// connection.
+    /// Resolve a TLS passthrough connection, by its lowercase SNI if it
+    /// sent one, to a backend address. Checks SNI-based TLS routes first
+    /// (exact, then wildcard), then falls back to port-based TCP routes.
+    /// Selection is healthy weighted round-robin, same as the L4 path. On
+    /// `Err` the caller drops the connection.
     pub fn resolve_tls_passthrough(
         &self,
-        sni: &str,
+        sni: Option<&str>,
         server_port: u16,
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
     ) -> Result<std::net::SocketAddr, PassthroughMiss> {
-        let (backends, key) = if let Some(backends) = self.tls_route_backends(sni, server_port) {
+        let routed = sni.and_then(|sni| Some((sni, self.tls_route_backends(sni, server_port)?)));
+        let (backends, key) = if let Some((sni, backends)) = routed {
             // Counter keyed per (port, SNI) so each route rotates
             // independently; a collision only shares a counter.
             let key = {
@@ -396,13 +396,6 @@ impl RouteTable {
             Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
             Some(b) => Ok(b.socket_addr),
         }
-    }
-
-    /// Check if a TLS passthrough route exists for this SNI hostname on this
-    /// port. Used by the worker to dynamically decide between passthrough and
-    /// termination when both share a port.
-    pub fn has_tls_passthrough_route(&self, sni: &str, server_port: u16) -> bool {
-        self.tls_route_backends(sni, server_port).is_some()
     }
 }
 
@@ -702,13 +695,13 @@ pub fn hostnames_intersect(a: &str, b: &str) -> bool {
 /// Successive parent domains: "a.b.example.com" yields "b.example.com",
 /// "example.com", "com".
 #[inline]
-fn parent_domains(host: &str) -> ParentDomains<'_> {
+pub(crate) fn parent_domains(host: &str) -> ParentDomains<'_> {
     ParentDomains(host)
 }
 
 /// Hand-rolled rather than iter::successors: the closure-based adapter did
 /// not inline flat, costing measurable ns on the route-miss path.
-struct ParentDomains<'a>(&'a str);
+pub(crate) struct ParentDomains<'a>(&'a str);
 
 impl<'a> Iterator for ParentDomains<'a> {
     type Item = &'a str;
