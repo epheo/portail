@@ -304,8 +304,8 @@ impl Sessions {
         };
         session.last_active.store(now, Relaxed);
         let sent = session.backend_socket.send(datagram).await;
-        if let Err(e) = sent {
-            debug!("UDP send to backend failed for {}: {}", client, e);
+        if let Err(_e) = sent {
+            debug!("UDP send to backend failed for {}: {}", client, _e);
             self.map.remove(&client);
         }
     }

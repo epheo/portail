@@ -467,10 +467,10 @@ async fn serve_tls_connection(
     listener_stats: Arc<ListenerStats>,
     drain: CancellationToken,
 ) {
-    let refuse = |why: &str| {
+    let refuse = |_why: &str| {
         METRICS.tls_handshake_failures_total.inc();
         listener_stats.tls_handshake_failures.inc();
-        debug!("TLS connection from {} closed: {}", peer, why);
+        debug!("TLS connection from {} closed: {}", peer, _why);
     };
     // Waits out fragmented hellos.
     let mut sni = match tls::peek_client_hello(&tcp_stream, cfg.client_header_timeout).await {
