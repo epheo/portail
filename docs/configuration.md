@@ -148,7 +148,7 @@ values; defaults shown):
 |--------|---------|-------------|
 | `backendTimeout` | `30s` | Backend connect timeout |
 | `clientHeaderTimeout` | `30s` | Slow-loris guard: max time for a TLS handshake or a request's header block |
-| `idleBodyTimeout` | `300s` | Per-step progress budget on request/response body streaming, and on an L4 relay once one direction has closed; reaps peers that stay connected but stop transferring. `0s` disables |
+| `idleBodyTimeout` | `300s` | Reaps peers that stay connected but stop transferring |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
 | `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4, shared | Concurrent UDP sessions per listener socket |
@@ -164,6 +164,14 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 - Idle keepalive waits stay unbounded.
 - It also bounds each connection's close, TLS close_notify included.
 - After a reply the proxy wrote itself, it bounds the wait for the client to finish sending.
+
+`idleBodyTimeout`:
+
+- Each step of request and response body streaming must progress within it.
+- So must an L4 relay once one direction has closed.
+- It also bounds a stalled h2 connection: writes pending that long drop it.
+- Idle keepalive waits and idle h2 connections stay unbounded.
+- `0s` disables.
 
 `udpMaxSessions`:
 
