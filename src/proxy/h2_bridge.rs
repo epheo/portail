@@ -177,7 +177,10 @@ async fn serve_stream(
         ctx.peer.ip(),
         &ctx.cfg,
         ctx.listener_stats.clone(),
-        ctx.drain.clone(),
+        // The connection drains by GOAWAY, which lets every accepted stream
+        // finish. Its token would end the engine's first read, polled on a
+        // still empty pipe, before the request is in.
+        CancellationToken::new(),
     );
     let engine_conn = Connection::Mem {
         inner: engine_io,
