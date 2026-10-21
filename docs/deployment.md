@@ -49,6 +49,7 @@ Static addresses (`GatewayStaticAddresses`) are not supported yet: `spec.address
 An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically.
 Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
 A listener that gains a local address leaves all interfaces for it in the same pass, and goes back when it loses it.
+A listener whose published port changes while its `targetPort` stays reopens that socket in the same pass, to route and terminate as the new port.
 A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
 portail sets `Programmed` from bound listener ports; an IP address missing from the pod does not make it `False`.
 
