@@ -154,3 +154,34 @@ fn a_path_to_normalize_allocates_once() {
     });
     assert!(n <= 1, "{n} allocations");
 }
+
+/// What a URLRewrite rule costs each request it takes: a full-path value,
+/// its query and the new hostname are the rule's, borrowed. Each request
+/// cloned the path and hostname, and took a count on the query.
+#[test]
+fn a_full_path_rewrite_borrows_the_rules_values() {
+    use portail::proxy::http_filters::extract_url_rewrite;
+    use portail::routing::{HttpFilter, URLRewritePath};
+    let filters = [HttpFilter::URLRewrite {
+        hostname: Some("new.test".to_string()),
+        path: Some(URLRewritePath::ReplaceFullPath("/new?from=rule".into())),
+    }];
+    let n = allocations(|| extract_url_rewrite(&filters, "/api", "/api/users").is_some());
+    assert_eq!(n, 0);
+
+    let HttpFilter::URLRewrite {
+        path: Some(URLRewritePath::ReplaceFullPath(value)),
+        ..
+    } = &filters[0]
+    else {
+        unreachable!()
+    };
+    let query = value.query.as_ref().unwrap();
+    let rewrite = extract_url_rewrite(&filters, "/api", "/api/users");
+    assert_eq!(
+        std::sync::Arc::strong_count(query),
+        1,
+        "a count per request"
+    );
+    drop(rewrite);
+}

@@ -3,6 +3,7 @@
 //! Applies header modifications, URL rewrites, and request mirroring
 //! on raw byte slices — no intermediate String allocations on the request path.
 
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -20,27 +21,38 @@ pub struct HeaderModifications<'a> {
     pub remove: &'a [String],
 }
 
+/// A URLRewrite applied to one request, borrowed from its rule.
 #[derive(Debug, Clone)]
-pub struct URLRewrite {
-    pub hostname: Option<String>,
-    pub path: Option<RewrittenPath>,
+pub struct URLRewrite<'a> {
+    pub hostname: Option<&'a str>,
+    pub path: Option<RewrittenPath<'a>>,
 }
 
 /// A path modifier applied to one request: its new path, and the query its
 /// value carries ([`crate::routing::PathValue`]), which goes before the
 /// request's.
 #[derive(Debug, Clone)]
-pub struct RewrittenPath {
-    pub path: String,
-    pub query: Option<std::sync::Arc<str>>,
+pub struct RewrittenPath<'a> {
+    /// A full path is the value's own; a prefix replacement is joined to
+    /// the request's rest.
+    pub path: Cow<'a, str>,
+    pub query: Option<&'a str>,
 }
 
 #[cfg(test)]
-impl RewrittenPath {
+impl<'a> RewrittenPath<'a> {
     /// The path a full-path value gives, its query split off as a rule's is.
-    pub(crate) fn from_value(value: &str) -> Self {
-        let crate::routing::PathValue { path, query } = value.into();
-        Self { path, query }
+    pub(crate) fn from_value(value: &'a str) -> Self {
+        match value.split_once('?') {
+            Some((path, query)) => Self {
+                path: path.into(),
+                query: Some(query),
+            },
+            None => Self {
+                path: value.into(),
+                query: None,
+            },
+        }
     }
 }
 
@@ -409,26 +421,30 @@ pub fn extract_header_mods<'a>(
     None
 }
 
-/// Extract URL rewrite parameters from rule filters.
-pub fn extract_url_rewrite(
-    filters: &[HttpFilter],
+/// Extract URL rewrite parameters from rule filters. Only a prefix
+/// replacement allocates: the rest is the rule's, borrowed.
+pub fn extract_url_rewrite<'a>(
+    filters: &'a [HttpFilter],
     rule_path: &str,
     request_path: &str,
-) -> Option<URLRewrite> {
+) -> Option<URLRewrite<'a>> {
     for filter in filters {
         if let HttpFilter::URLRewrite { hostname, path } = filter {
             let rewritten_path = path.as_ref().map(|p| match p {
                 URLRewritePath::ReplaceFullPath(value) => RewrittenPath {
-                    path: value.path.clone(),
-                    query: value.query.clone(),
+                    path: Cow::Borrowed(&value.path),
+                    query: value.query.as_deref(),
                 },
                 URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath {
-                    path: join_prefix_path(&value.path, prefix_remainder(rule_path, request_path)),
-                    query: value.query.clone(),
+                    path: Cow::Owned(join_prefix_path(
+                        &value.path,
+                        prefix_remainder(rule_path, request_path),
+                    )),
+                    query: value.query.as_deref(),
                 },
             });
             return Some(URLRewrite {
-                hostname: hostname.clone(),
+                hostname: hostname.as_deref(),
                 path: rewritten_path,
             });
         }
@@ -614,13 +630,13 @@ fn split_first_line(raw: &[u8]) -> (&[u8], &[u8]) {
 pub(crate) fn apply_request_header_modifications(
     header_region: &[u8],
     header_mods: Option<&HeaderModifications<'_>>,
-    url_rewrite: Option<&URLRewrite>,
+    url_rewrite: Option<&URLRewrite<'_>>,
     out: &mut Vec<u8>,
 ) {
     let path = url_rewrite
         .and_then(|r| r.path.as_ref())
-        .map(|p| (p.path.as_bytes(), p.query.as_deref()));
-    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
+        .map(|p| (p.path.as_bytes(), p.query));
+    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname);
     rewrite_request_head(header_region, path, header_mods, rewrite_hostname, out);
 }
 
@@ -914,7 +930,7 @@ mod tests {
     #[test]
     fn test_url_rewrite_hostname_adds_a_missing_host() {
         let rewrite = URLRewrite {
-            hostname: Some("internal.example".to_string()),
+            hostname: Some("internal.example"),
             path: None,
         };
         let mut out = Vec::new();
@@ -1084,15 +1100,12 @@ mod tests {
             prefix_remainder(r"^/a$|^/much-longer-alternative$", "/a"),
             ""
         );
-        let rewrite = extract_url_rewrite(
-            &[HttpFilter::URLRewrite {
-                hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
-            }],
-            r"^/a$|^/much-longer-alternative$",
-            "/a",
-        )
-        .unwrap();
+        let filters = [HttpFilter::URLRewrite {
+            hostname: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
+        }];
+        let rewrite =
+            extract_url_rewrite(&filters, r"^/a$|^/much-longer-alternative$", "/a").unwrap();
         assert!(matches!(rewrite.path, Some(RewrittenPath { path: ref p, .. }) if p == "/new"));
     }
 
@@ -1154,63 +1167,51 @@ mod tests {
     #[test]
     fn test_url_rewrite_joins_a_value_query_and_the_request_query() {
         let mut out = Vec::new();
-        let prefix = |value: &str, path: &str| {
-            let rewrite = extract_url_rewrite(
-                &[HttpFilter::URLRewrite {
-                    hostname: None,
-                    path: Some(URLRewritePath::ReplacePrefixMatch(value.into())),
-                }],
-                "/old",
-                path,
-            );
-            rewrite.unwrap().path.unwrap()
-        };
-        for (path, target, want) in [
+        // A prefix value's rule matched "/old" on its request path; a
+        // full-path value has none.
+        for (value, prefix_of, target, want) in [
             (
-                RewrittenPath::from_value("/login?next=home"),
+                "/login?next=home",
+                None,
                 "/old?a=1&b",
                 "/login?next=home&a=1&b",
             ),
+            ("/login?next=home", None, "/old", "/login?next=home"),
+            ("/login?next=home", None, "/old?", "/login?next=home"),
+            ("/login?", None, "/old?a=1", "/login?a=1"),
             (
-                RewrittenPath::from_value("/login?next=home"),
-                "/old",
-                "/login?next=home",
-            ),
-            (
-                RewrittenPath::from_value("/login?next=home"),
-                "/old?",
-                "/login?next=home",
-            ),
-            (
-                RewrittenPath::from_value("/login?"),
-                "/old?a=1",
-                "/login?a=1",
-            ),
-            (
-                prefix("/new?src=gw", "/old/x"),
+                "/new?src=gw",
+                Some("/old/x"),
                 "/old/x?a=1",
                 "/new/x?src=gw&a=1",
             ),
-            (prefix("/?src=gw", "/old/x"), "/old/x", "/x?src=gw"),
+            ("/?src=gw", Some("/old/x"), "/old/x", "/x?src=gw"),
             // A value's query already ending in '&' takes the request's
             // as is: it made /login?next=home&&a=1.
             (
-                RewrittenPath::from_value("/login?next=home&"),
+                "/login?next=home&",
+                None,
                 "/old?a=1",
                 "/login?next=home&a=1",
             ),
             (
-                prefix("/new?src=gw&", "/old/x"),
+                "/new?src=gw&",
+                Some("/old/x"),
                 "/old/x?a=1",
                 "/new/x?src=gw&a=1",
             ),
         ] {
-            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
-            let rewrite = URLRewrite {
+            let path = match prefix_of {
+                None => URLRewritePath::ReplaceFullPath(value.into()),
+                Some(_) => URLRewritePath::ReplacePrefixMatch(value.into()),
+            };
+            let filters = [HttpFilter::URLRewrite {
                 hostname: None,
                 path: Some(path),
-            };
-            apply_request_header_modifications(head.as_bytes(), None, Some(&rewrite), &mut out);
+            }];
+            let rewrite = extract_url_rewrite(&filters, "/old", prefix_of.unwrap_or("/old"));
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            apply_request_header_modifications(head.as_bytes(), None, rewrite.as_ref(), &mut out);
             let s = std::str::from_utf8(&out).unwrap();
             assert!(s.starts_with(&format!("GET {want} HTTP/1.1\r\n")), "{s}");
         }
@@ -1220,7 +1221,7 @@ mod tests {
     fn test_apply_modifications_host_rewrite() {
         let headers = b"GET / HTTP/1.1\r\nHost: original.example.com\r\n\r\n";
         let rewrite = URLRewrite {
-            hostname: Some("rewritten.example.com".to_string()),
+            hostname: Some("rewritten.example.com"),
             path: None,
         };
         let mut result = Vec::new();
@@ -1235,7 +1236,7 @@ mod tests {
     fn test_apply_modifications_combined() {
         let headers = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
         let rewrite = URLRewrite {
-            hostname: Some("new.com".to_string()),
+            hostname: Some("new.com"),
             path: Some(RewrittenPath::from_value("/new")),
         };
         let mods = HeaderModifications {

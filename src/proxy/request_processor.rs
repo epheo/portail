@@ -760,7 +760,7 @@ mod tests {
             let rewrite =
                 crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, "/")
                     .unwrap();
-            assert_eq!(rewrite.hostname.as_deref(), Some("new.example.com"));
+            assert_eq!(rewrite.hostname, Some("new.example.com"));
             assert!(rewrite.path.is_none());
         } else {
             panic!("expected HttpForward");

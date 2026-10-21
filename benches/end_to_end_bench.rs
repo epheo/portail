@@ -340,6 +340,15 @@ fn path_modifiers(c: &mut Criterion) {
         b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
     });
 
+    // A full path, its query and a hostname: the rule's, borrowed.
+    let rewrite = [HttpFilter::URLRewrite {
+        hostname: Some("internal.api.com".to_string()),
+        path: Some(URLRewritePath::ReplaceFullPath("/new?src=gw".into())),
+    }];
+    c.bench_function("url_rewrite_full_path", |b| {
+        b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
+    });
+
     // A full-path redirect whose value carries a query, joined with the
     // request's: the '&' decision reads the value's last byte only.
     let mut table = RouteTable::new();
