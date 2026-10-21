@@ -119,7 +119,7 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
 }
 
 /// RAII in-flight-connection counter. One guard lives inside each spawned
-/// per-connection task; `DataPlane::shutdown` polls the shared count and
+/// per-connection task; `data_plane::Drain::run` polls the shared count and
 /// drains until it reaches zero (or the drain timeout expires). Drop-based so
 /// the count stays correct on every exit path, including panics and aborts.
 struct ConnGuard {

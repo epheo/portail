@@ -139,6 +139,10 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
+    // Registered first: as PID 1, a SIGTERM that lands before the handler
+    // exists is dropped, not acted on (see the wait for shutdown below).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // Before listeners: a request must never race the writer task's spawn.
     if let Some(target) = &args.access_log {
         portail::access_log::init(target)?;
@@ -196,6 +200,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // Start initial listeners from config file
     data_plane.lock().unwrap().start(routes.clone());
     info!("Portail ready: {} listeners", listeners.len());
+    let drain = data_plane.lock().unwrap().drain_handle();
 
     // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
@@ -272,7 +277,6 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // ignored: every pod sat out its full terminationGracePeriod and died by
     // SIGKILL, holding its (host-network) ports for those 30s and stalling
     // every rollout behind EADDRINUSE retries.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
@@ -281,9 +285,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     shutdown_token.cancel();
 
     info!("Shutting down Portail");
-    if let Ok(dp) = std::sync::Arc::try_unwrap(data_plane) {
-        dp.into_inner().unwrap().shutdown().await;
-    }
+    drain.run().await;
 
     info!("Portail shutdown complete");
     Ok(())
