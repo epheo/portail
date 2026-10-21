@@ -281,12 +281,17 @@ fn compile_match(m: &HttpRouteMatch) -> Result<CompiledMatch, RouteError> {
                     p.value
                 )));
             }
-            let match_type = if p.match_type == HttpPathMatchType::Exact {
-                routing::PathMatchType::Exact
+            if p.match_type == HttpPathMatchType::Exact {
+                (routing::PathMatchType::Exact, p.value.clone(), None)
             } else {
-                routing::PathMatchType::Prefix
-            };
-            (match_type, p.value.clone(), None)
+                // Gateway API v1.4.1 PathPrefix: "When specified, a trailing
+                // `/` is ignored", so /abc/ matches /abc. The root stays "/".
+                let prefix = match p.value.trim_end_matches('/') {
+                    "" => "/",
+                    trimmed => trimmed,
+                };
+                (routing::PathMatchType::Prefix, prefix.to_string(), None)
+            }
         }
     };
 

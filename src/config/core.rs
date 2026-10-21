@@ -1335,6 +1335,45 @@ mod tests {
         assert!(!found("h.example.com", "/", b"x-v: v1\r\n", "q=v1x"));
     }
 
+    /// PathPrefix /abc/ did not match /abc.
+    #[test]
+    fn a_path_prefix_ignores_its_trailing_slash() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [
+                {"hostnames":["p.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/foo/"}}],
+                           "filters":[{"type":"URLRewrite","urlRewrite":{"path":{"type":"ReplacePrefixMatch","replacePrefixMatch":"/xyz"}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]},
+                {"hostnames":["r.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let rewrite = |path: &str| {
+            let rule = rt.find_http_route("p.example.com", "GET", path, &[], "", 8080)?;
+            let rewrite =
+                crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, path)?;
+            match rewrite.path? {
+                crate::proxy::http_filters::RewrittenPath::PrefixReplaced(p) => Some(p),
+                crate::proxy::http_filters::RewrittenPath::Full(p) => panic!("{p}"),
+            }
+        };
+        // The ReplacePrefixMatch table of Gateway API v1.4.1, prefix /foo/.
+        assert_eq!(rewrite("/foo/bar").as_deref(), Some("/xyz/bar"));
+        assert_eq!(rewrite("/foo").as_deref(), Some("/xyz"));
+        assert_eq!(rewrite("/foo/").as_deref(), Some("/xyz/"));
+        assert_eq!(rewrite("/foobar"), None);
+
+        let root = |path| {
+            rt.find_http_route("r.example.com", "GET", path, &[], "", 8080)
+                .is_some()
+        };
+        assert!(root("/") && root("/x") && root("/x/y"));
+    }
+
     /// A rule with `matches: []`, or none at all, served nothing.
     #[test]
     fn a_rule_without_matches_matches_every_path() {
