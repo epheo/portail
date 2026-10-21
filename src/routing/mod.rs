@@ -6,6 +6,8 @@ use std::time::Duration;
 
 mod build;
 
+pub(crate) use build::resolve_socket_addrs;
+
 #[cfg(test)]
 mod tests;
 

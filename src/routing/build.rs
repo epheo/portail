@@ -79,22 +79,31 @@ impl RouteTable {
         }
     }
 
-    /// Order-independent fingerprint of every backend socket address in the table.
+    /// Order-independent fingerprint of every backend and mirror socket
+    /// address in the table.
     ///
     /// The DNS-refresh task re-resolves and rebuilds the table on an interval but
     /// swaps it only when this signature changes, so a churny resolver that merely
     /// reorders records (or returns an unchanged set) costs nothing. `wrapping_add`
     /// (commutative, and unlike XOR does not cancel duplicate addresses) makes the
     /// fold independent of record order across rules and route kinds.
+    /// Mirrors count too: a build drops a mirror DNS cannot resolve, and only
+    /// a changed signature brings it back once it resolves.
     pub fn dns_signature(&self) -> u64 {
-        let http_backends = self.listener_scopes.values().flatten().flat_map(|scope| {
+        let http_rules = self.listener_scopes.values().flatten().flat_map(|scope| {
             scope
                 .http_routes
                 .values()
                 .chain(scope.wildcard_http_routes.values())
                 .chain(scope.catch_all_http_routes.iter())
                 .flat_map(|he| he.iter())
-                .flat_map(|rule| rule.backends.iter())
+        });
+        let http_addrs = http_rules.flat_map(|rule| {
+            let mirrors = rule.filters.iter().filter_map(|f| match f {
+                HttpFilter::RequestMirror { backend_addr, .. } => Some(*backend_addr),
+                _ => None,
+            });
+            rule.backends.iter().map(|b| b.socket_addr).chain(mirrors)
         });
         let l4_backends = self
             .tcp_routes
@@ -110,10 +119,11 @@ impl RouteTable {
                     .values()
                     .flat_map(|by_host| by_host.values()),
             )
-            .flatten();
-        http_backends
+            .flatten()
+            .map(|b| b.socket_addr);
+        http_addrs
             .chain(l4_backends)
-            .map(|b| backend_addr_hash(&b.socket_addr))
+            .map(|addr| backend_addr_hash(&addr))
             .fold(0u64, |acc, h| acc.wrapping_add(h))
     }
 
@@ -283,7 +293,7 @@ impl Default for RouteTable {
 /// the STRICT_DNS contract: a headless Service publishes one A-record per ready
 /// pod at `<svc>.<ns>.svc`, a ClusterIP Service one VIP, an ExternalName a
 /// CNAME chain. Errors if a DNS name resolves to nothing.
-pub(super) fn resolve_socket_addrs(address: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn resolve_socket_addrs(address: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
@@ -424,5 +434,39 @@ mod tests {
         assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].1[0], ("/a/b/c".to_string(), 4));
         assert_eq!(entries(&batch), ordered);
+    }
+
+    /// A mirror the build dropped for a DNS miss comes back only through a
+    /// signature change once it resolves.
+    #[test]
+    fn dns_signature_covers_mirror_addresses() {
+        let signature = |mirror: Option<&str>| {
+            let filters = mirror
+                .map(|addr| HttpFilter::RequestMirror {
+                    backend_addr: addr.parse().unwrap(),
+                    mirror_percent: 100,
+                })
+                .into_iter()
+                .collect();
+            let backend = Backend::new("127.0.0.1".to_string(), 8001).unwrap();
+            let mut table = RouteTable::new();
+            table.add_http_route(
+                "m.example.com",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    filters,
+                    vec![backend],
+                ),
+            );
+            table.dns_signature()
+        };
+        assert_ne!(signature(None), signature(Some("10.0.0.1:9999")));
+        assert_ne!(
+            signature(Some("10.0.0.1:9999")),
+            signature(Some("10.0.0.2:9999"))
+        );
     }
 }

@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use super::types::*;
+use crate::routing::{Backend, RouteTable};
 
 impl PortailConfig {
     /// Load configuration from file with auto-format detection
@@ -63,72 +67,124 @@ impl PortailConfig {
     }
 }
 
-impl PortailConfig {
-    /// Like [`Self::to_route_table`], but fails when any configured backendRef
-    /// cannot be DNS-resolved — instead of silently building the route with
-    /// fewer (possibly zero) backends. Used on the standalone path (startup
-    /// and SIGHUP reload) where a valid config with a transient DNS blip must
-    /// not degrade live routes to 5xx while reporting success. The Kubernetes
-    /// path stays lenient by design: a route whose backends don't resolve is
-    /// conformance-required to serve 500, and the DNS-refresh task picks the
-    /// backends up as their records appear.
-    pub fn to_route_table_strict(&self) -> Result<crate::routing::RouteTable> {
-        self.check_backend_resolution()?;
-        self.to_route_table()
+/// What the table build does with a name DNS cannot resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildPolicy {
+    /// Fail the build. The standalone load and reload paths: a valid config
+    /// hit by a DNS blip must not swap in routes that serve 5xx while
+    /// reporting success.
+    Strict,
+    /// Skip that backend or mirror and build the rest. The Kubernetes path:
+    /// a route whose backends do not resolve must serve 500 (conformance),
+    /// and the DNS-refresh task picks names up as their records appear.
+    Lenient,
+}
+
+/// Every address of a backend (name, port). Injected so tests can count and
+/// fail lookups without a resolver.
+pub(crate) type Lookup<'l> = dyn FnMut(&str, u16) -> Result<Vec<SocketAddr>> + 'l;
+
+/// One lookup per distinct (name, port) per build: rules sharing a backend
+/// get one address set, and a dead name costs one resolver timeout, not one
+/// per rule.
+struct Resolver<'a, 'l> {
+    policy: BuildPolicy,
+    lookup: &'a mut Lookup<'l>,
+    seen: HashMap<(String, u16), Option<Vec<SocketAddr>>>,
+}
+
+impl Resolver<'_, '_> {
+    /// `None`: the name did not resolve and the policy is lenient. Warns on
+    /// the first lookup only.
+    fn addrs(&mut self, name: &str, port: u16, what: &str) -> Result<Option<&[SocketAddr]>> {
+        let found = match self.seen.entry((name.to_string(), port)) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let found = match (self.lookup)(name, port) {
+                    Ok(addrs) => Some(addrs),
+                    Err(err) if self.policy == BuildPolicy::Strict => {
+                        return Err(anyhow!(
+                            "{} backend {}:{} failed to resolve: {}",
+                            what,
+                            name,
+                            port,
+                            err
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Skipping {} backend {}:{} - DNS resolution failed: {}",
+                            what,
+                            name,
+                            port,
+                            err
+                        );
+                        None
+                    }
+                };
+                e.insert(found)
+            }
+        };
+        Ok(found.as_deref())
     }
 
-    /// Resolve every referenced (backend name, port) once, erroring on the
-    /// first failure. Deduplicated, so the double resolution cost of the
-    /// strict path stays bounded by the number of distinct backends.
-    fn check_backend_resolution(&self) -> Result<()> {
-        let http = self
-            .http_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "HTTP"));
-        let tcp = self
-            .tcp_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "TCP"));
-        let udp = self
-            .udp_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "UDP"));
-        let tls = self
-            .tls_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "TLS"));
-
-        let mut seen = std::collections::HashSet::new();
-        for (refs, proto) in http.chain(tcp).chain(udp).chain(tls) {
-            for br in refs {
-                if br.invalid || !seen.insert((br.name.clone(), br.port)) {
-                    continue;
-                }
-                crate::routing::Backend::all_with_weight(br.name.clone(), br.port, 1).map_err(
-                    |e| {
-                        anyhow!(
-                            "{} backend {}:{} failed to resolve: {}",
-                            proto,
-                            br.name,
-                            br.port,
-                            e
-                        )
-                    },
-                )?;
+    /// One backend per address of each ref, at the ref's weight. An invalid
+    /// ref is never looked up: it keeps its weight as a rejecting stand-in.
+    fn backends(&mut self, refs: &[BackendRef], what: &str) -> Result<Vec<Backend>> {
+        let mut backends = Vec::new();
+        for br in refs {
+            if br.invalid {
+                backends.push(Backend::rejecting(br.weight));
+            } else if let Some(addrs) = self.addrs(&br.name, br.port, what)? {
+                backends.extend(addrs.iter().map(|&a| backend_at(a, br.weight, &br.name)));
             }
         }
-        Ok(())
+        Ok(backends)
+    }
+}
+
+fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
+    Backend {
+        socket_addr,
+        weight,
+        filters: vec![],
+        use_tls: false,
+        server_name: server_name.to_string(),
+        action: crate::routing::BackendAction::Forward,
+    }
+}
+
+impl PortailConfig {
+    /// Like [`Self::to_route_table`], but a backendRef or mirror that DNS
+    /// cannot resolve fails the build instead of being skipped.
+    pub fn to_route_table_strict(&self) -> Result<RouteTable> {
+        self.build_route_table(
+            BuildPolicy::Strict,
+            &mut crate::routing::resolve_socket_addrs,
+        )
     }
 
-    /// Convert configuration to RouteTable for runtime use
-    /// All route processing happens once at startup - zero runtime overhead
-    pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
+    /// Convert configuration to RouteTable for runtime use. A backend or
+    /// mirror DNS cannot resolve is skipped (see [`BuildPolicy::Lenient`]).
+    pub fn to_route_table(&self) -> Result<RouteTable> {
+        self.build_route_table(
+            BuildPolicy::Lenient,
+            &mut crate::routing::resolve_socket_addrs,
+        )
+    }
+
+    pub(crate) fn build_route_table(
+        &self,
+        policy: BuildPolicy,
+        lookup: &mut Lookup,
+    ) -> Result<RouteTable> {
         use crate::routing;
 
+        let mut resolver = Resolver {
+            policy,
+            lookup,
+            seen: HashMap::new(),
+        };
         let mut route_table = routing::RouteTable::new();
 
         tracing::debug!(
@@ -216,12 +272,7 @@ impl PortailConfig {
                             rule.backend_refs.len()
                         );
 
-                        let (backends, filters) = build_rule_components(
-                            rule,
-                            &self.endpoint_overrides,
-                            &self.app_protocol_overrides,
-                            &self.headless_target_ports,
-                        )?;
+                        let (backends, filters) = self.rule_components(rule, &mut resolver)?;
 
                         for route_match in &rule.matches {
                             let mut routing_rule =
@@ -248,8 +299,8 @@ impl PortailConfig {
         }
         route_table.sort_http_routes();
 
-        self.convert_l4_routes(&mut route_table, &self.tcp_routes, false);
-        self.convert_l4_routes(&mut route_table, &self.udp_routes, true);
+        self.convert_l4_routes(&mut route_table, &self.tcp_routes, false, &mut resolver)?;
+        self.convert_l4_routes(&mut route_table, &self.udp_routes, true, &mut resolver)?;
 
         // Convert TLS routes (SNI-based), scoped to the ports of the TLS
         // listeners their parentRefs attach to. Without parentRefs
@@ -268,7 +319,7 @@ impl PortailConfig {
             }
 
             for rule in &tls_route.rules {
-                let backends = resolve_backends_lenient(&rule.backend_refs, "TLS");
+                let backends = resolver.backends(&rule.backend_refs, "TLS")?;
 
                 for hostname in &tls_route.hostnames {
                     for &port in &ports {
@@ -298,7 +349,8 @@ impl PortailConfig {
         route_table: &mut crate::routing::RouteTable,
         routes: &[TcpRouteConfig],
         is_udp: bool,
-    ) {
+        resolver: &mut Resolver,
+    ) -> Result<()> {
         let proto = if is_udp { "UDP" } else { "TCP" };
         for (route_idx, route) in routes.iter().enumerate() {
             let Some(rule) = route.rules.first() else {
@@ -319,7 +371,7 @@ impl PortailConfig {
             if listeners.is_empty() {
                 continue;
             }
-            let backends = resolve_backends_lenient(&rule.backend_refs, "L4");
+            let backends = resolver.backends(&rule.backend_refs, proto)?;
             for listener in listeners {
                 let added = if is_udp {
                     route_table.add_udp_route(listener.port, backends.clone())
@@ -336,32 +388,8 @@ impl PortailConfig {
                 }
             }
         }
+        Ok(())
     }
-}
-
-/// Lenient backend resolution: skip (and warn about) refs whose DNS fails,
-/// keeping the rest. The strict startup path pre-checks resolution in
-/// `check_backend_resolution`, so leniency here only affects the Kubernetes
-/// path, where serving with fewer backends is conformance-required.
-fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routing::Backend> {
-    refs.iter()
-        .flat_map(|br| {
-            if br.invalid {
-                return vec![crate::routing::Backend::rejecting(br.weight)];
-            }
-            crate::routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
-                .map_err(|e| {
-                    tracing::warn!(
-                        "Skipping {} backend {}:{} - DNS resolution failed: {}",
-                        what,
-                        br.name,
-                        br.port,
-                        e
-                    )
-                })
-                .unwrap_or_default()
-        })
-        .collect()
 }
 
 /// Listeners a route's parentRefs select, for every route kind in both
@@ -392,117 +420,94 @@ fn find_listeners_for_route<'a>(
     matched
 }
 
-/// Build backends and filters from a route rule. Extracts common logic from the route loop.
-fn build_rule_components(
-    rule: &HttpRouteRule,
-    endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
-    app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
-    headless_target_ports: &std::collections::HashMap<(String, u16), u16>,
-) -> Result<(
-    Vec<crate::routing::Backend>,
-    Vec<crate::routing::HttpFilter>,
-)> {
-    use crate::routing;
+impl PortailConfig {
+    /// Backends and filters of one rule, resolved through `resolver`.
+    fn rule_components(
+        &self,
+        rule: &HttpRouteRule,
+        resolver: &mut Resolver,
+    ) -> Result<(Vec<Backend>, Vec<crate::routing::HttpFilter>)> {
+        let mut backends = Vec::new();
+        for backend_ref in &rule.backend_refs {
+            if backend_ref.invalid {
+                backends.push(Backend::rejecting(backend_ref.weight));
+                continue;
+            }
+            let backend_filters = convert_filters(&backend_ref.filters, resolver)?;
 
-    let mut backends = Vec::new();
-    for backend_ref in &rule.backend_refs {
-        if backend_ref.invalid {
-            backends.push(routing::Backend::rejecting(backend_ref.weight));
-            continue;
-        }
-        let backend_filters = convert_filters(&backend_ref.filters)?;
+            // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
+            let override_key = (backend_ref.name.clone(), backend_ref.port);
+            let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
+                self.app_protocol_overrides
+                    .get(&override_key)
+                    .map(|s| s.as_str())
+            });
+            let backend_use_tls = effective_app_protocol == Some("https");
+            let mut push = |addr: SocketAddr, server_name: &str| {
+                let mut backend = backend_at(addr, backend_ref.weight, server_name);
+                backend.filters = backend_filters.clone();
+                backend.use_tls = backend_use_tls;
+                backends.push(backend);
+            };
 
-        // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
-        let override_key = (backend_ref.name.clone(), backend_ref.port);
-        let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
-            app_protocol_overrides
+            // Check if this backend has endpoint overrides (headless service)
+            if let Some(endpoints) = self
+                .endpoint_overrides
                 .get(&override_key)
-                .map(|s| s.as_str())
-        });
-        let backend_use_tls = effective_app_protocol == Some("https");
-
-        // Check if this backend has endpoint overrides (headless service)
-        if let Some(endpoints) = endpoint_overrides.get(&override_key) {
-            if !endpoints.is_empty() {
+                .filter(|e| !e.is_empty())
+            {
                 tracing::debug!(
                     "        Headless backend {}:{} -> {} pod endpoints",
                     backend_ref.name,
                     backend_ref.port,
                     endpoints.len()
                 );
-                for (pod_ip, target_port) in endpoints {
-                    match routing::Backend::with_weight(
-                        pod_ip.clone(),
-                        *target_port,
-                        backend_ref.weight,
-                    ) {
-                        Ok(mut backend) => {
-                            backend.filters = backend_filters.clone();
-                            backend.use_tls = backend_use_tls;
-                            backends.push(backend);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "        Skipping headless endpoint {}:{} - {}",
-                                pod_ip,
-                                target_port,
-                                e
-                            );
-                        }
+                // An endpoint is one target: its first address.
+                for (host, target_port) in endpoints {
+                    if let Some(&addr) = resolver
+                        .addrs(host, *target_port, "HTTP")?
+                        .and_then(<[_]>::first)
+                    {
+                        push(addr, host);
                     }
                 }
                 continue;
             }
-        }
 
-        // Standard DNS-based resolution — resolve to every A-record (STRICT_DNS):
-        // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
-        // FQDN to one VIP. The existing weighted selection load-balances across the
-        // resulting flat entries.
-        //
-        // Port: a headless Service has no VIP, so DNS returns pod IPs and we must
-        // connect on the Service's targetPort, not the service port (DNS carries no
-        // port). For ClusterIP the FQDN resolves to the VIP and the service port is
-        // correct (kube-proxy maps it), so there is no override and we keep the ref's
-        // port.
-        let connect_port = headless_target_ports
-            .get(&override_key)
-            .copied()
-            .unwrap_or(backend_ref.port);
-        match routing::Backend::all_with_weight(
-            backend_ref.name.clone(),
-            connect_port,
-            backend_ref.weight,
-        ) {
-            Ok(resolved) => {
+            // Standard DNS-based resolution — resolve to every A-record (STRICT_DNS):
+            // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
+            // FQDN to one VIP. The existing weighted selection load-balances across the
+            // resulting flat entries.
+            //
+            // Port: a headless Service has no VIP, so DNS returns pod IPs and we must
+            // connect on the Service's targetPort, not the service port (DNS carries no
+            // port). For ClusterIP the FQDN resolves to the VIP and the service port is
+            // correct (kube-proxy maps it), so there is no override and we keep the ref's
+            // port.
+            let connect_port = self
+                .headless_target_ports
+                .get(&override_key)
+                .copied()
+                .unwrap_or(backend_ref.port);
+            if let Some(addrs) = resolver.addrs(&backend_ref.name, connect_port, "HTTP")? {
                 tracing::debug!(
                     "        Backend: {}:{} weight={} tls={} -> {} address(es)",
                     backend_ref.name,
                     backend_ref.port,
                     backend_ref.weight,
                     backend_use_tls,
-                    resolved.len()
+                    addrs.len()
                 );
-                for mut backend in resolved {
-                    backend.filters = backend_filters.clone();
-                    backend.use_tls = backend_use_tls;
-                    backends.push(backend);
+                for &addr in addrs {
+                    push(addr, &backend_ref.name);
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    "        Skipping backend {}:{} - DNS resolution failed: {}",
-                    backend_ref.name,
-                    backend_ref.port,
-                    e
-                );
-            }
         }
-    }
 
-    super::wire::check_rule_filters(&rule.filters)?;
-    let filters = convert_filters(&rule.filters)?;
-    Ok((backends, filters))
+        super::wire::check_rule_filters(&rule.filters)?;
+        let filters = convert_filters(&rule.filters, resolver)?;
+        Ok((backends, filters))
+    }
 }
 
 /// Build a routing rule from a route match, reused backends, and filters.
@@ -627,38 +632,41 @@ fn intersect_hostnames(listener_hostname: Option<&str>, route_hostnames: &[Strin
     }
 }
 
-fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
-    config_filters
-        .iter()
-        .map(crate::routing::HttpFilter::try_from)
-        .collect()
-}
+/// A mirror DNS cannot resolve is left out when the policy is lenient:
+/// primary traffic never depends on it.
+fn convert_filters(
+    config_filters: &[HttpRouteFilter],
+    resolver: &mut Resolver,
+) -> Result<Vec<crate::routing::HttpFilter>> {
+    use crate::routing::HttpFilter;
 
-impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
-    type Error = anyhow::Error;
-
-    fn try_from(f: &HttpRouteFilter) -> Result<Self> {
+    let mut filters = Vec::with_capacity(config_filters.len());
+    for f in config_filters {
         // The table build is the one funnel every config path shares, and
         // not every caller runs validate() first (the reconciler, DNS
         // refresh): this keeps CR/LF off the wire even if one forgets.
         super::wire::check_filter(f)?;
-        Ok(match f {
-            HttpRouteFilter::RequestHeaderModifier { config } => Self::RequestHeaderModifier {
-                add: std::sync::Arc::new(config.add.clone()),
-                set: std::sync::Arc::new(config.set.clone()),
-                remove: std::sync::Arc::new(config.remove.clone()),
-            },
-            HttpRouteFilter::ResponseHeaderModifier { config } => Self::ResponseHeaderModifier {
-                add: std::sync::Arc::new(config.add.clone()),
-                set: std::sync::Arc::new(config.set.clone()),
-                remove: std::sync::Arc::new(config.remove.clone()),
-            },
+        filters.push(match f {
+            HttpRouteFilter::RequestHeaderModifier { config } => {
+                HttpFilter::RequestHeaderModifier {
+                    add: std::sync::Arc::new(config.add.clone()),
+                    set: std::sync::Arc::new(config.set.clone()),
+                    remove: std::sync::Arc::new(config.remove.clone()),
+                }
+            }
+            HttpRouteFilter::ResponseHeaderModifier { config } => {
+                HttpFilter::ResponseHeaderModifier {
+                    add: std::sync::Arc::new(config.add.clone()),
+                    set: std::sync::Arc::new(config.set.clone()),
+                    remove: std::sync::Arc::new(config.remove.clone()),
+                }
+            }
             HttpRouteFilter::RequestRedirect { config } => {
                 let path = config
                     .path
                     .as_ref()
                     .map(crate::routing::URLRewritePath::from);
-                Self::RequestRedirect {
+                HttpFilter::RequestRedirect {
                     // Accepted in any case, but the redirect builder compares
                     // against lowercase literals to drop default ports.
                     scheme: config.scheme.as_deref().map(str::to_ascii_lowercase),
@@ -668,7 +676,7 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                     status_code: config.status_code,
                 }
             }
-            HttpRouteFilter::URLRewrite { config } => Self::URLRewrite {
+            HttpRouteFilter::URLRewrite { config } => HttpFilter::URLRewrite {
                 hostname: config.hostname.clone(),
                 path: config
                     .path
@@ -676,11 +684,14 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                     .map(crate::routing::URLRewritePath::from),
             },
             HttpRouteFilter::RequestMirror { config } => {
-                let backend = crate::routing::Backend::with_weight(
-                    config.backend_ref.name.clone(),
-                    config.backend_ref.port,
-                    config.backend_ref.weight,
-                )?;
+                let target = &config.backend_ref;
+                // Mirrors go to one endpoint: the first address.
+                let Some(&backend_addr) = resolver
+                    .addrs(&target.name, target.port, "RequestMirror")?
+                    .and_then(<[_]>::first)
+                else {
+                    continue;
+                };
                 // Fraction takes precedence over percent per Gateway API spec.
                 // If neither is set, mirror 100% of requests.
                 let effective_percent = if let Some(ref frac) = config.fraction {
@@ -692,13 +703,14 @@ impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
                 } else {
                     config.percent.unwrap_or(100).min(100)
                 };
-                Self::RequestMirror {
-                    backend_addr: backend.socket_addr,
+                HttpFilter::RequestMirror {
+                    backend_addr,
                     mirror_percent: effective_percent,
                 }
             }
-        })
+        });
     }
+    Ok(filters)
 }
 
 impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
@@ -1386,5 +1398,128 @@ mod tests {
             "should have resolved ExternalName backend"
         );
         assert_eq!(rule.backends[0].socket_addr.port(), 443);
+    }
+
+    /// IP literals resolve to themselves, `multi.svc` to two pods, any other
+    /// name fails. Records every lookup.
+    fn fake_dns(
+        calls: &std::cell::RefCell<Vec<String>>,
+        name: &str,
+        port: u16,
+    ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+        calls.borrow_mut().push(format!("{name}:{port}"));
+        let ips: Vec<std::net::IpAddr> = match name.parse() {
+            Ok(ip) => vec![ip],
+            Err(_) if name == "multi.svc" => vec![[10, 0, 0, 1].into(), [10, 0, 0, 2].into()],
+            Err(_) => anyhow::bail!("NXDOMAIN"),
+        };
+        Ok(ips
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect())
+    }
+
+    fn build_with_fake_dns(
+        config: &PortailConfig,
+        policy: super::BuildPolicy,
+    ) -> (anyhow::Result<crate::routing::RouteTable>, Vec<String>) {
+        let calls = std::cell::RefCell::new(vec![]);
+        let built = config.build_route_table(policy, &mut |n, p| fake_dns(&calls, n, p));
+        (built, calls.into_inner())
+    }
+
+    /// Two listeners, two hostnames, two rules on one backend, plus TCP and
+    /// TLS routes on it.
+    fn shared_backend_config(http_backend: &str) -> PortailConfig {
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"a","protocol":"HTTP","port":8080}},
+                {{"name":"b","protocol":"HTTP","port":8081}},
+                {{"name":"t","protocol":"TCP","port":5432}},
+                {{"name":"p","protocol":"TLS","port":8443,"tls":{{"mode":"Passthrough"}}}}]}},
+            "httpRoutes": [{{
+                "parentRefs": [{{"name":"g","sectionName":"a"}},{{"name":"g","sectionName":"b"}}],
+                "hostnames": ["x.example.com","y.example.com"],
+                "rules": [
+                    {{"matches":[{{"path":{{"type":"PathPrefix","value":"/a"}}}}],"backendRefs":[{{"name":"{b}","port":80}}]}},
+                    {{"matches":[{{"path":{{"type":"PathPrefix","value":"/b"}}}}],"backendRefs":[{{"name":"multi.svc","port":80}}]}}
+                ]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],"rules":[{{"backendRefs":[{{"name":"multi.svc","port":80}}]}}]}}],
+            "tlsRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"p"}}],"hostnames":["s.example.com"],"rules":[{{"backendRefs":[{{"name":"multi.svc","port":80}}]}}]}}]
+        }}"#,
+            b = http_backend
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Strict used to look every backend up twice (a pre-check, then the
+    /// build), and the build once per rule x hostname x listener.
+    #[test]
+    fn each_backend_name_is_looked_up_once_per_build() {
+        let config = shared_backend_config("multi.svc");
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["multi.svc:80"]);
+        let rule = rt
+            .find_http_route("y.example.com", "GET", "/a", &[], "", 8081)
+            .unwrap();
+        assert_eq!(rule.backends.len(), 2);
+        assert_eq!(rt.find_tcp_backends(5432).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn strict_build_fails_on_a_dead_backend_lenient_skips_it() {
+        let config = shared_backend_config("dead.svc");
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let err = built.unwrap_err().to_string();
+        assert!(
+            err.starts_with("HTTP backend dead.svc:80 failed to resolve: NXDOMAIN"),
+            "{err}"
+        );
+        assert_eq!(calls, vec!["dead.svc:80"]);
+
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["dead.svc:80", "multi.svc:80"]);
+        let dead = rt
+            .find_http_route("x.example.com", "GET", "/a", &[], "", 8080)
+            .unwrap();
+        assert!(dead.backends.is_empty());
+        let live = rt
+            .find_http_route("x.example.com", "GET", "/b", &[], "", 8080)
+            .unwrap();
+        assert_eq!(live.backends.len(), 2);
+    }
+
+    /// A mirror DNS cannot resolve used to fail the whole lenient build, so
+    /// every route of the Gateway stopped updating.
+    #[test]
+    fn mirror_dns_miss_drops_the_mirror_and_keeps_the_route() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["m.example.com"],
+                "rules": [{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "filters":[{"type":"RequestMirror","requestMirror":{"backendRef":{"name":"dead.svc","port":9999}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+
+        let (built, _) = build_with_fake_dns(&config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        let rule = rt
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert_eq!(rule.backends.len(), 1);
+        assert!(rule.filters.is_empty(), "{:?}", rule.filters);
+
+        let (built, _) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let err = built.unwrap_err().to_string();
+        assert!(
+            err.starts_with("RequestMirror backend dead.svc:9999 failed to resolve"),
+            "{err}"
+        );
     }
 }
