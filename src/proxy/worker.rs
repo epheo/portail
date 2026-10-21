@@ -558,6 +558,10 @@ async fn serve_tls_connection(
     let _ = handle_connection(conn, peer, state).await;
 }
 
+/// A client connection's buffer: the largest request head, and the most
+/// a lingering close reads off. The h2 bridge's close reads off no more.
+pub(crate) const CLIENT_BUF: usize = 64 * 1024;
+
 pub(crate) async fn handle_connection(
     mut client: Connection,
     _peer: SocketAddr,
@@ -578,7 +582,7 @@ pub(crate) async fn handle_connection(
         return forward_to_tcp_route(client, &state).await;
     }
 
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; CLIENT_BUF];
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
     if let Ok(Handoff::Tcp { backend_addr, len }) = served {
         return handle_tcp_connection(
