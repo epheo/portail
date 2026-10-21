@@ -57,7 +57,9 @@ impl ListenerScope {
         }
     }
 
-    /// Look up an HTTP route within this listener scope.
+    /// Look up an HTTP route within this listener scope, with the
+    /// precedence of the route hostname it matched under, ranked as
+    /// [`Self::hostname_match_priority`] ranks a listener's.
     fn lookup_http_route<'a>(
         &'a self,
         host: &str,
@@ -65,7 +67,7 @@ impl ListenerScope {
         path: &str,
         header_data: &[u8],
         query_string: &str,
-    ) -> Option<&'a HttpRouteRule> {
+    ) -> Option<(u32, &'a HttpRouteRule)> {
         // Try exact host first
         if let Some(host_entry) = self.http_routes.get(host) {
             if let Some(rule) = RouteTable::find_best_rule_match(
@@ -75,7 +77,7 @@ impl ListenerScope {
                 header_data,
                 query_string,
             ) {
-                return Some(rule);
+                return Some((u32::MAX, rule));
             }
         }
 
@@ -90,7 +92,7 @@ impl ListenerScope {
                     header_data,
                     query_string,
                 ) {
-                    return Some(rule);
+                    return Some((1 + parent.len() as u32, rule));
                 }
             }
         }
@@ -104,7 +106,7 @@ impl ListenerScope {
                 header_data,
                 query_string,
             ) {
-                return Some(rule);
+                return Some((0, rule));
             }
         }
 
@@ -242,19 +244,29 @@ impl RouteTable {
         // Phase 2: Only search routes in scopes at the highest matching priority.
         // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
         // (priority 1), routes from the catch-all listener (priority 0) are excluded.
+        // A port holds one scope per listener hostname, and so do the shared
+        // scopes: only one of each can sit at the highest priority, and
+        // only that pair needs comparing.
+        let compare = !own.is_empty() && !shared.is_empty();
+        let mut best: Option<(u32, &HttpRouteRule)> = None;
         for scope in own.iter().chain(shared) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if priority < highest_priority {
                     continue;
                 }
-                if let Some(rule) =
+                if let Some(found) =
                     scope.lookup_http_route(host_key, method, path, header_data, query_string)
                 {
-                    return Some(rule);
+                    if !compare {
+                        return Some(found.1);
+                    }
+                    if best.is_none_or(|held| outranks(found, held)) {
+                        best = Some(found);
+                    }
                 }
             }
         }
-        None
+        best.map(|(_, rule)| rule)
     }
 
     /// Whether any HTTP route can match on `server_port`: its own scopes or
@@ -438,6 +450,18 @@ impl RouteTable {
     }
 }
 
+/// Whether `a` takes a request from `b`, both found for it with the
+/// precedence of the route hostname each matched under. Gateway API
+/// v1.4.1 HTTPRoute: the more specific hostname, then the more specific
+/// match (HTTPRouteRule.matches), then the earlier route.
+#[inline]
+fn outranks(a: (u32, &HttpRouteRule), b: (u32, &HttpRouteRule)) -> bool {
+    b.0.cmp(&a.0)
+        .then_with(|| build::match_precedence(a.1, b.1))
+        .then(a.1.route_index.cmp(&b.1.route_index))
+        .is_lt()
+}
+
 pub type HostEntry = Vec<HttpRouteRule>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -483,6 +507,11 @@ pub struct HttpRouteRule {
     /// like `requests`: table swaps re-attach the SAME limiter, so a
     /// throttled client stays throttled across reconciles and DNS refreshes.
     pub limiter: Option<Arc<crate::rate_limit::Limiter>>,
+    /// Its route's place among the config's HTTP routes, which come in
+    /// precedence order (oldest first in Kubernetes, file order otherwise).
+    /// Within a scope the stable sort keeps it; between a port's scope and
+    /// the shared one it breaks a tie.
+    pub route_index: u32,
 }
 
 impl HttpRouteRule {
@@ -514,6 +543,7 @@ impl HttpRouteRule {
             // counts into this unrendered cell.
             requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             limiter: None,
+            route_index: 0,
         }
     }
 

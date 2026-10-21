@@ -215,7 +215,7 @@ fn config_benchmark(c: &mut Criterion) {
     }
 
     // A route without parentRefs: one scope every HTTP port shares, found
-    // through the port-0 scopes and the table's set of HTTP ports.
+    // through the port's flag.
     let shared: portail::config::PortailConfig = serde_json::from_str(
         r#"{"gateway":{"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":443}]},
             "httpRoutes":[{"hostnames":["api.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/api"}}],"backendRefs":[{"name":"127.0.0.1","port":8080}]}]}]}"#,
@@ -224,6 +224,20 @@ fn config_benchmark(c: &mut Criterion) {
     let shared_table = shared.to_route_table().unwrap();
     c.bench_function("http_route_lookup_shared_scope", |b| {
         b.iter(|| lookup(&shared_table, "api.com", "/api/users"))
+    });
+
+    // The port's own scope and the shared one both match: each is
+    // searched, and the better match compared.
+    let both: portail::config::PortailConfig = serde_json::from_str(
+        r#"{"gateway":{"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":443}]},
+            "httpRoutes":[
+              {"parentRefs":[{"name":"g"}],"hostnames":["api.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"backendRefs":[{"name":"127.0.0.1","port":8080}]}]},
+              {"hostnames":["api.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/api"}}],"backendRefs":[{"name":"127.0.0.1","port":8081}]}]}]}"#,
+    )
+    .unwrap();
+    let both_table = both.to_route_table().unwrap();
+    c.bench_function("http_route_lookup_own_and_shared", |b| {
+        b.iter(|| lookup(&both_table, "api.com", "/api/users"))
     });
 
     // Control plane, not per request: one host's rules sort once per build.

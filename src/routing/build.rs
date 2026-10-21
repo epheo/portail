@@ -208,51 +208,7 @@ impl RouteTable {
     }
 
     fn sort_rules(rules: &mut [HttpRouteRule]) {
-        // Sort by specificity (most specific first):
-        // 1. Method presence (rules with method match first)
-        // 2. Path type: exact > regex > prefix
-        // 3. Path length (longer first)
-        // 4. Header matcher count (more matchers = higher priority)
-        // 5. Query param matcher count (more matchers = higher priority)
-        rules.sort_by(|a, b| {
-            // 1. Path match type: exact > regex > prefix
-            fn rank(t: &PathMatchType) -> u8 {
-                match t {
-                    PathMatchType::Exact => 0,
-                    PathMatchType::RegularExpression => 1,
-                    PathMatchType::Prefix => 2,
-                }
-            }
-            let r = rank(&a.path_match_type).cmp(&rank(&b.path_match_type));
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
-
-            // 2. Path length (longer = more specific = higher priority)
-            let r = b.path.len().cmp(&a.path.len());
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
-
-            // 3. Method match presence (rules with method > rules without)
-            let am = a.method_match.is_some() as u8;
-            let bm = b.method_match.is_some() as u8;
-            let r = bm.cmp(&am);
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
-
-            // 4. Header matcher count (more matchers = higher priority)
-            let r = b.header_matches.len().cmp(&a.header_matches.len());
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
-
-            // 5. Query param matcher count
-            b.query_param_matches
-                .len()
-                .cmp(&a.query_param_matches.len())
-        });
+        rules.sort_by(match_precedence);
     }
 
     /// The first registration of a port wins and later ones return false:
@@ -311,6 +267,30 @@ impl RouteTable {
         };
         insert_first(by_host, host_key, backends)
     }
+}
+
+/// Which of two rules matching one request takes it, most specific first:
+/// Exact path, then regex, then prefix; the longer path; a method match;
+/// more header matches; more query param matches. `Equal` leaves the tie
+/// to route order.
+pub(super) fn match_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp::Ordering {
+    fn rank(t: &PathMatchType) -> u8 {
+        match t {
+            PathMatchType::Exact => 0,
+            PathMatchType::RegularExpression => 1,
+            PathMatchType::Prefix => 2,
+        }
+    }
+    rank(&a.path_match_type)
+        .cmp(&rank(&b.path_match_type))
+        .then_with(|| b.path.len().cmp(&a.path.len()))
+        .then_with(|| b.method_match.is_some().cmp(&a.method_match.is_some()))
+        .then_with(|| b.header_matches.len().cmp(&a.header_matches.len()))
+        .then_with(|| {
+            b.query_param_matches
+                .len()
+                .cmp(&a.query_param_matches.len())
+        })
 }
 
 fn insert_first<K: std::hash::Hash + Eq>(

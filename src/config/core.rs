@@ -383,6 +383,7 @@ impl PortailConfig {
                         // as when every insert compiled its own rule.
                         routing_rule.counter = Default::default();
                         routing_rule.limiter = limiter.clone();
+                        routing_rule.route_index = route_idx as u32;
                         tracing::debug!(
                             "      Adding route: {} {} -> {} backends (listener {}:{:?})",
                             hostname,
@@ -881,6 +882,54 @@ mod tests {
                 .find_http_route("a.example.com", "GET", "/", &[], "", port)
                 .is_none());
         }
+    }
+
+    /// A route without parentRefs competes with a port's own routes by
+    /// precedence, as one route table would: the more specific hostname,
+    /// then the more specific match, then the earlier route. The port's
+    /// own scope was searched first, whole: its PathPrefix / took /api
+    /// from an Exact /api, and its wildcard host an exact one.
+    #[test]
+    fn a_route_without_parent_refs_competes_by_precedence() {
+        let route = |parent: bool, host: &str, kind: &str, path: &str, port: u16| {
+            let parent_refs = if parent { r#"[{"name": "g"}]"# } else { "[]" };
+            format!(
+                r#"{{"parentRefs": {parent_refs}, "hostnames": ["{host}"],
+                    "rules": [{{"matches": [{{"path": {{"type": "{kind}", "value": "{path}"}}}}],
+                        "backendRefs": [{{"name": "127.0.0.1", "port": {port}}}]}}]}}"#
+            )
+        };
+        let routes = [
+            route(true, "a.example.com", "PathPrefix", "/", 7001),
+            route(false, "a.example.com", "Exact", "/api", 7002),
+            route(true, "*.example.com", "Exact", "/api/v1", 7003),
+            route(false, "b.example.com", "PathPrefix", "/", 7004),
+            route(false, "c.example.com", "PathPrefix", "/", 7005),
+            route(true, "c.example.com", "PathPrefix", "/", 7006),
+            route(true, "d.example.com", "PathPrefix", "/", 7007),
+            route(false, "d.example.com", "PathPrefix", "/", 7008),
+        ];
+        let json = format!(
+            r#"{{"gateway": {{"name": "g", "listeners": [{{"name": "web", "protocol": "HTTP", "port": 8080}}]}},
+                "httpRoutes": [{}]}}"#,
+            routes.join(",")
+        );
+        let config: PortailConfig = serde_json::from_str(&json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let backend = |host, path| {
+            rt.find_http_route(host, "GET", path, &[], "", 8080)
+                .map(|rule| rule.backends[0].socket_addr.port())
+        };
+        assert_eq!(backend("a.example.com", "/api"), Some(7002), "Exact first");
+        assert_eq!(backend("a.example.com", "/other"), Some(7001));
+        assert_eq!(
+            backend("b.example.com", "/api/v1"),
+            Some(7004),
+            "exact host"
+        );
+        assert_eq!(backend("x.example.com", "/api/v1"), Some(7003));
+        assert_eq!(backend("c.example.com", "/"), Some(7005), "earlier route");
+        assert_eq!(backend("d.example.com", "/"), Some(7007), "earlier route");
     }
 
     /// TLSRoute.hostnames: "any TLSRoute hostnames that do not match the

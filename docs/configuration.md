@@ -191,6 +191,7 @@ Standalone mode:
 - An HTTP route attaches to HTTP and HTTPS listeners only: on a TCP port it would hold back server-speaks-first clients.
 - A TCP route can also attach to a TLS listener, as the fallback for passthrough connections no TLS route matches.
 - Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
+- An HTTP route without parentRefs (a config built without validation) serves every HTTP and HTTPS port, ranked with the routes of the port's listener without a hostname: the more specific hostname, then the more specific match, then the first in the file.
 - TCP and UDP routes use their first rule only.
 - Listeners on one port share its routes, whatever address each binds: HTTP, TCP, and HTTPS with TLS are three families, and two families on one port fail the load (`Protocol conflict`).
 
