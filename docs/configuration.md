@@ -181,6 +181,39 @@ Standalone mode:
 - Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
 - TCP and UDP routes use their first rule only.
 
+## HTTPRoute Rules
+
+Kubernetes HTTPRoutes and the `httpRoutes` of a config file are checked by the same rules.
+
+Matching:
+
+- `RegularExpression` path, header and query matches use the Rust `regex` crate syntax (RE2-like: no look-around, no backreferences).
+- A regex must match the whole value: path regex `/api` matches `/api`, not `/static/api/x`.
+- `PathPrefix` ignores a trailing `/`: `/abc/` matches `/abc`, `/abc/` and `/abc/def`, not `/abcd`.
+- A rule with no `matches`, or `matches: []`, matches every request, like `PathPrefix /`.
+
+Filters:
+
+- Only `RequestMirror` may appear more than once in one filter list.
+- `RequestRedirect` and `URLRewrite` cannot share a rule.
+- A `URLRewrite` hostname and a `RequestHeaderModifier` that sets `Host` cannot share a rule.
+- `ReplacePrefixMatch` needs every match of its rule to be a `PathPrefix`.
+- A backendRef filter must be a `RequestHeaderModifier` or `ResponseHeaderModifier`.
+- `RequestMirror` keeps its share exact: `fraction: {numerator: 1, denominator: 1000}` mirrors one request in a thousand.
+- `percent` must be 0 to 100; a `fraction` needs a denominator of at least 1 and a numerator no larger.
+
+A route that breaks one of these rules:
+
+- Kubernetes: it is rejected alone, `Accepted=False`, and every other route keeps serving.
+- The reason is `UnsupportedValue` for a value portail cannot apply, `IncompatibleFilters` for filters that cannot share a rule.
+- Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
+
+A backend or mirror name DNS cannot resolve:
+
+- Kubernetes: the backend is left out and its share goes to the other backends; a mirror is dropped.
+- The DNS refresh (`dnsRefreshInterval`) brings it back once it resolves.
+- Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
+
 ## Performance Options
 
 The `performance` block of a config file (all durations accept `"30s"`-style
