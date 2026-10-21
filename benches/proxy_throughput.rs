@@ -8,6 +8,13 @@
 //!   - `portail` binary built (cargo build --release)
 //!
 //! Run with: cargo bench --bench proxy_throughput
+//!
+//! Environment:
+//!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
+//!     nf1 nf4 f1 f4 pool4 churn_direct churn_conn churn_proc
+//!   - `PT_SECS`: seconds per scenario, 10 by default
+//!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
+//!     (target/release, then target/debug)
 
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
@@ -24,7 +31,7 @@ use rewrk_core::{
 const CONCURRENCY: usize = 64;
 const NUM_WORKERS: usize = 4;
 const REQUESTS_PER_BATCH: usize = 500;
-const BENCH_DURATION: Duration = Duration::from_secs(10);
+const DEFAULT_BENCH_SECS: u64 = 10;
 
 const PORTAIL_PORT: u16 = 29_100;
 const PORTAIL_FILTER_PORT: u16 = 29_200;
@@ -51,7 +58,7 @@ fn main() {
         let backend_ports: Vec<u16> = (0..NUM_BACKENDS).map(|i| KISS_BASE_PORT + i).collect();
 
         // Baseline: direct to kiss (no proxy)
-        {
+        if selected("direct") {
             println!("--- Direct to kiss (baseline, no proxy) ---");
             run_bench(KISS_BASE_PORT, "/bench.txt").await;
         }
@@ -59,7 +66,7 @@ fn main() {
         println!();
 
         // Scenario 1: No filters, single backend
-        {
+        if selected("nf1") {
             let proxy = spawn_portail_no_filters(&backend_ports[..1], PORTAIL_PORT);
             println!("--- No-filter path (1 backend) ---");
             run_bench(PORTAIL_PORT, "/bench.txt").await;
@@ -69,7 +76,7 @@ fn main() {
         println!();
 
         // Scenario 2: No filters, multiple backends
-        {
+        if selected("nf4") {
             let proxy = spawn_portail_no_filters(&backend_ports, PORTAIL_PORT);
             println!("--- No-filter path ({} backends) ---", NUM_BACKENDS);
             run_bench(PORTAIL_PORT, "/bench.txt").await;
@@ -79,7 +86,7 @@ fn main() {
         println!();
 
         // Scenario 3: With filters, single backend
-        {
+        if selected("f1") {
             let proxy = spawn_portail_with_filters(&backend_ports[..1], PORTAIL_FILTER_PORT);
             println!("--- Filter path (1 backend) ---");
             run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
@@ -89,7 +96,7 @@ fn main() {
         println!();
 
         // Scenario 4: With filters, multiple backends
-        {
+        if selected("f4") {
             let proxy = spawn_portail_with_filters(&backend_ports, PORTAIL_FILTER_PORT);
             println!("--- Filter path ({} backends) ---", NUM_BACKENDS);
             run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
@@ -101,7 +108,7 @@ fn main() {
         // Scenario 5: keepalive load with the process-wide pool — the
         // contention guard. Compare against scenario 2: same load, pool
         // scope is the only variable.
-        {
+        if selected("pool4") {
             let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "process");
             println!(
                 "--- No-filter path ({} backends), process-wide pool ---",
@@ -119,14 +126,14 @@ fn main() {
         // with churn, a per-connection pool gets zero backend reuse (every
         // request pays a fresh backend connect), while the process-wide pool
         // still reuses idle backend conns across client connections.
-        {
+        if selected("churn_direct") {
             println!("--- Churn: direct to kiss (baseline) ---");
             run_churn_bench(KISS_BASE_PORT, "/bench.txt").await;
         }
 
         println!();
 
-        {
+        if selected("churn_conn") {
             let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "connection");
             println!(
                 "--- Churn: proxy, per-connection pool ({} backends) ---",
@@ -138,7 +145,7 @@ fn main() {
 
         println!();
 
-        {
+        if selected("churn_proc") {
             let proxy = spawn_portail_pool(&backend_ports, PORTAIL_PORT, "process");
             println!(
                 "--- Churn: proxy, process-wide pool ({} backends) ---",
@@ -161,7 +168,7 @@ async fn run_bench(port: u16, path: &str) {
         .build()
         .unwrap();
 
-    let producer = BenchProducer::new(path, BENCH_DURATION);
+    let producer = BenchProducer::new(path, bench_duration());
     let collector = BenchCollector::default();
 
     let mut benchmarker =
@@ -179,9 +186,20 @@ async fn run_bench(port: u16, path: &str) {
     collector.print_results(wall_elapsed);
 }
 
+/// Whether `PT_ONLY` leaves `scenario` in.
+fn selected(scenario: &str) -> bool {
+    std::env::var("PT_ONLY").map_or(true, |only| only.split(',').any(|s| s == scenario))
+}
+
+/// How long each scenario runs: `PT_SECS`, else `DEFAULT_BENCH_SECS`.
+fn bench_duration() -> Duration {
+    let secs = std::env::var("PT_SECS").ok().and_then(|s| s.parse().ok());
+    Duration::from_secs(secs.unwrap_or(DEFAULT_BENCH_SECS))
+}
+
 /// Connection-churn load: N tasks each looping connect → one GET → read the
 /// full response (Content-Length-framed) → close silently, for
-/// BENCH_DURATION. Hand-rolled because rewrk-core keeps its client
+/// `bench_duration()`. Hand-rolled because rewrk-core keeps its client
 /// connections alive.
 ///
 /// Deliberately does NOT send `Connection: close`: the proxy forwards the
@@ -193,7 +211,7 @@ async fn run_churn_bench(port: u16, path: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CHURN_CONCURRENCY: usize = 64;
-    let deadline = Instant::now() + BENCH_DURATION;
+    let deadline = Instant::now() + bench_duration();
     let request = std::sync::Arc::new(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path));
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -481,6 +499,9 @@ fn spawn_portail_with_config(config: &str, port: u16) -> ProcessHandle {
 }
 
 fn portail_binary_path() -> PathBuf {
+    if let Some(binary) = std::env::var_os("PORTAIL_BIN") {
+        return PathBuf::from(binary);
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let release = root.join("target/release/portail");
     if release.exists() {
