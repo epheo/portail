@@ -674,7 +674,45 @@ impl PortailProcess {
         Self::spawn_config_args(config, proxy_port, &[])
     }
 
+    /// Spawn with at most `limit` open fds, soft and hard: portail raises
+    /// only the soft limit, so this one holds.
+    pub fn spawn_with_fd_limit(
+        routes: &[(&str, &str, SocketAddr)],
+        proxy_port: u16,
+        limit: u64,
+        extra_args: &[&str],
+    ) -> Self {
+        let config = build_test_config_with_tcp(routes, proxy_port, &[]);
+        Self::spawn_config_limited(config, proxy_port, extra_args, Some(limit))
+    }
+
+    /// CPU time the process has used so far, user and system.
+    pub fn cpu_time(&self) -> Duration {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.child.id()))
+            .expect("read /proc stat");
+        // Fields after the parenthesized command name, which may hold spaces.
+        let fields: Vec<&str> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        // SAFETY: sysconf only reads a configuration value.
+        let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        Duration::from_millis(ticks * 1000 / per_second)
+    }
+
     fn spawn_config_args(config: String, proxy_port: u16, extra_args: &[&str]) -> Self {
+        Self::spawn_config_limited(config, proxy_port, extra_args, None)
+    }
+
+    fn spawn_config_limited(
+        config: String,
+        proxy_port: u16,
+        extra_args: &[&str],
+        fd_limit: Option<u64>,
+    ) -> Self {
         let config_file = tempfile::Builder::new()
             .suffix(".json")
             .tempfile()
@@ -689,8 +727,17 @@ impl PortailProcess {
                 .args(extra_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .pre_exec(|| {
+                .pre_exec(move || {
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    if let Some(limit) = fd_limit {
+                        let lim = libc::rlimit {
+                            rlim_cur: limit,
+                            rlim_max: limit,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                     Ok(())
                 })
                 .spawn()
