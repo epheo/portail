@@ -2055,7 +2055,7 @@ const LINGER_IDLE: Duration = Duration::from_secs(5);
 /// announces the close, and the process exits well inside the 30s drain
 /// window instead of waiting out the idle clients. A client that keeps its
 /// socket open after the close, as urllib3 and HttpURLConnection pools do,
-/// holds the drain for LINGER_IDLE at most.
+/// holds the drain for LINGER_IDLE at most, and is never reset.
 #[test]
 fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
     let (backend, arrived) = spawn_slow_backend(Duration::from_secs(1));
@@ -2096,13 +2096,15 @@ fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
         sigterm.elapsed()
     );
 
-    let mut response = Vec::new();
-    busy.read_to_end(&mut response)
-        .expect("in-flight connection not closed after its response");
+    let response = read_one_response(&mut busy).expect("in-flight response cut short");
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
     assert!(response.ends_with("\r\n\r\nok"), "{response}");
+    let mut rest = Vec::new();
+    busy.read_to_end(&mut rest)
+        .expect("in-flight connection not closed cleanly after its response");
+    assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
 
     // `busy` stays open. Slack covers the drain's 500ms poll and the exit.
     let slack = Duration::from_secs(3);
@@ -2110,5 +2112,10 @@ fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
         .wait_exit(LINGER_IDLE + slack)
         .expect("a client keeping its socket open held the drain");
     assert!(status.success(), "{status}");
+    // A reset after the close, once its EOF was read, shows only here.
+    assert!(
+        busy.take_error().unwrap().is_none(),
+        "in-flight connection reset"
+    );
     drop(busy);
 }
