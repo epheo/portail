@@ -16,7 +16,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::converters::CertData;
-use crate::kubernetes::reconciler::listener_conflicts;
+use crate::kubernetes::reconciler::{listener_conflicts, listener_is_served};
 use crate::kubernetes::reference_grants::is_reference_allowed;
 use crate::kubernetes::status;
 use crate::logging::warn;
@@ -178,6 +178,14 @@ pub(super) fn validate_gateway(
             ls.accepted = false;
             ls.accepted_reason = "UnsupportedProtocol".into();
             ls.accepted_message = format!("Protocol '{}' is not supported", listener.protocol);
+        } else if !listener_is_served(listener) {
+            // The reason GRPCRoute gives a listener whose protocol variant
+            // the implementation cannot serve.
+            ls.accepted = false;
+            ls.accepted_reason = "UnsupportedProtocol".into();
+            ls.accepted_message =
+                "TLS listeners are served in Passthrough mode only; an HTTPS listener terminates"
+                    .into();
         } else if let Some(&reason) = conflicts.get(listener.name.as_str()) {
             let message = if reason == "ProtocolConflict" {
                 "Listener port shared with another listener using different protocol"
@@ -676,5 +684,45 @@ mod tests {
             assert!(listeners[name].conflicted, "{name}");
         }
         assert_eq!(listeners["plain"].conflicted_reason, "ProtocolConflict");
+    }
+
+    /// The data plane serves a TLS listener in Passthrough mode only: a
+    /// Terminate one was Accepted and Programmed, its TLSRoutes forwarded
+    /// raw, and it shared its port with HTTPS as one family. It is rejected
+    /// alone and takes no part in conflicts, like an unsupported TCP
+    /// listener (GatewaySpec.listeners).
+    #[test]
+    fn a_tls_terminate_listener_is_rejected_alone() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners[0].name = "web".into();
+        gw.spec.listeners[0].hostname = Some("web.example.com".into());
+        let terminate = GatewayListeners {
+            tls: Some(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Terminate),
+                certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                    name: "unused".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..listener("db", 443, "TLS", Some("web.example.com"))
+        };
+        gw.spec.listeners.push(terminate);
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        let db = &listeners["db"];
+        assert!(!db.accepted && !db.programmed && !db.conflicted);
+        assert_eq!(db.accepted_reason, "UnsupportedProtocol");
+        assert!(
+            db.accepted_message.contains("Passthrough"),
+            "{}",
+            db.accepted_message
+        );
+        let web = &listeners["web"];
+        assert!(web.accepted && !web.conflicted);
+        assert!(gw_cond.ok);
     }
 }

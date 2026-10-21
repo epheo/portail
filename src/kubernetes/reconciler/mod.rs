@@ -5,7 +5,7 @@ use std::sync::Arc;
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
-use gateway_api::gateways::{Gateway, GatewayListeners};
+use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::httproutes::*;
 use gateway_api::referencegrants::ReferenceGrant;
 
@@ -588,8 +588,11 @@ mod policy_tests {
 /// API, Listener: listeners sharing a port need distinct protocols, or
 /// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
 /// indistinct listeners are rejected: the spec forbids picking a winner.
-/// HTTPS and TLS are one family here: one socket serves both, told apart
-/// by SNI, so only their hostnames must differ.
+/// HTTPS and TLS passthrough are one family here: one socket serves both,
+/// told apart by SNI, so only their hostnames must differ. A listener the
+/// data plane does not serve conflicts with none: it is rejected alone, as
+/// GatewaySpec.listeners has it for TCP listeners an implementation does
+/// not support ("the previous rule does not apply").
 pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
     fn family(protocol: &str) -> &str {
         match protocol {
@@ -597,9 +600,11 @@ pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str
             other => other,
         }
     }
+    let served: Vec<&GatewayListeners> =
+        listeners.iter().filter(|l| listener_is_served(l)).collect();
     let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
-    for (i, a) in listeners.iter().enumerate() {
-        for b in listeners[i + 1..].iter().filter(|b| b.port == a.port) {
+    for (i, a) in served.iter().enumerate() {
+        for b in served[i + 1..].iter().filter(|b| b.port == a.port) {
             let reason = if family(&a.protocol) != family(&b.protocol) {
                 "ProtocolConflict"
             } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
@@ -616,6 +621,20 @@ pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str
         }
     }
     conflicts
+}
+
+/// Whether the data plane serves this listener: a protocol it runs, and a
+/// TLS listener in Passthrough mode only. TLSRoute is served as passthrough
+/// alone; an HTTPS listener terminates.
+pub(crate) fn listener_is_served(l: &GatewayListeners) -> bool {
+    match l.protocol.as_str() {
+        "HTTP" | "HTTPS" | "TCP" | "UDP" => true,
+        "TLS" => l
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.mode == Some(GatewayListenersTlsMode::Passthrough)),
+        _ => false,
+    }
 }
 
 /// published listener port -> Service `targetPort` for the Service fronting this

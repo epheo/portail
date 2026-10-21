@@ -178,6 +178,8 @@ Kubernetes mode:
 - A parentRef without `namespace` names a Gateway in the route's own namespace.
 - A `Conflicted` listener, not distinct from another on its port, is not served: nothing binds, no route attaches, and a parentRef naming it reports `NoMatchingParent`.
 - HTTPS and TLS listeners can share a port if their hostnames differ: one socket serves both, by SNI. Any other two protocols on one port are `ProtocolConflict`.
+- A TLS listener is served in `Passthrough` mode only: TLSRoute is passthrough here, and an HTTPS listener terminates. A TLS listener in `Terminate` mode reports `Accepted=False` with reason `UnsupportedProtocol`, binds nothing and takes no route.
+- A listener portail does not serve (an unsupported protocol, TLS `Terminate`) conflicts with no other: it is rejected alone.
 - Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
 - A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
 - TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.

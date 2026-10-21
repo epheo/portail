@@ -19,8 +19,11 @@ pub(crate) fn is_route_allowed_by_listener(
     route_kind: &str,
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
 ) -> bool {
-    // The listener protocol decides the route kinds it takes. A protocol the
-    // data plane cannot run takes none (its supportedKinds is empty).
+    // The listener protocol decides the route kinds it takes. A listener the
+    // data plane cannot run takes none.
+    if !super::reconciler::listener_is_served(listener) {
+        return false;
+    }
     let protocol_allows = match listener.protocol.as_str() {
         "HTTP" | "HTTPS" => route_kind == "HTTPRoute",
         "TLS" => route_kind == "TLSRoute",

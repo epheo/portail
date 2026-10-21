@@ -90,6 +90,9 @@ fn convert_listener(
         "UDP" => Protocol::UDP,
         other => return Err(anyhow!("unsupported listener protocol: {}", other)),
     };
+    if !super::reconciler::listener_is_served(l) {
+        return Err(anyhow!("TLS listener not in Passthrough mode"));
+    }
 
     let tls = l.tls.as_ref().map(|t| {
         let mode = match t.mode {

@@ -3463,6 +3463,90 @@ fn https_and_tls_passthrough_share_a_port() {
     assert!(!table.has_tls_passthrough_route("app.example.com", 443));
 }
 
+/// `default/name`, on listener `section` of `default/gw`, for `hostname`,
+/// to 127.0.0.1:`port`.
+fn tls_route_on(name: &str, section: &str, hostname: &str, port: i32) -> TLSRoute {
+    TLSRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                section_name: Some(section.to_string()),
+                ..Default::default()
+            }]),
+            hostnames: vec![hostname.to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+/// TLSRoute is served as passthrough only. A TLS Terminate listener was
+/// converted and bound, and its TLSRoutes forwarded raw TLS, never
+/// terminated; it also shared its port with HTTPS as one family. It is
+/// not served now: nothing attaches to it, and its HTTPS sibling stays.
+#[test]
+fn a_tls_terminate_listener_is_not_served() {
+    let mut https = gw_listener("web", 443, "HTTPS");
+    https.hostname = Some("app.example.com".to_string());
+    https.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Terminate),
+        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+            name: "cert".to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    let mut terminate = https.clone();
+    terminate.name = "db".to_string();
+    terminate.protocol = "TLS".to_string();
+    terminate.hostname = Some("secure.example.com".to_string());
+    let gw = attach_gateway(vec![terminate, https]);
+    let app = app_route(
+        "app",
+        "default",
+        vec![http_parent(None, Some("web"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let tls = tls_route_on("secure", "db", "secure.example.com", 7001);
+    let snapshot = test_snapshot(
+        vec![app],
+        vec![],
+        vec![tls],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot);
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["web"]);
+    assert!(status_of(&result, "app").accepted);
+    let secure = status_of(&result, "secure");
+    assert!(!secure.accepted);
+    assert_eq!(secure.accepted_reason, "NotAllowedByListeners");
+    assert!(app_served_on(&table, 443));
+    assert!(result.config.tls_routes.is_empty());
+}
+
 /// config-routing #7: every rule overwrote the previous one on the same
 /// port. TCPRoute rules have no match to choose between, so the first rule
 /// takes the listener, as ties go to the first rule (HTTPRouteRule.matches).
