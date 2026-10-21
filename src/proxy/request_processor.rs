@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use crate::logging::{debug, error};
 use crate::metrics::METRICS;
+use crate::proxy::backend_pool::LogThrottle;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::{extract_routing_info, normalize_path, HttpRequestInfo};
 use crate::proxy::method::{is_idempotent, method_len};
@@ -451,35 +452,33 @@ fn analyze_l4_request<'a>(
     make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
-    let Some(backend_list) = lookup(server_port) else {
-        error!(
-            "{} routing failed for port {}: no route configured",
-            proto, server_port
-        );
-        return Ok(RoutingResult::CloseConnection);
+    static NO_ROUTE: LogThrottle = LogThrottle::new();
+    static NO_BACKENDS: LogThrottle = LogThrottle::new();
+    static NO_WEIGHT: LogThrottle = LogThrottle::new();
+    let unroutable = |throttle: &LogThrottle, condition: &str| {
+        if let Some(suppressed) = throttle.admit_now() {
+            error!(
+                "{} routing failed for port {}: {}; {} similar suppressed",
+                proto, server_port, condition, suppressed
+            );
+        }
+        Ok(RoutingResult::CloseConnection)
     };
 
+    let Some(backend_list) = lookup(server_port) else {
+        return unroutable(&NO_ROUTE, "no route configured");
+    };
     if backend_list.is_empty() {
-        error!(
-            "{} routing failed for port {}: no backends available",
-            proto, server_port
-        );
-        return Ok(RoutingResult::CloseConnection);
+        return unroutable(&NO_BACKENDS, "no backends available");
     }
 
     // Weighted round-robin among healthy backends, honoring per-backendRef
     // weights (weight 0 = no traffic, per Gateway API semantics).
-    let selected_backend =
-        match backend_selector.select_l4_backend(server_port as u64, backend_list, health) {
-            Some(b) => b,
-            None => {
-                error!(
-                    "{} routing: no healthy backend with positive weight for port {}",
-                    proto, server_port
-                );
-                return Ok(RoutingResult::CloseConnection);
-            }
-        };
+    let Some(selected_backend) =
+        backend_selector.select_l4_backend(server_port as u64, backend_list, health)
+    else {
+        return unroutable(&NO_WEIGHT, "no backend with positive weight");
+    };
     if selected_backend.action == BackendAction::Reject {
         debug!(
             "{} routing: port {} picked an invalid backendRef's share; rejecting",
@@ -1335,6 +1334,38 @@ mod tests {
         ] {
             let text = String::from_utf8_lossy(req);
             assert_eq!(client_done(req), want, "{text}");
+        }
+    }
+
+    /// A UDP port with no route, or none to forward to, meets it once per
+    /// datagram, and a spoofed flood sends those at packet rate: one line
+    /// per window names each condition.
+    #[test]
+    fn an_unroutable_l4_port_logs_once_per_window() {
+        use crate::proxy::test_util::{in_own_process, Captured};
+        if !in_own_process(module_path!(), "an_unroutable_l4_port_logs_once_per_window") {
+            return;
+        }
+        let (log, _subscriber) = Captured::warnings();
+        let mut rt = RouteTable::new();
+        rt.add_udp_route(5354, vec![]);
+        let mut weightless = Backend::new("127.0.0.1".to_string(), 53).unwrap();
+        weightless.weight = 0;
+        rt.add_udp_route(5355, vec![weightless]);
+        let sel = BackendSelector::new();
+        for _ in 0..100 {
+            for port in [5353, 5354, 5355] {
+                let routed = analyze_udp_request(&rt, &sel, port, &health()).unwrap();
+                assert!(matches!(routed, RoutingResult::CloseConnection));
+            }
+        }
+        let log = log.text();
+        for condition in [
+            "port 5353: no route configured",
+            "port 5354: no backends available",
+            "port 5355: no backend with positive weight",
+        ] {
+            assert_eq!(log.matches(condition).count(), 1, "{log}");
         }
     }
 
