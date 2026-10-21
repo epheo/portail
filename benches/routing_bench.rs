@@ -63,6 +63,28 @@ fn routing_benchmark(c: &mut Criterion) {
     }
     group.finish();
 
+    // What a 404 flood repeats: a host no listener serves, and a served
+    // host's unrouted path.
+    let mut miss_group = c.benchmark_group("route_miss");
+    for (name, host, path) in [
+        ("unknown_host", "nope.example.com", "/api/users"),
+        ("unrouted_path", "host50.example.com", "/admin"),
+    ] {
+        miss_group.bench_function(name, |b| {
+            b.iter(|| {
+                std::hint::black_box(std::hint::black_box(&small_table).find_http_route(
+                    std::hint::black_box(host),
+                    "GET",
+                    std::hint::black_box(path),
+                    &[],
+                    "",
+                    std::hint::black_box(443),
+                ))
+            })
+        });
+    }
+    miss_group.finish();
+
     let mut complex_table = RouteTable::new();
 
     for path in ["/", "/api", "/api/v1", "/api/v1/users", "/api/v2"] {

@@ -18,9 +18,8 @@ fn test_bench_config_route_lookup() {
     //   Path: /bench.txt
     //   server_port: 29100
     let result = rt.find_http_route("127.0.0.1", "GET", "/bench.txt", &[], "", 29100);
-    println!("Route lookup: {:?}", result.is_ok());
-    if let Err(ref e) = result {
-        println!("Error: {}", e);
+    println!("Route lookup: {:?}", result.is_some());
+    if result.is_none() {
         // Print route table state
         println!(
             "Listener scopes: {:?}",
@@ -39,7 +38,7 @@ fn test_bench_config_route_lookup() {
         }
     }
     assert!(
-        result.is_ok(),
+        result.is_some(),
         "Route lookup failed — this is the benchmark 404 bug"
     );
 }

@@ -163,7 +163,7 @@ fn test_wildcard_host_matching() {
 
     assert!(rt
         .find_http_route("example.org", "GET", "/", &[], "", 0)
-        .is_err());
+        .is_none());
 }
 
 #[test]

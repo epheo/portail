@@ -2252,7 +2252,7 @@ fn test_reconcile_to_route_table_http() {
 
     assert!(rt
         .find_http_route("other.com", "GET", "/api", &[], "", 8080)
-        .is_err());
+        .is_none());
 }
 
 #[test]
@@ -2778,7 +2778,7 @@ fn from_all_namespaces() -> Option<GatewayListenersAllowedRoutes> {
 fn app_served_on(table: &RouteTable, port: u16) -> bool {
     table
         .find_http_route("app.example.com", "GET", "/", &[], "", port)
-        .is_ok()
+        .is_some()
 }
 
 fn status_of<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance {

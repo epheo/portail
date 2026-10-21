@@ -135,6 +135,9 @@ impl RouteTable {
     /// 1. Find all listener scopes matching the server port
     /// 2. Among those, find scopes matching the Host header (exact > wildcard > catch-all)
     /// 3. Within the best-matching scope, look up the route rule
+    ///
+    /// A miss is a 404 any client can send on every request, so it carries
+    /// nothing: a formatted error allocated per request in a 404 flood.
     #[inline(always)]
     pub fn find_http_route<'a>(
         &'a self,
@@ -144,7 +147,7 @@ impl RouteTable {
         header_data: &[u8],
         query_string: &str,
         server_port: u16,
-    ) -> Result<&'a HttpRouteRule> {
+    ) -> Option<&'a HttpRouteRule> {
         // Normalize host to lowercase
         let host_bytes = host.as_bytes();
         let needs_lowercase = host_bytes.iter().any(|b| b.is_ascii_uppercase());
@@ -188,17 +191,7 @@ impl RouteTable {
             }
         }
 
-        let highest_priority = match highest_priority {
-            Some(p) => p,
-            None => {
-                return Err(anyhow!(
-                    "No HTTP route found for host={} path={} port={}",
-                    host_key,
-                    path,
-                    server_port
-                ))
-            }
-        };
+        let highest_priority = highest_priority?;
 
         // Phase 2: Only search routes in scopes at the highest matching priority.
         // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
@@ -215,17 +208,11 @@ impl RouteTable {
                 if let Some(rule) =
                     scope.lookup_http_route(host_key, method, path, header_data, query_string)
                 {
-                    return Ok(rule);
+                    return Some(rule);
                 }
             }
         }
-
-        Err(anyhow!(
-            "No HTTP route found for host={} path={} port={}",
-            host_key,
-            path,
-            server_port
-        ))
+        None
     }
 
     /// Whether any HTTP route can match on `server_port`: its own scopes or

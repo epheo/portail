@@ -226,16 +226,15 @@ fn analyze_http_request<'a>(
         }))
     };
 
-    let rule = match routes.find_http_route(
+    let Some(rule) = routes.find_http_route(
         request_info.host,
         request_info.method,
         request_info.path,
         request_info.header_data,
         request_info.query_string,
         server_port,
-    ) {
-        Ok(rule) => rule,
-        Err(_) => return reply(404, None),
+    ) else {
+        return reply(404, None);
     };
 
     // Check for redirect filters FIRST — redirect rules often have no backends,
