@@ -196,7 +196,7 @@ impl PerformanceConfig {
         if self.udp_session_timeout.is_zero() {
             return Err(anyhow!("udpSessionTimeout must be greater than 0"));
         }
-        if self.udp_max_sessions == 0 {
+        if self.udp_max_sessions == Some(0) {
             return Err(anyhow!("udpMaxSessions must be at least 1"));
         }
         Ok(())
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn test_zero_udp_max_sessions_rejected() {
         let mut cfg = config_with_listeners(vec![listener_on("http", 8080, None, None)]);
-        cfg.performance.udp_max_sessions = 0;
+        cfg.performance.udp_max_sessions = Some(0);
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("udpMaxSessions"), "{}", err);
     }

@@ -28,12 +28,33 @@ pub struct SessionLimits {
 }
 
 impl SessionLimits {
+    /// Reads the fd limit, so build after `privileges::raise_nofile_limit`,
+    /// which `main` runs before the data plane exists.
     pub fn from_perf(perf: &PerformanceConfig) -> Self {
+        Self::with_nofile(perf, nofile_soft_limit())
+    }
+
+    fn with_nofile(perf: &PerformanceConfig, nofile_soft: Option<u64>) -> Self {
+        // The soft limit containers commonly start with.
+        const UNKNOWN_NOFILE: u64 = 1024;
+        // A quarter of the fd budget per listener: each session holds one fd,
+        // and the rest stays for TCP, whose accept loops all fail at EMFILE.
+        let quarter = nofile_soft.unwrap_or(UNKNOWN_NOFILE) / 4;
+        let derived = usize::try_from(quarter).unwrap_or(usize::MAX).max(1);
         Self {
             idle_timeout: perf.udp_session_timeout,
-            max_sessions: perf.udp_max_sessions,
+            max_sessions: perf.udp_max_sessions.unwrap_or(derived),
         }
     }
+}
+
+fn nofile_soft_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct we own.
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0).then_some(lim.rlim_cur)
 }
 
 struct UdpSession {
@@ -83,7 +104,10 @@ pub async fn run_udp_worker(
     shutdown: CancellationToken,
     health: Arc<HealthRegistry>,
 ) {
-    info!("UDP listener on :{} started", server_port);
+    info!(
+        "UDP listener on :{} started (up to {} sessions)",
+        server_port, limits.max_sessions
+    );
 
     // Same per-port scrape identity as the TCP accept loops; `accepted`
     // counts datagrams here since UDP has no connections.
@@ -387,6 +411,30 @@ mod tests {
             .ok()?
             .ok()?;
         Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
+    #[test]
+    fn default_cap_is_a_quarter_of_the_fd_budget() {
+        let perf = PerformanceConfig::default();
+        let cap = |nofile| SessionLimits::with_nofile(&perf, nofile).max_sessions;
+        assert_eq!(cap(Some(1_048_576)), 262_144);
+        assert_eq!(cap(Some(1_024)), 256);
+        assert_eq!(cap(Some(3)), 1, "never zero");
+        assert_eq!(
+            cap(None),
+            256,
+            "an unreadable limit counts as the usual 1024"
+        );
+    }
+
+    #[test]
+    fn explicit_cap_wins_over_the_fd_budget() {
+        let perf = PerformanceConfig {
+            udp_max_sessions: Some(7),
+            ..Default::default()
+        };
+        let limits = SessionLimits::with_nofile(&perf, Some(1_048_576));
+        assert_eq!(limits.max_sessions, 7);
     }
 
     #[tokio::test]
