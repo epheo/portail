@@ -1353,23 +1353,27 @@ async fn forward_response_headers(
     expect_upgrade: bool,
     client_close: bool,
 ) -> Result<HeaderPhase> {
-    let resp_header_end =
+    let read =
         match tokio::time::timeout(header_budget, read_response_head(backend, header_buf)).await {
-            Ok(Ok(end)) => end,
+            Ok(Ok(read)) => read,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 send_error_response(client, 504).await?;
                 return Ok(HeaderPhase::ErrorSent(504));
             }
         };
-
-    let Some(framing) =
-        frame_response(header_buf, resp_header_end, is_head_request, expect_upgrade)
-    else {
+    let Some((resp_header_end, head)) = read else {
         warn!("Backend sent a response head with ambiguous framing; rejecting");
         send_error_response(client, 502).await?;
         return Ok(HeaderPhase::ErrorSent(502));
     };
+    let framing = frame_response(
+        head,
+        header_buf,
+        resp_header_end,
+        is_head_request,
+        expect_upgrade,
+    );
 
     // A 101 nobody asked for would turn the client connection into an
     // unframed tunnel; refuse it while the client wire is still clean.
@@ -1596,9 +1600,13 @@ const MAX_INTERIM_RESPONSES: u32 = 8;
 /// Phase 1: read response headers from the backend into `header_buf`. Performs
 /// NO writes to the client; aborting/timeout/error before this returns leaves the
 /// client wire untouched, so the caller can still emit a clean `504`.
-/// Returns where the final (non-interim) head ends: `header_buf` then holds
-/// `[headers..header_end][same-read body tail...]`.
-async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) -> Result<usize> {
+/// Returns the final (non-interim) head and where it ends: `header_buf` then
+/// holds `[headers..header_end][same-read body tail...]`. `None` when a head,
+/// interim ones included, is malformed (see `parse_response_head`).
+async fn read_response_head(
+    backend: &mut Connection,
+    header_buf: &mut Vec<u8>,
+) -> Result<Option<(usize, ResponseHead)>> {
     header_buf.clear();
     let mut interim_seen = 0u32;
 
@@ -1606,9 +1614,9 @@ async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) 
         // Check before reading: a swallowed interim response leaves the next
         // response's bytes already buffered.
         if let Some(header_end) = find_header_end(header_buf) {
-            // A malformed status line is returned as final, for the caller
-            // to refuse.
-            let status = head_status(&header_buf[..header_end]).unwrap_or(0);
+            let Some(head) = parse_response_head(&header_buf[..header_end]) else {
+                return Ok(None);
+            };
 
             // Interim responses are proxy-consumed: the proxy answers
             // 100-continue itself (Expect never reaches the backend), and
@@ -1616,7 +1624,7 @@ async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) 
             // already got a 100. 1xx has no body, so everything past the
             // block belongs to the next response. 101 is not interim here:
             // the caller dispatches it (upgrade accept or reject).
-            if (100..200).contains(&status) && status != 101 {
+            if (100..200).contains(&head.status) && head.status != 101 {
                 interim_seen += 1;
                 if interim_seen > MAX_INTERIM_RESPONSES {
                     return Err(anyhow::anyhow!(
@@ -1624,11 +1632,11 @@ async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) 
                         MAX_INTERIM_RESPONSES
                     ));
                 }
-                debug!("Swallowing backend interim {} response", status);
+                debug!("Swallowing backend interim {} response", head.status);
                 header_buf.drain(..header_end);
                 continue;
             }
-            return Ok(header_end);
+            return Ok(Some((header_end, head)));
         }
 
         if header_buf.len() > RESPONSE_HEADER_CAP {
@@ -1647,16 +1655,15 @@ async fn read_response_head(backend: &mut Connection, header_buf: &mut Vec<u8>) 
     }
 }
 
-/// Framing of the final head in `header_buf[..header_end]`, including how
-/// much of the same-read tail belongs to its body. `None` when the head is
-/// malformed (see `parse_response_head`): none of it may reach the client.
+/// Framing of `parsed`, the final head in `header_buf[..header_end]`,
+/// including how much of the same-read tail belongs to its body.
 fn frame_response(
+    parsed: ResponseHead,
     header_buf: &[u8],
     header_end: usize,
     is_head_request: bool,
     expect_upgrade: bool,
-) -> Option<ResponseFraming> {
-    let parsed = parse_response_head(&header_buf[..header_end])?;
+) -> ResponseFraming {
     let status = parsed.status;
     // RFC 7230 3.3: responses to HEAD have no message body regardless
     // of the response's Content-Length / Transfer-Encoding. Forcing
@@ -1713,7 +1720,7 @@ fn frame_response(
             BodyFraming::Close => framing.body_bytes_already_forwarded = tail.len(),
         }
     }
-    Some(framing)
+    framing
 }
 
 /// How the response body ended.
@@ -2816,6 +2823,33 @@ mod connection_tests {
         );
     }
 
+    /// An interim head is never forwarded, but a lenient reader could still
+    /// split it differently and take its tail for the final response.
+    #[tokio::test]
+    async fn malformed_interim_heads_get_a_502() {
+        const FINAL: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        for interim in [
+            "HTTP/1.1 100 Continue\r\nX-Bad\r\n\r\n",
+            "HTTP/1.1 103 Early Hints\r\nLink : </a>\r\n\r\n",
+            "HTTP/1.1 100 Continue\r\nX-A: 1\rX-B: 2\r\n\r\n",
+        ] {
+            let addr = closing_backend(format!("{interim}{FINAL}").as_bytes()).await;
+            let (mut client, _task) = serve(routes(addr));
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert!(
+                out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{interim:?}: {out}"
+            );
+        }
+        let addr = closing_backend(
+            format!("HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n{FINAL}").as_bytes(),
+        )
+        .await;
+        let (mut client, _task) = serve(routes(addr));
+        let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+        assert_eq!(out, FINAL);
+    }
+
     /// Framing hangs on the status: read as 204, `2040` dropped the body
     /// a lenient client then waited for.
     #[tokio::test]
@@ -2921,7 +2955,7 @@ pub(crate) enum BodyFraming {
 /// The one reading of a response head that the body relay, the sanitizer
 /// and the h2 bridge all follow: two readings could disagree on where the
 /// body ends, and the client would take the rest as the next response.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResponseHead {
     pub(crate) status: u16,
     /// Chunked overrides a Content-Length, which must then not be
@@ -3010,10 +3044,6 @@ fn parse_status_line(line: &[u8]) -> Option<(u16, bool)> {
     }
     let status = u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
     Some((status, *minor == b'0'))
-}
-
-fn head_status(head: &[u8]) -> Option<u16> {
-    parse_status_line(header_lines(head).next()?).map(|(status, _)| status)
 }
 
 #[cfg(test)]
@@ -3167,7 +3197,8 @@ mod tests {
     #[test]
     fn chunked_response_ignores_content_length() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
-        let framing = frame_response(head, head.len(), false, false).unwrap();
+        let parsed = parse_response_head(head).unwrap();
+        let framing = frame_response(parsed, head, head.len(), false, false);
         assert!(framing.chunked.is_some());
         assert_eq!(framing.content_length, None);
         assert!(framing.transfer_encoded);
@@ -3298,10 +3329,7 @@ mod tests {
                 String::from_utf8_lossy(line)
             );
         }
-        // The head's own status, and the one interim detection reads.
         let head = b"HTTP/1.1 304 Not Modified\r\nETag: x\r\n\r\n";
         assert_eq!(parse_response_head(head).unwrap().status, 304);
-        assert_eq!(head_status(head), Some(304));
-        assert_eq!(head_status(b"HTTP/1.1 1000 X\r\n\r\n"), None);
     }
 }
