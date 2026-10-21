@@ -172,11 +172,25 @@ pub async fn run_controller(
             watcher::Config::default(),
         ),
     };
+    // A deletion runs no reconcile. A relist (InitDone) may also have
+    // dropped Gateways deleted while the watch was down.
+    let gateway_gone = Arc::new(tokio::sync::Notify::new());
     let gw_stream = reflector::reflector(
         gw_writer,
         watcher::watcher(gw_api, gw_watcher_config).modify(drop_unread_metadata),
     )
     .default_backoff()
+    .inspect({
+        let gone = gateway_gone.clone();
+        move |event| {
+            if matches!(
+                event,
+                Ok(watcher::Event::Delete(_) | watcher::Event::InitDone)
+            ) {
+                gone.notify_one();
+            }
+        }
+    })
     .applied_objects();
 
     // --- Secondary resources ---
@@ -291,6 +305,20 @@ pub async fn run_controller(
         pending_watches,
         started: std::time::Instant::now(),
     });
+
+    // Scoped mode serves one Gateway; its deletion ends the pod instead.
+    if unscoped {
+        let ctx = ctx.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = gateway_gone.notified() => reconcile::prune_deleted_gateways(&ctx).await,
+                }
+            }
+        });
+    }
 
     // Cold-start visibility: a pod sitting NotReady because the apiserver is
     // slow to deliver the first Gateway (or because binds keep failing) used

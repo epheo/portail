@@ -606,6 +606,64 @@ fn gateway_class_is_ours(
     })
 }
 
+type GatewayConfigs = HashMap<(String, String), Arc<crate::config::PortailConfig>>;
+
+/// Drop the configs of Gateways no longer in the store.
+fn retain_live_gateways(ctx: &ControllerCtx, configs: &mut GatewayConfigs) {
+    let live: HashSet<(String, String)> = ctx
+        .cache
+        .gateways
+        .state()
+        .iter()
+        .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
+        .collect();
+    configs.retain(|k, _| live.contains(k));
+}
+
+/// What the data plane runs: the one Gateway's config in scoped mode, the
+/// merge of all of them in legacy unscoped mode.
+fn effective_of(configs: &GatewayConfigs) -> Arc<crate::config::PortailConfig> {
+    match configs.values().next() {
+        Some(only) if configs.len() == 1 => only.clone(),
+        _ => Arc::new(merge_gateway_configs(configs)),
+    }
+}
+
+/// Unscoped mode: stop serving Gateways deleted from the store. Deletion
+/// runs no reconcile, and with no Gateway left no later pass would ever
+/// close their listeners or drop their routes.
+pub(super) async fn prune_deleted_gateways(ctx: &ControllerCtx) {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    let (effective, left) = {
+        let mut configs = match ctx.gateway_configs.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = configs.len();
+        retain_live_gateways(ctx, &mut configs);
+        if configs.len() == before {
+            return;
+        }
+        (effective_of(&configs), configs.len())
+    };
+    let usable = discover_usable_addresses();
+    let bind = compute_bind_addresses(&effective.gateway.addresses, &usable);
+    let required = required_endpoints(
+        &effective.gateway.listeners,
+        bind.as_deref().unwrap_or_default(),
+    );
+    match apply_data_plane(ctx, &effective, &usable, &required)
+        .await
+        .build_error
+    {
+        Some(e) => error!(
+            "Failed to build route table after a Gateway deletion: {}",
+            e
+        ),
+        None => info!("Deleted Gateway(s) pruned; {} Gateway(s) served", left),
+    }
+}
+
 /// The data plane's last apply: one per process, since every Gateway it
 /// serves shares the route table and the listener set.
 #[derive(Clone)]
@@ -886,21 +944,8 @@ pub(super) async fn reconcile(
             Err(poisoned) => poisoned.into_inner(),
         };
         map.insert(gw_key.clone(), config.clone());
-        // Prune Gateways that no longer exist — deletions don't run this
-        // reconciler, so stale entries are collected on any later pass.
-        let live: HashSet<(String, String)> = ctx
-            .cache
-            .gateways
-            .state()
-            .iter()
-            .filter_map(|g| Some((g.namespace()?, g.metadata.name.clone()?)))
-            .collect();
-        map.retain(|k, _| live.contains(k));
-        if map.len() <= 1 {
-            config.clone()
-        } else {
-            Arc::new(merge_gateway_configs(&map))
-        }
+        retain_live_gateways(&ctx, &mut map);
+        effective_of(&map)
     };
 
     let dp = apply_data_plane(&ctx, &effective_config, &usable, &required).await;
@@ -1437,6 +1482,46 @@ mod tests {
         api.clear();
         reconcile(Arc::new(gw), ctx).await.unwrap();
         assert_eq!(endpoint_slice_lists(&api), 1, "the pods changed");
+    }
+
+    /// Unscoped mode: deleting the last Gateway closes its listener and
+    /// empties the table. Deletion ran no reconcile, so they served on.
+    #[tokio::test]
+    async fn deleted_gateway_stops_serving() {
+        let port = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].port = port.into();
+        apply(&mut cluster.gateways, gw.clone());
+        let ctx = cluster.ctx(api.client());
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert!(std::net::TcpListener::bind(("0.0.0.0", port)).is_err());
+
+        cluster
+            .gateways
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(gw));
+        prune_deleted_gateways(&ctx).await;
+        assert!(ctx
+            .published
+            .load_full()
+            .unwrap()
+            .config
+            .gateway
+            .listeners
+            .is_empty());
+        // The accept loop drops its socket once it sees the cancel.
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while std::net::TcpListener::bind(("0.0.0.0", port)).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the deleted Gateway's port is released");
     }
 
     /// A write computed from a stale read is refused (409), not applied
