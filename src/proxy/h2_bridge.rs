@@ -10,17 +10,18 @@
 //! engine's 100-continue handling is bypassed by stripping `expect`.
 
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -88,14 +89,92 @@ pub(crate) struct H2Ctx {
     pub(crate) drain: CancellationToken,
 }
 
+/// The client's stream as h2 drives it. h2 ends a connection by shutting
+/// the stream down and dropping it, while a client closing in step still
+/// sends its own GOAWAY and close_notify: closed on those unread, the kernel
+/// resets and the client's close fails. So the shutdown reads off what
+/// still comes until the client closes too, within `budget`, as nginx does
+/// for HTTP/2.
+struct LingeringClose<S> {
+    inner: S,
+    budget: Duration,
+    /// Armed once the stream is shut down.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LingeringClose<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.deadline.is_none() {
+            ready!(Pin::new(&mut this.inner).poll_shutdown(cx))?;
+            this.deadline = Some(Box::pin(tokio::time::sleep(this.budget)));
+        }
+        // What still comes is dropped: the size only sets reads per wake.
+        let mut discard = [0u8; 4096];
+        loop {
+            let mut buf = ReadBuf::new(&mut discard);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
+                // EOF or an error: the client is done.
+                Poll::Ready(_) => return Poll::Ready(Ok(())),
+                Poll::Pending => {
+                    return match &mut this.deadline {
+                        Some(deadline) => deadline.as_mut().poll(cx).map(Ok),
+                        None => Poll::Ready(Ok(())),
+                    };
+                }
+            }
+        }
+    }
+}
+
 /// Serve one ALPN-negotiated h2 client connection until it closes.
 pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
+    let io = LingeringClose {
+        inner: tls_stream,
+        budget: ctx.cfg.client_header_timeout,
+        deadline: None,
+    };
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
         .initial_window_size(STREAM_WINDOW)
         .initial_connection_window_size(CONNECTION_WINDOW)
-        .handshake(tls_stream);
+        .handshake(io);
     // The h2 preface + SETTINGS is this protocol's header-read phase; it
     // gets the same slow-loris budget as an h1 header block.
     let mut conn = match tokio::time::timeout(ctx.cfg.client_header_timeout, handshake).await {
