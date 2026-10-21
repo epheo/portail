@@ -184,11 +184,12 @@ const FLOOD_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// Log a backend socket (TCP connect, UDP session) the proxy could not open
 /// for want of its own resources, at most once per `FLOOD_LOG_EVERY`.
+/// A line names the backend it met; the count it carries covers every one.
 pub(crate) fn log_local_exhaustion(addr: SocketAddr, e: &io::Error) {
     static THROTTLE: LogThrottle = LogThrottle::new();
     if let Some(suppressed) = THROTTLE.admit_now() {
         warn!(
-            "Backend {} not reached: proxy out of its own resources ({}); backend health untouched, {} similar suppressed",
+            "Backend {} not reached: proxy out of its own resources ({}); backend health untouched; {} more since the last such line, any backend",
             addr, e, suppressed
         );
     }
@@ -557,6 +558,27 @@ mod tests {
         assert_eq!(throttle.admit(109, every), None);
         assert_eq!(throttle.admit(110, every), Some(2));
         assert_eq!(throttle.admit(500, every), Some(0));
+    }
+
+    /// One throttle covers every backend: the count a line carries is not
+    /// the named backend's. It read "N similar suppressed" after one address.
+    #[test]
+    fn exhaustion_line_counts_every_backend() {
+        use crate::proxy::test_util::{in_own_process, Captured};
+        if !in_own_process(module_path!(), "exhaustion_line_counts_every_backend") {
+            return;
+        }
+        let (log, _subscriber) = Captured::warnings();
+        let e = io::Error::from_raw_os_error(libc::EMFILE);
+        log_local_exhaustion("127.0.0.1:1".parse().unwrap(), &e);
+        log_local_exhaustion("127.0.0.1:2".parse().unwrap(), &e);
+        let log = log.text();
+        assert_eq!(log.matches("not reached").count(), 1, "{log}");
+        assert!(
+            log.contains("Backend 127.0.0.1:1 not reached")
+                && log.contains("; 0 more since the last such line, any backend"),
+            "{log}"
+        );
     }
 
     /// Lets what the remote end sent land before probing.
