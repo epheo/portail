@@ -655,6 +655,7 @@ pub(crate) fn convert_udp_route(route: &UDPRoute) -> Result<UdpRouteConfig> {
 // ---------------------------------------------------------------------------
 
 /// Format backend name as `{service}.{namespace}.svc` for DNS resolution.
+/// The Service override maps are keyed by this name: build both here.
 pub(crate) fn backend_dns_name(
     name: &str,
     namespace: Option<&str>,

@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use super::converters::backend_dns_name;
 use crate::config::{HttpRouteFilter, PortailConfig};
 use crate::logging::{debug, info, warn};
 
@@ -140,7 +141,7 @@ pub(crate) fn resolve_services(
             None => continue,
         };
         let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
         for sp in spec.ports.iter().flatten() {
             let service_port = sp.port as u16;
             let target_port = match sp.target_port.as_ref() {
@@ -189,7 +190,7 @@ pub(crate) fn resolve_services(
             None => continue,
         };
         let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
 
         if let Some(ports) = spec.ports.as_ref() {
             for sp in ports {
@@ -226,7 +227,7 @@ pub(crate) fn resolve_services(
             None => continue,
         };
         let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = format!("{}.{}.svc", svc_name, svc_ns);
+        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
         if let Some(ports) = spec.ports.as_ref() {
             for sp in ports {
                 if let Some(ref app_proto) = sp.app_protocol {
@@ -251,7 +252,10 @@ pub(crate) fn resolve_services(
 impl NamedTargetPortReq {
     /// The override-map key this request resolves.
     pub fn backend(&self) -> (String, u16) {
-        (format!("{}.{}.svc", self.svc, self.ns), self.service_port)
+        (
+            backend_dns_name(&self.svc, None, &self.ns),
+            self.service_port,
+        )
     }
 }
 
