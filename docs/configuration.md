@@ -176,7 +176,7 @@ Kubernetes mode:
 
 - A parentRef attaches to the listeners it selects (by `sectionName`, `port`, or all) that admit the route: `allowedRoutes` namespaces and kinds, hostname intersection, and a protocol portail serves.
 - A parentRef without `namespace` names a Gateway in the route's own namespace.
-- Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by namespace/name.
+- Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
 - A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
 - TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.
 - An invalid backendRef (`RefNotPermitted`, `BackendNotFound`, `InvalidKind`) keeps its weight. Its share of HTTP requests gets `500`; its share of TCP and TLS passthrough connections is closed, of UDP datagrams dropped.
