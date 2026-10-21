@@ -217,7 +217,7 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 §6.1).
+/// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 6.1).
 /// The status line is copied untouched.
 ///
 /// Framing is the caller's reading of the head (`worker::parse_response_head`),
