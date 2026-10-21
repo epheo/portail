@@ -32,6 +32,15 @@ pub const MAX_BURST: u32 = u32::MAX / MILLITOKENS_PER_REQUEST;
 /// memory between sweeps.
 pub const SWEEP_INTERVAL_SECS: u64 = 60;
 
+/// A bucket age at or above this (about 24.8 days) is a wrapped negative:
+/// the request read the clock before a concurrent one stored its stamp.
+const BACKWARDS_MS: u32 = 1 << 31;
+
+/// The sweep evicts buckets idle this long (about 12.4 days) whatever their
+/// fill, so no live bucket ages into `BACKWARDS_MS`. Only a burst taking
+/// longer than this to refill notices: it comes back full.
+const STALE_MS: u32 = 1 << 30;
+
 pub struct Limiter {
     /// Requests per second == millitokens per millisecond.
     rate: AtomicU32,
@@ -42,8 +51,8 @@ pub struct Limiter {
     /// evaded from a single /64).
     buckets: DashMap<u128, AtomicU64, fnv::FnvBuildHasher>,
     /// Bucket timestamps are u32 milliseconds since this instant. Wrapping
-    /// subtraction stays correct across the 49-day wrap for any entry
-    /// touched within the sweep interval, and the sweep evicts the rest.
+    /// subtraction stays correct across the 49-day wrap: `elapsed` reads ages
+    /// below `BACKWARDS_MS`, and the sweep evicts buckets at `STALE_MS`.
     epoch: Instant,
 }
 
@@ -100,12 +109,19 @@ impl Limiter {
     /// Drop buckets that have refilled to capacity — an idle client's bucket
     /// is indistinguishable from no bucket at all.
     fn sweep(&self) {
-        let now = self.now_ms();
+        self.sweep_at(self.now_ms());
+    }
+
+    fn sweep_at(&self, now: u32) {
         let rate = self.rate.load(Relaxed);
         let burst = self.burst_mt.load(Relaxed);
         self.buckets.retain(|_, cell| {
             let (last, tokens) = unpack(cell.load(Relaxed));
-            refill(tokens, now.wrapping_sub(last), rate, burst) < burst
+            match elapsed(now, last) {
+                // Touched after `now` was read: live, whatever it holds.
+                None => true,
+                Some(dt) => dt < STALE_MS && refill(tokens, dt, rate, burst) < burst,
+            }
         });
     }
 
@@ -133,6 +149,15 @@ fn unpack(state: u64) -> (u32, u32) {
     ((state >> 32) as u32, state as u32)
 }
 
+/// Milliseconds from `last` to `now`, or `None` when `now` is the older of
+/// the two: a request that read the clock just before a concurrent one
+/// stored its timestamp. Wrapping subtraction alone reads that as a ~49-day
+/// gap and refills the bucket to burst.
+fn elapsed(now: u32, last: u32) -> Option<u32> {
+    let dt = now.wrapping_sub(last);
+    (dt < BACKWARDS_MS).then_some(dt)
+}
+
 fn refill(tokens: u32, dt_ms: u32, rate: u32, burst: u32) -> u32 {
     // u64 arithmetic: dt (< 2^32) * rate (validated <= 10^6) cannot overflow.
     (u64::from(tokens) + u64::from(dt_ms) * u64::from(rate)).min(u64::from(burst)) as u32
@@ -142,13 +167,17 @@ fn consume(cell: &AtomicU64, now_ms: u32, rate: u32, burst: u32) -> bool {
     let mut cur = cell.load(Relaxed);
     loop {
         let (last, tokens) = unpack(cur);
-        let filled = refill(tokens, now_ms.wrapping_sub(last), rate, burst);
+        // A backwards clock is no time passed, and the stamp never rewinds.
+        let (stamp, filled) = match elapsed(now_ms, last) {
+            Some(dt) => (now_ms, refill(tokens, dt, rate, burst)),
+            None => (last, tokens),
+        };
         let (next, granted) = if filled >= MILLITOKENS_PER_REQUEST {
-            (pack(now_ms, filled - MILLITOKENS_PER_REQUEST), true)
+            (pack(stamp, filled - MILLITOKENS_PER_REQUEST), true)
         } else {
             // Advance the timestamp WITH the partial refill folded in, so
             // accrual is never lost to a denied request.
-            (pack(now_ms, filled), false)
+            (pack(stamp, filled), false)
         };
         match cell.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
             Ok(_) => return granted,
@@ -158,7 +187,9 @@ fn consume(cell: &AtomicU64, now_ms: u32, rate: u32, burst: u32) -> bool {
 }
 
 fn client_key(peer: IpAddr) -> u128 {
-    match peer {
+    // A dual-stack bind reports IPv4 peers as ::ffff:a.b.c.d, which would
+    // all share one /64 bucket.
+    match peer.to_canonical() {
         IpAddr::V4(v4) => u128::from(u32::from(v4)),
         // /64 prefix; low bits zeroed. Cannot collide with the v4 space
         // (a v4 key has zero high bits, a routable v6 /64 does not).
@@ -291,16 +322,59 @@ mod tests {
             l.check_at(2, 900); // pinned near empty at t=900
         }
         assert_eq!(l.tracked_clients(), 2);
-        // Freeze time via check_at's clock: sweep uses now_ms(), so emulate
-        // by reconfigure-free direct retain at a chosen instant.
-        let now = 2000u32;
-        let rate = l.rate.load(Relaxed);
-        let burst = l.burst_mt.load(Relaxed);
-        l.buckets.retain(|_, cell| {
-            let (last, tokens) = unpack(cell.load(Relaxed));
-            refill(tokens, now.wrapping_sub(last), rate, burst) < burst
-        });
+        l.sweep_at(2000);
         assert_eq!(l.tracked_clients(), 1);
+    }
+
+    /// The sweep reads its clock once; a client touched after that read must
+    /// survive it, or the most throttled clients reset every sweep.
+    #[test]
+    fn sweep_keeps_bucket_touched_after_its_clock_read() {
+        let l = Limiter::new(1, 10);
+        for _ in 0..10 {
+            assert!(l.check_at(K, 1_000));
+        }
+        l.sweep_at(999);
+        assert_eq!(l.tracked_clients(), 1);
+        assert!(!l.check_at(K, 1_000));
+    }
+
+    /// A bucket slow enough to stay below burst for weeks is still evicted
+    /// before its age could wrap into the backwards range.
+    #[test]
+    fn sweep_evicts_stale_bucket_before_its_age_wraps() {
+        let l = Limiter::new(1, MAX_BURST);
+        l.buckets.insert(K, AtomicU64::new(pack(0, 0)));
+        l.sweep_at(STALE_MS - 1);
+        assert_eq!(l.tracked_clients(), 1);
+        l.sweep_at(STALE_MS);
+        assert_eq!(l.tracked_clients(), 0);
+    }
+
+    /// A request whose clock read predates a concurrently stored timestamp
+    /// must see no time pass, not a ~49-day gap that refills to burst, and
+    /// must not drag the timestamp back either.
+    #[test]
+    fn backwards_clock_neither_refills_nor_rewinds() {
+        let l = Limiter::new(2, 3);
+        for _ in 0..3 {
+            assert!(l.check_at(K, 1_000));
+        }
+        assert!(!l.check_at(K, 900));
+        // One token per 500ms, counted from 1000, not from 900.
+        assert!(!l.check_at(K, 1_499));
+        assert!(l.check_at(K, 1_500));
+    }
+
+    /// A dual-stack listener reports IPv4 clients as ::ffff:a.b.c.d; keyed
+    /// by /64 they would all share a single bucket.
+    #[test]
+    fn ipv4_mapped_peers_key_like_ipv4() {
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        let other: IpAddr = "::ffff:203.0.113.10".parse().unwrap();
+        let v4: IpAddr = Ipv4Addr::new(203, 0, 113, 9).into();
+        assert_eq!(client_key(mapped), client_key(v4));
+        assert_ne!(client_key(mapped), client_key(other));
     }
 
     #[test]
