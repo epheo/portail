@@ -20,6 +20,7 @@ use helpers::{
     read_one_response, spawn_slow_backend, tcp_roundtrip, wait_for_listener, InspectingBackend,
     PortailProcess, TcpEchoBackend, TestBackend,
 };
+use portail::proxy::worker::LINGER_IDLE;
 
 /// Pick a proxy port unlikely to conflict. Each test uses a unique port.
 fn proxy_port(offset: u16) -> u16 {
@@ -2048,9 +2049,10 @@ fn test_controller_failure_exits_nonzero() {
 
 /// SIGTERM: idle connections close at once (keepalive, or one that has not
 /// sent its first request yet), an in-flight exchange finishes and
-/// announces the close, which waits for the client's own, and the process
-/// exits well inside the 30s drain window instead of waiting out the idle
-/// clients.
+/// announces the close, and the process exits well inside the 30s drain
+/// window instead of waiting out the idle clients. A client that keeps its
+/// socket open after the close, as urllib3 and HttpURLConnection pools do,
+/// holds the drain for LINGER_IDLE at most.
 #[test]
 fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
     let (backend, arrived) = spawn_slow_backend(Duration::from_secs(1));
@@ -2098,13 +2100,12 @@ fn test_sigterm_closes_idle_keepalive_and_finishes_in_flight() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
     assert!(response.ends_with("\r\n\r\nok"), "{response}");
-    // Told to close, a client closes once it has the response (RFC 9112
-    // 9.6). The proxy's close waits for that: a request the client
-    // pipelined meanwhile would otherwise reset the response.
-    drop(busy);
 
+    // `busy` stays open. Slack covers the drain's 500ms poll and the exit.
+    let slack = Duration::from_secs(3);
     let status = proxy
-        .wait_exit(Duration::from_secs(10))
-        .expect("no exit within 10s of SIGTERM");
+        .wait_exit(LINGER_IDLE + slack)
+        .expect("a client keeping its socket open held the drain");
     assert!(status.success(), "{status}");
+    drop(busy);
 }

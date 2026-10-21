@@ -103,7 +103,8 @@ pub(crate) struct H2Ctx {
 /// while a client closing in step still sends its own GOAWAY and
 /// close_notify: closed on those unread, the kernel resets and the client's
 /// close fails. So the shutdown reads off what still comes until the client
-/// closes too, within `close_budget`, as nginx does for HTTP/2.
+/// closes too or falls silent for `LINGER_IDLE`, within `close_budget`, as
+/// nginx does for HTTP/2.
 struct ClientStream<S> {
     inner: S,
     /// `None` lets writes wait forever.
@@ -117,9 +118,12 @@ struct ClientStream<S> {
     close_budget: Duration,
     /// Armed by the first shutdown poll, before the inner shutdown: a client
     /// that stops reading holds the close_notify write as long as it likes.
+    /// The linger then moves it to `LINGER_IDLE` past the client's last
+    /// bytes, never past the budget.
     close_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// The inner shutdown is done; only the linger is left.
-    shut: bool,
+    /// The budget's end, once the inner shutdown is done and only the
+    /// linger is left.
+    linger_until: Option<tokio::time::Instant>,
 }
 
 impl<S> ClientStream<S> {
@@ -131,7 +135,7 @@ impl<S> ClientStream<S> {
             stalled: false,
             close_budget,
             close_deadline: None,
-            shut: false,
+            linger_until: None,
         }
     }
 
@@ -208,23 +212,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
         let deadline = this
             .close_deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
-        if !this.shut {
-            if Pin::new(&mut this.inner).poll_shutdown(cx)?.is_pending() {
-                return deadline.as_mut().poll(cx).map(Ok);
+        // The silence that ends the linger counts from its start, then
+        // from the client's last bytes.
+        let mut restart = false;
+        let close_by = match this.linger_until {
+            Some(close_by) => close_by,
+            None => {
+                if Pin::new(&mut this.inner).poll_shutdown(cx)?.is_pending() {
+                    return deadline.as_mut().poll(cx).map(Ok);
+                }
+                restart = true;
+                *this.linger_until.insert(deadline.deadline())
             }
-            this.shut = true;
-        }
+        };
         // What still comes is dropped: the size only sets reads per wake.
         let mut discard = [0u8; 4096];
         loop {
             let mut buf = ReadBuf::new(&mut discard);
             match Pin::new(&mut this.inner).poll_read(cx, &mut buf) {
-                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => restart = true,
                 // EOF or an error: the client is done.
                 Poll::Ready(_) => return Poll::Ready(Ok(())),
-                Poll::Pending => return deadline.as_mut().poll(cx).map(Ok),
+                Poll::Pending => break,
             }
         }
+        if restart {
+            let idle = tokio::time::Instant::now() + worker::LINGER_IDLE;
+            deadline.as_mut().reset(idle.min(close_by));
+        }
+        deadline.as_mut().poll(cx).map(Ok)
     }
 }
 
@@ -989,6 +1005,36 @@ mod tests {
             "close_notify held the close past its budget"
         );
         assert!(started.elapsed() >= budget, "{:?}", started.elapsed());
+    }
+
+    /// A client that keeps its socket open after the close held it, its
+    /// task and a drain for the whole close budget. Silent for LINGER_IDLE,
+    /// it is done; one still sending is read until it stops, or the budget
+    /// runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_closing_h2_connection_lingers_while_the_client_sends() {
+        let budget = worker::LINGER_IDLE * 6;
+        let every = worker::LINGER_IDLE / 2;
+        for (sends, lingered) in [
+            (0, worker::LINGER_IDLE),
+            (4, every * 4 + worker::LINGER_IDLE),
+            (usize::MAX, budget),
+        ] {
+            let (server, mut client) = tokio::io::duplex(64 * 1024);
+            let sender = tokio::spawn(async move {
+                for _ in 0..sends {
+                    tokio::time::sleep(every).await;
+                    let _ = client.write_all(b"x").await;
+                }
+                // Never closes.
+                std::future::pending::<()>().await;
+            });
+            let mut io = ClientStream::new(server, None, budget);
+            let started = tokio::time::Instant::now();
+            io.shutdown().await.unwrap();
+            assert_eq!(started.elapsed(), lingered, "{sends} sends");
+            sender.abort();
+        }
     }
 
     /// A client stream taking every write at once but completing a flush
