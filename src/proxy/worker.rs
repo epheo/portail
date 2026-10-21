@@ -1352,8 +1352,8 @@ async fn fail_backend(
     Ok((false, None))
 }
 
-/// Answer a connect the proxy could not make for want of its own fds, ports
-/// or memory: a 503, and the backend's health left alone.
+/// Answer a connect the proxy could not make for want of its own fds or
+/// memory: a 503, and the backend's health left alone.
 async fn refuse_locally(
     state: &mut ConnectionState,
     client: &mut Connection,
@@ -1362,7 +1362,7 @@ async fn refuse_locally(
 ) -> Result<()> {
     log_local_exhaustion(addr, e);
     // Not refused(): a lingering close would hold this connection's fd
-    // while the proxy is short of fds, ports or memory.
+    // while the proxy is short of fds or memory.
     state.last_status = 503;
     send_error_response(client, 503).await
 }
