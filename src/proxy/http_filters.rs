@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::logging::warn;
+use crate::proxy::http_parser::is_forwarding_claim;
 use crate::routing::{HttpFilter, HttpHeader, URLRewritePath};
 
 /// Borrowed header modification parameters — zero per-request allocation.
@@ -263,12 +264,10 @@ pub(crate) fn sanitize_response_headers(
 /// overwhelmingly common non-hop-by-hop headers.
 ///
 /// Also client headers that must never pass even though they are not
-/// hop-by-hop. HTTP2-Settings: h2c is never offered to a backend. Forwarded
-/// and X-Forwarded-Proto, -Host, -Port, -Ssl, -Scheme: a backend trusts them
-/// as the proxy's word on the original request, so a client copy could claim
-/// TLS, a host or a port it never used. X-Forwarded-For is not here: the
-/// proxy appends to the client's list. The parser strips these via spans on
-/// the fast path; this covers the paths that re-derive the set by name.
+/// hop-by-hop: HTTP2-Settings, as h2c is never offered to a backend, and the
+/// forwarding claims of `is_forwarding_claim`. The parser strips these via
+/// spans on the fast path; this covers the paths that re-derive the set by
+/// name.
 #[inline]
 pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
     match name.first().map(|b| b.to_ascii_lowercase()) {
@@ -278,21 +277,9 @@ pub(crate) fn is_hop_by_hop_request_header(name: &[u8]) -> bool {
         Some(b't') => name.eq_ignore_ascii_case(b"te") || name.eq_ignore_ascii_case(b"trailer"),
         Some(b'e') => name.eq_ignore_ascii_case(b"expect"),
         Some(b'h') => name.eq_ignore_ascii_case(b"http2-settings"),
-        Some(b'f') => name.eq_ignore_ascii_case(b"forwarded"),
-        Some(b'x') => is_proxy_asserted_x_forwarded(name),
+        Some(b'f' | b'x') => is_forwarding_claim(name),
         _ => false,
     }
-}
-
-fn is_proxy_asserted_x_forwarded(name: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"x-forwarded-";
-    if name.len() <= PREFIX.len() || !name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-        return false;
-    }
-    let suffix = &name[PREFIX.len()..];
-    [&b"proto"[..], b"host", b"port", b"ssl", b"scheme"]
-        .iter()
-        .any(|s| suffix.eq_ignore_ascii_case(s))
 }
 
 #[inline]
@@ -931,6 +918,32 @@ mod tests {
             std::str::from_utf8(&out).unwrap(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\n"
         );
+    }
+
+    /// The parser strips by span what the slow path strips by name.
+    #[test]
+    fn test_parser_and_slow_path_agree_on_forwarding_claims() {
+        for name in [
+            "Forwarded",
+            "X-Forwarded-Proto",
+            "x-forwarded-host",
+            "X-FORWARDED-PORT",
+            "X-Forwarded-Ssl",
+            "X-Forwarded-Scheme",
+            "X-Forwarded-For",
+            "X-Forwarded-Hostname",
+            "X-Forwarded-",
+            "Forwarded-For",
+            "From",
+        ] {
+            let req = format!("GET / HTTP/1.1\r\nHost: h\r\n{name}: v\r\n\r\n");
+            let span_stripped = parsed_spans(req.as_bytes()).strip_spans.iter().count() == 1;
+            assert_eq!(
+                span_stripped,
+                is_hop_by_hop_request_header(name.as_bytes()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
