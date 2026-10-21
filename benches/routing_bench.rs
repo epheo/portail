@@ -1,5 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use portail::routing::{Backend, HttpRouteRule, PathMatchType, RouteTable};
+use portail::proxy::health::HealthRegistry;
+use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
+use std::hint::black_box;
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
@@ -10,6 +12,19 @@ fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
         vec![],
         vec![],
         vec![backend],
+    )
+}
+
+/// One HTTP lookup with every input opaque: a constant input lets the
+/// compiler fold the lookup or hoist it out of the timing loop.
+fn lookup<'a>(table: &'a RouteTable, host: &str, path: &str) -> Option<&'a HttpRouteRule> {
+    black_box(table).find_http_route(
+        black_box(host),
+        black_box("GET"),
+        black_box(path),
+        black_box(&[]),
+        black_box(""),
+        black_box(443),
     )
 }
 
@@ -47,18 +62,7 @@ fn routing_benchmark(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("http_route_lookup", size),
             &table,
-            |b, table| {
-                b.iter(|| {
-                    std::hint::black_box(table.find_http_route(
-                        &host,
-                        "GET",
-                        "/api/users",
-                        &[],
-                        "",
-                        443,
-                    ))
-                })
-            },
+            |b, table| b.iter(|| lookup(table, &host, "/api/users")),
         );
     }
     group.finish();
@@ -70,18 +74,7 @@ fn routing_benchmark(c: &mut Criterion) {
         ("unknown_host", "nope.example.com", "/api/users"),
         ("unrouted_path", "host50.example.com", "/admin"),
     ] {
-        miss_group.bench_function(name, |b| {
-            b.iter(|| {
-                std::hint::black_box(std::hint::black_box(&small_table).find_http_route(
-                    std::hint::black_box(host),
-                    "GET",
-                    std::hint::black_box(path),
-                    &[],
-                    "",
-                    std::hint::black_box(443),
-                ))
-            })
-        });
+        miss_group.bench_function(name, |b| b.iter(|| lookup(&small_table, host, path)));
     }
     miss_group.finish();
 
@@ -93,22 +86,11 @@ fn routing_benchmark(c: &mut Criterion) {
     }
 
     c.bench_function("path_matching_simple", |b| {
-        b.iter(|| {
-            std::hint::black_box(complex_table.find_http_route("api.com", "GET", "/", &[], "", 443))
-        })
+        b.iter(|| lookup(&complex_table, "api.com", "/"))
     });
 
     c.bench_function("path_matching_complex", |b| {
-        b.iter(|| {
-            std::hint::black_box(complex_table.find_http_route(
-                "api.com",
-                "GET",
-                "/api/v1/users/123/profile",
-                &[],
-                "",
-                443,
-            ))
-        })
+        b.iter(|| lookup(&complex_table, "api.com", "/api/v1/users/123/profile"))
     });
 
     let mut tcp_table = RouteTable::new();
@@ -118,26 +100,54 @@ fn routing_benchmark(c: &mut Criterion) {
     }
 
     c.bench_function("tcp_route_lookup", |b| {
-        b.iter(|| std::hint::black_box(tcp_table.find_tcp_backends(8500)))
+        b.iter(|| black_box(&tcp_table).find_tcp_backends(black_box(8500)))
     });
 
-    let backends = (0..100)
-        .map(|_| Backend::new("127.0.0.1".to_string(), 8080).unwrap())
+    // Every backend healthy, as in steady state: what is timed is the
+    // weighted round robin itself.
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+    let mut selection = c.benchmark_group("backend_selection");
+
+    let l4_backends: Vec<Backend> = (0..100)
+        .map(|i| Backend::new("127.0.0.1".to_string(), 8000 + i).unwrap())
         .collect();
-    tcp_table.add_tcp_route(9999, backends);
-
-    c.bench_function("backend_selection_round_robin", |b| {
-        b.iter(|| std::hint::black_box(tcp_table.find_tcp_backends(9999)))
+    selection.bench_function("l4_round_robin_100", |b| {
+        b.iter(|| selector.select_l4_backend(black_box(9999), black_box(&l4_backends), &health))
     });
+
+    let mut weighted_table = RouteTable::new();
+    let weighted = (1..=4)
+        .map(|w| Backend::with_weight("127.0.0.1".to_string(), 8000 + w as u16, w).unwrap())
+        .collect();
+    weighted_table.add_http_route(
+        "weighted.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            weighted,
+        ),
+    );
+    // Taken back from the table, which precomputes the cumulative weights.
+    let rule = weighted_table
+        .find_http_route("weighted.com", "GET", "/", &[], "", 443)
+        .unwrap();
+    selection.bench_function("http_weighted_4", |b| {
+        b.iter(|| selector.select_healthy_weighted_backend(black_box(rule), &health))
+    });
+    selection.finish();
 }
 
 fn memory_benchmark(c: &mut Criterion) {
     c.bench_function("route_table_creation", |b| {
-        b.iter(|| std::hint::black_box(RouteTable::new()))
+        b.iter(|| black_box(RouteTable::new()))
     });
 
     c.bench_function("backend_creation", |b| {
-        b.iter(|| std::hint::black_box(Backend::new("127.0.0.1".to_string(), 8080).unwrap()))
+        b.iter(|| black_box(Backend::new("127.0.0.1".to_string(), 8080).unwrap()))
     });
 
     c.bench_function("add_http_route", |b| {
@@ -146,7 +156,7 @@ fn memory_benchmark(c: &mut Criterion) {
             |mut table| {
                 let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
                 table.add_http_route("host.com", make_rule("/api", backend));
-                std::hint::black_box(table)
+                black_box(table)
             },
             criterion::BatchSize::SmallInput,
         )
