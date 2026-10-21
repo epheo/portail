@@ -274,6 +274,20 @@ impl BackendPool {
         }
     }
 
+    /// A live idle conn opened for this address, protocol and SNI, if the
+    /// pool holds one. Never waits.
+    pub fn take_idle(
+        &mut self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Option<Connection> {
+        let idle = self.pools.get_mut(&(addr, use_tls))?;
+        let conn = idle.take_live(sni(use_tls, server_name))?;
+        debug!("Pool hit: reusing connection to {}", addr);
+        Some(conn)
+    }
+
     /// Get a backend connection — pooled if available and alive, otherwise fresh.
     ///
     /// Returns `(Connection, from_pool)`. `from_pool == true` means the caller
@@ -290,11 +304,8 @@ impl BackendPool {
         server_name: &str,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
-        if let Some(idle) = self.pools.get_mut(&(addr, use_tls)) {
-            if let Some(conn) = idle.take_live(sni(use_tls, server_name)) {
-                debug!("Pool hit: reusing connection to {}", addr);
-                return Ok((conn, true));
-            }
+        if let Some(conn) = self.take_idle(addr, use_tls, server_name) {
+            return Ok((conn, true));
         }
 
         METRICS.pool_misses_total.inc();
@@ -367,6 +378,21 @@ impl SharedBackendPool {
         }
     }
 
+    pub fn take_idle(
+        &self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Option<Connection> {
+        // Shard lock held only for the sync pop+probe loop.
+        let conn = self
+            .pools
+            .get_mut(&(addr, use_tls))?
+            .take_live(sni(use_tls, server_name))?;
+        debug!("Shared pool hit: reusing connection to {}", addr);
+        Some(conn)
+    }
+
     pub async fn acquire(
         &self,
         addr: SocketAddr,
@@ -374,12 +400,8 @@ impl SharedBackendPool {
         server_name: &str,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
-        // Shard lock held only for the sync pop+probe loop, never across await.
-        if let Some(mut idle) = self.pools.get_mut(&(addr, use_tls)) {
-            if let Some(conn) = idle.take_live(sni(use_tls, server_name)) {
-                debug!("Shared pool hit: reusing connection to {}", addr);
-                return Ok((conn, true));
-            }
+        if let Some(conn) = self.take_idle(addr, use_tls, server_name) {
+            return Ok((conn, true));
         }
 
         METRICS.pool_misses_total.inc();
@@ -431,6 +453,20 @@ pub enum PoolHandle {
 }
 
 impl PoolHandle {
+    /// A live idle conn, if the pool holds one: a hit needs no connect
+    /// budget, and arming one costs a timer.
+    pub fn take_idle(
+        &mut self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+    ) -> Option<Connection> {
+        match self {
+            PoolHandle::PerConn(p) => p.take_idle(addr, use_tls, server_name),
+            PoolHandle::Shared(p) => p.take_idle(addr, use_tls, server_name),
+        }
+    }
+
     pub async fn acquire(
         &mut self,
         addr: SocketAddr,

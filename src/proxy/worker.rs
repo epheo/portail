@@ -1558,18 +1558,19 @@ async fn connect_to_backend(
     total_deadline: Option<std::time::Instant>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
-    let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
-    match tokio::time::timeout(
-        connect_budget,
-        state.pool.acquire(
-            backend_addr,
-            backend_ref.use_tls,
-            &backend_ref.server_name,
-            &state.backend_keepalive,
-        ),
-    )
-    .await
-    {
+    let (use_tls, server_name) = (backend_ref.use_tls, backend_ref.server_name.as_str());
+    let acquired = match state.pool.take_idle(backend_addr, use_tls, server_name) {
+        Some(conn) => Ok(Ok((conn, true))),
+        None => {
+            let connect_budget = clamp_to_deadline(backend_budget, total_deadline);
+            let keepalive = &state.backend_keepalive;
+            let connect = state
+                .pool
+                .acquire(backend_addr, use_tls, server_name, keepalive);
+            tokio::time::timeout(connect_budget, connect).await
+        }
+    };
+    match acquired {
         Ok(Ok(result)) => {
             // Reset passive-failure state: without this, transient failures
             // accumulate over the process lifetime and eventually trip the
