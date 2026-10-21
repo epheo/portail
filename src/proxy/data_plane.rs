@@ -164,10 +164,13 @@ pub(crate) fn merge_cert_refs_by_port(
         if !matches!(listener_cfg.protocol, Protocol::HTTPS | Protocol::TLS) {
             continue;
         }
-        merged
-            .entry(listener_cfg.port)
-            .or_default()
-            .extend(tls_cfg.certificate_refs.iter().cloned());
+        let refs = merged.entry(listener_cfg.port).or_default();
+        // A listener bound on several addresses comes once per address.
+        for r in &tls_cfg.certificate_refs {
+            if !refs.contains(r) {
+                refs.push(r.clone());
+            }
+        }
     }
     merged
 }
@@ -926,6 +929,25 @@ mod tests {
             "Passthrough must not contribute"
         );
         assert!(!merged.contains_key(&80), "HTTP must not contribute");
+    }
+
+    /// A listener bound on two addresses comes as two copies. Each added
+    /// its refs again: the fingerprint moved with the address count, and
+    /// a new address rebuilt the port's ServerConfig with unchanged certs.
+    #[test]
+    fn a_listener_on_several_addresses_merges_its_refs_once() {
+        let listener = https_listener("https", 443, Some("a.example.org"), "c");
+        let on = |address: &str| ListenerConfig {
+            address: Some(address.to_string()),
+            ..listener.clone()
+        };
+        let one = merge_cert_refs_by_port(&[on("10.0.0.1")]);
+        let two = merge_cert_refs_by_port(&[on("10.0.0.1"), on("10.0.0.2")]);
+        assert_eq!(two[&443].len(), 1);
+        assert_eq!(
+            compute_cert_fingerprint(&one[&443]),
+            compute_cert_fingerprint(&two[&443])
+        );
     }
 
     /// Fingerprint over a port's merged refs must be stable across calls —

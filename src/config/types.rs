@@ -95,7 +95,7 @@ pub enum TlsMode {
     Passthrough,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CertificateRef {
     pub name: String,
     /// The listener hostname associated with this cert (for SNI routing).
