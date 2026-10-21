@@ -26,7 +26,7 @@ fn test_bench_config_route_lookup() {
             rt.listener_scopes.keys().collect::<Vec<_>>()
         );
         for (port, scopes) in &rt.listener_scopes {
-            for scope in scopes {
+            for scope in &scopes.scopes {
                 println!(
                     "  Port {} scope: listener_hostname={:?} http_routes_hosts={:?} catch_all={}",
                     port,

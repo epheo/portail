@@ -471,7 +471,7 @@ impl PortailConfig {
         }
 
         tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
-            route_table.listener_scopes.values().map(|v| v.len()).sum::<usize>(), route_table.tcp_routes.len(), route_table.udp_routes.len());
+            route_table.http_scopes().count(), route_table.tcp_routes.len(), route_table.udp_routes.len());
 
         Ok(route_table)
     }
@@ -709,18 +709,16 @@ mod tests {
     /// Collect every backend socket-address port in the route table (HTTP scopes).
     fn http_backend_ports(rt: &crate::routing::RouteTable) -> Vec<u16> {
         let mut ports = Vec::new();
-        for scopes in rt.listener_scopes.values() {
-            for scope in scopes {
-                let entries = scope
-                    .http_routes
-                    .values()
-                    .chain(scope.wildcard_http_routes.values())
-                    .chain(scope.catch_all_http_routes.iter());
-                for he in entries {
-                    for rule in he {
-                        for b in &rule.backends {
-                            ports.push(b.socket_addr.port());
-                        }
+        for scope in rt.http_scopes() {
+            let entries = scope
+                .http_routes
+                .values()
+                .chain(scope.wildcard_http_routes.values())
+                .chain(scope.catch_all_http_routes.iter());
+            for he in entries {
+                for rule in he {
+                    for b in &rule.backends {
+                        ports.push(b.socket_addr.port());
                     }
                 }
             }
@@ -870,7 +868,7 @@ mod tests {
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
         let rt = config.to_route_table().unwrap();
-        assert_eq!(rt.listener_scopes.values().flatten().count(), 1);
+        assert_eq!(rt.http_scopes().count(), 1);
         for port in [8080, 8081, 8443] {
             assert!(rt.has_http_routes(port), "{port}");
             assert!(rt

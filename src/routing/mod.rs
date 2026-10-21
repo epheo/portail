@@ -1,4 +1,4 @@
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,14 +115,16 @@ impl ListenerScope {
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
-    /// Port 0 holds the scopes every port in `any_port_http` shares: routes
-    /// without parentRefs, or `add_http_route` in tests and benches.
-    pub listener_scopes: FnvHashMap<u16, Vec<ListenerScope>>,
-    /// The ports the port-0 scopes serve: every port when `None` (a table
-    /// built by hand), else the HTTP and HTTPS listener ports of the config
-    /// the table was built from. A TCP port that searched them would wait
-    /// to sniff, and hang a server-speaks-first client.
-    any_port_http: Option<FnvHashSet<u16>>,
+    pub listener_scopes: FnvHashMap<u16, PortScopes>,
+    /// The scopes ports share, added under port 0: routes without
+    /// parentRefs, or `add_http_route` in tests and benches. Outside the
+    /// map, so a table without them costs a request no second probe.
+    shared_scopes: Vec<ListenerScope>,
+    /// A table built by hand: every port searches `shared_scopes`. One
+    /// built from a config clears it, and only its HTTP and HTTPS listener
+    /// ports do ([`PortScopes::shared`]). A TCP port that searched them
+    /// would wait to sniff, and hang a server-speaks-first client.
+    shared_on_every_port: bool,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
@@ -131,6 +133,15 @@ pub struct RouteTable {
     /// within its listener's. Port 0 holds the routes without parentRefs,
     /// which every passthrough listener searches after its own.
     pub tls_scopes: FnvHashMap<u16, Vec<TlsScope>>,
+}
+
+/// One port's HTTP route scopes, one per listener hostname.
+#[derive(Debug, Clone, Default)]
+pub struct PortScopes {
+    pub scopes: Vec<ListenerScope>,
+    /// The port also searches the table's shared scopes. Resolved when the
+    /// table is built: a request reads this flag, not a set of ports.
+    pub shared: bool,
 }
 
 /// One TLS passthrough listener's routes, by SNI.
@@ -209,25 +220,16 @@ impl RouteTable {
             &host_lower
         };
 
-        // O(1) port lookup, then iterate only matching scopes.
-        // Also the port-0 scopes this port shares (see `any_port_http`).
-        let port_scopes = self.listener_scopes.get(&server_port);
-        let wildcard_scopes = if server_port != 0 {
-            self.listener_scopes
-                .get(&0)
-                .filter(|_| self.shares_any_port_scopes(server_port))
-        } else {
-            None
-        };
+        // O(1) port lookup, then iterate only matching scopes, the shared
+        // ones too when the port takes them.
+        let port = self.listener_scopes.get(&server_port);
+        let shared = self.shared_scopes_of(port);
+        let own = port.map_or(&[][..], |p| &p.scopes[..]);
 
         // Phase 1: Find the highest hostname match priority among all matching scopes.
         let mut highest_priority: Option<u32> = None;
 
-        for scope in port_scopes
-            .into_iter()
-            .chain(wildcard_scopes)
-            .flat_map(|v| v.iter())
-        {
+        for scope in own.iter().chain(shared) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if highest_priority.is_none() || priority > highest_priority.unwrap() {
                     highest_priority = Some(priority);
@@ -240,11 +242,7 @@ impl RouteTable {
         // Phase 2: Only search routes in scopes at the highest matching priority.
         // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
         // (priority 1), routes from the catch-all listener (priority 0) are excluded.
-        for scope in port_scopes
-            .into_iter()
-            .chain(wildcard_scopes)
-            .flat_map(|v| v.iter())
-        {
+        for scope in own.iter().chain(shared) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if priority < highest_priority {
                     continue;
@@ -260,22 +258,30 @@ impl RouteTable {
     }
 
     /// Whether any HTTP route can match on `server_port`: its own scopes or
-    /// the port-0 ones it shares, as `find_http_route` searches them.
+    /// the shared ones it takes, as `find_http_route` searches them.
     pub fn has_http_routes(&self, server_port: u16) -> bool {
-        let routed = |port| {
-            self.listener_scopes
-                .get(&port)
-                .is_some_and(|s| !s.is_empty())
-        };
-        routed(server_port) || (routed(0) && self.shares_any_port_scopes(server_port))
+        let port = self.listener_scopes.get(&server_port);
+        port.is_some_and(|p| !p.scopes.is_empty()) || !self.shared_scopes_of(port).is_empty()
     }
 
-    /// Whether `server_port` searches the port-0 scopes (`any_port_http`).
-    #[inline]
-    fn shares_any_port_scopes(&self, server_port: u16) -> bool {
-        self.any_port_http
-            .as_ref()
-            .is_none_or(|ports| ports.contains(&server_port))
+    /// The shared scopes a port with `port`'s entry searches: none, unless
+    /// some exist and every port takes them or it does.
+    #[inline(always)]
+    fn shared_scopes_of(&self, port: Option<&PortScopes>) -> &[ListenerScope] {
+        if self.shared_scopes.is_empty()
+            || !(self.shared_on_every_port || port.is_some_and(|p| p.shared))
+        {
+            return &[];
+        }
+        &self.shared_scopes
+    }
+
+    /// Every HTTP route scope: each port's, then the shared ones.
+    pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
+        self.listener_scopes
+            .values()
+            .flat_map(|p| &p.scopes)
+            .chain(&self.shared_scopes)
     }
 
     pub fn has_tcp_route(&self, server_port: u16) -> bool {

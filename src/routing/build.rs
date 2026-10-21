@@ -72,7 +72,8 @@ impl RouteTable {
     pub fn new() -> Self {
         Self {
             listener_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
-            any_port_http: None,
+            shared_scopes: Vec::new(),
+            shared_on_every_port: true,
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -90,7 +91,7 @@ impl RouteTable {
     /// Mirrors count too: a build drops a mirror DNS cannot resolve, and only
     /// a changed signature brings it back once it resolves.
     pub fn dns_signature(&self) -> u64 {
-        let http_rules = self.listener_scopes.values().flatten().flat_map(|scope| {
+        let http_rules = self.http_scopes().flat_map(|scope| {
             scope
                 .http_routes
                 .values()
@@ -155,7 +156,11 @@ impl RouteTable {
     /// Order every host entry by match precedence. The sort is stable, so
     /// equal rules keep their push order.
     pub(crate) fn sort_http_routes(&mut self) {
-        for scope in self.listener_scopes.values_mut().flatten() {
+        let own = self
+            .listener_scopes
+            .values_mut()
+            .flat_map(|p| &mut p.scopes);
+        for scope in own.chain(&mut self.shared_scopes) {
             for host_entry in scope.host_entries_mut() {
                 Self::sort_rules(host_entry);
             }
@@ -170,7 +175,10 @@ impl RouteTable {
         // Scopes store lowercase hostnames (see ListenerScope::new), so
         // normalize before matching an existing scope.
         let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
-        let scopes = self.listener_scopes.entry(listener_port).or_default();
+        let scopes = match listener_port {
+            0 => &mut self.shared_scopes,
+            port => &mut self.listener_scopes.entry(port).or_default().scopes,
+        };
         match scopes
             .iter()
             .position(|s| s.listener_hostname == normalized)
@@ -183,13 +191,17 @@ impl RouteTable {
         }
     }
 
-    /// Serve the port-0 scopes on `ports` only, and on no other port.
+    /// Serve the shared (port-0) scopes on `ports` only, and on no other
+    /// port.
     pub(crate) fn share_any_port_scopes_on(&mut self, ports: impl IntoIterator<Item = u16>) {
-        self.any_port_http = Some(ports.into_iter().collect());
+        self.shared_on_every_port = false;
+        for port in ports {
+            self.listener_scopes.entry(port).or_default().shared = true;
+        }
     }
 
-    /// Convenience: add an HTTP route to a default catch-all scope on port 0.
-    /// Used by tests and benchmarks.
+    /// Convenience: add an HTTP route to a default catch-all scope on port 0,
+    /// which every port shares. Used by tests and benchmarks.
     #[allow(dead_code)]
     pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
         self.add_http_route_for_listener(0, None, host, rule);
@@ -423,7 +435,7 @@ mod tests {
     /// Every host entry as (path, insertion tag), keyed for comparison.
     fn entries(table: &RouteTable) -> Vec<(String, Vec<(String, u64)>)> {
         let mut out = Vec::new();
-        for scope in table.listener_scopes.values().flatten() {
+        for scope in table.http_scopes() {
             let keyed = scope
                 .http_routes
                 .iter()
