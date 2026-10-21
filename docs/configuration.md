@@ -17,11 +17,12 @@
 | `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
 | `--validate-only` | Validate config file without starting the server (requires `--config`) |
 | `--check-config` | Parse and display config values, then exit (requires `--config`) |
-| `--example-config` | Display paths to example configuration files and exit |
+| `--example-config` | List the built-in example configurations and exit |
 | `--generate-config <TYPE>` | Generate example config: `minimal` or `development` |
 | `--output <FILE>` | Output file for generated configuration (requires `--generate-config`) |
-| `--cert-dir <DIR>` | Directory for TLS certificate files (default: `/etc/portail/certs`) |
+| `--cert-dir <DIR>` | Directory for TLS certificate files (default: `certs`, relative to the working directory) |
 | `--supported-features` | Print supported Gateway API features and exit |
+| `--print-crd` | Print portail's CRD manifests (RateLimitPolicy) as YAML and exit |
 | `--verbose, -v` | Enable verbose logging (repeat for more: `-vv`, `-vvv`) |
 
 ## Environment Variables
@@ -171,13 +172,13 @@ logs behave identically. The bridge costs one in-memory hop per direction,
 paid only by h2 connections. Negotiation volume is visible in
 `portail_http2_connections_total`.
 
+The streams of one h2 connection share one backend pool, like keepalive requests on an h1 connection.
+`backendPoolScope: process` extends that reuse across clients.
+
 Limits to know about:
 
 - Trailers do not survive the bridge, so gRPC cannot ride it; GRPCRoute
   support requires the future native h2 path.
-- Each h2 stream is its own engine exchange. With the default
-  `backendPoolScope: connection` there is no backend reuse across streams;
-  set `backendPoolScope: process` alongside `http2` for backend keepalive.
 - WebSocket/CONNECT streams are refused over h2; h2-capable browsers fall
   back to HTTP/1.1 for WebSocket automatically.
 
@@ -268,4 +269,4 @@ In standalone mode, TLS certificates are read from the filesystem. Place `{name}
 portail --config config.yaml --cert-dir /path/to/certs
 ```
 
-The default cert directory is `/etc/portail/certs`.
+The default cert directory is `certs`, relative to the working directory.

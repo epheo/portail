@@ -45,7 +45,10 @@ Portail runs as a regular Deployment (no `hostNetwork`). A Kubernetes Service ex
 
 **Unprivileged binds (no `NET_BIND_SERVICE`).** A published listener port (e.g. 80/443) is a client-facing contract, not the port the process must bind. Under `portail-operator`, the Service maps each published port to an unprivileged `targetPort` (e.g. `80 → 8080`) and portail binds that target — so the pod drops *all* capabilities, runs `runAsNonRoot` with `allowPrivilegeEscalation: false` and no sysctl, fully compliant with restricted Pod Security on both vanilla Kubernetes and OpenShift `restricted-v2`. portail discovers its fronting Service by the label `portail.epheo.eu/gateway: <gateway-name>` in the Gateway's namespace and binds the numeric `targetPort` of each port matching a listener. If no such Service exists — multi-network mode, the host-networked DaemonSet, or before the operator has created it — portail binds the published port directly. Those modes add `capabilities.add: [NET_BIND_SERVICE]`, which pairs with the `cap_net_bind_service` **file capability** baked into the image (`setcap …=+p`): portail raises it to effective at startup and binds the privileged port while staying **non-root** with `allowPrivilegeEscalation: false` — no sysctl, no root, no custom SCC. (`+p`, not `+ep`, so the same image still execs in service-mode pods that drop the capability.)
 
-When `spec.addresses` is set on a Gateway, listeners bind to that specific IP. If the IP doesn't exist on the pod's interfaces, the Gateway gets `Programmed=False`. The network itself provides isolation: each Deployment only serves Gateways whose addresses are reachable from its pods.
+Static addresses (`GatewayStaticAddresses`) are not supported yet: `spec.addresses` never assigns an IP.
+An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically.
+Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
+portail sets `Programmed` from bound listener ports alone; an address missing from the pod does not make it `False`.
 
 The same pattern works with **NodePort** or **ClusterIP**. Just change `spec.type` in `service.yaml`. See the loadbalancer example's README for details.
 
@@ -102,8 +105,11 @@ Multus interface no longer exposes `/metrics` (see
 
 ## Verifying
 
+portail-operator writes GatewayClass status; portail never does.
+Without the operator it stays empty, and portail still serves Gateways whose class names its controller.
+
 ```bash
-# GatewayClass accepted?
+# GatewayClass accepted? (portail-operator only)
 kubectl get gatewayclass portail -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
 
 # Gateway status
