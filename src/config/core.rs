@@ -148,9 +148,9 @@ impl Resolver<'_, '_> {
         let key = (name.to_string(), port);
         let overrides = self.endpoint_overrides;
         if let Some(targets) = overrides.get(&key).filter(|t| !t.is_empty()) {
-            // An endpoint is one target: its first address.
+            // An endpoint is one target.
             for (host, target_port) in targets {
-                if let Some(&addr) = self.addrs(host, *target_port, what)?.and_then(<[_]>::first) {
+                if let Some(addr) = self.addrs(host, *target_port, what)?.and_then(one_target) {
                     each(addr, host);
                 }
             }
@@ -193,6 +193,23 @@ impl Resolver<'_, '_> {
         }
         Ok(backends)
     }
+}
+
+/// The address a one-target backend (an ExternalName endpoint) uses: a
+/// function of the address set, not of its order. A resolver that only
+/// reorders the set keeps the pick, the table and its DNS signature, so the
+/// refresh swaps nothing until the set changes. The resolver's first
+/// address changed with every reorder.
+/// Hashed with this process's own random keys rather than the smallest
+/// address: each pod still picks its own member of the set, as the
+/// resolver's rotation spread them before.
+fn one_target(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    static KEYS: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(std::hash::RandomState::new);
+    addrs
+        .iter()
+        .copied()
+        .max_by_key(|addr| std::hash::BuildHasher::hash_one(keys, addr))
 }
 
 fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
@@ -1310,7 +1327,13 @@ mod tests {
             .iter()
             .map(|b| (b.socket_addr, b.server_name.as_str()))
             .collect();
-        assert_eq!(dialed, vec![(([10, 0, 0, 1], 443).into(), "multi.svc")]);
+        // One address of the set: see one_target.
+        let set: [std::net::SocketAddr; 2] =
+            [([10, 0, 0, 1], 443).into(), ([10, 0, 0, 2], 443).into()];
+        assert!(
+            matches!(&dialed[..], [(addr, "multi.svc")] if set.contains(addr)),
+            "{dialed:?}"
+        );
     }
 
     /// One route whose regex does not compile used to fail the whole build:
@@ -1603,6 +1626,61 @@ mod tests {
         );
     }
 
+    /// An ExternalName endpoint took the resolver's first address: an answer
+    /// that only reordered the set changed the table and its signature, and
+    /// the DNS refresh swapped the table on most ticks.
+    #[test]
+    fn an_external_name_keeps_its_address_while_its_set_stands() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["x.example.com", "y.example.com"],
+                "rules": [{"backendRefs":[{"name":"ext.default.svc","port":443}]}]
+            }]
+        }"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.endpoint_overrides.insert(
+            ("ext.default.svc".to_string(), 443),
+            vec![("api.example.org".to_string(), 443)],
+        );
+        let build = |answer: &[u8]| {
+            let mut lookup = |name: &str, port| -> anyhow::Result<Vec<std::net::SocketAddr>> {
+                assert_eq!(name, "api.example.org");
+                Ok(answer
+                    .iter()
+                    .map(|&i| ([10, 0, 0, i], port).into())
+                    .collect())
+            };
+            config
+                .build_route_table(super::BuildPolicy::Lenient, &mut lookup)
+                .unwrap()
+        };
+        let picked = |rt: &crate::routing::RouteTable| {
+            rt.find_http_route("y.example.com", "GET", "/", &[], "", 8080)
+                .unwrap()
+                .backends[0]
+                .socket_addr
+        };
+
+        let table = build(&[1, 2, 3]);
+        for order in [[2, 3, 1], [3, 1, 2], [3, 2, 1]] {
+            let reordered = build(&order);
+            assert_eq!(picked(&reordered), picked(&table), "{order:?}");
+            assert_eq!(reordered.dns_signature(), table.dns_signature());
+        }
+
+        let std::net::IpAddr::V4(ip) = picked(&table).ip() else {
+            unreachable!()
+        };
+        let rest: Vec<u8> = [1, 2, 3]
+            .into_iter()
+            .filter(|&i| i != ip.octets()[3])
+            .collect();
+        let moved = build(&rest);
+        assert_ne!(picked(&moved), picked(&table), "the picked address left");
+        assert_ne!(moved.dns_signature(), table.dns_signature());
+    }
+
     /// A mirror DNS cannot resolve used to fail the whole lenient build, so
     /// every route of the Gateway stopped updating.
     #[test]
@@ -1705,8 +1783,10 @@ mod tests {
             ("ext.default.svc".to_string(), 5432),
             vec![("multi.svc".to_string(), 5432)],
         );
+        // One address of the set (see one_target), the same for every kind.
+        let picked = super::one_target(&[pod(1, 5432), pod(2, 5432)]).unwrap();
         for (kind, addrs) in dialed(&external) {
-            assert_eq!(addrs, vec![pod(1, 5432)], "{kind}");
+            assert_eq!(addrs, vec![picked], "{kind}");
         }
     }
 }

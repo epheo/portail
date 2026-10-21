@@ -232,8 +232,9 @@ In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirr
 
 - ClusterIP: its DNS name, on the Service port, which kube-proxy maps to the pods.
 - Headless: every ready pod DNS returns, on the `targetPort`, as DNS carries no port. A named `targetPort` is read from the Service's EndpointSlices.
-- ExternalName: its external name, on the Service port.
+- ExternalName: its external name, on the Service port, at one address of the set each pod picks by hash, so pods spread over the set.
 - A mirror sends its copies to one address: the smallest the Service resolves to.
+- These single addresses change only when the address set does; a reordered DNS answer changes nothing.
 
 ## Performance Options
 
