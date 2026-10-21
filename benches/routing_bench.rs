@@ -115,6 +115,31 @@ fn routing_benchmark(c: &mut Criterion) {
         b.iter(|| black_box(&plan).select(black_box(Some("a.db.example.com"))))
     });
 
+    // Per passthrough connection: its TLS route across the listener's
+    // scope and the shared one, here a wildcard two labels up, past an
+    // exact miss in both, and the round robin keyed by that route.
+    let mut tls_table = RouteTable::new();
+    let tls_backends = || {
+        (0..4)
+            .map(|i| Backend::new("127.0.0.1".to_string(), 9000 + i).unwrap())
+            .collect::<Vec<_>>()
+    };
+    tls_table.add_tls_route_for_listener(8443, None, "app.example.com", tls_backends());
+    tls_table.add_tls_route_for_listener(8443, None, "*.example.com", tls_backends());
+    tls_table.add_tls_route(0, "other.example.com", tls_backends());
+    let (tls_selector, tls_health) = (BackendSelector::new(), HealthRegistry::new());
+    c.bench_function("tls_route_resolve_wildcard", |b| {
+        b.iter(|| {
+            black_box(&tls_table).resolve_tls_passthrough(
+                black_box(Some("a.db.example.com")),
+                black_box(8443),
+                black_box(None),
+                &tls_selector,
+                &tls_health,
+            )
+        })
+    });
+
     // Every backend healthy, as in steady state: what is timed is the
     // weighted round robin itself.
     let selector = BackendSelector::new();

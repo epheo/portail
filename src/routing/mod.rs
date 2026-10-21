@@ -160,22 +160,6 @@ pub struct TlsScope {
 }
 
 impl TlsScope {
-    /// Exact hostname first, then wildcards walking up domain labels
-    /// (`*.example.com` also covers `a.b.example.com`), then the catch-all.
-    fn lookup(&self, sni: Option<&str>) -> Option<&Vec<Backend>> {
-        if let Some(sni) = sni {
-            if let Some(backends) = self.exact.get(sni) {
-                return Some(backends);
-            }
-            for parent in parent_domains(sni) {
-                if let Some(backends) = self.wildcard.get(parent) {
-                    return Some(backends);
-                }
-            }
-        }
-        self.catch_all.as_ref()
-    }
-
     pub(crate) fn backends(&self) -> impl Iterator<Item = &Vec<Backend>> {
         self.exact
             .values()
@@ -383,28 +367,61 @@ impl RouteTable {
         self.udp_routes.get(&server_port)
     }
 
-    /// The TLS-route backends for a lowercase SNI (`None`: the hello sent
-    /// none) within the passthrough listener `listener` names on a port,
-    /// then within the routes without parentRefs (port 0).
-    fn tls_route_backends(
+    /// The TLS route a lowercase SNI (`None`: the hello sent none) selects
+    /// within the passthrough listener `listener` names on a port and the
+    /// routes without parentRefs (port 0), ranked as one set: the exact
+    /// hostname, then the longest wildcard, then the catch-all; on a tie
+    /// the listener's own. With the key its round robin counts under: the
+    /// route's, never the SNI a client chose to send.
+    fn tls_route(
         &self,
         sni: Option<&str>,
         server_port: u16,
         listener: Option<&str>,
-    ) -> Option<&Vec<Backend>> {
+    ) -> Option<(&Vec<Backend>, u64)> {
         let own = self.tls_scopes.get(&server_port).and_then(|scopes| {
             scopes
                 .iter()
                 .find(|s| s.listener_hostname.as_deref() == listener)
         });
-        let shared = (server_port != 0)
-            .then(|| self.tls_scopes.get(&0))
-            .flatten()
-            .into_iter()
-            .flatten();
-        own.into_iter()
-            .chain(shared)
-            .find_map(|scope| scope.lookup(sni))
+        let shared = match server_port {
+            0 => &[][..],
+            _ => self.tls_scopes.get(&0).map_or(&[][..], Vec::as_slice),
+        };
+        let scopes = || {
+            own.map(|scope| (server_port, scope))
+                .into_iter()
+                .chain(shared.iter().map(|scope| (0, scope)))
+        };
+        // Bounded by the routes configured: an exact route's name is a
+        // configured hostname, a wildcard's its parent domain.
+        let key = |port: u16, scope: &TlsScope, kind: u8, name: &str| {
+            use std::hash::Hasher;
+            let mut h = fnv::FnvHasher::default();
+            h.write_u16(port);
+            h.write(scope.listener_hostname.as_deref().unwrap_or("").as_bytes());
+            h.write_u8(kind);
+            h.write(name.as_bytes());
+            h.finish()
+        };
+        if let Some(sni) = sni {
+            for (port, scope) in scopes() {
+                if let Some(backends) = scope.exact.get(sni) {
+                    return Some((backends, key(port, scope, b'=', sni)));
+                }
+            }
+            for parent in parent_domains(sni) {
+                for (port, scope) in scopes() {
+                    if let Some(backends) = scope.wildcard.get(parent) {
+                        return Some((backends, key(port, scope, b'*', parent)));
+                    }
+                }
+            }
+        }
+        scopes().find_map(|(port, scope)| {
+            let backends = scope.catch_all.as_ref()?;
+            Some((backends, key(port, scope, b'.', "")))
+        })
     }
 
     /// Resolve a TLS passthrough connection, by its lowercase SNI if it
@@ -421,24 +438,16 @@ impl RouteTable {
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
     ) -> Result<std::net::SocketAddr, PassthroughMiss> {
-        let (backends, key) =
-            if let Some(backends) = self.tls_route_backends(sni, server_port, listener) {
-                // Counter keyed per (port, SNI) so each route rotates
-                // independently; a collision only shares a counter.
-                let key = {
-                    use std::hash::Hasher;
-                    let mut h = fnv::FnvHasher::default();
-                    h.write(sni.unwrap_or_default().as_bytes());
-                    h.write_u16(server_port);
-                    h.finish()
-                };
-                (backends, key)
-            } else if let Some(backends) = self.tcp_routes.get(&server_port) {
-                // Shares the TCP path's counter.
-                (backends, server_port as u64)
-            } else {
-                return Err(PassthroughMiss::NoRoute);
-            };
+        // Each route rotates on its own counter; a key collision only
+        // shares one.
+        let (backends, key) = if let Some(route) = self.tls_route(sni, server_port, listener) {
+            route
+        } else if let Some(backends) = self.tcp_routes.get(&server_port) {
+            // Shares the TCP path's counter.
+            (backends, server_port as u64)
+        } else {
+            return Err(PassthroughMiss::NoRoute);
+        };
         if backends.is_empty() {
             return Err(PassthroughMiss::NoBackends);
         }

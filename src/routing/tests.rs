@@ -761,6 +761,68 @@ fn test_tls_passthrough_round_robins_backends() {
     assert_eq!(seen, [9001, 9002].into_iter().collect());
 }
 
+/// A passthrough listener's own routes and the routes without parentRefs
+/// rank as one set: the exact hostname, then the longest wildcard, then
+/// the catch-all. The listener's own scope was searched whole first, so
+/// its catch-all took a host a shared route names exactly.
+#[test]
+fn tls_routes_rank_across_a_listeners_scope_and_the_shared_one() {
+    let mut rt = RouteTable::new();
+    rt.add_tls_route_for_listener(8443, None, "*", vec![backend(9001)]);
+    rt.add_tls_route_for_listener(8443, None, "*.example.com", vec![backend(9002)]);
+    rt.add_tls_route_for_listener(8443, None, "own.example.com", vec![backend(9003)]);
+    rt.add_tls_route(0, "s.example.com", vec![backend(9004)]);
+    rt.add_tls_route(0, "*.b.example.com", vec![backend(9005)]);
+    rt.add_tls_route(0, "*.example.com", vec![backend(9006)]);
+    rt.add_tls_route(0, "*", vec![backend(9007)]);
+    for (sni, port) in [
+        ("s.example.com", 9004),
+        ("x.b.example.com", 9005),
+        ("own.example.com", 9003),
+        ("x.example.com", 9002),
+        ("other.org", 9001),
+    ] {
+        assert_eq!(
+            resolve_pt(&rt, sni, 8443).map(|a| a.port()),
+            Some(port),
+            "{sni}"
+        );
+    }
+}
+
+/// Selection rotates per route: hellos naming different hosts under one
+/// wildcard route, or none at all on a catch-all, take turns. The counter
+/// was keyed by the client's SNI, one per name a client chose to send.
+#[test]
+fn tls_passthrough_rotates_per_route_not_per_sni() {
+    let mut rt = RouteTable::new();
+    rt.add_tls_route_for_listener(
+        8443,
+        None,
+        "*.example.com",
+        vec![backend(9001), backend(9002)],
+    );
+    rt.add_tls_route_for_listener(8443, None, "*", vec![backend(9003), backend(9004)]);
+    let selector = BackendSelector::new();
+    let health = crate::proxy::health::HealthRegistry::new();
+    let pick = |sni| {
+        rt.resolve_tls_passthrough(sni, 8443, None, &selector, &health)
+            .unwrap()
+            .port()
+    };
+    let wildcard: Vec<_> = [
+        "a.example.com",
+        "b.example.com",
+        "c.example.com",
+        "d.example.com",
+    ]
+    .map(|sni| pick(Some(sni)))
+    .into();
+    assert_eq!(wildcard, [9001, 9002, 9001, 9002]);
+    let catch_all: Vec<_> = [None, Some("x.org"), None, Some("y.org")].map(pick).into();
+    assert_eq!(catch_all, [9003, 9004, 9003, 9004]);
+}
+
 /// Passthrough fails over: an unhealthy backend gets no connections while a
 /// healthy one remains, and with every backend down it fails open instead of
 /// refusing the connection.

@@ -422,6 +422,7 @@ HTTPS and TLS passthrough listeners on one port share one socket:
 - An HTTPS listener terminates with its own certificate and routes HTTP by `Host`; a TLS passthrough listener forwards the raw stream by its TLS routes.
 - No SNI, or an SNI no listener names: the listener without a hostname takes it; with none, the connection closes, counted in `portail_listener_tls_handshake_failures_total`.
 - A TLS route matches within its listener only: its hostnames outside the listener's are ignored, and a route without hostnames takes the listener's.
-- A TLS route without parentRefs (a config built without validation) serves every passthrough listener, after that listener's own routes.
+- A TLS route without parentRefs (a config built without validation) serves every passthrough listener, ranked with that listener's own routes: the exact hostname, then the longest wildcard, then the route without hostnames; on a tie the listener's own.
+- Connections rotate over a TLS route's backends per route, whatever SNI each sent under it.
 - Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
 - A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
