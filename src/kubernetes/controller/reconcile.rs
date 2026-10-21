@@ -830,6 +830,7 @@ pub(super) async fn reconcile(
     if !named_reqs.is_empty() {
         resolve_named_target_ports(
             &ctx.client,
+            &ctx.named_ports,
             &named_reqs,
             &mut result.config.headless_target_ports,
         )
@@ -1380,6 +1381,61 @@ mod tests {
             Some(&8080)
         );
         assert_eq!(endpoint_slice_lists(&api), 1);
+    }
+
+    /// A named targetPort is read once per Service version and DNS epoch;
+    /// every pass used to list EndpointSlices again.
+    #[tokio::test]
+    async fn named_target_port_reads_wait_for_a_change() {
+        let api = MockApi::default();
+        api.reply_to(
+            "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+            200,
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{
+                    "metadata": {"name": "db-1"},
+                    "addressType": "IPv4",
+                    "endpoints": [],
+                    "ports": [{"name": "web", "port": 8080}],
+                }],
+            }),
+        );
+        let mut cluster = TestCluster::default();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        let svc = testkit::service("db", "web", 80, serde_json::json!("http"));
+        apply(&mut cluster.services, svc.clone());
+        apply(
+            &mut cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "db", 80),
+        );
+        let ctx = cluster.ctx(api.client());
+        assert!(
+            !ctx.named_ports.dns_changed(),
+            "nothing cached: a DNS change is not worth a reconcile"
+        );
+
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 1);
+
+        api.clear();
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 0, "nothing moved");
+
+        let mut changed = svc;
+        changed.metadata.resource_version = Some("2".into());
+        apply(&mut cluster.services, changed);
+        api.clear();
+        reconcile(Arc::new(gw.clone()), ctx.clone()).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 1, "the Service changed");
+
+        assert!(ctx.named_ports.dns_changed());
+        api.clear();
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        assert_eq!(endpoint_slice_lists(&api), 1, "the pods changed");
     }
 
     /// A write computed from a stale read is refused (409), not applied

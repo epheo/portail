@@ -36,6 +36,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::dns_refresh::Published;
+use crate::kubernetes::services::NamedPortCache;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 
@@ -113,6 +114,7 @@ struct ControllerCtx {
     /// Gateway A cannot clobber Gateway B's routes in the shared table.
     gateway_configs:
         Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
+    named_ports: Arc<NamedPortCache>,
     /// When the controller came up — cold-start latency context for the
     /// "Data plane ready" log line and the not-ready watchdog.
     started: std::time::Instant,
@@ -265,6 +267,7 @@ pub async fn run_controller(
         last_applied: Arc::new(std::sync::Mutex::new(None)),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        named_ports: Arc::new(NamedPortCache::default()),
         started: std::time::Instant::now(),
     });
 
@@ -298,12 +301,22 @@ pub async fn run_controller(
         Ok(dp) => dp.health().clone(),
         Err(poisoned) => poisoned.into_inner().health().clone(),
     };
+    // A swap means pods came or went: named targetPorts, whose numbers live
+    // on the pods, are read again by a reconcile of every Gateway. That keeps
+    // them as fresh as the pod IPs, on the same interval.
+    let (pods_changed, named_port_refresh) = futures::channel::mpsc::unbounded::<()>();
+    let named_ports = ctx.named_ports.clone();
     crate::kubernetes::dns_refresh::spawn_dns_refresh(
         published,
         ctx.routes.clone(),
         health,
         ctx.performance_config.dns_refresh_interval,
         shutdown.clone(),
+        move || {
+            if named_ports.dns_changed() {
+                let _ = pods_changed.unbounded_send(());
+            }
+        },
     );
 
     // --- Gateway controller ---
@@ -360,6 +373,7 @@ pub async fn run_controller(
             let gw = ctx.cache.gateways.clone();
             move |_: GatewayClass| all_gateway_refs(&gw)
         })
+        .reconcile_all_on(named_port_refresh)
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);

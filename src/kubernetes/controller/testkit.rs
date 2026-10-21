@@ -215,6 +215,7 @@ impl TestCluster {
             last_applied: Arc::new(std::sync::Mutex::new(None)),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            named_ports: Default::default(),
             started: std::time::Instant::now(),
         })
     }

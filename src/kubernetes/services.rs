@@ -12,6 +12,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::Api;
 use kube::Client;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::config::PortailConfig;
 use crate::logging::{debug, info, warn};
@@ -35,11 +37,60 @@ pub(crate) struct ServiceState {
 pub(crate) struct NamedTargetPortReq {
     ns: String,
     svc: String,
+    service_version: Option<String>,
     service_port: u16,
     /// What the EndpointSlice port is named: slices carry the Service port's
     /// name (Service.ports[].name), not the targetPort's. Empty when unnamed.
     service_port_name: String,
     target_port_name: String,
+}
+
+/// The port numbers a Service's EndpointSlices publish, by port name, read
+/// once per Service version and DNS epoch.
+#[derive(Default)]
+pub(crate) struct NamedPortCache {
+    /// Bumped on every DNS refresh swap; an entry from an older epoch is stale.
+    epoch: AtomicU64,
+    entries: Mutex<HashMap<(String, String), CachedPorts>>,
+}
+
+struct CachedPorts {
+    service_version: Option<String>,
+    epoch: u64,
+    ports: HashMap<String, u16>,
+}
+
+impl NamedPortCache {
+    /// DNS refresh saw the resolved backends change: pods came or went, and
+    /// a named port's number lives on the pods. Returns whether anything was
+    /// cached, so whether a re-read is worth a reconcile.
+    pub fn dns_changed(&self) -> bool {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let had_entries = !entries.is_empty();
+        entries.clear();
+        had_entries
+    }
+
+    fn get(&self, req: &NamedTargetPortReq, epoch: u64) -> Option<HashMap<String, u16>> {
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(&(req.ns.clone(), req.svc.clone()))
+            .filter(|c| c.epoch == epoch && c.service_version == req.service_version)
+            .map(|c| c.ports.clone())
+    }
+
+    fn put(&self, req: &NamedTargetPortReq, epoch: u64, ports: HashMap<String, u16>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.insert(
+            (req.ns.clone(), req.svc.clone()),
+            CachedPorts {
+                service_version: req.service_version.clone(),
+                epoch,
+                ports,
+            },
+        );
+    }
 }
 
 /// Resolve service metadata: known services set, ExternalName overrides,
@@ -101,6 +152,7 @@ pub(crate) fn resolve_services(
                     named_target_ports.push(NamedTargetPortReq {
                         ns: svc_ns.to_string(),
                         svc: svc_name.to_string(),
+                        service_version: svc.metadata.resource_version.clone(),
                         service_port,
                         service_port_name: sp.name.clone().unwrap_or_default(),
                         target_port_name: name.clone(),
@@ -241,18 +293,19 @@ pub(crate) fn retain_referenced(config: &mut PortailConfig, referenced: &HashSet
         .retain(|k, _| referenced.contains(k));
 }
 
-/// Pick the numeric value of a Service port from the Service's EndpointSlices,
-/// by the Service port's name ("" when unnamed: the slice omits it too).
-/// All slices of a Service share the same port mapping, so the first match wins.
-/// Returns `None` if no slice publishes a port with that name.
-fn pick_named_port(slices: &[EndpointSlice], service_port_name: &str) -> Option<u16> {
-    slices
-        .iter()
-        .filter_map(|s| s.ports.as_ref())
-        .flatten()
-        .find(|p| p.name.as_deref().unwrap_or_default() == service_port_name)
-        .and_then(|p| p.port)
-        .and_then(|p| u16::try_from(p).ok())
+/// The port numbers a Service's EndpointSlices publish, by the Service
+/// port's name ("" when unnamed: the slice omits it too). All slices of a
+/// Service share the same port mapping, so the first match wins.
+fn slice_ports(slices: &[EndpointSlice]) -> HashMap<String, u16> {
+    let mut ports = HashMap::new();
+    for p in slices.iter().filter_map(|s| s.ports.as_ref()).flatten() {
+        if let Some(number) = p.port.and_then(|n| u16::try_from(n).ok()) {
+            ports
+                .entry(p.name.clone().unwrap_or_default())
+                .or_insert(number);
+        }
+    }
+    ports
 }
 
 /// Resolve headless *named* targetPorts via a one-shot, label-filtered
@@ -261,36 +314,54 @@ fn pick_named_port(slices: &[EndpointSlice], service_port_name: &str) -> Option<
 /// success, overwrites the `(fqdn, service_port)` entry in `out` with the numeric
 /// targetPort; on a miss or API error it leaves the service-port fallback seeded
 /// by [`resolve_services`] in place and warns. Never fatal.
+///
+/// A read is cached until the Service changes or DNS refresh sees pods
+/// change ([`NamedPortCache::dns_changed`]); passes in between read nothing.
 pub(crate) async fn resolve_named_target_ports(
     client: &Client,
+    cache: &NamedPortCache,
     reqs: &[NamedTargetPortReq],
     out: &mut HashMap<(String, u16), u16>,
 ) {
+    let epoch = cache.epoch.load(Ordering::Acquire);
     for req in reqs {
-        let api: Api<EndpointSlice> = Api::namespaced(client.clone(), &req.ns);
-        let lp = kube::api::ListParams::default()
-            .labels(&format!("kubernetes.io/service-name={}", req.svc));
-        match api.list(&lp).await {
-            Ok(list) => match pick_named_port(&list.items, &req.service_port_name) {
-                Some(port) => {
-                    let fqdn = format!("{}.{}.svc", req.svc, req.ns);
-                    out.insert((fqdn, req.service_port), port);
-                    debug!(
-                        "Headless {}/{} port {} named targetPort {:?} -> {}",
-                        req.ns, req.svc, req.service_port, req.target_port_name, port
-                    );
+        let (ports, fresh) = match cache.get(req, epoch) {
+            Some(ports) => (ports, false),
+            None => {
+                let api: Api<EndpointSlice> = Api::namespaced(client.clone(), &req.ns);
+                let lp = kube::api::ListParams::default()
+                    .labels(&format!("kubernetes.io/service-name={}", req.svc));
+                match api.list(&lp).await {
+                    Ok(list) => {
+                        let ports = slice_ports(&list.items);
+                        cache.put(req, epoch, ports.clone());
+                        (ports, true)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Headless {}/{} port {}: EndpointSlice list for named targetPort \
+                             {:?} failed ({}); using the service port",
+                            req.ns, req.svc, req.service_port, req.target_port_name, e
+                        );
+                        continue;
+                    }
                 }
-                None => warn!(
-                    "Headless {}/{} port {}: named targetPort {:?} not found in \
-                     EndpointSlices; using the service port",
-                    req.ns, req.svc, req.service_port, req.target_port_name
-                ),
-            },
-            Err(e) => warn!(
-                "Headless {}/{} port {}: EndpointSlice list for named targetPort \
-                 {:?} failed ({}); using the service port",
-                req.ns, req.svc, req.service_port, req.target_port_name, e
+            }
+        };
+        match ports.get(&req.service_port_name) {
+            Some(&port) => {
+                out.insert(req.backend(), port);
+                debug!(
+                    "Headless {}/{} port {} named targetPort {:?} -> {}",
+                    req.ns, req.svc, req.service_port, req.target_port_name, port
+                );
+            }
+            None if fresh => warn!(
+                "Headless {}/{} port {}: named targetPort {:?} not found in \
+                 EndpointSlices; using the service port",
+                req.ns, req.svc, req.service_port, req.target_port_name
             ),
+            None => {}
         }
     }
 }
@@ -300,7 +371,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pick_named_port_matches_by_name() {
+    fn slice_ports_match_by_name() {
         use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
         let slice = EndpointSlice {
             ports: Some(vec![
@@ -318,17 +389,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            pick_named_port(std::slice::from_ref(&slice), "http"),
-            Some(8080)
+            slice_ports(std::slice::from_ref(&slice)).get("http"),
+            Some(&8080)
         );
         // Unknown name → None (caller keeps the service-port fallback).
-        assert_eq!(pick_named_port(&[slice], "grpc"), None);
+        assert_eq!(slice_ports(&[slice]).get("grpc"), None);
         // No slices at all → None.
-        assert_eq!(pick_named_port(&[], "http"), None);
+        assert_eq!(slice_ports(&[]).get("http"), None);
     }
 
     #[test]
-    fn pick_named_port_scans_across_slices() {
+    fn slice_ports_scan_across_slices() {
         use k8s_openapi::api::discovery::v1::{EndpointPort, EndpointSlice};
         // The matching port lives in the second slice; the first has none.
         let empty = EndpointSlice {
@@ -343,7 +414,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        assert_eq!(pick_named_port(&[empty, has], "http"), Some(3000));
+        assert_eq!(slice_ports(&[empty, has]).get("http"), Some(&3000));
     }
 
     fn headless(
@@ -399,8 +470,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            pick_named_port(&[slice], &reqs[0].service_port_name),
-            Some(8080)
+            slice_ports(&[slice]).get(&reqs[0].service_port_name),
+            Some(&8080)
         );
 
         // An unnamed Service port: the slice port is unnamed too.
@@ -412,7 +483,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        assert_eq!(pick_named_port(&[unnamed_slice], ""), Some(3000));
+        assert_eq!(slice_ports(&[unnamed_slice]).get(""), Some(&3000));
     }
 
     #[test]

@@ -52,12 +52,15 @@ pub struct Published {
 /// mode (the standalone config-file path re-resolves on reload via
 /// `config_watcher`, not here), and it no-ops on each tick until the first
 /// reconcile populates the cell. A zero `interval` disables the task entirely.
+///
+/// `on_swap` runs after each swap: the backends' pods changed.
 pub fn spawn_dns_refresh(
     published: Arc<ArcSwapOption<Published>>,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     interval: Duration,
     shutdown: CancellationToken,
+    on_swap: impl Fn() + Send + 'static,
 ) {
     if interval.is_zero() {
         info!("DNS refresh disabled (interval is zero)");
@@ -116,7 +119,8 @@ pub fn spawn_dns_refresh(
                 SwapOutcome::Swapped => {
                     health.prune(&routes.load());
                     METRICS.dns_refresh_swaps_total.inc();
-                    info!("DNS refresh: resolved backend set changed; route table swapped")
+                    info!("DNS refresh: resolved backend set changed; route table swapped");
+                    on_swap();
                 }
                 SwapOutcome::Superseded => {
                     METRICS.dns_refresh_superseded_total.inc();
@@ -241,6 +245,43 @@ mod tests {
         let now = published.load_full().unwrap();
         assert!(Arc::ptr_eq(&now.table, &live));
         assert!(Arc::ptr_eq(&now.config, &pair.config));
+    }
+
+    /// A swap tells the controller: the backends' pods changed.
+    #[tokio::test]
+    async fn swap_runs_on_swap() {
+        let config: PortailConfig = serde_json::from_str(
+            r#"{
+                "gateway": {"name": "g", "listeners": [{"name": "h", "protocol": "HTTP", "port": 80}]},
+                "httpRoutes": [{
+                    "parentRefs": [{"name": "g", "sectionName": "h"}],
+                    "hostnames": ["a.example"],
+                    "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 8001}]}]
+                }]
+            }"#,
+        )
+        .unwrap();
+        // The live table resolved elsewhere: the next tick's rebuild differs.
+        let pair = Arc::new(Published {
+            config: Arc::new(config),
+            table: Arc::new(table_with_tcp_backend("10.0.0.1")),
+        });
+        let routes = Arc::new(ArcSwap::new(pair.table.clone()));
+        let (swapped, mut on_swap) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        spawn_dns_refresh(
+            Arc::new(ArcSwapOption::new(Some(pair))),
+            routes,
+            Arc::new(HealthRegistry::new()),
+            Duration::from_millis(10),
+            shutdown.clone(),
+            move || {
+                let _ = swapped.send(());
+            },
+        );
+        let called = tokio::time::timeout(Duration::from_secs(5), on_swap.recv()).await;
+        shutdown.cancel();
+        assert!(matches!(called, Ok(Some(()))));
     }
 
     /// A reconcile stores its table, then its pair. A tick reading between
