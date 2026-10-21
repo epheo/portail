@@ -152,8 +152,15 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
             compile_backend_filters(b).map_err(|e| e.at(format_args!("backendRef {}", i)))
         })
         .collect::<Result<_, _>>()?;
-    let matches = rule
-        .matches
+    // Gateway API v1.4.1 HTTPRouteRule.matches: "If no matches are
+    // specified, the default is a prefix path match on "/"".
+    let default_match = [HttpRouteMatch::path_prefix("/")];
+    let matches = if rule.matches.is_empty() {
+        &default_match[..]
+    } else {
+        &rule.matches[..]
+    };
+    let matches = matches
         .iter()
         .enumerate()
         .map(|(i, m)| compile_match(m).map_err(|e| e.at(format_args!("match {}", i))))

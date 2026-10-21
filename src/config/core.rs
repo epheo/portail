@@ -1335,6 +1335,28 @@ mod tests {
         assert!(!found("h.example.com", "/", b"x-v: v1\r\n", "q=v1x"));
     }
 
+    /// A rule with `matches: []`, or none at all, served nothing.
+    #[test]
+    fn a_rule_without_matches_matches_every_path() {
+        for matches in [r#""matches":[],"#, ""] {
+            let json = format!(
+                r#"{{
+                "gateway": {{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":8080}}]}},
+                "httpRoutes": [{{"hostnames":["e.example.com"],
+                    "rules":[{{{matches}"backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}]
+            }}"#
+            );
+            let config: PortailConfig = serde_json::from_str(&json).unwrap();
+            let rt = config.to_route_table().unwrap();
+            for path in ["/", "/anything/at/all"] {
+                let rule = rt
+                    .find_http_route("e.example.com", "GET", path, &[], "", 8080)
+                    .unwrap_or_else(|| panic!("{matches:?} {path}: no route"));
+                assert_eq!(rule.path_match_type, crate::routing::PathMatchType::Prefix);
+            }
+        }
+    }
+
     /// Rounded to whole percents, fraction 1/1000 became 0%: it never mirrored.
     #[test]
     fn mirror_fraction_reaches_the_table_exact() {
