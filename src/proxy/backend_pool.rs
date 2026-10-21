@@ -8,9 +8,10 @@
 //! [`SharedBackendPool`] — one pool per process, shared by every client
 //! connection (`performance.backendPoolScope: process`): cross-client reuse
 //! under client-connection churn, at the cost of a DashMap shard lock per
-//! checkout/check-in. Keyed by the full backend identity (addr, TLS, SNI)
-//! because cross-client sharing loses the per-route context the
-//! per-connection pool carried implicitly.
+//! checkout/check-in.
+//!
+//! Both key idle conns alike (see [`IdleConns`]): by address and protocol,
+//! and TLS ones also by the SNI they were opened with.
 //!
 //! On a pool hit `acquire` returns `(Connection, true)`; the caller uses that
 //! signal to retry once with a fresh conn (`acquire_fresh`) if the pooled
@@ -40,19 +41,58 @@ fn new_tls_connector() -> Arc<tokio_rustls::TlsConnector> {
     Arc::new(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
 }
 
-/// Pop idle conns until one probes alive; dead ones are discarded. A peer
-/// FIN, a reset, or a byte from a supposedly idle HTTP backend (poisoned or
-/// desynced) all make a conn unusable. The probe cannot see a close racing
-/// the next request: the caller's from_pool replay covers that.
-fn take_live(conns: &mut Vec<Connection>) -> Option<Connection> {
-    while let Some(mut conn) = conns.pop() {
-        if conn.idle_and_open() {
-            METRICS.pool_hits_total.inc();
-            return Some(conn);
+/// Idle conns to one backend address over one protocol. TLS ones are kept
+/// apart by the server name they were opened with: a conn opened for one
+/// SNI must never carry a request for another, as the backend may have
+/// picked its certificate or vhost by it. Plain conns carry no SNI and
+/// share one list. A handful of names per address at most, so a scan.
+#[derive(Default)]
+struct IdleConns(Vec<(Box<str>, Vec<Connection>)>);
+
+impl IdleConns {
+    /// Pop idle conns opened for `sni` until one probes alive; dead ones
+    /// are discarded. A peer FIN, a reset, or a byte from a supposedly
+    /// idle HTTP backend (poisoned or desynced) all make a conn unusable.
+    /// The probe cannot see a close racing the next request: the caller's
+    /// from_pool replay covers that.
+    fn take_live(&mut self, sni: &str) -> Option<Connection> {
+        let (_, conns) = self.0.iter_mut().find(|(s, _)| **s == *sni)?;
+        while let Some(mut conn) = conns.pop() {
+            if conn.idle_and_open() {
+                METRICS.pool_hits_total.inc();
+                return Some(conn);
+            }
+            METRICS.pool_stale_discards_total.inc();
         }
-        METRICS.pool_stale_discards_total.inc();
+        None
     }
-    None
+
+    fn put(&mut self, sni: &str, conn: Connection, max_idle: usize) {
+        let i = match self.0.iter().position(|(s, _)| **s == *sni) {
+            Some(i) => i,
+            None => {
+                self.0.push((sni.into(), Vec::new()));
+                self.0.len() - 1
+            }
+        };
+        let conns = &mut self.0[i].1;
+        if conns.len() < max_idle {
+            conns.push(conn);
+        } else {
+            // Drop closes the fd.
+            METRICS.pool_overflow_drops_total.inc();
+        }
+    }
+}
+
+/// The SNI an idle conn is keyed by: its server name over TLS, none in the
+/// clear.
+fn sni(use_tls: bool, server_name: &str) -> &str {
+    if use_tls {
+        server_name
+    } else {
+        ""
+    }
 }
 
 /// Why a backend connection could not be opened.
@@ -197,8 +237,7 @@ pub struct BackendPool {
     /// Keyed by (addr, use_tls): one addr can be reachable both plain and
     /// TLS (two routes, different backendRef TLS), and a plain conn handed
     /// to a TLS request (or vice versa) would speak the wrong protocol.
-    /// SNI stays out of the key to keep checkout allocation-free.
-    pools: HashMap<(SocketAddr, bool), Vec<Connection>>,
+    pools: HashMap<(SocketAddr, bool), IdleConns>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     tls_connector: Arc<tokio_rustls::TlsConnector>,
@@ -230,8 +269,8 @@ impl BackendPool {
         server_name: &str,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
-        if let Some(conns) = self.pools.get_mut(&(addr, use_tls)) {
-            if let Some(conn) = take_live(conns) {
+        if let Some(idle) = self.pools.get_mut(&(addr, use_tls)) {
+            if let Some(conn) = idle.take_live(sni(use_tls, server_name)) {
                 debug!("Pool hit: reusing connection to {}", addr);
                 return Ok((conn, true));
             }
@@ -270,14 +309,18 @@ impl BackendPool {
         .await
     }
 
-    pub fn release(&mut self, addr: SocketAddr, use_tls: bool, conn: Connection) {
-        let conns = self.pools.entry((addr, use_tls)).or_default();
-        if conns.len() < self.max_idle_per_backend {
-            conns.push(conn);
-        } else {
-            // Drop closes the fd.
-            METRICS.pool_overflow_drops_total.inc();
-        }
+    pub fn release(
+        &mut self,
+        addr: SocketAddr,
+        use_tls: bool,
+        server_name: &str,
+        conn: Connection,
+    ) {
+        self.pools.entry((addr, use_tls)).or_default().put(
+            sni(use_tls, server_name),
+            conn,
+            self.max_idle_per_backend,
+        );
     }
 }
 
@@ -287,7 +330,7 @@ impl BackendPool {
 /// per-connection pool, dead idle conns are discarded at checkout by the
 /// probe, with the caller's from_pool retry as the safety net.
 pub struct SharedBackendPool {
-    pools: DashMap<(SocketAddr, bool, String), Vec<Connection>>,
+    pools: DashMap<(SocketAddr, bool), IdleConns>,
     max_idle_per_backend: usize,
     connect_timeout: Duration,
     tls_connector: Arc<tokio_rustls::TlsConnector>,
@@ -311,11 +354,8 @@ impl SharedBackendPool {
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
         // Shard lock held only for the sync pop+probe loop, never across await.
-        if let Some(mut entry) = self
-            .pools
-            .get_mut(&(addr, use_tls, server_name.to_string()))
-        {
-            if let Some(conn) = take_live(&mut entry) {
+        if let Some(mut idle) = self.pools.get_mut(&(addr, use_tls)) {
+            if let Some(conn) = idle.take_live(sni(use_tls, server_name)) {
                 debug!("Shared pool hit: reusing connection to {}", addr);
                 return Ok((conn, true));
             }
@@ -353,16 +393,11 @@ impl SharedBackendPool {
     }
 
     pub fn release(&self, addr: SocketAddr, use_tls: bool, server_name: &str, conn: Connection) {
-        let mut conns = self
-            .pools
-            .entry((addr, use_tls, server_name.to_string()))
-            .or_default();
-        if conns.len() < self.max_idle_per_backend {
-            conns.push(conn);
-        } else {
-            // Drop closes the fd.
-            METRICS.pool_overflow_drops_total.inc();
-        }
+        self.pools.entry((addr, use_tls)).or_default().put(
+            sni(use_tls, server_name),
+            conn,
+            self.max_idle_per_backend,
+        );
     }
 }
 
@@ -409,7 +444,7 @@ impl PoolHandle {
         conn: Connection,
     ) {
         match self {
-            PoolHandle::PerConn(p) => p.release(addr, use_tls, conn),
+            PoolHandle::PerConn(p) => p.release(addr, use_tls, server_name, conn),
             PoolHandle::Shared(p) => p.release(addr, use_tls, server_name, conn),
         }
     }
@@ -561,6 +596,85 @@ mod tests {
         server.flush().await.unwrap();
         client.read_exact(&mut [0u8; 1]).await.unwrap();
         Some((Connection::ClientTls { inner: client }, server))
+    }
+
+    /// TLS server greeting each connection with one byte, which a client
+    /// reads past the session tickets as a response would; `None` without
+    /// openssl.
+    async fn tls_server() -> Option<SocketAddr> {
+        let (cert_pem, key_pem) = crate::proxy::tls::test_util::generate_test_cert("s.test")?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = crate::config::CertificateRef {
+            name: "s".to_string(),
+            cert_pem: Some(cert_pem),
+            key_pem: Some(key_pem),
+            ..Default::default()
+        };
+        let server_cfg =
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    if tls.write_all(b"x").await.is_ok() && tls.flush().await.is_ok() {
+                        let _ = tls.read_to_end(&mut Vec::new()).await;
+                    }
+                });
+            }
+        });
+        Some(addr)
+    }
+
+    /// A conn opened with one SNI must never carry a request for another:
+    /// the backend picked its certificate and vhost by it. Plain conns
+    /// carry no SNI, and both pool scopes key alike.
+    #[tokio::test]
+    async fn tls_conns_are_pooled_by_sni_plain_ones_by_address() {
+        use tokio::io::AsyncReadExt;
+        let Some(tls) = tls_server().await else {
+            return; // openssl unavailable
+        };
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let plain_addr = plain.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = plain.accept().await {
+                held.push(sock);
+            }
+        });
+        let keepalive = TcpKeepalive::new();
+        let timeout = Duration::from_secs(2);
+        for mut pool in [
+            PoolHandle::PerConn(BackendPool::new(4, timeout)),
+            PoolHandle::Shared(Arc::new(SharedBackendPool::new(4, timeout))),
+        ] {
+            let (mut conn, _) = pool.acquire(tls, true, "a.test", &keepalive).await.unwrap();
+            conn.read_exact(&mut [0u8; 1]).await.unwrap();
+            pool.release(tls, true, "a.test", conn);
+            let (_, reused) = pool.acquire(tls, true, "b.test", &keepalive).await.unwrap();
+            assert!(!reused, "a conn opened for a.test served b.test");
+            let (_, reused) = pool.acquire(tls, true, "a.test", &keepalive).await.unwrap();
+            assert!(reused, "a.test lost its pooled conn");
+
+            let (conn, _) = pool
+                .acquire(plain_addr, false, "x", &keepalive)
+                .await
+                .unwrap();
+            pool.release(plain_addr, false, "x", conn);
+            let (_, reused) = pool
+                .acquire(plain_addr, false, "y", &keepalive)
+                .await
+                .unwrap();
+            assert!(reused, "a plain conn was keyed by server name");
+        }
     }
 
     #[tokio::test]
