@@ -48,6 +48,42 @@ pub(crate) mod test_util {
         }
     }
 
+    /// A log sink a test reads back.
+    #[derive(Clone, Default)]
+    pub(crate) struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Lines at WARN and above logged on this thread while the guard
+        /// lives.
+        pub(crate) fn warnings() -> (Self, tracing::subscriber::DefaultGuard) {
+            let log = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     /// Whether the test `name` in `module` runs in a process of its own,
     /// as a lowered fd limit would starve every test running beside it.
     /// The parent runs it in a child process, asserts it passed, and gets

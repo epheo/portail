@@ -711,47 +711,12 @@ mod tests {
         }
     }
 
-    /// A log sink a test reads back.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Captured {
-        /// Warnings this thread logs until the guard drops.
-        fn warnings() -> (Self, tracing::subscriber::DefaultGuard) {
-            let log = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer({
-                    let log = log.clone();
-                    move || log.clone()
-                })
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-            (log, tracing::subscriber::set_default(subscriber))
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
     /// Out of fds, every datagram from a new source fails to open its
     /// session, and a spoofed flood sends those at packet rate: one line
     /// per window, not one per datagram.
     #[test]
     fn running_out_of_fds_logs_once_per_window() {
-        use crate::proxy::test_util::{in_own_process, FdsExhausted};
+        use crate::proxy::test_util::{in_own_process, Captured, FdsExhausted};
         if !in_own_process(module_path!(), "running_out_of_fds_logs_once_per_window") {
             return;
         }
@@ -788,7 +753,7 @@ mod tests {
     /// the proxy's own shortage.
     #[test]
     fn failing_toward_the_backend_logs_once_per_window() {
-        use crate::proxy::test_util::in_own_process;
+        use crate::proxy::test_util::{in_own_process, Captured};
         if !in_own_process(
             module_path!(),
             "failing_toward_the_backend_logs_once_per_window",
