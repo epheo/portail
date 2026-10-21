@@ -1970,6 +1970,18 @@ fn test_sigterm_drains_in_kubernetes_mode() {
     );
 }
 
+/// A controller that stops, here because no cluster config exists, must
+/// take the process down for kubelet to restart it, not leave the pod
+/// NotReady forever while /livez still answers 200.
+#[test]
+fn test_controller_failure_exits_nonzero() {
+    let mut proxy = PortailProcess::start_kubernetes(None, 25085);
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("still running without a controller:\n{}", proxy.output()));
+    assert!(!status.success(), "{status}:\n{}", proxy.output());
+}
+
 /// SIGTERM: idle connections close at once (keepalive, or one that has not
 /// sent its first request yet), an in-flight exchange finishes and
 /// announces the close, and the process exits well inside the 30s drain
