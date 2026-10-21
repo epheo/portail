@@ -3471,3 +3471,47 @@ fn equally_specific_http_routes_oldest_wins() {
     assert_eq!(winner(vec![b.clone(), a.clone()]), 8003);
     assert_eq!(winner(vec![a, b]), 8003);
 }
+
+/// Same age: the route first by "{namespace}/{name}" wins (HTTPRouteRule
+/// matches). The (namespace, name) pair put a/z before a-b/c; the string
+/// puts "a-b/c" first, as '-' sorts before '/'.
+#[test]
+fn same_age_routes_tie_break_on_the_namespace_slash_name_string() {
+    let mut web = gw_listener("web", 80, "HTTP");
+    web.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![web]);
+    let route = |ns: &str, name: &str, port: i32| {
+        let mut r = app_route(
+            name,
+            ns,
+            vec![http_parent(Some("default"), None)],
+            &[("127.0.0.1", None, port, 1)],
+        );
+        r.metadata.creation_timestamp = created(100);
+        r
+    };
+    let mut services = loopback_services();
+    for ns in ["a", "a-b"] {
+        services
+            .known_services
+            .insert(("127.0.0.1".to_string(), ns.to_string()));
+    }
+    let winner = |routes: Vec<HTTPRoute>| {
+        let snapshot = snapshot_of(routes, vec![], vec![]);
+        let mut config = reconcile_to_config(&gw, &snapshot, &HashMap::new(), &services)
+            .unwrap()
+            .config;
+        fixup_backends_for_test(&mut config);
+        config
+            .to_route_table()
+            .unwrap()
+            .find_http_route("app.example.com", "GET", "/", &[], "", 80)
+            .unwrap()
+            .backends[0]
+            .socket_addr
+            .port()
+    };
+    let (a_z, a_b_c) = (route("a", "z", 8001), route("a-b", "c", 8002));
+    assert_eq!(winner(vec![a_z.clone(), a_b_c.clone()]), 8002);
+    assert_eq!(winner(vec![a_b_c, a_z]), 8002);
+}

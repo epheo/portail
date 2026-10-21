@@ -566,13 +566,19 @@ struct RouteCollectCtx<'a> {
 }
 
 /// Gateway API precedence between routes whose matches tie: the oldest
-/// creationTimestamp, then namespace/name (Listener.allowedRoutes).
-fn precedence<R: GatewayRoute>(route: &R) -> (Option<&Time>, &str, &str) {
-    (
-        route.creation_timestamp(),
-        route.route_namespace(),
-        route.identity().0,
-    )
+/// creationTimestamp, then "{namespace}/{name}" in alphabetical order
+/// (HTTPRouteRule.matches). The string, not the (namespace, name) pair:
+/// "a-b/c" sorts before "a/z".
+fn precedence<R: GatewayRoute>(a: &R, b: &R) -> std::cmp::Ordering {
+    fn key<R: GatewayRoute>(r: &R) -> impl Iterator<Item = u8> + '_ {
+        r.route_namespace()
+            .bytes()
+            .chain(std::iter::once(b'/'))
+            .chain(r.identity().0.bytes())
+    }
+    a.creation_timestamp()
+        .cmp(&b.creation_timestamp())
+        .then_with(|| key(a).cmp(key(b)))
 }
 
 /// Generic route collection with namespace scoping and acceptance tracking.
@@ -596,7 +602,7 @@ fn collect_routes<R: GatewayRoute>(
             )
         })
         .collect();
-    ordered.sort_by(|a, b| precedence(*a).cmp(&precedence(*b)));
+    ordered.sort_by(|a, b| precedence(*a, *b));
 
     // Ports an older route already serves (ONE_ROUTE_PER_LISTENER kinds).
     // Keyed by port like the table: two listeners on one port share a socket.
