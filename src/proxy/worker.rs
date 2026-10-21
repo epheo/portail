@@ -3168,6 +3168,28 @@ mod connection_tests {
         assert!(out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{out}");
     }
 
+    /// Two routes to one TLS backend under different SNIs: a conn pooled
+    /// for one served the other, whose request then met the first one's
+    /// certificate and vhost.
+    #[tokio::test]
+    async fn pooled_tls_conn_serves_only_its_own_sni() {
+        let Some(addr) = scripted_tls_backend(|_, _| Turn::Answer).await else {
+            return; // openssl unavailable
+        };
+        let rt = tls_routes(addr, &[("a.test", "a.sni"), ("b.test", "b.sni")]);
+        let (mut client, _task) = serve(rt);
+        for (host, sni) in [
+            ("a.test", "a.sni"),
+            ("b.test", "b.sni"),
+            ("a.test", "a.sni"),
+        ] {
+            let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            let out = response(&mut client).await;
+            assert!(out.ends_with(&format!("\r\n\r\n{sni}")), "{host}: {out}");
+        }
+    }
+
     /// RLIMIT_NOFILE lowered to the lowest free fd, so the next socket()
     /// fails with EMFILE; the old limit comes back on drop.
     struct FdsExhausted(libc::rlimit);
