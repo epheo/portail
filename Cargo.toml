@@ -20,6 +20,9 @@ fastrand = "2"
 fnv = "1.0"
 memchr = "2"
 regex = "1"
+# Parses a route regex on its own before it is anchored. Already in the
+# tree via regex; this only promotes it to a direct dependency.
+regex-syntax = "0.8"
 arc-swap = "1"
 anyhow = "1.0"
 bytes = "1"

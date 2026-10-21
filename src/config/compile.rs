@@ -352,10 +352,19 @@ fn value_matcher(
     })
 }
 
+/// Gateway API leaves the dialect to the implementation: this is the regex
+/// crate's. A pattern matches the whole value, as in Envoy-based
+/// implementations, so path regex `/api` does not match `/static/api/x`.
 fn compile_regex(pattern: &str, what: &str) -> Result<regex::Regex, RouteError> {
-    regex::Regex::new(pattern).map_err(|e| {
+    let invalid = |e: &dyn fmt::Display| {
         RouteError::unsupported(format!("Invalid {} regex '{}': {}", what, pattern, e))
-    })
+    };
+    // Alone first: a stray ')' would close the anchoring group and turn an
+    // invalid pattern into a valid one.
+    regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .map_err(|e| invalid(&e))?;
+    regex::Regex::new(&format!("^(?:{})$", pattern)).map_err(|e| invalid(&e))
 }
 
 fn compile_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError> {
@@ -472,5 +481,29 @@ impl From<&HttpURLRewritePath> for routing::URLRewritePath {
                 Self::ReplacePrefixMatch(value.clone())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_regex_is_judged_alone_before_it_is_anchored() {
+        // Anchored as is, "/a)(/b" reads ^(?:/a)(/b)$: valid, and wrong.
+        let err = compile_regex("/a)(/b", "path").unwrap_err();
+        assert_eq!(err.reason, RejectReason::UnsupportedValue);
+        assert!(
+            err.message.starts_with("Invalid path regex '/a)(/b'"),
+            "{}",
+            err.message
+        );
+
+        // The group keeps an alternation whole: ^/api|/v2$ would match "/x/v2".
+        let re = compile_regex("/api|/v[0-9]+", "path").unwrap();
+        assert!(re.is_match("/api") && re.is_match("/v2"));
+        assert!(!re.is_match("/x/v2") && !re.is_match("/api/x"));
+        assert!(compile_regex("^/a.*$", "path").unwrap().is_match("/abc"));
+        assert!(compile_regex("(?i)/api", "path").unwrap().is_match("/API"));
     }
 }

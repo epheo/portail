@@ -1308,6 +1308,36 @@ mod tests {
         );
     }
 
+    /// Unanchored, path regex `/api` matched `/static/api/x`, and header or
+    /// query regex `v1` matched `xv1x`.
+    #[test]
+    fn regex_matches_are_full_matches() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [
+                {"hostnames":["p.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"RegularExpression","value":"/api"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]},
+                {"hostnames":["h.example.com"],
+                 "rules":[{"matches":[{"headers":[{"name":"x-v","type":"RegularExpression","value":"v1"}],
+                                       "queryParams":[{"name":"q","type":"RegularExpression","value":"v1"}]}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let found = |host, path, headers: &[u8], query| {
+            rt.find_http_route(host, "GET", path, headers, query, 8080)
+                .is_some()
+        };
+        assert!(found("p.example.com", "/api", b"", ""));
+        assert!(!found("p.example.com", "/static/api/x", b"", ""));
+        assert!(!found("p.example.com", "/api/x", b"", ""));
+        assert!(found("h.example.com", "/", b"x-v: v1\r\n", "q=v1"));
+        assert!(!found("h.example.com", "/", b"x-v: xv1x\r\n", "q=v1"));
+        assert!(!found("h.example.com", "/", b"x-v: v1\r\n", "q=v1x"));
+    }
+
     /// IP literals resolve to themselves, `multi.svc` to two pods, any other
     /// name fails. Records every lookup.
     fn fake_dns(
