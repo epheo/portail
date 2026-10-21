@@ -65,7 +65,11 @@ pub(crate) trait GatewayRoute: Sized {
     fn hostnames(&self) -> &[String] {
         &[]
     }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config>;
+    /// The converted config carries no parentRefs: see `attach`.
+    fn convert(&self) -> Result<Self::Config>;
+    /// The one source of attachment for the table: one ref per listener
+    /// the route was accepted on, never re-derived from the spec's refs.
+    fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>);
     fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
     fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
     /// Mirror-filter backend refs (HTTPRoute only). Validated like forward
@@ -118,8 +122,11 @@ macro_rules! impl_gateway_route {
             fn creation_timestamp(&self) -> Option<&Time> {
                 self.metadata.creation_timestamp.as_ref()
             }
-            fn convert(&self, gw: &str) -> Result<Self::Config> {
-                $cv(self, gw)
+            fn convert(&self) -> Result<Self::Config> {
+                $cv(self)
+            }
+            fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>) {
+                config.parent_refs = parent_refs;
             }
             fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
                 config
@@ -669,7 +676,7 @@ fn collect_routes<R: GatewayRoute>(
             continue;
         }
 
-        match route.convert(cx.gateway_name) {
+        match route.convert() {
             Ok(mut config) => {
                 let mut refs_resolved = true;
                 let mut refs_messages = Vec::new();
@@ -777,6 +784,27 @@ fn collect_routes<R: GatewayRoute>(
                         Err(reason) => route_status.push(rejection(section_name, *port, reason)),
                     }
                 }
+                let mut attached: Vec<&String> = Vec::new();
+                for listener in per_parent
+                    .iter()
+                    .filter_map(|(_, _, result)| result.as_ref().ok())
+                    .flatten()
+                {
+                    if !attached.contains(&listener) {
+                        attached.push(listener);
+                    }
+                }
+                R::attach(
+                    &mut config,
+                    attached
+                        .into_iter()
+                        .map(|listener| ParentRef {
+                            name: cx.gateway_name.to_string(),
+                            section_name: Some(listener.clone()),
+                            port: None,
+                        })
+                        .collect(),
+                );
                 configs.push(config);
             }
             Err(e) => {

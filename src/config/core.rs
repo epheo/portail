@@ -144,22 +144,22 @@ impl PortailConfig {
                 http_route.rules.len()
             );
 
-            // Find all matching listeners for this route's parentRefs.
-            // A route may target a specific listener (sectionName) or all listeners (no sectionName).
             let matched_listeners =
                 find_listeners_for_route(&http_route.parent_refs, &self.gateway);
 
-            // No matching listener: route without gateway context (file-based
+            // No parentRefs: route without gateway context (file-based
             // configs). One pseudo-scope on port 0 with no hostname
             // constraint, so hostname intersection passes routes through.
             // Rate limiting rides the listener, so the pseudo-scope has none.
+            // Refs that select no listener attach nowhere: the any-port scope
+            // would serve the route on every port.
             type Scope<'a> = (
                 u16,
                 Option<&'a str>,
                 &'a str,
                 Option<std::sync::Arc<crate::rate_limit::Limiter>>,
             );
-            let scopes: Vec<Scope> = if matched_listeners.is_empty() {
+            let scopes: Vec<Scope> = if http_route.parent_refs.is_empty() {
                 vec![(0, None, "", None)]
             } else {
                 matched_listeners
@@ -251,7 +251,7 @@ impl PortailConfig {
         self.convert_l4_routes(&mut route_table, &self.udp_routes, true);
 
         // Convert TLS routes (SNI-based), scoped to the ports of the TLS
-        // listeners their parentRefs attach to. Without gateway context
+        // listeners their parentRefs attach to. Without parentRefs
         // (file-based configs) they land in the any-port (0) scope.
         for tls_route in &self.tls_routes {
             let matched_listeners = find_listeners_for_route(&tls_route.parent_refs, &self.gateway);
@@ -262,7 +262,7 @@ impl PortailConfig {
                 .collect();
             ports.sort_unstable();
             ports.dedup();
-            if ports.is_empty() {
+            if tls_route.parent_refs.is_empty() {
                 ports.push(0);
             }
 
@@ -347,9 +347,9 @@ fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routi
         .collect()
 }
 
-/// Find all listeners that a route attaches to via its parentRefs.
-/// A route without sectionName attaches to all listeners.
-/// A route with sectionName attaches only to that specific listener.
+/// Listeners a route's parentRefs select, in both modes. In Kubernetes mode
+/// each ref names one listener the reconciler accepted the route on; in a
+/// file config an unset sectionName or port selects every listener.
 fn find_listeners_for_route<'a>(
     parent_refs: &[ParentRef],
     gateway: &'a GatewayConfig,

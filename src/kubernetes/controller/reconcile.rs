@@ -330,9 +330,7 @@ fn count_attached_routes(
 ///
 /// Listener names and route parentRef sectionNames are prefixed with their
 /// Gateway's identity so a route can never cross-match a same-named listener
-/// on another Gateway; parentRefs without a sectionName are expanded to one
-/// ref per listener of *their own* Gateway for the same reason (an unscoped
-/// ref would attach to every merged listener).
+/// on another Gateway.
 fn merge_gateway_configs(
     configs: &HashMap<(String, String), Arc<crate::config::PortailConfig>>,
 ) -> crate::config::PortailConfig {
@@ -352,48 +350,28 @@ fn merge_gateway_configs(
         for l in &mut c.gateway.listeners {
             l.name = format!("{}{}", prefix, l.name);
         }
-        // (name, port) pairs of this Gateway's listeners, post-prefixing,
-        // used to expand sectionName-less parentRefs.
-        let listener_names: Vec<(String, u16)> = c
-            .gateway
-            .listeners
-            .iter()
-            .map(|l| (l.name.clone(), l.port))
-            .collect();
-        let expand = |refs: &mut Vec<ParentRef>| {
-            let mut out = Vec::with_capacity(refs.len());
-            for pr in refs.drain(..) {
-                match &pr.section_name {
-                    Some(section) => out.push(ParentRef {
-                        section_name: Some(format!("{}{}", prefix, section)),
-                        ..pr
-                    }),
-                    None => {
-                        for (lname, lport) in &listener_names {
-                            if pr.port.is_none_or(|p| *lport == p as u16) {
-                                out.push(ParentRef {
-                                    name: pr.name.clone(),
-                                    section_name: Some(lname.clone()),
-                                    port: pr.port,
-                                });
-                            }
-                        }
-                    }
+        // The reconciler names every attached listener. A ref without a
+        // sectionName would select every merged Gateway's listeners.
+        let scope = |refs: &mut Vec<ParentRef>| {
+            refs.retain_mut(|pr| match &mut pr.section_name {
+                Some(section) => {
+                    section.insert_str(0, &prefix);
+                    true
                 }
-            }
-            *refs = out;
+                None => false,
+            })
         };
         for r in &mut c.http_routes {
-            expand(&mut r.parent_refs);
+            scope(&mut r.parent_refs);
         }
         for r in &mut c.tcp_routes {
-            expand(&mut r.parent_refs);
+            scope(&mut r.parent_refs);
         }
         for r in &mut c.udp_routes {
-            expand(&mut r.parent_refs);
+            scope(&mut r.parent_refs);
         }
         for r in &mut c.tls_routes {
-            expand(&mut r.parent_refs);
+            scope(&mut r.parent_refs);
         }
 
         merged.gateway.listeners.extend(c.gateway.listeners);
@@ -1163,8 +1141,8 @@ mod tests {
     }
 
     /// Unscoped mode: merging two Gateways' configs must keep every route,
-    /// prefix listener names per Gateway, and expand sectionName-less
-    /// parentRefs to their own Gateway's listeners only — never the other's.
+    /// and prefix listener and parentRef names per Gateway so each route
+    /// stays on its own Gateway's listeners only, never the other's.
     #[test]
     fn merge_gateway_configs_isolates_gateways() {
         use crate::config::{
@@ -1190,10 +1168,10 @@ mod tests {
                     addresses: vec![],
                 },
                 http_routes: vec![HttpRouteConfig {
-                    // No sectionName: attaches to all of THIS gateway's listeners.
+                    // As the reconciler attaches: one ref per accepted listener.
                     parent_refs: vec![ParentRef {
                         name: gw.to_string(),
-                        section_name: None,
+                        section_name: Some(listener.to_string()),
                         port: None,
                     }],
                     hostnames: vec![host.to_string()],
@@ -1225,7 +1203,7 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["ns-a/gw-a/http", "ns-b/gw-b/http"]);
 
-        // Both routes survive; each parentRef was expanded to exactly its own
+        // Both routes survive; each parentRef names exactly its own
         // Gateway's (prefixed) listener.
         assert_eq!(merged.http_routes.len(), 2);
         let route_a = merged

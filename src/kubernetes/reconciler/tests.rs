@@ -2780,6 +2780,127 @@ fn app_served_on(table: &RouteTable, port: u16) -> bool {
         .is_ok()
 }
 
+fn status_of<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance {
+    result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == name)
+        .unwrap()
+}
+
+/// k8s #1: status attached a route from another namespace only to the
+/// listener admitting every namespace, yet the table re-derived attachment
+/// from the raw parentRef and also served it on the Same-namespace listener.
+#[test]
+fn attachment_follows_allowed_routes_namespaces() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![gw_listener("same", 80, "HTTP"), all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(Some("default"), None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert!(status_of(&result, "r").accepted);
+    assert_eq!(status_of(&result, "r").listener_names, vec!["all"]);
+    let attached: Vec<_> = result.config.http_routes[0]
+        .parent_refs
+        .iter()
+        .map(|pr| pr.section_name.as_deref())
+        .collect();
+    assert_eq!(attached, vec![Some("all")], "the config names the listener");
+    assert!(app_served_on(&table, 8080));
+    assert!(
+        !app_served_on(&table, 80),
+        "served on a listener that does not admit the route's namespace"
+    );
+}
+
+/// k8s #1: allowedRoutes.kinds was bypassed the same way.
+#[test]
+fn attachment_follows_allowed_routes_kinds() {
+    let mut grpc_only = gw_listener("grpc-only", 8080, "HTTP");
+    grpc_only.allowed_routes = Some(GatewayListenersAllowedRoutes {
+        namespaces: None,
+        kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+            group: None,
+            kind: "GRPCRoute".to_string(),
+        }]),
+    });
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP"), grpc_only]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert_eq!(status_of(&result, "r").listener_names, vec!["web"]);
+    assert!(app_served_on(&table, 80));
+    assert!(
+        !app_served_on(&table, 8080),
+        "served on a listener whose allowedRoutes.kinds excludes HTTPRoute"
+    );
+}
+
+/// k8s #1: a ref to other-ns/gw's listener "b" attached to default/gw's
+/// listener "b": the table filtered parentRefs by Gateway name only.
+#[test]
+fn attachment_ignores_a_same_named_gateway_elsewhere() {
+    let gw = attach_gateway(vec![
+        gw_listener("a", 80, "HTTP"),
+        gw_listener("b", 8080, "HTTP"),
+    ]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![
+            http_parent(None, Some("a")),
+            http_parent(Some("other-ns"), Some("b")),
+        ],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert_eq!(
+        result.route_status.len(),
+        1,
+        "only the ref to default/gw is ours"
+    );
+    assert!(app_served_on(&table, 80));
+    assert!(
+        !app_served_on(&table, 8080),
+        "served through a ref to another namespace's Gateway"
+    );
+}
+
+/// A listener the data plane cannot run (unsupported protocol) accepted the
+/// route; no configured listener matched its ref, so it fell into the
+/// any-port scope and was served on every port.
+#[test]
+fn route_on_an_unservable_listener_is_served_nowhere() {
+    let gw = attach_gateway(vec![
+        gw_listener("web", 80, "HTTP"),
+        gw_listener("grpc", 9090, "GRPC"),
+    ]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, Some("grpc"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    let status = status_of(&result, "r");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "NotAllowedByListeners");
+    assert!(!app_served_on(&table, 80), "leaked onto every port");
+}
+
 /// An unset parentRef namespace is the route's own: a route in other-ns
 /// naming "gw" targets other-ns/gw, never default/gw, even where default/gw
 /// admits every namespace.

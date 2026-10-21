@@ -14,7 +14,7 @@ use gateway_api::httproutes::*;
 use crate::config::*;
 use crate::logging::warn;
 
-use super::parent_ref::{extract_parent_refs, L4BackendRefAccess};
+use super::parent_ref::L4BackendRefAccess;
 
 // ---------------------------------------------------------------------------
 // Type alias for TLS certificate data
@@ -144,9 +144,8 @@ fn convert_listener(
 // HTTP route conversion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn convert_http_route(route: &HTTPRoute, gateway_name: &str) -> Result<HttpRouteConfig> {
+pub(crate) fn convert_http_route(route: &HTTPRoute) -> Result<HttpRouteConfig> {
     let ns = route_namespace(&route.metadata);
-    let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let hostnames = route.spec.hostnames.clone().unwrap_or_default();
 
     let rules = route
@@ -164,7 +163,7 @@ pub(crate) fn convert_http_route(route: &HTTPRoute, gateway_name: &str) -> Resul
         .unwrap_or_default();
 
     Ok(HttpRouteConfig {
-        parent_refs,
+        parent_refs: Vec::new(),
         hostnames,
         rules,
     })
@@ -605,9 +604,8 @@ fn convert_l4_backend_refs<B: L4BackendRefAccess>(
         .collect()
 }
 
-pub(crate) fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<TcpRouteConfig> {
+pub(crate) fn convert_tcp_route(route: &TCPRoute) -> Result<TcpRouteConfig> {
     let ns = route_namespace(&route.metadata);
-    let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let rules = route
         .spec
         .rules
@@ -616,12 +614,14 @@ pub(crate) fn convert_tcp_route(route: &TCPRoute, gateway_name: &str) -> Result<
             backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "TCP", Some(80)),
         })
         .collect();
-    Ok(TcpRouteConfig { parent_refs, rules })
+    Ok(TcpRouteConfig {
+        parent_refs: Vec::new(),
+        rules,
+    })
 }
 
-pub(crate) fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<TlsRouteConfig> {
+pub(crate) fn convert_tls_route(route: &TLSRoute) -> Result<TlsRouteConfig> {
     let ns = route_namespace(&route.metadata);
-    let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let hostnames = route.spec.hostnames.clone();
     let rules = route
         .spec
@@ -632,15 +632,14 @@ pub(crate) fn convert_tls_route(route: &TLSRoute, gateway_name: &str) -> Result<
         })
         .collect();
     Ok(TlsRouteConfig {
-        parent_refs,
+        parent_refs: Vec::new(),
         hostnames,
         rules,
     })
 }
 
-pub(crate) fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<UdpRouteConfig> {
+pub(crate) fn convert_udp_route(route: &UDPRoute) -> Result<UdpRouteConfig> {
     let ns = route_namespace(&route.metadata);
-    let parent_refs = extract_parent_refs(&route.spec.parent_refs, gateway_name);
     let rules = route
         .spec
         .rules
@@ -649,7 +648,10 @@ pub(crate) fn convert_udp_route(route: &UDPRoute, gateway_name: &str) -> Result<
             backend_refs: convert_l4_backend_refs(&r.backend_refs, ns, "UDP", None),
         })
         .collect();
-    Ok(UdpRouteConfig { parent_refs, rules })
+    Ok(UdpRouteConfig {
+        parent_refs: Vec::new(),
+        rules,
+    })
 }
 
 // ---------------------------------------------------------------------------

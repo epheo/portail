@@ -8,8 +8,6 @@ use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
 use gateway_api::httproutes::*;
 
-use crate::config::ParentRef;
-
 // ---------------------------------------------------------------------------
 // ParentRefAccess — abstracts over HTTPRouteParentRefs, TCPRouteParentRefs, etc.
 // ---------------------------------------------------------------------------
@@ -127,24 +125,4 @@ pub(crate) fn route_targets_gateway<T: ParentRefAccess>(
         refs.iter()
             .any(|pr| parent_ref_matches_gateway(pr, route_ns, gateway_name, gateway_ns))
     })
-}
-
-/// Extract ParentRef configs for parentRefs targeting this gateway.
-pub(crate) fn extract_parent_refs<T: ParentRefAccess>(
-    parent_refs: &Option<Vec<T>>,
-    gateway_name: &str,
-) -> Vec<ParentRef> {
-    parent_refs
-        .as_ref()
-        .map(|refs| {
-            refs.iter()
-                .filter(|pr| pr.ref_name() == gateway_name)
-                .map(|pr| ParentRef {
-                    name: pr.ref_name().to_string(),
-                    section_name: pr.ref_section_name().map(String::from),
-                    port: pr.ref_port(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
