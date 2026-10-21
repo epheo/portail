@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
@@ -159,8 +159,23 @@ fn tls_holds_input<D>(tls: &mut rustls::ConnectionCommon<D>) -> bool {
 pub enum TlsKind {
     /// HTTPS: handshake with the port's terminating config, then HTTP.
     Terminate,
+    /// HTTPS whose certs did not load: closed before a handshake. The
+    /// port's config would answer with another listener's cert.
+    NoCert,
     /// TLS Passthrough: forward the raw stream, ClientHello first.
     Passthrough,
+}
+
+impl TlsKind {
+    /// Which of two listeners on one hostname takes it: HTTPS, and among
+    /// HTTPS the one whose certs loaded.
+    fn rank(self) -> u8 {
+        match self {
+            TlsKind::Passthrough => 0,
+            TlsKind::NoCert => 1,
+            TlsKind::Terminate => 2,
+        }
+    }
 }
 
 /// The listener an SNI selects on a TLS port.
@@ -194,7 +209,7 @@ pub struct TlsPlan {
 impl TlsPlan {
     /// Two listeners on one hostname are indistinct and the controller
     /// accepts neither; merged Gateways can still bring both. HTTPS wins
-    /// then, whatever their order.
+    /// then, whatever their order, and one whose certs loaded.
     pub fn add(&mut self, hostname: Option<&str>, kind: TlsKind) {
         self.passes_through |= kind == TlsKind::Passthrough;
         let hostname = hostname.map(str::to_ascii_lowercase);
@@ -202,9 +217,8 @@ impl TlsPlan {
             kind,
             hostname: hostname.as_deref().map(Arc::from),
         };
-        let replaces = |held: Option<&TlsListener>| {
-            held.is_none_or(|held| held.kind == TlsKind::Passthrough && kind == TlsKind::Terminate)
-        };
+        let replaces =
+            |held: Option<&TlsListener>| held.is_none_or(|held| held.kind.rank() < kind.rank());
         match hostname.as_deref() {
             None => {
                 if replaces(self.catch_all.as_ref()) {
@@ -249,7 +263,8 @@ impl TlsPlan {
 }
 
 /// SNI-based certificate resolver, by the precedence `TlsPlan::select`
-/// picks the HTTPS listener with: the cert served is that listener's.
+/// picks the HTTPS listener with: the cert served is that listener's. A
+/// listener whose certs did not load never gets here ([`TlsKind::NoCert`]).
 /// Returns None if no matching cert is found (no fallback to a default cert).
 #[derive(Debug)]
 struct SniCertResolver {
@@ -400,6 +415,27 @@ pub fn build_server_config(
     cert_dir: &Path,
     http2: bool,
 ) -> Result<ServerConfig> {
+    build_terminating(cert_refs, cert_dir, http2).map(|(config, _)| config)
+}
+
+/// What tells a port's certificate refs apart from pass to pass: the
+/// Secret, and the listener hostname it serves.
+pub(crate) type CertKey = (Option<String>, String, Option<String>);
+
+pub(crate) fn cert_key(cert_ref: &CertificateRef) -> CertKey {
+    (
+        cert_ref.namespace.clone(),
+        cert_ref.name.clone(),
+        cert_ref.hostname.clone(),
+    )
+}
+
+/// [`build_server_config`], with the refs whose certs loaded.
+pub(crate) fn build_terminating(
+    cert_refs: &[CertificateRef],
+    cert_dir: &Path,
+    http2: bool,
+) -> Result<(ServerConfig, HashSet<CertKey>)> {
     if cert_refs.is_empty() {
         return Err(anyhow!(
             "TLS Terminate mode requires at least one certificateRef"
@@ -414,6 +450,7 @@ pub fn build_server_config(
     let mut wildcard_map = HashMap::new();
     let mut by_name = HashMap::new();
     let mut fallback_key = None;
+    let mut loaded = HashSet::new();
 
     for cert_ref in cert_refs {
         let (certs, key) = match load_cert_and_key(cert_ref, cert_dir) {
@@ -430,6 +467,7 @@ pub fn build_server_config(
                 continue;
             }
         };
+        loaded.insert(cert_key(cert_ref));
         // Use the listener hostname for SNI routing.
         // Cert refs with no hostname come from catch-all listeners and become the fallback.
         if let Some(hostname) = cert_ref.hostname.as_deref() {
@@ -476,7 +514,7 @@ pub fn build_server_config(
         vec![b"http/1.1".to_vec()]
     };
 
-    Ok(config)
+    Ok((config, loaded))
 }
 
 /// Build a static TLS acceptor (standalone mode).

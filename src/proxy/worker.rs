@@ -500,9 +500,10 @@ async fn serve_tls_connection(
             .await;
             return;
         }
+        TlsKind::NoCert => return refuse("its listener's certs failed to load"),
         TlsKind::Terminate => match &plan.terminate {
             Some(config) => config.clone(),
-            None => return refuse("its listener's certs failed to load"),
+            None => return refuse("its port's certs failed to load"),
         },
     };
 

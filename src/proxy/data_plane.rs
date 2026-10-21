@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,9 +29,25 @@ use crate::routing::{BackendSelector, RouteTable};
 /// passthrough). Every endpoint bound for the port shares it.
 pub(crate) type PortPlan = Arc<ArcSwapOption<TlsPlan>>;
 
-/// A terminating config and the fingerprint of the certs it was built
-/// from: a pass with the same certs reuses it.
-type BuiltConfig = (u64, Arc<rustls::ServerConfig>);
+/// A port's terminating config, as a pass built it.
+struct BuiltConfig {
+    /// Of the certs it was built from: a pass with the same certs reuses it.
+    fingerprint: u64,
+    /// The refs whose certs loaded.
+    loaded: HashSet<tls::CertKey>,
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl BuiltConfig {
+    /// Whether some cert of HTTPS listener `l` is in the config.
+    fn has_cert_of(&self, l: &ListenerConfig) -> bool {
+        l.tls.as_ref().is_some_and(|t| {
+            t.certificate_refs
+                .iter()
+                .any(|r| self.loaded.contains(&tls::cert_key(r)))
+        })
+    }
+}
 
 struct TcpListenerEntry {
     port: u16,
@@ -197,19 +213,53 @@ pub(crate) fn merge_cert_refs_by_port(
 /// The terminating config is rebuilt only when its port's merged certs
 /// changed (`built`, kept for ports with HTTPS listeners only). Failures
 /// come back per port so construction can hard-fail while the reconcile
-/// path retries next pass; such a port terminates nothing meanwhile.
+/// path retries next pass; such a port terminates nothing meanwhile. An
+/// HTTPS listener none of whose certs is in the config refuses its SNI
+/// ([`TlsKind::NoCert`]).
 fn plan_ports(
     listener_configs: &[ListenerConfig],
     cert_dir: &std::path::Path,
     http2: bool,
     built: &mut HashMap<u16, BuiltConfig>,
 ) -> (HashMap<u16, Option<TlsPlan>>, Vec<(u16, String)>) {
+    let merged = merge_cert_refs_by_port(listener_configs);
+    built.retain(|port, _| merged.contains_key(port));
+    let mut errors = Vec::new();
+    for (port, refs) in merged {
+        let fingerprint = compute_cert_fingerprint(&refs);
+        if built
+            .get(&port)
+            .is_some_and(|b| b.fingerprint == fingerprint)
+        {
+            continue;
+        }
+        match tls::build_terminating(&refs, cert_dir, http2) {
+            Ok((config, loaded)) => {
+                built.insert(
+                    port,
+                    BuiltConfig {
+                        fingerprint,
+                        loaded,
+                        config: Arc::new(config),
+                    },
+                );
+            }
+            Err(e) => {
+                built.remove(&port);
+                errors.push((port, format!("TLS config build failed: {}", e)));
+            }
+        }
+    }
+
     let mut plans: HashMap<u16, Option<TlsPlan>> = HashMap::new();
     for l in listener_configs {
         let kind = match l.protocol {
             Protocol::UDP => continue,
             Protocol::HTTP | Protocol::TCP => None,
-            Protocol::HTTPS => Some(TlsKind::Terminate),
+            Protocol::HTTPS => match built.get(&l.port) {
+                Some(b) if b.has_cert_of(l) => Some(TlsKind::Terminate),
+                _ => Some(TlsKind::NoCert),
+            },
             Protocol::TLS if l.is_tls_passthrough() => Some(TlsKind::Passthrough),
             // TLS Terminate is not served: kept out by validation and the
             // controller alike.
@@ -221,29 +271,9 @@ fn plan_ports(
                 .add(l.hostname.as_deref(), kind);
         }
     }
-
-    let merged = merge_cert_refs_by_port(listener_configs);
-    built.retain(|port, _| merged.contains_key(port));
-    let mut errors = Vec::new();
-    for (port, refs) in merged {
-        let fingerprint = compute_cert_fingerprint(&refs);
-        let config = match built.get(&port) {
-            Some((held, config)) if *held == fingerprint => Some(config.clone()),
-            _ => match tls::build_server_config(&refs, cert_dir, http2) {
-                Ok(config) => {
-                    let config = Arc::new(config);
-                    built.insert(port, (fingerprint, config.clone()));
-                    Some(config)
-                }
-                Err(e) => {
-                    built.remove(&port);
-                    errors.push((port, format!("TLS config build failed: {}", e)));
-                    None
-                }
-            },
-        };
-        if let Some(Some(plan)) = plans.get_mut(&port) {
-            plan.terminate = config;
+    for (port, plan) in &mut plans {
+        if let Some(plan) = plan {
+            plan.terminate = built.get(port).map(|b| b.config.clone());
         }
     }
     (plans, errors)
@@ -268,6 +298,11 @@ fn compute_cert_fingerprint(refs: &[CertificateRef]) -> u64 {
         }
         if let Some(pem) = &r.key_pem {
             hasher.write(pem);
+        }
+        // A reused config must be for these refs: their loaded set is
+        // keyed by namespace too.
+        if let Some(namespace) = &r.namespace {
+            hasher.write(namespace.as_bytes());
         }
         hasher.write(r.name.as_bytes());
         if let Some(h) = &r.hostname {
@@ -1287,6 +1322,38 @@ mod tests {
         assert!(after.is_err(), "the deleted listener's cert: {after:?}");
     }
 
+    /// An HTTPS listener whose certs failed alone, beside listeners whose
+    /// certs loaded, refuses its SNI: by listener precedence the SNI is
+    /// its, and its certs are what may answer it. The handshake went on
+    /// with the wildcard's or the catch-all's cert.
+    #[tokio::test]
+    async fn an_https_listener_whose_certs_failed_refuses_its_sni() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(catch_all), Some(wildcard)) = (
+            crate::proxy::tls::test_util::generate_test_cert("catch-all"),
+            crate::proxy::tls::test_util::generate_test_cert("*.example.org"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let mut wild = https_with_cert(port, Some("*.example.org"), &wildcard);
+        wild.name = "wild".into();
+        let mut all = https_with_cert(port, None, &catch_all);
+        all.name = "all".into();
+        let failed = https_listener("a", port, Some("a.example.org"), "bad");
+        let other = https_listener("b", port, Some("b.other.org"), "bad");
+        let _dp = serve(&[all, wild, failed, other], RouteTable::new()).await;
+
+        for sni in ["a.example.org", "b.other.org"] {
+            assert!(presented(port, Some(sni)).await.is_err(), "{sni}");
+        }
+        assert_eq!(
+            presented(port, Some("x.example.org")).await,
+            Ok(der(&wildcard.0))
+        );
+        assert_eq!(presented(port, Some("y.org")).await, Ok(der(&catch_all.0)));
+    }
+
     /// A port that changes protocol keeps its socket and serves the new
     /// one from its next connection, HTTP to HTTPS and back. The socket kept
     /// the mode it was bound with until restart.
@@ -1517,10 +1584,7 @@ mod tests {
 
         let (opened, errors) = dp.add_tcp_listeners(&on(&["127.0.0.1"]), routes.clone(), &perf);
         assert_eq!((opened, errors.len()), (1, 0));
-        let hash_after_first = dp
-            .terminate_configs
-            .get(&23443)
-            .map(|(fingerprint, _)| *fingerprint);
+        let hash_after_first = dp.terminate_configs.get(&23443).map(|b| b.fingerprint);
         assert!(
             hash_after_first.is_some(),
             "TLS state prepared for the port"
@@ -1533,9 +1597,7 @@ mod tests {
         assert_eq!(errors, vec![]);
         assert_eq!(opened, 1, "the address that appeared later must be bound");
         assert_eq!(
-            dp.terminate_configs
-                .get(&23443)
-                .map(|(fingerprint, _)| *fingerprint),
+            dp.terminate_configs.get(&23443).map(|b| b.fingerprint),
             hash_after_first
         );
     }
