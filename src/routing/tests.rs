@@ -641,6 +641,33 @@ fn test_resolve_tls_passthrough_no_route() {
     assert!(resolve_pt(&rt, "example.com", 8443).is_none());
 }
 
+/// A route with no backend at all was reported as having no positive
+/// weight; the L4 path tells the two apart, and so does this.
+#[test]
+fn passthrough_miss_tells_no_backends_from_no_weight() {
+    let mut weightless = backend(9001);
+    weightless.weight = 0;
+    let mut rt = RouteTable::new();
+    rt.add_tls_route(0, "empty.example.com", vec![]);
+    rt.add_tls_route(0, "weightless.example.com", vec![weightless]);
+    rt.add_tcp_route(8443, vec![]);
+    let (selector, health) = (
+        BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let miss = |sni| {
+        rt.resolve_tls_passthrough(sni, 8443, &selector, &health)
+            .unwrap_err()
+    };
+    assert_eq!(miss("empty.example.com"), PassthroughMiss::NoBackends);
+    assert_eq!(miss("weightless.example.com"), PassthroughMiss::NoWeight);
+    assert_eq!(miss("tcp.example.com"), PassthroughMiss::NoBackends);
+    assert_eq!(
+        PassthroughMiss::NoBackends.to_string(),
+        "no backends available"
+    );
+}
+
 #[test]
 fn test_tls_route_sni_exact_match() {
     let mut rt = RouteTable::new();

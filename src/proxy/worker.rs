@@ -3238,6 +3238,7 @@ mod connection_tests {
         let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
         weightless.weight = 0;
         rt.add_tls_route(0, "weightless.test", vec![weightless]);
+        rt.add_tls_route(0, "empty.test", vec![]);
         let routes = Arc::new(ArcSwap::from_pointee(rt));
         let cfg = WorkerConfig {
             max_idle_per_backend: 4,
@@ -3250,6 +3251,7 @@ mod connection_tests {
         for (sni, why) in [
             ("rejected.test", "drew an invalid backendRef's share"),
             ("weightless.test", "no backend with positive weight"),
+            ("empty.test", "no backends available"),
             ("unrouted.test", "no route"),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -354,7 +354,7 @@ impl RouteTable {
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
     ) -> Result<std::net::SocketAddr, PassthroughMiss> {
-        let picked = if let Some(backends) = self.tls_route_backends(sni, server_port) {
+        let (backends, key) = if let Some(backends) = self.tls_route_backends(sni, server_port) {
             // Counter keyed per (port, SNI) so each route rotates
             // independently; a collision only shares a counter.
             let key = {
@@ -364,14 +364,17 @@ impl RouteTable {
                 h.write_u16(server_port);
                 h.finish()
             };
-            selector.select_l4_backend(key, backends, health)
+            (backends, key)
         } else if let Some(backends) = self.tcp_routes.get(&server_port) {
             // Shares the TCP path's counter.
-            selector.select_l4_backend(server_port as u64, backends, health)
+            (backends, server_port as u64)
         } else {
             return Err(PassthroughMiss::NoRoute);
         };
-        match picked {
+        if backends.is_empty() {
+            return Err(PassthroughMiss::NoBackends);
+        }
+        match selector.select_l4_backend(key, backends, health) {
             None => Err(PassthroughMiss::NoWeight),
             Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
             Some(b) => Ok(b.socket_addr),
@@ -592,11 +595,15 @@ pub struct Backend {
     pub action: BackendAction,
 }
 
-/// Why a TLS passthrough connection goes nowhere.
+/// Why a TLS passthrough connection goes nowhere, worded as the L4
+/// path words it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassthroughMiss {
     /// No TLS route for its SNI, and no TCP route on its port.
     NoRoute,
+    /// Its route resolved to no backend at all.
+    NoBackends,
+    /// Every backend of its route has weight 0.
     NoWeight,
     /// Its share is an invalid backendRef's ([`BackendAction::Reject`]).
     Rejected,
@@ -606,6 +613,7 @@ impl std::fmt::Display for PassthroughMiss {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::NoRoute => "no route",
+            Self::NoBackends => "no backends available",
             Self::NoWeight => "no backend with positive weight",
             Self::Rejected => "drew an invalid backendRef's share; rejected",
         })
