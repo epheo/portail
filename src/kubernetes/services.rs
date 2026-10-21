@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::config::PortailConfig;
+use crate::config::{HttpRouteFilter, PortailConfig};
 use crate::logging::{debug, info, warn};
 
 /// Resolved service metadata needed for route table construction.
@@ -255,16 +255,22 @@ impl NamedTargetPortReq {
     }
 }
 
-/// (FQDN, port) of every backend a rule of `config` routes to: the keys the
-/// override maps are read with. Mirrors resolve their target directly. An
-/// invalid ref is never resolved, and a RefNotPermitted one names a
-/// namespace this Gateway may not read.
+/// (FQDN, port) of every backend a rule of `config` routes or mirrors to:
+/// the keys the override maps are read with. An invalid ref is never
+/// resolved, and a RefNotPermitted one names a namespace this Gateway may
+/// not read.
 pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u16)> {
-    let http = config
-        .http_routes
-        .iter()
-        .flat_map(|r| &r.rules)
-        .flat_map(|rule| &rule.backend_refs);
+    let http_rules = config.http_routes.iter().flat_map(|r| &r.rules);
+    let mirrors = http_rules
+        .clone()
+        .flat_map(|rule| &rule.filters)
+        .filter_map(|f| match f {
+            HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
+            _ => None,
+        });
+    let http = http_rules
+        .flat_map(|rule| &rule.backend_refs)
+        .chain(mirrors);
     let l4 = config
         .tcp_routes
         .iter()
@@ -484,6 +490,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(slice_ports(&[unnamed_slice]).get(""), Some(&3000));
+    }
+
+    /// The table build reads a mirror's Service through the override maps,
+    /// as a backendRef's: the trim dropped its entries.
+    #[test]
+    fn a_mirrored_service_keeps_its_override_entries() {
+        let json = r#"{"httpRoutes": [{"hostnames": ["m.example.com"], "rules": [{
+            "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "shadow.prod.svc", "port": 80}}}],
+            "backendRefs": [{"name": "web.prod.svc", "port": 80}]}]}]}"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+        for svc in ["web.prod.svc", "shadow.prod.svc", "other.prod.svc"] {
+            config
+                .headless_target_ports
+                .insert((svc.to_string(), 80), 8080);
+        }
+        let referenced = referenced_backends(&config);
+        retain_referenced(&mut config, &referenced);
+        let mut kept: Vec<_> = config
+            .headless_target_ports
+            .keys()
+            .map(|(svc, _)| svc.as_str())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["shadow.prod.svc", "web.prod.svc"]);
     }
 
     #[test]
