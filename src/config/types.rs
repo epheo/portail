@@ -653,10 +653,13 @@ pub struct PerformanceConfig {
     /// without it, an unset route `request_timeout` (the default) lets such
     /// a peer pin the task, both fds, and a backend connection forever.
     /// Also bounds an L4 relay once one direction has closed: a peer that
-    /// never closes the other would pin it just the same. Does not apply to
-    /// upgraded tunnels, L4 relays with both directions open, or the idle
-    /// wait between keepalive requests (long idle is legitimate there). Defaults
-    /// to 300s — Envoy's stream_idle_timeout default; `0s` disables.
+    /// never closes the other would pin it just the same. Also bounds writes
+    /// to an h2 client, which h2 leaves unbounded: a connection whose client
+    /// stopped reading is dropped once its writes stall this long. Does not
+    /// apply to upgraded tunnels, L4 relays with both directions open, idle
+    /// h2 connections, or the idle wait between keepalive requests (long
+    /// idle is legitimate there). Defaults to 300s, Envoy's
+    /// stream_idle_timeout default; `0s` disables.
     #[serde(default = "default_idle_body_timeout", with = "human_duration")]
     pub idle_body_timeout: Duration,
 

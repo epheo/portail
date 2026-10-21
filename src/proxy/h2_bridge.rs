@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -90,34 +90,70 @@ pub(crate) struct H2Ctx {
     pub(crate) drain: CancellationToken,
 }
 
-/// The client's stream as h2 drives it. h2 ends a connection by shutting
-/// the stream down and dropping it, while a client closing in step still
-/// sends its own GOAWAY and close_notify: closed on those unread, the kernel
-/// resets and the client's close fails. So the shutdown reads off what
-/// still comes until the client closes too, within `budget`, as nginx does
-/// for HTTP/2.
-struct LingeringClose<S> {
+/// The client's stream as h2 drives it, with the two bounds h2 lacks.
+///
+/// Writes: h2 has no send timeout. A client that stops reading parks its
+/// writes forever: while its streams live, after they were reset, and in
+/// the flush h2 runs before it shuts the stream down. Writes pending for
+/// `write_idle` with no flush completing fail, and h2 drops the connection,
+/// as nginx's send_timeout does. Reads stay unbounded: an idle connection
+/// is legitimate.
+///
+/// Close: h2 ends a connection by shutting the stream down and dropping it,
+/// while a client closing in step still sends its own GOAWAY and
+/// close_notify: closed on those unread, the kernel resets and the client's
+/// close fails. So the shutdown reads off what still comes until the client
+/// closes too, within `close_budget`, as nginx does for HTTP/2.
+struct ClientStream<S> {
     inner: S,
-    budget: Duration,
+    /// `None` lets writes wait forever.
+    write_idle: Option<Duration>,
+    /// One timer for all of the connection's write stalls, reset as each
+    /// begins: a stall must not allocate.
+    stall: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// A write or flush was pending since `stall` was last reset, and no
+    /// flush has completed since.
+    stalled: bool,
+    close_budget: Duration,
     /// Armed by the first shutdown poll, before the inner shutdown: a client
     /// that stops reading holds the close_notify write as long as it likes.
-    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    close_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// The inner shutdown is done; only the linger is left.
     shut: bool,
 }
 
-impl<S> LingeringClose<S> {
-    fn new(inner: S, budget: Duration) -> Self {
+impl<S> ClientStream<S> {
+    fn new(inner: S, write_idle: Option<Duration>, close_budget: Duration) -> Self {
         Self {
             inner,
-            budget,
-            deadline: None,
+            write_idle,
+            stall: None,
+            stalled: false,
+            close_budget,
+            close_deadline: None,
             shut: false,
         }
     }
+
+    /// A write or flush is pending: start the stall clock unless it runs,
+    /// and fail once it ran out.
+    fn poll_stall<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        let Some(idle) = self.write_idle else {
+            return Poll::Pending;
+        };
+        let stall = self
+            .stall
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+        if !self.stalled {
+            self.stalled = true;
+            stall.as_mut().reset(tokio::time::Instant::now() + idle);
+        }
+        ready!(stall.as_mut().poll(cx));
+        Poll::Ready(Err(io::ErrorKind::TimedOut.into()))
+    }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for LingeringClose<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for ClientStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -127,13 +163,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for LingeringClose<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
+    // A write taken is no progress: TLS buffers what the client never
+    // reads, so counting it let every timer wakeup buy another budget.
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Pending => self.poll_stall(cx),
+            taken => taken,
+        }
     }
 
     fn poll_write_vectored(
@@ -141,7 +182,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        match Pin::new(&mut self.inner).poll_write_vectored(cx, bufs) {
+            Poll::Pending => self.poll_stall(cx),
+            taken => taken,
+        }
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -149,14 +193,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Pending => self.poll_stall(cx),
+            flushed => {
+                self.stalled = false;
+                flushed
+            }
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
-        let budget = this.budget;
+        let budget = this.close_budget;
         let deadline = this
-            .deadline
+            .close_deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
         if !this.shut {
             if Pin::new(&mut this.inner).poll_shutdown(cx)?.is_pending() {
@@ -180,7 +230,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
 
 /// Serve one ALPN-negotiated h2 client connection until it closes.
 pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
-    let io = LingeringClose::new(tls_stream, ctx.cfg.client_header_timeout);
+    let io = ClientStream::new(
+        tls_stream,
+        worker::idle_opt(ctx.cfg.idle_body_timeout),
+        ctx.cfg.client_header_timeout,
+    );
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
@@ -878,8 +932,8 @@ mod tests {
         assert!(build_h2_response(b"garbage\r\n\r\n", 0, false).is_err());
     }
 
-    /// A server TLS stream and its client, past the handshake; `None`
-    /// without openssl.
+    /// A server TLS stream and its client, past a handshake that picked h2;
+    /// `None` without openssl.
     async fn tls_pair() -> Option<(
         ServerTlsStream<TcpStream>,
         tokio_rustls::client::TlsStream<TcpStream>,
@@ -893,13 +947,14 @@ mod tests {
             ..Default::default()
         };
         let server_cfg =
-            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
+            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), true)
                 .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-        let client_cfg = rustls::ClientConfig::builder()
+        let mut client_cfg = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
             .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"h2".to_vec()];
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -923,7 +978,7 @@ mod tests {
             return; // openssl unavailable
         };
         let budget = Duration::from_millis(300);
-        let mut io = LingeringClose::new(server, budget);
+        let mut io = ClientStream::new(server, None, budget);
         let chunk = [0u8; 64 * 1024];
         while tokio::time::timeout(budget, io.write(&chunk)).await.is_ok() {}
 
@@ -934,5 +989,288 @@ mod tests {
             "close_notify held the close past its budget"
         );
         assert!(started.elapsed() >= budget, "{:?}", started.elapsed());
+    }
+
+    /// A client stream taking every write at once but completing a flush
+    /// only `every` after the last one: a client reading at that pace.
+    struct SlowReader {
+        every: Duration,
+        flushed: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl SlowReader {
+        fn new(every: Duration) -> Self {
+            Self {
+                every,
+                flushed: Box::pin(tokio::time::sleep(every)),
+            }
+        }
+    }
+
+    impl AsyncRead for SlowReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SlowReader {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            ready!(self.flushed.as_mut().poll(cx));
+            let next = tokio::time::Instant::now() + self.every;
+            self.flushed.as_mut().reset(next);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Only a completed flush shows the client reading: each restarts the
+    /// write clock, while a write the stream merely took does not.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_completed_flush_restarts_the_write_clock() {
+        let budget = Duration::from_secs(10);
+        let client = |every, idle| ClientStream::new(SlowReader::new(every), idle, budget);
+
+        let mut io = client(budget * 3 / 4, Some(budget));
+        for _ in 0..8 {
+            io.write_all(b"x").await.unwrap();
+            io.flush().await.expect("a client keeping pace was dropped");
+        }
+
+        let mut io = client(budget * 2, Some(budget));
+        io.write_all(b"x").await.unwrap();
+        let first = tokio::time::timeout(budget / 2, io.flush()).await;
+        assert!(first.is_err(), "flushed early");
+        io.write_all(b"x").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let stalled = io.flush().await.unwrap_err();
+        assert_eq!(stalled.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < budget,
+            "a taken write restarted the clock"
+        );
+
+        let mut io = client(budget * 2, None);
+        io.write_all(b"x").await.unwrap();
+        io.flush()
+            .await
+            .expect("idleBodyTimeout 0s timed a write out");
+    }
+
+    /// Backend answering each request head with a `body` of `len` bytes,
+    /// sent as fast as the proxy takes it.
+    async fn backend(len: usize, body: &'static [u8]) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
+                        seen.extend_from_slice(&chunk[..n]);
+                        if find_header_end(&seen).is_none() {
+                            continue;
+                        }
+                        seen.clear();
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");
+                        if sock.write_all(head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        for _ in 0..len / body.len() {
+                            if sock.write_all(body).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The bridge's context for a.test routed to `backend`, with `budget`
+    /// as idleBodyTimeout and clientHeaderTimeout.
+    fn ctx(backend: SocketAddr, budget: Duration) -> H2Ctx {
+        let mut routes = RouteTable::new();
+        routes.add_http_route(
+            "a.test",
+            crate::routing::HttpRouteRule::new(
+                crate::routing::PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![crate::routing::Backend {
+                    socket_addr: backend,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                }],
+            ),
+        );
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: budget,
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: budget,
+            http2: true,
+        };
+        H2Ctx {
+            server_port: 8080,
+            routes: Arc::new(ArcSwap::from_pointee(routes)),
+            selector: Arc::new(BackendSelector::new()),
+            health: Arc::new(HealthRegistry::new()),
+            pool: Arc::new(SharedBackendPool::new(4, cfg.connect_timeout)),
+            cfg,
+            listener_stats: Arc::new(ListenerStats::default()),
+            peer: "127.0.0.1:40000".parse().unwrap(),
+            drain: CancellationToken::new(),
+        }
+    }
+
+    /// A client stream that stops reading once `reading` is cleared.
+    struct Unread<S> {
+        inner: S,
+        reading: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Unread<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.reading.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Unread<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Windows no response here outgrows, so only the sockets push back.
+    const CLIENT_WINDOW: u32 = 1 << 30;
+
+    /// What a client that stopped reading mid-response does next.
+    #[derive(Debug, Clone, Copy)]
+    enum Then {
+        Waits,
+        ResetsItsStream,
+        /// h2 flushes before it shuts the stream down.
+        Closes,
+    }
+
+    /// h2 has no send timeout: a client that stopped reading held its
+    /// connection forever, its streams reset or its close stuck in h2's
+    /// last flush. A write pending past idleBodyTimeout now drops it.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_loses_its_h2_connection() {
+        use std::os::fd::AsFd;
+        let budget = Duration::from_millis(500);
+        let addr = backend(1 << 40, &[b'x'; 64 * 1024]).await;
+        for then in [Then::Waits, Then::ResetsItsStream, Then::Closes] {
+            let Some((server, client)) = tls_pair().await else {
+                return; // openssl unavailable
+            };
+            let mut served = tokio::spawn(serve(server, ctx(addr, budget)));
+            // Closed on unread bytes once h2 drops the client stream, the
+            // socket would reset: the proxy's next write would fail anyway.
+            let _socket = client.get_ref().0.as_fd().try_clone_to_owned().unwrap();
+            let reading = Arc::new(AtomicBool::new(true));
+            let io = Unread {
+                inner: client,
+                reading: Arc::clone(&reading),
+            };
+            let (send, conn) = h2::client::Builder::new()
+                .initial_window_size(CLIENT_WINDOW)
+                .initial_connection_window_size(CLIENT_WINDOW)
+                .handshake::<_, Bytes>(io)
+                .await
+                .unwrap();
+            tokio::spawn(conn);
+            let mut send = send.ready().await.unwrap();
+            let req = http::Request::get("https://a.test/").body(()).unwrap();
+            let (resp, mut stream) = send.send_request(req, true).unwrap();
+            let resp = resp.await.unwrap();
+            reading.store(false, Ordering::Relaxed);
+            // Every buffer on the way fills well within this.
+            tokio::time::sleep(budget / 2).await;
+            match then {
+                Then::Waits => {}
+                Then::ResetsItsStream => stream.send_reset(h2::Reason::CANCEL),
+                Then::Closes => drop((send, resp, stream)),
+            }
+            let ended = tokio::time::timeout(budget * 4, &mut served).await;
+            assert!(ended.is_ok(), "{then:?}: connection held past its budget");
+        }
+    }
+
+    /// GET a.test over `send`: the status and body.
+    async fn get(send: &h2::client::SendRequest<Bytes>) -> (u16, Vec<u8>) {
+        let mut send = send.clone().ready().await.unwrap();
+        let req = http::Request::get("https://a.test/").body(()).unwrap();
+        let (resp, _) = send.send_request(req, true).unwrap();
+        let resp = resp.await.unwrap();
+        let status = resp.status().as_u16();
+        let mut body = resp.into_body();
+        let mut out = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            out.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        (status, out)
+    }
+
+    /// Reads stay unbounded: with nothing to write, an h2 connection idles
+    /// past every budget, as an h1 keepalive connection does.
+    #[tokio::test]
+    async fn an_idle_h2_connection_outlives_its_budgets() {
+        let budget = Duration::from_millis(200);
+        let addr = backend(2, b"ok").await;
+        let Some((server, client)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        let served = tokio::spawn(serve(server, ctx(addr, budget)));
+        let (send, conn) = h2::client::handshake(client).await.unwrap();
+        tokio::spawn(conn);
+        for _ in 0..2 {
+            assert_eq!(get(&send).await, (200, b"ok".to_vec()));
+            tokio::time::sleep(budget * 3).await;
+            assert!(!served.is_finished(), "an idle connection was dropped");
+        }
     }
 }
