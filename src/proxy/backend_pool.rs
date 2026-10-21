@@ -17,16 +17,17 @@
 //! conn turns out to be closed by the time we write to it, or closes before
 //! answering a request it may replay.
 
-use crate::logging::debug;
+use crate::logging::{debug, warn};
 use crate::metrics::METRICS;
 use crate::proxy::tls::Connection;
-use anyhow::Result;
 use dashmap::DashMap;
 use socket2::TcpKeepalive;
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 /// Client TLS connector that skips certificate verification.
@@ -54,6 +55,87 @@ fn take_live(conns: &mut Vec<Connection>) -> Option<Connection> {
     None
 }
 
+/// Why a backend connection could not be opened.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The proxy itself ran out of fds, ephemeral ports or kernel memory.
+    /// The backend was never reached, so its health must not hear of it:
+    /// one exhausted proxy would otherwise eject healthy backends
+    /// route-wide.
+    Local(io::Error),
+    /// Refused, unreachable, timed out, or the TLS handshake failed.
+    Backend(anyhow::Error),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Local(e) => write!(f, "proxy out of fds, ports or memory: {}", e),
+            ConnectError::Backend(e) => e.fmt(f),
+        }
+    }
+}
+
+/// Classify a socket error from opening a backend connection.
+fn connect_error(addr: SocketAddr, e: io::Error) -> ConnectError {
+    match e.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::EADDRNOTAVAIL | libc::ENOBUFS | libc::ENOMEM) => {
+            ConnectError::Local(e)
+        }
+        _ => ConnectError::Backend(anyhow::anyhow!("Backend connect failed {}: {}", addr, e)),
+    }
+}
+
+/// Lines a log throttle lets through: one per window, the rest counted.
+struct LogThrottle {
+    /// The second, on the caller's clock, from which a line may go out.
+    next: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl LogThrottle {
+    const fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(lines suppressed since the last one)` when a line may go out
+    /// at `now` (seconds), opening a window of `every`.
+    fn admit(&self, now: u64, every: Duration) -> Option<u64> {
+        let next = self.next.load(Relaxed);
+        if now < next
+            || self
+                .next
+                .compare_exchange(next, now + every.as_secs(), Relaxed, Relaxed)
+                .is_err()
+        {
+            self.suppressed.fetch_add(1, Relaxed);
+            return None;
+        }
+        Some(self.suppressed.swap(0, Relaxed))
+    }
+}
+
+/// Out of fds, every connect fails at once: one line per window keeps the
+/// log from flooding while it lasts, and is still seen within seconds.
+const LOCAL_EXHAUSTION_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// Log a connect the proxy could not make for want of its own resources,
+/// at most once per `LOCAL_EXHAUSTION_LOG_EVERY`.
+pub(crate) fn log_local_exhaustion(addr: SocketAddr, e: &io::Error) {
+    static THROTTLE: LogThrottle = LogThrottle::new();
+    static LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
+    let now = LOG_EPOCH.get_or_init(Instant::now).elapsed().as_secs();
+    if let Some(suppressed) = THROTTLE.admit(now, LOCAL_EXHAUSTION_LOG_EVERY) {
+        warn!(
+            "Backend {} not reached: proxy out of fds, ports or memory ({}); backend health untouched, {} similar suppressed",
+            addr, e, suppressed
+        );
+    }
+}
+
 /// Open a TCP connection to a backend within `timeout`, Nagle off. The
 /// keepalive is the one accepted sockets get: a backend that vanishes
 /// without FIN or RST would otherwise park an idle client's task and both
@@ -62,12 +144,18 @@ pub(crate) async fn connect_tcp(
     addr: SocketAddr,
     timeout: Duration,
     keepalive: &TcpKeepalive,
-) -> Result<TcpStream> {
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend connect timeout: {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed {}: {}", addr, e))?;
-    tcp.set_nodelay(true)?;
+) -> Result<TcpStream, ConnectError> {
+    let tcp = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => return Err(connect_error(addr, e)),
+        Err(_) => {
+            return Err(ConnectError::Backend(anyhow::anyhow!(
+                "Backend connect timeout: {}",
+                addr
+            )))
+        }
+    };
+    tcp.set_nodelay(true).map_err(|e| connect_error(addr, e))?;
     // _-prefixed: debug! compiles out in release builds.
     if let Err(_e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(keepalive) {
         debug!("TCP keepalive setup failed for backend {}: {}", addr, _e);
@@ -82,7 +170,7 @@ async fn connect_new(
     use_tls: bool,
     server_name: &str,
     keepalive: &TcpKeepalive,
-) -> Result<Connection> {
+) -> Result<Connection, ConnectError> {
     debug!("Pool miss: connecting to {} (tls={})", addr, use_tls);
     let tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
     METRICS.upstream_connects_total.inc();
@@ -92,10 +180,13 @@ async fn connect_new(
             .unwrap_or_else(|_| {
                 rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
             });
-        let tls_stream = tls_connector
-            .connect(domain, tcp)
-            .await
-            .map_err(|e| anyhow::anyhow!("Backend TLS handshake failed {}: {}", addr, e))?;
+        let tls_stream = tls_connector.connect(domain, tcp).await.map_err(|e| {
+            ConnectError::Backend(anyhow::anyhow!(
+                "Backend TLS handshake failed {}: {}",
+                addr,
+                e
+            ))
+        })?;
         Ok(Connection::ClientTls { inner: tls_stream })
     } else {
         Ok(Connection::Plain { inner: tcp })
@@ -138,7 +229,7 @@ impl BackendPool {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<(Connection, bool)> {
+    ) -> Result<(Connection, bool), ConnectError> {
         if let Some(conns) = self.pools.get_mut(&(addr, use_tls)) {
             if let Some(conn) = take_live(conns) {
                 debug!("Pool hit: reusing connection to {}", addr);
@@ -167,7 +258,7 @@ impl BackendPool {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<Connection> {
+    ) -> Result<Connection, ConnectError> {
         connect_new(
             &self.tls_connector,
             self.connect_timeout,
@@ -218,7 +309,7 @@ impl SharedBackendPool {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<(Connection, bool)> {
+    ) -> Result<(Connection, bool), ConnectError> {
         // Shard lock held only for the sync pop+probe loop, never across await.
         if let Some(mut entry) = self
             .pools
@@ -249,7 +340,7 @@ impl SharedBackendPool {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<Connection> {
+    ) -> Result<Connection, ConnectError> {
         connect_new(
             &self.tls_connector,
             self.connect_timeout,
@@ -290,7 +381,7 @@ impl PoolHandle {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<(Connection, bool)> {
+    ) -> Result<(Connection, bool), ConnectError> {
         match self {
             PoolHandle::PerConn(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
             PoolHandle::Shared(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
@@ -303,7 +394,7 @@ impl PoolHandle {
         use_tls: bool,
         server_name: &str,
         keepalive: &TcpKeepalive,
-    ) -> Result<Connection> {
+    ) -> Result<Connection, ConnectError> {
         match self {
             PoolHandle::PerConn(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
             PoolHandle::Shared(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
@@ -383,6 +474,35 @@ mod tests {
                 listener.accept().await.unwrap().0
             },);
         (client, server)
+    }
+
+    #[test]
+    fn running_out_of_fds_ports_or_memory_is_local() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let class = |errno| connect_error(addr, io::Error::from_raw_os_error(errno));
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::EADDRNOTAVAIL,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+        ] {
+            assert!(matches!(class(errno), ConnectError::Local(_)), "{errno}");
+        }
+        for errno in [libc::ECONNREFUSED, libc::EHOSTUNREACH, libc::ETIMEDOUT] {
+            assert!(matches!(class(errno), ConnectError::Backend(_)), "{errno}");
+        }
+    }
+
+    #[test]
+    fn log_throttle_lets_one_line_per_window_and_counts_the_rest() {
+        let throttle = LogThrottle::new();
+        let every = Duration::from_secs(10);
+        assert_eq!(throttle.admit(100, every), Some(0));
+        assert_eq!(throttle.admit(100, every), None);
+        assert_eq!(throttle.admit(109, every), None);
+        assert_eq!(throttle.admit(110, every), Some(2));
+        assert_eq!(throttle.admit(500, every), Some(0));
     }
 
     /// Lets what the remote end sent land before probing.

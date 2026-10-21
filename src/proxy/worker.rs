@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
-use crate::proxy::backend_pool::{connect_tcp, BackendPool, PoolHandle, SharedBackendPool};
+use crate::proxy::backend_pool::{
+    connect_tcp, log_local_exhaustion, BackendPool, ConnectError, PoolHandle, SharedBackendPool,
+};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
@@ -1152,9 +1154,23 @@ async fn fail_backend(
     Ok((false, None))
 }
 
+/// Answer a connect the proxy could not make for want of its own fds, ports
+/// or memory: a 503, and the backend's health left alone.
+async fn refuse_locally(
+    state: &mut ConnectionState,
+    client: &mut Connection,
+    addr: SocketAddr,
+    e: &std::io::Error,
+) -> Result<()> {
+    log_local_exhaustion(addr, e);
+    state.last_status = 503;
+    send_error_response(client, 503).await
+}
+
 /// Acquire a backend connection within `backend_budget` (clamped by `total_deadline`).
-/// On any failure or timeout, records health failure and sends `502`/`504` to the
-/// client. Returns `Ok(None)` when the caller should bail out (`return Ok(false)`),
+/// On a backend failure or timeout, records health failure and sends `502`/`504`
+/// to the client; on local exhaustion, a `503` (see [`ConnectError::Local`]).
+/// Returns `Ok(None)` when the caller should bail out (`return Ok(false)`),
 /// which signals the connection is not reusable.
 ///
 /// `Ok(Some((conn, from_pool)))`: `from_pool == true` means the conn came from
@@ -1187,6 +1203,10 @@ async fn connect_to_backend(
             // success on connect).
             state.health.record_success(backend_addr);
             Ok(Some(result))
+        }
+        Ok(Err(ConnectError::Local(e))) => {
+            refuse_locally(state, client, backend_addr, &e).await?;
+            Ok(None)
         }
         Ok(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
@@ -1386,7 +1406,8 @@ async fn send_request_with_retry(
 
 /// Send the assembled request again on a brand-new connection, in place of
 /// a pooled one found dead. Unlike that stale entry, a failure here is the
-/// backend's: answered to the client and charged to its health (`Ok(None)`).
+/// backend's, unless the proxy is out of resources: answered to the client
+/// either way (`Ok(None)`).
 #[allow(clippy::too_many_arguments)]
 async fn resend_on_fresh(
     client: &mut Connection,
@@ -1417,6 +1438,10 @@ async fn resend_on_fresh(
         Ok(Ok(c)) => {
             state.health.record_success(backend_addr);
             c
+        }
+        Ok(Err(ConnectError::Local(e))) => {
+            refuse_locally(state, client, backend_addr, &e).await?;
+            return Ok(None);
         }
         Ok(Err(e2)) => {
             warn!(
@@ -2104,6 +2129,11 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let mut backend = match connect_tcp(backend_addr, connect_timeout, keepalive).await {
         Ok(backend) => backend,
+        // Raw TCP has no status to answer with: the client is just closed.
+        Err(ConnectError::Local(e)) => {
+            log_local_exhaustion(backend_addr, &e);
+            return Ok(());
+        }
         Err(e) => {
             if health.record_failure(backend_addr) {
                 HealthRegistry::spawn_probe(health, backend_addr);
@@ -2423,12 +2453,17 @@ mod connection_tests {
     }
 
     fn serve(rt: RouteTable) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        serve_state(conn_state(rt, false))
+    }
+
+    /// `serve` for a state the test adjusted first.
+    fn serve_state(state: ConnectionState) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
         let (client, engine) = tokio::io::duplex(64 * 1024);
         let peer = "127.0.0.1:40000".parse().unwrap();
         let task = tokio::spawn(handle_connection(
             Connection::Mem { inner: engine },
             peer,
-            conn_state(rt, false),
+            state,
         ));
         (client, task)
     }
@@ -2990,6 +3025,94 @@ mod connection_tests {
         let (mut client, _task) = serve(routes(addr));
         let out = exchange(&mut client, GET_A).await;
         assert!(out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{out}");
+    }
+
+    /// RLIMIT_NOFILE lowered to the lowest free fd, so the next socket()
+    /// fails with EMFILE; the old limit comes back on drop.
+    struct FdsExhausted(libc::rlimit);
+
+    impl FdsExhausted {
+        fn new() -> Self {
+            let mut old = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
+            let lowest_free = unsafe { libc::dup(2) };
+            assert!(lowest_free >= 0);
+            unsafe { libc::close(lowest_free) };
+            let low = libc::rlimit {
+                rlim_cur: lowest_free as libc::rlim_t,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+            Self(old)
+        }
+    }
+
+    impl Drop for FdsExhausted {
+        fn drop(&mut self) {
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
+        }
+    }
+
+    /// Out of fds, the proxy never reaches the backend: the client gets a
+    /// 503 and the backend's health is untouched. Counted as backend
+    /// failures, one exhausted proxy ejected healthy backends route-wide.
+    /// Runs in a child process of its own, as the lowered limit would
+    /// starve every test running beside it.
+    #[test]
+    fn local_exhaustion_is_a_503_not_a_backend_failure() {
+        const CHILD: &str = "PORTAIL_TEST_FDS_EXHAUSTED";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::local_exhaustion_is_a_503_not_a_backend_failure",
+                module_path!().split_once("::").unwrap().1
+            );
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([&name, "--exact", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && log.contains("1 passed"), "{log}");
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (addr, _rx) = backend(REFUSED).await;
+            let unused = idle_backend().await;
+            let health = Arc::new(HealthRegistry::new());
+            let serve_shared = |rt| {
+                let mut state = conn_state(rt, false);
+                state.health = Arc::clone(&health);
+                serve_state(state)
+            };
+
+            let exhausted = FdsExhausted::new();
+            for _ in 0..=crate::proxy::health::FAILURE_THRESHOLD {
+                let (mut client, _task) = serve_shared(routes(addr));
+                let out = exchange(&mut client, GET_A).await;
+                assert!(
+                    out.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                    "{out}"
+                );
+                // Raw TCP has no status to send: the client is just closed.
+                let l4 = routes_with_tcp(unused.local_addr().unwrap(), addr);
+                let (mut client, _task) = serve_shared(l4);
+                assert_eq!(exchange(&mut client, OPAQUE).await, "");
+            }
+            assert!(health.is_healthy(&addr));
+            drop(exhausted);
+
+            let (mut client, _task) = serve_shared(routes(addr));
+            let out = exchange(&mut client, GET_A).await;
+            assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        });
     }
 
     #[tokio::test]
