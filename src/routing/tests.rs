@@ -623,6 +623,7 @@ fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketA
     let selector = BackendSelector::new();
     let health = crate::proxy::health::HealthRegistry::new();
     rt.resolve_tls_passthrough(sni, port, &selector, &health)
+        .ok()
 }
 
 #[test]

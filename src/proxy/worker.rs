@@ -2453,12 +2453,7 @@ async fn handle_tls_passthrough(
     let route_table = routes.load();
     let backend_addr = route_table
         .resolve_tls_passthrough(&hostname, server_port, &selector, &health)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "TLS passthrough: no route or no healthy backend for SNI '{}'",
-                hostname
-            )
-        })?;
+        .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI '{}': {}", hostname, miss))?;
 
     // peek_sni consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
@@ -3218,6 +3213,59 @@ mod connection_tests {
         let seen = delivered(&mut rx).await;
         assert!(seen.starts_with("GET /ws HTTP/1.1\r\n"), "{seen}");
         assert!(seen.ends_with("\r\n\r\nHELDTUNNEL"), "{seen}");
+    }
+
+    /// A client's first flight: a ClientHello naming `sni`.
+    fn client_hello(sni: &str) -> Vec<u8> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut hello = Vec::new();
+        conn.write_tls(&mut hello).unwrap();
+        hello
+    }
+
+    /// A passthrough connection that drew an invalid backendRef's share
+    /// was said to find no route or no healthy backend.
+    #[tokio::test]
+    async fn tls_passthrough_says_why_it_has_no_backend() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
+        let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
+        weightless.weight = 0;
+        rt.add_tls_route(0, "weightless.test", vec![weightless]);
+        let routes = Arc::new(ArcSwap::from_pointee(rt));
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for (sni, why) in [
+            ("rejected.test", "drew an invalid backendRef's share"),
+            ("weightless.test", "no backend with positive weight"),
+            ("unrouted.test", "no route"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&client_hello(sni)).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let routes = Arc::clone(&routes);
+            let (health, selector) = (Arc::default(), Arc::default());
+            let err = handle_tls_passthrough(server, 8443, routes, health, selector, &cfg)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why), "{sni}: {err}");
+        }
     }
 
     /// A backend nothing should reach: the test holds the listener.

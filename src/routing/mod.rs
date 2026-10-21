@@ -345,16 +345,16 @@ impl RouteTable {
     /// Resolve a TLS passthrough connection to a backend address.
     /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
     /// back to port-based TCP routes. Selection is healthy weighted
-    /// round-robin, same as the L4 path; `None` (caller drops the
-    /// connection) also covers no positive weight and a Reject pick.
+    /// round-robin, same as the L4 path. On `Err` the caller drops the
+    /// connection.
     pub fn resolve_tls_passthrough(
         &self,
         sni: &str,
         server_port: u16,
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
-    ) -> Option<std::net::SocketAddr> {
-        if let Some(backends) = self.tls_route_backends(sni, server_port) {
+    ) -> Result<std::net::SocketAddr, PassthroughMiss> {
+        let picked = if let Some(backends) = self.tls_route_backends(sni, server_port) {
             // Counter keyed per (port, SNI) so each route rotates
             // independently; a collision only shares a counter.
             let key = {
@@ -364,19 +364,18 @@ impl RouteTable {
                 h.write_u16(server_port);
                 h.finish()
             };
-            return selector
-                .select_l4_backend(key, backends, health)
-                .filter(|b| b.action == BackendAction::Forward)
-                .map(|b| b.socket_addr);
+            selector.select_l4_backend(key, backends, health)
+        } else if let Some(backends) = self.tcp_routes.get(&server_port) {
+            // Shares the TCP path's counter.
+            selector.select_l4_backend(server_port as u64, backends, health)
+        } else {
+            return Err(PassthroughMiss::NoRoute);
+        };
+        match picked {
+            None => Err(PassthroughMiss::NoWeight),
+            Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
+            Some(b) => Ok(b.socket_addr),
         }
-
-        // Fall back to port-based TCP routes, sharing the TCP path's counter.
-        self.tcp_routes.get(&server_port).and_then(|backends| {
-            selector
-                .select_l4_backend(server_port as u64, backends, health)
-                .filter(|b| b.action == BackendAction::Forward)
-                .map(|b| b.socket_addr)
-        })
     }
 
     /// Check if a TLS passthrough route exists for this SNI hostname on this
@@ -591,6 +590,26 @@ pub struct Backend {
     /// Hostname for TLS SNI (the original DNS name before resolution)
     pub server_name: String,
     pub action: BackendAction,
+}
+
+/// Why a TLS passthrough connection goes nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassthroughMiss {
+    /// No TLS route for its SNI, and no TCP route on its port.
+    NoRoute,
+    NoWeight,
+    /// Its share is an invalid backendRef's ([`BackendAction::Reject`]).
+    Rejected,
+}
+
+impl std::fmt::Display for PassthroughMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoRoute => "no route",
+            Self::NoWeight => "no backend with positive weight",
+            Self::Rejected => "drew an invalid backendRef's share; rejected",
+        })
+    }
 }
 
 /// What a request or connection that selects a backend gets.
