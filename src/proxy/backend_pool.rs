@@ -139,14 +139,14 @@ fn connect_error(addr: SocketAddr, e: io::Error) -> ConnectError {
 }
 
 /// Lines a log throttle lets through: one per window, the rest counted.
-struct LogThrottle {
+pub(crate) struct LogThrottle {
     /// The second, on the caller's clock, from which a line may go out.
     next: AtomicU64,
     suppressed: AtomicU64,
 }
 
 impl LogThrottle {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             next: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
@@ -168,20 +168,25 @@ impl LogThrottle {
         }
         Some(self.suppressed.swap(0, Relaxed))
     }
+
+    /// [`Self::admit`] now, one line per `FLOOD_LOG_EVERY`.
+    pub(crate) fn admit_now(&self) -> Option<u64> {
+        static LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
+        let now = LOG_EPOCH.get_or_init(Instant::now).elapsed().as_secs();
+        self.admit(now, FLOOD_LOG_EVERY)
+    }
 }
 
-/// Out of fds, every connect fails at once: one line per window keeps the
+/// A failure that repeats as often as its trigger does (every connect out of
+/// fds, every datagram from a spoofed source): one line per window keeps the
 /// log from flooding while it lasts, and is still seen within seconds.
-const LOCAL_EXHAUSTION_LOG_EVERY: Duration = Duration::from_secs(10);
+const FLOOD_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// Log a backend socket (TCP connect, UDP session) the proxy could not open
-/// for want of its own resources, at most once per
-/// `LOCAL_EXHAUSTION_LOG_EVERY`.
+/// for want of its own resources, at most once per `FLOOD_LOG_EVERY`.
 pub(crate) fn log_local_exhaustion(addr: SocketAddr, e: &io::Error) {
     static THROTTLE: LogThrottle = LogThrottle::new();
-    static LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
-    let now = LOG_EPOCH.get_or_init(Instant::now).elapsed().as_secs();
-    if let Some(suppressed) = THROTTLE.admit(now, LOCAL_EXHAUSTION_LOG_EVERY) {
+    if let Some(suppressed) = THROTTLE.admit_now() {
         warn!(
             "Backend {} not reached: proxy out of its own resources ({}); backend health untouched, {} similar suppressed",
             addr, e, suppressed
