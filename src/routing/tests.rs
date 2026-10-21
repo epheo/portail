@@ -13,6 +13,7 @@ fn backend(port: u16) -> Backend {
         filters: vec![],
         use_tls: false,
         server_name: String::new(),
+        action: BackendAction::Forward,
     }
 }
 
@@ -162,7 +163,7 @@ fn test_wildcard_host_matching() {
 
     assert!(rt
         .find_http_route("example.org", "GET", "/", &[], "", 0)
-        .is_err());
+        .is_none());
 }
 
 #[test]
@@ -285,6 +286,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -292,6 +294,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -619,7 +622,8 @@ fn test_exact_beats_regex_precedence() {
 fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketAddr> {
     let selector = BackendSelector::new();
     let health = crate::proxy::health::HealthRegistry::new();
-    rt.resolve_tls_passthrough(sni, port, &selector, &health)
+    rt.resolve_tls_passthrough(Some(sni), port, None, &selector, &health)
+        .ok()
 }
 
 #[test]
@@ -635,6 +639,33 @@ fn test_resolve_tls_passthrough_found() {
 fn test_resolve_tls_passthrough_no_route() {
     let rt = RouteTable::new();
     assert!(resolve_pt(&rt, "example.com", 8443).is_none());
+}
+
+/// A route with no backend at all was reported as having no positive
+/// weight; the L4 path tells the two apart, and so does this.
+#[test]
+fn passthrough_miss_tells_no_backends_from_no_weight() {
+    let mut weightless = backend(9001);
+    weightless.weight = 0;
+    let mut rt = RouteTable::new();
+    rt.add_tls_route(0, "empty.example.com", vec![]);
+    rt.add_tls_route(0, "weightless.example.com", vec![weightless]);
+    rt.add_tcp_route(8443, vec![]);
+    let (selector, health) = (
+        BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let miss = |sni| {
+        rt.resolve_tls_passthrough(Some(sni), 8443, None, &selector, &health)
+            .unwrap_err()
+    };
+    assert_eq!(miss("empty.example.com"), PassthroughMiss::NoBackends);
+    assert_eq!(miss("weightless.example.com"), PassthroughMiss::NoWeight);
+    assert_eq!(miss("tcp.example.com"), PassthroughMiss::NoBackends);
+    assert_eq!(
+        PassthroughMiss::NoBackends.to_string(),
+        "no backends available"
+    );
 }
 
 #[test]
@@ -677,14 +708,14 @@ fn test_tls_route_scoped_to_listener_port() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(9443, "svc.example.com", vec![backend(9001)]);
 
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+    assert!(resolve_pt(&rt, "svc.example.com", 9443).is_some());
     assert_eq!(
         resolve_pt(&rt, "svc.example.com", 9443),
         Some("127.0.0.1:9001".parse().unwrap())
     );
 
     // Same SNI on a different port: no passthrough.
-    assert!(!rt.has_tls_passthrough_route("svc.example.com", 443));
+    assert!(!resolve_pt(&rt, "svc.example.com", 443).is_some());
     assert_eq!(resolve_pt(&rt, "svc.example.com", 443), None);
 }
 
@@ -693,8 +724,8 @@ fn test_tls_route_scoped_to_listener_port() {
 fn test_tls_route_any_port_scope_matches_all_ports() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(0, "svc.example.com", vec![backend(9001)]);
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 443));
-    assert!(rt.has_tls_passthrough_route("svc.example.com", 9443));
+    assert!(resolve_pt(&rt, "svc.example.com", 443).is_some());
+    assert!(resolve_pt(&rt, "svc.example.com", 9443).is_some());
 }
 
 /// Wildcard TLS matching walks up domain labels like the HTTP wildcard
@@ -704,7 +735,7 @@ fn test_tls_route_any_port_scope_matches_all_ports() {
 fn test_tls_wildcard_matches_multi_label_subdomain() {
     let mut rt = RouteTable::new();
     rt.add_tls_route(0, "*.example.com", vec![backend(9002)]);
-    assert!(rt.has_tls_passthrough_route("a.b.example.com", 8443));
+    assert!(resolve_pt(&rt, "a.b.example.com", 8443).is_some());
     assert_eq!(
         resolve_pt(&rt, "a.b.example.com", 8443),
         Some("127.0.0.1:9002".parse().unwrap())
@@ -722,12 +753,74 @@ fn test_tls_passthrough_round_robins_backends() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .unwrap()
                 .port(),
         );
     }
     assert_eq!(seen, [9001, 9002].into_iter().collect());
+}
+
+/// A passthrough listener's own routes and the routes without parentRefs
+/// rank as one set: the exact hostname, then the longest wildcard, then
+/// the catch-all. The listener's own scope was searched whole first, so
+/// its catch-all took a host a shared route names exactly.
+#[test]
+fn tls_routes_rank_across_a_listeners_scope_and_the_shared_one() {
+    let mut rt = RouteTable::new();
+    rt.add_tls_route_for_listener(8443, None, "*", vec![backend(9001)]);
+    rt.add_tls_route_for_listener(8443, None, "*.example.com", vec![backend(9002)]);
+    rt.add_tls_route_for_listener(8443, None, "own.example.com", vec![backend(9003)]);
+    rt.add_tls_route(0, "s.example.com", vec![backend(9004)]);
+    rt.add_tls_route(0, "*.b.example.com", vec![backend(9005)]);
+    rt.add_tls_route(0, "*.example.com", vec![backend(9006)]);
+    rt.add_tls_route(0, "*", vec![backend(9007)]);
+    for (sni, port) in [
+        ("s.example.com", 9004),
+        ("x.b.example.com", 9005),
+        ("own.example.com", 9003),
+        ("x.example.com", 9002),
+        ("other.org", 9001),
+    ] {
+        assert_eq!(
+            resolve_pt(&rt, sni, 8443).map(|a| a.port()),
+            Some(port),
+            "{sni}"
+        );
+    }
+}
+
+/// Selection rotates per route: hellos naming different hosts under one
+/// wildcard route, or none at all on a catch-all, take turns. The counter
+/// was keyed by the client's SNI, one per name a client chose to send.
+#[test]
+fn tls_passthrough_rotates_per_route_not_per_sni() {
+    let mut rt = RouteTable::new();
+    rt.add_tls_route_for_listener(
+        8443,
+        None,
+        "*.example.com",
+        vec![backend(9001), backend(9002)],
+    );
+    rt.add_tls_route_for_listener(8443, None, "*", vec![backend(9003), backend(9004)]);
+    let selector = BackendSelector::new();
+    let health = crate::proxy::health::HealthRegistry::new();
+    let pick = |sni| {
+        rt.resolve_tls_passthrough(sni, 8443, None, &selector, &health)
+            .unwrap()
+            .port()
+    };
+    let wildcard: Vec<_> = [
+        "a.example.com",
+        "b.example.com",
+        "c.example.com",
+        "d.example.com",
+    ]
+    .map(|sni| pick(Some(sni)))
+    .into();
+    assert_eq!(wildcard, [9001, 9002, 9001, 9002]);
+    let catch_all: Vec<_> = [None, Some("x.org"), None, Some("y.org")].map(pick).into();
+    assert_eq!(catch_all, [9003, 9004, 9003, 9004]);
 }
 
 /// Passthrough fails over: an unhealthy backend gets no connections while a
@@ -743,7 +836,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     mark_unhealthy(&health, 9001);
     for _ in 0..4 {
         let addr = rt
-            .resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            .resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
             .unwrap();
         assert_eq!(addr.port(), 9002);
     }
@@ -752,7 +845,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..4 {
         seen.insert(
-            rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+            rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .expect("all-unhealthy must fail open")
                 .port(),
         );
@@ -807,6 +900,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -814,6 +908,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -853,6 +948,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -860,6 +956,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),
@@ -1061,6 +1158,77 @@ fn test_zero_weight_backend_skipped_on_slow_path() {
     }
 }
 
+/// An invalid backendRef's Reject entry keeps exactly its configured share
+/// while a sibling is unhealthy: the unhealthy share moves to the healthy
+/// forwarding backends only, evenly, never to the Reject entry.
+#[test]
+fn test_reject_share_is_exact_while_a_sibling_is_unhealthy() {
+    let backends = vec![
+        weighted(8001, 1),
+        weighted(8002, 1),
+        Backend::rejecting(1),
+        weighted(8003, 1),
+    ];
+    let mut rt = RouteTable::new();
+    rt.add_http_route(
+        "test.com",
+        rule(PathMatchType::Prefix, "/", backends.clone()),
+    );
+    let r = rt
+        .find_http_route("test.com", "GET", "/", &[], "", 0)
+        .unwrap();
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+
+    let selector = BackendSelector::new();
+    let mut http = [0u32; 4];
+    let mut l4 = [0u32; 4];
+    for _ in 0..800 {
+        http[selector
+            .select_healthy_weighted_backend(r, &health)
+            .unwrap()] += 1;
+        let b = selector
+            .select_l4_backend(7000, &backends, &health)
+            .unwrap();
+        let i = backends.iter().position(|c| std::ptr::eq(c, b)).unwrap();
+        l4[i] += 1;
+    }
+    assert_eq!(http, [0, 300, 200, 300]);
+    assert_eq!(l4, [0, 300, 200, 300]);
+}
+
+/// With every forwarding backend down, panic routing keeps each one's own
+/// share; the Reject entry still gets only its own.
+#[test]
+fn test_reject_share_is_exact_when_every_forwarding_backend_is_down() {
+    let backends = vec![weighted(8001, 3), Backend::rejecting(1)];
+    let mut rt = RouteTable::new();
+    rt.add_http_route(
+        "test.com",
+        rule(PathMatchType::Prefix, "/", backends.clone()),
+    );
+    let r = rt
+        .find_http_route("test.com", "GET", "/", &[], "", 0)
+        .unwrap();
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+
+    let selector = BackendSelector::new();
+    let mut http = [0u32; 2];
+    let mut l4 = [0u32; 2];
+    for _ in 0..400 {
+        http[selector
+            .select_healthy_weighted_backend(r, &health)
+            .unwrap()] += 1;
+        let b = selector
+            .select_l4_backend(7000, &backends, &health)
+            .unwrap();
+        l4[usize::from(b.action == BackendAction::Reject)] += 1;
+    }
+    assert_eq!(http, [300, 100]);
+    assert_eq!(l4, [300, 100]);
+}
+
 #[test]
 fn test_cumulative_weights_precomputed() {
     let mut rt = RouteTable::new();
@@ -1079,6 +1247,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
                 Backend {
                     socket_addr: "127.0.0.1:8002".parse().unwrap(),
@@ -1086,6 +1255,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: BackendAction::Forward,
                 },
             ],
         ),

@@ -5,6 +5,8 @@
 //! listener/Gateway condition computation).
 
 mod reconcile;
+#[cfg(test)]
+mod testkit;
 mod validate;
 mod watch;
 
@@ -32,15 +34,19 @@ use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
 
+use crate::kubernetes::addresses::NetworkIps;
 use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::dns_refresh::Published;
+use crate::kubernetes::reconciler::RouteVerdicts;
+use crate::kubernetes::services::NamedPortCache;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 
 use reconcile::reconcile;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
-    create_reflector_gated_with_config, map_policy_to_gateways, map_route_to_gateways,
-    map_secret_to_gateways,
+    create_reflector_gated_with_config, drop_unread_metadata, map_policy_to_gateways,
+    map_route_to_gateways, map_secret_to_gateways, PendingWatches,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -81,10 +87,10 @@ struct ControllerCtx {
     controller_name: String,
     cache: ResourceCache,
     routes: Arc<ArcSwap<RouteTable>>,
-    /// Last config the reconciler built, published for the background DNS-refresh
-    /// task to re-resolve without an apiserver round-trip. `None` until the first
-    /// successful reconcile.
-    config_cell: Arc<ArcSwapOption<crate::config::PortailConfig>>,
+    /// Last config the reconciler built and the table built from it, published
+    /// for the background DNS-refresh task to re-resolve without an apiserver
+    /// round-trip. `None` until the first successful reconcile.
+    published: Arc<ArcSwapOption<Published>>,
     data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
     /// When false, the operator owns Gateway lifecycle status
@@ -93,27 +99,27 @@ struct ControllerCtx {
     /// Flipped to true once the data plane has bound this instance's listener
     /// ports. Surfaced via the readiness endpoint for the pod's readinessProbe.
     ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Fingerprint of the last reconcile pass that was fully applied — config
-    /// built + route table swapped + every status PATCH accepted. When a new
-    /// pass computes the same fingerprint, the rebuild and all status writes
-    /// are skipped: this is what keeps a permanently-unaccepted route (or our
-    /// own status-write watch echoes) from re-running regex compilation, DNS
-    /// resolution, and N apiserver PATCHes on every requeue. Keyed per
-    /// Gateway: a single shared slot meant that in unscoped mode two
-    /// Gateways' alternating passes never matched and re-applied forever.
-    last_applied: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
+    /// The data plane's last apply: the effective config's fingerprint and
+    /// its build outcome. A pass with the same fingerprint and live
+    /// listeners skips the bind and the rebuild: no table is built, so
+    /// nothing is resolved or compiled for one. Route acceptance compiles
+    /// apart, once per route generation: see `route_verdicts`.
+    last_applied: Arc<std::sync::Mutex<Option<reconcile::Applied>>>,
+    route_verdicts: Arc<RouteVerdicts>,
     /// Serializes the apply section of reconcile (merge → ensure → table
     /// build → swap → status). kube-rs reconciles different Gateways
     /// concurrently in unscoped mode, and interleaved passes could publish a
     /// table built from a stale merge over the shared data plane. Uncontended
     /// in scoped mode (one Gateway per process).
     apply_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Last built config per Gateway. In scoped mode this holds exactly one
-    /// entry; in legacy unscoped mode (one process watching every Gateway)
-    /// the entries are merged before each route-table build so reconciling
-    /// Gateway A cannot clobber Gateway B's routes in the shared table.
-    gateway_configs:
-        Arc<std::sync::Mutex<HashMap<(String, String), Arc<crate::config::PortailConfig>>>>,
+    /// Last built config and bind addresses per Gateway. In scoped mode this
+    /// holds exactly one entry; in legacy unscoped mode (one process
+    /// watching every Gateway) the entries are merged before each
+    /// route-table build so reconciling Gateway A cannot clobber Gateway B's
+    /// routes in the shared table, nor bind them on its addresses.
+    gateway_configs: Arc<std::sync::Mutex<reconcile::GatewayConfigs>>,
+    named_ports: Arc<NamedPortCache>,
+    network_ips: Arc<NetworkIps>,
     /// When the controller came up — cold-start latency context for the
     /// "Data plane ready" log line and the not-ready watchdog.
     started: std::time::Instant,
@@ -145,8 +151,9 @@ pub async fn run_controller(
     // per key and never clears on delete, so deleting and recreating a Gateway
     // with the same name (recreates restart at generation 1) would be
     // suppressed and the recreated Gateway never reconciled. Status-only watch
-    // echoes of our own writes are instead absorbed by the reconcile
-    // fingerprint short-circuit, which skips the rebuild and all PATCHes.
+    // echoes of our own writes are instead absorbed by reconcile: the
+    // data-plane fingerprint skips the rebuild, and status that already
+    // matches the store is not written.
     //
     // When `gateway_scope` is set (operator-managed Deployments), narrow the
     // watch to that single Gateway via namespace + `metadata.name` field
@@ -169,17 +176,33 @@ pub async fn run_controller(
             watcher::Config::default(),
         ),
     };
-    let gw_stream = reflector::reflector(gw_writer, watcher::watcher(gw_api, gw_watcher_config))
-        .default_backoff()
-        .applied_objects();
+    // A deletion runs no reconcile. A relist (InitDone) may also have
+    // dropped Gateways deleted while the watch was down.
+    let gateway_gone = Arc::new(tokio::sync::Notify::new());
+    let gw_stream = reflector::reflector(
+        gw_writer,
+        watcher::watcher(gw_api, gw_watcher_config).modify(drop_unread_metadata),
+    )
+    .default_backoff()
+    .inspect({
+        let gone = gateway_gone.clone();
+        move |event| {
+            if matches!(
+                event,
+                Ok(watcher::Event::Delete(_) | watcher::Event::InitDone)
+            ) {
+                gone.notify_one();
+            }
+        }
+    })
+    .applied_objects();
 
     // --- Secondary resources ---
     // Each resource gets a reflector (store + stream). The stream feeds into
     // Controller::watches_stream() with a mapper that targets affected Gateway(s).
-    // This is the standard kube-rs/controller-runtime pattern: secondary resource
-    // events go through a separate path unaffected by the primary predicate_filter.
+    // No watch is predicate-filtered: status-only events (our own writes
+    // included) reach reconcile, which absorbs them.
 
-    // CRD reflectors — generation-filtered to ignore status-only changes.
     // HTTPRoute is required (GA); TCP/TLS/UDPRoute are experimental (optional).
     // All route watches stay CLUSTER-WIDE and unconditional: a route in any
     // namespace, of any kind, may parentRef this Gateway and must get a status
@@ -193,20 +216,41 @@ pub async fn run_controller(
     // routes, and stays cluster-wide and ungated for the same reason routes
     // do: a policy in any namespace may target this Gateway and must get an
     // ancestor status, which requires observing it.
+    let pending_watches = PendingWatches::default();
     let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector) = tokio::join!(
-        create_optional_reflector(Api::<TCPRoute>::all(client.clone())),
-        create_optional_reflector(Api::<TLSRoute>::all(client.clone())),
-        create_optional_reflector(Api::<UDPRoute>::all(client.clone())),
-        create_optional_reflector(Api::<RateLimitPolicy>::all(client.clone())),
+        create_optional_reflector(
+            Api::<TCPRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<TLSRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<UDPRoute>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
+        create_optional_reflector(
+            Api::<RateLimitPolicy>::all(client.clone()),
+            &client,
+            &pending_watches
+        ),
     );
     let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
     let (store_tls_routes, tls_route_stream) = tls_reflector;
     let (store_udp_routes, udp_route_stream) = udp_reflector;
     let (store_rate_limit_policies, policy_stream) = policy_reflector;
+    tokio::spawn(pending_watches.recheck_every(
+        client.clone(),
+        Duration::from_secs(RESYNC_SECS),
+        shutdown.clone(),
+    ));
     // GatewayClass status is owned by portail-operator now; portail no longer
     // runs its own GatewayClass controller.
 
-    // Core resource reflectors — no generation filter (core types don't reliably set it).
     // The Namespace watch is opened only when a listener uses
     // `allowedRoutes: Selector` (the only consumer of namespace labels).
     let (store_namespaces, namespace_stream) = create_reflector_gated(
@@ -237,9 +281,7 @@ pub async fn run_controller(
 
     let store_gateways_for_controller = store_gateways.clone();
 
-    // Shared cell the reconciler publishes its last-built config into, read by the
-    // background DNS-refresh task to re-resolve backend FQDNs off the apiserver.
-    let config_cell = Arc::new(ArcSwapOption::<crate::config::PortailConfig>::empty());
+    let published = Arc::new(ArcSwapOption::<Published>::empty());
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -258,16 +300,35 @@ pub async fn run_controller(
             gateway_classes: unscoped.then_some(store_gateway_classes),
         },
         routes,
-        config_cell: config_cell.clone(),
+        published: published.clone(),
         data_plane,
         performance_config,
         manage_gateway_status,
         ready,
-        last_applied: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        last_applied: Arc::new(std::sync::Mutex::new(None)),
+        route_verdicts: Arc::default(),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        network_ips: Arc::default(),
+        // A stale read lasts as long as before the cache: every requeue
+        // listed the slices again.
+        named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
         started: std::time::Instant::now(),
     });
+
+    // Scoped mode serves one Gateway; its deletion ends the pod instead.
+    if unscoped {
+        let ctx = ctx.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = gateway_gone.notified() => reconcile::prune_deleted_gateways(&ctx).await,
+                }
+            }
+        });
+    }
 
     // Cold-start visibility: a pod sitting NotReady because the apiserver is
     // slow to deliver the first Gateway (or because binds keep failing) used
@@ -299,18 +360,25 @@ pub async fn run_controller(
         Ok(dp) => dp.health().clone(),
         Err(poisoned) => poisoned.into_inner().health().clone(),
     };
+    // A swap means pods came or went: named targetPorts, whose numbers live
+    // on the pods, are read again by a reconcile of every Gateway. That keeps
+    // them as fresh as the pod IPs, on the same interval.
+    let (pods_changed, named_port_refresh) = futures::channel::mpsc::unbounded::<()>();
+    let named_ports = ctx.named_ports.clone();
     crate::kubernetes::dns_refresh::spawn_dns_refresh(
-        config_cell,
+        published,
         ctx.routes.clone(),
         health,
         ctx.performance_config.dns_refresh_interval,
         shutdown.clone(),
+        move || {
+            if named_ports.dns_changed() {
+                let _ = pods_changed.unbounded_send(());
+            }
+        },
     );
 
     // --- Gateway controller ---
-    // Primary: Gateway stream with generation predicate (breaks feedback loop).
-    // Secondary: watches_stream() per resource type with targeted mappers.
-    //
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
     // Secret → map to Gateways referencing it in TLS config (targeted)
     // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
@@ -318,32 +386,34 @@ pub async fn run_controller(
     // Each watches_stream closure captures an owned gateway store clone via move.
     let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
         std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
+    let [cn1, cn2, cn3, cn4, cn8] = std::array::from_fn::<_, 5, _>(|_| controller_name.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
-        // Routes: targeted — only reconcile the Gateway(s) referenced in parentRefs.
+        // Routes: targeted, to the Gateway(s) its parentRefs name and the
+        // ones its status says we reported on.
         // No predicate_filter here: it caches generation per object key and never
         // clears on delete, so delete+recreate with the same name (common in
-        // conformance tests) would be suppressed. The status feedback loop is
-        // already broken by the primary Gateway stream's predicate filter.
+        // conformance tests) would be suppressed. The echo of our own status
+        // writes finds nothing to write.
         .watches_stream(http_route_stream, move |route: HTTPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw1)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw1, &cn1)
         })
         .watches_stream(tcp_route_stream, move |route: TCPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw2)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw2, &cn2)
         })
         .watches_stream(tls_route_stream, move |route: TLSRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw3)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw3, &cn3)
         })
         .watches_stream(udp_route_stream, move |route: UDPRoute| {
-            map_route_to_gateways(&route, &route.spec.parent_refs, &gw4)
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw4, &cn4)
         })
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS
         .watches_stream(secret_stream, move |secret: Secret| {
             map_secret_to_gateways(&secret, &gw5)
         })
-        // RateLimitPolicy: targeted — the one Gateway its targetRef names.
+        // RateLimitPolicy: targeted like routes, by targetRef and status.
         .watches_stream(policy_stream, move |policy: RateLimitPolicy| {
-            map_policy_to_gateways(&policy, &gw8)
+            map_policy_to_gateways(&policy, &gw8, &cn8)
         })
         // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
         // These have complex multi-hop mappings; the 1s debounce coalesces bursts.
@@ -362,6 +432,7 @@ pub async fn run_controller(
             let gw = ctx.cache.gateways.clone();
             move |_: GatewayClass| all_gateway_refs(&gw)
         })
+        .reconcile_all_on(named_port_refresh)
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);
@@ -385,28 +456,30 @@ pub async fn run_controller(
     Ok(())
 }
 
+/// The safety-net re-check of a converged Gateway, in seconds.
+const RESYNC_SECS: u64 = 600;
+
 /// Requeue cadence after a reconcile that APPLIED changes. A *converged*
 /// Gateway — its data plane Programmed and every attached route Accepted —
 /// only needs a slow safety-net re-check (600s). An unconverged one re-runs
 /// in 5s so a status write that raced an unsynced reflector cache (or a
 /// missed watch event) heals well inside the conformance 60s accept-gate.
 /// A route held permanently not-Accepted only pays this fast cadence once:
-/// the next pass sees an unchanged fingerprint, skips the rebuild and status
-/// writes, and drops to the `skip_requeue_secs` cadence.
+/// the next pass finds nothing to rebuild or write and drops to the
+/// `skip_requeue_secs` cadence.
 fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
-        600
+        RESYNC_SECS
     } else {
         5
     }
 }
 
-/// Requeue cadence after a short-circuited reconcile (fingerprint unchanged):
-/// nothing was rebuilt or written, so the fast heal cadence has nothing to
-/// heal — back off to a periodic re-check instead.
+/// Requeue cadence after a reconcile that rebuilt and wrote nothing: the
+/// fast heal cadence has nothing to heal, so back off to a periodic re-check.
 fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
-        600
+        RESYNC_SECS
     } else {
         60
     }

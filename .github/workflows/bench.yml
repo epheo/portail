@@ -39,8 +39,12 @@ jobs:
       # criterion's `--output-format bencher` emits libtest-style lines
       # (`test <name> ... bench: <ns> ns/iter (+/- <mad>)`), which
       # github-action-benchmark parses with `tool: cargo`.
+      # A restored cache can carry a partial target/criterion, and criterion
+      # then prints its baseline errors inside the bencher lines, which the
+      # tracking step cannot parse.
       - name: Run criterion micro-benches
         run: |
+          rm -rf target/criterion
           cargo bench --bench parsing_bench --bench sniff_bench --bench routing_bench --bench end_to_end_bench \
             -- --output-format bencher | tee bench-output.txt
 

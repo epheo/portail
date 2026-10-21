@@ -6,5 +6,3 @@ resources:
 - gateway-frontend.yaml
 - gateway-backend.yaml
 - httproute.yaml
-patches:
-- path: rbac-patch.yaml

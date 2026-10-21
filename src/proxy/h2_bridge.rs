@@ -28,7 +28,7 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::debug;
-use crate::metrics::ListenerStats;
+use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::SharedBackendPool;
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
@@ -326,9 +326,13 @@ async fn serve_stream(
 
     let Some((head, chunk_body)) = synth_request_head(&parts, body.is_end_stream()) else {
         // CONNECT or no authority: not expressible as an origin-form h1
-        // exchange through the engine. Count it like an engine-answered
-        // error so refusals are not invisible to /metrics.
-        ctx.listener_stats.http_requests.inc();
+        // exchange through the engine. Counted as the engine counts an h1
+        // CONNECT or a head without Host.
+        METRICS.http_requests_rejected_total.inc();
+        debug!(
+            "Rejecting an h2 stream from {}: CONNECT or no authority",
+            ctx.peer
+        );
         let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
@@ -1199,6 +1203,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );
@@ -1315,6 +1320,32 @@ mod tests {
             let ended = tokio::time::timeout(budget * 4, &mut served).await;
             assert!(ended.is_ok(), "{then:?}: connection held past its budget");
         }
+    }
+
+    /// No backend sees a CONNECT stream: like an h1 CONNECT, it is a
+    /// rejected request, not a dispatched one.
+    #[tokio::test]
+    async fn a_refused_stream_counts_as_rejected() {
+        let Some((server, client)) = tls_pair().await else {
+            return; // openssl unavailable
+        };
+        let ctx = ctx(backend(2, b"ok").await, Duration::from_secs(5));
+        let stats = Arc::clone(&ctx.listener_stats);
+        tokio::spawn(serve(server, ctx));
+        let (send, conn) = h2::client::handshake(client).await.unwrap();
+        tokio::spawn(conn);
+        let rejected = || METRICS.http_requests_rejected_total.get();
+        let before = rejected();
+        let mut send = send.ready().await.unwrap();
+        let req = http::Request::builder()
+            .method("CONNECT")
+            .uri("a.test:443")
+            .body(())
+            .unwrap();
+        let (resp, _) = send.send_request(req, true).unwrap();
+        assert_eq!(resp.await.unwrap().status(), 400);
+        assert_eq!(stats.http_requests.get(), 0);
+        assert!(rejected() > before);
     }
 
     /// GET a.test over `send`: the status and body.

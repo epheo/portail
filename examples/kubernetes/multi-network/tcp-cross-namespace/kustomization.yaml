@@ -9,5 +9,3 @@ resources:
 - tcproute.yaml
 - referencegrant.yaml
 - backend.yaml
-patches:
-- path: rbac-patch.yaml

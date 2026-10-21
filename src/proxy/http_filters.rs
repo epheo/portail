@@ -3,6 +3,7 @@
 //! Applies header modifications, URL rewrites, and request mirroring
 //! on raw byte slices — no intermediate String allocations on the request path.
 
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -20,27 +21,52 @@ pub struct HeaderModifications<'a> {
     pub remove: &'a [String],
 }
 
+/// A URLRewrite applied to one request, borrowed from its rule.
 #[derive(Debug, Clone)]
-pub struct URLRewrite {
-    pub hostname: Option<String>,
-    pub path: Option<RewrittenPath>,
+pub struct URLRewrite<'a> {
+    pub hostname: Option<&'a str>,
+    pub path: Option<RewrittenPath<'a>>,
 }
 
+/// A path modifier applied to one request: its new path, and the query its
+/// value carries ([`crate::routing::PathValue`]), which goes before the
+/// request's.
 #[derive(Debug, Clone)]
-pub enum RewrittenPath {
-    Full(String),
-    PrefixReplaced(String),
+pub struct RewrittenPath<'a> {
+    /// A full path is the value's own; a prefix replacement is joined to
+    /// the request's rest.
+    pub path: Cow<'a, str>,
+    pub query: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl<'a> RewrittenPath<'a> {
+    /// The path a full-path value gives, its query split off as a rule's is.
+    pub(crate) fn from_value(value: &'a str) -> Self {
+        match value.split_once('?') {
+            Some((path, query)) => Self {
+                path: path.into(),
+                query: Some(query),
+            },
+            None => Self {
+                path: value.into(),
+                query: None,
+            },
+        }
+    }
 }
 
 /// Assemble the outgoing request header block into `out` (reused scratch):
 /// copies `raw` minus the parser-recorded hop-by-hop spans via bulk gap
 /// copies, then appends X-Forwarded-For / X-Forwarded-Proto and, for upgrade
-/// requests, the Connection: upgrade the stripped original carried.
+/// requests, the Connection: upgrade the stripped original carried. A
+/// `path` takes the place of the request line's own, its query kept.
 /// One pass, no allocation after scratch warmup.
 ///
 /// `raw` is the full header block ending with the blank-line CRLF.
 pub(crate) fn assemble_forward_headers(
     raw: &[u8],
+    path: Option<&[u8]>,
     spans: &crate::proxy::http_parser::StripSpans,
     upgrade_span: Option<(u32, u32)>,
     keep_upgrade: bool,
@@ -58,6 +84,11 @@ pub(crate) fn assemble_forward_headers(
 
     // Both sources are in ascending parse order; merge while copying gaps.
     let mut cursor = 0usize;
+    if let Some(path) = path {
+        // No span covers the request line: the gaps resume at its CRLF.
+        cursor = memchr::memchr(b'\r', raw).unwrap_or(0);
+        put_request_line(&raw[..cursor], path, None, out);
+    }
     let mut upgrade_pending = strip_upgrade;
     for (s, e) in spans.iter() {
         if let Some((us, ue)) = upgrade_pending {
@@ -84,6 +115,7 @@ pub(crate) fn assemble_forward_headers(
 /// §6.1 requires stripping every header the Connection field names).
 pub(crate) fn assemble_forward_headers_slow(
     raw: &[u8],
+    path: Option<&[u8]>,
     keep_upgrade: bool,
     client_ip: std::net::IpAddr,
     is_tls: bool,
@@ -117,7 +149,10 @@ pub(crate) fn assemble_forward_headers_slow(
         if first {
             // Request line is never a header.
             first = false;
-            out.extend_from_slice(line);
+            match path {
+                Some(path) => put_request_line(line, path, None, out),
+                None => out.extend_from_slice(line),
+            }
             out.extend_from_slice(b"\r\n");
             continue;
         }
@@ -167,10 +202,10 @@ fn append_forward_headers(
     }
 }
 
-/// The origin-form target and the authority of an absolute-form request
-/// (`raw` is its head, `path_span` the parser's path within it). `None` for
-/// any other form, at one byte compare when the path starts the target, as
-/// it does in the common origin-form request.
+/// The path and the authority of an absolute-form request (`raw` is its
+/// head, `path_span` the parser's path within it). `None` for any other
+/// form, at one byte compare when the path starts the target, as it does in
+/// the common origin-form request.
 pub(crate) fn absolute_form_target(
     raw: &[u8],
     path_span: Option<(u32, u32)>,
@@ -191,23 +226,27 @@ pub(crate) fn absolute_form_target(
                 .is_some_and(|t| t.eq_ignore_ascii_case(s))
         })?
         .len();
-    // The parser held everything up to '/' to host[:port].
+    // The parser held everything up to '/' to host[:port], so the query,
+    // if any, comes after the path.
     let rest = &target[scheme_len..];
     let authority_len = memchr::memchr(b'/', rest).unwrap_or(rest.len());
-    let origin = match &rest[authority_len..] {
-        // RFC 9112 3.2.1: an empty path is sent as "/".
-        b"" => &b"/"[..],
-        path_and_query => path_and_query,
+    let path_and_query = &rest[authority_len..];
+    let path = match memchr::memchr(b'?', path_and_query) {
+        Some(query) => &path_and_query[..query],
+        None => path_and_query,
     };
-    Some((origin, std::str::from_utf8(&rest[..authority_len]).ok()?))
+    // RFC 9112 3.2.1: an empty path is sent as "/".
+    let path = if path.is_empty() { &b"/"[..] } else { path };
+    Some((path, std::str::from_utf8(&rest[..authority_len]).ok()?))
 }
 
 /// Rewrite an absolute-form request head into `out` for an origin server
-/// (RFC 9112 3.2.1): `target` replaces the request-target, and `authority`
-/// replaces the client's Host, or is added where an HTTP/1.0 client sent
-/// none (3.2.2). Filters then act on it as on any origin-form request.
-pub(crate) fn to_origin_form(head: &[u8], target: &[u8], authority: &str, out: &mut Vec<u8>) {
-    rewrite_request_head(head, Some(target), None, Some(authority), out);
+/// (RFC 9112 3.2.1): `path` replaces the request-target up to its query,
+/// and `authority` replaces the client's Host, or is added where an
+/// HTTP/1.0 client sent none (3.2.2). Filters then act on it as on any
+/// origin-form request.
+pub(crate) fn to_origin_form(head: &[u8], path: &[u8], authority: &str, out: &mut Vec<u8>) {
+    rewrite_request_head(head, Some((path, None)), None, Some(authority), out);
 }
 
 /// Request-target bounds within a request line: between its first two SPs.
@@ -340,7 +379,8 @@ pub(crate) fn prefix_remainder<'a>(rule_path: &str, request_path: &'a str) -> &'
 }
 
 /// Join a prefix replacement with the remaining suffix from the original path.
-/// Avoids double-slash: `/` + `/three` → `/three`, not `//three`.
+/// Avoids double-slash: `/` + `/three` is `/three`, not `//three`. The
+/// value's query, split off when its rule compiled, follows the joined path.
 pub(crate) fn join_prefix_path(prefix: &str, suffix: &str) -> String {
     // Strip trailing slash from prefix if suffix starts with slash
     let prefix = if prefix.ends_with('/') && suffix.starts_with('/') {
@@ -381,22 +421,30 @@ pub fn extract_header_mods<'a>(
     None
 }
 
-/// Extract URL rewrite parameters from rule filters.
-pub fn extract_url_rewrite(
-    filters: &[HttpFilter],
+/// Extract URL rewrite parameters from rule filters. Only a prefix
+/// replacement allocates: the rest is the rule's, borrowed.
+pub fn extract_url_rewrite<'a>(
+    filters: &'a [HttpFilter],
     rule_path: &str,
     request_path: &str,
-) -> Option<URLRewrite> {
+) -> Option<URLRewrite<'a>> {
     for filter in filters {
         if let HttpFilter::URLRewrite { hostname, path } = filter {
             let rewritten_path = path.as_ref().map(|p| match p {
-                URLRewritePath::ReplaceFullPath(value) => RewrittenPath::Full(value.clone()),
-                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath::PrefixReplaced(
-                    join_prefix_path(value, prefix_remainder(rule_path, request_path)),
-                ),
+                URLRewritePath::ReplaceFullPath(value) => RewrittenPath {
+                    path: Cow::Borrowed(&value.path),
+                    query: value.query.as_deref(),
+                },
+                URLRewritePath::ReplacePrefixMatch(value) => RewrittenPath {
+                    path: Cow::Owned(join_prefix_path(
+                        &value.path,
+                        prefix_remainder(rule_path, request_path),
+                    )),
+                    query: value.query.as_deref(),
+                },
             });
             return Some(URLRewrite {
-                hostname: hostname.clone(),
+                hostname: hostname.as_deref(),
                 path: rewritten_path,
             });
         }
@@ -415,28 +463,24 @@ pub(crate) const MIRROR_BODY_MAX: usize = 1024 * 1024; // 1 MB
 /// mirrors are shed instead of accumulating 5s × RPS tasks of buffered bodies.
 static MIRROR_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
 
-/// Fire-and-forget mirror dispatch with percentage-based filtering and timeout.
+/// Fire-and-forget mirror dispatch with fraction-based sampling and timeout.
 ///
 /// Iterates rule filters looking for `RequestMirror` variants.
-/// For each target, rolls a random number to decide whether to mirror based on
-/// the configured percentage. Spawned tasks are bounded by a total 5s timeout
+/// For each target, draws against the configured fraction to decide whether
+/// to mirror. Spawned tasks are bounded by a total 5s timeout
 /// (2s connect + 3s write) to prevent leaked tasks from slow/dead backends,
 /// and by `MIRROR_PERMITS` in flight.
 pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
     for filter in filters {
-        let (addr, percent) = match filter {
+        let (addr, fraction) = match filter {
             HttpFilter::RequestMirror {
                 backend_addr,
-                mirror_percent,
-            } => (*backend_addr, *mirror_percent),
+                fraction,
+            } => (*backend_addr, *fraction),
             _ => continue,
         };
 
-        // Probabilistic dispatch: skip if random roll exceeds configured percent
-        if percent == 0 {
-            continue;
-        }
-        if percent < 100 && fastrand::u32(0..100) >= percent {
+        if !fraction.sample() {
             continue;
         }
 
@@ -586,22 +630,23 @@ fn split_first_line(raw: &[u8]) -> (&[u8], &[u8]) {
 pub(crate) fn apply_request_header_modifications(
     header_region: &[u8],
     header_mods: Option<&HeaderModifications<'_>>,
-    url_rewrite: Option<&URLRewrite>,
+    url_rewrite: Option<&URLRewrite<'_>>,
     out: &mut Vec<u8>,
 ) {
-    let path = url_rewrite.and_then(|r| r.path.as_ref()).map(|p| match p {
-        RewrittenPath::Full(p) | RewrittenPath::PrefixReplaced(p) => p.as_bytes(),
-    });
-    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname.as_deref());
+    let path = url_rewrite
+        .and_then(|r| r.path.as_ref())
+        .map(|p| (p.path.as_bytes(), p.query));
+    let rewrite_hostname = url_rewrite.and_then(|r| r.hostname);
     rewrite_request_head(header_region, path, header_mods, rewrite_hostname, out);
 }
 
-/// The request line with `target` in place of its own, then the header
-/// lines through `apply_header_mods_inner`, into `out` (cleared first).
-/// Shared by URLRewrite paths and the origin-form rewrite.
+/// The request line with `path` in place of its target's path, then the
+/// header lines through `apply_header_mods_inner`, into `out` (cleared
+/// first). Shared by URLRewrite paths and the origin-form rewrite. `path`
+/// carries the query of the value it came from, if any.
 fn rewrite_request_head(
     header_region: &[u8],
-    target: Option<&[u8]>,
+    path: Option<(&[u8], Option<&str>)>,
     header_mods: Option<&HeaderModifications<'_>>,
     rewrite_hostname: Option<&str>,
     out: &mut Vec<u8>,
@@ -609,16 +654,53 @@ fn rewrite_request_head(
     out.clear();
     out.reserve(header_region.len() + 256);
     let (first_line, rest) = split_first_line(header_region);
-    match target.and_then(|t| Some((t, target_bounds(first_line)?))) {
-        Some((target, (start, end))) => {
-            out.extend_from_slice(&first_line[..start]);
-            out.extend_from_slice(target);
-            out.extend_from_slice(&first_line[end..]);
-        }
+    match path {
+        Some((path, value_query)) => put_request_line(first_line, path, value_query, out),
         None => out.extend_from_slice(first_line),
     }
     out.extend_from_slice(b"\r\n");
     apply_header_mods_inner(rest, header_mods, rewrite_hostname, out);
+}
+
+/// Request line `line` (no CRLF) into `out`, with `path` in place of all
+/// its target holds before the query. The query stays: path normalization
+/// and path modifiers (HTTPPathModifier) change the path only. A modifier
+/// value's own query (`value_query`) comes first, the request's after it
+/// ([`query_glue`]). The parser let no '?' into an absolute-form
+/// authority, so such a target leaves origin-form.
+fn put_request_line(line: &[u8], path: &[u8], value_query: Option<&str>, out: &mut Vec<u8>) {
+    let Some((start, end)) = target_bounds(line) else {
+        out.extend_from_slice(line);
+        return;
+    };
+    let query = memchr::memchr(b'?', &line[start..end]).map_or(end, |q| start + q);
+    out.extend_from_slice(&line[..start]);
+    out.extend_from_slice(path);
+    match value_query {
+        // As sent, a bare '?' included.
+        None => out.extend_from_slice(&line[query..end]),
+        Some(value_query) => {
+            out.push(b'?');
+            out.extend_from_slice(value_query.as_bytes());
+            if end > query + 1 {
+                out.extend_from_slice(query_glue(value_query).as_bytes());
+                out.extend_from_slice(&line[query + 1..end]);
+            }
+        }
+    }
+    out.extend_from_slice(&line[end..]);
+}
+
+/// What goes between a path modifier value's query and the request's
+/// non-empty one: a '&', unless the value's is empty or already ends in one.
+/// Gateway API v1.4.1 bounds the value by length only, so it may carry a
+/// query.
+pub(crate) fn query_glue(value_query: &str) -> &'static str {
+    if value_query.is_empty() || value_query.ends_with('&') {
+        ""
+    } else {
+        "&"
+    }
 }
 
 /// Apply response header modifications into `out` (cleared first), including
@@ -659,6 +741,7 @@ mod tests {
         let mut out = Vec::new();
         assemble_forward_headers(
             req,
+            None,
             &info.strip_spans,
             info.upgrade_span,
             false,
@@ -687,6 +770,7 @@ mod tests {
         let mut out = Vec::new();
         assemble_forward_headers(
             req,
+            None,
             &info.strip_spans,
             info.upgrade_span,
             true,
@@ -705,6 +789,7 @@ mod tests {
         assert!(!info.is_upgrade);
         assemble_forward_headers(
             req,
+            None,
             &info.strip_spans,
             info.upgrade_span,
             false,
@@ -723,7 +808,14 @@ mod tests {
         assert!(info.strip_spans.needs_slow_path);
 
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        assemble_forward_headers_slow(
+            req,
+            None,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
         let s = std::str::from_utf8(&out).unwrap();
         assert!(!s.to_ascii_lowercase().contains("x-internal"));
         assert!(!s.to_ascii_lowercase().contains("connection:"));
@@ -737,7 +829,7 @@ mod tests {
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, X-Foo\r\nX-Foo: 1\r\nSec-WebSocket-Key: k\r\n\r\n";
         let ip = "10.1.2.3".parse().unwrap();
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, true, ip, false, &mut out);
+        assemble_forward_headers_slow(req, None, true, ip, false, &mut out);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Upgrade: websocket\r\n"), "{s}");
         assert!(s.ends_with("Connection: upgrade\r\n\r\n"), "{s}");
@@ -746,7 +838,7 @@ mod tests {
         assert!(s.contains("Sec-WebSocket-Key: k\r\n"));
 
         // Not an upgrade: the Upgrade line goes with the other nominated ones.
-        assemble_forward_headers_slow(req, false, ip, false, &mut out);
+        assemble_forward_headers_slow(req, None, false, ip, false, &mut out);
         let s = std::str::from_utf8(&out).unwrap().to_ascii_lowercase();
         assert!(!s.contains("upgrade"), "{s}");
     }
@@ -755,7 +847,14 @@ mod tests {
     fn test_assemble_slow_path_replaces_client_forwarded_proto() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto: https\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        assemble_forward_headers_slow(
+            req,
+            None,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
         let s = std::str::from_utf8(&out).unwrap();
         assert_eq!(s.matches("X-Forwarded-Proto").count(), 1, "{s}");
         assert!(s.contains("X-Forwarded-Proto: http\r\n"), "{s}");
@@ -771,11 +870,11 @@ mod tests {
     }
 
     #[test]
-    fn test_absolute_form_target_splits_origin_form_from_authority() {
+    fn test_absolute_form_target_splits_path_from_authority() {
         for (req, want) in [
             (
                 &b"GET http://a.test:8080/p?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
-                Some((&b"/p?q=1"[..], "a.test:8080")),
+                Some((&b"/p"[..], "a.test:8080")),
             ),
             (
                 b"GET http://a.test/ HTTP/1.1\r\nHost: a.test\r\n\r\n",
@@ -805,7 +904,7 @@ mod tests {
         let mut out = Vec::new();
         to_origin_form(
             b"GET http://a.test:8080/p?q HTTP/1.1\r\nhost: a.test\r\nAccept: */*\r\n\r\n",
-            b"/p?q",
+            b"/p",
             "a.test:8080",
             &mut out,
         );
@@ -831,7 +930,7 @@ mod tests {
     #[test]
     fn test_url_rewrite_hostname_adds_a_missing_host() {
         let rewrite = URLRewrite {
-            hostname: Some("internal.example".to_string()),
+            hostname: Some("internal.example"),
             path: None,
         };
         let mut out = Vec::new();
@@ -853,7 +952,14 @@ mod tests {
     fn test_assemble_slow_path_drops_client_forwarding_claims() {
         let req = b"GET / HTTP/1.1\r\nHost: h\r\nForwarded: for=6.6.6.6;proto=https\r\nX-Forwarded-Host: evil\r\nx-forwarded-port: 443\r\nX-Forwarded-Ssl: on\r\nX-FORWARDED-SCHEME: https\r\nX-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Hostname: kept\r\nConnection: X-Internal\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        assemble_forward_headers_slow(
+            req,
+            None,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
         let s = std::str::from_utf8(&out).unwrap();
         let lower = s.to_ascii_lowercase();
         for name in [
@@ -877,7 +983,14 @@ mod tests {
         // as a second request while the proxy relays it as this one's body.
         let req = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: keep-alive, Content-Length, HOST, Transfer-Encoding, X-Internal\r\nX-Internal: s\r\n\r\n";
         let mut out = Vec::new();
-        assemble_forward_headers_slow(req, false, "10.1.2.3".parse().unwrap(), false, &mut out);
+        assemble_forward_headers_slow(
+            req,
+            None,
+            false,
+            "10.1.2.3".parse().unwrap(),
+            false,
+            &mut out,
+        );
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Content-Length: 5\r\n"), "{s}");
         assert!(s.contains("Host: h\r\n"), "{s}");
@@ -987,16 +1100,13 @@ mod tests {
             prefix_remainder(r"^/a$|^/much-longer-alternative$", "/a"),
             ""
         );
-        let rewrite = extract_url_rewrite(
-            &[HttpFilter::URLRewrite {
-                hostname: None,
-                path: Some(URLRewritePath::ReplacePrefixMatch("/new".to_string())),
-            }],
-            r"^/a$|^/much-longer-alternative$",
-            "/a",
-        )
-        .unwrap();
-        assert!(matches!(rewrite.path, Some(RewrittenPath::PrefixReplaced(ref p)) if p == "/new"));
+        let filters = [HttpFilter::URLRewrite {
+            hostname: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
+        }];
+        let rewrite =
+            extract_url_rewrite(&filters, r"^/a$|^/much-longer-alternative$", "/a").unwrap();
+        assert!(matches!(rewrite.path, Some(RewrittenPath { path: ref p, .. }) if p == "/new"));
     }
 
     #[test]
@@ -1004,7 +1114,7 @@ mod tests {
         let headers = b"GET /old/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let rewrite = URLRewrite {
             hostname: None,
-            path: Some(RewrittenPath::Full("/new/path".to_string())),
+            path: Some(RewrittenPath::from_value("/new/path")),
         };
         let mut result = Vec::new();
         apply_request_header_modifications(headers, None, Some(&rewrite), &mut result);
@@ -1014,11 +1124,104 @@ mod tests {
         assert!(result_str.contains("Host: example.com"));
     }
 
+    /// A path modifier replaces the path only (HTTPPathModifier): the
+    /// query goes on as sent.
+    #[test]
+    fn test_url_rewrite_keeps_the_query() {
+        let mut out = Vec::new();
+        for (path, head, line) in [
+            (
+                RewrittenPath::from_value("/new"),
+                &b"GET /old?a=1&b=%2F HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+                "GET /new?a=1&b=%2F HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::from_value("/v2/x"),
+                b"GET /v1/x?a HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /v2/x?a HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::from_value("/new"),
+                b"GET /old? HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /new? HTTP/1.1\r\n",
+            ),
+            (
+                RewrittenPath::from_value("/new"),
+                b"GET /old HTTP/1.1\r\nHost: h\r\n\r\n",
+                "GET /new HTTP/1.1\r\n",
+            ),
+        ] {
+            let rewrite = URLRewrite {
+                hostname: None,
+                path: Some(path),
+            };
+            apply_request_header_modifications(head, None, Some(&rewrite), &mut out);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(s.starts_with(line), "{s}");
+        }
+    }
+
+    /// A value with a query of its own made two: /login?next=home?a=1.
+    /// The value's query comes first, then the request's after a '&';
+    /// either alone stays as it is.
+    #[test]
+    fn test_url_rewrite_joins_a_value_query_and_the_request_query() {
+        let mut out = Vec::new();
+        // A prefix value's rule matched "/old" on its request path; a
+        // full-path value has none.
+        for (value, prefix_of, target, want) in [
+            (
+                "/login?next=home",
+                None,
+                "/old?a=1&b",
+                "/login?next=home&a=1&b",
+            ),
+            ("/login?next=home", None, "/old", "/login?next=home"),
+            ("/login?next=home", None, "/old?", "/login?next=home"),
+            ("/login?", None, "/old?a=1", "/login?a=1"),
+            (
+                "/new?src=gw",
+                Some("/old/x"),
+                "/old/x?a=1",
+                "/new/x?src=gw&a=1",
+            ),
+            ("/?src=gw", Some("/old/x"), "/old/x", "/x?src=gw"),
+            // A value's query already ending in '&' takes the request's
+            // as is: it made /login?next=home&&a=1.
+            (
+                "/login?next=home&",
+                None,
+                "/old?a=1",
+                "/login?next=home&a=1",
+            ),
+            (
+                "/new?src=gw&",
+                Some("/old/x"),
+                "/old/x?a=1",
+                "/new/x?src=gw&a=1",
+            ),
+        ] {
+            let path = match prefix_of {
+                None => URLRewritePath::ReplaceFullPath(value.into()),
+                Some(_) => URLRewritePath::ReplacePrefixMatch(value.into()),
+            };
+            let filters = [HttpFilter::URLRewrite {
+                hostname: None,
+                path: Some(path),
+            }];
+            let rewrite = extract_url_rewrite(&filters, "/old", prefix_of.unwrap_or("/old"));
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            apply_request_header_modifications(head.as_bytes(), None, rewrite.as_ref(), &mut out);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(s.starts_with(&format!("GET {want} HTTP/1.1\r\n")), "{s}");
+        }
+    }
+
     #[test]
     fn test_apply_modifications_host_rewrite() {
         let headers = b"GET / HTTP/1.1\r\nHost: original.example.com\r\n\r\n";
         let rewrite = URLRewrite {
-            hostname: Some("rewritten.example.com".to_string()),
+            hostname: Some("rewritten.example.com"),
             path: None,
         };
         let mut result = Vec::new();
@@ -1033,8 +1236,8 @@ mod tests {
     fn test_apply_modifications_combined() {
         let headers = b"GET /old HTTP/1.1\r\nHost: old.com\r\nUser-Agent: test\r\n\r\n";
         let rewrite = URLRewrite {
-            hostname: Some("new.com".to_string()),
-            path: Some(RewrittenPath::Full("/new".to_string())),
+            hostname: Some("new.com"),
+            path: Some(RewrittenPath::from_value("/new")),
         };
         let mods = HeaderModifications {
             add: &[HttpHeader {

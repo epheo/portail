@@ -1,3 +1,4 @@
+pub(crate) mod compile;
 pub mod core;
 pub mod examples;
 pub mod parsing;
@@ -5,6 +6,7 @@ pub mod types;
 pub mod validation;
 pub(crate) mod wire;
 
+pub(crate) use compile::RouteError;
 pub use types::*;
 
 // Re-export example generation functions

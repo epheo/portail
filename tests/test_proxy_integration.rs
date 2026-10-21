@@ -629,8 +629,8 @@ fn test_response_header_modifier_e2e() {
 fn test_request_redirect_e2e() {
     let port = proxy_port(25);
     let filter = r#"{"type": "RequestRedirect", "requestRedirect": {"hostname": "other.com", "statusCode": 301}}"#;
-    // Redirect rules don't need backend_refs, but our helper always adds one.
-    // The proxy should return redirect before contacting any backend.
+    // The helper adds a backendRef beside the redirect: unused, as a
+    // redirect never forwards, and the config loads.
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let proxy = PortailProcess::spawn_with_filters(&[("localhost", "/", dead_addr, filter)], port);
 

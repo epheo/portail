@@ -46,9 +46,12 @@ Portail runs as a regular Deployment (no `hostNetwork`). A Kubernetes Service ex
 **Unprivileged binds (no `NET_BIND_SERVICE`).** A published listener port (e.g. 80/443) is a client-facing contract, not the port the process must bind. Under `portail-operator`, the Service maps each published port to an unprivileged `targetPort` (e.g. `80 → 8080`) and portail binds that target — so the pod drops *all* capabilities, runs `runAsNonRoot` with `allowPrivilegeEscalation: false` and no sysctl, fully compliant with restricted Pod Security on both vanilla Kubernetes and OpenShift `restricted-v2`. portail discovers its fronting Service by the label `portail.epheo.eu/gateway: <gateway-name>` in the Gateway's namespace and binds the numeric `targetPort` of each port matching a listener. If no such Service exists — multi-network mode, the host-networked DaemonSet, or before the operator has created it — portail binds the published port directly. Those modes add `capabilities.add: [NET_BIND_SERVICE]`, which pairs with the `cap_net_bind_service` **file capability** baked into the image (`setcap …=+p`): portail raises it to effective at startup and binds the privileged port while staying **non-root** with `allowPrivilegeEscalation: false` — no sysctl, no root, no custom SCC. (`+p`, not `+ep`, so the same image still execs in service-mode pods that drop the capability.)
 
 Static addresses (`GatewayStaticAddresses`) are not supported yet: `spec.addresses` never assigns an IP.
-An address already on a pod interface is bound specifically.
+An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically.
 Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
-portail sets `Programmed` from bound listener ports alone; an address missing from the pod does not make it `False`.
+A listener that gains a local address leaves all interfaces for it in the same pass, and goes back when it loses it.
+A listener whose published port changes while its `targetPort` stays reopens that socket in the same pass, to route and terminate as the new port.
+A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
+portail sets `Programmed` from bound listener ports; an IP address missing from the pod does not make it `False`.
 
 The same pattern works with **NodePort** or **ClusterIP**. Just change `spec.type` in `service.yaml`. See the loadbalancer example's README for details.
 
@@ -59,10 +62,15 @@ See: `examples/kubernetes/loadbalancer/`
 A Portail pod attached to multiple User Defined Networks (UDN) via Multus, routing between isolated network segments at L4-L7.
 
 ```bash
-kubectl apply -k examples/kubernetes/multi-network/
+kubectl apply -k examples/kubernetes/multi-network/http-single-namespace/
 ```
 
-Each UDN gets its own Gateway with `spec.addresses` set to Portail's IP on that network. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
+Each UDN gets its own Gateway with a `portail.epheo.eu/Network` address naming it. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
+portail reads the network's NetworkAttachmentDefinition (the base ClusterRole allows it) and binds the pod's IP on that network.
+A NetworkAttachmentDefinition that cannot be read keeps the network's last IP, while the pod has it; only a network with no IP on the pod, or none at all, unbinds.
+That last IP is forgotten once no Gateway names the network: dropped from `spec.addresses`, or its Gateway deleted.
+Each Gateway's listeners bind its own addresses only: a network with no IP on the pod unbinds that Gateway alone.
+One portail serving several Gateways routes by port: Gateways sharing a port are not isolated from each other.
 
 NAT is implicit: the backend sees Portail's UDN IP as source, not the original client. No iptables or kernel NAT required.
 
@@ -116,6 +124,13 @@ kubectl get gatewayclass portail -o jsonpath='{.status.conditions[?(@.type=="Acc
 kubectl get gateway my-gateway -o yaml
 # Look for Accepted: True and Programmed: True
 ```
+
+portail writes only the status that differs from what the API server holds, so a wiped or outdated status is rewritten on the next pass.
+A route or RateLimitPolicy that stops naming a Gateway loses portail's status entry for that Gateway.
+A listener whose port is not bound reports `Programmed=False` with reason `Pending`.
+Listeners sharing a port and protocol conflict unless their hostnames differ; TCP and UDP listeners need a port each.
+Without portail-operator, a Gateway with some listeners rejected stays `Accepted=True` with reason `ListenersNotValid`.
+`attachedRoutes` counts every route attached to the listener, accepted or not.
 
 ## Uninstall
 

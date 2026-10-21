@@ -314,7 +314,7 @@ impl HealthRegistry {
 /// `RouteTable::dns_signature` covers, or every swap would wipe the state of
 /// the backends it misses.
 fn routed_addrs(table: &RouteTable) -> HashSet<SocketAddr> {
-    let http = table.listener_scopes.values().flatten().flat_map(|scope| {
+    let http = table.http_scopes().flat_map(|scope| {
         scope
             .http_routes
             .values()
@@ -329,15 +329,10 @@ fn routed_addrs(table: &RouteTable) -> HashSet<SocketAddr> {
         .chain(table.udp_routes.values())
         .chain(
             table
-                .tls_routes
+                .tls_scopes
                 .values()
-                .flat_map(|by_host| by_host.values()),
-        )
-        .chain(
-            table
-                .wildcard_tls_routes
-                .values()
-                .flat_map(|by_host| by_host.values()),
+                .flatten()
+                .flat_map(crate::routing::TlsScope::backends),
         )
         .flatten();
     http.chain(l4).map(|b| b.socket_addr).collect()

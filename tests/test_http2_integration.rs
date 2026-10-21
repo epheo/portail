@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use helpers::{
-    extract_status, generate_test_cert, spawn_slow_backend, PortailProcess, TestBackend,
+    extract_status, generate_test_cert, spawn_slow_backend, InspectingBackend, PortailProcess,
+    TestBackend,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -666,6 +667,25 @@ async fn test_h2_unknown_host_gets_engine_error() {
     let sr = h2_handshake(tls_connect(h2_port(5), &[b"h2"]).await).await;
     let (status, _) = h2_get(&sr, "https://unrouted.test/").await;
     assert_eq!(status, 404);
+}
+
+/// An h2 :path reaches the backend with its dot-segments removed, as an h1
+/// target does: the bridge replays it through the same engine.
+#[tokio::test]
+async fn test_h2_path_reaches_the_backend_normalized() {
+    let backend = InspectingBackend::spawn("normalized");
+    let Some(_proxy) = spawn_h2_proxy(h2_port(51), backend.addr) else {
+        return;
+    };
+
+    let sr = h2_handshake(tls_connect(h2_port(51), &[b"h2"]).await).await;
+    let uri = format!("https://{}/public/%2e%2e/admin/./x?q=1", SNI);
+    let (status, body) = h2_get(&sr, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"normalized");
+    let received = backend.received_requests();
+    let head = String::from_utf8_lossy(&received[0]);
+    assert!(head.starts_with("GET /admin/x?q=1 HTTP/1.1\r\n"), "{head}");
 }
 
 #[tokio::test]

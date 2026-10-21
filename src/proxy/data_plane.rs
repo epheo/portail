@@ -7,7 +7,8 @@
 //! `DRAIN_TIMEOUT` for in-flight connections to finish.
 
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,13 +16,40 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol, TlsMode};
+use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol};
 use crate::logging::{info, warn};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::tls::{self, DynamicTlsAcceptor};
+use crate::proxy::tls::{self, TlsKind, TlsPlan};
 use crate::proxy::udp_worker;
 use crate::proxy::worker;
 use crate::routing::{BackendSelector, RouteTable};
+
+/// What a TCP port serves, read by its accept loops per connection:
+/// `None` for plain bytes (HTTP, TCP), a plan for TLS (HTTPS, TLS
+/// passthrough). Every endpoint bound for the port shares it.
+pub(crate) type PortPlan = Arc<ArcSwapOption<TlsPlan>>;
+
+/// A port's terminating config, as a pass built it.
+struct BuiltConfig {
+    /// Of the certs it was built from: a pass with the same certs reuses it.
+    fingerprint: u64,
+    /// The refs it was built for: a failed rebuild of the same refs keeps it.
+    refs: HashSet<tls::CertKey>,
+    /// The refs whose certs loaded.
+    loaded: HashSet<tls::CertKey>,
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl BuiltConfig {
+    /// Whether some cert of HTTPS listener `l` is in the config.
+    fn has_cert_of(&self, l: &ListenerConfig) -> bool {
+        l.tls.as_ref().is_some_and(|t| {
+            t.certificate_refs
+                .iter()
+                .any(|r| self.loaded.contains(&tls::cert_key(r)))
+        })
+    }
+}
 
 struct TcpListenerEntry {
     port: u16,
@@ -29,8 +57,7 @@ struct TcpListenerEntry {
     bound_port: u16,
     address: Option<String>,
     listener: TcpListener,
-    tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
-    tls_passthrough: bool,
+    plan: PortPlan,
 }
 
 struct UdpListenerEntry {
@@ -49,14 +76,16 @@ enum ListenerSlot {
     /// The token is this listener's own (a child of the process shutdown):
     /// cancelling it tears down just this accept loop, so a listener removed
     /// from the Gateway spec stops serving without touching its siblings.
-    Running(JoinHandle<()>, CancellationToken),
+    /// The port is the published one the loop serves: it routes, and reads
+    /// its plan, by it.
+    Running(JoinHandle<()>, CancellationToken, u16),
 }
 
 impl ListenerSlot {
     fn alive(&self) -> bool {
         match self {
             ListenerSlot::Pending => true,
-            ListenerSlot::Running(handle, _) => !handle.is_finished(),
+            ListenerSlot::Running(handle, ..) => !handle.is_finished(),
         }
     }
 }
@@ -82,10 +111,11 @@ pub struct DataPlane {
     udp_sessions: udp_worker::SessionLimits,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
-    /// Per-port dynamic TLS acceptors for hot-reload support.
-    tls_configs: std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
-    /// Per-port cert fingerprint to skip no-op TLS reloads.
-    tls_cert_hashes: std::collections::HashMap<u16, u64>,
+    /// Per published TCP port, every pass's plan (see [`PortPlan`]).
+    plans: HashMap<u16, PortPlan>,
+    /// Per port with HTTPS listeners, the config terminating for them.
+    /// Dropped with the last of them: no cert outlives its listener.
+    terminate_configs: HashMap<u16, BuiltConfig>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
     /// Process-wide backend pool when `performance.backendPoolScope: process`;
@@ -141,83 +171,137 @@ impl Drain {
 /// scope is configured. Not user-tunable today.
 const DEFAULT_MAX_IDLE_PER_BACKEND: usize = 64;
 
-/// Merge TLS cert refs across all Terminate listeners on the same port.
+/// Merge TLS cert refs across all HTTPS listeners on the same port.
 ///
 /// One TCP listener per port serves traffic for every (port, hostname) scope,
 /// so its `ServerConfig` must hold every hostname's cert. Building per-listener
 /// would let the last write clobber earlier listeners and strand SNIs — e.g.
 /// `example.org` via a catch-all listener gets dropped when a sibling
 /// `https-with-hostname` listener is processed last, hanging its TLS handshake
-/// until the client times out.
+/// until the client times out. An HTTPS listener without certs still names
+/// its port: the build then fails for it, and says so.
 pub(crate) fn merge_cert_refs_by_port(
     listener_configs: &[ListenerConfig],
-) -> std::collections::HashMap<u16, Vec<CertificateRef>> {
-    let mut merged: std::collections::HashMap<u16, Vec<CertificateRef>> =
-        std::collections::HashMap::new();
+) -> HashMap<u16, Vec<CertificateRef>> {
+    let mut merged: HashMap<u16, Vec<CertificateRef>> = HashMap::new();
+    // A listener bound on several addresses comes once per address. The
+    // hostname is part of the key: one Secret on two listeners serves two
+    // SNIs.
+    let mut seen = std::collections::HashSet::new();
     for listener_cfg in listener_configs {
+        if listener_cfg.protocol != Protocol::HTTPS {
+            continue;
+        }
+        let refs = merged.entry(listener_cfg.port).or_default();
         let Some(tls_cfg) = &listener_cfg.tls else {
             continue;
         };
-        if tls_cfg.mode != TlsMode::Terminate {
-            continue;
+        for r in &tls_cfg.certificate_refs {
+            let key = (
+                listener_cfg.port,
+                r.namespace.as_deref(),
+                r.name.as_str(),
+                r.hostname.as_deref(),
+            );
+            if seen.insert(key) {
+                refs.push(r.clone());
+            }
         }
-        if !matches!(listener_cfg.protocol, Protocol::HTTPS | Protocol::TLS) {
-            continue;
-        }
-        merged
-            .entry(listener_cfg.port)
-            .or_default()
-            .extend(tls_cfg.certificate_refs.iter().cloned());
     }
     merged
 }
 
-/// Build one `DynamicTlsAcceptor` per port from the merged cert refs of all
-/// Terminate listeners sharing it (see [`merge_cert_refs_by_port`]). Failures
-/// come back per port so construction can hard-fail while the reconcile path
-/// retries next pass.
-fn build_port_acceptors(
+/// The plan of every TCP port `listener_configs` name, from those listeners
+/// alone (see [`PortPlan`]): a TLS plan when an HTTPS or TLS passthrough
+/// listener is on it, which TLS then is for every connection, else plain.
+/// The terminating config is rebuilt only when its port's merged certs
+/// changed (`built`, kept for ports with HTTPS listeners only). Failures
+/// come back per port so construction can hard-fail while the reconcile
+/// path retries next pass.
+///
+/// A rebuild that loads no cert keeps the last good config when the
+/// port's refs are the same ones (a bad Secret rotation), else the port
+/// terminates nothing: certs must not outlive their listener. An HTTPS
+/// listener none of whose certs is in the config refuses its SNI
+/// ([`TlsKind::NoCert`]).
+fn plan_ports(
     listener_configs: &[ListenerConfig],
     cert_dir: &std::path::Path,
     http2: bool,
-) -> (
-    std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
-    Vec<(u16, String)>,
-) {
-    let mut acceptors = std::collections::HashMap::new();
+    built: &mut HashMap<u16, BuiltConfig>,
+) -> (HashMap<u16, Option<TlsPlan>>, Vec<(u16, String)>) {
+    let merged = merge_cert_refs_by_port(listener_configs);
+    built.retain(|port, _| merged.contains_key(port));
     let mut errors = Vec::new();
-    for (port, refs) in merge_cert_refs_by_port(listener_configs) {
-        match tls::build_server_config(&refs, cert_dir, http2) {
-            Ok(config) => {
-                acceptors.insert(port, Arc::new(DynamicTlsAcceptor::new(config)));
+    for (port, refs) in merged {
+        let fingerprint = compute_cert_fingerprint(&refs);
+        if built
+            .get(&port)
+            .is_some_and(|b| b.fingerprint == fingerprint)
+        {
+            continue;
+        }
+        let keys: HashSet<tls::CertKey> = refs.iter().map(tls::cert_key).collect();
+        match tls::build_terminating(&refs, cert_dir, http2) {
+            Ok((config, loaded)) => {
+                built.insert(
+                    port,
+                    BuiltConfig {
+                        fingerprint,
+                        refs: keys,
+                        loaded,
+                        config: Arc::new(config),
+                    },
+                );
             }
-            Err(e) => errors.push((port, format!("TLS config build failed: {}", e))),
+            Err(e) => {
+                // Its fingerprint stays the old one: the next pass
+                // retries, and reports again.
+                let rotation = built.get(&port).is_some_and(|b| b.refs == keys);
+                let kept = if rotation {
+                    "; serving the last good certificates"
+                } else {
+                    built.remove(&port);
+                    ""
+                };
+                errors.push((port, format!("TLS config build failed: {}{}", e, kept)));
+            }
         }
     }
-    (acceptors, errors)
+
+    let mut plans: HashMap<u16, Option<TlsPlan>> = HashMap::new();
+    for l in listener_configs {
+        let kind = match l.protocol {
+            Protocol::UDP => continue,
+            Protocol::HTTP | Protocol::TCP => None,
+            Protocol::HTTPS => match built.get(&l.port) {
+                Some(b) if b.has_cert_of(l) => Some(TlsKind::Terminate),
+                _ => Some(TlsKind::NoCert),
+            },
+            Protocol::TLS if l.is_tls_passthrough() => Some(TlsKind::Passthrough),
+            // TLS Terminate is not served: kept out by validation and the
+            // controller alike.
+            Protocol::TLS => continue,
+        };
+        let plan = plans.entry(l.port).or_default();
+        if let Some(kind) = kind {
+            plan.get_or_insert_with(TlsPlan::default)
+                .add(l.hostname.as_deref(), kind);
+        }
+    }
+    for (port, plan) in &mut plans {
+        if let Some(plan) = plan {
+            plan.terminate = built.get(port).map(|b| b.config.clone());
+        }
+    }
+    (plans, errors)
 }
 
-/// TLS dispatch for one listener: Terminate listeners take the shared
-/// per-port acceptor (merged certs), Passthrough gets SNI forwarding.
-/// `None` means the port's config build failed and the listener must not
-/// bind — it could never handshake.
-fn listener_tls_dispatch(
-    listener_cfg: &ListenerConfig,
-    port_acceptors: &std::collections::HashMap<u16, Arc<DynamicTlsAcceptor>>,
-) -> Option<(Option<Arc<DynamicTlsAcceptor>>, bool)> {
-    match (&listener_cfg.protocol, &listener_cfg.tls) {
-        (Protocol::HTTPS, Some(tls_cfg)) | (Protocol::TLS, Some(tls_cfg))
-            if tls_cfg.mode == TlsMode::Terminate =>
-        {
-            port_acceptors
-                .get(&listener_cfg.port)
-                .map(|acceptor| (Some(acceptor.clone()), false))
-        }
-        (Protocol::TLS, Some(tls_cfg)) if tls_cfg.mode == TlsMode::Passthrough => {
-            Some((None, true))
-        }
-        _ => Some((None, false)),
-    }
+/// Whether a socket on a port with this plan could serve a connection: a
+/// TLS port whose HTTPS certs failed and that forwards nothing is not
+/// bound.
+fn serves(plan: Option<&TlsPlan>) -> bool {
+    plan.is_none_or(TlsPlan::serves)
 }
 
 /// Compute a fingerprint of all cert PEM bytes for change detection.
@@ -232,6 +316,11 @@ fn compute_cert_fingerprint(refs: &[CertificateRef]) -> u64 {
         }
         if let Some(pem) = &r.key_pem {
             hasher.write(pem);
+        }
+        // A reused config must be for these refs: their loaded set is
+        // keyed by namespace too.
+        if let Some(namespace) = &r.namespace {
+            hasher.write(namespace.as_bytes());
         }
         hasher.write(r.name.as_bytes());
         if let Some(h) = &r.hostname {
@@ -255,15 +344,24 @@ impl DataPlane {
         let mut tcp_listeners = Vec::new();
         let mut udp_listeners = Vec::new();
 
-        // Per-port acceptors from the MERGED cert refs — same merge the
-        // reconcile path applies, so siblings on a shared port cannot clobber
-        // each other's SNI bindings here either. A bad cert set fails
-        // construction outright: standalone mode has no retry pass.
-        let (port_acceptors, tls_errors) =
-            build_port_acceptors(listeners, cert_dir, performance_config.http2);
+        // Per-port plans, their terminating configs from the MERGED cert
+        // refs, the reconcile path's own, so siblings on a shared port
+        // cannot clobber each other's SNI bindings here either. A bad cert
+        // set fails construction outright: standalone mode has no retry pass.
+        let mut terminate_configs = HashMap::new();
+        let (plans, tls_errors) = plan_ports(
+            listeners,
+            cert_dir,
+            performance_config.http2,
+            &mut terminate_configs,
+        );
         if let Some((port, err)) = tls_errors.into_iter().next() {
             return Err(anyhow::anyhow!("port {}: {}", port, err));
         }
+        let plans: HashMap<u16, PortPlan> = plans
+            .into_iter()
+            .map(|(port, plan)| (port, Arc::new(ArcSwapOption::from_pointee(plan))))
+            .collect();
 
         // One socket per endpoint: siblings on a shared port ride the same
         // socket (routing is port-keyed), and a second bind would fail
@@ -276,33 +374,19 @@ impl DataPlane {
             // the socket we actually bind — the Service's targetPort when set.
             let port = listener_cfg.port;
             let bound_port = listener_cfg.target_port.unwrap_or(port);
+            let plan = match listener_cfg.protocol {
+                Protocol::UDP => None,
+                // A listener no plan took (TLS Terminate) binds nothing.
+                _ => match plans.get(&port) {
+                    Some(plan) => Some(plan),
+                    None => continue,
+                },
+            };
             if !bound_endpoints.insert((listener_cfg.address.clone(), bound_port)) {
                 continue;
             }
-            match listener_cfg.protocol {
-                Protocol::HTTP | Protocol::HTTPS | Protocol::TCP | Protocol::TLS => {
-                    let (tls_acceptor, tls_passthrough) =
-                        match listener_tls_dispatch(listener_cfg, &port_acceptors) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                    let std_listener = create_tcp_listener(
-                        bound_port,
-                        listener_cfg.address.as_deref(),
-                        listener_cfg.interface.as_deref(),
-                    )?;
-                    let tokio_listener = TcpListener::from_std(std_listener)?;
-
-                    tcp_listeners.push(TcpListenerEntry {
-                        port,
-                        bound_port,
-                        address: listener_cfg.address.clone(),
-                        listener: tokio_listener,
-                        tls_acceptor,
-                        tls_passthrough,
-                    });
-                }
-                Protocol::UDP => {
+            match plan {
+                None => {
                     let std_socket = create_udp_socket(
                         bound_port,
                         listener_cfg.address.as_deref(),
@@ -317,21 +401,29 @@ impl DataPlane {
                         socket: tokio_socket,
                     });
                 }
+                Some(plan) => {
+                    let std_listener = create_tcp_listener(
+                        bound_port,
+                        listener_cfg.address.as_deref(),
+                        listener_cfg.interface.as_deref(),
+                    )?;
+                    let tokio_listener = TcpListener::from_std(std_listener)?;
+
+                    tcp_listeners.push(TcpListenerEntry {
+                        port,
+                        bound_port,
+                        address: listener_cfg.address.clone(),
+                        listener: tokio_listener,
+                        plan: plan.clone(),
+                    });
+                }
             }
         }
-
-        // Readiness tracks the bound socket, so key endpoints on the bound
-        // port. Sockets exist from here on; `start()` attaches accept loops.
-        let listener_tasks: std::collections::HashMap<(Option<String>, u16), ListenerSlot> =
-            listeners
-                .iter()
-                .map(|l| {
-                    (
-                        (l.address.clone(), l.target_port.unwrap_or(l.port)),
-                        ListenerSlot::Pending,
-                    )
-                })
-                .collect();
+        // Sockets exist from here on; `start()` attaches accept loops.
+        let listener_tasks = bound_endpoints
+            .into_iter()
+            .map(|endpoint| (endpoint, ListenerSlot::Pending))
+            .collect();
 
         Ok(Self {
             tcp_listeners,
@@ -346,8 +438,8 @@ impl DataPlane {
             udp_sessions: udp_worker::SessionLimits::from_perf(performance_config),
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            tls_configs: std::collections::HashMap::new(),
-            tls_cert_hashes: std::collections::HashMap::new(),
+            plans,
+            terminate_configs,
             selector: Arc::new(BackendSelector::new()),
             shared_pool: match performance_config.backend_pool_scope {
                 crate::config::PoolScope::Process => Some(Arc::new(
@@ -374,9 +466,10 @@ impl DataPlane {
             .is_some_and(ListenerSlot::alive)
     }
 
-    /// Spawn an accept loop and record it under its endpoint. The loop gets
-    /// its own child token of the process shutdown, so it can be torn down
-    /// individually (spec removed the listener) or collectively.
+    /// Spawn an accept loop serving published `port` and record it under
+    /// its endpoint. The loop gets its own child token of the process
+    /// shutdown, so it can be torn down individually (spec removed the
+    /// listener) or collectively.
     ///
     /// The wrapper is the death-watch: an accept loop returns exactly once,
     /// on cancellation, so any other exit means its socket is gone — flip
@@ -386,8 +479,12 @@ impl DataPlane {
     /// body: under `panic = "abort"` the whole process dies with it — its
     /// own honest signal — and `JoinHandle::is_finished` covers the unwind
     /// case.)
-    fn spawn_listener_task<F, Fut>(&mut self, endpoint: (Option<String>, u16), make_task: F)
-    where
+    fn spawn_listener_task<F, Fut>(
+        &mut self,
+        endpoint: (Option<String>, u16),
+        port: u16,
+        make_task: F,
+    ) where
         F: FnOnce(CancellationToken) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -406,29 +503,44 @@ impl DataPlane {
             }
         });
         self.listener_tasks
-            .insert(endpoint, ListenerSlot::Running(handle, cancel));
+            .insert(endpoint, ListenerSlot::Running(handle, cancel, port));
     }
 
-    /// Dynamically add TCP/UDP listeners for new ports. Called by the K8s
-    /// controller when new Gateway ports are discovered. One listener per
-    /// (address, port); accept work is distributed by the Tokio runtime.
-    /// Builds TLS acceptors from in-memory cert data when listeners use
-    /// HTTPS/TLS. For already-bound ports, updates the TLS config via
-    /// `DynamicTlsAcceptor` hot-reload. Returns `(ports_opened, errors)`.
-    pub fn add_tcp_listeners(
-        &mut self,
+    /// The (address, bound port) endpoints `listener_configs` bind, each
+    /// with the published port it serves, the first listener's as the bind
+    /// loop takes it: each listener on its own address, or every interface.
+    /// A wildcard endpoint stands for the specific ones on its port: it
+    /// already takes their traffic, routing is port-keyed, and Linux refuses
+    /// a specific bind beside a listening wildcard.
+    fn desired_endpoints(
         listener_configs: &[ListenerConfig],
-        addresses: &[String],
-        routes: Arc<ArcSwap<RouteTable>>,
-        performance_config: &crate::config::PerformanceConfig,
-    ) -> (usize, Vec<(u16, String)>) {
-        let mut opened = 0usize;
-        let mut errors = Vec::new();
+    ) -> HashMap<(Option<String>, u16), u16> {
+        let mut desired: HashMap<(Option<String>, u16), u16> = HashMap::new();
+        for lc in listener_configs {
+            desired
+                .entry((lc.address.clone(), lc.target_port.unwrap_or(lc.port)))
+                .or_insert(lc.port);
+        }
+        let wildcard_ports: HashSet<u16> = desired
+            .keys()
+            .filter(|(addr, _)| addr.is_none())
+            .map(|(_, port)| *port)
+            .collect();
+        desired.retain(|(addr, port), _| addr.is_none() || !wildcard_ports.contains(port));
+        desired
+    }
 
-        // Reap finished accept loops before anything else: a finished task
-        // means its socket is gone (the listener lives inside the task), so
-        // the endpoint must stop counting as bound — the bind loop below
-        // then re-opens it this same pass.
+    /// Reap dead accept loops, and close the endpoints `listener_configs`
+    /// no longer want: a listener removed from the spec, a wildcard whose
+    /// port moved to specific addresses (or the reverse), or an endpoint
+    /// now serving another published port on the same bound one. Returns
+    /// the closed loops. Each releases its socket as it exits, and until
+    /// then a bind overlapping it fails: await them, then
+    /// [`Self::add_tcp_listeners`] the same listeners.
+    pub fn close_unwanted(&mut self, listener_configs: &[ListenerConfig]) -> Vec<JoinHandle<()>> {
+        // A finished task means its socket is gone (the listener lives
+        // inside the task), so the endpoint must stop counting as bound;
+        // the bind loop then re-opens it this same pass.
         self.listener_tasks.retain(|(addr, bound_port), slot| {
             if slot.alive() {
                 true
@@ -442,87 +554,69 @@ impl DataPlane {
             }
         });
 
-        // If addresses are specified, bind each listener to each address.
-        // Otherwise, bind to the listener's own address (or 0.0.0.0).
-        let bind_addrs: Vec<Option<&str>> = if addresses.is_empty() {
-            vec![None]
-        } else {
-            addresses.iter().map(|a| Some(a.as_str())).collect()
-        };
-
-        // Tear down endpoints the spec no longer wants — without this, a
-        // listener removed from the Gateway kept its port serving until pod
-        // restart. Desired = the same (effective_addr, bound_port) product
-        // the bind loop below computes. A wildcard socket stays as long as
-        // ANY listener still wants its port: routing is port-keyed, it
-        // already serves every address, and replacing it with an
-        // address-specific bind would dark the port for a pass (cancel is
-        // async, the socket closes when the task observes it).
-        let desired: std::collections::HashSet<(Option<String>, u16)> = listener_configs
-            .iter()
-            .flat_map(|lc| {
-                let bound_port = lc.target_port.unwrap_or(lc.port);
-                bind_addrs
-                    .iter()
-                    .map(move |ba| (ba.or(lc.address.as_deref()).map(String::from), bound_port))
+        let desired = Self::desired_endpoints(listener_configs);
+        self.listener_tasks
+            // Pre-start sockets (standalone mode) are never managed here.
+            .extract_if(|endpoint, slot| match slot {
+                ListenerSlot::Pending => false,
+                ListenerSlot::Running(.., port) => desired.get(endpoint) != Some(port),
             })
-            .collect();
-        let desired_ports: std::collections::HashSet<u16> =
-            desired.iter().map(|(_, p)| *p).collect();
-        self.listener_tasks.retain(|endpoint, slot| {
-            let keep = desired.contains(endpoint)
-                || (endpoint.0.is_none() && desired_ports.contains(&endpoint.1))
-                // Pre-start sockets (standalone mode) are never managed here.
-                || matches!(slot, ListenerSlot::Pending);
-            if !keep {
+            .filter_map(|(endpoint, slot)| {
                 info!(
                     "Listener {}:{} no longer in spec; closing",
                     endpoint.0.as_deref().unwrap_or("*"),
                     endpoint.1
                 );
-                if let ListenerSlot::Running(_, cancel) = slot {
-                    cancel.cancel();
-                }
-            }
-            keep
-        });
-        // Drop TLS state for ports no longer configured, so a re-added port
-        // rebuilds its ServerConfig from current certs instead of a stale one.
-        let live_ports: std::collections::HashSet<u16> =
-            listener_configs.iter().map(|lc| lc.port).collect();
-        self.tls_configs.retain(|port, _| live_ports.contains(port));
-        self.tls_cert_hashes
-            .retain(|port, _| live_ports.contains(port));
-
-        // Reconcile per-port TLS state FIRST, gated by the cheap fingerprint:
-        // build_server_config (full PEM parse + key load for every ref) runs
-        // only when the port's merged cert bytes actually changed, and once
-        // per port — not once per listener sharing it. The bind loop below
-        // always runs, so a newly appeared bind address still gets bound even
-        // when the certs are unchanged.
-        let merged_cert_refs = merge_cert_refs_by_port(listener_configs);
-        for (&port, port_refs) in &merged_cert_refs {
-            let fingerprint = compute_cert_fingerprint(port_refs);
-            if self.tls_cert_hashes.get(&port) == Some(&fingerprint) {
-                continue; // Certs unchanged — the existing acceptor keeps serving
-            }
-            match tls::build_server_config(
-                port_refs,
-                std::path::Path::new("/unused"),
-                performance_config.http2,
-            ) {
-                Ok(config) => {
-                    if let Some(existing) = self.tls_configs.get(&port) {
-                        existing.update(config);
-                        info!("Hot-reloaded TLS config for port {}", port);
-                    } else {
-                        self.tls_configs
-                            .insert(port, Arc::new(DynamicTlsAcceptor::new(config)));
+                match slot {
+                    ListenerSlot::Running(handle, cancel, _) => {
+                        cancel.cancel();
+                        Some(handle)
                     }
-                    self.tls_cert_hashes.insert(port, fingerprint);
+                    ListenerSlot::Pending => None,
                 }
-                // No fingerprint recorded on failure: the next pass retries.
-                Err(e) => errors.push((port, format!("TLS config build failed: {}", e))),
+            })
+            .collect()
+    }
+
+    /// Bind the endpoints `listener_configs` want that have no live accept
+    /// loop: each listener on its own `address` (one listener per bind
+    /// address, expanded by the caller), or every interface. One listener
+    /// per (address, port); accept work is distributed by the Tokio runtime.
+    /// Publishes every TCP port's plan first ([`plan_ports`]): a socket
+    /// already bound serves its next connection by it, so a port changes
+    /// protocol, gains or sheds a listener or a cert, without a rebind.
+    /// Returns `(ports_opened, errors)`.
+    ///
+    /// The second half of a pass: [`Self::close_unwanted`] of the same
+    /// listeners first, its loops awaited, or a bind overlapping a socket
+    /// still open fails.
+    pub fn add_tcp_listeners(
+        &mut self,
+        listener_configs: &[ListenerConfig],
+        routes: Arc<ArcSwap<RouteTable>>,
+        performance_config: &crate::config::PerformanceConfig,
+    ) -> (usize, Vec<(u16, String)>) {
+        let mut opened = 0usize;
+        let desired = Self::desired_endpoints(listener_configs);
+
+        // build_server_config (full PEM parse + key load for every ref) runs
+        // only when a port's merged cert bytes changed, and once per port.
+        // The bind loop below always runs, so a newly appeared bind address
+        // still gets bound when the certs are unchanged.
+        let (plans, mut errors) = plan_ports(
+            listener_configs,
+            std::path::Path::new("/unused"),
+            performance_config.http2,
+            &mut self.terminate_configs,
+        );
+        self.plans.retain(|port, _| plans.contains_key(port));
+        for (port, plan) in plans {
+            match self.plans.get(&port) {
+                Some(slot) => slot.store(plan.map(Arc::new)),
+                None => {
+                    self.plans
+                        .insert(port, Arc::new(ArcSwapOption::from_pointee(plan)));
+                }
             }
         }
 
@@ -532,98 +626,95 @@ impl DataPlane {
             let port = listener_cfg.port;
             let bound_port = listener_cfg.target_port.unwrap_or(port);
 
-            // TLS-terminate listeners take the per-port acceptor prepared
-            // above; a failed config build (error already recorded) skips
-            // the listener.
-            let (tls_acceptor, tls_passthrough) =
-                match listener_tls_dispatch(listener_cfg, &self.tls_configs) {
-                    Some(v) => v,
-                    None => continue,
-                };
+            let plan = match listener_cfg.protocol {
+                Protocol::UDP => None,
+                // A listener no plan took (TLS Terminate) binds nothing; nor
+                // does a port that could serve no connection (its certs
+                // failed, error already recorded).
+                _ => match self.plans.get(&port) {
+                    Some(plan) if serves(plan.load().as_deref()) => Some(plan.clone()),
+                    _ => continue,
+                },
+            };
 
-            for &bind_addr in &bind_addrs {
-                let effective_addr = bind_addr.or(listener_cfg.address.as_deref());
-                let endpoint = (effective_addr.map(String::from), bound_port);
-                if self.endpoint_alive(&endpoint) {
-                    continue; // Endpoint already bound with a live accept loop
+            let address = listener_cfg.address.as_deref();
+            let endpoint = (listener_cfg.address.clone(), bound_port);
+            // Already bound, a specific address the port's wildcard stands
+            // for, or an endpoint another published port takes: the one
+            // `close_unwanted` keeps it for.
+            if self.endpoint_alive(&endpoint) || desired.get(&endpoint) != Some(&port) {
+                continue;
+            }
+
+            if let Some(plan) = plan {
+                match self.bind_tcp(listener_cfg, endpoint, plan, &routes, performance_config) {
+                    Ok(()) => opened += 1,
+                    Err(e) => errors.push((port, e)),
                 }
-                // A wildcard socket we already hold serves every address on
-                // the port (routing is port-keyed); an additional
-                // address-specific bind adds nothing and, depending on the
-                // platform's overlap rules, can fail EADDRINUSE against our
-                // own wildcard socket.
-                if endpoint.0.is_some() && self.endpoint_alive(&(None, bound_port)) {
-                    continue;
+            } else {
+                match create_udp_socket(bound_port, address, listener_cfg.interface.as_deref()) {
+                    Ok(std_socket) => match UdpSocket::from_std(std_socket) {
+                        Ok(tokio_socket) => {
+                            let routes = routes.clone();
+                            let health = self.health.clone();
+                            let limits = self.udp_sessions.clone();
+                            let socket = Arc::new(tokio_socket);
+
+                            self.spawn_listener_task(endpoint, port, |cancel| async move {
+                                udp_worker::run_udp_worker(
+                                    socket, port, routes, limits, cancel, health,
+                                )
+                                .await;
+                            });
+                            opened += 1;
+                        }
+                        Err(e) => errors.push((port, format!("UDP from_std: {}", e))),
+                    },
+                    Err(e) => errors.push((port, format!("UDP bind: {}", e))),
                 }
-
-                if listener_cfg.protocol == Protocol::UDP {
-                    match create_udp_socket(
-                        bound_port,
-                        effective_addr,
-                        listener_cfg.interface.as_deref(),
-                    ) {
-                        Ok(std_socket) => match UdpSocket::from_std(std_socket) {
-                            Ok(tokio_socket) => {
-                                let routes = routes.clone();
-                                let health = self.health.clone();
-                                let limits = self.udp_sessions.clone();
-                                let socket = Arc::new(tokio_socket);
-
-                                self.spawn_listener_task(endpoint, |cancel| async move {
-                                    udp_worker::run_udp_worker(
-                                        socket, port, routes, limits, cancel, health,
-                                    )
-                                    .await;
-                                });
-                                opened += 1;
-                            }
-                            Err(e) => errors.push((port, format!("UDP from_std: {}", e))),
-                        },
-                        Err(e) => errors.push((port, format!("UDP bind: {}", e))),
-                    }
-                } else {
-                    match create_tcp_listener(
-                        bound_port,
-                        effective_addr,
-                        listener_cfg.interface.as_deref(),
-                    ) {
-                        Ok(std_listener) => match TcpListener::from_std(std_listener) {
-                            Ok(tokio_listener) => {
-                                let routes = routes.clone();
-                                let health = self.health.clone();
-                                // The controller's perf config takes precedence
-                                // over the startup one for dynamic listeners.
-                                let cfg = worker::WorkerConfig::from_perf(
-                                    performance_config,
-                                    self.worker_config.max_idle_per_backend,
-                                );
-                                let acceptor = tls_acceptor.clone();
-                                let passthrough = tls_passthrough;
-
-                                let ctx = worker::ListenerCtx {
-                                    server_port: port,
-                                    routes,
-                                    cfg,
-                                    tls_acceptor: acceptor,
-                                    tls_passthrough: passthrough,
-                                    health,
-                                    selector: self.selector.clone(),
-                                    active_connections: self.active_connections.clone(),
-                                    shared_pool: self.shared_pool.clone(),
-                                };
-                                self.spawn_listener_task(endpoint, |cancel| async move {
-                                    worker::run_worker(tokio_listener, ctx, cancel).await;
-                                });
-                                opened += 1;
-                            }
-                            Err(e) => errors.push((port, format!("TCP from_std: {}", e))),
-                        },
-                        Err(e) => errors.push((port, format!("TCP bind: {}", e))),
-                    }
-                }
-            } // end for bind_addr
+            }
         }
         (opened, errors)
+    }
+
+    /// Bind `listener_cfg`'s `endpoint` and spawn its accept loop, which
+    /// reads `plan` per connection.
+    fn bind_tcp(
+        &mut self,
+        listener_cfg: &ListenerConfig,
+        endpoint: (Option<String>, u16),
+        plan: PortPlan,
+        routes: &Arc<ArcSwap<RouteTable>>,
+        performance_config: &crate::config::PerformanceConfig,
+    ) -> Result<(), String> {
+        let std_listener = create_tcp_listener(
+            endpoint.1,
+            endpoint.0.as_deref(),
+            listener_cfg.interface.as_deref(),
+        )
+        .map_err(|e| format!("TCP bind: {}", e))?;
+        let tokio_listener =
+            TcpListener::from_std(std_listener).map_err(|e| format!("TCP from_std: {}", e))?;
+        // The controller's perf config takes precedence over the startup
+        // one for dynamic listeners.
+        let cfg = worker::WorkerConfig::from_perf(
+            performance_config,
+            self.worker_config.max_idle_per_backend,
+        );
+        let ctx = worker::ListenerCtx {
+            server_port: listener_cfg.port,
+            routes: routes.clone(),
+            cfg,
+            plan,
+            health: self.health.clone(),
+            selector: self.selector.clone(),
+            active_connections: self.active_connections.clone(),
+            shared_pool: self.shared_pool.clone(),
+        };
+        self.spawn_listener_task(endpoint, listener_cfg.port, |cancel| async move {
+            worker::run_worker(tokio_listener, ctx, cancel).await;
+        });
+        Ok(())
     }
 
     /// Start async listener tasks (one accept loop per TCP listener / UDP socket).
@@ -639,21 +730,19 @@ impl DataPlane {
                 bound_port,
                 address,
                 listener,
-                tls_acceptor,
-                tls_passthrough,
+                plan,
             } = entry;
             let ctx = worker::ListenerCtx {
                 server_port: port,
                 routes: routes.clone(),
                 cfg: self.worker_config,
-                tls_acceptor,
-                tls_passthrough,
+                plan,
                 health: self.health.clone(),
                 selector: self.selector.clone(),
                 active_connections: self.active_connections.clone(),
                 shared_pool: self.shared_pool.clone(),
             };
-            self.spawn_listener_task((address, bound_port), |cancel| async move {
+            self.spawn_listener_task((address, bound_port), port, |cancel| async move {
                 worker::run_worker(listener, ctx, cancel).await;
             });
         }
@@ -666,7 +755,8 @@ impl DataPlane {
             let limits = self.udp_sessions.clone();
             let port = entry.port;
 
-            self.spawn_listener_task((entry.address, entry.bound_port), |cancel| async move {
+            let endpoint = (entry.address, entry.bound_port);
+            self.spawn_listener_task(endpoint, port, |cancel| async move {
                 udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
             });
         }
@@ -696,8 +786,9 @@ impl DataPlane {
         required.iter().all(|ep| {
             self.endpoint_alive(ep)
                 // A wildcard socket on the port already accepts traffic for
-                // any specific address; routing is keyed on the port. The
-                // reverse does NOT hold: a required wildcard bind is not
+                // any specific address; routing is keyed on the port. It is
+                // still open only while the spec wants it (close_unwanted).
+                // The reverse does NOT hold: a required wildcard bind is not
                 // satisfied by an address-specific one.
                 || (ep.0.is_some() && self.endpoint_alive(&(None, ep.1)))
         })
@@ -773,6 +864,27 @@ fn create_udp_socket(
 }
 
 #[cfg(test)]
+pub(crate) mod test_ports {
+    use std::hash::BuildHasher;
+
+    /// A port free on every interface, below the ephemeral range. The
+    /// kernel hands ephemeral ports to this process's client sockets, and
+    /// one took a wildcard port between its probe and its bind.
+    pub(crate) fn wildcard() -> u16 {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        let first_ephemeral: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+        let unprivileged = 1024..first_ephemeral;
+        let len = unprivileged.len();
+        // Tests running beside this one start elsewhere.
+        let start = std::hash::RandomState::new().hash_one(()) as usize;
+        (0..len)
+            .map(|i| unprivileged.start + ((start + i) % len) as u16)
+            .find(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_ok())
+            .expect("a free port below the ephemeral range")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{CertificateRef, ListenerConfig, Protocol as P, TlsConfig, TlsMode as TM};
@@ -798,6 +910,7 @@ mod tests {
                     hostname: hostname.map(str::to_string),
                     cert_pem: Some(b"PEM-CERT".to_vec()),
                     key_pem: Some(b"PEM-KEY".to_vec()),
+                    namespace: None,
                 }],
             }),
             rate_limit: None,
@@ -870,6 +983,45 @@ mod tests {
             "Passthrough must not contribute"
         );
         assert!(!merged.contains_key(&80), "HTTP must not contribute");
+    }
+
+    /// Refs merge by their Secret's key and the hostname they serve, never
+    /// by comparing PEM bytes pairwise: one Secret seen twice merges once,
+    /// whatever bytes each copy carries.
+    #[test]
+    fn merged_refs_dedup_by_secret_key() {
+        let mut a = https_listener("a", 443, Some("a.example.org"), "cert");
+        a.tls.as_mut().unwrap().certificate_refs[0].namespace = Some("ns1".into());
+        let mut again = a.clone();
+        again.address = Some("10.0.0.2".into());
+        again.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(b"ROTATED".to_vec());
+        let mut other_ns = a.clone();
+        other_ns.tls.as_mut().unwrap().certificate_refs[0].namespace = Some("ns2".into());
+        let merged = merge_cert_refs_by_port(&[a, again, other_ns]);
+        let namespaces: Vec<_> = merged[&443]
+            .iter()
+            .map(|r| r.namespace.as_deref())
+            .collect();
+        assert_eq!(namespaces, vec![Some("ns1"), Some("ns2")]);
+    }
+
+    /// A listener bound on two addresses comes as two copies. Each added
+    /// its refs again: the fingerprint moved with the address count, and
+    /// a new address rebuilt the port's ServerConfig with unchanged certs.
+    #[test]
+    fn a_listener_on_several_addresses_merges_its_refs_once() {
+        let listener = https_listener("https", 443, Some("a.example.org"), "c");
+        let on = |address: &str| ListenerConfig {
+            address: Some(address.to_string()),
+            ..listener.clone()
+        };
+        let one = merge_cert_refs_by_port(&[on("10.0.0.1")]);
+        let two = merge_cert_refs_by_port(&[on("10.0.0.1"), on("10.0.0.2")]);
+        assert_eq!(two[&443].len(), 1);
+        assert_eq!(
+            compute_cert_fingerprint(&one[&443]),
+            compute_cert_fingerprint(&two[&443])
+        );
     }
 
     /// Fingerprint over a port's merged refs must be stable across calls —
@@ -986,6 +1138,568 @@ mod tests {
         }
     }
 
+    /// A passthrough listener and an HTTPS one on a port share its socket,
+    /// whichever comes first: SNI picks forwarding or termination. Listed
+    /// first, the passthrough listener bound a socket that dropped every
+    /// SNI its HTTPS sibling serves.
+    #[tokio::test]
+    async fn https_and_passthrough_share_a_socket_in_either_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.example.org")
+        else {
+            return; // openssl unavailable
+        };
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+                .with_no_client_auth(),
+        );
+        let perf = test_perf();
+        for passthrough_first in [true, false] {
+            let port = free_port();
+            let mut https = https_listener("web", port, Some("app.example.org"), "cert");
+            https.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(cert.clone());
+            https.tls.as_mut().unwrap().certificate_refs[0].key_pem = Some(key.clone());
+            let mut passthrough = https_listener("db", port, Some("secure.example.org"), "-");
+            passthrough.protocol = P::TLS;
+            passthrough.tls = Some(TlsConfig {
+                mode: TM::Passthrough,
+                certificate_refs: vec![],
+            });
+            let listeners = if passthrough_first {
+                vec![passthrough, https]
+            } else {
+                vec![https, passthrough]
+            };
+            let mut table = RouteTable::new();
+            let forward = crate::routing::Backend::new(
+                "127.0.0.1".into(),
+                backend.local_addr().unwrap().port(),
+            )
+            .unwrap();
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward],
+            );
+            let routes = Arc::new(ArcSwap::from_pointee(table));
+            let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+            bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let sni = rustls::pki_types::ServerName::try_from("app.example.org").unwrap();
+            let connector = tokio_rustls::TlsConnector::from(client_cfg.clone());
+            let hs = connector.connect(sni, tcp).await;
+            assert!(
+                hs.is_ok(),
+                "{passthrough_first}: terminated: {:?}",
+                hs.err()
+            );
+
+            let name = rustls::pki_types::ServerName::try_from("secure.example.org").unwrap();
+            let mut hello = Vec::new();
+            rustls::ClientConnection::new(client_cfg.clone(), name)
+                .unwrap()
+                .write_tls(&mut hello)
+                .unwrap();
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            client.write_all(&hello).await.unwrap();
+            let (mut forwarded, _) = tokio::time::timeout(Duration::from_secs(5), backend.accept())
+                .await
+                .expect("passthrough reached the backend")
+                .unwrap();
+            let mut got = vec![0u8; hello.len()];
+            forwarded.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, hello, "{passthrough_first}: passed through as sent");
+        }
+    }
+
+    /// An HTTPS listener for `hostname` on `port`, its cert in memory.
+    fn https_with_cert(
+        port: u16,
+        hostname: Option<&str>,
+        (cert, key): &(Vec<u8>, Vec<u8>),
+    ) -> ListenerConfig {
+        let mut https = https_listener("web", port, hostname, "cert");
+        let cert_ref = &mut https.tls.as_mut().unwrap().certificate_refs[0];
+        cert_ref.cert_pem = Some(cert.clone());
+        cert_ref.key_pem = Some(key.clone());
+        https
+    }
+
+    fn passthrough_listener(port: u16, hostname: Option<&str>) -> ListenerConfig {
+        ListenerConfig {
+            protocol: P::TLS,
+            tls: Some(TlsConfig {
+                mode: TM::Passthrough,
+                certificate_refs: vec![],
+            }),
+            ..https_listener("db", port, hostname, "-")
+        }
+    }
+
+    /// Trusts any server; sends `sni`, or no SNI at all.
+    fn client_config(sni: Option<&str>) -> (Arc<rustls::ClientConfig>, ServerName<'static>) {
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        config.enable_sni = sni.is_some();
+        let name = ServerName::try_from(sni.unwrap_or("unsent.test").to_string()).unwrap();
+        (Arc::new(config), name)
+    }
+
+    use rustls::pki_types::ServerName;
+
+    /// The cert the proxy on `port` presents for `sni`, or why it presents none.
+    async fn presented(port: u16, sni: Option<&str>) -> Result<Vec<u8>, String> {
+        let (config, name) = client_config(sni);
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let handshake = tokio_rustls::TlsConnector::from(config).connect(name, tcp);
+        match tokio::time::timeout(Duration::from_secs(5), handshake).await {
+            Ok(Ok(tls)) => Ok(tls.get_ref().1.peer_certificates().unwrap()[0].to_vec()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("handshake timed out".into()),
+        }
+    }
+
+    fn der(pem: &[u8]) -> Vec<u8> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(pem)
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Send a ClientHello for `sni` to `port`: `Some` with what `backend`
+    /// received, as sent, or `None` once the proxy closed the connection
+    /// without reaching the backend.
+    async fn hello_reaches(
+        port: u16,
+        sni: Option<&str>,
+        backend: &tokio::net::TcpListener,
+    ) -> Option<bool> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (config, name) = client_config(sni);
+        let mut hello = Vec::new();
+        rustls::ClientConnection::new(config, name)
+            .unwrap()
+            .write_tls(&mut hello)
+            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(&hello).await.unwrap();
+        let (wait, mut byte) = (Duration::from_secs(5), [0u8; 1]);
+        tokio::select! {
+            accepted = backend.accept() => {
+                let (mut forwarded, _) = accepted.unwrap();
+                let mut got = vec![0u8; hello.len()];
+                forwarded.read_exact(&mut got).await.unwrap();
+                Some(got == hello)
+            }
+            read = tokio::time::timeout(wait, client.read(&mut byte)) => {
+                assert!(!matches!(read, Ok(Ok(n)) if n > 0), "the proxy answered");
+                assert!(read.is_ok(), "neither closed nor forwarded");
+                None
+            }
+        }
+    }
+
+    /// One pass binding `listeners` on a fresh data plane over `table`.
+    async fn serve(listeners: &[ListenerConfig], table: RouteTable) -> DataPlane {
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(table));
+        bind_until(&mut dp, listeners, &routes, &perf, 1).await;
+        dp
+    }
+
+    /// An HTTPS listener deleted while a passthrough sibling keeps its port:
+    /// the socket stays, and served the deleted listener's cert until
+    /// restart. Each pass now plans the port from its listeners alone.
+    #[tokio::test]
+    async fn a_deleted_https_listener_leaves_no_cert_behind() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let https = https_with_cert(port, Some("app.example.org"), &cert);
+        let passthrough = passthrough_listener(port, Some("secure.example.org"));
+        let mut dp = serve(&[https, passthrough.clone()], RouteTable::new()).await;
+        assert_eq!(
+            presented(port, Some("app.example.org")).await,
+            Ok(der(&cert.0))
+        );
+
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let pass = ensure(&mut dp, &[passthrough], &routes, &perf).await;
+        assert_eq!(pass, (0, vec![]), "the socket stays");
+        let after = presented(port, Some("app.example.org")).await;
+        assert!(after.is_err(), "the deleted listener's cert: {after:?}");
+    }
+
+    /// A Secret rotated to certs that fail to load keeps its port serving
+    /// the last good ones, and the failure is still reported each pass.
+    /// The port dropped its config and refused every handshake until the
+    /// Secret was fixed. A pass that also changes the port's listeners
+    /// keeps nothing: those certs could outlive their listener.
+    #[tokio::test]
+    async fn a_bad_cert_rotation_keeps_the_last_good_certs() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(good), Some(fixed)) = (
+            crate::proxy::tls::test_util::generate_test_cert("app.example.org"),
+            crate::proxy::tls::test_util::generate_test_cert("app.example.org"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let listener = https_with_cert(port, Some("app.example.org"), &good);
+        let rotated_bad = https_listener("web", port, Some("app.example.org"), "cert");
+        let mut dp = serve(std::slice::from_ref(&listener), RouteTable::new()).await;
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let sni = Some("app.example.org");
+        assert_eq!(presented(port, sni).await, Ok(der(&good.0)));
+
+        for _ in 0..2 {
+            let (opened, errors) =
+                ensure(&mut dp, std::slice::from_ref(&rotated_bad), &routes, &perf).await;
+            assert_eq!(opened, 0);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].1.contains("last good"), "{errors:?}");
+            assert_eq!(presented(port, sni).await, Ok(der(&good.0)));
+        }
+
+        let fixed_listener = https_with_cert(port, Some("app.example.org"), &fixed);
+        let pass = ensure(&mut dp, &[fixed_listener], &routes, &perf).await;
+        assert_eq!(pass, (0, vec![]));
+        assert_eq!(presented(port, sni).await, Ok(der(&fixed.0)));
+
+        let mut renamed_bad = rotated_bad.clone();
+        renamed_bad.hostname = Some("new.example.org".into());
+        renamed_bad.tls.as_mut().unwrap().certificate_refs[0].hostname =
+            renamed_bad.hostname.clone();
+        let (_, errors) = ensure(&mut dp, &[renamed_bad], &routes, &perf).await;
+        assert!(!errors[0].1.contains("last good"), "{errors:?}");
+        for sni in [sni, Some("new.example.org")] {
+            assert!(presented(port, sni).await.is_err(), "{sni:?}");
+        }
+    }
+
+    /// An HTTPS listener whose certs failed alone, beside listeners whose
+    /// certs loaded, refuses its SNI: by listener precedence the SNI is
+    /// its, and its certs are what may answer it. The handshake went on
+    /// with the wildcard's or the catch-all's cert.
+    #[tokio::test]
+    async fn an_https_listener_whose_certs_failed_refuses_its_sni() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(catch_all), Some(wildcard)) = (
+            crate::proxy::tls::test_util::generate_test_cert("catch-all"),
+            crate::proxy::tls::test_util::generate_test_cert("*.example.org"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let mut wild = https_with_cert(port, Some("*.example.org"), &wildcard);
+        wild.name = "wild".into();
+        let mut all = https_with_cert(port, None, &catch_all);
+        all.name = "all".into();
+        let failed = https_listener("a", port, Some("a.example.org"), "bad");
+        let other = https_listener("b", port, Some("b.other.org"), "bad");
+        let _dp = serve(&[all, wild, failed, other], RouteTable::new()).await;
+
+        for sni in ["a.example.org", "b.other.org"] {
+            assert!(presented(port, Some(sni)).await.is_err(), "{sni}");
+        }
+        assert_eq!(
+            presented(port, Some("x.example.org")).await,
+            Ok(der(&wildcard.0))
+        );
+        assert_eq!(presented(port, Some("y.org")).await, Ok(der(&catch_all.0)));
+    }
+
+    /// A listener whose published port changes while its targetPort stays
+    /// serves the new port's routes and plan from its socket. Sockets are
+    /// keyed by the bound port, so the accept loop stayed: it routed by the
+    /// old port and read the old port's plan, which no pass updated again.
+    #[tokio::test]
+    async fn a_published_port_change_on_the_same_target_port_follows() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let target = free_port();
+        let (old, new, tls) = (21080, 21081, 21443);
+        let on = |listener: ListenerConfig, port: u16| ListenerConfig {
+            port,
+            target_port: Some(target),
+            ..listener
+        };
+        let (backend, forward) = test_backend().await;
+        let mut table = RouteTable::new();
+        table.add_http_route_for_listener(
+            new,
+            None,
+            "h",
+            crate::routing::HttpRouteRule::new(
+                crate::routing::PathMatchType::Prefix,
+                "/".into(),
+                vec![],
+                vec![],
+                vec![],
+                vec![forward],
+            ),
+        );
+        let (perf, routes) = (test_perf(), Arc::new(ArcSwap::from_pointee(table)));
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        rebind(&mut dp, &on(http_listener(0, None), old), &routes, &perf).await;
+        rebind(&mut dp, &on(http_listener(0, None), new), &routes, &perf).await;
+
+        tokio::spawn(async move {
+            let (mut conn, _) = backend.accept().await.unwrap();
+            let mut head = [0u8; 1024];
+            let _ = conn.read(&mut head).await;
+            let _ = conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", target))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let https = on(https_with_cert(0, Some("app.example.org"), &cert), tls);
+        rebind(&mut dp, &https, &routes, &perf).await;
+        assert_eq!(
+            presented(target, Some("app.example.org")).await,
+            Ok(der(&cert.0))
+        );
+    }
+
+    /// A port that changes protocol keeps its socket and serves the new
+    /// one from its next connection, HTTP to HTTPS and back. The socket kept
+    /// the mode it was bound with until restart.
+    #[tokio::test]
+    async fn a_live_port_changes_protocol_without_a_rebind() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let http = http_listener(port, None);
+        let https = https_with_cert(port, None, &cert);
+        let mut dp = serve(std::slice::from_ref(&http), RouteTable::new()).await;
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let answers_http = || async {
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response).await;
+            response.starts_with(b"HTTP/1.1 ")
+        };
+        assert!(answers_http().await);
+
+        assert_eq!(ensure(&mut dp, &[https], &routes, &perf).await, (0, vec![]));
+        assert_eq!(
+            presented(port, Some("app.example.org")).await,
+            Ok(der(&cert.0))
+        );
+
+        assert_eq!(ensure(&mut dp, &[http], &routes, &perf).await, (0, vec![]));
+        assert!(answers_http().await);
+    }
+
+    /// No SNI, or one no listener names, goes to the port's listener without
+    /// a hostname, whatever the listener order; with none, the connection
+    /// closes unforwarded. The socket decided by which listener bound it.
+    #[tokio::test]
+    async fn the_catch_all_takes_no_sni_and_unmatched_sni_in_either_order() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let in_order = |mut listeners: Vec<ListenerConfig>, reversed: bool| {
+            if reversed {
+                listeners.reverse();
+            }
+            listeners
+        };
+        for reversed in [false, true] {
+            // An HTTPS catch-all beside a named passthrough listener.
+            let (backend, forward) = test_backend().await;
+            let port = free_port();
+            let listeners = in_order(
+                vec![
+                    https_with_cert(port, None, &cert),
+                    passthrough_listener(port, Some("secure.example.org")),
+                ],
+                reversed,
+            );
+            let mut table = RouteTable::new();
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward],
+            );
+            let _dp = serve(&listeners, table).await;
+            for sni in [None, Some("other.example.org")] {
+                assert_eq!(presented(port, sni).await, Ok(der(&cert.0)), "{sni:?}");
+            }
+            let to_route = hello_reaches(port, Some("secure.example.org"), &backend).await;
+            assert_eq!(to_route, Some(true));
+
+            // A passthrough catch-all beside a named HTTPS listener: its
+            // TCP route takes what no TLS route names.
+            let (backend, forward) = test_backend().await;
+            let port = free_port();
+            let listeners = in_order(
+                vec![
+                    https_with_cert(port, Some("app.example.org"), &cert),
+                    passthrough_listener(port, None),
+                ],
+                reversed,
+            );
+            let mut table = RouteTable::new();
+            table.add_tcp_route(port, vec![forward]);
+            let _dp = serve(&listeners, table).await;
+            for sni in [None, Some("other.example.org")] {
+                assert_eq!(
+                    hello_reaches(port, sni, &backend).await,
+                    Some(true),
+                    "{sni:?}"
+                );
+            }
+            assert_eq!(
+                presented(port, Some("app.example.org")).await,
+                Ok(der(&cert.0))
+            );
+
+            // No catch-all.
+            let (backend, forward) = test_backend().await;
+            let port = free_port();
+            let listeners = in_order(
+                vec![
+                    https_with_cert(port, Some("app.example.org"), &cert),
+                    passthrough_listener(port, Some("secure.example.org")),
+                ],
+                reversed,
+            );
+            let mut table = RouteTable::new();
+            table.add_tls_route_for_listener(
+                port,
+                Some("secure.example.org"),
+                "secure.example.org",
+                vec![forward.clone()],
+            );
+            table.add_tcp_route(port, vec![forward]);
+            let _dp = serve(&listeners, table).await;
+            for sni in [None, Some("other.example.org")] {
+                assert_eq!(hello_reaches(port, sni, &backend).await, None, "{sni:?}");
+            }
+        }
+    }
+
+    /// A TLS route without parentRefs serves passthrough listeners only:
+    /// on a port of HTTPS listeners alone it took any SNI it named from
+    /// them, and forwarded raw what they should have terminated.
+    #[tokio::test]
+    async fn a_tls_route_without_parent_refs_never_takes_an_https_port() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("s.example.com") else {
+            return; // openssl unavailable
+        };
+        let (backend, forward) = test_backend().await;
+        let port = free_port();
+        let mut table = RouteTable::new();
+        table.add_tls_route(0, "s.example.com", vec![forward]);
+        let _dp = serve(&[https_with_cert(port, None, &cert)], table).await;
+        assert_eq!(
+            presented(port, Some("s.example.com")).await,
+            Ok(der(&cert.0))
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, backend.accept())
+                .await
+                .is_err(),
+            "nothing forwarded"
+        );
+    }
+
+    /// A backend the test holds, and a route's forward to it.
+    async fn test_backend() -> (tokio::net::TcpListener, crate::routing::Backend) {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        let forward = crate::routing::Backend::new("127.0.0.1".into(), port).unwrap();
+        (backend, forward)
+    }
+
+    /// An HTTPS listener naming a host exactly takes it from a wildcard
+    /// passthrough listener: exact before wildcard (GatewaySpec.listeners).
+    /// Passthrough routes were tried first, across the port.
+    #[tokio::test]
+    async fn an_exact_https_listener_beats_a_wildcard_passthrough_one() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("a.example.com") else {
+            return; // openssl unavailable
+        };
+        let (backend, forward) = test_backend().await;
+        let port = free_port();
+        let listeners = [
+            passthrough_listener(port, Some("*.example.com")),
+            https_with_cert(port, Some("a.example.com"), &cert),
+        ];
+        let mut table = RouteTable::new();
+        table.add_tls_route_for_listener(
+            port,
+            Some("*.example.com"),
+            "*.example.com",
+            vec![forward],
+        );
+        let _dp = serve(&listeners, table).await;
+        assert_eq!(
+            presented(port, Some("a.example.com")).await,
+            Ok(der(&cert.0))
+        );
+        assert_eq!(
+            hello_reaches(port, Some("b.example.com"), &backend).await,
+            Some(true)
+        );
+    }
+
     /// Regression: with unchanged certs, a reconcile that brings a NEW bind
     /// address must still bind it. The old flow `continue`d out of the whole
     /// listener iteration on a fingerprint match, silently skipping the
@@ -1000,18 +1714,23 @@ mod tests {
         listener.tls.as_mut().unwrap().certificate_refs[0].cert_pem = Some(cert);
         listener.tls.as_mut().unwrap().certificate_refs[0].key_pem = Some(key);
 
+        let on = |addresses: &[&str]| -> Vec<ListenerConfig> {
+            addresses
+                .iter()
+                .map(|a| ListenerConfig {
+                    address: Some(a.to_string()),
+                    ..listener.clone()
+                })
+                .collect()
+        };
+
         let perf = test_perf();
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        let (opened, errors) = dp.add_tcp_listeners(
-            std::slice::from_ref(&listener),
-            &["127.0.0.1".to_string()],
-            routes.clone(),
-            &perf,
-        );
+        let (opened, errors) = dp.add_tcp_listeners(&on(&["127.0.0.1"]), routes.clone(), &perf);
         assert_eq!((opened, errors.len()), (1, 0));
-        let hash_after_first = dp.tls_cert_hashes.get(&23443).copied();
+        let hash_after_first = dp.terminate_configs.get(&23443).map(|b| b.fingerprint);
         assert!(
             hash_after_first.is_some(),
             "TLS state prepared for the port"
@@ -1019,15 +1738,14 @@ mod tests {
 
         // Same certs, one more address: the new endpoint must be bound and
         // the TLS state must not churn.
-        let (opened, errors) = dp.add_tcp_listeners(
-            std::slice::from_ref(&listener),
-            &["127.0.0.1".to_string(), "127.0.0.2".to_string()],
-            routes,
-            &perf,
-        );
+        let (opened, errors) =
+            dp.add_tcp_listeners(&on(&["127.0.0.1", "127.0.0.2"]), routes, &perf);
         assert_eq!(errors, vec![]);
         assert_eq!(opened, 1, "the address that appeared later must be bound");
-        assert_eq!(dp.tls_cert_hashes.get(&23443).copied(), hash_after_first);
+        assert_eq!(
+            dp.terminate_configs.get(&23443).map(|b| b.fingerprint),
+            hash_after_first
+        );
     }
 
     /// Unparseable certs on a port shared by several Terminate listeners:
@@ -1042,46 +1760,120 @@ mod tests {
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes, &perf);
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, routes, &perf);
         assert_eq!(opened, 0, "a port that cannot handshake must not bind");
         assert_eq!(errors.len(), 1, "one error per port, not per listener");
         assert!(
-            !dp.tls_cert_hashes.contains_key(&23444),
+            !dp.terminate_configs.contains_key(&23444),
             "failed build must retry next pass"
         );
     }
 
-    /// A wildcard bind on a port covers every specific address: readiness
-    /// treats (Some(addr), port) as served by (None, port), and the bind loop
-    /// must not attempt an address-specific re-bind (which can EADDRINUSE
-    /// against our own wildcard socket, keeping Programmed=False forever).
-    #[tokio::test]
-    async fn wildcard_bind_covers_specific_addresses() {
-        let listeners = vec![ListenerConfig {
+    fn http_listener(port: u16, address: Option<&str>) -> ListenerConfig {
+        ListenerConfig {
             name: "http".into(),
             protocol: P::HTTP,
-            port: 23445,
+            port,
             target_port: None,
             hostname: None,
-            address: None, // wildcard
+            address: address.map(str::to_string),
             interface: None,
             tls: None,
             rate_limit: None,
-        }];
+        }
+    }
+
+    fn free_port() -> u16 {
+        test_ports::wildcard()
+    }
+
+    fn accepts(addr: &str, port: u16) -> bool {
+        std::net::TcpStream::connect((addr, port)).is_ok()
+    }
+
+    /// One pass as the controller runs it: close what `listeners` no longer
+    /// want, wait for those accept loops, bind the rest.
+    async fn ensure(
+        dp: &mut DataPlane,
+        listeners: &[ListenerConfig],
+        routes: &Arc<ArcSwap<RouteTable>>,
+        perf: &crate::config::PerformanceConfig,
+    ) -> (usize, Vec<(u16, String)>) {
+        for accept_loop in dp.close_unwanted(listeners) {
+            accept_loop.await.unwrap();
+        }
+        dp.add_tcp_listeners(listeners, routes.clone(), perf)
+    }
+
+    /// Moves `dp` to one listener as the controller does ([`ensure`]).
+    /// Binds again while a test beside this one still holds the port, as
+    /// `bind_until` does, unless its endpoint already runs.
+    async fn rebind(
+        dp: &mut DataPlane,
+        listener: &ListenerConfig,
+        routes: &Arc<ArcSwap<RouteTable>>,
+        perf: &crate::config::PerformanceConfig,
+    ) {
+        let listeners = std::slice::from_ref(listener);
+        ensure(dp, listeners, routes, perf).await;
+        let bound_port = listener.target_port.unwrap_or(listener.port);
+        if !dp.endpoint_alive(&(listener.address.clone(), bound_port)) {
+            bind_until(dp, listeners, routes, perf, 1).await;
+        }
+    }
+
+    /// A listener that gains a specific address leaves the wildcard for
+    /// it, and goes back when it loses it. The wildcard stayed bound while
+    /// its port was still wanted, exposed on every interface, and counted
+    /// as ready for the specific address, which was never bound.
+    #[tokio::test]
+    async fn wildcard_gives_way_to_a_specific_address_and_back() {
+        // Accepting a probe builds a backend pool: rustls needs its provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = free_port();
+        let on_every_interface = http_listener(port, None);
+        let on_one_address = http_listener(port, Some("127.0.0.1"));
+        let (wildcard, specific) = ((None, port), (Some("127.0.0.1".to_string()), port));
         let perf = test_perf();
-        let mut dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        // Same port, now with a concrete bind address (e.g. a Gateway
-        // spec.addresses entry): the wildcard already serves it.
-        let (opened, errors) =
-            dp.add_tcp_listeners(&listeners, &["127.0.0.1".to_string()], routes, &perf);
-        assert_eq!((opened, errors.len()), (0, 0), "no re-bind, no error");
+        rebind(&mut dp, &on_every_interface, &routes, &perf).await;
+        assert!(accepts("127.0.0.2", port));
 
-        assert!(dp.is_ready_for_endpoints(&[(Some("127.0.0.1".to_string()), 23445)]));
-        assert!(dp.is_ready_for_endpoints(&[(None, 23445)]));
-        // The reverse is not satisfied: specific never covers wildcard.
-        assert!(!dp.is_ready_for_endpoints(&[(None, 23446)]));
+        rebind(&mut dp, &on_one_address, &routes, &perf).await;
+        assert!(dp.is_ready_for_endpoints(std::slice::from_ref(&specific)));
+        assert!(!dp.is_ready_for_endpoints(std::slice::from_ref(&wildcard)));
+        assert!(accepts("127.0.0.1", port));
+        assert!(!accepts("127.0.0.2", port), "the wildcard is closed");
+
+        rebind(&mut dp, &on_every_interface, &routes, &perf).await;
+        assert!(dp.is_ready_for_endpoints(&[wildcard]));
+        assert!(accepts("127.0.0.2", port));
+    }
+
+    /// A wildcard the spec wants stands for the specific addresses on its
+    /// port, whatever the listener order: a specific bind beside it fails
+    /// EADDRINUSE. The specific listener used to bind first and the
+    /// wildcard then failed.
+    #[tokio::test]
+    async fn a_wanted_wildcard_stands_for_specific_addresses() {
+        // Accepting a probe builds a backend pool: rustls needs its provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = free_port();
+        let listeners = vec![
+            http_listener(port, Some("127.0.0.1")),
+            http_listener(port, None),
+        ];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+        let (opened, errors) = ensure(&mut dp, &listeners, &routes, &perf).await;
+        assert_eq!((opened, errors), (0, vec![]), "nothing left to bind");
+        assert!(dp.is_ready_for_endpoints(&[(None, port), (Some("127.0.0.1".to_string()), port)]));
+        assert!(accepts("127.0.0.2", port));
     }
 
     /// A dead accept loop must drop out of readiness and be rebound by the
@@ -1105,12 +1897,12 @@ mod tests {
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes.clone(), &perf);
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, routes.clone(), &perf);
         assert_eq!((opened, errors.len()), (1, 0));
         assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
 
         // Kill the accept loop out-of-band — stands in for any task death.
-        if let Some(ListenerSlot::Running(handle, _)) = dp.listener_tasks.get(&(None, 23447)) {
+        if let Some(ListenerSlot::Running(handle, ..)) = dp.listener_tasks.get(&(None, 23447)) {
             handle.abort();
         } else {
             panic!("expected a running listener slot");
@@ -1128,7 +1920,7 @@ mod tests {
         );
 
         // The next ensure pass reaps the corpse and rebinds the endpoint.
-        let (opened, errors) = dp.add_tcp_listeners(&listeners, &[], routes, &perf);
+        let (opened, errors) = ensure(&mut dp, &listeners, &routes, &perf).await;
         assert_eq!((opened, errors.len()), (1, 0), "dead endpoint must rebind");
         assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
     }
@@ -1147,7 +1939,7 @@ mod tests {
     ) {
         let mut opened = 0;
         for _ in 0..200 {
-            opened += dp.add_tcp_listeners(listeners, &[], routes.clone(), perf).0;
+            opened += dp.add_tcp_listeners(listeners, routes.clone(), perf).0;
             if opened == want {
                 return;
             }
@@ -1189,7 +1981,7 @@ mod tests {
 
         // Spec drops listener b: its endpoint must leave the map and the
         // socket must actually close (cancel lands async, poll briefly).
-        let (opened, errors) = dp.add_tcp_listeners(&both[..1], &[], routes.clone(), &perf);
+        let (opened, errors) = ensure(&mut dp, &both[..1], &routes, &perf).await;
         assert_eq!((opened, errors.len()), (0, 0));
         assert!(!dp.is_ready_for_endpoints(&[endpoint(b)]));
         assert!(dp.is_ready_for_endpoints(&[endpoint(a)]), "sibling kept");

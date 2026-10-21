@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn path_starts_with_slash_without_sp_ctl_or_fragment() {
-        for ok in ["/", "/a/b", "/a?b=c", "/%20", "/caf\u{e9}", "/~user"] {
+        for ok in ["/", "/a/b", "/a?b=c", "/a?", "/%20", "/caf\u{e9}", "/~user"] {
             assert!(check_path(ok).is_ok(), "{ok:?}");
         }
         for bad in [
@@ -381,6 +381,49 @@ mod tests {
             "http://x/a",
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Gateway API v1.4.1 bounds these values by length only: replaceFullPath
+    /// "/login?next=home" is valid, and the request's query joins it. Both
+    /// config paths compile a route through the funnel.
+    #[test]
+    fn a_path_modifier_value_may_carry_a_query() {
+        use crate::config::compile::compile_http_route;
+        for (filter, path) in [
+            (
+                "urlRewrite",
+                r#"{"type":"ReplaceFullPath","replaceFullPath":"/new?src=gw"}"#,
+            ),
+            (
+                "urlRewrite",
+                r#"{"type":"ReplacePrefixMatch","replacePrefixMatch":"/new?"}"#,
+            ),
+            (
+                "requestRedirect",
+                r#"{"type":"ReplaceFullPath","replaceFullPath":"/?a=b"}"#,
+            ),
+            (
+                "requestRedirect",
+                r#"{"type":"ReplacePrefixMatch","replacePrefixMatch":"/new?src=gw"}"#,
+            ),
+        ] {
+            // A redirect may have no backendRefs (the HTTPRoute CRD).
+            let (kind, backends) = if filter == "urlRewrite" {
+                ("URLRewrite", r#"{"name":"127.0.0.1","port":8001}"#)
+            } else {
+                ("RequestRedirect", "")
+            };
+            let json = format!(
+                r#"{{"hostnames":["p.example.com"],"rules":[{{
+                    "matches":[{{"path":{{"type":"PathPrefix","value":"/old"}}}}],
+                    "filters":[{{"type":"{kind}","{filter}":{{"path":{path}}}}}],
+                    "backendRefs":[{backends}]}}]}}"#
+            );
+            let route: crate::config::HttpRouteConfig = serde_json::from_str(&json).unwrap();
+            if let Err(err) = compile_http_route(&route) {
+                panic!("{json}: {err}");
+            }
         }
     }
 
@@ -516,7 +559,7 @@ mod tests {
                 config: URLRewriteConfig {
                     hostname: Some("internal.example.com".to_string()),
                     path: Some(HttpURLRewritePath::ReplaceFullPath {
-                        value: "/v2?x=1".to_string(),
+                        value: "/v2;v=1".to_string(),
                     }),
                 },
             },

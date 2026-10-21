@@ -4,6 +4,22 @@ use gateway_api::gateways::*;
 use gateway_api::referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo};
 use kube::core::ObjectMeta;
 
+/// A pass that remembers no verdict, as every test but the cache's wants.
+fn reconcile_to_config(
+    gateway: &Gateway,
+    snapshot: &ClusterSnapshot,
+    cert_data: &CertData,
+    services: &ServiceState,
+) -> Result<ReconcileResult> {
+    super::reconcile_to_config(
+        gateway,
+        snapshot,
+        cert_data,
+        services,
+        &RouteVerdicts::default(),
+    )
+}
+
 fn default_ns_labels() -> HashMap<String, BTreeMap<String, String>> {
     let mut m = HashMap::new();
     m.insert("default".to_string(), BTreeMap::new());
@@ -281,13 +297,20 @@ fn test_backend_dns_name_with_namespace() {
     );
 }
 
+/// `test_http_route` moved to `ns`, its parentRef still naming default/test-gw.
+fn route_from_ns(ns: &str) -> HTTPRoute {
+    let mut route = test_http_route();
+    route.metadata.namespace = Some(ns.to_string());
+    route.spec.parent_refs.as_mut().unwrap()[0].namespace = Some("default".to_string());
+    route
+}
+
 #[test]
 fn test_namespace_scoping_same() {
     let mut gw = test_gateway();
     gw.metadata.namespace = Some("default".to_string());
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("other-ns".to_string());
+    let route = route_from_ns("other-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert("other-ns".to_string(), BTreeMap::new());
@@ -318,8 +341,7 @@ fn test_namespace_scoping_all() {
         kinds: None,
     });
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("other-ns".to_string());
+    let route = route_from_ns("other-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert("other-ns".to_string(), BTreeMap::new());
@@ -351,8 +373,7 @@ fn test_namespace_scoping_selector() {
         kinds: None,
     });
 
-    let mut route = test_http_route();
-    route.metadata.namespace = Some("prod-ns".to_string());
+    let route = route_from_ns("prod-ns");
 
     let mut ns_labels = default_ns_labels();
     ns_labels.insert(
@@ -1757,7 +1778,7 @@ fn test_crlf_header_value_keeps_route_out_and_reports_it() {
         .find(|ra| ra.name == "crlf-route")
         .unwrap();
     assert!(!ra.accepted);
-    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
     assert!(
         ra.message.contains(
             "rule 0: filter 0: RequestHeaderModifier set[0].value (header \"X-Tenant\"): control character 0x0d"
@@ -1766,7 +1787,8 @@ fn test_crlf_header_value_keeps_route_out_and_reports_it() {
         ra.message
     );
     assert!(!ra.message.contains("X-Injected"), "{}", ra.message);
-    assert!(ra.listener_names.is_empty());
+    // Still attached by allowedRoutes and parentRef: attachedRoutes counts it.
+    assert_eq!(ra.listener_names, vec!["http".to_string()]);
 
     let sibling = result
         .route_status
@@ -1841,7 +1863,13 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
         ),
     ];
     for (filter, field) in cases {
-        let result = reconcile_http(vec![route_with_filters("inj", vec![filter], vec![])]);
+        // The CRD refuses a redirect beside backendRefs.
+        let redirects = filter.r#type == HTTPRouteRulesFiltersType::RequestRedirect;
+        let mut route = route_with_filters("inj", vec![filter], vec![]);
+        if redirects {
+            route.spec.rules.as_mut().unwrap()[0].backend_refs = None;
+        }
+        let result = reconcile_http(vec![route]);
         assert!(result.config.http_routes.is_empty(), "{field}");
         let ra = &result.route_status[0];
         assert!(!ra.accepted, "{field}");
@@ -1928,6 +1956,270 @@ fn test_unsupported_backend_ref_filter_rejects_route() {
     );
 }
 
+/// One rule under `parentRefs: [test-gw]` and `api.example.com`.
+fn route_with_rule(name: &str, rule: serde_json::Value) -> HTTPRoute {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {
+            "parentRefs": [{"name": "test-gw"}],
+            "hostnames": ["api.example.com"],
+            "rules": [rule]
+        }
+    }))
+    .unwrap()
+}
+
+fn rejection<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance {
+    let ra = result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == name)
+        .unwrap();
+    assert!(!ra.accepted, "{name}: {}", ra.message);
+    ra
+}
+
+/// A redirect rule never forwards. A cluster that skips the CRD's CEL
+/// check can still send backendRefs beside it, and one naming no Service
+/// turned ResolvedRefs False (BackendNotFound). They are left out: never
+/// checked, resolved or probed.
+#[test]
+fn a_redirect_rule_leaves_its_backend_refs_out() {
+    let route = route_with_rule(
+        "redirect",
+        serde_json::json!({"filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"scheme": "https"}}
+        ], "backendRefs": [{"name": "ghost-svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![route]);
+    let ra = status_of(&result, "redirect");
+    assert!(ra.accepted, "{}", ra.message);
+    assert!(ra.refs_resolved, "{}: {}", ra.refs_reason, ra.refs_message);
+    assert!(result.config.http_routes[0].rules[0]
+        .backend_refs
+        .is_empty());
+    assert!(crate::kubernetes::services::referenced_backends(&result.config).is_empty());
+}
+
+/// Acceptance never compiled regexes: the route read Accepted, then failed
+/// the table build for the whole Gateway.
+#[test]
+fn test_bad_regex_route_is_rejected_alone() {
+    let bad = route_with_rule(
+        "bad-regex",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/(?=x)"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![bad, test_http_route()]);
+    let ra = rejection(&result, "bad-regex");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(
+        ra.message
+            .contains("rule 0: match 0: Invalid path regex '/(?=x)'"),
+        "{}",
+        ra.message
+    );
+    // Still attached by allowedRoutes: Listener.attachedRoutes counts it.
+    assert_eq!(ra.listener_names, vec!["http".to_string()]);
+    assert_eq!(result.config.http_routes.len(), 1, "only the sibling");
+    let mut config = result.config.clone();
+    fixup_backends_for_test(&mut config);
+    assert!(config.to_route_table().is_ok());
+}
+
+/// Acceptance compiled every route's regexes on every pass, status echoes
+/// and requeues included. A verdict now stands while the route's
+/// generation does, and leaves with the route.
+#[test]
+fn a_route_verdict_stands_until_its_generation_moves() {
+    let mut route = route_with_rule(
+        "r",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/a.*"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    route.metadata.uid = Some("r-uid".to_string());
+    route.metadata.generation = Some(1);
+    let verdicts = RouteVerdicts::default();
+    let pass = |routes: Vec<HTTPRoute>| {
+        let snapshot = test_snapshot(routes, vec![], vec![], vec![], &default_ns_labels(), vec![]);
+        super::reconcile_to_config(
+            &test_gateway(),
+            &snapshot,
+            &HashMap::new(),
+            &empty_services(),
+            &verdicts,
+        )
+        .unwrap()
+    };
+    let gateway = ("default".to_string(), "test-gw".to_string());
+
+    assert!(pass(vec![route.clone()]).route_status[0].accepted);
+    // A planted verdict stands in for the check: the pass reports it.
+    verdicts
+        .0
+        .lock()
+        .unwrap()
+        .get_mut(&gateway)
+        .unwrap()
+        .insert(
+            "r-uid".to_string(),
+            (1, Err(RouteError::unsupported("planted"))),
+        );
+    let ra = &pass(vec![route.clone()]).route_status[0];
+    assert!(!ra.accepted);
+    assert_eq!(ra.message, "Conversion failed: planted");
+
+    route.metadata.generation = Some(2);
+    assert!(pass(vec![route]).route_status[0].accepted, "checked again");
+    pass(vec![]);
+    assert!(verdicts.0.lock().unwrap()[&gateway].is_empty());
+}
+
+/// A route that fails its check still reports ResolvedRefs from its refs.
+/// It said False with InvalidKind whatever they were: a bad regex is not a
+/// ref problem, and a ref problem beside a bad filter kept its own reason.
+#[test]
+fn rejected_route_reports_resolved_refs_from_its_refs() {
+    let bad_regex = route_with_rule(
+        "bad-regex",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/(?=x)"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let bad_filter_and_ref = route_with_rule(
+        "bad-filter-and-ref",
+        serde_json::json!({"filters": [
+            {"type": "ExtensionRef", "extensionRef": {"group": "x.io", "kind": "Auth", "name": "a"}}
+        ], "backendRefs": [{"name": "svc", "namespace": "db", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![bad_regex, bad_filter_and_ref]);
+
+    let ra = rejection(&result, "bad-regex");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(ra.refs_resolved, "{}", ra.refs_message);
+    assert_eq!(ra.refs_reason, "ResolvedRefs");
+
+    let ra = rejection(&result, "bad-filter-and-ref");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(!ra.refs_resolved);
+    assert_eq!(ra.refs_reason, "RefNotPermitted", "{}", ra.refs_message);
+}
+
+/// Gateway API v1.4.1 RouteReasonIncompatibleFilters: "incompatible filters
+/// present on a route rule (for example if the URLRewrite and
+/// RequestRedirect are both present on an HTTPRoute)".
+#[test]
+fn test_incompatible_filters_reason() {
+    let redirect_and_rewrite = route_with_rule(
+        "redirect-and-rewrite",
+        serde_json::json!({"filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"scheme": "https"}},
+            {"type": "URLRewrite", "urlRewrite": {"hostname": "x.example.com"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let two_hosts = route_with_rule(
+        "two-hosts",
+        serde_json::json!({"filters": [
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "Host", "value": "a"}]}},
+            {"type": "URLRewrite", "urlRewrite": {"hostname": "b.example.com"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    // The data plane applies the first modifier and skips the second.
+    let repeated = route_with_rule(
+        "repeated",
+        serde_json::json!({"filters": [
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X-A", "value": "a"}]}},
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X-B", "value": "b"}]}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let prefix_on_exact = route_with_rule(
+        "prefix-on-exact",
+        serde_json::json!({"matches": [{"path": {"type": "Exact", "value": "/a"}}],
+            "filters": [{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/b"}}}],
+            "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![
+        redirect_and_rewrite,
+        two_hosts,
+        repeated,
+        prefix_on_exact,
+    ]);
+    for (name, message) in [
+        (
+            "redirect-and-rewrite",
+            "rule 0: URLRewrite and RequestRedirect are mutually exclusive",
+        ),
+        (
+            "two-hosts",
+            "rule 0: URLRewrite hostname and RequestHeaderModifier set \"Host\"",
+        ),
+        (
+            "repeated",
+            "rule 0: filter 1: RequestHeaderModifier filter cannot be repeated",
+        ),
+        (
+            "prefix-on-exact",
+            "rule 0: match 0: ReplacePrefixMatch requires a PathPrefix path match, got Exact",
+        ),
+    ] {
+        let ra = rejection(&result, name);
+        assert_eq!(ra.accepted_reason, "IncompatibleFilters", "{name}");
+        assert!(ra.message.contains(message), "{name}: {}", ra.message);
+    }
+    assert!(result.config.http_routes.is_empty());
+}
+
+/// Gateway API v1.4.1 filter type: "Unknown values here must result in the
+/// implementation setting the Accepted Condition for the Route to
+/// `status: False`, with a Reason of `UnsupportedValue`." Backend-level
+/// filters the data plane cannot apply say the same.
+#[test]
+fn test_unsupported_filters_reason() {
+    let extension_ref = route_with_rule(
+        "extension-ref",
+        serde_json::json!({"filters": [
+            {"type": "ExtensionRef", "extensionRef": {"group": "x.io", "kind": "Auth", "name": "a"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let backend_redirect = route_with_rule(
+        "backend-redirect",
+        serde_json::json!({"backendRefs": [{"name": "svc", "port": 80, "filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"hostname": "example.org"}}
+        ]}]}),
+    );
+    let backend_missing_config = route_with_rule(
+        "backend-missing-config",
+        serde_json::json!({"backendRefs": [{"name": "svc", "port": 80, "filters": [
+            {"type": "RequestHeaderModifier"}
+        ]}]}),
+    );
+    let result = reconcile_http(vec![
+        extension_ref,
+        backend_redirect,
+        backend_missing_config,
+    ]);
+    for (name, message) in [
+        (
+            "extension-ref",
+            "rule 0: filter 0: unsupported filter type ExtensionRef",
+        ),
+        (
+            "backend-redirect",
+            "rule 0: backendRef 0: filter 0: RequestRedirect is not supported on a backendRef",
+        ),
+        (
+            "backend-missing-config",
+            "rule 0: backendRef 0: filter 0: RequestHeaderModifier filter missing config",
+        ),
+    ] {
+        let ra = rejection(&result, name);
+        assert_eq!(ra.accepted_reason, "UnsupportedValue", "{name}");
+        assert!(ra.message.contains(message), "{name}: {}", ra.message);
+    }
+    assert!(result.config.http_routes.is_empty());
+}
+
 fn request_header_modifier(set: Vec<(&str, &str)>, remove: Vec<&str>) -> HTTPRouteRulesFilters {
     HTTPRouteRulesFilters {
         r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
@@ -1961,7 +2253,7 @@ fn test_removing_content_length_rejects_route() {
     assert!(result.config.http_routes.is_empty());
     let ra = &result.route_status[0];
     assert!(!ra.accepted);
-    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
     assert!(
         ra.message.contains(
             "rule 0: filter 0: RequestHeaderModifier remove[0]: \"Content-Length\": framing header is owned by the proxy"
@@ -2246,7 +2538,7 @@ fn test_reconcile_to_route_table_http() {
 
     assert!(rt
         .find_http_route("other.com", "GET", "/api", &[], "", 8080)
-        .is_err());
+        .is_none());
 }
 
 #[test]
@@ -2642,4 +2934,920 @@ fn status_parents_json_matches_full_route_serialization() {
         .and_then(|v| v.as_array().cloned())
         .unwrap();
     assert_eq!(route.status_parents_json(), via_full);
+}
+
+// ---- Attachment: the table serves a route exactly where status attaches it ----
+
+use crate::routing::RouteTable;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+fn created(secs: i64) -> Option<Time> {
+    Some(Time(
+        k8s_openapi::chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+    ))
+}
+
+fn gw_listener(name: &str, port: i32, protocol: &str) -> GatewayListeners {
+    GatewayListeners {
+        name: name.to_string(),
+        port,
+        protocol: protocol.to_string(),
+        hostname: None,
+        tls: None,
+        allowed_routes: None,
+    }
+}
+
+/// `default/gw` with the given listeners.
+fn attach_gateway(listeners: Vec<GatewayListeners>) -> Gateway {
+    Gateway {
+        metadata: ObjectMeta {
+            name: Some("gw".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: GatewaySpec {
+            gateway_class_name: "portail".to_string(),
+            listeners,
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+fn http_parent(ns: Option<&str>, section: Option<&str>) -> HTTPRouteParentRefs {
+    HTTPRouteParentRefs {
+        name: "gw".to_string(),
+        namespace: ns.map(String::from),
+        section_name: section.map(String::from),
+        ..Default::default()
+    }
+}
+
+/// app.example.com, PathPrefix "/", backends as (name, namespace, port, weight).
+fn app_route(
+    name: &str,
+    ns: &str,
+    parent_refs: Vec<HTTPRouteParentRefs>,
+    backends: &[(&str, Option<&str>, i32, i32)],
+) -> HTTPRoute {
+    HTTPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            ..Default::default()
+        },
+        spec: HTTPRouteSpec {
+            parent_refs: Some(parent_refs),
+            hostnames: Some(vec!["app.example.com".to_string()]),
+            rules: Some(vec![HTTPRouteRules {
+                matches: Some(vec![HTTPRouteRulesMatches {
+                    path: Some(HTTPRouteRulesMatchesPath {
+                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                        value: Some("/".to_string()),
+                    }),
+                    ..Default::default()
+                }]),
+                backend_refs: Some(
+                    backends
+                        .iter()
+                        .map(|(svc, svc_ns, port, weight)| HTTPRouteRulesBackendRefs {
+                            name: svc.to_string(),
+                            namespace: svc_ns.map(String::from),
+                            port: Some(*port),
+                            weight: Some(*weight),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }]),
+        },
+        status: None,
+    }
+}
+
+/// The "127.0.0.1" Service exists in every namespace these tests use.
+fn loopback_services() -> ServiceState {
+    let mut services = empty_services();
+    for ns in ["other-ns", "db"] {
+        services
+            .known_services
+            .insert(("127.0.0.1".to_string(), ns.to_string()));
+    }
+    services
+}
+
+fn snapshot_of(http: Vec<HTTPRoute>, tcp: Vec<TCPRoute>, udp: Vec<UDPRoute>) -> ClusterSnapshot {
+    test_snapshot(http, tcp, vec![], udp, &default_ns_labels(), vec![])
+}
+
+/// Reconcile, then build the table the data plane would run.
+fn reconcile_table(gw: &Gateway, snapshot: &ClusterSnapshot) -> (ReconcileResult, RouteTable) {
+    let result = reconcile_to_config(gw, snapshot, &HashMap::new(), &loopback_services()).unwrap();
+    let mut config = result.config.clone();
+    fixup_backends_for_test(&mut config);
+    let table = config.to_route_table().unwrap();
+    (result, table)
+}
+
+fn from_all_namespaces() -> Option<GatewayListenersAllowedRoutes> {
+    Some(GatewayListenersAllowedRoutes {
+        namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+            from: Some(GatewayListenersAllowedRoutesNamespacesFrom::All),
+            selector: None,
+        }),
+        kinds: None,
+    })
+}
+
+fn app_served_on(table: &RouteTable, port: u16) -> bool {
+    table
+        .find_http_route("app.example.com", "GET", "/", &[], "", port)
+        .is_some()
+}
+
+fn status_of<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance {
+    result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == name)
+        .unwrap()
+}
+
+/// k8s #1: status attached a route from another namespace only to the
+/// listener admitting every namespace, yet the table re-derived attachment
+/// from the raw parentRef and also served it on the Same-namespace listener.
+#[test]
+fn attachment_follows_allowed_routes_namespaces() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![gw_listener("same", 80, "HTTP"), all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(Some("default"), None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert!(status_of(&result, "r").accepted);
+    assert_eq!(status_of(&result, "r").listener_names, vec!["all"]);
+    let attached: Vec<_> = result.config.http_routes[0]
+        .parent_refs
+        .iter()
+        .map(|pr| pr.section_name.as_deref())
+        .collect();
+    assert_eq!(attached, vec![Some("all")], "the config names the listener");
+    assert!(app_served_on(&table, 8080));
+    assert!(
+        !app_served_on(&table, 80),
+        "served on a listener that does not admit the route's namespace"
+    );
+}
+
+/// k8s #1: allowedRoutes.kinds was bypassed the same way.
+#[test]
+fn attachment_follows_allowed_routes_kinds() {
+    let mut grpc_only = gw_listener("grpc-only", 8080, "HTTP");
+    grpc_only.allowed_routes = Some(GatewayListenersAllowedRoutes {
+        namespaces: None,
+        kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+            group: None,
+            kind: "GRPCRoute".to_string(),
+        }]),
+    });
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP"), grpc_only]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert_eq!(status_of(&result, "r").listener_names, vec!["web"]);
+    assert!(app_served_on(&table, 80));
+    assert!(
+        !app_served_on(&table, 8080),
+        "served on a listener whose allowedRoutes.kinds excludes HTTPRoute"
+    );
+}
+
+/// k8s #1: a ref to other-ns/gw's listener "b" attached to default/gw's
+/// listener "b": the table filtered parentRefs by Gateway name only.
+#[test]
+fn attachment_ignores_a_same_named_gateway_elsewhere() {
+    let gw = attach_gateway(vec![
+        gw_listener("a", 80, "HTTP"),
+        gw_listener("b", 8080, "HTTP"),
+    ]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![
+            http_parent(None, Some("a")),
+            http_parent(Some("other-ns"), Some("b")),
+        ],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert_eq!(
+        result.route_status.len(),
+        1,
+        "only the ref to default/gw is ours"
+    );
+    assert!(app_served_on(&table, 80));
+    assert!(
+        !app_served_on(&table, 8080),
+        "served through a ref to another namespace's Gateway"
+    );
+}
+
+/// A listener the data plane cannot run (unsupported protocol) accepted the
+/// route; no configured listener matched its ref, so it fell into the
+/// any-port scope and was served on every port.
+#[test]
+fn route_on_an_unservable_listener_is_served_nowhere() {
+    let gw = attach_gateway(vec![
+        gw_listener("web", 80, "HTTP"),
+        gw_listener("grpc", 9090, "GRPC"),
+    ]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, Some("grpc"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    let status = status_of(&result, "r");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "NotAllowedByListeners");
+    assert!(!app_served_on(&table, 80), "leaked onto every port");
+}
+
+fn tcp_parent(section: Option<&str>, port: Option<i32>) -> TCPRouteParentRefs {
+    TCPRouteParentRefs {
+        name: "gw".to_string(),
+        section_name: section.map(String::from),
+        port,
+        ..Default::default()
+    }
+}
+
+/// One rule per entry of `rules`, each a list of (backend name, port, weight).
+fn tcp_route(
+    name: &str,
+    secs: i64,
+    parent_refs: Vec<TCPRouteParentRefs>,
+    rules: &[&[(&str, i32, i32)]],
+) -> TCPRoute {
+    TCPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: TCPRouteSpec {
+            parent_refs: Some(parent_refs),
+            rules: rules
+                .iter()
+                .map(|backends| TCPRouteRules {
+                    backend_refs: backends
+                        .iter()
+                        .map(|(svc, port, weight)| TCPRouteRulesBackendRefs {
+                            name: svc.to_string(),
+                            port: Some(*port),
+                            weight: Some(*weight),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+fn tcp_backend_port(table: &RouteTable, port: u16) -> Option<u16> {
+    table
+        .find_tcp_backends(port)
+        .map(|b| b[0].socket_addr.port())
+}
+
+/// k8s #2: an accepted TCPRoute whose parentRef names no sectionName (bare,
+/// or port only) was programmed nowhere.
+#[test]
+fn tcp_route_attaches_without_section_name() {
+    let gw = attach_gateway(vec![
+        gw_listener("db", 5432, "TCP"),
+        gw_listener("cache", 6379, "TCP"),
+    ]);
+    for (parent, served) in [
+        (tcp_parent(None, None), [true, true]),
+        (tcp_parent(None, Some(6379)), [false, true]),
+    ] {
+        let route = tcp_route("t", 100, vec![parent], &[&[("127.0.0.1", 7001, 1)]]);
+        let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+        assert!(status_of(&result, "t").accepted);
+        for (port, want) in [5432, 6379].into_iter().zip(served) {
+            assert_eq!(
+                tcp_backend_port(&table, port).is_some(),
+                want,
+                "port {}",
+                port
+            );
+        }
+    }
+}
+
+/// k8s #2: only the first parentRef of a TCPRoute was ever programmed.
+#[test]
+fn tcp_route_attaches_through_every_parent_ref() {
+    let gw = attach_gateway(vec![
+        gw_listener("db", 5432, "TCP"),
+        gw_listener("cache", 6379, "TCP"),
+    ]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![
+            tcp_parent(Some("db"), None),
+            tcp_parent(Some("cache"), None),
+        ],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+    assert_eq!(tcp_backend_port(&table, 6379), Some(7001));
+}
+
+/// config-routing #7: TCPRoutes on one listener overwrote each other in
+/// input order. Listener.allowedRoutes precedence: the oldest Route, then
+/// namespace/name; the other reports Conflicted.
+#[test]
+fn oldest_tcp_route_owns_its_listener() {
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let older = tcp_route(
+        "older",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let newer = tcp_route(
+        "newer",
+        200,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7002, 1)]],
+    );
+    for routes in [
+        vec![newer.clone(), older.clone()],
+        vec![older.clone(), newer.clone()],
+    ] {
+        let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], routes, vec![]));
+        assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+        assert!(status_of(&result, "older").accepted);
+        let loser = status_of(&result, "newer");
+        assert!(!loser.accepted);
+        assert_eq!(loser.accepted_reason, "Conflicted");
+        // Still attached by allowedRoutes and parentRef: attachedRoutes counts it.
+        assert_eq!(loser.listener_names, vec!["db".to_string()]);
+    }
+}
+
+/// Two TCP listeners on one port are not distinct. Gateway API v1.4.1
+/// GatewaySpec.listeners: "ALL indistinct Listeners must not be accepted
+/// for processing". Both were bound and given routes, and the older route
+/// won their port.
+#[test]
+fn conflicted_listeners_serve_nothing() {
+    let gw = attach_gateway(vec![
+        gw_listener("a", 5432, "TCP"),
+        gw_listener("b", 5432, "TCP"),
+        gw_listener("c", 6379, "TCP"),
+    ]);
+    let older = tcp_route(
+        "older",
+        100,
+        vec![tcp_parent(Some("a"), None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let newer = tcp_route(
+        "newer",
+        200,
+        vec![tcp_parent(Some("b"), None)],
+        &[&[("127.0.0.1", 7002, 1)]],
+    );
+    let distinct = tcp_route(
+        "distinct",
+        300,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7003, 1)]],
+    );
+    let (result, table) = reconcile_table(
+        &gw,
+        &snapshot_of(vec![], vec![newer, older, distinct], vec![]),
+    );
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["c"], "conflicted listeners bind nothing");
+    assert_eq!(tcp_backend_port(&table, 5432), None);
+    for name in ["older", "newer"] {
+        let status = status_of(&result, name);
+        assert!(!status.accepted, "{name}");
+        assert_eq!(status.accepted_reason, "NoMatchingParent", "{name}");
+        assert!(status.listener_names.is_empty(), "{name}: no attachment");
+    }
+    let distinct = status_of(&result, "distinct");
+    assert!(distinct.accepted);
+    assert_eq!(distinct.listener_names, vec!["c".to_string()]);
+    assert_eq!(tcp_backend_port(&table, 6379), Some(7003));
+}
+
+/// HTTPS and TLS passthrough on one port are distinct by hostname: one
+/// socket serves both, by SNI. Gateway API v1.4.1 GatewaySpec.listeners,
+/// Compatible Listeners: an implementation that cannot mix them on a port
+/// would not consider them compatible; this one can. Both were dropped as
+/// ProtocolConflict, and nothing served the port.
+#[test]
+fn https_and_tls_passthrough_share_a_port() {
+    let mut https = gw_listener("web", 443, "HTTPS");
+    https.hostname = Some("app.example.com".to_string());
+    https.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Terminate),
+        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+            name: "cert".to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    let mut passthrough = gw_listener("db", 443, "TLS");
+    passthrough.hostname = Some("secure.example.com".to_string());
+    passthrough.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Passthrough),
+        ..Default::default()
+    });
+    let gw = attach_gateway(vec![passthrough, https]);
+    let app = app_route(
+        "app",
+        "default",
+        vec![http_parent(None, Some("web"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let tls = TLSRoute {
+        metadata: ObjectMeta {
+            name: Some("secure".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                section_name: Some("db".to_string()),
+                ..Default::default()
+            }]),
+            hostnames: vec!["secure.example.com".to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(7001),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let snapshot = test_snapshot(
+        vec![app],
+        vec![],
+        vec![tls],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot);
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["db", "web"]);
+    for name in ["app", "secure"] {
+        assert!(status_of(&result, name).accepted, "{name}");
+    }
+    assert!(app_served_on(&table, 443));
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let backend = table
+        .resolve_tls_passthrough(
+            Some("secure.example.com"),
+            443,
+            Some("secure.example.com"),
+            &selector,
+            &health,
+        )
+        .unwrap();
+    assert_eq!(backend.port(), 7001);
+    assert!(table
+        .resolve_tls_passthrough(
+            Some("app.example.com"),
+            443,
+            Some("secure.example.com"),
+            &selector,
+            &health
+        )
+        .is_err());
+}
+
+/// `default/name`, on listener `section` of `default/gw`, for `hostname`,
+/// to 127.0.0.1:`port`.
+fn tls_route_on(name: &str, section: &str, hostname: &str, port: i32) -> TLSRoute {
+    TLSRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                section_name: Some(section.to_string()),
+                ..Default::default()
+            }]),
+            hostnames: vec![hostname.to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+/// TLSRoute is served as passthrough only. A TLS Terminate listener was
+/// converted and bound, and its TLSRoutes forwarded raw TLS, never
+/// terminated; it also shared its port with HTTPS as one family. It is
+/// not served now: nothing attaches to it, and its HTTPS sibling stays.
+#[test]
+fn a_tls_terminate_listener_is_not_served() {
+    let mut https = gw_listener("web", 443, "HTTPS");
+    https.hostname = Some("app.example.com".to_string());
+    https.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Terminate),
+        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+            name: "cert".to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    let mut terminate = https.clone();
+    terminate.name = "db".to_string();
+    terminate.protocol = "TLS".to_string();
+    terminate.hostname = Some("secure.example.com".to_string());
+    let gw = attach_gateway(vec![terminate, https]);
+    let app = app_route(
+        "app",
+        "default",
+        vec![http_parent(None, Some("web"))],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let tls = tls_route_on("secure", "db", "secure.example.com", 7001);
+    let snapshot = test_snapshot(
+        vec![app],
+        vec![],
+        vec![tls],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot);
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["web"]);
+    assert!(status_of(&result, "app").accepted);
+    let secure = status_of(&result, "secure");
+    assert!(!secure.accepted);
+    assert_eq!(secure.accepted_reason, "NotAllowedByListeners");
+    assert!(app_served_on(&table, 443));
+    assert!(result.config.tls_routes.is_empty());
+}
+
+/// config-routing #7: every rule overwrote the previous one on the same
+/// port. TCPRoute rules have no match to choose between, so the first rule
+/// takes the listener, as ties go to the first rule (HTTPRouteRule.matches).
+#[test]
+fn tcp_route_first_rule_owns_the_listener() {
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1)], &[("127.0.0.1", 7002, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
+}
+
+/// k8s #2 for UDPRoute: a bare parentRef is programmed, and the oldest
+/// route owns the listener.
+#[test]
+fn udp_route_attaches_like_tcp() {
+    let gw = attach_gateway(vec![gw_listener("dns", 5353, "UDP")]);
+    let udp = |name: &str, secs: i64, port: i32| UDPRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: UDPRouteSpec {
+            parent_refs: Some(vec![UDPRouteParentRefs {
+                name: "gw".to_string(),
+                ..Default::default()
+            }]),
+            rules: vec![UDPRouteRules {
+                backend_refs: vec![UDPRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (result, table) = reconcile_table(
+        &gw,
+        &snapshot_of(
+            vec![],
+            vec![],
+            vec![udp("newer", 200, 7002), udp("older", 100, 7001)],
+        ),
+    );
+    assert_eq!(
+        table.find_udp_backends(5353).unwrap()[0].socket_addr.port(),
+        7001
+    );
+    assert!(status_of(&result, "older").accepted);
+    assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+}
+
+/// TLSRoutes claiming the same SNI on one listener overwrote each other in
+/// input order; the oldest wins, as for any tie.
+#[test]
+fn oldest_tls_route_owns_its_hostname() {
+    let mut passthrough = gw_listener("tls", 6443, "TLS");
+    passthrough.tls = Some(GatewayListenersTls {
+        mode: Some(GatewayListenersTlsMode::Passthrough),
+        ..Default::default()
+    });
+    let gw = attach_gateway(vec![passthrough]);
+    let tls = |name: &str, secs: i64, port: i32| TLSRoute {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(secs),
+            ..Default::default()
+        },
+        spec: TLSRouteSpec {
+            parent_refs: Some(vec![TLSRouteParentRefs {
+                name: "gw".to_string(),
+                ..Default::default()
+            }]),
+            hostnames: vec!["secure.example.com".to_string()],
+            rules: vec![TLSRouteRules {
+                backend_refs: vec![TLSRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    for routes in [
+        vec![tls("newer", 200, 7002), tls("older", 100, 7001)],
+        vec![tls("older", 100, 7001), tls("newer", 200, 7002)],
+    ] {
+        let snapshot = test_snapshot(vec![], vec![], routes, vec![], &default_ns_labels(), vec![]);
+        let (_, table) = reconcile_table(&gw, &snapshot);
+        let backend = table
+            .resolve_tls_passthrough(Some("secure.example.com"), 6443, None, &selector, &health)
+            .unwrap();
+        assert_eq!(backend.port(), 7001);
+    }
+}
+
+/// k8s #7: an invalid backendRef was removed, so its weight went to the
+/// valid ones. HTTPRouteRule.backendRefs: the share of requests that would
+/// have gone to an invalid backend gets a 500.
+#[test]
+fn invalid_backend_share_answers_500() {
+    use crate::proxy::request_processor::{analyze_request, RoutingResult};
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP")]);
+    let route = app_route(
+        "r",
+        "default",
+        vec![http_parent(None, None)],
+        &[
+            ("127.0.0.1", None, 8001, 2),
+            // BackendNotFound
+            ("ghost-svc", None, 8002, 1),
+            // RefNotPermitted: no ReferenceGrant in db
+            ("127.0.0.1", Some("db"), 8003, 1),
+        ],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+    assert!(!status_of(&result, "r").refs_resolved);
+
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let request = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n";
+    let (mut forwarded, mut failed) = (0, 0);
+    for _ in 0..400 {
+        match analyze_request(&table, &selector, request, 80, &health, false).unwrap() {
+            RoutingResult::HttpForward { backend, .. } => {
+                assert_eq!(backend.socket_addr.port(), 8001);
+                forwarded += 1;
+            }
+            RoutingResult::LocalReply(reply) => {
+                assert_eq!(reply.status, 500);
+                failed += 1;
+            }
+            _ => panic!("unexpected routing result"),
+        }
+    }
+    assert_eq!((forwarded, failed), (200, 200));
+}
+
+/// k8s #7 for TCPRoute: connections for an invalid backend's share are
+/// rejected (TCPRouteRule.backendRefs), not sent to the valid backend.
+#[test]
+fn invalid_tcp_backend_share_is_rejected() {
+    use crate::proxy::request_processor::{analyze_tcp_request, RoutingResult};
+    let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
+    let route = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(Some("db"), None)],
+        &[&[("127.0.0.1", 7001, 1), ("ghost-svc", 7002, 1)]],
+    );
+    let (_, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![route], vec![]));
+
+    let (selector, health) = (
+        crate::routing::BackendSelector::new(),
+        crate::proxy::health::HealthRegistry::new(),
+    );
+    let (mut forwarded, mut rejected) = (0, 0);
+    for _ in 0..400 {
+        match analyze_tcp_request(&table, &selector, 5432, &health).unwrap() {
+            RoutingResult::TcpForward { backend_addr } => {
+                assert_eq!(backend_addr.port(), 7001);
+                forwarded += 1;
+            }
+            RoutingResult::CloseConnection => rejected += 1,
+            _ => panic!("unexpected routing result"),
+        }
+    }
+    assert_eq!((forwarded, rejected), (200, 200));
+}
+
+/// An unset parentRef namespace is the route's own: a route in other-ns
+/// naming "gw" targets other-ns/gw, never default/gw, even where default/gw
+/// admits every namespace.
+#[test]
+fn parent_ref_without_namespace_targets_the_routes_namespace() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(None, None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![route], vec![], vec![]));
+
+    assert!(
+        result.route_status.is_empty(),
+        "no status on a Gateway the route does not target"
+    );
+    assert!(!app_served_on(&table, 8080));
+}
+
+/// config-routing #5: equally specific routes tie-broke by reflector order.
+/// Listener.allowedRoutes: the oldest Route wins, then namespace/name.
+#[test]
+fn equally_specific_http_routes_oldest_wins() {
+    let gw = attach_gateway(vec![gw_listener("web", 80, "HTTP")]);
+    let route = |name: &str, secs: i64, port: i32| {
+        let mut r = app_route(
+            name,
+            "default",
+            vec![http_parent(None, None)],
+            &[("127.0.0.1", None, port, 1)],
+        );
+        r.metadata.creation_timestamp = created(secs);
+        r
+    };
+    let winner = |routes: Vec<HTTPRoute>| {
+        let (_, table) = reconcile_table(&gw, &snapshot_of(routes, vec![], vec![]));
+        table
+            .find_http_route("app.example.com", "GET", "/", &[], "", 80)
+            .unwrap()
+            .backends[0]
+            .socket_addr
+            .port()
+    };
+
+    let (older, newer) = (route("older", 100, 8001), route("newer", 200, 8002));
+    assert_eq!(winner(vec![newer.clone(), older.clone()]), 8001);
+    assert_eq!(winner(vec![older, newer]), 8001);
+
+    // Same age: namespace/name decides.
+    let (a, b) = (route("a", 100, 8003), route("b", 100, 8004));
+    assert_eq!(winner(vec![b.clone(), a.clone()]), 8003);
+    assert_eq!(winner(vec![a, b]), 8003);
+}
+
+/// Same age: the route first by "{namespace}/{name}" wins (HTTPRouteRule
+/// matches). The (namespace, name) pair put a/z before a-b/c; the string
+/// puts "a-b/c" first, as '-' sorts before '/'.
+#[test]
+fn same_age_routes_tie_break_on_the_namespace_slash_name_string() {
+    let mut web = gw_listener("web", 80, "HTTP");
+    web.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![web]);
+    let route = |ns: &str, name: &str, port: i32| {
+        let mut r = app_route(
+            name,
+            ns,
+            vec![http_parent(Some("default"), None)],
+            &[("127.0.0.1", None, port, 1)],
+        );
+        r.metadata.creation_timestamp = created(100);
+        r
+    };
+    let mut services = loopback_services();
+    for ns in ["a", "a-b"] {
+        services
+            .known_services
+            .insert(("127.0.0.1".to_string(), ns.to_string()));
+    }
+    let winner = |routes: Vec<HTTPRoute>| {
+        let snapshot = snapshot_of(routes, vec![], vec![]);
+        let mut config = reconcile_to_config(&gw, &snapshot, &HashMap::new(), &services)
+            .unwrap()
+            .config;
+        fixup_backends_for_test(&mut config);
+        config
+            .to_route_table()
+            .unwrap()
+            .find_http_route("app.example.com", "GET", "/", &[], "", 80)
+            .unwrap()
+            .backends[0]
+            .socket_addr
+            .port()
+    };
+    let (a_z, a_b_c) = (route("a", "z", 8001), route("a-b", "c", 8002));
+    assert_eq!(winner(vec![a_z.clone(), a_b_c.clone()]), 8002);
+    assert_eq!(winner(vec![a_b_c, a_z]), 8002);
 }

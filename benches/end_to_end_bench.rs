@@ -1,6 +1,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::extract_routing_info;
-use portail::routing::{Backend, HttpRouteRule, PathMatchType, RouteTable};
+use portail::proxy::request_processor::analyze_request;
+use portail::routing::{Backend, BackendSelector, HttpRouteRule, PathMatchType, RouteTable};
+use std::hint::black_box;
 use std::time::Duration;
 
 fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
@@ -209,6 +212,178 @@ fn latency_scenarios(c: &mut Criterion) {
     }
 }
 
+/// `analyze_request` per request: parse, route lookup, weighted backend
+/// selection and the invalid-backendRef check on the selected backend.
+fn request_analysis(c: &mut Criterion) {
+    let mut table = RouteTable::new();
+    let backends = vec![
+        Backend::with_weight("127.0.0.1".to_string(), 8080, 3).unwrap(),
+        Backend::with_weight("127.0.0.1".to_string(), 8081, 1).unwrap(),
+    ];
+    table.add_http_route(
+        "api.example.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            backends,
+        ),
+    );
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+    let request = b"GET /users/42 HTTP/1.1\r\nHost: api.example.com\r\nAccept: */*\r\n\r\n";
+
+    c.bench_function("e2e_analyze_request_weighted_backends", |b| {
+        b.iter(|| {
+            let result = analyze_request(
+                &table,
+                &selector,
+                std::hint::black_box(request),
+                std::hint::black_box(80),
+                &health,
+                false,
+            );
+            std::hint::black_box(result.is_ok())
+        })
+    });
+}
+
+/// `analyze_request` by path shape: only a dot-segment pays the rewrite
+/// path normalization makes before the route match.
+fn path_analysis(c: &mut Criterion) {
+    let mut table = RouteTable::new();
+    for path in ["/", "/admin", "/static"] {
+        let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
+        table.add_http_route("app.api.com", make_rule(path, backend));
+    }
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+
+    for (name, request) in [
+        (
+            "e2e_analyze_path_clean",
+            &b"GET /admin/users/42/profile?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n"[..],
+        ),
+        (
+            "e2e_analyze_path_dotted",
+            b"GET /static/js/vendor.min.js?v=1.2 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n",
+        ),
+        (
+            "e2e_analyze_path_dot_segments",
+            b"GET /public/../admin/./users/42/profile?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n",
+        ),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                analyze_request(
+                    black_box(&table),
+                    &selector,
+                    black_box(request),
+                    black_box(80),
+                    &health,
+                    false,
+                )
+            })
+        });
+    }
+}
+
+/// Path modifiers per request: a redirect's Location (prefix join plus
+/// the query join), and a URLRewrite's prefix join. A value's own query
+/// was split off when its rule compiled: no request scans the value.
+fn path_modifiers(c: &mut Criterion) {
+    use portail::proxy::http_filters::extract_url_rewrite;
+    use portail::routing::{HttpFilter, URLRewritePath};
+
+    let mut table = RouteTable::new();
+    let redirect = HttpFilter::RequestRedirect {
+        scheme: Some("https".to_string()),
+        hostname: None,
+        port: None,
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
+        status_code: 302,
+    };
+    table.add_http_route(
+        "app.api.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/old".to_string(),
+            vec![],
+            vec![],
+            vec![redirect],
+            vec![],
+        ),
+    );
+    let selector = BackendSelector::new();
+    let health = HealthRegistry::new();
+    let request = b"GET /old/users/42?tab=1 HTTP/1.1\r\nHost: app.api.com\r\nAccept: */*\r\n\r\n";
+    c.bench_function("e2e_analyze_redirect_prefix_with_query", |b| {
+        b.iter(|| {
+            analyze_request(
+                black_box(&table),
+                &selector,
+                black_box(&request[..]),
+                black_box(80),
+                &health,
+                false,
+            )
+        })
+    });
+
+    let rewrite = [HttpFilter::URLRewrite {
+        hostname: None,
+        path: Some(URLRewritePath::ReplacePrefixMatch("/new".into())),
+    }];
+    c.bench_function("url_rewrite_prefix", |b| {
+        b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
+    });
+
+    // A full path, its query and a hostname: the rule's, borrowed.
+    let rewrite = [HttpFilter::URLRewrite {
+        hostname: Some("internal.api.com".to_string()),
+        path: Some(URLRewritePath::ReplaceFullPath("/new?src=gw".into())),
+    }];
+    c.bench_function("url_rewrite_full_path", |b| {
+        b.iter(|| extract_url_rewrite(black_box(&rewrite), "/old", black_box("/old/users/42")))
+    });
+
+    // A full-path redirect whose value carries a query, joined with the
+    // request's: the '&' decision reads the value's last byte only.
+    let mut table = RouteTable::new();
+    let redirect = HttpFilter::RequestRedirect {
+        scheme: None,
+        hostname: None,
+        port: None,
+        path: Some(URLRewritePath::ReplaceFullPath("/login?next=home".into())),
+        status_code: 302,
+    };
+    table.add_http_route(
+        "app.api.com",
+        HttpRouteRule::new(
+            PathMatchType::Prefix,
+            "/old".to_string(),
+            vec![],
+            vec![],
+            vec![redirect],
+            vec![],
+        ),
+    );
+    c.bench_function("e2e_analyze_redirect_full_value_query", |b| {
+        b.iter(|| {
+            analyze_request(
+                black_box(&table),
+                &selector,
+                black_box(&request[..]),
+                black_box(80),
+                &health,
+                false,
+            )
+        })
+    });
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(1000))
@@ -222,6 +397,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = e2e_benches;
     config = config();
-    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios
+    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis, path_analysis, path_modifiers
 }
 criterion_main!(e2e_benches);

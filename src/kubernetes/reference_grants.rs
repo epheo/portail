@@ -19,23 +19,33 @@ pub(crate) fn is_route_allowed_by_listener(
     route_kind: &str,
     namespace_labels: &HashMap<String, BTreeMap<String, String>>,
 ) -> bool {
-    // Check protocol ↔ route kind enforcement
+    // The listener protocol decides the route kinds it takes. A listener the
+    // data plane cannot run takes none.
+    if !super::reconciler::listener_is_served(listener) {
+        return false;
+    }
     let protocol_allows = match listener.protocol.as_str() {
         "HTTP" | "HTTPS" => route_kind == "HTTPRoute",
         "TLS" => route_kind == "TLSRoute",
         "TCP" => route_kind == "TCPRoute",
         "UDP" => route_kind == "UDPRoute",
-        _ => true, // Unknown protocol, allow anything
+        _ => false,
     };
     if !protocol_allows {
         return false;
     }
 
-    // Check allowedRoutes.kinds if specified
+    // Check allowedRoutes.kinds if specified. A kind of another group is not
+    // ours: supportedKinds leaves it out (RouteGroupKind.group defaults to
+    // gateway.networking.k8s.io).
     if let Some(ref allowed) = listener.allowed_routes {
         if let Some(ref kinds) = allowed.kinds {
             if !kinds.is_empty() {
-                let kind_allowed = kinds.iter().any(|k| k.kind == route_kind);
+                let kind_allowed = kinds.iter().any(|k| {
+                    k.kind == route_kind
+                        && k.group.as_deref().unwrap_or("gateway.networking.k8s.io")
+                            == "gateway.networking.k8s.io"
+                });
                 if !kind_allowed {
                     return false;
                 }
@@ -203,4 +213,53 @@ pub(crate) fn is_reference_allowed(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway_api::gateways::{
+        GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+    };
+
+    fn http_listener(kinds: Vec<(Option<&str>, &str)>) -> GatewayListeners {
+        GatewayListeners {
+            name: "http".into(),
+            port: 80,
+            protocol: "HTTP".into(),
+            hostname: None,
+            tls: None,
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                kinds: Some(
+                    kinds
+                        .into_iter()
+                        .map(|(group, kind)| GatewayListenersAllowedRoutesKinds {
+                            group: group.map(str::to_string),
+                            kind: kind.into(),
+                        })
+                        .collect(),
+                ),
+                namespaces: None,
+            }),
+        }
+    }
+
+    /// allowedRoutes.kinds names a group too: HTTPRoute of example.com is
+    /// not ours, and supportedKinds already said so. It used to admit
+    /// HTTPRoutes all the same.
+    #[test]
+    fn allowed_kind_of_another_group_admits_nothing() {
+        let allowed = |listener: &GatewayListeners| {
+            is_route_allowed_by_listener(listener, "ns", "ns", "HTTPRoute", &HashMap::new())
+        };
+        assert!(!allowed(&http_listener(vec![(
+            Some("example.com"),
+            "HTTPRoute"
+        )])));
+        assert!(allowed(&http_listener(vec![(None, "HTTPRoute")])));
+        assert!(allowed(&http_listener(vec![(
+            Some("gateway.networking.k8s.io"),
+            "HTTPRoute"
+        )])));
+    }
 }

@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Result};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 
+use super::compile::{CompiledFilter, CompiledRule};
 use super::types::*;
+use crate::routing::{Backend, RouteTable};
 
 impl PortailConfig {
     /// Load configuration from file with auto-format detection
@@ -63,72 +68,194 @@ impl PortailConfig {
     }
 }
 
-impl PortailConfig {
-    /// Like [`Self::to_route_table`], but fails when any configured backendRef
-    /// cannot be DNS-resolved — instead of silently building the route with
-    /// fewer (possibly zero) backends. Used on the standalone path (startup
-    /// and SIGHUP reload) where a valid config with a transient DNS blip must
-    /// not degrade live routes to 5xx while reporting success. The Kubernetes
-    /// path stays lenient by design: a route whose backends don't resolve is
-    /// conformance-required to serve 500, and the DNS-refresh task picks the
-    /// backends up as their records appear.
-    pub fn to_route_table_strict(&self) -> Result<crate::routing::RouteTable> {
-        self.check_backend_resolution()?;
-        self.to_route_table()
+/// What the table build does with a route that fails its check, or a name
+/// DNS cannot resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildPolicy {
+    /// Fail the build. The standalone load and reload paths: a valid config
+    /// hit by a DNS blip must not swap in routes that serve 5xx while
+    /// reporting success.
+    Strict,
+    /// Leave that route, backend or mirror out and build the rest. The
+    /// Kubernetes path: route status reports the rejected route, a route
+    /// whose backends do not resolve must serve 500 (conformance), and the
+    /// DNS-refresh task picks names up as their records appear.
+    Lenient,
+}
+
+/// Every address of a backend (name, port). Injected so tests can count and
+/// fail lookups without a resolver.
+pub(crate) type Lookup<'l> = dyn FnMut(&str, u16) -> Result<Vec<SocketAddr>> + 'l;
+
+/// One lookup per distinct (name, port) per build: rules sharing a backend
+/// get one address set, and a dead name costs one resolver timeout, not one
+/// per rule.
+struct Resolver<'a, 'l> {
+    policy: BuildPolicy,
+    lookup: &'a mut Lookup<'l>,
+    seen: HashMap<(String, u16), Option<Vec<SocketAddr>>>,
+    endpoint_overrides: &'a HashMap<(String, u16), Vec<(String, u16)>>,
+    headless_target_ports: &'a HashMap<(String, u16), u16>,
+}
+
+impl Resolver<'_, '_> {
+    /// `None`: the name did not resolve and the policy is lenient. Warns on
+    /// the first lookup only.
+    fn addrs(&mut self, name: &str, port: u16, what: &str) -> Result<Option<&[SocketAddr]>> {
+        let found = match self.seen.entry((name.to_string(), port)) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let found = match (self.lookup)(name, port) {
+                    Ok(addrs) => Some(addrs),
+                    Err(err) if self.policy == BuildPolicy::Strict => {
+                        return Err(anyhow!(
+                            "{} backend {}:{} failed to resolve: {}",
+                            what,
+                            name,
+                            port,
+                            err
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Skipping {} backend {}:{} - DNS resolution failed: {}",
+                            what,
+                            name,
+                            port,
+                            err
+                        );
+                        None
+                    }
+                };
+                e.insert(found)
+            }
+        };
+        Ok(found.as_deref())
     }
 
-    /// Resolve every referenced (backend name, port) once, erroring on the
-    /// first failure. Deduplicated, so the double resolution cost of the
-    /// strict path stays bounded by the number of distinct backends.
-    fn check_backend_resolution(&self) -> Result<()> {
-        let http = self
-            .http_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "HTTP"));
-        let tcp = self
-            .tcp_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "TCP"));
-        let udp = self
-            .udp_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "UDP"));
-        let tls = self
-            .tls_routes
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|rule| (rule.backend_refs.as_slice(), "TLS"));
-
-        let mut seen = std::collections::HashSet::new();
-        for (refs, proto) in http.chain(tcp).chain(udp).chain(tls) {
-            for br in refs {
-                if !seen.insert((br.name.clone(), br.port)) {
-                    continue;
+    /// Every address backend `name:port` dials, each with the name it goes
+    /// by (a TLS backend's SNI). Every route kind and mirror reaches a
+    /// Service through here, so all heed what DNS cannot say: an ExternalName
+    /// Service is its external name, and a headless one's pods listen on its
+    /// targetPort, as DNS returns their IPs but no port.
+    fn endpoints(
+        &mut self,
+        name: &str,
+        port: u16,
+        what: &str,
+        mut each: impl FnMut(SocketAddr, &str),
+    ) -> Result<()> {
+        let key = (name.to_string(), port);
+        let overrides = self.endpoint_overrides;
+        if let Some(targets) = overrides.get(&key).filter(|t| !t.is_empty()) {
+            // An endpoint is one target.
+            for (host, target_port) in targets {
+                if let Some(addr) = self.addrs(host, *target_port, what)?.and_then(one_target) {
+                    each(addr, host);
                 }
-                crate::routing::Backend::all_with_weight(br.name.clone(), br.port, 1).map_err(
-                    |e| {
-                        anyhow!(
-                            "{} backend {}:{} failed to resolve: {}",
-                            proto,
-                            br.name,
-                            br.port,
-                            e
-                        )
-                    },
-                )?;
+            }
+            return Ok(());
+        }
+        // A ClusterIP Service has no entry: kube-proxy maps its service port.
+        let connect_port = self
+            .headless_target_ports
+            .get(&key)
+            .copied()
+            .unwrap_or(port);
+        if let Some(addrs) = self.addrs(name, connect_port, what)? {
+            tracing::debug!(
+                "        {} backend {}:{} -> {} address(es) on port {}",
+                what,
+                name,
+                port,
+                addrs.len(),
+                connect_port
+            );
+            for &addr in addrs {
+                each(addr, name);
             }
         }
         Ok(())
     }
 
-    /// Convert configuration to RouteTable for runtime use
-    /// All route processing happens once at startup - zero runtime overhead
-    pub fn to_route_table(&self) -> Result<crate::routing::RouteTable> {
+    /// One backend per endpoint of each ref, at the ref's weight. An invalid
+    /// ref is never looked up: it keeps its weight as a rejecting stand-in.
+    fn backends(&mut self, refs: &[BackendRef], what: &str) -> Result<Vec<Backend>> {
+        let mut backends = Vec::new();
+        for br in refs {
+            if br.invalid {
+                backends.push(Backend::rejecting(br.weight));
+            } else {
+                self.endpoints(&br.name, br.port, what, |addr, name| {
+                    backends.push(backend_at(addr, br.weight, name))
+                })?;
+            }
+        }
+        Ok(backends)
+    }
+}
+
+/// The address a one-target backend (an ExternalName endpoint) uses: a
+/// function of the address set, not of its order. A resolver that only
+/// reorders the set keeps the pick, the table and its DNS signature, so the
+/// refresh swaps nothing until the set changes. The resolver's first
+/// address changed with every reorder.
+/// Hashed with this process's own random keys rather than the smallest
+/// address: each pod still picks its own member of the set, as the
+/// resolver's rotation spread them before.
+fn one_target(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    static KEYS: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(std::hash::RandomState::new);
+    addrs
+        .iter()
+        .copied()
+        .max_by_key(|addr| std::hash::BuildHasher::hash_one(keys, addr))
+}
+
+fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
+    Backend {
+        socket_addr,
+        weight,
+        filters: vec![],
+        use_tls: false,
+        server_name: server_name.to_string(),
+        action: crate::routing::BackendAction::Forward,
+    }
+}
+
+impl PortailConfig {
+    /// Like [`Self::to_route_table`], but a route that fails its check, or a
+    /// backendRef or mirror DNS cannot resolve, fails the build.
+    pub fn to_route_table_strict(&self) -> Result<RouteTable> {
+        self.build_route_table(
+            BuildPolicy::Strict,
+            &mut crate::routing::resolve_socket_addrs,
+        )
+    }
+
+    /// Convert configuration to RouteTable for runtime use. What cannot be
+    /// built is left out (see [`BuildPolicy::Lenient`]).
+    pub fn to_route_table(&self) -> Result<RouteTable> {
+        self.build_route_table(
+            BuildPolicy::Lenient,
+            &mut crate::routing::resolve_socket_addrs,
+        )
+    }
+
+    pub(crate) fn build_route_table(
+        &self,
+        policy: BuildPolicy,
+        lookup: &mut Lookup,
+    ) -> Result<RouteTable> {
         use crate::routing;
 
+        let mut resolver = Resolver {
+            policy,
+            lookup,
+            seen: HashMap::new(),
+            endpoint_overrides: &self.endpoint_overrides,
+            headless_target_ports: &self.headless_target_ports,
+        };
         let mut route_table = routing::RouteTable::new();
 
         tracing::debug!(
@@ -144,22 +271,64 @@ impl PortailConfig {
                 http_route.rules.len()
             );
 
-            // Find all matching listeners for this route's parentRefs.
-            // A route may target a specific listener (sectionName) or all listeners (no sectionName).
-            let matched_listeners =
-                find_listeners_for_route(&http_route.parent_refs, &self.gateway);
+            // Each route alone: one that fails is left out (lenient) and the
+            // rest still goes live.
+            let compiled = match super::compile::compile_http_route(http_route) {
+                Ok(compiled) => compiled,
+                Err(e) if policy == BuildPolicy::Strict => {
+                    return Err(anyhow!("HTTP route {}: {}", route_idx, e));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping HTTP route {} {:?} ({}): {}",
+                        route_idx,
+                        http_route.hostnames,
+                        e.reason.as_str(),
+                        e
+                    );
+                    continue;
+                }
+            };
 
-            // No matching listener: route without gateway context (file-based
-            // configs). One pseudo-scope on port 0 with no hostname
-            // constraint, so hostname intersection passes routes through.
-            // Rate limiting rides the listener, so the pseudo-scope has none.
+            // Per-rule work once, however many listeners and hostnames.
+            let mut rules = Vec::new();
+            for (rule_idx, rule) in compiled.rules.iter().enumerate() {
+                tracing::debug!(
+                    "    Processing rule {}: {} matches, {} backend_refs",
+                    rule_idx,
+                    rule.matches.len(),
+                    rule.source.backend_refs.len()
+                );
+                let backends = self.rule_backends(rule, &mut resolver)?;
+                let filters = rule_filters(&rule.filters, &mut resolver)?;
+                let timeouts = rule.source.timeouts.as_ref();
+                rules.extend(
+                    rule.matches
+                        .iter()
+                        .map(|m| m.to_rule(&filters, &backends, timeouts)),
+                );
+            }
+
+            let matched_listeners: Vec<&ListenerConfig> =
+                find_listeners_for_route(&http_route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| takes_http_routes(l))
+                    .collect();
+
+            // No parentRefs: route without gateway context. One pseudo-scope
+            // on port 0, with no hostname constraint, so hostname
+            // intersection passes routes through; the HTTP and HTTPS
+            // listener ports share it, and no other port does
+            // (`share_any_port_scopes_on`). One copy, not one per port.
+            // Rate limiting rides the listener, so the pseudo-scope has
+            // none. Refs that select no listener attach nowhere.
             type Scope<'a> = (
                 u16,
                 Option<&'a str>,
                 &'a str,
                 Option<std::sync::Arc<crate::rate_limit::Limiter>>,
             );
-            let scopes: Vec<Scope> = if matched_listeners.is_empty() {
+            let scopes: Vec<Scope> = if http_route.parent_refs.is_empty() {
                 vec![(0, None, "", None)]
             } else {
                 matched_listeners
@@ -208,77 +377,102 @@ impl PortailConfig {
                         port,
                         listener_hostname
                     );
-                    for (rule_idx, rule) in http_route.rules.iter().enumerate() {
+                    for rule in &rules {
+                        let mut routing_rule = rule.clone();
+                        // Each inserted rule rotates over its backends alone,
+                        // as when every insert compiled its own rule.
+                        routing_rule.counter = Default::default();
+                        routing_rule.limiter = limiter.clone();
+                        routing_rule.route_index = route_idx as u32;
                         tracing::debug!(
-                            "    Processing rule {}: {} matches, {} backend_refs",
-                            rule_idx,
-                            rule.matches.len(),
-                            rule.backend_refs.len()
+                            "      Adding route: {} {} -> {} backends (listener {}:{:?})",
+                            hostname,
+                            routing_rule.path,
+                            routing_rule.backends.len(),
+                            port,
+                            listener_hostname
                         );
-
-                        let (backends, filters) = build_rule_components(
-                            rule,
-                            &self.endpoint_overrides,
-                            &self.app_protocol_overrides,
-                            &self.headless_target_ports,
-                        )?;
-
-                        for route_match in &rule.matches {
-                            let mut routing_rule =
-                                build_routing_rule(route_match, &filters, &backends, rule)?;
-                            routing_rule.limiter = limiter.clone();
-                            tracing::debug!(
-                                "      Adding route: {} {} -> {} backends (listener {}:{:?})",
-                                hostname,
-                                routing_rule.path,
-                                backends.len(),
-                                port,
-                                listener_hostname
-                            );
-                            route_table.add_http_route_for_listener(
-                                port,
-                                listener_hostname,
-                                hostname,
-                                routing_rule,
-                            );
-                        }
+                        route_table.push_http_route_for_listener(
+                            port,
+                            listener_hostname,
+                            hostname,
+                            routing_rule,
+                        );
                     }
                 }
             }
         }
-
-        self.convert_l4_routes(&mut route_table, &self.tcp_routes, false);
-        self.convert_l4_routes(&mut route_table, &self.udp_routes, true);
-
-        // Convert TLS routes (SNI-based), scoped to the ports of the TLS
-        // listeners their parentRefs attach to. Without gateway context
-        // (file-based configs) they land in the any-port (0) scope.
-        for tls_route in &self.tls_routes {
-            let matched_listeners = find_listeners_for_route(&tls_route.parent_refs, &self.gateway);
-            let mut ports: Vec<u16> = matched_listeners
+        route_table.sort_http_routes();
+        route_table.share_any_port_scopes_on(
+            self.gateway
+                .listeners
                 .iter()
-                .filter(|l| l.protocol == Protocol::TLS)
-                .map(|l| l.port)
+                .filter(|l| takes_http_routes(l))
+                .map(|l| l.port),
+        );
+
+        self.convert_l4_routes(&mut route_table, &self.tcp_routes, false, &mut resolver)?;
+        self.convert_l4_routes(&mut route_table, &self.udp_routes, true, &mut resolver)?;
+
+        // Convert TLS routes (SNI-based), each into the scope of every TLS
+        // passthrough listener its parentRefs attach to, its hostnames
+        // intersected with the listener's as an HTTP route's are
+        // (TLSRoute.hostnames: the others "MUST be ignored"). Without
+        // parentRefs, one shared scope (port 0) every passthrough listener
+        // searches after its own.
+        for (route_idx, tls_route) in self.tls_routes.iter().enumerate() {
+            let mut scopes: Vec<(u16, Option<&str>)> = if tls_route.parent_refs.is_empty() {
+                vec![(0, None)]
+            } else {
+                find_listeners_for_route(&tls_route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| l.is_tls_passthrough())
+                    .map(|l| (l.port, l.hostname.as_deref()))
+                    .collect()
+            };
+            scopes.sort_unstable();
+            scopes.dedup();
+            let scopes: Vec<(u16, Option<&str>, Vec<String>)> = scopes
+                .into_iter()
+                .filter_map(|(port, listener_hostname)| {
+                    let hostnames = if tls_route.hostnames.is_empty() {
+                        vec![listener_hostname.unwrap_or("*").to_string()]
+                    } else {
+                        intersect_hostnames(listener_hostname, &tls_route.hostnames)
+                    };
+                    if hostnames.is_empty() {
+                        tracing::warn!(
+                            "TLS route {} has no hostnames within listener {:?} on port {}, skipping",
+                            route_idx,
+                            listener_hostname,
+                            port
+                        );
+                        return None;
+                    }
+                    Some((port, listener_hostname, hostnames))
+                })
                 .collect();
-            ports.sort_unstable();
-            ports.dedup();
-            if ports.is_empty() {
-                ports.push(0);
+            if scopes.is_empty() {
+                continue;
             }
 
             for rule in &tls_route.rules {
-                let backends = resolve_backends_lenient(&rule.backend_refs, "TLS");
-
-                for hostname in &tls_route.hostnames {
-                    for &port in &ports {
-                        route_table.add_tls_route(port, hostname, backends.clone());
+                let backends = resolver.backends(&rule.backend_refs, "TLS")?;
+                for (port, listener_hostname, hostnames) in &scopes {
+                    for hostname in hostnames {
+                        route_table.add_tls_route_for_listener(
+                            *port,
+                            *listener_hostname,
+                            hostname,
+                            backends.clone(),
+                        );
                     }
                 }
             }
         }
 
         tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
-            route_table.listener_scopes.values().map(|v| v.len()).sum::<usize>(), route_table.tcp_routes.len(), route_table.udp_routes.len());
+            route_table.http_scopes().count(), route_table.tcp_routes.len(), route_table.udp_routes.len());
 
         Ok(route_table)
     }
@@ -287,69 +481,70 @@ impl PortailConfig {
 impl PortailConfig {
     /// `UdpRouteConfig` aliases `TcpRouteConfig`, so one signature serves
     /// both route lists; `is_udp` picks the socket family.
+    ///
+    /// Attachment is the same as for HTTP routes. A TCP or UDP listener
+    /// carries one rule: rules have no match to choose between, so the
+    /// first rule of the first route wins (routes come in precedence order,
+    /// oldest first in Kubernetes mode, file order otherwise).
     fn convert_l4_routes(
         &self,
         route_table: &mut crate::routing::RouteTable,
         routes: &[TcpRouteConfig],
         is_udp: bool,
-    ) {
-        for route in routes {
-            if let Some(parent_ref) = route.parent_refs.first() {
-                if let Some(section_name) = &parent_ref.section_name {
-                    // TCPRoutes may also attach to TLS(Passthrough) listeners.
-                    let protocol_matches = |l: &&ListenerConfig| {
+        resolver: &mut Resolver,
+    ) -> Result<()> {
+        let proto = if is_udp { "UDP" } else { "TCP" };
+        for (route_idx, route) in routes.iter().enumerate() {
+            let Some(rule) = route.rules.first() else {
+                continue;
+            };
+            // TCPRoutes may also attach to TLS(Passthrough) listeners.
+            let listeners: Vec<&ListenerConfig> =
+                find_listeners_for_route(&route.parent_refs, &self.gateway)
+                    .into_iter()
+                    .filter(|l| {
                         if is_udp {
                             l.protocol == Protocol::UDP
                         } else {
                             matches!(l.protocol, Protocol::TCP | Protocol::TLS)
                         }
-                    };
-                    if let Some(listener) = self
-                        .gateway
-                        .listeners
-                        .iter()
-                        .find(|l| l.name == *section_name && protocol_matches(l))
-                    {
-                        for rule in &route.rules {
-                            let backends = resolve_backends_lenient(&rule.backend_refs, "L4");
-                            if is_udp {
-                                route_table.add_udp_route(listener.port, backends);
-                            } else {
-                                route_table.add_tcp_route(listener.port, backends);
-                            }
-                        }
-                    }
+                    })
+                    .collect();
+            if listeners.is_empty() {
+                continue;
+            }
+            let backends = resolver.backends(&rule.backend_refs, proto)?;
+            for listener in listeners {
+                let added = if is_udp {
+                    route_table.add_udp_route(listener.port, backends.clone())
+                } else {
+                    route_table.add_tcp_route(listener.port, backends.clone())
+                };
+                if !added {
+                    tracing::warn!(
+                        "{} route {}: listener '{}' already carries an earlier route, skipping",
+                        proto,
+                        route_idx,
+                        listener.name
+                    );
                 }
             }
         }
+        Ok(())
     }
 }
 
-/// Lenient backend resolution: skip (and warn about) refs whose DNS fails,
-/// keeping the rest. The strict startup path pre-checks resolution in
-/// `check_backend_resolution`, so leniency here only affects the Kubernetes
-/// path, where serving with fewer backends is conformance-required.
-fn resolve_backends_lenient(refs: &[BackendRef], what: &str) -> Vec<crate::routing::Backend> {
-    refs.iter()
-        .flat_map(|br| {
-            crate::routing::Backend::all_with_weight(br.name.clone(), br.port, br.weight)
-                .map_err(|e| {
-                    tracing::warn!(
-                        "Skipping {} backend {}:{} - DNS resolution failed: {}",
-                        what,
-                        br.name,
-                        br.port,
-                        e
-                    )
-                })
-                .unwrap_or_default()
-        })
-        .collect()
+/// HTTP routes serve on HTTP and HTTPS listeners only: on a TCP port with
+/// an HTTP route, the data plane waits for a request to sniff, and a
+/// server-speaks-first client (SMTP, MySQL) hangs.
+pub(crate) fn takes_http_routes(listener: &ListenerConfig) -> bool {
+    matches!(listener.protocol, Protocol::HTTP | Protocol::HTTPS)
 }
 
-/// Find all listeners that a route attaches to via its parentRefs.
-/// A route without sectionName attaches to all listeners.
-/// A route with sectionName attaches only to that specific listener.
+/// Listeners a route's parentRefs select, for every route kind in both
+/// modes. In Kubernetes mode each ref names one listener the reconciler
+/// accepted the route on; in a file config an unset sectionName or port
+/// selects every listener.
 fn find_listeners_for_route<'a>(
     parent_refs: &[ParentRef],
     gateway: &'a GatewayConfig,
@@ -374,186 +569,68 @@ fn find_listeners_for_route<'a>(
     matched
 }
 
-/// Build backends and filters from a route rule. Extracts common logic from the route loop.
-fn build_rule_components(
-    rule: &HttpRouteRule,
-    endpoint_overrides: &std::collections::HashMap<(String, u16), Vec<(String, u16)>>,
-    app_protocol_overrides: &std::collections::HashMap<(String, u16), String>,
-    headless_target_ports: &std::collections::HashMap<(String, u16), u16>,
-) -> Result<(
-    Vec<crate::routing::Backend>,
-    Vec<crate::routing::HttpFilter>,
-)> {
-    use crate::routing;
-
-    let mut backends = Vec::new();
-    for backend_ref in &rule.backend_refs {
-        let backend_filters = convert_filters(&backend_ref.filters)?;
-
-        // Determine app_protocol: explicit on BackendRef (from JSON config) or from Service spec override
-        let override_key = (backend_ref.name.clone(), backend_ref.port);
-        let effective_app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
-            app_protocol_overrides
-                .get(&override_key)
-                .map(|s| s.as_str())
-        });
-        let backend_use_tls = effective_app_protocol == Some("https");
-
-        // Check if this backend has endpoint overrides (headless service)
-        if let Some(endpoints) = endpoint_overrides.get(&override_key) {
-            if !endpoints.is_empty() {
-                tracing::debug!(
-                    "        Headless backend {}:{} -> {} pod endpoints",
-                    backend_ref.name,
-                    backend_ref.port,
-                    endpoints.len()
-                );
-                for (pod_ip, target_port) in endpoints {
-                    match routing::Backend::with_weight(
-                        pod_ip.clone(),
-                        *target_port,
-                        backend_ref.weight,
-                    ) {
-                        Ok(mut backend) => {
-                            backend.filters = backend_filters.clone();
-                            backend.use_tls = backend_use_tls;
-                            backends.push(backend);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "        Skipping headless endpoint {}:{} - {}",
-                                pod_ip,
-                                target_port,
-                                e
-                            );
-                        }
-                    }
-                }
+impl PortailConfig {
+    /// Backends of one compiled rule, resolved through `resolver`.
+    fn rule_backends(&self, rule: &CompiledRule, resolver: &mut Resolver) -> Result<Vec<Backend>> {
+        let mut backends = Vec::new();
+        // Not looked up, so not probed either: the redirect answers.
+        if rule.source.redirects() {
+            return Ok(backends);
+        }
+        for (backend_ref, backend_filters) in
+            rule.source.backend_refs.iter().zip(&rule.backend_filters)
+        {
+            if backend_ref.invalid {
+                backends.push(Backend::rejecting(backend_ref.weight));
                 continue;
             }
-        }
 
-        // Standard DNS-based resolution — resolve to every A-record (STRICT_DNS):
-        // a headless Service FQDN expands to one backend per ready pod, a ClusterIP
-        // FQDN to one VIP. The existing weighted selection load-balances across the
-        // resulting flat entries.
-        //
-        // Port: a headless Service has no VIP, so DNS returns pod IPs and we must
-        // connect on the Service's targetPort, not the service port (DNS carries no
-        // port). For ClusterIP the FQDN resolves to the VIP and the service port is
-        // correct (kube-proxy maps it), so there is no override and we keep the ref's
-        // port.
-        let connect_port = headless_target_ports
-            .get(&override_key)
-            .copied()
-            .unwrap_or(backend_ref.port);
-        match routing::Backend::all_with_weight(
-            backend_ref.name.clone(),
-            connect_port,
-            backend_ref.weight,
-        ) {
-            Ok(resolved) => {
-                tracing::debug!(
-                    "        Backend: {}:{} weight={} tls={} -> {} address(es)",
-                    backend_ref.name,
-                    backend_ref.port,
-                    backend_ref.weight,
-                    backend_use_tls,
-                    resolved.len()
-                );
-                for mut backend in resolved {
-                    backend.filters = backend_filters.clone();
-                    backend.use_tls = backend_use_tls;
-                    backends.push(backend);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "        Skipping backend {}:{} - DNS resolution failed: {}",
-                    backend_ref.name,
-                    backend_ref.port,
-                    e
-                );
-            }
+            let app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
+                self.app_protocol_overrides
+                    .get(&(backend_ref.name.clone(), backend_ref.port))
+                    .map(String::as_str)
+            });
+            let use_tls = app_protocol == Some("https");
+            resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
+                let mut backend = backend_at(addr, backend_ref.weight, name);
+                backend.filters = backend_filters.clone();
+                backend.use_tls = use_tls;
+                backends.push(backend);
+            })?;
         }
+        Ok(backends)
     }
-
-    super::wire::check_rule_filters(&rule.filters)?;
-    let filters = convert_filters(&rule.filters)?;
-    Ok((backends, filters))
 }
 
-/// Build a routing rule from a route match, reused backends, and filters.
-fn build_routing_rule(
-    route_match: &crate::config::HttpRouteMatch,
-    filters: &[crate::routing::HttpFilter],
-    backends: &[crate::routing::Backend],
-    rule: &HttpRouteRule,
-) -> Result<crate::routing::HttpRouteRule> {
-    use crate::routing;
-
-    let (path, path_match_type, path_regex) = if let Some(path_match) = &route_match.path {
-        match path_match.match_type {
-            HttpPathMatchType::PathPrefix => (
-                path_match.value.as_str(),
-                routing::PathMatchType::Prefix,
-                None,
-            ),
-            HttpPathMatchType::Exact => (
-                path_match.value.as_str(),
-                routing::PathMatchType::Exact,
-                None,
-            ),
-            HttpPathMatchType::RegularExpression => {
-                let re = regex::Regex::new(&path_match.value)
-                    .map_err(|e| anyhow!("Invalid path regex '{}': {}", path_match.value, e))?;
-                (
-                    path_match.value.as_str(),
-                    routing::PathMatchType::RegularExpression,
-                    Some(re),
-                )
+/// Rule filters in the table's form. A mirror DNS cannot resolve is left
+/// out when the policy is lenient: primary traffic never depends on it.
+fn rule_filters(
+    filters: &[CompiledFilter],
+    resolver: &mut Resolver,
+) -> Result<Vec<crate::routing::HttpFilter>> {
+    let mut out = Vec::with_capacity(filters.len());
+    for f in filters {
+        match f {
+            CompiledFilter::Ready(filter) => out.push(filter.clone()),
+            CompiledFilter::Mirror { backend, fraction } => {
+                // Copies go to one endpoint (HTTPRequestMirrorFilter.backendRef).
+                // The smallest address, not the resolver's first: records
+                // reordered between lookups would change the table and its
+                // DNS signature, and the refresh would swap on every tick.
+                let mut smallest: Option<SocketAddr> = None;
+                resolver.endpoints(&backend.name, backend.port, "RequestMirror", |addr, _| {
+                    smallest = Some(smallest.map_or(addr, |s| s.min(addr)));
+                })?;
+                if let Some(backend_addr) = smallest {
+                    out.push(crate::routing::HttpFilter::RequestMirror {
+                        backend_addr,
+                        fraction: *fraction,
+                    });
+                }
             }
         }
-    } else {
-        ("/", routing::PathMatchType::Prefix, None)
-    };
-
-    let header_matches: Vec<routing::HeaderMatch> = route_match
-        .headers
-        .iter()
-        .map(|hm| {
-            Ok(routing::HeaderMatch {
-                name: hm.name.to_ascii_lowercase(),
-                matcher: build_value_matcher(&hm.value, &hm.match_type)?,
-            })
-        })
-        .collect::<Result<_>>()?;
-    let query_param_matches: Vec<routing::QueryParamMatch> = route_match
-        .query_params
-        .iter()
-        .map(|qm| {
-            Ok(routing::QueryParamMatch {
-                name: qm.name.clone(),
-                matcher: build_value_matcher(&qm.value, &qm.match_type)?,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    let mut routing_rule = routing::HttpRouteRule::new(
-        path_match_type,
-        path.to_string(),
-        header_matches,
-        query_param_matches,
-        filters.to_vec(),
-        backends.to_vec(),
-    )
-    .with_method(route_match.method.clone());
-    routing_rule.path_regex = path_regex;
-    if let Some(ref timeouts) = rule.timeouts {
-        routing_rule.request_timeout = timeouts.request;
-        routing_rule.backend_request_timeout = timeouts.backend_request;
     }
-    Ok(routing_rule)
+    Ok(out)
 }
 
 /// Check if a route hostname is within the scope of a listener hostname.
@@ -605,111 +682,6 @@ fn intersect_hostnames(listener_hostname: Option<&str>, route_hostnames: &[Strin
     }
 }
 
-fn convert_filters(config_filters: &[HttpRouteFilter]) -> Result<Vec<crate::routing::HttpFilter>> {
-    config_filters
-        .iter()
-        .map(crate::routing::HttpFilter::try_from)
-        .collect()
-}
-
-impl TryFrom<&HttpRouteFilter> for crate::routing::HttpFilter {
-    type Error = anyhow::Error;
-
-    fn try_from(f: &HttpRouteFilter) -> Result<Self> {
-        // The table build is the one funnel every config path shares, and
-        // not every caller runs validate() first (the reconciler, DNS
-        // refresh): this keeps CR/LF off the wire even if one forgets.
-        super::wire::check_filter(f)?;
-        Ok(match f {
-            HttpRouteFilter::RequestHeaderModifier { config } => Self::RequestHeaderModifier {
-                add: std::sync::Arc::new(config.add.clone()),
-                set: std::sync::Arc::new(config.set.clone()),
-                remove: std::sync::Arc::new(config.remove.clone()),
-            },
-            HttpRouteFilter::ResponseHeaderModifier { config } => Self::ResponseHeaderModifier {
-                add: std::sync::Arc::new(config.add.clone()),
-                set: std::sync::Arc::new(config.set.clone()),
-                remove: std::sync::Arc::new(config.remove.clone()),
-            },
-            HttpRouteFilter::RequestRedirect { config } => {
-                let path = config
-                    .path
-                    .as_ref()
-                    .map(crate::routing::URLRewritePath::from);
-                Self::RequestRedirect {
-                    // Accepted in any case, but the redirect builder compares
-                    // against lowercase literals to drop default ports.
-                    scheme: config.scheme.as_deref().map(str::to_ascii_lowercase),
-                    hostname: config.hostname.clone(),
-                    port: config.port,
-                    path,
-                    status_code: config.status_code,
-                }
-            }
-            HttpRouteFilter::URLRewrite { config } => Self::URLRewrite {
-                hostname: config.hostname.clone(),
-                path: config
-                    .path
-                    .as_ref()
-                    .map(crate::routing::URLRewritePath::from),
-            },
-            HttpRouteFilter::RequestMirror { config } => {
-                let backend = crate::routing::Backend::with_weight(
-                    config.backend_ref.name.clone(),
-                    config.backend_ref.port,
-                    config.backend_ref.weight,
-                )?;
-                // Fraction takes precedence over percent per Gateway API spec.
-                // If neither is set, mirror 100% of requests.
-                let effective_percent = if let Some(ref frac) = config.fraction {
-                    if frac.denominator > 0 {
-                        ((frac.numerator as u64 * 100) / frac.denominator as u64).min(100) as u32
-                    } else {
-                        100
-                    }
-                } else {
-                    config.percent.unwrap_or(100).min(100)
-                };
-                Self::RequestMirror {
-                    backend_addr: backend.socket_addr,
-                    mirror_percent: effective_percent,
-                }
-            }
-        })
-    }
-}
-
-impl From<&HttpURLRewritePath> for crate::routing::URLRewritePath {
-    fn from(p: &HttpURLRewritePath) -> Self {
-        match p {
-            HttpURLRewritePath::ReplaceFullPath { value } => Self::ReplaceFullPath(value.clone()),
-            HttpURLRewritePath::ReplacePrefixMatch { value } => {
-                Self::ReplacePrefixMatch(value.clone())
-            }
-        }
-    }
-}
-
-/// Build a value matcher, propagating invalid-regex errors. `validate()` also
-/// checks these regexes, but nothing forces every caller of `to_route_table`
-/// through `validate()` first (the reconciler and DNS-refresh call it
-/// directly), so this must not panic on an unvalidated config.
-fn build_value_matcher(
-    value: &str,
-    match_type: &super::types::StringMatchType,
-) -> Result<crate::routing::ValueMatcher> {
-    match match_type {
-        super::types::StringMatchType::Exact => {
-            Ok(crate::routing::ValueMatcher::Exact(value.to_string()))
-        }
-        super::types::StringMatchType::RegularExpression => {
-            let re = regex::Regex::new(value)
-                .map_err(|e| anyhow!("Invalid match regex '{}': {}", value, e))?;
-            Ok(crate::routing::ValueMatcher::Regex(re))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::parsing::parse_duration;
@@ -738,18 +710,16 @@ mod tests {
     /// Collect every backend socket-address port in the route table (HTTP scopes).
     fn http_backend_ports(rt: &crate::routing::RouteTable) -> Vec<u16> {
         let mut ports = Vec::new();
-        for scopes in rt.listener_scopes.values() {
-            for scope in scopes {
-                let entries = scope
-                    .http_routes
-                    .values()
-                    .chain(scope.wildcard_http_routes.values())
-                    .chain(scope.catch_all_http_routes.iter());
-                for he in entries {
-                    for rule in he {
-                        for b in &rule.backends {
-                            ports.push(b.socket_addr.port());
-                        }
+        for scope in rt.http_scopes() {
+            let entries = scope
+                .http_routes
+                .values()
+                .chain(scope.wildcard_http_routes.values())
+                .chain(scope.catch_all_http_routes.iter());
+            for he in entries {
+                for rule in he {
+                    for b in &rule.backends {
+                        ports.push(b.socket_addr.port());
                     }
                 }
             }
@@ -786,6 +756,253 @@ mod tests {
             vec![3000],
             "headless backend must connect on the targetPort, not the service port"
         );
+    }
+
+    /// config-routing #7, file configs: a TCP route without sectionName
+    /// passed validation, then vanished. It attaches like an HTTP route now,
+    /// and on a shared listener the first route's first rule wins.
+    #[test]
+    fn test_l4_routes_attach_like_http_routes() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "cache", "protocol": "TCP", "port": 6379},
+                {"name": "web", "protocol": "HTTP", "port": 8080}
+            ]},
+            "tcpRoutes": [
+                {"parentRefs": [{"name": "g"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]},
+                           {"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]},
+                {"parentRefs": [{"name": "g", "sectionName": "db"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7003}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table().unwrap();
+        let backend_port = |port| rt.find_tcp_backends(port).unwrap()[0].socket_addr.port();
+        assert_eq!(backend_port(5432), 7001);
+        assert_eq!(backend_port(6379), 7001);
+        assert!(rt.find_tcp_backends(8080).is_none());
+    }
+
+    /// A parentRef without sectionName put an HTTP route on every listener,
+    /// TCP ones too: the TCP port then waited for a request to sniff, and a
+    /// server-speaks-first client hung.
+    #[test]
+    fn http_routes_attach_to_http_and_https_listeners_only() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "web", "protocol": "HTTP", "port": 8080},
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "dns", "protocol": "UDP", "port": 5353}
+            ]},
+            "httpRoutes": [{"parentRefs": [{"name": "g"}], "hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt.has_http_routes(8080));
+        assert!(!rt.has_http_routes(5432), "the TCP port must not sniff");
+        assert!(!rt.has_http_routes(5353));
+        assert!(rt.has_tcp_route(5432));
+
+        // Its only ref naming a TCP listener, the route attaches nowhere.
+        let mut on_tcp = config.clone();
+        on_tcp.http_routes[0].parent_refs[0].section_name = Some("db".to_string());
+        let err = on_tcp.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP route 0: parentRef (sectionName: Some(\"db\")"),
+            "{err}"
+        );
+        assert!(!on_tcp.to_route_table().unwrap().has_http_routes(5432));
+    }
+
+    /// A route with no parentRefs went to the any-port scope, which every
+    /// port searches: the TCP port then waited to sniff, and a
+    /// server-speaks-first client hung.
+    #[test]
+    fn a_route_without_parent_refs_serves_http_ports_only() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "web", "protocol": "HTTP", "port": 8080},
+                {"name": "db", "protocol": "TCP", "port": 5432}
+            ]},
+            "httpRoutes": [{"hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt.has_tcp_route(5432));
+        assert!(!rt.has_http_routes(5432), "the TCP port must not sniff");
+        let found = |port| {
+            rt.find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_some()
+        };
+        assert!(found(8080));
+        assert!(!found(5432));
+    }
+
+    /// A route without parentRefs went into one copy of itself per HTTP or
+    /// HTTPS port: memory and build time grew with ports times rules. One
+    /// shared scope now serves every such port, and no other.
+    #[test]
+    fn a_route_without_parent_refs_is_one_scope_for_every_http_port() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "a", "protocol": "HTTP", "port": 8080},
+                {"name": "b", "protocol": "HTTP", "port": 8081},
+                {"name": "s", "protocol": "HTTPS", "port": 8443,
+                 "tls": {"mode": "Terminate", "certificateRefs": [{"name": "c"}]}},
+                {"name": "db", "protocol": "TCP", "port": 5432},
+                {"name": "raw", "protocol": "TCP", "port": 6000}
+            ]},
+            "httpRoutes": [{"hostnames": ["a.example.com"],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}],
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "db"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert_eq!(rt.http_scopes().count(), 1);
+        for port in [8080, 8081, 8443] {
+            assert!(rt.has_http_routes(port), "{port}");
+            assert!(rt
+                .find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_some());
+        }
+        for port in [5432, 6000] {
+            assert!(!rt.has_http_routes(port), "{port}");
+            assert!(rt
+                .find_http_route("a.example.com", "GET", "/", &[], "", port)
+                .is_none());
+        }
+    }
+
+    /// A route without parentRefs competes with a port's own routes by
+    /// precedence, as one route table would: the more specific hostname,
+    /// then the more specific match, then the earlier route. The port's
+    /// own scope was searched first, whole: its PathPrefix / took /api
+    /// from an Exact /api, and its wildcard host an exact one.
+    #[test]
+    fn a_route_without_parent_refs_competes_by_precedence() {
+        let route = |parent: bool, host: &str, kind: &str, path: &str, port: u16| {
+            let parent_refs = if parent { r#"[{"name": "g"}]"# } else { "[]" };
+            format!(
+                r#"{{"parentRefs": {parent_refs}, "hostnames": ["{host}"],
+                    "rules": [{{"matches": [{{"path": {{"type": "{kind}", "value": "{path}"}}}}],
+                        "backendRefs": [{{"name": "127.0.0.1", "port": {port}}}]}}]}}"#
+            )
+        };
+        let routes = [
+            route(true, "a.example.com", "PathPrefix", "/", 7001),
+            route(false, "a.example.com", "Exact", "/api", 7002),
+            route(true, "*.example.com", "Exact", "/api/v1", 7003),
+            route(false, "b.example.com", "PathPrefix", "/", 7004),
+            route(false, "c.example.com", "PathPrefix", "/", 7005),
+            route(true, "c.example.com", "PathPrefix", "/", 7006),
+            route(true, "d.example.com", "PathPrefix", "/", 7007),
+            route(false, "d.example.com", "PathPrefix", "/", 7008),
+        ];
+        let json = format!(
+            r#"{{"gateway": {{"name": "g", "listeners": [{{"name": "web", "protocol": "HTTP", "port": 8080}}]}},
+                "httpRoutes": [{}]}}"#,
+            routes.join(",")
+        );
+        let config: PortailConfig = serde_json::from_str(&json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let backend = |host, path| {
+            rt.find_http_route(host, "GET", path, &[], "", 8080)
+                .map(|rule| rule.backends[0].socket_addr.port())
+        };
+        assert_eq!(backend("a.example.com", "/api"), Some(7002), "Exact first");
+        assert_eq!(backend("a.example.com", "/other"), Some(7001));
+        assert_eq!(
+            backend("b.example.com", "/api/v1"),
+            Some(7004),
+            "exact host"
+        );
+        assert_eq!(backend("x.example.com", "/api/v1"), Some(7003));
+        assert_eq!(backend("c.example.com", "/"), Some(7005), "earlier route");
+        assert_eq!(backend("d.example.com", "/"), Some(7007), "earlier route");
+    }
+
+    /// TLSRoute.hostnames: "any TLSRoute hostnames that do not match the
+    /// Listener hostname MUST be ignored". They went into the table as
+    /// they were. A route with no hostnames matches its listener's, and
+    /// went nowhere.
+    #[test]
+    fn a_tls_route_matches_only_within_its_listener() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "p", "protocol": "TLS", "port": 8443, "hostname": "*.example.com",
+                 "tls": {"mode": "Passthrough"}},
+                {"name": "q", "protocol": "TLS", "port": 9443, "hostname": "db.example.org",
+                 "tls": {"mode": "Passthrough"}}
+            ]},
+            "tlsRoutes": [
+                {"parentRefs": [{"name": "g", "sectionName": "p"}],
+                 "hostnames": ["a.example.com", "b.other.org"],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]},
+                {"parentRefs": [{"name": "g", "sectionName": "q"}],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7002}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        let resolve = |sni, port, listener| {
+            rt.resolve_tls_passthrough(Some(sni), port, listener, &selector, &health)
+                .map(|addr| addr.port())
+        };
+        assert_eq!(
+            resolve("a.example.com", 8443, Some("*.example.com")),
+            Ok(7001)
+        );
+        assert_eq!(
+            resolve("b.other.org", 8443, Some("*.example.com")),
+            Err(crate::routing::PassthroughMiss::NoRoute)
+        );
+        assert_eq!(
+            resolve("db.example.org", 9443, Some("db.example.org")),
+            Ok(7002)
+        );
+    }
+
+    /// A TLS route without parentRefs is one scope every passthrough
+    /// listener searches after its own, on any port.
+    #[test]
+    fn a_tls_route_without_parent_refs_serves_every_passthrough_listener() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [
+                {"name": "p", "protocol": "TLS", "port": 8443, "hostname": "*.example.com",
+                 "tls": {"mode": "Passthrough"}},
+                {"name": "q", "protocol": "TLS", "port": 9443, "tls": {"mode": "Passthrough"}}
+            ]},
+            "tlsRoutes": [{"hostnames": ["s.example.com"],
+                 "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 7001}]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        for (port, listener) in [(8443, Some("*.example.com")), (9443, None)] {
+            let backend = rt
+                .resolve_tls_passthrough(Some("s.example.com"), port, listener, &selector, &health)
+                .map(|addr| addr.port());
+            assert_eq!(backend, Ok(7001), "{port}");
+        }
+        assert_eq!(rt.tls_scopes.values().flatten().count(), 1);
     }
 
     #[test]
@@ -1055,7 +1272,7 @@ mod tests {
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
                     "filters": [{"type": "RequestRedirect", "requestRedirect": {"scheme": "HTTPS", "statusCode": 301}}],
-                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                    "backendRefs": []
                 }]
             }]
         }"#;
@@ -1073,7 +1290,7 @@ mod tests {
     }
 
     /// Callers that skip validate() (reconciler, DNS refresh) still cannot
-    /// build a table whose filters would write CR/LF.
+    /// build a table whose filters would write CR/LF: the route stays out.
     #[test]
     fn test_route_table_build_rejects_injectable_filter() {
         let json = r#"{
@@ -1093,9 +1310,15 @@ mod tests {
             }]
         }"#;
         let config: PortailConfig = serde_json::from_str(json).unwrap();
-        let err = config.to_route_table().unwrap_err().to_string();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt
+            .find_http_route("example.com", "GET", "/", &[], "", 8080)
+            .is_none());
+        let err = config.to_route_table_strict().unwrap_err().to_string();
         assert!(
-            err.contains("ResponseHeaderModifier set[0].value"),
+            err.starts_with(
+                "HTTP route 0: rule 0: backendRef 0: filter 0: ResponseHeaderModifier set[0].value"
+            ),
             "{}",
             err
         );
@@ -1126,11 +1349,11 @@ mod tests {
         assert_eq!(rule.filters.len(), 1);
         if let crate::routing::HttpFilter::RequestMirror {
             backend_addr,
-            mirror_percent,
+            fraction,
         } = &rule.filters[0]
         {
             assert_eq!(backend_addr.port(), 9999);
-            assert_eq!(*mirror_percent, 100); // default when no percent/fraction specified
+            assert_eq!(*fraction, crate::routing::Fraction::ALL); // default when no percent/fraction specified
         } else {
             panic!("expected RequestMirror filter");
         }
@@ -1292,10 +1515,10 @@ mod tests {
         assert_eq!(result, vec!["api.example.com"]);
     }
 
+    /// The controller maps an ExternalName Service (FQDN, port) to its
+    /// external name: that name is dialed, and the FQDN never looked up.
     #[test]
     fn test_external_name_endpoint_override_resolves() {
-        // Simulate what the controller does for ExternalName services:
-        // endpoint_overrides maps (svc_fqdn, port) → (externalName, port)
         let json = r#"{
             "gateway": {
                 "name": "test-gw",
@@ -1313,28 +1536,506 @@ mod tests {
         let mut config: PortailConfig = serde_json::from_str(json).unwrap();
         assert!(config.validate().is_ok());
 
-        // Insert ExternalName override: svc FQDN → external DNS name
         config.endpoint_overrides.insert(
             ("external-api.default.svc".to_string(), 443),
-            vec![("httpbin.org".to_string(), 443)],
+            vec![("multi.svc".to_string(), 443)],
         );
 
-        // to_route_table should resolve "httpbin.org" via DNS
-        let rt = config.to_route_table();
-        assert!(
-            rt.is_ok(),
-            "ExternalName DNS resolution should succeed: {:?}",
-            rt.err()
-        );
-        let rt = rt.unwrap();
-
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["multi.svc:443"]);
         let rule = rt
             .find_http_route("proxy.example.com", "GET", "/", &[], "", 8080)
             .unwrap();
+        let dialed: Vec<_> = rule
+            .backends
+            .iter()
+            .map(|b| (b.socket_addr, b.server_name.as_str()))
+            .collect();
+        // One address of the set: see one_target.
+        let set: [std::net::SocketAddr; 2] =
+            [([10, 0, 0, 1], 443).into(), ([10, 0, 0, 2], 443).into()];
         assert!(
-            !rule.backends.is_empty(),
-            "should have resolved ExternalName backend"
+            matches!(&dialed[..], [(addr, "multi.svc")] if set.contains(addr)),
+            "{dialed:?}"
         );
-        assert_eq!(rule.backends[0].socket_addr.port(), 443);
+    }
+
+    /// One route whose regex does not compile used to fail the whole build:
+    /// every Gateway in it stopped updating and went Programmed=False.
+    #[test]
+    fn one_bad_route_does_not_take_the_table_down() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [
+                {"hostnames":["bad.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"RegularExpression","value":"/(?=x)"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]},
+                {"hostnames":["good.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8002}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        assert!(rt
+            .find_http_route("good.example.com", "GET", "/", &[], "", 8080)
+            .is_some());
+        assert!(rt
+            .find_http_route("bad.example.com", "GET", "/x", &[], "", 8080)
+            .is_none());
+
+        let err = config.to_route_table_strict().unwrap_err().to_string();
+        assert!(
+            err.starts_with("HTTP route 0: rule 0: match 0: Invalid path regex '/(?=x)'"),
+            "{err}"
+        );
+    }
+
+    /// Unanchored, path regex `/api` matched `/static/api/x`, and header or
+    /// query regex `v1` matched `xv1x`.
+    #[test]
+    fn regex_matches_are_full_matches() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [
+                {"hostnames":["p.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"RegularExpression","value":"/api"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]},
+                {"hostnames":["h.example.com"],
+                 "rules":[{"matches":[{"headers":[{"name":"x-v","type":"RegularExpression","value":"v1"}],
+                                       "queryParams":[{"name":"q","type":"RegularExpression","value":"v1"}]}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let found = |host, path, headers: &[u8], query| {
+            rt.find_http_route(host, "GET", path, headers, query, 8080)
+                .is_some()
+        };
+        assert!(found("p.example.com", "/api", b"", ""));
+        assert!(!found("p.example.com", "/static/api/x", b"", ""));
+        assert!(!found("p.example.com", "/api/x", b"", ""));
+        assert!(found("h.example.com", "/", b"x-v: v1\r\n", "q=v1"));
+        assert!(!found("h.example.com", "/", b"x-v: xv1x\r\n", "q=v1"));
+        assert!(!found("h.example.com", "/", b"x-v: v1\r\n", "q=v1x"));
+    }
+
+    /// PathPrefix /abc/ did not match /abc.
+    #[test]
+    fn a_path_prefix_ignores_its_trailing_slash() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [
+                {"hostnames":["p.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/foo/"}}],
+                           "filters":[{"type":"URLRewrite","urlRewrite":{"path":{"type":"ReplacePrefixMatch","replacePrefixMatch":"/xyz"}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]},
+                {"hostnames":["r.example.com"],
+                 "rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]}
+            ]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let rt = config.to_route_table().unwrap();
+        let rewrite = |path: &str| {
+            let rule = rt.find_http_route("p.example.com", "GET", path, &[], "", 8080)?;
+            let rewrite =
+                crate::proxy::http_filters::extract_url_rewrite(&rule.filters, &rule.path, path)?;
+            rewrite.path.map(|p| p.path)
+        };
+        // The ReplacePrefixMatch table of Gateway API v1.4.1, prefix /foo/.
+        assert_eq!(rewrite("/foo/bar").as_deref(), Some("/xyz/bar"));
+        assert_eq!(rewrite("/foo").as_deref(), Some("/xyz"));
+        assert_eq!(rewrite("/foo/").as_deref(), Some("/xyz/"));
+        assert_eq!(rewrite("/foobar"), None);
+
+        let root = |path| {
+            rt.find_http_route("r.example.com", "GET", path, &[], "", 8080)
+                .is_some()
+        };
+        assert!(root("/") && root("/x") && root("/x/y"));
+    }
+
+    /// A rule with `matches: []`, or none at all, served nothing.
+    #[test]
+    fn a_rule_without_matches_matches_every_path() {
+        for matches in [r#""matches":[],"#, ""] {
+            let json = format!(
+                r#"{{
+                "gateway": {{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":8080}}]}},
+                "httpRoutes": [{{"hostnames":["e.example.com"],
+                    "rules":[{{{matches}"backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}]
+            }}"#
+            );
+            let config: PortailConfig = serde_json::from_str(&json).unwrap();
+            let rt = config.to_route_table().unwrap();
+            for path in ["/", "/anything/at/all"] {
+                let rule = rt
+                    .find_http_route("e.example.com", "GET", path, &[], "", 8080)
+                    .unwrap_or_else(|| panic!("{matches:?} {path}: no route"));
+                assert_eq!(rule.path_match_type, crate::routing::PathMatchType::Prefix);
+            }
+        }
+    }
+
+    /// Rounded to whole percents, fraction 1/1000 became 0%: it never mirrored.
+    #[test]
+    fn mirror_fraction_reaches_the_table_exact() {
+        let fraction = |mirror: &str| {
+            let json = format!(
+                r#"{{
+                "gateway": {{"name":"g","listeners":[{{"name":"h","protocol":"HTTP","port":8080}}]}},
+                "httpRoutes": [{{"hostnames":["m.example.com"],
+                    "rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],
+                               "filters":[{{"type":"RequestMirror","requestMirror":{{"backendRef":{{"name":"127.0.0.1","port":9999}}{mirror}}}}}],
+                               "backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}]
+            }}"#
+            );
+            let config: PortailConfig = serde_json::from_str(&json).unwrap();
+            let rt = config.to_route_table().unwrap();
+            let rule = rt
+                .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+                .unwrap();
+            match &rule.filters[..] {
+                [crate::routing::HttpFilter::RequestMirror { fraction, .. }] => *fraction,
+                other => panic!("{other:?}"),
+            }
+        };
+        let exact = crate::routing::Fraction::new;
+        assert_eq!(
+            fraction(r#","fraction":{"numerator":1,"denominator":1000}"#),
+            exact(1, 1000).unwrap()
+        );
+        assert_eq!(
+            fraction(r#","fraction":{"numerator":1}"#),
+            exact(1, 100).unwrap()
+        );
+        assert_eq!(fraction(r#","percent":25"#), exact(25, 100).unwrap());
+        assert_eq!(fraction(""), crate::routing::Fraction::ALL);
+    }
+
+    /// IP literals resolve to themselves, `multi.svc` to two pods, any other
+    /// name fails. Records every lookup.
+    fn fake_dns(
+        calls: &std::cell::RefCell<Vec<String>>,
+        name: &str,
+        port: u16,
+    ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+        calls.borrow_mut().push(format!("{name}:{port}"));
+        let ips: Vec<std::net::IpAddr> = match name.parse() {
+            Ok(ip) => vec![ip],
+            Err(_) if name == "multi.svc" => vec![[10, 0, 0, 1].into(), [10, 0, 0, 2].into()],
+            Err(_) => anyhow::bail!("NXDOMAIN"),
+        };
+        Ok(ips
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect())
+    }
+
+    fn build_with_fake_dns(
+        config: &PortailConfig,
+        policy: super::BuildPolicy,
+    ) -> (anyhow::Result<crate::routing::RouteTable>, Vec<String>) {
+        let calls = std::cell::RefCell::new(vec![]);
+        let built = config.build_route_table(policy, &mut |n, p| fake_dns(&calls, n, p));
+        (built, calls.into_inner())
+    }
+
+    /// Two listeners, two hostnames, two rules on one backend, plus TCP and
+    /// TLS routes on it.
+    fn shared_backend_config(http_backend: &str) -> PortailConfig {
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"a","protocol":"HTTP","port":8080}},
+                {{"name":"b","protocol":"HTTP","port":8081}},
+                {{"name":"t","protocol":"TCP","port":5432}},
+                {{"name":"p","protocol":"TLS","port":8443,"tls":{{"mode":"Passthrough"}}}}]}},
+            "httpRoutes": [{{
+                "parentRefs": [{{"name":"g","sectionName":"a"}},{{"name":"g","sectionName":"b"}}],
+                "hostnames": ["x.example.com","y.example.com"],
+                "rules": [
+                    {{"matches":[{{"path":{{"type":"PathPrefix","value":"/a"}}}}],"backendRefs":[{{"name":"{b}","port":80}}]}},
+                    {{"matches":[{{"path":{{"type":"PathPrefix","value":"/b"}}}}],"backendRefs":[{{"name":"multi.svc","port":80}}]}}
+                ]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],"rules":[{{"backendRefs":[{{"name":"multi.svc","port":80}}]}}]}}],
+            "tlsRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"p"}}],"hostnames":["s.example.com"],"rules":[{{"backendRefs":[{{"name":"multi.svc","port":80}}]}}]}}]
+        }}"#,
+            b = http_backend
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Strict used to look every backend up twice (a pre-check, then the
+    /// build), and the build once per rule x hostname x listener.
+    #[test]
+    fn each_backend_name_is_looked_up_once_per_build() {
+        let config = shared_backend_config("multi.svc");
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["multi.svc:80"]);
+        let rule = rt
+            .find_http_route("y.example.com", "GET", "/a", &[], "", 8081)
+            .unwrap();
+        assert_eq!(rule.backends.len(), 2);
+        assert_eq!(rt.find_tcp_backends(5432).unwrap().len(), 2);
+    }
+
+    /// A redirect rule never forwards: its backendRefs are not looked up,
+    /// and it carries no backend for health to probe. A dead name beside a
+    /// redirect failed a strict build.
+    #[test]
+    fn a_redirect_rule_leaves_its_backend_refs_alone() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name":"g"}],
+                "hostnames": ["r.example.com"],
+                "rules": [{"filters":[{"type":"RequestRedirect","requestRedirect":{"scheme":"https"}}],
+                           "backendRefs":[{"name":"dead.svc","port":80}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let rt = built.unwrap();
+        assert_eq!(calls, Vec::<String>::new());
+        let rule = rt
+            .find_http_route("r.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(rule.backends.is_empty());
+    }
+
+    #[test]
+    fn strict_build_fails_on_a_dead_backend_lenient_skips_it() {
+        let config = shared_backend_config("dead.svc");
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let err = built.unwrap_err().to_string();
+        assert!(
+            err.starts_with("HTTP backend dead.svc:80 failed to resolve: NXDOMAIN"),
+            "{err}"
+        );
+        assert_eq!(calls, vec!["dead.svc:80"]);
+
+        let (built, calls) = build_with_fake_dns(&config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        assert_eq!(calls, vec!["dead.svc:80", "multi.svc:80"]);
+        let dead = rt
+            .find_http_route("x.example.com", "GET", "/a", &[], "", 8080)
+            .unwrap();
+        assert!(dead.backends.is_empty());
+        let live = rt
+            .find_http_route("x.example.com", "GET", "/b", &[], "", 8080)
+            .unwrap();
+        assert_eq!(live.backends.len(), 2);
+    }
+
+    /// The DNS refresh swaps the table when its signature changes, and the
+    /// signature counts mirror addresses: a resolver that only reorders a
+    /// mirror's records must not change it.
+    #[test]
+    fn a_mirror_keeps_its_address_when_dns_reorders_records() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["m.example.com"],
+                "rules": [{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "filters":[{"type":"RequestMirror","requestMirror":{"backendRef":{"name":"mirror.svc","port":9999}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let build = |order: [[u8; 4]; 2]| {
+            let mut lookup = |name: &str, port| -> anyhow::Result<Vec<std::net::SocketAddr>> {
+                Ok(match name.parse::<std::net::IpAddr>() {
+                    Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+                    Err(_) => order.map(|ip| (ip, port).into()).to_vec(),
+                })
+            };
+            config
+                .build_route_table(super::BuildPolicy::Lenient, &mut lookup)
+                .unwrap()
+        };
+        let one = build([[10, 0, 0, 2], [10, 0, 0, 1]]);
+        let other = build([[10, 0, 0, 1], [10, 0, 0, 2]]);
+        assert_eq!(one.dns_signature(), other.dns_signature());
+        let rule = one
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(
+            matches!(&rule.filters[..], [crate::routing::HttpFilter::RequestMirror { backend_addr, .. }]
+                if *backend_addr == ([10, 0, 0, 1], 9999).into()),
+            "{:?}",
+            rule.filters
+        );
+    }
+
+    /// An ExternalName endpoint took the resolver's first address: an answer
+    /// that only reordered the set changed the table and its signature, and
+    /// the DNS refresh swapped the table on most ticks.
+    #[test]
+    fn an_external_name_keeps_its_address_while_its_set_stands() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["x.example.com", "y.example.com"],
+                "rules": [{"backendRefs":[{"name":"ext.default.svc","port":443}]}]
+            }]
+        }"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.endpoint_overrides.insert(
+            ("ext.default.svc".to_string(), 443),
+            vec![("api.example.org".to_string(), 443)],
+        );
+        let build = |answer: &[u8]| {
+            let mut lookup = |name: &str, port| -> anyhow::Result<Vec<std::net::SocketAddr>> {
+                assert_eq!(name, "api.example.org");
+                Ok(answer
+                    .iter()
+                    .map(|&i| ([10, 0, 0, i], port).into())
+                    .collect())
+            };
+            config
+                .build_route_table(super::BuildPolicy::Lenient, &mut lookup)
+                .unwrap()
+        };
+        let picked = |rt: &crate::routing::RouteTable| {
+            rt.find_http_route("y.example.com", "GET", "/", &[], "", 8080)
+                .unwrap()
+                .backends[0]
+                .socket_addr
+        };
+
+        let table = build(&[1, 2, 3]);
+        for order in [[2, 3, 1], [3, 1, 2], [3, 2, 1]] {
+            let reordered = build(&order);
+            assert_eq!(picked(&reordered), picked(&table), "{order:?}");
+            assert_eq!(reordered.dns_signature(), table.dns_signature());
+        }
+
+        let std::net::IpAddr::V4(ip) = picked(&table).ip() else {
+            unreachable!()
+        };
+        let rest: Vec<u8> = [1, 2, 3]
+            .into_iter()
+            .filter(|&i| i != ip.octets()[3])
+            .collect();
+        let moved = build(&rest);
+        assert_ne!(picked(&moved), picked(&table), "the picked address left");
+        assert_ne!(moved.dns_signature(), table.dns_signature());
+    }
+
+    /// A mirror DNS cannot resolve used to fail the whole lenient build, so
+    /// every route of the Gateway stopped updating.
+    #[test]
+    fn mirror_dns_miss_drops_the_mirror_and_keeps_the_route() {
+        let json = r#"{
+            "gateway": {"name":"g","listeners":[{"name":"h","protocol":"HTTP","port":8080}]},
+            "httpRoutes": [{
+                "hostnames": ["m.example.com"],
+                "rules": [{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],
+                           "filters":[{"type":"RequestMirror","requestMirror":{"backendRef":{"name":"dead.svc","port":9999}}}],
+                           "backendRefs":[{"name":"127.0.0.1","port":8001}]}]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+
+        let (built, _) = build_with_fake_dns(&config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        let rule = rt
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert_eq!(rule.backends.len(), 1);
+        assert!(rule.filters.is_empty(), "{:?}", rule.filters);
+
+        let (built, _) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let err = built.unwrap_err().to_string();
+        assert!(
+            err.starts_with("RequestMirror backend dead.svc:9999 failed to resolve"),
+            "{err}"
+        );
+    }
+
+    /// Backend `name:5432` behind a TCP, a UDP and a TLS passthrough route,
+    /// and mirrored from an HTTP route.
+    fn l4_and_mirror_config(name: &str) -> PortailConfig {
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"h","protocol":"HTTP","port":8080}},
+                {{"name":"t","protocol":"TCP","port":5432}},
+                {{"name":"u","protocol":"UDP","port":5353}},
+                {{"name":"p","protocol":"TLS","port":8443,"tls":{{"mode":"Passthrough"}}}}]}},
+            "httpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"h"}}],"hostnames":["m.example.com"],
+                "rules":[{{"filters":[{{"type":"RequestMirror","requestMirror":{{"backendRef":{{"name":"{name}","port":5432}}}}}}],
+                          "backendRefs":[{{"name":"127.0.0.1","port":8001}}]}}]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}],
+            "udpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"u"}}],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}],
+            "tlsRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"p"}}],"hostnames":["s.example.com"],"rules":[{{"backendRefs":[{{"name":"{name}","port":5432}}]}}]}}]
+        }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// The addresses each route kind of [`l4_and_mirror_config`] dials.
+    fn dialed(config: &PortailConfig) -> Vec<(&'static str, Vec<std::net::SocketAddr>)> {
+        let (built, _) = build_with_fake_dns(config, super::BuildPolicy::Lenient);
+        let rt = built.unwrap();
+        let addrs = |b: &[crate::routing::Backend]| b.iter().map(|b| b.socket_addr).collect();
+        let rule = rt
+            .find_http_route("m.example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        let mirror = rule
+            .filters
+            .iter()
+            .filter_map(|f| match f {
+                crate::routing::HttpFilter::RequestMirror { backend_addr, .. } => {
+                    Some(*backend_addr)
+                }
+                _ => None,
+            })
+            .collect();
+        vec![
+            ("TCP", addrs(rt.find_tcp_backends(5432).unwrap())),
+            ("UDP", addrs(rt.find_udp_backends(5353).unwrap())),
+            (
+                "TLS",
+                addrs(&rt.tls_scopes[&8443][0].exact["s.example.com"]),
+            ),
+            ("mirror", mirror),
+        ]
+    }
+
+    /// Only HTTP backends heeded the Service facts DNS cannot give: L4
+    /// routes and mirrors dialed a headless Service's pods on the service
+    /// port, and looked an ExternalName Service's own name up.
+    #[test]
+    fn every_route_kind_and_mirrors_reach_a_service_alike() {
+        let pod = |last: u8, port| std::net::SocketAddr::from(([10, 0, 0, last], port));
+
+        let mut headless = l4_and_mirror_config("multi.svc");
+        headless
+            .headless_target_ports
+            .insert(("multi.svc".to_string(), 5432), 15432);
+        for (kind, addrs) in dialed(&headless) {
+            let want = match kind {
+                "mirror" => vec![pod(1, 15432)],
+                _ => vec![pod(1, 15432), pod(2, 15432)],
+            };
+            assert_eq!(addrs, want, "{kind}");
+        }
+
+        let mut external = l4_and_mirror_config("ext.default.svc");
+        external.endpoint_overrides.insert(
+            ("ext.default.svc".to_string(), 5432),
+            vec![("multi.svc".to_string(), 5432)],
+        );
+        // One address of the set (see one_target), the same for every kind.
+        let picked = super::one_target(&[pod(1, 5432), pod(2, 5432)]).unwrap();
+        for (kind, addrs) in dialed(&external) {
+            assert_eq!(addrs, vec![picked], "{kind}");
+        }
     }
 }

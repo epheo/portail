@@ -16,8 +16,9 @@ impl ListenerScope {
         }
     }
 
-    /// Add a route to this listener scope.
-    fn add_route(&mut self, route_host: &str, mut rule: HttpRouteRule) {
+    /// Append a route to its host entry, unordered: the caller sorts the
+    /// returned entry, or every entry once after a batch.
+    fn push_route(&mut self, route_host: &str, mut rule: HttpRouteRule) -> &mut HostEntry {
         // Pre-compute metadata to avoid per-request work
         rule.has_filters =
             !rule.filters.is_empty() || rule.backends.iter().any(|b| !b.filters.is_empty());
@@ -44,8 +45,7 @@ impl ListenerScope {
                 .catch_all_http_routes
                 .get_or_insert_with(|| Vec::with_capacity(8));
             host_entry.push(rule);
-            RouteTable::sort_rules(host_entry);
-            return;
+            return host_entry;
         }
 
         // Wildcard hosts (*.example.com) are stored by their parent domain
@@ -56,9 +56,15 @@ impl ListenerScope {
         };
 
         let host_entry = map.entry(key).or_insert_with(|| Vec::with_capacity(8));
-
         host_entry.push(rule);
-        RouteTable::sort_rules(host_entry);
+        host_entry
+    }
+
+    fn host_entries_mut(&mut self) -> impl Iterator<Item = &mut HostEntry> {
+        self.http_routes
+            .values_mut()
+            .chain(self.wildcard_http_routes.values_mut())
+            .chain(self.catch_all_http_routes.iter_mut())
     }
 }
 
@@ -66,48 +72,55 @@ impl RouteTable {
     pub fn new() -> Self {
         Self {
             listener_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
+            shared_scopes: Vec::new(),
+            shared_on_every_port: true,
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
-            tls_routes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
-            wildcard_tls_routes: FnvHashMap::with_capacity_and_hasher(8, Default::default()),
+            tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
         }
     }
 
-    /// Order-independent fingerprint of every backend socket address in the table.
+    /// Order-independent fingerprint of every backend and mirror socket
+    /// address in the table.
     ///
     /// The DNS-refresh task re-resolves and rebuilds the table on an interval but
     /// swaps it only when this signature changes, so a churny resolver that merely
     /// reorders records (or returns an unchanged set) costs nothing. `wrapping_add`
     /// (commutative, and unlike XOR does not cancel duplicate addresses) makes the
     /// fold independent of record order across rules and route kinds.
+    /// Mirrors count too: a build drops a mirror DNS cannot resolve, and only
+    /// a changed signature brings it back once it resolves.
     pub fn dns_signature(&self) -> u64 {
-        let http_backends = self.listener_scopes.values().flatten().flat_map(|scope| {
+        let http_rules = self.http_scopes().flat_map(|scope| {
             scope
                 .http_routes
                 .values()
                 .chain(scope.wildcard_http_routes.values())
                 .chain(scope.catch_all_http_routes.iter())
                 .flat_map(|he| he.iter())
-                .flat_map(|rule| rule.backends.iter())
+        });
+        let http_addrs = http_rules.flat_map(|rule| {
+            let mirrors = rule.filters.iter().filter_map(|f| match f {
+                HttpFilter::RequestMirror { backend_addr, .. } => Some(*backend_addr),
+                _ => None,
+            });
+            rule.backends.iter().map(|b| b.socket_addr).chain(mirrors)
         });
         let l4_backends = self
             .tcp_routes
             .values()
             .chain(self.udp_routes.values())
             .chain(
-                self.tls_routes
+                self.tls_scopes
                     .values()
-                    .flat_map(|by_host| by_host.values()),
+                    .flatten()
+                    .flat_map(TlsScope::backends),
             )
-            .chain(
-                self.wildcard_tls_routes
-                    .values()
-                    .flat_map(|by_host| by_host.values()),
-            )
-            .flatten();
-        http_backends
+            .flatten()
+            .map(|b| b.socket_addr);
+        http_addrs
             .chain(l4_backends)
-            .map(|b| backend_addr_hash(&b.socket_addr))
+            .map(|addr| backend_addr_hash(&addr))
             .fold(0u64, |acc, h| acc.wrapping_add(h))
     }
 
@@ -120,102 +133,177 @@ impl RouteTable {
         route_host: &str,
         rule: HttpRouteRule,
     ) {
+        let host_entry = self
+            .scope_mut(listener_port, listener_hostname)
+            .push_route(route_host, rule);
+        Self::sort_rules(host_entry);
+    }
+
+    /// [`Self::add_http_route_for_listener`] for a batch: entries stay
+    /// unordered until [`Self::sort_http_routes`] runs once after the last
+    /// push. Sorting per insert made a table build quadratic in rules per host.
+    pub(crate) fn push_http_route_for_listener(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+        route_host: &str,
+        rule: HttpRouteRule,
+    ) {
+        self.scope_mut(listener_port, listener_hostname)
+            .push_route(route_host, rule);
+    }
+
+    /// Order every host entry by match precedence. The sort is stable, so
+    /// equal rules keep their push order.
+    pub(crate) fn sort_http_routes(&mut self) {
+        let own = self
+            .listener_scopes
+            .values_mut()
+            .flat_map(|p| &mut p.scopes);
+        for scope in own.chain(&mut self.shared_scopes) {
+            for host_entry in scope.host_entries_mut() {
+                Self::sort_rules(host_entry);
+            }
+        }
+    }
+
+    fn scope_mut(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+    ) -> &mut ListenerScope {
         // Scopes store lowercase hostnames (see ListenerScope::new), so
         // normalize before matching an existing scope.
         let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
-        let scopes = self.listener_scopes.entry(listener_port).or_default();
-        let scope = match scopes
-            .iter_mut()
-            .find(|s| s.listener_hostname == normalized)
+        let scopes = match listener_port {
+            0 => &mut self.shared_scopes,
+            port => &mut self.listener_scopes.entry(port).or_default().scopes,
+        };
+        match scopes
+            .iter()
+            .position(|s| s.listener_hostname == normalized)
         {
-            Some(s) => s,
+            Some(i) => &mut scopes[i],
             None => {
                 scopes.push(ListenerScope::new(listener_port, normalized));
                 scopes.last_mut().unwrap()
             }
-        };
-
-        scope.add_route(route_host, rule);
+        }
     }
 
-    /// Convenience: add an HTTP route to a default catch-all scope on port 0.
-    /// Used by tests and benchmarks.
+    /// Serve the shared (port-0) scopes on `ports` only, and on no other
+    /// port.
+    pub(crate) fn share_any_port_scopes_on(&mut self, ports: impl IntoIterator<Item = u16>) {
+        self.shared_on_every_port = false;
+        for port in ports {
+            self.listener_scopes.entry(port).or_default().shared = true;
+        }
+    }
+
+    /// Convenience: add an HTTP route to a default catch-all scope on port 0,
+    /// which every port shares. Used by tests and benchmarks.
     #[allow(dead_code)]
     pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
         self.add_http_route_for_listener(0, None, host, rule);
     }
 
     fn sort_rules(rules: &mut [HttpRouteRule]) {
-        // Sort by specificity (most specific first):
-        // 1. Method presence (rules with method match first)
-        // 2. Path type: exact > regex > prefix
-        // 3. Path length (longer first)
-        // 4. Header matcher count (more matchers = higher priority)
-        // 5. Query param matcher count (more matchers = higher priority)
-        rules.sort_by(|a, b| {
-            // 1. Path match type: exact > regex > prefix
-            fn rank(t: &PathMatchType) -> u8 {
-                match t {
-                    PathMatchType::Exact => 0,
-                    PathMatchType::RegularExpression => 1,
-                    PathMatchType::Prefix => 2,
-                }
-            }
-            let r = rank(&a.path_match_type).cmp(&rank(&b.path_match_type));
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
+        rules.sort_by(match_precedence);
+    }
 
-            // 2. Path length (longer = more specific = higher priority)
-            let r = b.path.len().cmp(&a.path.len());
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
+    /// The first registration of a port wins and later ones return false:
+    /// callers add routes in precedence order, as for HTTP ties.
+    pub fn add_tcp_route(&mut self, port: u16, backends: Vec<Backend>) -> bool {
+        insert_first(&mut self.tcp_routes, port, backends)
+    }
 
-            // 3. Method match presence (rules with method > rules without)
-            let am = a.method_match.is_some() as u8;
-            let bm = b.method_match.is_some() as u8;
-            let r = bm.cmp(&am);
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
+    /// First registration wins, as for TCP.
+    pub fn add_udp_route(&mut self, port: u16, backends: Vec<Backend>) -> bool {
+        insert_first(&mut self.udp_routes, port, backends)
+    }
 
-            // 4. Header matcher count (more matchers = higher priority)
-            let r = b.header_matches.len().cmp(&a.header_matches.len());
-            if r != std::cmp::Ordering::Equal {
-                return r;
-            }
+    /// [`Self::add_tls_route_for_listener`] on the port's listener without
+    /// a hostname. Port 0: every passthrough listener's shared routes.
+    pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) -> bool {
+        self.add_tls_route_for_listener(port, None, hostname, backends)
+    }
 
-            // 5. Query param matcher count
+    /// Register a TLS passthrough route for `route_host` (`*` for any SNI,
+    /// and none) within the listener on `port` with `listener_hostname`.
+    /// The first registration of a hostname in a listener wins, as for TCP.
+    pub fn add_tls_route_for_listener(
+        &mut self,
+        port: u16,
+        listener_hostname: Option<&str>,
+        route_host: &str,
+        backends: Vec<Backend>,
+    ) -> bool {
+        let listener_hostname = listener_hostname.map(str::to_ascii_lowercase);
+        let scopes = self.tls_scopes.entry(port).or_default();
+        let scope = match scopes
+            .iter()
+            .position(|s| s.listener_hostname == listener_hostname)
+        {
+            Some(i) => &mut scopes[i],
+            None => {
+                scopes.push(TlsScope {
+                    listener_hostname,
+                    ..TlsScope::default()
+                });
+                scopes.last_mut().unwrap()
+            }
+        };
+        let host_lower = route_host.to_ascii_lowercase();
+        if host_lower == "*" {
+            if scope.catch_all.is_some() {
+                return false;
+            }
+            scope.catch_all = Some(backends);
+            return true;
+        }
+        let (by_host, host_key) = match host_lower.strip_prefix("*.") {
+            Some(parent) => (&mut scope.wildcard, parent.to_string()),
+            None => (&mut scope.exact, host_lower),
+        };
+        insert_first(by_host, host_key, backends)
+    }
+}
+
+/// Which of two rules matching one request takes it, most specific first:
+/// Exact path, then regex, then prefix; the longer path; a method match;
+/// more header matches; more query param matches. `Equal` leaves the tie
+/// to route order.
+pub(super) fn match_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp::Ordering {
+    fn rank(t: &PathMatchType) -> u8 {
+        match t {
+            PathMatchType::Exact => 0,
+            PathMatchType::RegularExpression => 1,
+            PathMatchType::Prefix => 2,
+        }
+    }
+    rank(&a.path_match_type)
+        .cmp(&rank(&b.path_match_type))
+        .then_with(|| b.path.len().cmp(&a.path.len()))
+        .then_with(|| b.method_match.is_some().cmp(&a.method_match.is_some()))
+        .then_with(|| b.header_matches.len().cmp(&a.header_matches.len()))
+        .then_with(|| {
             b.query_param_matches
                 .len()
                 .cmp(&a.query_param_matches.len())
-        });
-    }
+        })
+}
 
-    pub fn add_tcp_route(&mut self, port: u16, backends: Vec<Backend>) {
-        self.tcp_routes.insert(port, backends);
-    }
-
-    pub fn add_udp_route(&mut self, port: u16, backends: Vec<Backend>) {
-        self.udp_routes.insert(port, backends);
-    }
-
-    /// Register a TLS passthrough route on a listener port. Port 0 means
-    /// any-port (file-based configs without gateway context).
-    pub fn add_tls_route(&mut self, port: u16, hostname: &str, backends: Vec<Backend>) {
-        let host_lower = hostname.to_ascii_lowercase();
-        if let Some(stripped) = host_lower.strip_prefix("*.") {
-            self.wildcard_tls_routes
-                .entry(port)
-                .or_default()
-                .insert(stripped.to_string(), backends);
-        } else {
-            self.tls_routes
-                .entry(port)
-                .or_default()
-                .insert(host_lower, backends);
+fn insert_first<K: std::hash::Hash + Eq>(
+    map: &mut FnvHashMap<K, Vec<Backend>>,
+    key: K,
+    backends: Vec<Backend>,
+) -> bool {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(backends);
+            true
         }
+        std::collections::hash_map::Entry::Occupied(_) => false,
     }
 }
 
@@ -232,7 +320,7 @@ impl Default for RouteTable {
 /// the STRICT_DNS contract: a headless Service publishes one A-record per ready
 /// pod at `<svc>.<ns>.svc`, a ClusterIP Service one VIP, an ExternalName a
 /// CNAME chain. Errors if a DNS name resolves to nothing.
-pub(super) fn resolve_socket_addrs(address: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn resolve_socket_addrs(address: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
@@ -279,7 +367,21 @@ impl Backend {
             filters: vec![],
             use_tls: false,
             server_name: address,
+            action: BackendAction::Forward,
         })
+    }
+
+    /// The stand-in for an invalid backendRef: see [`BackendAction::Reject`].
+    /// The address is unspecified and never dialed.
+    pub fn rejecting(weight: u32) -> Self {
+        Self {
+            socket_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            weight,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: BackendAction::Reject,
+        }
     }
 
     /// Resolve to one backend per resolved address (STRICT_DNS-style multi-A).
@@ -300,7 +402,111 @@ impl Backend {
                 filters: vec![],
                 use_tls: false,
                 server_name: address.clone(),
+                action: BackendAction::Forward,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every host entry as (path, insertion tag), keyed for comparison.
+    fn entries(table: &RouteTable) -> Vec<(String, Vec<(String, u64)>)> {
+        let mut out = Vec::new();
+        for scope in table.http_scopes() {
+            let keyed = scope
+                .http_routes
+                .iter()
+                .chain(scope.wildcard_http_routes.iter())
+                .map(|(k, v)| (k.clone(), v))
+                .chain(scope.catch_all_http_routes.iter().map(|v| ("*".into(), v)));
+            for (key, rules) in keyed {
+                let rules = rules
+                    .iter()
+                    .map(|r| (r.path.clone(), r.request_timeout.unwrap().as_secs()))
+                    .collect();
+                out.push((key, rules));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// One sort after the batch gives the order a sort per insert gave,
+    /// ties included.
+    #[test]
+    fn batch_push_then_one_sort_matches_ordered_inserts() {
+        let paths = ["/", "/a", "/a/b", "/b", "/a/b/c", "/c", "/a", "/"];
+        let mut ordered = RouteTable::new();
+        let mut batch = RouteTable::new();
+        for (tag, path) in paths.iter().enumerate() {
+            for host in ["x.example.com", "*.example.com", "*"] {
+                let mut rule = HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    path.to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                rule.request_timeout = Some(Duration::from_secs(tag as u64));
+                ordered.add_http_route_for_listener(80, None, host, rule.clone());
+                batch.push_http_route_for_listener(80, None, host, rule);
+            }
+        }
+        batch.sort_http_routes();
+        let ordered = entries(&ordered);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].1[0], ("/a/b/c".to_string(), 4));
+        assert_eq!(entries(&batch), ordered);
+    }
+
+    #[test]
+    fn mirror_fraction_samples_its_exact_share() {
+        fastrand::seed(7);
+        let hits = |f: Fraction| (0..1_000_000).filter(|_| f.sample()).count();
+        let thousandth = hits(Fraction::new(1, 1000).unwrap());
+        assert!((800..1200).contains(&thousandth), "{thousandth}");
+        assert_eq!(hits(Fraction::ALL), 1_000_000);
+        assert_eq!(hits(Fraction::new(0, 100).unwrap()), 0);
+        assert_eq!(Fraction::new(50, 100), Fraction::new(1, 2));
+        assert_eq!(Fraction::new(0, 0), None);
+        assert_eq!(Fraction::new(2, 1), None);
+    }
+
+    /// A mirror the build dropped for a DNS miss comes back only through a
+    /// signature change once it resolves.
+    #[test]
+    fn dns_signature_covers_mirror_addresses() {
+        let signature = |mirror: Option<&str>| {
+            let filters = mirror
+                .map(|addr| HttpFilter::RequestMirror {
+                    backend_addr: addr.parse().unwrap(),
+                    fraction: Fraction::ALL,
+                })
+                .into_iter()
+                .collect();
+            let backend = Backend::new("127.0.0.1".to_string(), 8001).unwrap();
+            let mut table = RouteTable::new();
+            table.add_http_route(
+                "m.example.com",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    filters,
+                    vec![backend],
+                ),
+            );
+            table.dns_signature()
+        };
+        assert_ne!(signature(None), signature(Some("10.0.0.1:9999")));
+        assert_ne!(
+            signature(Some("10.0.0.1:9999")),
+            signature(Some("10.0.0.2:9999"))
+        );
     }
 }

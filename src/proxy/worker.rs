@@ -35,7 +35,7 @@ use crate::proxy::request_processor::{
     analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
     RequestMeta, RoutingResult,
 };
-use crate::proxy::tls::{self, Connection, DynamicTlsAcceptor};
+use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Continue reading from `client` into `buf` starting at offset `already_read`
@@ -332,8 +332,8 @@ pub struct ListenerCtx {
     pub server_port: u16,
     pub routes: Arc<ArcSwap<RouteTable>>,
     pub cfg: WorkerConfig,
-    pub tls_acceptor: Option<Arc<DynamicTlsAcceptor>>,
-    pub tls_passthrough: bool,
+    /// Read per connection: plain, or a TLS dispatch.
+    pub plan: crate::proxy::data_plane::PortPlan,
     pub health: Arc<HealthRegistry>,
     pub selector: Arc<BackendSelector>,
     pub active_connections: Arc<AtomicUsize>,
@@ -346,8 +346,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
         server_port,
         routes,
         cfg,
-        tls_acceptor,
-        tls_passthrough,
+        plan,
         health,
         selector,
         active_connections,
@@ -385,19 +384,11 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                             debug!("TCP keepalive setup failed for {}: {}", peer, _e);
                         }
                         let routes = routes.clone();
-                        let acceptor = tls_acceptor.clone();
                         let health = health.clone();
                         let conn_guard =
                             ConnGuard::new(active_connections.clone(), listener_stats.clone());
 
-                        if tls_passthrough && acceptor.is_none() {
-                            // Pure passthrough mode (no TLS termination cert available)
-                            let selector = selector.clone();
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
-                                let _ = handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
-                            });
-                        } else if let Some(acceptor) = acceptor {
+                        if let Some(tls) = plan.load_full() {
                             let selector = selector.clone();
                             let shared_pool = shared_pool.clone();
                             let listener_stats = listener_stats.clone();
@@ -407,7 +398,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
-                                    acceptor,
+                                    tls,
                                     server_port,
                                     routes,
                                     cfg,
@@ -457,17 +448,16 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     }
 }
 
-/// One accepted connection on a TLS-terminate listener.
-///
-/// First check whether this SNI should be passed through instead of
-/// terminated — that handles HTTPS/Terminate and TLS/Passthrough listeners
-/// sharing one port. Otherwise handshake, then dispatch by ALPN: h2 goes to
-/// the bridge, all else stays on the h1 path.
+/// One accepted connection on a TLS port: its SNI selects a listener by
+/// the port's plan, read at accept. A passthrough listener forwards the raw
+/// stream; an HTTPS one handshakes, then dispatches by ALPN: h2 goes to the
+/// bridge, all else stays on the h1 path. A connection no listener takes,
+/// or one that is not TLS, closes as a failed handshake.
 #[allow(clippy::too_many_arguments)]
 async fn serve_tls_connection(
     tcp_stream: TcpStream,
     peer: SocketAddr,
-    acceptor: Arc<DynamicTlsAcceptor>,
+    plan: Arc<TlsPlan>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     cfg: WorkerConfig,
@@ -477,28 +467,51 @@ async fn serve_tls_connection(
     listener_stats: Arc<ListenerStats>,
     drain: CancellationToken,
 ) {
-    // Peek ClientHello for SNI to decide dispatch mode, waiting out
-    // fragmented hellos.
-    let should_passthrough =
-        match crate::proxy::tls::peek_sni(&tcp_stream, cfg.client_header_timeout).await {
-            Some(hostname) => {
-                let rt = routes.load();
-                rt.has_tls_passthrough_route(&hostname, server_port)
-            }
-            None => false,
-        };
-
-    if should_passthrough {
-        let _ =
-            handle_tls_passthrough(tcp_stream, server_port, routes, health, selector, &cfg).await;
-        return;
+    let refuse = |_why: &str| {
+        METRICS.tls_handshake_failures_total.inc();
+        listener_stats.tls_handshake_failures.inc();
+        debug!("TLS connection from {} closed: {}", peer, _why);
+    };
+    // Waits out fragmented hellos.
+    let mut sni = match tls::peek_client_hello(&tcp_stream, cfg.client_header_timeout).await {
+        Hello::Sni(sni) => Some(sni),
+        Hello::Nameless => None,
+        Hello::Unreadable => return refuse("no ClientHello"),
+    };
+    // In place: the peek already allocated it.
+    if let Some(sni) = sni.as_mut() {
+        sni.make_ascii_lowercase();
     }
+    let Some(listener) = plan.select(sni.as_deref()) else {
+        return refuse("no listener takes its SNI");
+    };
+    let config = match listener.kind {
+        TlsKind::Passthrough => {
+            let _ = handle_tls_passthrough(
+                tcp_stream,
+                sni.as_deref(),
+                listener.hostname.as_deref(),
+                server_port,
+                routes,
+                health,
+                selector,
+                &cfg,
+            )
+            .await;
+            return;
+        }
+        TlsKind::NoCert => return refuse("its listener's certs failed to load"),
+        TlsKind::Terminate => match &plan.terminate {
+            Some(config) => config.clone(),
+            None => return refuse("its port's certs failed to load"),
+        },
+    };
 
     // Bound the handshake: a client that stalls mid-handshake would
     // otherwise pin this task (and its buffers) forever.
     let tls_stream = match tokio::time::timeout(
         cfg.client_header_timeout,
-        acceptor.acceptor().accept(tcp_stream),
+        tokio_rustls::TlsAcceptor::from(config).accept(tcp_stream),
     )
     .await
     {
@@ -671,10 +684,6 @@ async fn serve_http(
                 rule,
                 meta,
             } => {
-                // Per-vhost sample (rule carries its route hostname's registry
-                // slot) + the per-listener aggregate.
-                rule.requests.fetch_add(1, Ordering::Relaxed);
-                state.listener_stats.http_requests.inc();
                 let limited = rule
                     .limiter
                     .as_ref()
@@ -694,13 +703,20 @@ async fn serve_http(
                         return Ok(Handoff::Close);
                     }
                     pipelined_tail(&buf[..n])
-                } else {
+                } else if let Some(framing) = Framing::of(&buf[..n], &meta) {
+                    // After the limiter and the framing: a 429 or a malformed
+                    // body is no dispatch. Per-vhost sample (the rule carries
+                    // its route hostname's registry slot) + the per-listener
+                    // aggregate.
+                    rule.requests.fetch_add(1, Ordering::Relaxed);
+                    state.listener_stats.http_requests.inc();
                     // proxy_http_request owns all timing for the request lifecycle —
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
                     let backend_addr = backend.socket_addr;
                     let (keep, leftover) =
-                        proxy_http_request(client, buf, n, backend, rule, &meta, state).await?;
+                        proxy_http_request(client, buf, framing, backend, rule, &meta, state)
+                            .await?;
                     if !meta.is_upgrade {
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
@@ -711,6 +727,19 @@ async fn serve_http(
                         return Ok(Handoff::Close);
                     }
                     leftover
+                } else {
+                    // Refused as a malformed head is: where the body ends is
+                    // unknown, so the connection closes.
+                    METRICS.http_requests_rejected_total.inc();
+                    let reply = LocalReply {
+                        status: 400,
+                        location: None,
+                        reusable: false,
+                        client_done: false,
+                        head: meta.is_head,
+                    };
+                    send_local_reply(client, state, &reply, access).await?;
+                    return Ok(Handoff::Close);
                 }
             }
             RoutingResult::LocalReply(mut reply) => {
@@ -956,6 +985,48 @@ async fn complete_headers(
     }
 }
 
+/// Where a request ends within the bytes read with its head, by its own
+/// framing, upgrade or not. Bytes past the end must never reach the backend
+/// as body (a desync/smuggling vector: the backend would parse them as a
+/// second request and answer it, poisoning the pooled connection). They are
+/// held back as leftover: the next pipelined request for the keepalive loop,
+/// or early tunnel bytes once the backend accepts an upgrade.
+struct Framing {
+    read: usize,
+    header_end: usize,
+    end: usize,
+    /// Carries on past what was read.
+    chunked: Option<ChunkedStream>,
+}
+
+impl Framing {
+    /// `None` when the chunked body read so far is malformed: settled before
+    /// the request is dispatched, so it costs no backend connection.
+    fn of(read: &[u8], meta: &RequestMeta) -> Option<Self> {
+        let header_end = find_header_end(read).unwrap_or(read.len());
+        let tail = &read[header_end..];
+        let (end, chunked) = if let Some(cl) = meta.content_length {
+            (header_end + tail.len().min(cl), None)
+        } else if meta.is_chunked {
+            let mut stream = ChunkedStream::new();
+            let consumed = stream.observe(tail);
+            if stream.is_broken() {
+                return None;
+            }
+            (header_end + consumed, Some(stream))
+        } else {
+            // No declared body: the entire tail is the next pipelined request.
+            (header_end, None)
+        };
+        Some(Self {
+            read: read.len(),
+            header_end,
+            end,
+            chunked,
+        })
+    }
+}
+
 /// Proxy a single HTTP request to a backend and forward the response.
 /// Returns `(keep, leftover)`: `keep` when the response went out whole and
 /// its head announced keep-alive, which the client may already act on;
@@ -979,7 +1050,7 @@ async fn complete_headers(
 async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
-    request_bytes: usize,
+    framing: Framing,
     backend_ref: &crate::routing::Backend,
     rule: &HttpRouteRule,
     meta: &RequestMeta,
@@ -1004,32 +1075,13 @@ async fn proxy_http_request(
     // keepalive response's status to the access log.
     state.last_status = 0;
 
-    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-
-    // Determine where THIS request ends within the bytes already read, from
-    // its own framing, upgrade or not. Bytes past that boundary must never
-    // reach the backend as body (a desync/smuggling vector: the backend
-    // would parse them as a second request and answer it, poisoning the
-    // pooled connection). They are held back as `leftover`: the next
-    // pipelined request for the keepalive loop, or early tunnel bytes once
-    // the backend accepts an upgrade. Settled before connecting, so a
-    // malformed body costs no backend connection.
+    let Framing {
+        read: request_bytes,
+        header_end: req_header_end,
+        end: request_end,
+        chunked: req_chunked,
+    } = framing;
     let tail_len = request_bytes - req_header_end;
-    let (request_end, req_chunked) = if let Some(cl) = meta.content_length {
-        (req_header_end + tail_len.min(cl), None)
-    } else if meta.is_chunked {
-        let mut stream = ChunkedStream::new();
-        let consumed = stream.observe(&buf[req_header_end..request_bytes]);
-        if stream.is_broken() {
-            state.refused(400);
-            send_error_response(client, 400).await?;
-            return Ok((false, None));
-        }
-        (req_header_end + consumed, Some(stream))
-    } else {
-        // No declared body: the entire tail is the next pipelined request.
-        (req_header_end, None)
-    };
     // Capture the held tail now: the response phase reuses `buf` as scratch
     // for backend reads and would overwrite it.
     let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
@@ -1553,9 +1605,11 @@ fn build_outgoing_headers(
     state: &mut ConnectionState,
 ) {
     let raw = &buf[..req_header_end];
+    let normalized = meta.normalized_path.as_deref().map(str::as_bytes);
     if meta.strip_spans.needs_slow_path {
         assemble_forward_headers_slow(
             raw,
+            normalized,
             meta.is_upgrade,
             state.peer_ip,
             state.is_tls,
@@ -1564,6 +1618,7 @@ fn build_outgoing_headers(
     } else {
         assemble_forward_headers(
             raw,
+            normalized,
             &meta.strip_spans,
             meta.upgrade_span,
             meta.is_upgrade,
@@ -1576,20 +1631,16 @@ fn build_outgoing_headers(
     // The backend is an origin server, sent origin-form only (RFC 9112
     // 3.2.1). Before filters, so a URLRewrite or set Host meets the same
     // head as for an origin-form request.
-    if let Some((target, authority)) = absolute_form_target(raw, meta.path_span) {
-        to_origin_form(&state.scratch_buf, target, authority, &mut state.filter_buf);
+    if let Some((path, authority)) = absolute_form_target(raw, meta.path_span) {
+        let path = normalized.unwrap_or(path);
+        to_origin_form(&state.scratch_buf, path, authority, &mut state.filter_buf);
         std::mem::swap(&mut state.scratch_buf, &mut state.filter_buf);
     }
 
     // has_filters already covers every backend's filters (see routing build).
     if rule.has_filters {
         let rule_mods = extract_header_mods(&rule.filters, false);
-        let request_path = meta
-            .path_span
-            .and_then(|(s, e)| raw.get(s as usize..e as usize))
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("/");
-        let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, request_path);
+        let url_rewrite = extract_url_rewrite(&rule.filters, &rule.path, meta.path(raw));
         let backend_mods = extract_header_mods(&backend_ref.filters, false);
         if rule_mods.is_some() || url_rewrite.is_some() || backend_mods.is_some() {
             apply_request_header_modifications(
@@ -2392,37 +2443,26 @@ fn clamp_to_deadline(budget: Duration, deadline: Option<std::time::Instant>) -> 
     }
 }
 
-/// L4 TLS passthrough: peek ClientHello for SNI, then forward raw TCP to backend.
+/// L4 TLS passthrough of a connection whose ClientHello was peeked for its
+/// `sni` (lowercase), which selected the passthrough listener with
+/// hostname `listener`: forward raw TCP to its route's backend.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tls_passthrough(
     client: TcpStream,
+    sni: Option<&str>,
+    listener: Option<&str>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
     cfg: &WorkerConfig,
 ) -> Result<()> {
-    let peek_timeout = cfg.client_header_timeout;
-    let hostname = match tls::peek_sni(&client, peek_timeout).await {
-        Some(h) => h,
-        None => {
-            return Err(anyhow::anyhow!(
-                "TLS passthrough: no complete ClientHello with SNI within {:?}, cannot route",
-                peek_timeout
-            ))
-        }
-    };
-
     let route_table = routes.load();
     let backend_addr = route_table
-        .resolve_tls_passthrough(&hostname, server_port, &selector, &health)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "TLS passthrough: no route or no healthy backend for SNI '{}'",
-                hostname
-            )
-        })?;
+        .resolve_tls_passthrough(sni, server_port, listener, &selector, &health)
+        .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
 
-    // peek_sni consumed nothing, so the ClientHello is still on the socket:
+    // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
     client.set_nodelay(true)?;
     handle_tcp_connection(
@@ -2821,6 +2861,7 @@ mod connection_tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );
@@ -2948,6 +2989,7 @@ mod connection_tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
                 }],
             ),
         );
@@ -3024,7 +3066,7 @@ mod connection_tests {
     async fn absolute_form_takes_a_path_prefix_rewrite() {
         let rewrite = vec![HttpFilter::URLRewrite {
             hostname: None,
-            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".to_string())),
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
         }];
         let seen = forwarded_head(
             |addr| filtered_route("p.test", "/v1", rewrite, addr),
@@ -3033,6 +3075,95 @@ mod connection_tests {
         .await;
         assert!(seen.starts_with("GET /v2/users HTTP/1.1\r\n"), "{seen}");
         assert!(seen.contains("\r\nHost: p.test:8080\r\n"), "{seen}");
+    }
+
+    /// Routing matches the path a backend resolves dot-segments to, and the
+    /// backend gets that very path: the rule on `/admin` cannot be walked
+    /// around, whatever form the request comes in.
+    #[tokio::test]
+    async fn dot_segments_reach_the_rule_and_backend_of_their_path() {
+        let (_held, elsewhere) = refusing_backend();
+        let guarded = move |admin| {
+            let mut rt = filtered_route("a.test", "/admin", vec![], admin);
+            rt.add_http_route(
+                "a.test",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![Backend {
+                        socket_addr: elsewhere,
+                        weight: 1,
+                        filters: vec![],
+                        use_tls: false,
+                        server_name: String::new(),
+                        action: crate::routing::BackendAction::Forward,
+                    }],
+                ),
+            );
+            rt
+        };
+        for (request, line) in [
+            (
+                "GET /public/../admin?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin?x=1 HTTP/1.1\r\n",
+            ),
+            (
+                "GET /public/%2E%2e/admin/./users HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin/users HTTP/1.1\r\n",
+            ),
+            (
+                "GET http://a.test/x/../admin?x HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /admin?x HTTP/1.1\r\n",
+            ),
+            // A Connection-nominated header takes the slow assembly path.
+            (
+                "GET /x/../admin HTTP/1.1\r\nHost: a.test\r\nConnection: X-Foo\r\nX-Foo: 1\r\n\r\n",
+                "GET /admin HTTP/1.1\r\n",
+            ),
+        ] {
+            let seen = forwarded_head(guarded, request).await;
+            assert!(seen.starts_with(line), "{request:?}: {seen}");
+        }
+    }
+
+    /// A prefix rewrite replaces the prefix of the path routing matched.
+    #[tokio::test]
+    async fn a_path_rewrite_applies_to_the_normalized_path() {
+        let rewrite = vec![HttpFilter::URLRewrite {
+            hostname: None,
+            path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
+        }];
+        let seen = forwarded_head(
+            |addr| filtered_route("p.test", "/v1", rewrite, addr),
+            "GET /v1/a/../b?q=1 HTTP/1.1\r\nHost: p.test\r\n\r\n",
+        )
+        .await;
+        assert!(seen.starts_with("GET /v2/b?q=1 HTTP/1.1\r\n"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_path_rewrite_keeps_the_query() {
+        for request in [
+            "GET /v1/users?id=7&x HTTP/1.1\r\nHost: p.test\r\n\r\n",
+            "GET http://p.test/v1/users?id=7&x HTTP/1.1\r\nHost: p.test\r\n\r\n",
+        ] {
+            let rewrite = vec![HttpFilter::URLRewrite {
+                hostname: None,
+                path: Some(URLRewritePath::ReplacePrefixMatch("/v2".into())),
+            }];
+            let seen = forwarded_head(
+                |addr| filtered_route("p.test", "/v1", rewrite, addr),
+                request,
+            )
+            .await;
+            assert!(
+                seen.starts_with("GET /v2/users?id=7&x HTTP/1.1\r\n"),
+                "{request:?}: {seen}"
+            );
+        }
     }
 
     /// The authority's Host is replaced by a `set Host`, never doubled.
@@ -3091,6 +3222,118 @@ mod connection_tests {
         assert!(seen.ends_with("\r\n\r\nHELDTUNNEL"), "{seen}");
     }
 
+    /// A client's first flight: a ClientHello naming `sni`.
+    fn client_hello(sni: &str) -> Vec<u8> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut hello = Vec::new();
+        conn.write_tls(&mut hello).unwrap();
+        hello
+    }
+
+    /// A passthrough connection that drew an invalid backendRef's share
+    /// was said to find no route or no healthy backend.
+    #[tokio::test]
+    async fn tls_passthrough_says_why_it_has_no_backend() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
+        let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
+        weightless.weight = 0;
+        rt.add_tls_route(0, "weightless.test", vec![weightless]);
+        rt.add_tls_route(0, "empty.test", vec![]);
+        let routes = Arc::new(ArcSwap::from_pointee(rt));
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for (sni, why) in [
+            ("rejected.test", "drew an invalid backendRef's share"),
+            ("weightless.test", "no backend with positive weight"),
+            ("empty.test", "no backends available"),
+            ("unrouted.test", "no route"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&client_hello(sni)).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let routes = Arc::clone(&routes);
+            let (health, selector) = (Arc::default(), Arc::default());
+            let err = handle_tls_passthrough(
+                server,
+                Some(sni),
+                None,
+                8443,
+                routes,
+                health,
+                selector,
+                &cfg,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(why), "{sni}: {err}");
+        }
+    }
+
+    /// A TLS connection no listener takes closes, counted as a failed
+    /// handshake: an SNI no listener names on a port without a catch-all, or
+    /// bytes that are not TLS. A passthrough socket dropped them uncounted.
+    #[tokio::test]
+    async fn an_unclaimed_tls_connection_closes_counted() {
+        let mut plan = TlsPlan::default();
+        plan.add(Some("named.test"), TlsKind::Passthrough);
+        let plan = Arc::new(plan);
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+        let cfg = WorkerConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for first_bytes in [
+            client_hello("other.test"),
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&first_bytes).await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let stats = Arc::new(ListenerStats::default());
+            serve_tls_connection(
+                server,
+                peer,
+                Arc::clone(&plan),
+                8443,
+                Arc::clone(&routes),
+                cfg,
+                Arc::default(),
+                Arc::default(),
+                None,
+                Arc::clone(&stats),
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(stats.tls_handshake_failures.get(), 1);
+            let read = client.read(&mut [0u8; 1]).await;
+            assert!(!matches!(read, Ok(n) if n > 0), "closed unanswered");
+        }
+    }
+
     /// A backend nothing should reach: the test holds the listener.
     async fn idle_backend() -> TcpListener {
         TcpListener::bind("127.0.0.1:0").await.unwrap()
@@ -3128,6 +3371,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             }],
         );
         rt
@@ -3335,6 +3579,7 @@ mod connection_tests {
                         filters: vec![],
                         use_tls: true,
                         server_name: sni.to_string(),
+                        action: crate::routing::BackendAction::Forward,
                     }],
                 ),
             );
@@ -3567,6 +3812,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             };
             // A conn whose peer is gone: the first write fails.
             let (dead, _) = tokio::io::duplex(1);
@@ -3625,6 +3871,7 @@ mod connection_tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                action: crate::routing::BackendAction::Forward,
             }],
         );
         rt
@@ -4070,6 +4317,55 @@ mod connection_tests {
         assert!(delivered(&mut rx).await.starts_with("GET /second "));
     }
 
+    /// The request counters count dispatches to a backend: a 429 counts
+    /// only as limited.
+    #[tokio::test]
+    async fn a_limited_request_counts_only_as_limited() {
+        let (addr, _rx) = backend(REFUSED).await;
+        let rule = |limiter| {
+            let mut rule = HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![Backend {
+                    socket_addr: addr,
+                    weight: 1,
+                    filters: vec![],
+                    use_tls: false,
+                    server_name: String::new(),
+                    action: crate::routing::BackendAction::Forward,
+                }],
+            );
+            rule.limiter = limiter;
+            rule
+        };
+        let mut rt = RouteTable::new();
+        // An empty bucket that never refills: every request is limited.
+        let empty = crate::rate_limit::limiter_for(0, "limited-count-test", 0, 0);
+        rt.add_http_route("limited.count.test", rule(Some(empty)));
+        rt.add_http_route("free.count.test", rule(None));
+        let state = conn_state(rt, false);
+        let stats = Arc::clone(&state.listener_stats);
+        let (mut client, _task) = serve_state(state);
+        let out = exchange(
+            &mut client,
+            b"GET / HTTP/1.1\r\nHost: limited.count.test\r\n\r\nGET / HTTP/1.1\r\nHost: free.count.test\r\n\r\n",
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("no"), "{out}");
+        assert_eq!(stats.rate_limited.get(), 1);
+        assert_eq!(stats.http_requests.get(), 1);
+        let host_count = |host| crate::metrics::host_requests_counter(host).load(Ordering::Relaxed);
+        assert_eq!(host_count("limited.count.test"), 0);
+        assert_eq!(host_count("free.count.test"), 1);
+    }
+
     #[tokio::test]
     async fn head_cut_short_by_eof_is_dropped() {
         let idle = idle_backend().await;
@@ -4104,6 +4400,28 @@ mod connection_tests {
         assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
         task.await.unwrap().unwrap();
         assert_never_connected(&idle).await;
+    }
+
+    /// No backend sees a body whose buffered chunked framing is broken:
+    /// its 400 counts as rejected, as a malformed head's does.
+    #[tokio::test]
+    async fn a_malformed_buffered_chunked_body_is_no_dispatch() {
+        let idle = idle_backend().await;
+        let state = conn_state(routes(idle.local_addr().unwrap()), false);
+        let stats = Arc::clone(&state.listener_stats);
+        let (mut client, task) = serve_state(state);
+        let rejected = || METRICS.http_requests_rejected_total.get();
+        let before = rejected();
+        let out = exchange(
+            &mut client,
+            b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\nzz\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&idle).await;
+        assert_eq!(stats.http_requests.get(), 0);
+        assert!(rejected() > before);
     }
 
     #[tokio::test]

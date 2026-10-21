@@ -5,12 +5,14 @@ use std::sync::Arc;
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
-use gateway_api::gateways::{Gateway, GatewayListeners};
+use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::httproutes::*;
 use gateway_api::referencegrants::ReferenceGrant;
 
 use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
+use crate::config::compile::compile_http_route;
 use crate::config::*;
 use crate::logging::warn;
 
@@ -55,17 +57,33 @@ pub(crate) trait GatewayRoute: Sized {
     type ParentRef: ParentRefAccess;
     type Config;
     const KIND: &'static str;
+    /// TCP and UDP listeners carry one route: their rules have no match to
+    /// choose between routes, so the oldest takes the listener
+    /// (Listener.allowedRoutes precedence) and later ones report Conflicted.
+    const ONE_ROUTE_PER_LISTENER: bool = false;
 
     fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
     fn route_namespace(&self) -> &str;
     fn identity(&self) -> (&str, Option<i64>);
+    fn uid(&self) -> Option<&str>;
+    fn creation_timestamp(&self) -> Option<&Time>;
     /// Default covers the hostname-less kinds (TCP/UDP).
     fn hostnames(&self) -> &[String] {
         &[]
     }
-    fn convert(&self, gateway_name: &str) -> Result<Self::Config>;
-    fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)>;
-    fn remove_invalid_backends(config: &mut Self::Config, invalid: &HashSet<(String, u16)>);
+    /// The converted config carries no parentRefs: see `attach`. `Err`
+    /// names a part the config could not represent and leaves out; every
+    /// backendRef is still in it.
+    fn convert(&self) -> (Self::Config, Result<(), RouteError>);
+    /// The table build's own check of a converted route: acceptance then
+    /// rejects, with the spec reason, every route the build would leave out.
+    fn check(_config: &Self::Config) -> Result<(), RouteError> {
+        Ok(())
+    }
+    /// The one source of attachment for the table: one ref per listener
+    /// the route was accepted on, never re-derived from the spec's refs.
+    fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>);
+    fn backend_refs_mut(config: &mut Self::Config) -> Vec<&mut BackendRef>;
     /// Mirror-filter backend refs (HTTPRoute only). Validated like forward
     /// refs, but an invalid mirror drops the filter instead of the backends:
     /// a mirror the route may not reference must not break primary traffic.
@@ -113,28 +131,24 @@ macro_rules! impl_gateway_route {
                     self.metadata.generation,
                 )
             }
-            fn convert(&self, gw: &str) -> Result<Self::Config> {
-                $cv(self, gw)
+            fn uid(&self) -> Option<&str> {
+                self.metadata.uid.as_deref()
             }
-            fn backend_refs(config: &Self::Config) -> Vec<(&str, u16, &str, &str)> {
+            fn creation_timestamp(&self) -> Option<&Time> {
+                self.metadata.creation_timestamp.as_ref()
+            }
+            fn convert(&self) -> (Self::Config, Result<(), RouteError>) {
+                $cv(self)
+            }
+            fn attach(config: &mut Self::Config, parent_refs: Vec<ParentRef>) {
+                config.parent_refs = parent_refs;
+            }
+            fn backend_refs_mut(config: &mut Self::Config) -> Vec<&mut BackendRef> {
                 config
                     .rules
-                    .iter()
-                    .flat_map(|r| {
-                        r.backend_refs
-                            .iter()
-                            .map(|b| (b.name.as_str(), b.port, b.group.as_str(), b.kind.as_str()))
-                    })
+                    .iter_mut()
+                    .flat_map(|r| r.backend_refs.iter_mut())
                     .collect()
-            }
-            fn remove_invalid_backends(
-                config: &mut Self::Config,
-                invalid: &HashSet<(String, u16)>,
-            ) {
-                for rule in &mut config.rules {
-                    rule.backend_refs
-                        .retain(|b| !invalid.contains(&(b.name.clone(), b.port)));
-                }
             }
             fn status_parents_json(&self) -> Vec<serde_json::Value> {
                 self.status
@@ -158,6 +172,9 @@ convert:     convert_http_route,
 extras: {
     fn hostnames(&self) -> &[String] {
         self.spec.hostnames.as_deref().unwrap_or(&[])
+    }
+    fn check(config: &HttpRouteConfig) -> Result<(), RouteError> {
+        compile_http_route(config).map(drop)
     }
     fn mirror_backend_refs(config: &HttpRouteConfig) -> Vec<(&str, u16, &str, &str)> {
         config
@@ -189,8 +206,11 @@ extras: {
 });
 
 impl_gateway_route!(TCPRoute, TCPRouteParentRefs, TcpRouteConfig, "TCPRoute",
-    parent_refs: self.spec.parent_refs,
-    convert:     convert_tcp_route);
+parent_refs: self.spec.parent_refs,
+convert:     convert_tcp_route,
+extras: {
+    const ONE_ROUTE_PER_LISTENER: bool = true;
+});
 
 impl_gateway_route!(TLSRoute, TLSRouteParentRefs, TlsRouteConfig, "TLSRoute",
 parent_refs: self.spec.parent_refs,
@@ -202,8 +222,11 @@ extras: {
 });
 
 impl_gateway_route!(UDPRoute, UDPRouteParentRefs, UdpRouteConfig, "UDPRoute",
-    parent_refs: self.spec.parent_refs,
-    convert:     convert_udp_route);
+parent_refs: self.spec.parent_refs,
+convert:     convert_udp_route,
+extras: {
+    const ONE_ROUTE_PER_LISTENER: bool = true;
+});
 
 pub struct ReconcileResult {
     pub config: PortailConfig,
@@ -238,8 +261,60 @@ pub struct RouteAcceptance {
     pub section_name: Option<String>,
     /// The parentRef port (status parentRef must mirror the spec's ref exactly)
     pub port: Option<i32>,
-    /// The listener names this parentRef was accepted by (for attached route counting)
+    /// The listeners this parentRef attaches to by allowedRoutes, whether or
+    /// not the route is accepted on them (Listener.attachedRoutes counts them)
     pub listener_names: Vec<String>,
+}
+
+type Verdict = Result<(), RouteError>;
+
+/// Route check verdicts per Gateway, by route uid, with the generation they
+/// were taken at. The check compiles every regex of a route; a pass whose
+/// routes did not change (a status echo, a requeue) takes the verdict
+/// instead. The table build still compiles for the table.
+#[derive(Default)]
+pub(crate) struct RouteVerdicts(
+    std::sync::Mutex<HashMap<(String, String), HashMap<String, (i64, Verdict)>>>,
+);
+
+impl RouteVerdicts {
+    fn take(&self, gateway: &(String, String)) -> HashMap<String, (i64, Verdict)> {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.remove(gateway).unwrap_or_default()
+    }
+
+    fn put(&self, gateway: (String, String), verdicts: HashMap<String, (i64, Verdict)>) {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.insert(gateway, verdicts);
+    }
+
+    /// Forget the Gateways `live` rejects.
+    pub fn retain(&self, live: impl Fn(&(String, String)) -> bool) {
+        let mut by_gateway = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        by_gateway.retain(|gateway, _| live(gateway));
+    }
+}
+
+/// One pass's verdicts: the last pass's while a route's generation stands,
+/// a new check otherwise. A route the pass does not see drops out.
+struct Checks {
+    last: HashMap<String, (i64, Verdict)>,
+    now: HashMap<String, (i64, Verdict)>,
+}
+
+impl Checks {
+    fn verdict<R: GatewayRoute>(&mut self, route: &R, config: &R::Config) -> Verdict {
+        let (Some(uid), (_, Some(generation))) = (route.uid(), route.identity()) else {
+            return R::check(config);
+        };
+        let verdict = match self.last.remove(uid) {
+            Some((taken_at, verdict)) if taken_at == generation => verdict,
+            _ => R::check(config),
+        };
+        self.now
+            .insert(uid.to_string(), (generation, verdict.clone()));
+        verdict
+    }
 }
 
 /// Convert Kubernetes Gateway API resources into a PortailConfig.
@@ -250,10 +325,26 @@ pub(crate) fn reconcile_to_config(
     snapshot: &ClusterSnapshot,
     cert_data: &CertData,
     services: &ServiceState,
+    verdicts: &RouteVerdicts,
 ) -> Result<ReconcileResult> {
     let mut gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
     let gateway_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+
+    // Gateway API v1.4.1 GatewaySpec.listeners: "ALL indistinct Listeners
+    // must not be accepted for processing". A conflicted listener binds
+    // nothing and takes no route; no winner is picked among them.
+    let conflicts = listener_conflicts(&gateway.spec.listeners);
+    gateway_config
+        .listeners
+        .retain(|l| !conflicts.contains_key(l.name.as_str()));
+    let listeners: Vec<GatewayListeners> = gateway
+        .spec
+        .listeners
+        .iter()
+        .filter(|l| !conflicts.contains_key(l.name.as_str()))
+        .cloned()
+        .collect();
 
     // Bind the fronting Service's targetPort: the operator maps the published
     // (possibly privileged) port -> an unprivileged target the pod binds, so no
@@ -276,19 +367,25 @@ pub(crate) fn reconcile_to_config(
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
-        listeners: &gateway.spec.listeners,
+        listeners: &listeners,
         namespace_labels: &snapshot.namespace_labels,
         reference_grants: &snapshot.reference_grants,
         known_services: &services.known_services,
     };
+    let gateway_key = (gateway_ns.to_string(), gateway_name.to_string());
+    let mut checks = Checks {
+        last: verdicts.take(&gateway_key),
+        now: HashMap::new(),
+    };
     let http_route_configs =
-        collect_routes::<HTTPRoute>(&snapshot.http_routes, &cx, &mut route_status);
+        collect_routes::<HTTPRoute>(&snapshot.http_routes, &cx, &mut checks, &mut route_status);
     let tcp_route_configs =
-        collect_routes::<TCPRoute>(&snapshot.tcp_routes, &cx, &mut route_status);
+        collect_routes::<TCPRoute>(&snapshot.tcp_routes, &cx, &mut checks, &mut route_status);
     let tls_route_configs =
-        collect_routes::<TLSRoute>(&snapshot.tls_routes, &cx, &mut route_status);
+        collect_routes::<TLSRoute>(&snapshot.tls_routes, &cx, &mut checks, &mut route_status);
     let udp_route_configs =
-        collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut route_status);
+        collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut checks, &mut route_status);
+    verdicts.put(gateway_key, checks.now);
 
     Ok(ReconcileResult {
         config: PortailConfig {
@@ -356,7 +453,7 @@ pub(crate) fn apply_rate_limit_policies(
                 Some(section) if !listeners.iter().any(|l| l.name == *section) => (
                     false,
                     "TargetNotFound",
-                    format!("Gateway has no listener named '{}'", section),
+                    format!("Gateway has no accepted listener named '{}'", section),
                 ),
                 _ if !applied.contains(&name) => (
                     false,
@@ -487,6 +584,59 @@ mod policy_tests {
     }
 }
 
+/// Listeners that are not distinct, with their Conflicted reason. Gateway
+/// API, Listener: listeners sharing a port need distinct protocols, or
+/// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
+/// indistinct listeners are rejected: the spec forbids picking a winner.
+/// HTTPS and TLS passthrough are one family here: one socket serves both,
+/// told apart by SNI, so only their hostnames must differ. A listener the
+/// data plane does not serve conflicts with none: it is rejected alone, as
+/// GatewaySpec.listeners has it for TCP listeners an implementation does
+/// not support ("the previous rule does not apply").
+pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
+    fn family(protocol: &str) -> &str {
+        match protocol {
+            "HTTPS" => "TLS",
+            other => other,
+        }
+    }
+    let served: Vec<&GatewayListeners> =
+        listeners.iter().filter(|l| listener_is_served(l)).collect();
+    let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
+    for (i, a) in served.iter().enumerate() {
+        for b in served[i + 1..].iter().filter(|b| b.port == a.port) {
+            let reason = if family(&a.protocol) != family(&b.protocol) {
+                "ProtocolConflict"
+            } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
+                "HostnameConflict"
+            } else {
+                continue;
+            };
+            for l in [a, b] {
+                let slot = conflicts.entry(l.name.as_str()).or_insert(reason);
+                if reason == "ProtocolConflict" {
+                    *slot = reason;
+                }
+            }
+        }
+    }
+    conflicts
+}
+
+/// Whether the data plane serves this listener: a protocol it runs, and a
+/// TLS listener in Passthrough mode only. TLSRoute is served as passthrough
+/// alone; an HTTPS listener terminates.
+pub(crate) fn listener_is_served(l: &GatewayListeners) -> bool {
+    match l.protocol.as_str() {
+        "HTTP" | "HTTPS" | "TCP" | "UDP" => true,
+        "TLS" => l
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.mode == Some(GatewayListenersTlsMode::Passthrough)),
+        _ => false,
+    }
+}
+
 /// published listener port -> Service `targetPort` for the Service fronting this
 /// Gateway, identified by the label `portail.epheo.eu/gateway == gw_name` in
 /// `gw_ns`. The operator emits exactly one such LoadBalancer Service with numeric
@@ -556,19 +706,57 @@ struct RouteCollectCtx<'a> {
     known_services: &'a HashSet<(String, String)>,
 }
 
+/// Gateway API precedence between routes whose matches tie: the oldest
+/// creationTimestamp, then "{namespace}/{name}" in alphabetical order
+/// (HTTPRouteRule.matches). The string, not the (namespace, name) pair:
+/// "a-b/c" sorts before "a/z".
+fn precedence<R: GatewayRoute>(a: &R, b: &R) -> std::cmp::Ordering {
+    fn key<R: GatewayRoute>(r: &R) -> impl Iterator<Item = u8> + '_ {
+        r.route_namespace()
+            .bytes()
+            .chain(std::iter::once(b'/'))
+            .chain(r.identity().0.bytes())
+    }
+    a.creation_timestamp()
+        .cmp(&b.creation_timestamp())
+        .then_with(|| key(a).cmp(key(b)))
+}
+
 /// Generic route collection with namespace scoping and acceptance tracking.
+/// Configs come out in precedence order: the table keeps insertion order
+/// among equally specific rules.
 fn collect_routes<R: GatewayRoute>(
     routes: &[Arc<R>],
     cx: &RouteCollectCtx,
+    checks: &mut Checks,
     route_status: &mut Vec<RouteAcceptance>,
 ) -> Vec<R::Config> {
     let kind = R::KIND;
-    let mut configs = Vec::new();
-    for route in routes {
-        if !route_targets_gateway(route.parent_refs(), cx.gateway_name, cx.gateway_ns) {
-            continue;
-        }
+    let mut ordered: Vec<&R> = routes
+        .iter()
+        .map(|r| &**r)
+        .filter(|r| {
+            route_targets_gateway(
+                r.parent_refs(),
+                r.route_namespace(),
+                cx.gateway_name,
+                cx.gateway_ns,
+            )
+        })
+        .collect();
+    ordered.sort_by(|a, b| precedence(*a, *b));
 
+    // Ports an older route already serves (ONE_ROUTE_PER_LISTENER kinds).
+    // Keyed by port like the table: two listeners on one port share a socket.
+    let port_of = |listener: &str| {
+        cx.listeners
+            .iter()
+            .find(|l| l.name == listener)
+            .map(|l| l.port)
+    };
+    let mut claimed: HashSet<i32> = HashSet::new();
+    let mut configs = Vec::new();
+    for route in ordered {
         let route_ns = route.route_namespace();
         let (name, generation) = route.identity();
 
@@ -578,29 +766,48 @@ fn collect_routes<R: GatewayRoute>(
         // inherit Accepted from a sibling ref (previously every ref got the
         // route-wide verdict, and every entry claimed every listener).
         let route_hostnames = route.hostnames();
+        // The listeners each ref attaches to by allowedRoutes, before an
+        // older route's claim: attachedRoutes counts them, accepted or not.
         let per_parent: Vec<(
             Option<String>,
             Option<i32>,
+            Vec<String>,
             Result<Vec<String>, &'static str>,
         )> = route
             .parent_refs()
             .as_ref()
             .map(|refs| {
                 refs.iter()
-                    .filter(|pr| parent_ref_matches_gateway(*pr, cx.gateway_name, cx.gateway_ns))
+                    .filter(|pr| {
+                        parent_ref_matches_gateway(*pr, route_ns, cx.gateway_name, cx.gateway_ns)
+                    })
                     .map(|pr| {
+                        let mut result = listeners_for_parent_ref(
+                            pr,
+                            cx.listeners,
+                            cx.gateway_ns,
+                            route_ns,
+                            kind,
+                            route_hostnames,
+                            cx.namespace_labels,
+                        );
+                        let attached = result.clone().unwrap_or_default();
+                        if R::ONE_ROUTE_PER_LISTENER {
+                            result = result.and_then(|mut listeners| {
+                                listeners
+                                    .retain(|l| !port_of(l).is_some_and(|p| claimed.contains(&p)));
+                                if listeners.is_empty() {
+                                    Err("Conflicted")
+                                } else {
+                                    Ok(listeners)
+                                }
+                            });
+                        }
                         (
                             pr.ref_section_name().map(String::from),
                             pr.ref_port(),
-                            listeners_for_parent_ref(
-                                pr,
-                                cx.listeners,
-                                cx.gateway_ns,
-                                route_ns,
-                                kind,
-                                route_hostnames,
-                                cx.namespace_labels,
-                            ),
+                            attached,
+                            result,
                         )
                     })
                     .collect()
@@ -613,6 +820,9 @@ fn collect_routes<R: GatewayRoute>(
                     "Route hostnames do not intersect with any listener hostname"
                 }
                 "NoMatchingParent" => "No matching listener found for route parentRef",
+                "Conflicted" => {
+                    "An older route already serves every listener this parentRef selects"
+                }
                 _ => "Route not allowed by any listener policy (namespace/hostname/kind)",
             };
             RouteAcceptance {
@@ -632,150 +842,162 @@ fn collect_routes<R: GatewayRoute>(
             }
         };
 
-        if per_parent.iter().all(|(_, _, r)| r.is_err()) {
-            for (section_name, port, result) in &per_parent {
+        if per_parent.iter().all(|(_, _, _, r)| r.is_err()) {
+            for (section_name, port, attached, result) in &per_parent {
                 let reason = result.as_ref().err().copied().unwrap_or("NoMatchingParent");
-                route_status.push(rejection(section_name, *port, reason));
+                route_status.push(RouteAcceptance {
+                    listener_names: attached.clone(),
+                    ..rejection(section_name, *port, reason)
+                });
             }
             continue;
         }
 
-        match route.convert(cx.gateway_name) {
-            Ok(mut config) => {
-                let mut refs_resolved = true;
-                let mut refs_messages = Vec::new();
-                let mut refs_reason = "ResolvedRefs";
-                let mut invalid_backends: HashSet<(String, u16)> = HashSet::new();
-                let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
+        let (mut config, converted) = route.convert();
+        let verdict = converted.and_then(|()| checks.verdict(route, &config));
 
-                // Group/kind (core Service only), cross-namespace ReferenceGrant,
-                // and service existence — one checker for forward and mirror refs.
-                let check_ref = |backend_name: &str,
-                                 group: &str,
-                                 ref_kind: &str|
-                 -> Option<(&'static str, String)> {
-                    if (!group.is_empty() && group != "core")
-                        || (ref_kind != "Service" && !ref_kind.is_empty())
-                    {
-                        return Some((
-                            "InvalidKind",
-                            format!("Unsupported backend ref group/kind: {}/{}", group, ref_kind),
-                        ));
-                    }
-                    // backend_name is "{svc}.{ns}.svc"; unparseable names get no
-                    // further checks (None here means "no error", not failure)
-                    let (svc_name, svc_ns) = parse_backend_dns_name(backend_name)?;
-                    if svc_ns != route_ns
-                        && !is_reference_allowed(
-                            cx.reference_grants,
-                            "gateway.networking.k8s.io",
-                            kind,
-                            route_ns,
-                            "",
-                            "Service",
-                            &svc_ns,
-                            &svc_name,
-                        )
-                    {
-                        return Some((
-                            "RefNotPermitted",
-                            format!(
-                                "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
-                                svc_name, svc_ns
-                            ),
-                        ));
-                    }
-                    if !cx
-                        .known_services
-                        .contains(&(svc_name.clone(), svc_ns.clone()))
-                    {
-                        return Some((
-                            "BackendNotFound",
-                            format!("Backend service {}.{} not found", svc_name, svc_ns),
-                        ));
-                    }
-                    None
-                };
+        let mut refs_resolved = true;
+        let mut refs_messages = Vec::new();
+        let mut refs_reason = "ResolvedRefs";
+        let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
-                for (backend_name, port, group, ref_kind) in R::backend_refs(&config) {
-                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
-                        refs_resolved = false;
-                        refs_reason = reason;
-                        refs_messages.push(message);
-                        invalid_backends.insert((backend_name.to_string(), port));
-                    }
+        // Group/kind (core Service only), cross-namespace ReferenceGrant,
+        // and service existence: one checker for forward and mirror refs.
+        let check_ref =
+            |backend_name: &str, group: &str, ref_kind: &str| -> Option<(&'static str, String)> {
+                if (!group.is_empty() && group != "core")
+                    || (ref_kind != "Service" && !ref_kind.is_empty())
+                {
+                    return Some((
+                        "InvalidKind",
+                        format!("Unsupported backend ref group/kind: {}/{}", group, ref_kind),
+                    ));
                 }
-                for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
-                    if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
-                        refs_resolved = false;
-                        refs_reason = reason;
-                        refs_messages.push(message);
-                        invalid_mirrors.insert((backend_name.to_string(), port));
-                    }
+                // backend_name is "{svc}.{ns}.svc"; unparseable names get no
+                // further checks (None here means "no error", not failure)
+                let (svc_name, svc_ns) = parse_backend_dns_name(backend_name)?;
+                if svc_ns != route_ns
+                    && !is_reference_allowed(
+                        cx.reference_grants,
+                        "gateway.networking.k8s.io",
+                        kind,
+                        route_ns,
+                        "",
+                        "Service",
+                        &svc_ns,
+                        &svc_name,
+                    )
+                {
+                    return Some((
+                        "RefNotPermitted",
+                        format!(
+                            "Cross-namespace reference to {}.{} not allowed by ReferenceGrant",
+                            svc_name, svc_ns
+                        ),
+                    ));
                 }
+                if !cx
+                    .known_services
+                    .contains(&(svc_name.clone(), svc_ns.clone()))
+                {
+                    return Some((
+                        "BackendNotFound",
+                        format!("Backend service {}.{} not found", svc_name, svc_ns),
+                    ));
+                }
+                None
+            };
 
-                // Remove invalid backends so the data plane returns 500 for them
-                if !invalid_backends.is_empty() {
-                    R::remove_invalid_backends(&mut config, &invalid_backends);
-                }
-                if !invalid_mirrors.is_empty() {
-                    R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
-                }
-
-                let refs_message = if refs_resolved {
-                    "All references resolved".to_string()
-                } else {
-                    refs_messages.join("; ")
-                };
-
-                for (section_name, port, result) in &per_parent {
-                    match result {
-                        Ok(listener_names) => route_status.push(RouteAcceptance {
-                            name: name.to_string(),
-                            namespace: route_ns.to_string(),
-                            kind,
-                            accepted: true,
-                            accepted_reason: "Accepted",
-                            message: "Accepted".to_string(),
-                            refs_resolved,
-                            refs_reason,
-                            refs_message: refs_message.clone(),
-                            generation,
-                            section_name: section_name.clone(),
-                            port: *port,
-                            listener_names: listener_names.clone(),
-                        }),
-                        Err(reason) => route_status.push(rejection(section_name, *port, reason)),
-                    }
-                }
-                configs.push(config);
-            }
-            Err(e) => {
-                for (section_name, port, result) in &per_parent {
-                    match result {
-                        // A parentRef the listeners would admit: report the
-                        // conversion failure. A ref rejected before conversion
-                        // keeps its own rejection reason.
-                        Ok(_) => route_status.push(RouteAcceptance {
-                            name: name.to_string(),
-                            namespace: route_ns.to_string(),
-                            kind,
-                            accepted: false,
-                            accepted_reason: "InvalidRoute",
-                            message: format!("Conversion failed: {}", e),
-                            refs_resolved: false,
-                            refs_reason: "InvalidKind",
-                            refs_message: format!("Conversion failed: {}", e),
-                            generation,
-                            section_name: section_name.clone(),
-                            port: *port,
-                            listener_names: vec![],
-                        }),
-                        Err(reason) => route_status.push(rejection(section_name, *port, reason)),
-                    }
-                }
+        // An invalid ref keeps its weight so its share fails rather
+        // than moving to the valid refs (HTTPRouteRule.backendRefs).
+        for backend in R::backend_refs_mut(&mut config) {
+            if let Some((reason, message)) = check_ref(&backend.name, &backend.group, &backend.kind)
+            {
+                refs_resolved = false;
+                refs_reason = reason;
+                refs_messages.push(message);
+                backend.invalid = true;
             }
         }
+        for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
+            if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+                refs_resolved = false;
+                refs_reason = reason;
+                refs_messages.push(message);
+                invalid_mirrors.insert((backend_name.to_string(), port));
+            }
+        }
+
+        if !invalid_mirrors.is_empty() {
+            R::remove_invalid_mirrors(&mut config, &invalid_mirrors);
+        }
+
+        let refs_message = if refs_resolved {
+            "All references resolved".to_string()
+        } else {
+            refs_messages.join("; ")
+        };
+
+        // A route that fails its check is exactly one the table build
+        // would leave out. Its refs still decide ResolvedRefs.
+        let (accepted_reason, message) = match &verdict {
+            Ok(()) => ("Accepted", "Accepted".to_string()),
+            Err(e) => (e.reason.as_str(), format!("Conversion failed: {}", e)),
+        };
+        for (section_name, port, attached, result) in &per_parent {
+            match result {
+                // A parentRef the listeners admit. One they reject keeps
+                // its own rejection reason.
+                Ok(_) => route_status.push(RouteAcceptance {
+                    name: name.to_string(),
+                    namespace: route_ns.to_string(),
+                    kind,
+                    accepted: verdict.is_ok(),
+                    accepted_reason,
+                    message: message.clone(),
+                    refs_resolved,
+                    refs_reason,
+                    refs_message: refs_message.clone(),
+                    generation,
+                    section_name: section_name.clone(),
+                    port: *port,
+                    listener_names: attached.clone(),
+                }),
+                Err(reason) => route_status.push(RouteAcceptance {
+                    listener_names: attached.clone(),
+                    ..rejection(section_name, *port, reason)
+                }),
+            }
+        }
+        if verdict.is_err() {
+            continue;
+        }
+
+        let mut attached: Vec<&String> = Vec::new();
+        for listener in per_parent
+            .iter()
+            .filter_map(|(_, _, _, result)| result.as_ref().ok())
+            .flatten()
+        {
+            if !attached.contains(&listener) {
+                attached.push(listener);
+            }
+        }
+        if R::ONE_ROUTE_PER_LISTENER {
+            claimed.extend(attached.iter().filter_map(|l| port_of(l)));
+        }
+        R::attach(
+            &mut config,
+            attached
+                .into_iter()
+                .map(|listener| ParentRef {
+                    name: cx.gateway_name.to_string(),
+                    section_name: Some(listener.clone()),
+                    port: None,
+                })
+                .collect(),
+        );
+        configs.push(config);
     }
     configs
 }

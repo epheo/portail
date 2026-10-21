@@ -43,8 +43,9 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   its listener ports, `503` before. Gate traffic on this.
 - `GET /metrics` — Prometheus text format. Process-wide counters
   (connections, backend pool, DNS refresh, health transitions, reconciles,
-  and `portail_http_requests_rejected_total` for request heads refused with
-  `400` as malformed or ambiguous; those are logged at debug level only),
+  and `portail_http_requests_rejected_total` for requests refused with
+  `400` before any backend, their head or chunked body framing malformed or
+  ambiguous; those are logged at debug level only),
   `portail_http_requests_total{host=...}`,
   `portail_upstream_connect_{errors,timeouts}_total{backend=...}` and
   `portail_upstream_send_errors_total{backend=...}` (a request a freshly
@@ -87,6 +88,28 @@ slower than the request rate sheds lines, counted in
 `portail_access_log_dropped_total`. Requests aborted mid-response (client
 gone, backend died with headers already sent) produce no line.
 
+## Request Paths
+
+Routes match the request path with its dot-segments removed (RFC 3986
+5.2.4), and the backend gets that same path, over HTTP/1 and HTTP/2 alike.
+A backend resolving `/public/../admin` to `/admin` is then reached through
+the route on `/admin`, never past it:
+
+- `.` and `..` segments are resolved; `%2e` and `%2E` count as a dot.
+- A `..` above the root stops there: `/../a` becomes `/a`.
+- Nothing else changes: empty segments stay (`//` is not merged), no
+  other escape is decoded (`%2F` stays as sent), the query is untouched.
+- A `.` or `..` segment with path parameters (`/public/..;/admin`) gets
+  `400` and closes the connection, counted in
+  `portail_http_requests_rejected_total`: Tomcat, Jetty and Spring drop
+  the parameters and resolve it, RFC 3986 does not. Parameters on any
+  other segment (`/a;jsessionid=1`) pass.
+- Access logs keep the path as the client sent it.
+
+URLRewrite and RequestRedirect path modifiers replace the path only. The
+query string is kept as sent, in the forwarded request and in a
+redirect's `Location`.
+
 ## Rate Limiting
 
 Per-client token bucket, attached per listener. Clients are keyed by source
@@ -118,8 +141,10 @@ spec:
 A `sectionName`-scoped policy overrides a Gateway-wide one for its listener;
 among policies of equal scope the oldest wins (GEP-713 conflict rule) and
 later ones report `Conflicted` in `status.ancestors`. The policy must live
-in the Gateway's namespace. Without the CRD installed, the watcher is
-skipped at startup and nothing changes.
+in the Gateway's namespace. Without the CRD installed, nothing changes.
+A CRD installed later is watched without a restart, within ten minutes:
+API discovery is read every ten minutes while a CRD is missing.
+The same holds for TCPRoute, TLSRoute and UDPRoute.
 
 Standalone mode — the same parameters on a listener:
 
@@ -139,7 +164,84 @@ Listener rate limits apply to routes bound to that listener via
 listener scoping and are never limited. Policy edits keep per-client state:
 a throttled crawler stays throttled across a rate change. Observability:
 `portail_rate_limited_total`, `portail_listener_rate_limited_total`, and
-`status: 429` access-log lines.
+`status: 429` access-log lines. A limited request counts there only:
+`portail_http_requests_total` and `portail_listener_http_requests_total`
+count requests dispatched to a backend.
+
+## Route Attachment
+
+A route is served on exactly the listeners its status attaches it to.
+
+Kubernetes mode:
+
+- A parentRef attaches to the listeners it selects (by `sectionName`, `port`, or all) that admit the route: `allowedRoutes` namespaces and kinds, hostname intersection, and a protocol portail serves.
+- A parentRef without `namespace` names a Gateway in the route's own namespace.
+- A `Conflicted` listener, not distinct from another on its port, is not served: nothing binds, no route attaches, and a parentRef naming it reports `NoMatchingParent`.
+- HTTPS and TLS listeners can share a port if their hostnames differ: one socket serves both, by SNI (see [Shared TLS Ports](#shared-tls-ports)). Any other two protocols on one port are `ProtocolConflict`.
+- A TLS listener is served in `Passthrough` mode only: TLSRoute is passthrough here, and an HTTPS listener terminates. A TLS listener in `Terminate` mode reports `Accepted=False` with reason `UnsupportedProtocol`, binds nothing and takes no route.
+- A listener portail does not serve (an unsupported protocol, TLS `Terminate`) conflicts with no other: it is rejected alone.
+- Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
+- A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
+- TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.
+- An invalid backendRef (`RefNotPermitted`, `BackendNotFound`, `InvalidKind`) keeps its weight. Its share of HTTP requests gets `500`; its share of TCP and TLS passthrough connections is closed, of UDP datagrams dropped.
+
+Standalone mode:
+
+- A parentRef without `sectionName` or `port` selects every listener, for TCP and UDP routes too.
+- An HTTP route attaches to HTTP and HTTPS listeners only: on a TCP port it would hold back server-speaks-first clients.
+- A TCP route can also attach to a TLS listener, as the fallback for passthrough connections no TLS route matches.
+- Where routes tie (equally specific matches, a shared TCP or UDP listener), the first in the file wins.
+- An HTTP route without parentRefs (a config built without validation) serves every HTTP and HTTPS port, ranked with the routes of the port's listener without a hostname: the more specific hostname, then the more specific match, then the first in the file.
+- TCP and UDP routes use their first rule only.
+- Listeners on one port share its routes, whatever address each binds: HTTP, TCP, and HTTPS with TLS are three families, and two families on one port fail the load (`Protocol conflict`).
+
+## HTTPRoute Rules
+
+Kubernetes HTTPRoutes and the `httpRoutes` of a config file are checked by the same rules.
+
+Matching:
+
+- `RegularExpression` path, header and query matches use the Rust `regex` crate syntax (RE2-like: no look-around, no backreferences).
+- A regex must match the whole value: path regex `/api` matches `/api`, not `/static/api/x`.
+- `PathPrefix` ignores a trailing `/`: `/abc/` matches `/abc`, `/abc/` and `/abc/def`, not `/abcd`.
+- A rule with no `matches`, or `matches: []`, matches every request, like `PathPrefix /`.
+
+Filters:
+
+- Only `RequestMirror` may appear more than once in one filter list.
+- `RequestRedirect` and `URLRewrite` cannot share a rule.
+- A `RequestRedirect` rule never forwards: `backendRefs` beside it are unused. The HTTPRoute CRD refuses them; a config file loads with a warning.
+- Those unused `backendRefs` are never resolved, health-probed, validated or counted in `ResolvedRefs`.
+- A `URLRewrite` hostname and a `RequestHeaderModifier` that sets `Host` cannot share a rule.
+- `ReplacePrefixMatch` needs every match of its rule to be a `PathPrefix`.
+- A path modifier replaces the path only: the request keeps its query. A `replaceFullPath` or `replacePrefixMatch` value with a query of its own puts it first: `/login?next=home` on `/old?a=1` gives `/login?next=home&a=1`.
+- The `&` goes in only when both queries are non-empty and the value's does not already end in `&`: `/login?next=home&` on `/old?a=1` gives `/login?next=home&a=1`.
+- A backendRef filter must be a `RequestHeaderModifier` or `ResponseHeaderModifier`.
+- `RequestMirror` keeps its share exact: `fraction: {numerator: 1, denominator: 1000}` mirrors one request in a thousand.
+- `percent` must be 0 to 100; a `fraction` needs a denominator of at least 1 and a numerator no larger.
+- A `RequestMirror` sets `percent` or `fraction`, not both.
+
+A route that breaks one of these rules:
+
+- Kubernetes: it is rejected alone, `Accepted=False`, and every other route keeps serving.
+- The reason is `UnsupportedValue` for a value portail cannot apply, `IncompatibleFilters` for filters that cannot share a rule.
+- Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
+
+A backend or mirror name DNS cannot resolve:
+
+- Kubernetes: the backend is left out and its share goes to the other backends; a mirror is dropped.
+- The DNS refresh (`dnsRefreshInterval`) brings it back once it resolves.
+- Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
+
+## Backend Services
+
+In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirror` all reach a Service the same way:
+
+- ClusterIP: its DNS name, on the Service port, which kube-proxy maps to the pods.
+- Headless: every ready pod DNS returns, on the `targetPort`, as DNS carries no port. A named `targetPort` is read from the Service's EndpointSlices.
+- ExternalName: its external name, on the Service port, at one address of the set each pod picks by hash, so pods spread over the set.
+- A mirror sends its copies to one address: the smallest the Service resolves to.
+- These single addresses change only when the address set does; a reordered DNS answer changes nothing.
 
 ## Performance Options
 
@@ -154,7 +256,7 @@ values; defaults shown):
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |
 | `udpSessionTimeout` | `30s` | Idle expiry for per-client UDP sessions; must be above `0s` |
 | `udpMaxSessions` | soft `RLIMIT_NOFILE` / 4, shared | Concurrent UDP sessions per listener socket |
-| `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window) |
+| `dnsRefreshInterval` | `5s` | How often backend FQDNs are re-resolved and the route table swapped on change (STRICT_DNS freshness window). In Kubernetes mode a change also re-reads the named `targetPort`s of headless backends; they are re-read every 10 minutes regardless |
 | `backendPoolScope` | `connection` | Idle backend-connection pool scope: `connection` pools per client connection (lock-free); `process` shares one pool across all clients (cross-client reuse under churn, at the cost of a sharded lock) |
 | `http2` | `false` | Serve HTTP/2 on TLS-terminate listeners (same switch as `--http2`; see HTTP/2 section) |
 
@@ -218,7 +320,9 @@ Limits to know about:
 - Trailers do not survive the bridge, so gRPC cannot ride it; GRPCRoute
   support requires the future native h2 path.
 - WebSocket/CONNECT streams are refused over h2; h2-capable browsers fall
-  back to HTTP/1.1 for WebSocket automatically.
+  back to HTTP/1.1 for WebSocket automatically. A refused stream gets
+  `400` and counts in `portail_http_requests_rejected_total`, as an h1
+  CONNECT does.
 
 ## Custom Controller Name
 
@@ -308,3 +412,19 @@ portail --config config.yaml --cert-dir /path/to/certs
 ```
 
 The default cert directory is `certs`, relative to the working directory.
+
+### Shared TLS Ports
+
+HTTPS and TLS passthrough listeners on one port share one socket:
+
+- The ClientHello's SNI selects one listener, by Gateway API precedence across HTTPS and TLS alike: exact hostname, then the longest wildcard, then the listener without a hostname.
+- A wildcard covers any depth: `*.example.com` takes `a.b.example.com`.
+- An HTTPS listener terminates with its own certificate and routes HTTP by `Host`; a TLS passthrough listener forwards the raw stream by its TLS routes.
+- No SNI, or an SNI no listener names: the listener without a hostname takes it; with none, the connection closes, counted in `portail_listener_tls_handshake_failures_total`.
+- A TLS route matches within its listener only: its hostnames outside the listener's are ignored, and a route without hostnames takes the listener's.
+- A TLS route without parentRefs (a config built without validation) serves every passthrough listener, ranked with that listener's own routes: the exact hostname, then the longest wildcard, then the route without hostnames; on a tie the listener's own.
+- Connections rotate over a TLS route's backends per route, whatever SNI each sent under it.
+- Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
+- A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
+- A port already serving whose certificates all fail on a later pass, with the same listeners and Secrets, keeps serving the last good ones: a bad rotation does not take HTTPS down. The failure is logged each pass until fixed. In Kubernetes mode a deleted Secret, or one a ReferenceGrant no longer permits, fails the same way; the listener reports `ResolvedRefs=False` meanwhile. A pass that also changes the port's listeners or Secrets keeps none.
+- An HTTPS listener whose own certificates fail to load closes the connections its SNI selects, even while its siblings' load: no other listener's certificate answers for its hostname.

@@ -1,10 +1,11 @@
-use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
 mod build;
+
+pub(crate) use build::resolve_socket_addrs;
 
 #[cfg(test)]
 mod tests;
@@ -56,7 +57,9 @@ impl ListenerScope {
         }
     }
 
-    /// Look up an HTTP route within this listener scope.
+    /// Look up an HTTP route within this listener scope, with the
+    /// precedence of the route hostname it matched under, ranked as
+    /// [`Self::hostname_match_priority`] ranks a listener's.
     fn lookup_http_route<'a>(
         &'a self,
         host: &str,
@@ -64,7 +67,7 @@ impl ListenerScope {
         path: &str,
         header_data: &[u8],
         query_string: &str,
-    ) -> Option<&'a HttpRouteRule> {
+    ) -> Option<(u32, &'a HttpRouteRule)> {
         // Try exact host first
         if let Some(host_entry) = self.http_routes.get(host) {
             if let Some(rule) = RouteTable::find_best_rule_match(
@@ -74,7 +77,7 @@ impl ListenerScope {
                 header_data,
                 query_string,
             ) {
-                return Some(rule);
+                return Some((u32::MAX, rule));
             }
         }
 
@@ -89,7 +92,7 @@ impl ListenerScope {
                     header_data,
                     query_string,
                 ) {
-                    return Some(rule);
+                    return Some((1 + parent.len() as u32, rule));
                 }
             }
         }
@@ -103,7 +106,7 @@ impl ListenerScope {
                 header_data,
                 query_string,
             ) {
-                return Some(rule);
+                return Some((0, rule));
             }
         }
 
@@ -114,19 +117,55 @@ impl ListenerScope {
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
-    /// Port 0 is a wildcard that matches any port (used in file-based configs / tests).
-    pub listener_scopes: FnvHashMap<u16, Vec<ListenerScope>>,
+    pub listener_scopes: FnvHashMap<u16, PortScopes>,
+    /// The scopes ports share, added under port 0: routes without
+    /// parentRefs, or `add_http_route` in tests and benches. Outside the
+    /// map, so a table without them costs a request no second probe.
+    shared_scopes: Vec<ListenerScope>,
+    /// A table built by hand: every port searches `shared_scopes`. One
+    /// built from a config clears it, and only its HTTP and HTTPS listener
+    /// ports do ([`PortScopes::shared`]). A TCP port that searched them
+    /// would wait to sniff, and hang a server-speaks-first client.
+    shared_on_every_port: bool,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
-    /// TLS passthrough routes, scoped by listener port then SNI hostname.
-    /// Port 0 is the any-port scope (file-based configs without gateway
-    /// context). Without the port dimension, a TLSRoute attached to one
-    /// listener would hijack matching SNI on every other port.
-    pub tls_routes: FnvHashMap<u16, FnvHashMap<String, Vec<Backend>>>,
-    /// Wildcard TLS passthrough routes, keyed by (port, parent domain):
+    /// TLS passthrough routes, one scope per listener, by port. A route
+    /// matches within the listener its SNI selected, as an HTTP route does
+    /// within its listener's. Port 0 holds the routes without parentRefs,
+    /// which every passthrough listener searches after its own.
+    pub tls_scopes: FnvHashMap<u16, Vec<TlsScope>>,
+}
+
+/// One port's HTTP route scopes, one per listener hostname.
+#[derive(Debug, Clone, Default)]
+pub struct PortScopes {
+    pub scopes: Vec<ListenerScope>,
+    /// The port also searches the table's shared scopes. Resolved when the
+    /// table is built: a request reads this flag, not a set of ports.
+    pub shared: bool,
+}
+
+/// One TLS passthrough listener's routes, by SNI.
+#[derive(Debug, Clone, Default)]
+pub struct TlsScope {
+    /// Lowercase; `None` for a listener without a hostname.
+    pub listener_hostname: Option<String>,
+    pub exact: FnvHashMap<String, Vec<Backend>>,
     /// `*.example.com` is stored under "example.com".
-    pub wildcard_tls_routes: FnvHashMap<u16, FnvHashMap<String, Vec<Backend>>>,
+    pub wildcard: FnvHashMap<String, Vec<Backend>>,
+    /// A route without hostnames on a listener without one: every SNI, and
+    /// a hello with none.
+    pub catch_all: Option<Vec<Backend>>,
+}
+
+impl TlsScope {
+    pub(crate) fn backends(&self) -> impl Iterator<Item = &Vec<Backend>> {
+        self.exact
+            .values()
+            .chain(self.wildcard.values())
+            .chain(self.catch_all.iter())
+    }
 }
 
 impl RouteTable {
@@ -135,6 +174,9 @@ impl RouteTable {
     /// 1. Find all listener scopes matching the server port
     /// 2. Among those, find scopes matching the Host header (exact > wildcard > catch-all)
     /// 3. Within the best-matching scope, look up the route rule
+    ///
+    /// A miss is a 404 any client can send on every request, so it carries
+    /// nothing: a formatted error allocated per request in a 404 flood.
     #[inline(always)]
     pub fn find_http_route<'a>(
         &'a self,
@@ -144,7 +186,7 @@ impl RouteTable {
         header_data: &[u8],
         query_string: &str,
         server_port: u16,
-    ) -> Result<&'a HttpRouteRule> {
+    ) -> Option<&'a HttpRouteRule> {
         // Normalize host to lowercase
         let host_bytes = host.as_bytes();
         let needs_lowercase = host_bytes.iter().any(|b| b.is_ascii_uppercase());
@@ -164,23 +206,16 @@ impl RouteTable {
             &host_lower
         };
 
-        // O(1) port lookup, then iterate only matching scopes.
-        // Also check port-0 wildcard scopes (file-based configs / tests).
-        let port_scopes = self.listener_scopes.get(&server_port);
-        let wildcard_scopes = if server_port != 0 {
-            self.listener_scopes.get(&0)
-        } else {
-            None
-        };
+        // O(1) port lookup, then iterate only matching scopes, the shared
+        // ones too when the port takes them.
+        let port = self.listener_scopes.get(&server_port);
+        let shared = self.shared_scopes_of(port);
+        let own = port.map_or(&[][..], |p| &p.scopes[..]);
 
         // Phase 1: Find the highest hostname match priority among all matching scopes.
         let mut highest_priority: Option<u32> = None;
 
-        for scope in port_scopes
-            .into_iter()
-            .chain(wildcard_scopes)
-            .flat_map(|v| v.iter())
-        {
+        for scope in own.iter().chain(shared) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if highest_priority.is_none() || priority > highest_priority.unwrap() {
                     highest_priority = Some(priority);
@@ -188,66 +223,72 @@ impl RouteTable {
             }
         }
 
-        let highest_priority = match highest_priority {
-            Some(p) => p,
-            None => {
-                return Err(anyhow!(
-                    "No HTTP route found for host={} path={} port={}",
-                    host_key,
-                    path,
-                    server_port
-                ))
-            }
-        };
+        let highest_priority = highest_priority?;
 
         // Phase 2: Only search routes in scopes at the highest matching priority.
         // This ensures listener isolation — if `bar.example.com` matches `*.example.com`
         // (priority 1), routes from the catch-all listener (priority 0) are excluded.
-        for scope in port_scopes
-            .into_iter()
-            .chain(wildcard_scopes)
-            .flat_map(|v| v.iter())
-        {
+        // A port holds one scope per listener hostname, and so do the shared
+        // scopes: only one of each can sit at the highest priority, and
+        // only that pair needs comparing.
+        let compare = !own.is_empty() && !shared.is_empty();
+        let mut best: Option<(u32, &HttpRouteRule)> = None;
+        for scope in own.iter().chain(shared) {
             if let Some(priority) = scope.hostname_match_priority(host_key) {
                 if priority < highest_priority {
                     continue;
                 }
-                if let Some(rule) =
+                if let Some(found) =
                     scope.lookup_http_route(host_key, method, path, header_data, query_string)
                 {
-                    return Ok(rule);
+                    if !compare {
+                        return Some(found.1);
+                    }
+                    if best.is_none_or(|held| outranks(found, held)) {
+                        best = Some(found);
+                    }
                 }
             }
         }
-
-        Err(anyhow!(
-            "No HTTP route found for host={} path={} port={}",
-            host_key,
-            path,
-            server_port
-        ))
+        best.map(|(_, rule)| rule)
     }
 
     /// Whether any HTTP route can match on `server_port`: its own scopes or
-    /// the any-port (0) ones, as `find_http_route` searches them.
+    /// the shared ones it takes, as `find_http_route` searches them.
     pub fn has_http_routes(&self, server_port: u16) -> bool {
-        [server_port, 0].iter().any(|port| {
-            self.listener_scopes
-                .get(port)
-                .is_some_and(|s| !s.is_empty())
-        })
+        let port = self.listener_scopes.get(&server_port);
+        port.is_some_and(|p| !p.scopes.is_empty()) || !self.shared_scopes_of(port).is_empty()
+    }
+
+    /// The shared scopes a port with `port`'s entry searches: none, unless
+    /// some exist and every port takes them or it does.
+    #[inline(always)]
+    fn shared_scopes_of(&self, port: Option<&PortScopes>) -> &[ListenerScope] {
+        if self.shared_scopes.is_empty()
+            || !(self.shared_on_every_port || port.is_some_and(|p| p.shared))
+        {
+            return &[];
+        }
+        &self.shared_scopes
+    }
+
+    /// Every HTTP route scope: each port's, then the shared ones.
+    pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
+        self.listener_scopes
+            .values()
+            .flat_map(|p| &p.scopes)
+            .chain(&self.shared_scopes)
     }
 
     pub fn has_tcp_route(&self, server_port: u16) -> bool {
         self.tcp_routes.contains_key(&server_port)
     }
 
+    /// A miss carries nothing, as for `find_http_route`: a port with no
+    /// route meets one per connection.
     #[inline(always)]
-    pub fn find_tcp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
-        if let Some(backend_list) = self.tcp_routes.get(&server_port) {
-            return Ok(backend_list);
-        }
-        Err(anyhow!("No TCP route found for port {}", server_port))
+    pub fn find_tcp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
+        self.tcp_routes.get(&server_port)
     }
 
     /// Match rules: method first (fastest reject), then exact path before longest prefix,
@@ -319,84 +360,115 @@ impl RouteTable {
         None
     }
 
+    /// A miss carries nothing: a port with no route meets one per datagram,
+    /// spoofed ones included.
     #[inline(always)]
-    pub fn find_udp_backends(&self, server_port: u16) -> Result<&Vec<Backend>> {
-        if let Some(backend_list) = self.udp_routes.get(&server_port) {
-            return Ok(backend_list);
-        }
-        Err(anyhow!("No UDP route found for port {}", server_port))
+    pub fn find_udp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
+        self.udp_routes.get(&server_port)
     }
 
-    /// Look up the TLS-route backends for an SNI hostname on a port: exact
-    /// hostname first, then wildcard walking up domain labels (matching the
-    /// HTTP wildcard semantics — `*.example.com` also covers
-    /// `a.b.example.com`), each within the connection's port scope and then
-    /// the any-port (0) scope.
-    fn tls_route_backends(&self, sni: &str, server_port: u16) -> Option<&Vec<Backend>> {
-        let sni_lower = sni.to_ascii_lowercase();
-        let ports: &[u16] = if server_port == 0 {
-            &[0]
-        } else {
-            &[server_port, 0]
+    /// The TLS route a lowercase SNI (`None`: the hello sent none) selects
+    /// within the passthrough listener `listener` names on a port and the
+    /// routes without parentRefs (port 0), ranked as one set: the exact
+    /// hostname, then the longest wildcard, then the catch-all; on a tie
+    /// the listener's own. With the key its round robin counts under: the
+    /// route's, never the SNI a client chose to send.
+    fn tls_route(
+        &self,
+        sni: Option<&str>,
+        server_port: u16,
+        listener: Option<&str>,
+    ) -> Option<(&Vec<Backend>, u64)> {
+        let own = self.tls_scopes.get(&server_port).and_then(|scopes| {
+            scopes
+                .iter()
+                .find(|s| s.listener_hostname.as_deref() == listener)
+        });
+        let shared = match server_port {
+            0 => &[][..],
+            _ => self.tls_scopes.get(&0).map_or(&[][..], Vec::as_slice),
         };
-        for port in ports {
-            if let Some(by_host) = self.tls_routes.get(port) {
-                if let Some(backends) = by_host.get(&sni_lower) {
-                    return Some(backends);
+        let scopes = || {
+            own.map(|scope| (server_port, scope))
+                .into_iter()
+                .chain(shared.iter().map(|scope| (0, scope)))
+        };
+        // Bounded by the routes configured: an exact route's name is a
+        // configured hostname, a wildcard's its parent domain.
+        let key = |port: u16, scope: &TlsScope, kind: u8, name: &str| {
+            use std::hash::Hasher;
+            let mut h = fnv::FnvHasher::default();
+            h.write_u16(port);
+            h.write(scope.listener_hostname.as_deref().unwrap_or("").as_bytes());
+            h.write_u8(kind);
+            h.write(name.as_bytes());
+            h.finish()
+        };
+        if let Some(sni) = sni {
+            for (port, scope) in scopes() {
+                if let Some(backends) = scope.exact.get(sni) {
+                    return Some((backends, key(port, scope, b'=', sni)));
                 }
             }
-            if let Some(by_host) = self.wildcard_tls_routes.get(port) {
-                for parent in parent_domains(&sni_lower) {
-                    if let Some(backends) = by_host.get(parent) {
-                        return Some(backends);
+            for parent in parent_domains(sni) {
+                for (port, scope) in scopes() {
+                    if let Some(backends) = scope.wildcard.get(parent) {
+                        return Some((backends, key(port, scope, b'*', parent)));
                     }
                 }
             }
         }
-        None
-    }
-
-    /// Resolve a TLS passthrough connection to a backend address.
-    /// Checks SNI-based TLS routes first (exact, then wildcard), then falls
-    /// back to port-based TCP routes. Selection is healthy weighted
-    /// round-robin, same as the L4 path; `None` also covers the
-    /// all-backends-unhealthy case (caller drops the connection).
-    pub fn resolve_tls_passthrough(
-        &self,
-        sni: &str,
-        server_port: u16,
-        selector: &BackendSelector,
-        health: &crate::proxy::health::HealthRegistry,
-    ) -> Option<std::net::SocketAddr> {
-        if let Some(backends) = self.tls_route_backends(sni, server_port) {
-            // Counter keyed per (port, SNI) so each route rotates
-            // independently; a collision only shares a counter.
-            let key = {
-                use std::hash::Hasher;
-                let mut h = fnv::FnvHasher::default();
-                h.write(sni.as_bytes());
-                h.write_u16(server_port);
-                h.finish()
-            };
-            return selector
-                .select_l4_backend(key, backends, health)
-                .map(|b| b.socket_addr);
-        }
-
-        // Fall back to port-based TCP routes, sharing the TCP path's counter.
-        self.tcp_routes.get(&server_port).and_then(|backends| {
-            selector
-                .select_l4_backend(server_port as u64, backends, health)
-                .map(|b| b.socket_addr)
+        scopes().find_map(|(port, scope)| {
+            let backends = scope.catch_all.as_ref()?;
+            Some((backends, key(port, scope, b'.', "")))
         })
     }
 
-    /// Check if a TLS passthrough route exists for this SNI hostname on this
-    /// port. Used by the worker to dynamically decide between passthrough and
-    /// termination when both share a port.
-    pub fn has_tls_passthrough_route(&self, sni: &str, server_port: u16) -> bool {
-        self.tls_route_backends(sni, server_port).is_some()
+    /// Resolve a TLS passthrough connection, by its lowercase SNI if it
+    /// sent one, to a backend address: a TLS route of the passthrough
+    /// listener its SNI selected (by hostname, `None` for the catch-all),
+    /// else the port's TCP route. Selection is healthy weighted
+    /// round-robin, same as the L4 path. On `Err` the caller drops the
+    /// connection.
+    pub fn resolve_tls_passthrough(
+        &self,
+        sni: Option<&str>,
+        server_port: u16,
+        listener: Option<&str>,
+        selector: &BackendSelector,
+        health: &crate::proxy::health::HealthRegistry,
+    ) -> Result<std::net::SocketAddr, PassthroughMiss> {
+        // Each route rotates on its own counter; a key collision only
+        // shares one.
+        let (backends, key) = if let Some(route) = self.tls_route(sni, server_port, listener) {
+            route
+        } else if let Some(backends) = self.tcp_routes.get(&server_port) {
+            // Shares the TCP path's counter.
+            (backends, server_port as u64)
+        } else {
+            return Err(PassthroughMiss::NoRoute);
+        };
+        if backends.is_empty() {
+            return Err(PassthroughMiss::NoBackends);
+        }
+        match selector.select_l4_backend(key, backends, health) {
+            None => Err(PassthroughMiss::NoWeight),
+            Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
+            Some(b) => Ok(b.socket_addr),
+        }
     }
+}
+
+/// Whether `a` takes a request from `b`, both found for it with the
+/// precedence of the route hostname each matched under. Gateway API
+/// v1.4.1 HTTPRoute: the more specific hostname, then the more specific
+/// match (HTTPRouteRule.matches), then the earlier route.
+#[inline]
+fn outranks(a: (u32, &HttpRouteRule), b: (u32, &HttpRouteRule)) -> bool {
+    b.0.cmp(&a.0)
+        .then_with(|| build::match_precedence(a.1, b.1))
+        .then(a.1.route_index.cmp(&b.1.route_index))
+        .is_lt()
 }
 
 pub type HostEntry = Vec<HttpRouteRule>;
@@ -444,6 +516,11 @@ pub struct HttpRouteRule {
     /// like `requests`: table swaps re-attach the SAME limiter, so a
     /// throttled client stays throttled across reconciles and DNS refreshes.
     pub limiter: Option<Arc<crate::rate_limit::Limiter>>,
+    /// Its route's place among the config's HTTP routes, which come in
+    /// precedence order (oldest first in Kubernetes, file order otherwise).
+    /// Within a scope the stable sort keeps it; between a port's scope and
+    /// the shared one it breaks a tie.
+    pub route_index: u32,
 }
 
 impl HttpRouteRule {
@@ -475,6 +552,7 @@ impl HttpRouteRule {
             // counts into this unrendered cell.
             requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             limiter: None,
+            route_index: 0,
         }
     }
 
@@ -538,15 +616,78 @@ pub enum HttpFilter {
     },
     RequestMirror {
         backend_addr: std::net::SocketAddr,
-        /// Percentage of requests to mirror (0–100). Default 100 = mirror all.
-        mirror_percent: u32,
+        fraction: Fraction,
     },
+}
+
+/// Share of requests a mirror copies, exact: whole percents turned 1/1000
+/// into 0%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fraction {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl Fraction {
+    pub const ALL: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    /// `None` outside the Gateway API bounds: a denominator of at least 1
+    /// and a numerator no larger. Reduced, so equal shares compare equal.
+    pub fn new(numerator: u32, denominator: u32) -> Option<Self> {
+        if denominator == 0 || numerator > denominator {
+            return None;
+        }
+        let (mut gcd, mut rest) = (numerator, denominator);
+        while rest != 0 {
+            (gcd, rest) = (rest, gcd % rest);
+        }
+        Some(Self {
+            numerator: numerator / gcd,
+            denominator: denominator / gcd,
+        })
+    }
+
+    /// One draw: true `numerator` times in `denominator`, on average.
+    #[inline]
+    pub fn sample(self) -> bool {
+        self.numerator == self.denominator
+            || (self.numerator > 0 && fastrand::u32(0..self.denominator) < self.numerator)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum URLRewritePath {
-    ReplaceFullPath(String),
-    ReplacePrefixMatch(String),
+    ReplaceFullPath(PathValue),
+    ReplacePrefixMatch(PathValue),
+}
+
+/// A path modifier value, split once when its rule compiles: a request
+/// never scans it. Gateway API v1.4.1 HTTPPathModifier bounds the value by
+/// length only, so it may carry a query, which comes before the request's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathValue {
+    pub path: String,
+    /// After the value's first '?', when it has one: `Some("")` for a
+    /// bare '?'.
+    pub query: Option<Arc<str>>,
+}
+
+impl From<&str> for PathValue {
+    fn from(value: &str) -> Self {
+        match value.split_once('?') {
+            Some((path, query)) => Self {
+                path: path.to_string(),
+                query: Some(query.into()),
+            },
+            None => Self {
+                path: value.to_string(),
+                query: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +706,44 @@ pub struct Backend {
     pub use_tls: bool,
     /// Hostname for TLS SNI (the original DNS name before resolution)
     pub server_name: String,
+    pub action: BackendAction,
+}
+
+/// Why a TLS passthrough connection goes nowhere, worded as the L4
+/// path words it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassthroughMiss {
+    /// No TLS route for its SNI, and no TCP route on its port.
+    NoRoute,
+    /// Its route resolved to no backend at all.
+    NoBackends,
+    /// Every backend of its route has weight 0.
+    NoWeight,
+    /// Its share is an invalid backendRef's ([`BackendAction::Reject`]).
+    Rejected,
+}
+
+impl std::fmt::Display for PassthroughMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoRoute => "no route",
+            Self::NoBackends => "no backends available",
+            Self::NoWeight => "no backend with positive weight",
+            Self::Rejected => "drew an invalid backendRef's share; rejected",
+        })
+    }
+}
+
+/// What a request or connection that selects a backend gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAction {
+    Forward,
+    /// Stands for an invalid backendRef (RefNotPermitted, BackendNotFound,
+    /// InvalidKind) and keeps its weight: its share fails (HTTP 500, L4
+    /// connection closed or datagram dropped) instead of moving to the
+    /// valid refs (HTTPRouteRule.backendRefs, TCPRouteRule.backendRefs).
+    /// Never connected to, so health never tracks it.
+    Reject,
 }
 
 /// True when `host` is a strict subdomain of `parent` on a label boundary
@@ -594,13 +773,13 @@ pub fn hostnames_intersect(a: &str, b: &str) -> bool {
 /// Successive parent domains: "a.b.example.com" yields "b.example.com",
 /// "example.com", "com".
 #[inline]
-fn parent_domains(host: &str) -> ParentDomains<'_> {
+pub(crate) fn parent_domains(host: &str) -> ParentDomains<'_> {
     ParentDomains(host)
 }
 
 /// Hand-rolled rather than iter::successors: the closure-based adapter did
 /// not inline flat, costing measurable ns on the route-miss path.
-struct ParentDomains<'a>(&'a str);
+pub(crate) struct ParentDomains<'a>(&'a str);
 
 impl<'a> Iterator for ParentDomains<'a> {
     type Item = &'a str;
@@ -767,18 +946,7 @@ impl BackendSelector {
             return Some(rule.cumulative_weights.partition_point(|&cw| cw <= slot));
         }
 
-        // Slow path — some positive-weight backends are unhealthy
-        let slot = counter % pool_weight;
-
-        if let Some(i) = nth_healthy_weighted(backends, health, slot) {
-            return Some(i);
-        }
-
-        // Only reachable if health flipped between the sum and the walk.
-        backends
-            .iter()
-            .position(|b| b.weight > 0 && health.is_healthy(&b.socket_addr))
-            .or_else(|| backends.iter().position(|b| b.weight > 0))
+        select_degraded(backends, health, counter, rule.total_weight)
     }
 
     /// Health-aware weighted round-robin over an L4 backend list, keyed by
@@ -804,24 +972,67 @@ impl BackendSelector {
             return None;
         }
         let counter = self.next_counter(key);
-        if healthy_weight > 0 {
-            if let Some(i) = nth_healthy_weighted(backends, health, counter % healthy_weight) {
-                return Some(&backends[i]);
-            }
-        }
-        // Panic routing, or health flipped between the sum and the walk.
-        let slot = counter % total_weight;
-        let mut cumulative: u64 = 0;
-        backends.iter().find(|b| {
-            cumulative += b.weight as u64;
-            cumulative > slot
-        })
+        let index = if healthy_weight == total_weight || healthy_weight == 0 {
+            // Every backend healthy, or panic routing over all of them.
+            slot_owner(backends, counter % total_weight)
+        } else {
+            select_degraded(backends, health, counter, total_weight)
+        };
+        index.map(|i| &backends[i])
     }
 }
 
-/// Walk to the healthy positive-weight backend owning weighted slot `slot`.
-/// `None` only when health flipped between the caller's weight sum and this
-/// walk.
+/// The backend owning weighted slot `slot` of the configured weights.
+#[inline]
+fn slot_owner(backends: &[Backend], slot: u64) -> Option<usize> {
+    let mut cumulative: u64 = 0;
+    backends.iter().position(|b| {
+        cumulative += b.weight as u64;
+        cumulative > slot
+    })
+}
+
+/// Selection while some positive-weight backend is unhealthy. A Reject
+/// entry keeps exactly its configured share: it stands for an invalid
+/// backendRef, whose share alone must fail, so it never absorbs an
+/// unhealthy backend's. The forwarding share spreads over the healthy
+/// forwarding backends by weight; with none healthy it stays with the slot's
+/// owner (panic routing).
+fn select_degraded(
+    backends: &[Backend],
+    health: &crate::proxy::health::HealthRegistry,
+    counter: u64,
+    total_weight: u64,
+) -> Option<usize> {
+    let slot = counter % total_weight;
+    let owner = slot_owner(backends, slot)?;
+    let (mut cumulative, mut rejected, mut rejected_below_slot, mut healthy) = (0u64, 0, 0, 0);
+    for b in backends {
+        let weight = b.weight as u64;
+        if b.action == BackendAction::Reject {
+            rejected += weight;
+            if cumulative + weight <= slot {
+                rejected_below_slot += weight;
+            }
+        } else if weight > 0 && health.is_healthy(&b.socket_addr) {
+            healthy += weight;
+        }
+        cumulative += weight;
+    }
+    if backends[owner].action == BackendAction::Reject || healthy == 0 {
+        return Some(owner);
+    }
+    // Forwarding picks made since the counter started: consecutive ones
+    // rotate over the healthy backends whatever share the Reject entries
+    // take in between. Without Reject entries this is `counter`.
+    let forward_pick =
+        counter / total_weight * (total_weight - rejected) + (slot - rejected_below_slot);
+    nth_healthy_weighted(backends, health, forward_pick % healthy).or(Some(owner))
+}
+
+/// Walk to the healthy positive-weight forwarding backend owning weighted
+/// slot `slot`. `None` only when health flipped between the caller's
+/// weight sum and this walk.
 #[inline]
 fn nth_healthy_weighted(
     backends: &[Backend],
@@ -830,7 +1041,8 @@ fn nth_healthy_weighted(
 ) -> Option<usize> {
     let mut cumulative: u64 = 0;
     for (i, b) in backends.iter().enumerate() {
-        if b.weight == 0 || !health.is_healthy(&b.socket_addr) {
+        if b.weight == 0 || b.action == BackendAction::Reject || !health.is_healthy(&b.socket_addr)
+        {
             continue;
         }
         cumulative += b.weight as u64;

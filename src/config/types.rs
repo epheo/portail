@@ -25,8 +25,8 @@ pub struct GatewayConfig {
     pub name: String,
     pub listeners: Vec<ListenerConfig>,
 
-    /// Bind addresses from Gateway spec.addresses (IPAddress entries only).
-    /// When non-empty, listeners bind to each address instead of 0.0.0.0.
+    /// Gateway spec.addresses: IPAddress values and portail.epheo.eu/Network
+    /// names. Kubernetes mode binds the ones local to the pod.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
 }
@@ -59,6 +59,18 @@ pub struct ListenerConfig {
     /// check per request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitSpec>,
+}
+
+impl ListenerConfig {
+    /// A TLS listener in Passthrough mode, the one TLS mode served: the
+    /// stream goes to a backend by SNI, raw.
+    pub fn is_tls_passthrough(&self) -> bool {
+        self.protocol == Protocol::TLS
+            && self
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.mode == TlsMode::Passthrough)
+    }
 }
 
 /// Token-bucket parameters, per client (IPv4 address / IPv6 /64).
@@ -95,9 +107,14 @@ pub enum TlsMode {
     Passthrough,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CertificateRef {
     pub name: String,
+    /// The Secret's namespace in Kubernetes mode: with `name`, the key a
+    /// port's merged refs are told apart by. `None` in a file config,
+    /// whose names are files in one directory.
+    #[serde(skip)]
+    pub namespace: Option<String>,
     /// The listener hostname associated with this cert (for SNI routing).
     /// e.g. "*.desku.be", "example.org", etc.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +241,16 @@ pub struct HttpRouteRule {
     pub backend_refs: Vec<BackendRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<HttpRouteTimeouts>,
+}
+
+impl HttpRouteRule {
+    /// A RequestRedirect answers the request itself: the rule never
+    /// forwards, and its backendRefs go unused in both modes.
+    pub fn redirects(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }))
+    }
 }
 
 /// Per-rule timeout configuration following Gateway API HTTPRouteTimeouts
@@ -454,6 +481,11 @@ pub struct BackendRef {
     /// Application protocol for backend connections (e.g. "https" for TLS backends)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_protocol: Option<String>,
+    /// Set by the Kubernetes reconciler on a ref it may not forward to
+    /// (RefNotPermitted, BackendNotFound, InvalidKind). The ref keeps its
+    /// weight and its share of traffic fails; it is never resolved.
+    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
+    pub invalid: bool,
 }
 
 fn default_backend_kind() -> String {
