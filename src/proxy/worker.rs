@@ -8,12 +8,12 @@ use arc_swap::ArcSwap;
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
@@ -242,6 +242,8 @@ pub(crate) struct ConnectionState {
     /// connection's own child of the listener token, so the checks on
     /// every request lock nothing shared.
     drain: CancellationToken,
+    /// How the requests observe `drain`: see `DrainWatch`.
+    drain_watch: Arc<DrainWatch>,
     /// The connection closes after a reply while the client may still be
     /// sending: the close reads off what comes instead of resetting on it.
     /// Set by `close_after_reply` only, so every reply follows one rule.
@@ -288,6 +290,7 @@ impl ConnectionState {
             listener_stats,
             last_status: 0,
             drain,
+            drain_watch: Arc::default(),
             linger: false,
             client_done: false,
             reset: false,
@@ -310,8 +313,66 @@ impl ConnectionState {
 }
 
 /// Whether a connection may take another request after this one.
-fn keep_open(drain: &CancellationToken, reusable: bool) -> bool {
-    reusable && !drain.is_cancelled()
+fn keep_open(drain: &DrainWatch, reusable: bool) -> bool {
+    reusable && !drain.started()
+}
+
+/// A connection's view of its drain token, read without the token's lock.
+/// tokio-util's `is_cancelled` locks the token, as do registering and
+/// dropping a wait on it, and every keepalive request did all three. The
+/// token is waited on once per connection instead (`arm`), by a waker
+/// that raises this flag.
+#[derive(Default)]
+struct DrainWatch {
+    started: AtomicBool,
+    task: futures::task::AtomicWaker,
+}
+
+impl DrainWatch {
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the drain has started.
+    async fn wait(&self) {
+        std::future::poll_fn(|cx| {
+            if self.started() {
+                return std::task::Poll::Ready(());
+            }
+            self.task.register(cx.waker());
+            // A drain since the check may have woken no one.
+            if self.started() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Have `drained`, a wait on the drain token, raise `watch`. Polled
+    /// this once, it stays registered for as long as it lives.
+    fn arm(watch: &Arc<DrainWatch>, drained: Pin<&mut WaitForCancellationFutureOwned>) {
+        use std::future::Future;
+        let waker = std::task::Waker::from(Arc::clone(watch));
+        if drained
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_ready()
+        {
+            waker.wake();
+        }
+    }
+}
+
+impl std::task::Wake for DrainWatch {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.started.store(true, Ordering::Release);
+        self.task.wake();
+    }
 }
 
 /// Pool handle for one client connection: the process-wide shared pool when
@@ -637,7 +698,10 @@ async fn serve_http(
     state: &mut ConnectionState,
     tcp_route: bool,
 ) -> Result<Handoff> {
-    let mut n = idle_read(client, buf, &state.drain).await?;
+    // Lives as long as the requests: dropping it ends the wait on the token.
+    let drained = std::pin::pin!(state.drain.clone().cancelled_owned());
+    DrainWatch::arm(&state.drain_watch, drained);
+    let mut n = idle_read(client, buf, &state.drain_watch).await?;
     n = sniff_first_request(client, buf, n, state.client_header_timeout, !tcp_route).await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
@@ -701,7 +765,7 @@ async fn serve_http(
                     let reply = LocalReply {
                         status: 429,
                         location: None,
-                        reusable: keep_open(&state.drain, meta.local_reply_reusable),
+                        reusable: keep_open(&state.drain_watch, meta.local_reply_reusable),
                         client_done: meta.client_done,
                         head: meta.is_head,
                     };
@@ -751,7 +815,7 @@ async fn serve_http(
                 }
             }
             RoutingResult::LocalReply(mut reply) => {
-                reply.reusable = keep_open(&state.drain, reply.reusable);
+                reply.reusable = keep_open(&state.drain_watch, reply.reusable);
                 if !send_local_reply(client, state, &reply, access).await? {
                     return Ok(Handoff::Close);
                 }
@@ -773,7 +837,7 @@ async fn serve_http(
             buf[..bytes.len()].copy_from_slice(&bytes);
             n = bytes.len();
         } else {
-            n = idle_read(client, buf, &state.drain).await?;
+            n = idle_read(client, buf, &state.drain_watch).await?;
         }
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
@@ -785,7 +849,7 @@ async fn serve_http(
             }
             match &buf[..n] {
                 // Between requests: as unbounded as the idle wait.
-                [] if skip > 0 => n = idle_read(client, buf, &state.drain).await?,
+                [] if skip > 0 => n = idle_read(client, buf, &state.drain_watch).await?,
                 // Inside an empty line: as bounded as a request head.
                 [b'\r'] => {
                     let rest = client.read(&mut buf[1..]);
@@ -898,13 +962,13 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
 async fn idle_read(
     client: &mut Connection,
     buf: &mut [u8],
-    drain: &CancellationToken,
+    drain: &DrainWatch,
 ) -> std::io::Result<usize> {
     tokio::select! {
         // A request already sent is served: its reply announces the close.
         biased;
         read = client.read(buf) => read,
-        () = drain.cancelled() => Ok(0),
+        () = drain.wait() => Ok(0),
     }
 }
 
@@ -1272,7 +1336,7 @@ async fn proxy_http_request(
             meta.is_head,
             meta.is_upgrade && !answered_early,
             meta.keepalive && !answered_early,
-            &state.drain,
+            &state.drain_watch,
         )
         .await?
         {
@@ -1865,7 +1929,7 @@ async fn forward_response_headers(
     is_head_request: bool,
     expect_upgrade: bool,
     keepalive: bool,
-    drain: &CancellationToken,
+    drain: &DrainWatch,
 ) -> Result<HeaderPhase> {
     let read = match head_wait {
         Some((timer, deadline)) => {
