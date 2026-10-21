@@ -255,6 +255,58 @@ fn spawn_raw_backend(response: String) -> SocketAddr {
     addr
 }
 
+/// What a [`spawn_holding_backend`] connection just did.
+#[derive(Debug, PartialEq)]
+enum BackendConn {
+    Opened,
+    Closed,
+}
+
+/// Backend that answers each request head with `reply`, never completing a
+/// response, and holds the connection until the proxy closes it. Reports
+/// each connection as it opens and as it closes.
+fn spawn_holding_backend(
+    reply: &'static [u8],
+) -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<BackendConn>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind holding backend");
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let _ = tx.send(BackendConn::Opened);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut seen, mut buf) = (Vec::new(), [0u8; 4096]);
+                while let Ok(n @ 1..) = s.read(&mut buf) {
+                    let had_head = seen.windows(4).any(|w| w == b"\r\n\r\n");
+                    seen.extend_from_slice(&buf[..n]);
+                    if !had_head && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let _ = s.write_all(reply);
+                    }
+                }
+                let _ = tx.send(BackendConn::Closed);
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// Next backend connection event. The bound sits far below the 30s backend
+/// budget, which is what releases an exchange nobody aborts.
+async fn next_backend_event(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<BackendConn>,
+) -> BackendConn {
+    tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("no backend connection opened or closed within 5s")
+        .expect("backend gone")
+}
+
 /// Cert + portail with `--http2`, one TestBackend route. `None` = no openssl.
 fn spawn_h2_proxy(port: u16, backend_addr: SocketAddr) -> Option<PortailProcess> {
     let (cert, key) = generate_test_cert(SNI)?;
@@ -585,4 +637,74 @@ async fn test_h2_not_offered_without_flag() {
 
     let tls = tls_connect(h2_port(7), &[b"h2", b"http/1.1"]).await;
     assert_eq!(negotiated_alpn(&tls).as_deref(), Some(b"http/1.1".as_ref()));
+}
+
+/// Rapid reset (the CVE-2023-44487 class): h2 frees a stream's slot the
+/// moment the client resets it, so the client can cycle far more streams
+/// through one connection than it may hold open. Each reset must take its
+/// engine and backend exchange down with it.
+#[tokio::test]
+async fn test_h2_reset_streams_release_their_backend_exchange() {
+    let (backend, mut events) = spawn_holding_backend(b"");
+    let Some(_proxy) = spawn_h2_proxy(h2_port(40), backend) else {
+        return;
+    };
+    let sr = h2_handshake(tls_connect(h2_port(40), &[b"h2"]).await).await;
+
+    // Well past the 128 streams the bridge lets a client hold open at once.
+    const CYCLES: usize = 300;
+    let (mut open, mut peak) = (0usize, 0usize);
+    for _ in 0..CYCLES {
+        let mut s = sr.clone().ready().await.expect("h2 ready");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{}/", SNI))
+            .body(())
+            .unwrap();
+        let (_resp, mut stream) = s.send_request(req, true).expect("send_request");
+        // Reset only once the backend holds the exchange: from then on only
+        // the reset can end it before the backend budget does.
+        loop {
+            match next_backend_event(&mut events).await {
+                BackendConn::Opened => break,
+                BackendConn::Closed => open -= 1,
+            }
+        }
+        open += 1;
+        peak = peak.max(open);
+        stream.send_reset(h2::Reason::CANCEL);
+    }
+    while open > 0 {
+        assert_eq!(next_backend_event(&mut events).await, BackendConn::Closed);
+        open -= 1;
+    }
+    assert!(
+        peak <= 128,
+        "{peak} backend exchanges outlived their reset streams"
+    );
+}
+
+/// A reset after the response head went out must end the exchange too: the
+/// bridge then waits on the engine's body, not on anything h2 would wake.
+#[tokio::test]
+async fn test_h2_reset_mid_body_releases_the_backend_exchange() {
+    let (backend, mut events) =
+        spawn_holding_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart");
+    let Some(_proxy) = spawn_h2_proxy(h2_port(41), backend) else {
+        return;
+    };
+    let sr = h2_handshake(tls_connect(h2_port(41), &[b"h2"]).await).await;
+    let mut s = sr.ready().await.expect("h2 ready");
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{}/", SNI))
+        .body(())
+        .unwrap();
+    let (resp, mut stream) = s.send_request(req, true).expect("send_request");
+    assert_eq!(next_backend_event(&mut events).await, BackendConn::Opened);
+    let resp = resp.await.expect("h2 response");
+    assert_eq!(resp.status(), 200);
+    stream.send_reset(h2::Reason::CANCEL);
+    // Far sooner than the 300s idle-body budget that ends it otherwise.
+    assert_eq!(next_backend_event(&mut events).await, BackendConn::Closed);
 }

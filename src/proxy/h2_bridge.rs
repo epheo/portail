@@ -9,8 +9,11 @@
 //! a native h2 path), CONNECT/:protocol streams are refused, and the
 //! engine's 100-continue handling is bypassed by stripping `expect`.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -18,6 +21,7 @@ use arc_swap::ArcSwap;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_util::sync::CancellationToken;
 
@@ -94,6 +98,9 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     };
 
     let ctx = Arc::new(ctx);
+    // h2 frees a stream's slot the moment the client resets it, while its
+    // engine may still wait on the backend: these bound the engines.
+    let engines = Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS as usize));
     let mut draining = false;
     loop {
         let stream = tokio::select! {
@@ -112,17 +119,21 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
             return;
         };
         let ctx = ctx.clone();
+        let engines = engines.clone();
         tokio::spawn(async move {
-            let _ = serve_stream(req, respond, &ctx).await;
+            let _ = serve_stream(req, respond, &ctx, &engines).await;
         });
     }
 }
 
-/// Replay one h2 stream as an h1 exchange through the engine.
+/// Replay one h2 stream as an h1 exchange through the engine. The engine
+/// runs under one of `engines`, and is dropped with its backend exchange
+/// the moment the client resets the stream.
 async fn serve_stream(
     req: http::Request<h2::RecvStream>,
-    respond: h2::server::SendResponse<Bytes>,
+    mut respond: h2::server::SendResponse<Bytes>,
     ctx: &H2Ctx,
+    engines: &Semaphore,
 ) -> Result<()> {
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
@@ -133,11 +144,13 @@ async fn serve_stream(
         // exchange through the engine. Count it like an engine-answered
         // error so refusals are not invisible to /metrics.
         ctx.listener_stats.http_requests.inc();
-        let mut respond = respond;
         let resp = http::Response::builder().status(400).body(()).unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
     };
+
+    // Held until the engine is done or dropped, not until h2 frees the slot.
+    let _engine_slot = unless_reset(engines.acquire(), |cx| respond.poll_reset(cx)).await?;
 
     let (io, engine_io) = tokio::io::duplex(DUPLEX_BUF);
     let state = worker::ConnectionState::new(
@@ -154,25 +167,29 @@ async fn serve_stream(
     );
     let engine = worker::handle_connection(Connection::Mem { inner: engine_io }, ctx.peer, state);
 
-    // The bridge owns its duplex half and drops it on completion, so the
-    // engine sees EOF and unblocks even when the client aborts the stream;
-    // otherwise the engine would park on the duplex until idle_body_timeout,
-    // pinning a backend connection long after the client gave up.
+    // The bridge owns its duplex half and drops it on completion, so an
+    // engine still reading the duplex sees EOF instead of parking on it.
     let bridge = async move {
         let mut io = io;
         let mut respond = respond;
         let result = async {
-            // A duplex write failing means the engine already answered and
-            // dropped its half (e.g. a routing 404); fall through to read
-            // that buffered response rather than aborting the stream.
-            if io.write_all(&head).await.is_ok() {
-                // Always pump: for a chunked body this must emit the
-                // terminator even when the body is empty, and for a
-                // content-length/no-body head it returns as soon as the h2
-                // stream ends.
-                pump_request_body(&mut io, body, chunk_body, idle).await?;
-            }
-            forward_response(&mut io, &mut respond, is_head, idle).await
+            // Waiting for the head, the engine may sit on the backend for
+            // its whole budget: only the reset watch sees the client leave.
+            let to_head = async {
+                // A duplex write failing means the engine already answered
+                // and dropped its half (e.g. a routing 404); fall through to
+                // read that buffered response rather than aborting the stream.
+                if io.write_all(&head).await.is_ok() {
+                    // Always pump: for a chunked body this must emit the
+                    // terminator even when the body is empty, and for a
+                    // content-length/no-body head it returns as soon as the
+                    // h2 stream ends.
+                    pump_request_body(&mut io, body, chunk_body, idle).await?;
+                }
+                read_response_head(&mut io).await
+            };
+            let resp_head = unless_reset(to_head, |cx| respond.poll_reset(cx)).await?;
+            forward_response(&mut io, &mut respond, resp_head, is_head, idle).await
         }
         .await;
         drop(io);
@@ -184,8 +201,42 @@ async fn serve_stream(
 
     // Engine errors (client-equivalent close, backend failures it already
     // answered) are its own business; the stream outcome is the bridge's.
-    let (_engine, result) = tokio::join!(engine, bridge);
+    let mut engine = pin!(engine);
+    let mut bridge = pin!(bridge);
+    let mut engine_done = false;
+    let result = std::future::poll_fn(|cx| {
+        if !engine_done {
+            engine_done = engine.as_mut().poll(cx).is_ready();
+        }
+        bridge.as_mut().poll(cx)
+    })
+    .await;
+    // A delivered response lets the engine wind down, as it may still pool
+    // its backend conn; a reset or failed stream drops the exchange.
+    if result.is_ok() && !engine_done {
+        let _ = engine.await;
+    }
     result
+}
+
+/// Await `fut` unless the client resets the stream, or its connection dies,
+/// first: h2 frees a reset stream's slot at once, so nothing the exchange
+/// waits on may outlive the reset.
+async fn unless_reset<T, E: Into<anyhow::Error>>(
+    fut: impl Future<Output = Result<T, E>>,
+    mut poll_reset: impl FnMut(&mut Context<'_>) -> Poll<Result<h2::Reason, h2::Error>>,
+) -> Result<T> {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(out.map_err(Into::into));
+        }
+        poll_reset(cx).map(|reset| match reset {
+            Ok(reason) => Err(anyhow!("client reset the stream: {:?}", reason)),
+            Err(e) => Err(anyhow!("h2 stream lost: {}", e)),
+        })
+    })
+    .await
 }
 
 /// Serialize an h2 request head as the equivalent h1 head. Returns the head
@@ -324,20 +375,13 @@ async fn pump_request_body(
     Ok(())
 }
 
-/// Read the engine's h1 response from the duplex and translate it onto the
-/// h2 stream: headers mapped (hop-by-hop dropped), body de-framed into DATA.
-async fn forward_response(
-    io: &mut DuplexStream,
-    respond: &mut h2::server::SendResponse<Bytes>,
-    is_head: bool,
-    idle: Option<Duration>,
-) -> Result<()> {
-    // After a freeze detaches the accumulator's capacity, an unreserved
-    // read_buf degrades to 64-byte reads; reserve keeps them at RESP_READ.
+/// Read the engine's h1 response head from the duplex. Returns the bytes
+/// read, which may run past the head into the body, and where the head ends.
+async fn read_response_head(io: &mut DuplexStream) -> Result<(BytesMut, usize)> {
     let mut acc = BytesMut::with_capacity(RESP_READ);
-    let header_end = loop {
+    loop {
         if let Some(end) = find_header_end(&acc) {
-            break end;
+            return Ok((acc, end));
         }
         if acc.len() > RESPONSE_HEAD_CAP {
             return Err(anyhow!("engine response headers exceed cap"));
@@ -348,8 +392,19 @@ async fn forward_response(
         if io.read_buf(&mut acc).await? == 0 {
             return Err(anyhow!("engine closed before response headers"));
         }
-    };
+    }
+}
 
+/// Translate the engine's h1 response, its head read by
+/// [`read_response_head`], onto the h2 stream: headers mapped (hop-by-hop
+/// dropped), body de-framed into DATA.
+async fn forward_response(
+    io: &mut DuplexStream,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    (mut acc, header_end): (BytesMut, usize),
+    is_head: bool,
+    idle: Option<Duration>,
+) -> Result<()> {
     // The engine framed its output by this same reading, which admits no
     // transfer coding but the chunked framing removed here: h2 carries none.
     let head = worker::parse_response_head(&acc[..header_end])
@@ -384,9 +439,7 @@ async fn forward_response(
                 return Ok(());
             }
             acc.clear();
-            acc.reserve(RESP_READ);
-            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
-            if n == 0 {
+            if read_body(io, &mut acc, &mut send, idle).await? == 0 {
                 return Err(anyhow!("truncated chunked response"));
             }
         }
@@ -402,9 +455,7 @@ async fn forward_response(
             if remaining == 0 {
                 return Ok(());
             }
-            acc.reserve(RESP_READ);
-            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
-            if n == 0 {
+            if read_body(io, &mut acc, &mut send, idle).await? == 0 {
                 return Err(anyhow!("truncated response body"));
             }
         }
@@ -415,15 +466,29 @@ async fn forward_response(
             if !acc.is_empty() {
                 send_data(&mut send, acc.split().freeze(), false, idle).await?;
             }
-            acc.reserve(RESP_READ);
-            let n = progress("h2 bridge", idle, io.read_buf(&mut acc)).await??;
-            if n == 0 {
+            if read_body(io, &mut acc, &mut send, idle).await? == 0 {
                 send.send_data(Bytes::new(), true)
                     .map_err(|e| anyhow!("h2 send: {}", e))?;
                 return Ok(());
             }
         }
     }
+}
+
+/// Read more of the engine's response body into `acc`. Parked here the
+/// bridge polls nothing else on the stream, so the client's reset is
+/// watched alongside.
+async fn read_body(
+    io: &mut DuplexStream,
+    acc: &mut BytesMut,
+    send: &mut h2::SendStream<Bytes>,
+    idle: Option<Duration>,
+) -> Result<usize> {
+    // After a freeze detaches the accumulator's capacity, an unreserved
+    // read_buf degrades to 64-byte reads; reserve keeps them at RESP_READ.
+    acc.reserve(RESP_READ);
+    let read = unless_reset(io.read_buf(acc), |cx| send.poll_reset(cx));
+    progress("h2 bridge", idle, read).await?
 }
 
 /// Decode one read's worth of chunked body and forward the payload.
