@@ -26,6 +26,7 @@ use crate::kubernetes::addresses::{
     substitute_network_ips, unresolved_networks, UsableAddresses,
 };
 use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::dns_refresh::Published;
 use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
     reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
@@ -853,16 +854,19 @@ pub(super) async fn reconcile(
 
     let programmed_cond = match build_route_table(effective_config.clone()).await {
         Ok(route_table) => {
-            ctx.routes.store(Arc::new(route_table));
+            let table = Arc::new(route_table);
+            ctx.routes.store(table.clone());
             if let Ok(health) = ctx.data_plane.lock().map(|dp| dp.health().clone()) {
-                health.prune(&ctx.routes.load());
+                health.prune(&table);
             }
-            // Publish the config only after the table it produced is live:
-            // the background DNS-refresh task re-resolves from this cell, and
-            // must never pick up a config whose build failed — nor one whose
-            // table hasn't been swapped in yet (the refresh CAS compares
-            // against the live table).
-            ctx.config_cell.store(Some(effective_config));
+            // Publish only after the table is live: the DNS-refresh task
+            // re-resolves from this pair and must never pick up a config
+            // whose build failed. Its CAS against the pair's table drops a
+            // tick that read the previous pair.
+            ctx.published.store(Some(Arc::new(Published {
+                config: effective_config,
+                table,
+            })));
             info!(
                 "Gateway {}/{} reconciled: {} HTTP, {} TCP, {} TLS, {} UDP routes",
                 gw_ns, gw_name, http_count, tcp_count, tls_count, udp_count,

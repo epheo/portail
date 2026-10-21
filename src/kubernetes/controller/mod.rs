@@ -33,6 +33,7 @@ use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
 
 use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::dns_refresh::Published;
 use crate::logging::{info, warn};
 use crate::routing::RouteTable;
 
@@ -81,10 +82,10 @@ struct ControllerCtx {
     controller_name: String,
     cache: ResourceCache,
     routes: Arc<ArcSwap<RouteTable>>,
-    /// Last config the reconciler built, published for the background DNS-refresh
-    /// task to re-resolve without an apiserver round-trip. `None` until the first
-    /// successful reconcile.
-    config_cell: Arc<ArcSwapOption<crate::config::PortailConfig>>,
+    /// Last config the reconciler built and the table built from it, published
+    /// for the background DNS-refresh task to re-resolve without an apiserver
+    /// round-trip. `None` until the first successful reconcile.
+    published: Arc<ArcSwapOption<Published>>,
     data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
     performance_config: crate::config::PerformanceConfig,
     /// When false, the operator owns Gateway lifecycle status
@@ -238,9 +239,7 @@ pub async fn run_controller(
 
     let store_gateways_for_controller = store_gateways.clone();
 
-    // Shared cell the reconciler publishes its last-built config into, read by the
-    // background DNS-refresh task to re-resolve backend FQDNs off the apiserver.
-    let config_cell = Arc::new(ArcSwapOption::<crate::config::PortailConfig>::empty());
+    let published = Arc::new(ArcSwapOption::<Published>::empty());
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
@@ -259,7 +258,7 @@ pub async fn run_controller(
             gateway_classes: unscoped.then_some(store_gateway_classes),
         },
         routes,
-        config_cell: config_cell.clone(),
+        published: published.clone(),
         data_plane,
         performance_config,
         manage_gateway_status,
@@ -301,7 +300,7 @@ pub async fn run_controller(
         Err(poisoned) => poisoned.into_inner().health().clone(),
     };
     crate::kubernetes::dns_refresh::spawn_dns_refresh(
-        config_cell,
+        published,
         ctx.routes.clone(),
         health,
         ctx.performance_config.dns_refresh_interval,

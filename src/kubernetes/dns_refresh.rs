@@ -22,6 +22,10 @@
 //! same cell, so if it stores a fresher table during this task's (blocking)
 //! re-resolve, the CAS leaves that table in place and this tick is dropped. That
 //! keeps the task stateless and unable to clobber a just-applied config change.
+//!
+//! The config and the table built from it are read as one [`Published`] pair.
+//! From two cells, a tick could pair an older config with a newer table and
+//! CAS a table built from the older config into place.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,15 +39,21 @@ use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
 use crate::routing::RouteTable;
 
+/// A config and the route table the reconciler built from it.
+pub struct Published {
+    pub config: Arc<PortailConfig>,
+    pub table: Arc<RouteTable>,
+}
+
 /// Spawn the background DNS-refresh task.
 ///
-/// `config` is the shared cell the Kubernetes reconciler publishes its last-built
-/// config into. This task is spawned only in Kubernetes mode (the standalone
-/// config-file path re-resolves on reload via `config_watcher`, not here), and it
-/// no-ops on each tick until the first reconcile populates the cell. A zero
-/// `interval` disables the task entirely.
+/// `published` is the shared cell the Kubernetes reconciler publishes its
+/// last-built config and table into. This task is spawned only in Kubernetes
+/// mode (the standalone config-file path re-resolves on reload via
+/// `config_watcher`, not here), and it no-ops on each tick until the first
+/// reconcile populates the cell. A zero `interval` disables the task entirely.
 pub fn spawn_dns_refresh(
-    config: Arc<ArcSwapOption<PortailConfig>>,
+    published: Arc<ArcSwapOption<Published>>,
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     interval: Duration,
@@ -72,14 +82,13 @@ pub fn spawn_dns_refresh(
                 }
             }
 
-            let Some(cfg) = config.load_full() else {
+            // The pair's table is the one to replace: the CAS in
+            // `apply_refresh` tells whether a reconcile swapped a fresher
+            // table in while we were resolving.
+            let Some(pair) = published.load_full() else {
                 continue;
             };
-
-            // Snapshot the live table we intend to replace, before the (slow)
-            // re-resolve, so the CAS in `apply_refresh` can tell whether a
-            // reconcile swapped a fresher table in while we were resolving.
-            let current = routes.load_full();
+            let cfg = pair.config.clone();
 
             // to_route_table() does blocking DNS resolution + regex compilation;
             // keep it off the async runtime. Each pod rebuilds only its own
@@ -103,7 +112,7 @@ pub fn spawn_dns_refresh(
                 }
             };
 
-            match apply_refresh(&routes, &current, built) {
+            match apply_refresh(&published, &routes, &pair, built) {
                 SwapOutcome::Swapped => {
                     health.prune(&routes.load());
                     METRICS.dns_refresh_swaps_total.inc();
@@ -132,31 +141,41 @@ enum SwapOutcome {
     Superseded,
 }
 
-/// Install `built` into `routes`, replacing the table snapshotted as `current`,
+/// Install `built`, re-resolved from `pair.config`, in place of `pair.table`,
 /// but only if (a) the resolved backend set actually changed and (b) no other
 /// writer swapped in the meantime.
 ///
-/// The compare-and-swap against `current` is what stops a slow re-resolve from
-/// clobbering a fresh reconcile: if the reconciler stored a newer table while we
-/// were resolving, the CAS leaves it in place and we drop our (now-stale) rebuild.
-/// `current` is an immutable snapshot, so its `dns_signature` is stable; comparing
-/// against it detects DNS drift relative to what was live at snapshot time. A
-/// churny resolver that merely reorders records is a no-op (the signature is
-/// order-independent).
+/// The compare-and-swap against `pair.table` is what stops a slow re-resolve
+/// from clobbering a fresh reconcile: if the reconciler stored a newer table
+/// while we were resolving, the CAS leaves it in place and we drop our
+/// (now-stale) rebuild. The pair is an immutable snapshot, so its
+/// `dns_signature` is stable; comparing against it detects DNS drift relative
+/// to what was live at snapshot time. A churny resolver that merely reorders
+/// records is a no-op (the signature is order-independent).
 fn apply_refresh(
+    published: &ArcSwapOption<Published>,
     routes: &ArcSwap<RouteTable>,
-    current: &Arc<RouteTable>,
+    pair: &Arc<Published>,
     built: RouteTable,
 ) -> SwapOutcome {
-    if built.dns_signature() == current.dns_signature() {
+    if built.dns_signature() == pair.table.dns_signature() {
         return SwapOutcome::Unchanged;
     }
-    let prev = routes.compare_and_swap(current, Arc::new(built));
-    if Arc::ptr_eq(current, &prev) {
-        SwapOutcome::Swapped
-    } else {
-        SwapOutcome::Superseded
+    let built = Arc::new(built);
+    let prev = routes.compare_and_swap(&pair.table, built.clone());
+    if !Arc::ptr_eq(&pair.table, &prev) {
+        return SwapOutcome::Superseded;
     }
+    // The next tick must compare against the table now live. A reconcile
+    // that published since keeps its newer pair.
+    published.compare_and_swap(
+        &Some(pair.clone()),
+        Some(Arc::new(Published {
+            config: pair.config.clone(),
+            table: built,
+        })),
+    );
+    SwapOutcome::Swapped
 }
 
 #[cfg(test)]
@@ -172,36 +191,68 @@ mod tests {
         t
     }
 
+    /// The cells as a reconcile leaves them: `table` live and published with
+    /// the config it was built from.
+    fn reconciled(
+        ip: &str,
+    ) -> (
+        ArcSwapOption<Published>,
+        ArcSwap<RouteTable>,
+        Arc<Published>,
+    ) {
+        let pair = Arc::new(Published {
+            config: Arc::new(PortailConfig::default()),
+            table: Arc::new(table_with_tcp_backend(ip)),
+        });
+        (
+            ArcSwapOption::new(Some(pair.clone())),
+            ArcSwap::new(pair.table.clone()),
+            pair,
+        )
+    }
+
     #[test]
     fn unchanged_set_does_not_swap() {
-        let live = Arc::new(table_with_tcp_backend("10.0.0.1"));
-        let routes = ArcSwap::new(live.clone());
+        let (published, routes, pair) = reconciled("10.0.0.1");
         // Re-resolve returns the same address set → no swap, same table instance.
         let built = table_with_tcp_backend("10.0.0.1");
-        assert_eq!(apply_refresh(&routes, &live, built), SwapOutcome::Unchanged);
-        assert!(Arc::ptr_eq(&routes.load_full(), &live));
+        assert_eq!(
+            apply_refresh(&published, &routes, &pair, built),
+            SwapOutcome::Unchanged
+        );
+        assert!(Arc::ptr_eq(&routes.load_full(), &pair.table));
     }
 
     #[test]
     fn changed_set_swaps() {
-        let live = Arc::new(table_with_tcp_backend("10.0.0.1"));
-        let routes = ArcSwap::new(live.clone());
+        let (published, routes, pair) = reconciled("10.0.0.1");
         // A pod was replaced (different address) → swap.
         let built = table_with_tcp_backend("10.0.0.2");
-        assert_eq!(apply_refresh(&routes, &live, built), SwapOutcome::Swapped);
         assert_eq!(
-            routes.load().dns_signature(),
+            apply_refresh(&published, &routes, &pair, built),
+            SwapOutcome::Swapped
+        );
+        let live = routes.load_full();
+        assert_eq!(
+            live.dns_signature(),
             table_with_tcp_backend("10.0.0.2").dns_signature()
         );
+        // The pair follows, so the next tick compares against the live table.
+        let now = published.load_full().unwrap();
+        assert!(Arc::ptr_eq(&now.table, &live));
+        assert!(Arc::ptr_eq(&now.config, &pair.config));
     }
 
+    /// A reconcile stores its table, then its pair. A tick reading between
+    /// the two sees the old pair, whose table is no longer live. With config
+    /// and table in two cells, that tick read the old config with the new
+    /// table and swapped a table built from the old config into place.
     #[test]
     fn concurrent_reconcile_is_not_clobbered() {
-        // The race: the DNS task snapshots `current`, then a reconcile stores a
+        // The race: the DNS task reads its pair, then a reconcile stores a
         // fresher table, then the (stale) re-resolve tries to swap. The CAS must
         // leave the reconcile's table in place — never revert to the stale build.
-        let snapshot = Arc::new(table_with_tcp_backend("10.0.0.1"));
-        let routes = ArcSwap::new(snapshot.clone());
+        let (published, routes, snapshot) = reconciled("10.0.0.1");
 
         // Reconcile lands during our rebuild: a different, fresher table.
         let reconciled = Arc::new(table_with_tcp_backend("10.0.0.9"));
@@ -211,7 +262,7 @@ mod tests {
         // NOT overwrite the reconcile's table.
         let stale_built = table_with_tcp_backend("10.0.0.2");
         assert_eq!(
-            apply_refresh(&routes, &snapshot, stale_built),
+            apply_refresh(&published, &routes, &snapshot, stale_built),
             SwapOutcome::Superseded
         );
         assert!(
