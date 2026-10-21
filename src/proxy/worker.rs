@@ -4513,13 +4513,14 @@ mod connection_tests {
     }
 
     /// Reads one request head off a backend connection.
-    async fn read_request_head(sock: &mut TcpStream) {
+    async fn read_request_head(sock: &mut TcpStream) -> Vec<u8> {
         let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
         while find_header_end(&seen).is_none() {
             let n = sock.read(&mut chunk).await.unwrap();
             assert!(n > 0, "closed mid head");
             seen.extend_from_slice(&chunk[..n]);
         }
+        seen
     }
 
     /// Bytes a backend sends past its response's framing cost it its conn,
@@ -4561,6 +4562,43 @@ mod connection_tests {
             read_request_head(&mut sock).await;
             sock.write_all(OK.as_bytes()).await.unwrap();
             assert_eq!(response(&mut client).await, OK, "with_head={with_head}");
+        }
+    }
+
+    /// A request pipelined while the backend overshoots its answer to the
+    /// one before gets its own response, from a fresh backend conn, and
+    /// the excess never reaches the client. Whether the request came with
+    /// the one before or while the backend worked.
+    #[tokio::test]
+    async fn backend_overshoot_spares_a_pipelined_request() {
+        const GET_B: &[u8] = b"GET /b HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        const B: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nB";
+        for together in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (mut client, _task) = serve(routes(listener.local_addr().unwrap()));
+            if together {
+                client.write_all(&[GET_A, GET_B].concat()).await.unwrap();
+            } else {
+                client.write_all(GET_A).await.unwrap();
+            }
+            let (mut sock, _) = listener.accept().await.unwrap();
+            assert!(read_request_head(&mut sock).await.starts_with(b"GET / "));
+            if !together {
+                client.write_all(GET_B).await.unwrap();
+            }
+            sock.write_all(format!("{OK}EXTRA").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(response(&mut client).await, OK, "together={together}");
+
+            let accept = tokio::time::timeout(Duration::from_secs(5), listener.accept());
+            let (mut sock, _) = accept
+                .await
+                .expect("B went to the overshooting conn")
+                .unwrap();
+            assert!(read_request_head(&mut sock).await.starts_with(b"GET /b "));
+            sock.write_all(B.as_bytes()).await.unwrap();
+            assert_eq!(response(&mut client).await, B, "together={together}");
         }
     }
 
