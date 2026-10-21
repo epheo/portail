@@ -611,10 +611,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_probe_recovers_backend_that_came_back_late() {
-        // Nothing listens on this port yet: the first probes fail and back off.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = listener.local_addr().unwrap();
-        drop(listener);
+        // Bound but not listening: probes are refused, and no other process
+        // can take the port before the backend comes back on it.
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let a = socket.local_addr().unwrap().as_socket().unwrap();
 
         let r = Arc::new(HealthRegistry::new());
         park(&r, a);
@@ -628,7 +632,9 @@ mod tests {
         assert!(!r.is_healthy(&a));
         assert!(!probe.is_finished(), "probe must not give up");
 
-        let listener = tokio::net::TcpListener::bind(a).await.unwrap();
+        socket.listen(1).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
         tokio::time::timeout(PROBE_MAX_INTERVAL * 2, probe)
             .await
             .expect("probe must succeed once the backend listens")
