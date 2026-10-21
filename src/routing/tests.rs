@@ -730,8 +730,9 @@ fn test_tls_passthrough_round_robins_backends() {
     assert_eq!(seen, [9001, 9002].into_iter().collect());
 }
 
-/// Passthrough fails over: an unhealthy backend gets no connections,
-/// and with every backend down the connection is refused (None).
+/// Passthrough fails over: an unhealthy backend gets no connections while a
+/// healthy one remains, and with every backend down it fails open instead of
+/// refusing the connection.
 #[test]
 fn test_tls_passthrough_skips_unhealthy_backend() {
     let mut rt = RouteTable::new();
@@ -748,9 +749,15 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
     }
 
     mark_unhealthy(&health, 9002);
-    assert!(rt
-        .resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
-        .is_none());
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..4 {
+        seen.insert(
+            rt.resolve_tls_passthrough("svc.example.com", 8443, &selector, &health)
+                .expect("all-unhealthy must fail open")
+                .port(),
+        );
+    }
+    assert_eq!(seen, [9001, 9002].into_iter().collect());
 }
 
 /// L4 selection honors backendRef weights: 3:1 over 400 picks gives
@@ -905,7 +912,13 @@ fn test_zero_weight_canary_with_unhealthy_primary_no_panic() {
     let health = crate::proxy::health::HealthRegistry::new();
     mark_unhealthy(&health, 8002);
     let selector = BackendSelector::new();
-    assert_eq!(selector.select_healthy_weighted_backend(r, &health), None);
+    // Fails open to the primary; the weight-0 canary stays excluded.
+    for _ in 0..10 {
+        assert_eq!(
+            selector.select_healthy_weighted_backend(r, &health),
+            Some(1)
+        );
+    }
 }
 
 #[test]
@@ -937,8 +950,67 @@ fn test_single_backend_weight_and_health_respected() {
         selector.select_healthy_weighted_backend(one, &health),
         Some(0)
     );
+    // A route's only backend is never parked by passive health.
     mark_unhealthy(&health, 8002);
-    assert_eq!(selector.select_healthy_weighted_backend(one, &health), None);
+    assert_eq!(
+        selector.select_healthy_weighted_backend(one, &health),
+        Some(0)
+    );
+}
+
+/// Panic routing: with every positive-weight backend ejected, traffic spreads
+/// over all of them by weight instead of answering 503. Passive health cannot
+/// tell dead pods from a ClusterIP VIP whose endpoints are briefly gone.
+#[test]
+fn test_all_unhealthy_fails_open_by_weight() {
+    let mut rt = RouteTable::new();
+    rt.add_http_route(
+        "test.com",
+        rule(
+            PathMatchType::Prefix,
+            "/",
+            vec![weighted(8001, 3), weighted(8002, 1), weighted(8003, 0)],
+        ),
+    );
+    let r = rt
+        .find_http_route("test.com", "GET", "/", &[], "", 0)
+        .unwrap();
+
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+    mark_unhealthy(&health, 8002);
+    let selector = BackendSelector::new();
+    let mut counts = [0u32; 3];
+    for _ in 0..400 {
+        let idx = selector
+            .select_healthy_weighted_backend(r, &health)
+            .expect("all-unhealthy must fail open");
+        counts[idx] += 1;
+    }
+    assert_eq!(counts, [300, 100, 0]);
+}
+
+#[test]
+fn test_l4_all_unhealthy_fails_open_by_weight() {
+    // The weight-0 backend is healthy but must still get nothing.
+    let backends = vec![weighted(8001, 3), weighted(8002, 1), weighted(8003, 0)];
+    let health = crate::proxy::health::HealthRegistry::new();
+    mark_unhealthy(&health, 8001);
+    mark_unhealthy(&health, 8002);
+    let selector = BackendSelector::new();
+    let mut counts = std::collections::HashMap::new();
+    for _ in 0..400 {
+        let b = selector
+            .select_l4_backend(7000, &backends, &health)
+            .expect("all-unhealthy must fail open");
+        *counts.entry(b.socket_addr.port()).or_insert(0u32) += 1;
+    }
+    assert_eq!(counts.get(&8001), Some(&300));
+    assert_eq!(counts.get(&8002), Some(&100));
+    assert_eq!(counts.get(&8003), None);
+
+    let zero = vec![weighted(8004, 0)];
+    assert!(selector.select_l4_backend(7001, &zero, &health).is_none());
 }
 
 #[test]
