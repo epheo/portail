@@ -1762,7 +1762,7 @@ fn test_crlf_header_value_keeps_route_out_and_reports_it() {
         .find(|ra| ra.name == "crlf-route")
         .unwrap();
     assert!(!ra.accepted);
-    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
     assert!(
         ra.message.contains(
             "rule 0: filter 0: RequestHeaderModifier set[0].value (header \"X-Tenant\"): control character 0x0d"
@@ -1934,6 +1934,169 @@ fn test_unsupported_backend_ref_filter_rejects_route() {
     );
 }
 
+/// One rule under `parentRefs: [test-gw]` and `api.example.com`.
+fn route_with_rule(name: &str, rule: serde_json::Value) -> HTTPRoute {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {
+            "parentRefs": [{"name": "test-gw"}],
+            "hostnames": ["api.example.com"],
+            "rules": [rule]
+        }
+    }))
+    .unwrap()
+}
+
+fn rejection<'a>(result: &'a ReconcileResult, name: &str) -> &'a RouteAcceptance {
+    let ra = result
+        .route_status
+        .iter()
+        .find(|ra| ra.name == name)
+        .unwrap();
+    assert!(!ra.accepted, "{name}: {}", ra.message);
+    ra
+}
+
+/// Acceptance never compiled regexes: the route read Accepted, then failed
+/// the table build for the whole Gateway.
+#[test]
+fn test_bad_regex_route_is_rejected_alone() {
+    let bad = route_with_rule(
+        "bad-regex",
+        serde_json::json!({"matches": [{"path": {"type": "RegularExpression", "value": "/(?=x)"}}],
+                           "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![bad, test_http_route()]);
+    let ra = rejection(&result, "bad-regex");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
+    assert!(
+        ra.message
+            .contains("rule 0: match 0: Invalid path regex '/(?=x)'"),
+        "{}",
+        ra.message
+    );
+    assert_eq!(result.config.http_routes.len(), 1, "only the sibling");
+    let mut config = result.config.clone();
+    fixup_backends_for_test(&mut config);
+    assert!(config.to_route_table().is_ok());
+}
+
+/// Gateway API v1.4.1 RouteReasonIncompatibleFilters: "incompatible filters
+/// present on a route rule (for example if the URLRewrite and
+/// RequestRedirect are both present on an HTTPRoute)".
+#[test]
+fn test_incompatible_filters_reason() {
+    let redirect_and_rewrite = route_with_rule(
+        "redirect-and-rewrite",
+        serde_json::json!({"filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"scheme": "https"}},
+            {"type": "URLRewrite", "urlRewrite": {"hostname": "x.example.com"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let two_hosts = route_with_rule(
+        "two-hosts",
+        serde_json::json!({"filters": [
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "Host", "value": "a"}]}},
+            {"type": "URLRewrite", "urlRewrite": {"hostname": "b.example.com"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    // The data plane applies the first modifier and skips the second.
+    let repeated = route_with_rule(
+        "repeated",
+        serde_json::json!({"filters": [
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X-A", "value": "a"}]}},
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X-B", "value": "b"}]}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let prefix_on_exact = route_with_rule(
+        "prefix-on-exact",
+        serde_json::json!({"matches": [{"path": {"type": "Exact", "value": "/a"}}],
+            "filters": [{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/b"}}}],
+            "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let result = reconcile_http(vec![
+        redirect_and_rewrite,
+        two_hosts,
+        repeated,
+        prefix_on_exact,
+    ]);
+    for (name, message) in [
+        (
+            "redirect-and-rewrite",
+            "rule 0: URLRewrite and RequestRedirect are mutually exclusive",
+        ),
+        (
+            "two-hosts",
+            "rule 0: URLRewrite hostname and RequestHeaderModifier set \"Host\"",
+        ),
+        (
+            "repeated",
+            "rule 0: filter 1: RequestHeaderModifier filter cannot be repeated",
+        ),
+        (
+            "prefix-on-exact",
+            "rule 0: match 0: ReplacePrefixMatch requires a PathPrefix path match, got Exact",
+        ),
+    ] {
+        let ra = rejection(&result, name);
+        assert_eq!(ra.accepted_reason, "IncompatibleFilters", "{name}");
+        assert!(ra.message.contains(message), "{name}: {}", ra.message);
+    }
+    assert!(result.config.http_routes.is_empty());
+}
+
+/// Gateway API v1.4.1 filter type: "Unknown values here must result in the
+/// implementation setting the Accepted Condition for the Route to
+/// `status: False`, with a Reason of `UnsupportedValue`." Backend-level
+/// filters the data plane cannot apply say the same.
+#[test]
+fn test_unsupported_filters_reason() {
+    let extension_ref = route_with_rule(
+        "extension-ref",
+        serde_json::json!({"filters": [
+            {"type": "ExtensionRef", "extensionRef": {"group": "x.io", "kind": "Auth", "name": "a"}}
+        ], "backendRefs": [{"name": "svc", "port": 80}]}),
+    );
+    let backend_redirect = route_with_rule(
+        "backend-redirect",
+        serde_json::json!({"backendRefs": [{"name": "svc", "port": 80, "filters": [
+            {"type": "RequestRedirect", "requestRedirect": {"hostname": "example.org"}}
+        ]}]}),
+    );
+    let backend_missing_config = route_with_rule(
+        "backend-missing-config",
+        serde_json::json!({"backendRefs": [{"name": "svc", "port": 80, "filters": [
+            {"type": "RequestHeaderModifier"}
+        ]}]}),
+    );
+    let result = reconcile_http(vec![
+        extension_ref,
+        backend_redirect,
+        backend_missing_config,
+    ]);
+    for (name, message) in [
+        (
+            "extension-ref",
+            "rule 0: filter 0: unsupported filter type ExtensionRef",
+        ),
+        (
+            "backend-redirect",
+            "rule 0: backendRef 0: filter 0: RequestRedirect is not supported on a backendRef",
+        ),
+        (
+            "backend-missing-config",
+            "rule 0: backendRef 0: filter 0: RequestHeaderModifier filter missing config",
+        ),
+    ] {
+        let ra = rejection(&result, name);
+        assert_eq!(ra.accepted_reason, "UnsupportedValue", "{name}");
+        assert!(ra.message.contains(message), "{name}: {}", ra.message);
+    }
+    assert!(result.config.http_routes.is_empty());
+}
+
 fn request_header_modifier(set: Vec<(&str, &str)>, remove: Vec<&str>) -> HTTPRouteRulesFilters {
     HTTPRouteRulesFilters {
         r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
@@ -1967,7 +2130,7 @@ fn test_removing_content_length_rejects_route() {
     assert!(result.config.http_routes.is_empty());
     let ra = &result.route_status[0];
     assert!(!ra.accepted);
-    assert_eq!(ra.accepted_reason, "InvalidRoute");
+    assert_eq!(ra.accepted_reason, "UnsupportedValue");
     assert!(
         ra.message.contains(
             "rule 0: filter 0: RequestHeaderModifier remove[0]: \"Content-Length\": framing header is owned by the proxy"

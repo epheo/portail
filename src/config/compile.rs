@@ -25,6 +25,13 @@ impl RejectReason {
             Self::IncompatibleFilters => "IncompatibleFilters",
         }
     }
+
+    /// The reason a route failed conversion or its check. An error without
+    /// one names a value the proxy cannot apply.
+    pub fn of(e: &anyhow::Error) -> Self {
+        e.downcast_ref::<RouteError>()
+            .map_or(Self::UnsupportedValue, |r| r.reason)
+    }
 }
 
 /// Why a route is rejected: the spec reason, and the field at fault.
@@ -142,14 +149,7 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            b.filters
-                .iter()
-                .enumerate()
-                .map(|(j, f)| {
-                    compile_backend_filter(f).map_err(|e| e.at(format_args!("filter {}", j)))
-                })
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.at(format_args!("backendRef {}", i)))
+            compile_backend_filters(b).map_err(|e| e.at(format_args!("backendRef {}", i)))
         })
         .collect::<Result<_, _>>()?;
     let matches = rule
@@ -176,6 +176,7 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
 /// Combinations within one rule that would put a malformed message on the
 /// wire, or that the spec forbids.
 fn check_filter_combination(filters: &[HttpRouteFilter]) -> Result<(), RouteError> {
+    check_no_repeats(filters)?;
     let has = |pred: fn(&HttpRouteFilter) -> bool| filters.iter().any(pred);
     if has(|f| matches!(f, HttpRouteFilter::RequestRedirect { .. }))
         && has(|f| matches!(f, HttpRouteFilter::URLRewrite { .. }))
@@ -185,6 +186,37 @@ fn check_filter_combination(filters: &[HttpRouteFilter]) -> Result<(), RouteErro
         ));
     }
     super::wire::check_rule_filters(filters).map_err(RouteError::incompatible)
+}
+
+/// Gateway API lets only RequestMirror repeat in one filter list. The data
+/// plane applies the first filter of any other type and skips the rest.
+fn check_no_repeats(filters: &[HttpRouteFilter]) -> Result<(), RouteError> {
+    use std::mem::discriminant;
+
+    for (i, f) in filters.iter().enumerate() {
+        let repeated = !matches!(f, HttpRouteFilter::RequestMirror { .. })
+            && filters[..i]
+                .iter()
+                .any(|earlier| discriminant(earlier) == discriminant(f));
+        if repeated {
+            return Err(RouteError::incompatible(format!(
+                "filter {}: {} filter cannot be repeated",
+                i,
+                filter_type(f)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn filter_type(f: &HttpRouteFilter) -> &'static str {
+    match f {
+        HttpRouteFilter::RequestHeaderModifier { .. } => "RequestHeaderModifier",
+        HttpRouteFilter::ResponseHeaderModifier { .. } => "ResponseHeaderModifier",
+        HttpRouteFilter::RequestRedirect { .. } => "RequestRedirect",
+        HttpRouteFilter::URLRewrite { .. } => "URLRewrite",
+        HttpRouteFilter::RequestMirror { .. } => "RequestMirror",
+    }
 }
 
 /// The data plane splices the request path by the matched prefix: Gateway
@@ -347,6 +379,15 @@ fn compile_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError>
     // header gets past, validate() or not.
     super::wire::check_filter(f).map_err(RouteError::unsupported)?;
     Ok(table_filter(f))
+}
+
+fn compile_backend_filters(b: &BackendRef) -> Result<Vec<routing::HttpFilter>, RouteError> {
+    check_no_repeats(&b.filters)?;
+    b.filters
+        .iter()
+        .enumerate()
+        .map(|(i, f)| compile_backend_filter(f).map_err(|e| e.at(format_args!("filter {}", i))))
+        .collect()
 }
 
 /// The data plane applies only header modifiers per backend: any other

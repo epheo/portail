@@ -842,6 +842,9 @@ fn collect_routes<R: GatewayRoute>(
                 configs.push(config);
             }
             Err(e) => {
+                // Conversion runs the table build's own check, so this is
+                // exactly the set of routes the build would leave out.
+                let conversion_reason = crate::config::RejectReason::of(&e).as_str();
                 for (section_name, port, attached, result) in &per_parent {
                     match result {
                         // A parentRef the listeners would admit: report the
@@ -852,7 +855,7 @@ fn collect_routes<R: GatewayRoute>(
                             namespace: route_ns.to_string(),
                             kind,
                             accepted: false,
-                            accepted_reason: "InvalidRoute",
+                            accepted_reason: conversion_reason,
                             message: format!("Conversion failed: {}", e),
                             refs_resolved: false,
                             refs_reason: "InvalidKind",
