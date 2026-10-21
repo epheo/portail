@@ -9,13 +9,14 @@
 
 use std::collections::HashMap;
 
-use gateway_api::gateways::{Gateway, GatewayListeners};
+use gateway_api::gateways::Gateway;
 use gateway_api::referencegrants::ReferenceGrant;
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::converters::CertData;
+use crate::kubernetes::reconciler::listener_conflicts;
 use crate::kubernetes::reference_grants::is_reference_allowed;
 use crate::kubernetes::status;
 use crate::logging::warn;
@@ -349,32 +350,6 @@ pub(super) fn validate_gateway(
     }
 
     (listener_statuses, cond)
-}
-
-/// Listeners that are not distinct, with their Conflicted reason. Gateway
-/// API, Listener: listeners sharing a port need distinct protocols, or
-/// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
-/// indistinct listeners are rejected: the spec forbids picking a winner.
-fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
-    let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
-    for (i, a) in listeners.iter().enumerate() {
-        for b in listeners[i + 1..].iter().filter(|b| b.port == a.port) {
-            let reason = if a.protocol != b.protocol {
-                "ProtocolConflict"
-            } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
-                "HostnameConflict"
-            } else {
-                continue;
-            };
-            for l in [a, b] {
-                let slot = conflicts.entry(l.name.as_str()).or_insert(reason);
-                if reason == "ProtocolConflict" {
-                    *slot = reason;
-                }
-            }
-        }
-    }
-    conflicts
 }
 
 #[cfg(test)]

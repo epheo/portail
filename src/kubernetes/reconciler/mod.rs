@@ -264,6 +264,21 @@ pub(crate) fn reconcile_to_config(
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
     let gateway_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
 
+    // Gateway API v1.4.1 GatewaySpec.listeners: "ALL indistinct Listeners
+    // must not be accepted for processing". A conflicted listener binds
+    // nothing and takes no route; no winner is picked among them.
+    let conflicts = listener_conflicts(&gateway.spec.listeners);
+    gateway_config
+        .listeners
+        .retain(|l| !conflicts.contains_key(l.name.as_str()));
+    let listeners: Vec<GatewayListeners> = gateway
+        .spec
+        .listeners
+        .iter()
+        .filter(|l| !conflicts.contains_key(l.name.as_str()))
+        .cloned()
+        .collect();
+
     // Bind the fronting Service's targetPort: the operator maps the published
     // (possibly privileged) port -> an unprivileged target the pod binds, so no
     // NET_BIND_SERVICE is needed. Empty in multi-network mode (no Service), where
@@ -285,7 +300,7 @@ pub(crate) fn reconcile_to_config(
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
-        listeners: &gateway.spec.listeners,
+        listeners: &listeners,
         namespace_labels: &snapshot.namespace_labels,
         reference_grants: &snapshot.reference_grants,
         known_services: &services.known_services,
@@ -365,7 +380,7 @@ pub(crate) fn apply_rate_limit_policies(
                 Some(section) if !listeners.iter().any(|l| l.name == *section) => (
                     false,
                     "TargetNotFound",
-                    format!("Gateway has no listener named '{}'", section),
+                    format!("Gateway has no accepted listener named '{}'", section),
                 ),
                 _ if !applied.contains(&name) => (
                     false,
@@ -494,6 +509,32 @@ mod policy_tests {
         assert!(policies[0].targets_gateway("edge", "gw"));
         assert_eq!(policies[0].name_any(), "other");
     }
+}
+
+/// Listeners that are not distinct, with their Conflicted reason. Gateway
+/// API, Listener: listeners sharing a port need distinct protocols, or
+/// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
+/// indistinct listeners are rejected: the spec forbids picking a winner.
+pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
+    let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
+    for (i, a) in listeners.iter().enumerate() {
+        for b in listeners[i + 1..].iter().filter(|b| b.port == a.port) {
+            let reason = if a.protocol != b.protocol {
+                "ProtocolConflict"
+            } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
+                "HostnameConflict"
+            } else {
+                continue;
+            };
+            for l in [a, b] {
+                let slot = conflicts.entry(l.name.as_str()).or_insert(reason);
+                if reason == "ProtocolConflict" {
+                    *slot = reason;
+                }
+            }
+        }
+    }
+    conflicts
 }
 
 /// published listener port -> Service `targetPort` for the Service fronting this

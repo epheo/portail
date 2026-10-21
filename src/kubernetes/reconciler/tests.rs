@@ -3205,14 +3205,16 @@ fn oldest_tcp_route_owns_its_listener() {
     }
 }
 
-/// Two TCP listeners on one port share one socket and one table entry, so
-/// the newer route conflicts there too, rather than reporting an
-/// attachment the table cannot serve.
+/// Two TCP listeners on one port are not distinct. Gateway API v1.4.1
+/// GatewaySpec.listeners: "ALL indistinct Listeners must not be accepted
+/// for processing". Both were bound and given routes, and the older route
+/// won their port.
 #[test]
-fn tcp_routes_on_listeners_sharing_a_port_conflict() {
+fn conflicted_listeners_serve_nothing() {
     let gw = attach_gateway(vec![
         gw_listener("a", 5432, "TCP"),
         gw_listener("b", 5432, "TCP"),
+        gw_listener("c", 6379, "TCP"),
     ]);
     let older = tcp_route(
         "older",
@@ -3226,9 +3228,36 @@ fn tcp_routes_on_listeners_sharing_a_port_conflict() {
         vec![tcp_parent(Some("b"), None)],
         &[&[("127.0.0.1", 7002, 1)]],
     );
-    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![newer, older], vec![]));
-    assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
-    assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+    let distinct = tcp_route(
+        "distinct",
+        300,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7003, 1)]],
+    );
+    let (result, table) = reconcile_table(
+        &gw,
+        &snapshot_of(vec![], vec![newer, older, distinct], vec![]),
+    );
+
+    let listeners: Vec<&str> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(listeners, vec!["c"], "conflicted listeners bind nothing");
+    assert_eq!(tcp_backend_port(&table, 5432), None);
+    for name in ["older", "newer"] {
+        let status = status_of(&result, name);
+        assert!(!status.accepted, "{name}");
+        assert_eq!(status.accepted_reason, "NoMatchingParent", "{name}");
+        assert!(status.listener_names.is_empty(), "{name}: no attachment");
+    }
+    let distinct = status_of(&result, "distinct");
+    assert!(distinct.accepted);
+    assert_eq!(distinct.listener_names, vec!["c".to_string()]);
+    assert_eq!(tcp_backend_port(&table, 6379), Some(7003));
 }
 
 /// config-routing #7: every rule overwrote the previous one on the same
