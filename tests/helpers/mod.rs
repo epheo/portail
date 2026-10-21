@@ -167,6 +167,41 @@ impl Drop for TestBackend {
     }
 }
 
+/// Keepalive backend answering `ok` to every request, except that a
+/// request for `/slow` is answered only after `delay`; its arrival is
+/// reported on the returned channel first, so a test can act while it is
+/// in flight.
+pub fn spawn_slow_backend(delay: Duration) -> (SocketAddr, std::sync::mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow backend");
+    let addr = listener.local_addr().unwrap();
+    let (arrived, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let arrived = arrived.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let mut head = Vec::new();
+                while let Ok(n @ 1..) = stream.read(&mut buf) {
+                    head.extend_from_slice(&buf[..n]);
+                    while let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let request: Vec<u8> = head.drain(..end + 4).collect();
+                        if request.starts_with(b"GET /slow ") {
+                            let _ = arrived.send(());
+                            thread::sleep(delay);
+                        }
+                        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        if stream.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
 /// Raw TCP echo backend — echoes bytes back without HTTP framing.
 pub struct TcpEchoBackend {
     pub addr: SocketAddr,
@@ -950,6 +985,20 @@ pub fn http_request_keepalive(
     }
 
     Ok(responses)
+}
+
+/// Read one response (head plus Content-Length body) off a connection
+/// that stays open.
+pub fn read_one_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !response_is_complete(&response) {
+        match stream.read(&mut buf)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => response.extend_from_slice(&buf[..n]),
+        }
+    }
+    Ok(response)
 }
 
 /// Check if a raw HTTP response contains complete headers + content-length body.

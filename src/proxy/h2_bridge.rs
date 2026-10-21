@@ -19,6 +19,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::logging::debug;
 use crate::metrics::ListenerStats;
@@ -68,6 +69,7 @@ pub(crate) struct H2Ctx {
     pub(crate) cfg: WorkerConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
+    pub(crate) drain: CancellationToken,
 }
 
 /// Serve one ALPN-negotiated h2 client connection until it closes.
@@ -135,6 +137,7 @@ async fn serve_stream(
         ctx.peer.ip(),
         &ctx.cfg,
         ctx.listener_stats.clone(),
+        ctx.drain.clone(),
     );
     let engine = worker::handle_connection(Connection::Mem { inner: engine_io }, ctx.peer, state);
 
