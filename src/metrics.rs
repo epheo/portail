@@ -78,7 +78,7 @@ metrics! {
     http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
     rate_limited_total: "Requests answered 429 by a per-client rate limit",
-    http_requests_rejected_total: "Requests answered 400 because their head was malformed or ambiguous",
+    http_requests_rejected_total: "Requests answered 400 because their head or chunked body framing was malformed or ambiguous",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
     pool_misses_total: "Backend pool checkouts that had to open a new connection",

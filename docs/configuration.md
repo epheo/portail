@@ -43,8 +43,9 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   its listener ports, `503` before. Gate traffic on this.
 - `GET /metrics` — Prometheus text format. Process-wide counters
   (connections, backend pool, DNS refresh, health transitions, reconciles,
-  and `portail_http_requests_rejected_total` for request heads refused with
-  `400` as malformed or ambiguous; those are logged at debug level only),
+  and `portail_http_requests_rejected_total` for requests refused with
+  `400` before any backend, their head or chunked body framing malformed or
+  ambiguous; those are logged at debug level only),
   `portail_http_requests_total{host=...}`,
   `portail_upstream_connect_{errors,timeouts}_total{backend=...}` and
   `portail_upstream_send_errors_total{backend=...}` (a request a freshly

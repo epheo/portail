@@ -690,10 +690,11 @@ async fn serve_http(
                         return Ok(Handoff::Close);
                     }
                     pipelined_tail(&buf[..n])
-                } else {
-                    // After the limiter: a 429 is no dispatch. Per-vhost sample
-                    // (the rule carries its route hostname's registry slot) +
-                    // the per-listener aggregate.
+                } else if let Some(framing) = Framing::of(&buf[..n], &meta) {
+                    // After the limiter and the framing: a 429 or a malformed
+                    // body is no dispatch. Per-vhost sample (the rule carries
+                    // its route hostname's registry slot) + the per-listener
+                    // aggregate.
                     rule.requests.fetch_add(1, Ordering::Relaxed);
                     state.listener_stats.http_requests.inc();
                     // proxy_http_request owns all timing for the request lifecycle —
@@ -701,7 +702,8 @@ async fn serve_http(
                     // (total deadline) are applied phase-aware inside.
                     let backend_addr = backend.socket_addr;
                     let (keep, leftover) =
-                        proxy_http_request(client, buf, n, backend, rule, &meta, state).await?;
+                        proxy_http_request(client, buf, framing, backend, rule, &meta, state)
+                            .await?;
                     if !meta.is_upgrade {
                         crate::metrics::REQUEST_DURATION.observe(request_started.elapsed());
                     }
@@ -712,6 +714,19 @@ async fn serve_http(
                         return Ok(Handoff::Close);
                     }
                     leftover
+                } else {
+                    // Refused as a malformed head is: where the body ends is
+                    // unknown, so the connection closes.
+                    METRICS.http_requests_rejected_total.inc();
+                    let reply = LocalReply {
+                        status: 400,
+                        location: None,
+                        reusable: false,
+                        client_done: false,
+                        head: meta.is_head,
+                    };
+                    send_local_reply(client, state, &reply, access).await?;
+                    return Ok(Handoff::Close);
                 }
             }
             RoutingResult::LocalReply(mut reply) => {
@@ -957,6 +972,48 @@ async fn complete_headers(
     }
 }
 
+/// Where a request ends within the bytes read with its head, by its own
+/// framing, upgrade or not. Bytes past the end must never reach the backend
+/// as body (a desync/smuggling vector: the backend would parse them as a
+/// second request and answer it, poisoning the pooled connection). They are
+/// held back as leftover: the next pipelined request for the keepalive loop,
+/// or early tunnel bytes once the backend accepts an upgrade.
+struct Framing {
+    read: usize,
+    header_end: usize,
+    end: usize,
+    /// Carries on past what was read.
+    chunked: Option<ChunkedStream>,
+}
+
+impl Framing {
+    /// `None` when the chunked body read so far is malformed: settled before
+    /// the request is dispatched, so it costs no backend connection.
+    fn of(read: &[u8], meta: &RequestMeta) -> Option<Self> {
+        let header_end = find_header_end(read).unwrap_or(read.len());
+        let tail = &read[header_end..];
+        let (end, chunked) = if let Some(cl) = meta.content_length {
+            (header_end + tail.len().min(cl), None)
+        } else if meta.is_chunked {
+            let mut stream = ChunkedStream::new();
+            let consumed = stream.observe(tail);
+            if stream.is_broken() {
+                return None;
+            }
+            (header_end + consumed, Some(stream))
+        } else {
+            // No declared body: the entire tail is the next pipelined request.
+            (header_end, None)
+        };
+        Some(Self {
+            read: read.len(),
+            header_end,
+            end,
+            chunked,
+        })
+    }
+}
+
 /// Proxy a single HTTP request to a backend and forward the response.
 /// Returns `(keep, leftover)`: `keep` when the response went out whole and
 /// its head announced keep-alive, which the client may already act on;
@@ -980,7 +1037,7 @@ async fn complete_headers(
 async fn proxy_http_request(
     client: &mut Connection,
     buf: &mut [u8],
-    request_bytes: usize,
+    framing: Framing,
     backend_ref: &crate::routing::Backend,
     rule: &HttpRouteRule,
     meta: &RequestMeta,
@@ -1005,32 +1062,13 @@ async fn proxy_http_request(
     // keepalive response's status to the access log.
     state.last_status = 0;
 
-    let req_header_end = find_header_end(&buf[..request_bytes]).unwrap_or(request_bytes);
-
-    // Determine where THIS request ends within the bytes already read, from
-    // its own framing, upgrade or not. Bytes past that boundary must never
-    // reach the backend as body (a desync/smuggling vector: the backend
-    // would parse them as a second request and answer it, poisoning the
-    // pooled connection). They are held back as `leftover`: the next
-    // pipelined request for the keepalive loop, or early tunnel bytes once
-    // the backend accepts an upgrade. Settled before connecting, so a
-    // malformed body costs no backend connection.
+    let Framing {
+        read: request_bytes,
+        header_end: req_header_end,
+        end: request_end,
+        chunked: req_chunked,
+    } = framing;
     let tail_len = request_bytes - req_header_end;
-    let (request_end, req_chunked) = if let Some(cl) = meta.content_length {
-        (req_header_end + tail_len.min(cl), None)
-    } else if meta.is_chunked {
-        let mut stream = ChunkedStream::new();
-        let consumed = stream.observe(&buf[req_header_end..request_bytes]);
-        if stream.is_broken() {
-            state.refused(400);
-            send_error_response(client, 400).await?;
-            return Ok((false, None));
-        }
-        (req_header_end + consumed, Some(stream))
-    } else {
-        // No declared body: the entire tail is the next pipelined request.
-        (req_header_end, None)
-    };
     // Capture the held tail now: the response phase reuses `buf` as scratch
     // for backend reads and would overwrite it.
     let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
@@ -4248,6 +4286,28 @@ mod connection_tests {
         assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
         task.await.unwrap().unwrap();
         assert_never_connected(&idle).await;
+    }
+
+    /// No backend sees a body whose buffered chunked framing is broken:
+    /// its 400 counts as rejected, as a malformed head's does.
+    #[tokio::test]
+    async fn a_malformed_buffered_chunked_body_is_no_dispatch() {
+        let idle = idle_backend().await;
+        let state = conn_state(routes(idle.local_addr().unwrap()), false);
+        let stats = Arc::clone(&state.listener_stats);
+        let (mut client, task) = serve_state(state);
+        let rejected = || METRICS.http_requests_rejected_total.get();
+        let before = rejected();
+        let out = exchange(
+            &mut client,
+            b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\nzz\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&idle).await;
+        assert_eq!(stats.http_requests.get(), 0);
+        assert!(rejected() > before);
     }
 
     #[tokio::test]
