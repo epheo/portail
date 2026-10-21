@@ -97,9 +97,12 @@ impl Connection {
     /// has neither closed it nor sent a byte nobody asked for. TLS must also
     /// hold no record it already read, such as a close_notify.
     ///
-    /// The socket is peeked with a direct recv(MSG_PEEK | MSG_DONTWAIT):
-    /// tokio's try_read skips the syscall while its cached readiness says
-    /// idle, which a FIN not yet seen by the reactor leaves stale.
+    /// The socket's recv(MSG_PEEK | MSG_DONTWAIT) runs only once tokio's
+    /// reactor has seen it readable since its last WouldBlock, which data or
+    /// a FIN on an idle conn does. A quiet conn costs no syscall: the request
+    /// path is at its minimum of four, and a fifth per reuse costs real
+    /// throughput. A close the reactor has yet to see is left to the
+    /// caller's from_pool replay.
     pub fn idle_and_open(&mut self) -> bool {
         let tcp = match self {
             Connection::Plain { inner } => &*inner,
@@ -121,10 +124,21 @@ impl Connection {
             Connection::Mem { .. } => return true,
         };
         let mut byte = [std::mem::MaybeUninit::uninit()];
-        let peek = socket2::SockRef::from(tcp)
-            .recv_with_flags(&mut byte, libc::MSG_PEEK | libc::MSG_DONTWAIT);
+        let peek = tcp.try_io(tokio::io::Interest::READABLE, || {
+            #[cfg(test)]
+            PEEK_SYSCALLS.with(|n| n.set(n.get() + 1));
+            socket2::SockRef::from(tcp)
+                .recv_with_flags(&mut byte, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+        });
         matches!(peek, Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Probe syscalls made on this thread: a tokio test's own, as its
+    /// runtime runs on it.
+    pub(crate) static PEEK_SYSCALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether rustls holds records read off the socket but not yet consumed:
