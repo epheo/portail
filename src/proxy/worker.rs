@@ -3381,55 +3381,16 @@ mod connection_tests {
         }
     }
 
-    /// RLIMIT_NOFILE lowered to the lowest free fd, so the next socket()
-    /// fails with EMFILE; the old limit comes back on drop.
-    struct FdsExhausted(libc::rlimit);
-
-    impl FdsExhausted {
-        fn new() -> Self {
-            let mut old = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
-            let lowest_free = unsafe { libc::dup(2) };
-            assert!(lowest_free >= 0);
-            unsafe { libc::close(lowest_free) };
-            let low = libc::rlimit {
-                rlim_cur: lowest_free as libc::rlim_t,
-                rlim_max: old.rlim_max,
-            };
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
-            Self(old)
-        }
-    }
-
-    impl Drop for FdsExhausted {
-        fn drop(&mut self) {
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
-        }
-    }
-
     /// Out of fds, the proxy never reaches the backend: the client gets a
     /// 503 and the backend's health is untouched. Counted as backend
     /// failures, one exhausted proxy ejected healthy backends route-wide.
-    /// Runs in a child process of its own, as the lowered limit would
-    /// starve every test running beside it.
     #[test]
     fn local_exhaustion_is_a_503_not_a_backend_failure() {
-        const CHILD: &str = "PORTAIL_TEST_FDS_EXHAUSTED";
-        if std::env::var_os(CHILD).is_none() {
-            let name = format!(
-                "{}::local_exhaustion_is_a_503_not_a_backend_failure",
-                module_path!().split_once("::").unwrap().1
-            );
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([&name, "--exact", "--test-threads=1"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let log = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
-            assert!(out.status.success() && log.contains("1 passed"), "{log}");
+        use crate::proxy::test_util::{in_own_process, FdsExhausted};
+        if !in_own_process(
+            module_path!(),
+            "local_exhaustion_is_a_503_not_a_backend_failure",
+        ) {
             return;
         }
 

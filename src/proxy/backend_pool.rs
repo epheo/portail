@@ -116,15 +116,25 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
+/// Whether a socket error means the proxy ran out of fds or kernel memory,
+/// whatever it was trying to reach.
+pub(crate) fn out_of_fds_or_memory(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
 /// Classify a socket error from opening a backend connection.
 ///
 /// EADDRNOTAVAIL is not local: connect() returns it once the ephemeral
 /// ports toward that one ip:port are all taken (TIME_WAIT pile-up), while
 /// other backends stay reachable. Ejecting the backend moves its share.
 fn connect_error(addr: SocketAddr, e: io::Error) -> ConnectError {
-    match e.raw_os_error() {
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => ConnectError::Local(e),
-        _ => ConnectError::Backend(anyhow::anyhow!("Backend connect failed {}: {}", addr, e)),
+    if out_of_fds_or_memory(&e) {
+        ConnectError::Local(e)
+    } else {
+        ConnectError::Backend(anyhow::anyhow!("Backend connect failed {}: {}", addr, e))
     }
 }
 
@@ -164,15 +174,16 @@ impl LogThrottle {
 /// log from flooding while it lasts, and is still seen within seconds.
 const LOCAL_EXHAUSTION_LOG_EVERY: Duration = Duration::from_secs(10);
 
-/// Log a connect the proxy could not make for want of its own resources,
-/// at most once per `LOCAL_EXHAUSTION_LOG_EVERY`.
+/// Log a backend socket (TCP connect, UDP session) the proxy could not open
+/// for want of its own resources, at most once per
+/// `LOCAL_EXHAUSTION_LOG_EVERY`.
 pub(crate) fn log_local_exhaustion(addr: SocketAddr, e: &io::Error) {
     static THROTTLE: LogThrottle = LogThrottle::new();
     static LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
     let now = LOG_EPOCH.get_or_init(Instant::now).elapsed().as_secs();
     if let Some(suppressed) = THROTTLE.admit(now, LOCAL_EXHAUSTION_LOG_EVERY) {
         warn!(
-            "Backend {} not reached: proxy out of fds or memory ({}); backend health untouched, {} similar suppressed",
+            "Backend {} not reached: proxy out of its own resources ({}); backend health untouched, {} similar suppressed",
             addr, e, suppressed
         );
     }
