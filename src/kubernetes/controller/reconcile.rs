@@ -375,6 +375,9 @@ fn data_plane_fingerprint(config: &crate::config::PortailConfig, bind: Option<&[
 /// Per-listener attachedRoutes. The spec counts ROUTES attached to a
 /// listener, so a route whose several parentRefs land on the same listener
 /// still counts once — status entries are per parentRef, hence the dedupe.
+/// Attachment is allowedRoutes and parentRef alone: the count "MUST count
+/// successfully attached Routes that may themselves have Accepted: false
+/// conditions" (Listener.attachedRoutes).
 fn count_attached_routes(
     listeners: &[gateway_api::gateways::GatewayListeners],
     route_status: &[RouteAcceptance],
@@ -382,9 +385,6 @@ fn count_attached_routes(
     let mut counts: HashMap<String, i32> = listeners.iter().map(|l| (l.name.clone(), 0)).collect();
     let mut counted: HashSet<(&str, &str, &str, &str)> = HashSet::new();
     for ra in route_status {
-        if !ra.accepted {
-            continue;
-        }
         for listener_name in &ra.listener_names {
             if counted.insert((ra.kind, &ra.namespace, &ra.name, listener_name)) {
                 *counts.entry(listener_name.clone()).or_insert(0) += 1;
@@ -1524,6 +1524,48 @@ mod tests {
         assert!(released.is_ok(), "the deleted Gateway's port is released");
     }
 
+    /// A TCP listener carries the oldest route; the newer one is Conflicted
+    /// yet still attached, and attachedRoutes counts both. It counted only
+    /// accepted routes.
+    #[tokio::test]
+    async fn attached_routes_count_conflicted_routes() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].protocol = "TCP".into();
+        apply(&mut cluster.gateways, gw.clone());
+        for (name, created) in [
+            ("old", "2020-01-01T00:00:00Z"),
+            ("new", "2021-01-01T00:00:00Z"),
+        ] {
+            let route: gateway_api::experimental::tcproutes::TCPRoute =
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "gateway.networking.k8s.io/v1alpha2",
+                    "kind": "TCPRoute",
+                    "metadata": {
+                        "name": name, "namespace": "default", "generation": 1,
+                        "resourceVersion": "1", "creationTimestamp": created,
+                    },
+                    "spec": {
+                        "parentRefs": [{"name": "gw"}],
+                        "rules": [{"backendRefs": [{"name": "svc", "port": 80}]}],
+                    },
+                }))
+                .unwrap();
+            apply(&mut cluster.tcp_routes, route);
+        }
+        let ctx = cluster.ctx(api.client());
+
+        reconcile(Arc::new(gw), ctx).await.unwrap();
+        let newer = api.status_patch("tcproutes", "new").unwrap();
+        assert_eq!(
+            newer["status"]["parents"][0]["conditions"][0]["reason"],
+            "Conflicted"
+        );
+        let gateway = api.status_patch("gateways", "gw").unwrap();
+        assert_eq!(gateway["status"]["listeners"][0]["attachedRoutes"], 2);
+    }
+
     /// A write computed from a stale read is refused (409), not applied
     /// over a concurrent writer's entry; the pass retries soon.
     #[tokio::test]
@@ -1647,10 +1689,16 @@ mod tests {
                 rejected.accepted = false;
                 rejected
             },
+            {
+                // Attached by allowedRoutes and parentRef, then rejected.
+                let mut conflicted = accepted_ra("d", None, &["https"]);
+                conflicted.accepted = false;
+                conflicted
+            },
         ];
         let counts = count_attached_routes(&listeners, &status);
         assert_eq!(counts["http"], 1, "route a counted once on http");
-        assert_eq!(counts["https"], 2, "routes a and b");
+        assert_eq!(counts["https"], 3, "routes a, b and the rejected d");
     }
 
     #[test]

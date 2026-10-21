@@ -1771,7 +1771,8 @@ fn test_crlf_header_value_keeps_route_out_and_reports_it() {
         ra.message
     );
     assert!(!ra.message.contains("X-Injected"), "{}", ra.message);
-    assert!(ra.listener_names.is_empty());
+    // Still attached by allowedRoutes and parentRef: attachedRoutes counts it.
+    assert_eq!(ra.listener_names, vec!["http".to_string()]);
 
     let sibling = result
         .route_status
@@ -3029,7 +3030,8 @@ fn oldest_tcp_route_owns_its_listener() {
         let loser = status_of(&result, "newer");
         assert!(!loser.accepted);
         assert_eq!(loser.accepted_reason, "Conflicted");
-        assert!(loser.listener_names.is_empty());
+        // Still attached by allowedRoutes and parentRef: attachedRoutes counts it.
+        assert_eq!(loser.listener_names, vec!["db".to_string()]);
     }
 }
 
