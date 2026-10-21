@@ -255,10 +255,27 @@ where
     }
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
-    let stream = reflector::reflector(writer, watcher::watcher(api, config))
-        .default_backoff()
-        .touched_objects(); // touched_objects includes deletes; applied_objects drops them
+    let stream = reflector::reflector(
+        writer,
+        watcher::watcher(api, config).modify(drop_unread_metadata),
+    )
+    .default_backoff()
+    .touched_objects(); // touched_objects includes deletes; applied_objects drops them
     (reader, Box::pin(stream))
+}
+
+const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
+
+/// Drop metadata no reconcile reads before the reflector caches the object.
+/// Every pod caches every Service and TLS Secret in the cluster, and
+/// managedFields often outweighs the spec. On a Secret, the last-applied
+/// annotation repeats the certificate and key.
+pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
+    let meta = obj.meta_mut();
+    meta.managed_fields = None;
+    if let Some(annotations) = meta.annotations.as_mut() {
+        annotations.remove(LAST_APPLIED_ANNOTATION);
+    }
 }
 
 /// The gated counterpart of `create_reflector`: same default streaming-list
@@ -283,6 +300,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_objects_drop_managed_fields_and_last_applied() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry;
+        let mut secret = Secret::default();
+        secret.metadata.managed_fields = Some(vec![ManagedFieldsEntry::default()]);
+        secret.metadata.annotations = Some(
+            [
+                (
+                    LAST_APPLIED_ANNOTATION.to_string(),
+                    "{\"data\":{}}".to_string(),
+                ),
+                ("keep".to_string(), "me".to_string()),
+            ]
+            .into(),
+        );
+        drop_unread_metadata(&mut secret);
+        assert!(secret.metadata.managed_fields.is_none());
+        let annotations = secret.metadata.annotations.unwrap();
+        assert!(!annotations.contains_key(LAST_APPLIED_ANNOTATION));
+        assert_eq!(annotations["keep"], "me");
+    }
 
     #[test]
     fn watch_shape_parse() {

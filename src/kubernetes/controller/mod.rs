@@ -39,8 +39,8 @@ use crate::routing::RouteTable;
 use reconcile::reconcile;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
-    create_reflector_gated_with_config, map_policy_to_gateways, map_route_to_gateways,
-    map_secret_to_gateways,
+    create_reflector_gated_with_config, drop_unread_metadata, map_policy_to_gateways,
+    map_route_to_gateways, map_secret_to_gateways,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -169,9 +169,12 @@ pub async fn run_controller(
             watcher::Config::default(),
         ),
     };
-    let gw_stream = reflector::reflector(gw_writer, watcher::watcher(gw_api, gw_watcher_config))
-        .default_backoff()
-        .applied_objects();
+    let gw_stream = reflector::reflector(
+        gw_writer,
+        watcher::watcher(gw_api, gw_watcher_config).modify(drop_unread_metadata),
+    )
+    .default_backoff()
+    .applied_objects();
 
     // --- Secondary resources ---
     // Each resource gets a reflector (store + stream). The stream feeds into
