@@ -1,5 +1,5 @@
 # Per-client rate limit on a whole Gateway. Requires the CRD:
-#   kubectl apply -f crds/ratelimitpolicy.yaml
+#   kubectl apply -f ../../deploy/crds/ratelimitpolicy.yaml
 # Scope with spec.targetRef.sectionName to limit one listener instead;
 # a listener-scoped policy overrides a Gateway-wide one for that listener.
 apiVersion: portail.epheo.eu/v1alpha1

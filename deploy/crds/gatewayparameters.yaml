@@ -1,0 +1,148 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gatewayparameters.portail.epheo.eu
+spec:
+  group: portail.epheo.eu
+  names:
+    categories: []
+    kind: GatewayParameters
+    plural: gatewayparameters
+    shortNames:
+    - gwp
+    singular: gatewayparameters
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.provisioning
+      name: Provisioning
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .spec.service.type
+      name: Service
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for GatewayParametersSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              How a Gateway's data plane is run. Built-in defaults, then the
+              GatewayClass's parameters, then the Gateway's: a set field wins field by
+              field; `networks` and `resources` replace whole.
+            properties:
+              image:
+                description: |-
+                  Data-plane image (Managed). Default: the controller's
+                  `--dataplane-image`.
+                nullable: true
+                type: string
+              networks:
+                description: |-
+                  Multus attachments of the data-plane pods (Managed), as
+                  NetworkSelectionElements.
+                items:
+                  description: The Multus NetworkSelectionElement fields a data plane needs.
+                  properties:
+                    gateway:
+                      items:
+                        type: string
+                      nullable: true
+                      type: array
+                    interface:
+                      description: The interface name in the pod.
+                      nullable: true
+                      type: string
+                    ips:
+                      description: Static addresses in CIDR form, e.g. 172.16.87.21/24.
+                      items:
+                        type: string
+                      nullable: true
+                      type: array
+                    mac:
+                      nullable: true
+                      type: string
+                    name:
+                      description: The NetworkAttachmentDefinition.
+                      type: string
+                    namespace:
+                      description: Its namespace; default the pod's.
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                nullable: true
+                type: array
+              provisioning:
+                description: |-
+                  Managed: the controller creates the Gateway's ServiceAccount,
+                  Deployment, Service and PodDisruptionBudget. Unmanaged: it serves
+                  the configuration and writes status; the pods are the owner's.
+                  Default Managed.
+                enum:
+                - Managed
+                - Unmanaged
+                - null
+                nullable: true
+                type: string
+              replicas:
+                description: |-
+                  Data-plane pods (Managed). Default 1; static `networks[].ips`
+                  require 1.
+                format: int32
+                minimum: 1.0
+                nullable: true
+                type: integer
+              resources:
+                description: |-
+                  Data-plane container resources (Managed), a core/v1
+                  ResourceRequirements; its worker threads follow the cpu limit.
+                  Default requests 100m/64Mi, limits 2/256Mi.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    type: object
+                type: object
+              service:
+                nullable: true
+                properties:
+                  type:
+                    description: |-
+                      The Service fronting the data plane; None creates none. Unset:
+                      None when the Gateway has a Network address or `networks`, else
+                      LoadBalancer.
+                    enum:
+                    - LoadBalancer
+                    - ClusterIP
+                    - NodePort
+                    - None
+                    - null
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        title: GatewayParameters
+        type: object
+    served: true
+    storage: true
+    subresources: {}

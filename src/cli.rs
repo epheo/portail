@@ -62,10 +62,10 @@ pub struct Args {
     #[arg(long)]
     pub supported_features: bool,
 
-    /// Print portail's CRD manifests (RateLimitPolicy) as YAML and exit
+    /// Print portail's CRD manifests (GatewayParameters, RateLimitPolicy) as YAML and exit
     ///
-    /// The Rust types are the source of truth; pipe this into
-    /// examples/kubernetes/crds/ when they change (a test enforces sync).
+    /// The Rust types are the source of truth; split this into
+    /// deploy/crds/ when they change (a test enforces sync).
     #[arg(long)]
     pub print_crd: bool,
 

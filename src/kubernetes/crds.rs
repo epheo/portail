@@ -1,11 +1,14 @@
-//! Portail's own policy CRDs (GEP-713 direct policy attachment).
+//! Portail's own CRDs: RateLimitPolicy (GEP-713 direct policy attachment)
+//! and GatewayParameters (the parametersRef target of a GatewayClass or a
+//! Gateway's infrastructure).
 //!
 //! Gateway API defines no rate-limit filter, so the limit rides portail's
 //! API group as a policy attached to a Gateway (optionally narrowed to one
 //! listener via `sectionName`). The Rust types here are the single source
-//! of truth: the checked-in CRD manifest is generated from them by
-//! `portail --print-crd` and a test asserts the two never drift.
+//! of truth: the checked-in CRD manifests under deploy/crds/ are generated
+//! from them by `portail --print-crd` and a test asserts they never drift.
 
+use k8s_openapi::api::core::v1::ResourceRequirements;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,11 +111,138 @@ pub struct PolicyCondition {
     pub observed_generation: Option<i64>,
 }
 
+/// How a Gateway's data plane is run. Built-in defaults, then the
+/// GatewayClass's parameters, then the Gateway's: a set field wins field by
+/// field; `networks` and `resources` replace whole.
+#[derive(CustomResource, Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "portail.epheo.eu",
+    version = "v1alpha1",
+    kind = "GatewayParameters",
+    // The derive would say "gatewayparameterses".
+    plural = "gatewayparameters",
+    namespaced,
+    shortname = "gwp",
+    printcolumn = r#"{"name":"Provisioning","type":"string","jsonPath":".spec.provisioning"}"#,
+    printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".spec.replicas"}"#,
+    printcolumn = r#"{"name":"Service","type":"string","jsonPath":".spec.service.type"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayParametersSpec {
+    /// Managed: the controller creates the Gateway's ServiceAccount,
+    /// Deployment, Service and PodDisruptionBudget. Unmanaged: it serves
+    /// the configuration and writes status; the pods are the owner's.
+    /// Default Managed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<Provisioning>,
+
+    /// Data-plane pods (Managed). Default 1; static `networks[].ips`
+    /// require 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub replicas: Option<i32>,
+
+    /// Data-plane image (Managed). Default: the controller's
+    /// `--dataplane-image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Data-plane container resources (Managed), a core/v1
+    /// ResourceRequirements; its worker threads follow the cpu limit.
+    /// Default requests 100m/64Mi, limits 2/256Mi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "resource_requirements_schema")]
+    pub resources: Option<ResourceRequirements>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceParameters>,
+
+    /// Multus attachments of the data-plane pods (Managed), as
+    /// NetworkSelectionElements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networks: Option<Vec<NetworkSelection>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum Provisioning {
+    Managed,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceParameters {
+    /// The Service fronting the data plane; None creates none. Unset:
+    /// None when the Gateway has a Network address or `networks`, else
+    /// LoadBalancer.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub type_: Option<ServiceType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ServiceType {
+    LoadBalancer,
+    ClusterIP,
+    NodePort,
+    None,
+}
+
+/// The Multus NetworkSelectionElement fields a data plane needs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSelection {
+    /// The NetworkAttachmentDefinition.
+    pub name: String,
+    /// Its namespace; default the pod's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Static addresses in CIDR form, e.g. 172.16.87.21/24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ips: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// The interface name in the pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+/// core/v1 ResourceRequirements as the apiserver's own CRDs describe it:
+/// k8s-openapi types carry no JsonSchema. `claims` is left out, so it is
+/// pruned: DRA claims do not apply to a data plane.
+fn resource_requirements_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let quantities = schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": {
+            "anyOf": [{"type": "integer"}, {"type": "string"}],
+            "pattern": r"^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$",
+            "x-kubernetes-int-or-string": true,
+        },
+    });
+    schemars::json_schema!({
+        "type": "object",
+        "nullable": true,
+        "properties": {
+            "limits": quantities.clone(),
+            "requests": quantities,
+        },
+    })
+}
+
+/// A CRD's manifest as YAML.
+fn crd_yaml_of<K: kube::CustomResourceExt>() -> anyhow::Result<String> {
+    Ok(serde_yaml::to_string(&K::crd())?)
+}
+
 /// All portail CRD manifests as one YAML document stream, for
-/// `portail --print-crd` and the checked-in-manifest drift test.
+/// `portail --print-crd`. Each is checked in on its own under deploy/crds/.
 pub fn crd_yaml() -> anyhow::Result<String> {
-    use kube::CustomResourceExt;
-    Ok(serde_yaml::to_string(&RateLimitPolicy::crd())?)
+    Ok(format!(
+        "{}---\n{}",
+        crd_yaml_of::<GatewayParameters>()?,
+        crd_yaml_of::<RateLimitPolicy>()?
+    ))
 }
 
 impl RateLimitPolicy {
@@ -162,14 +292,60 @@ mod tests {
         assert_eq!(p.effective_burst(), 7);
     }
 
-    #[test]
-    fn checked_in_crd_matches_generated() {
-        let generated = crd_yaml().unwrap();
-        let checked_in = include_str!("../../examples/kubernetes/crds/ratelimitpolicy.yaml");
+    fn assert_checked_in<K: kube::CustomResourceExt>(checked_in: &str, file: &str) {
         assert_eq!(
-            checked_in, generated,
-            "CRD manifest drifted from the Rust types; regenerate with: \
-             cargo run -- --print-crd > examples/kubernetes/crds/ratelimitpolicy.yaml"
+            checked_in,
+            crd_yaml_of::<K>().unwrap(),
+            "{file} drifted from the Rust types; regenerate it from `portail --print-crd`, \
+             one document per file"
+        );
+    }
+
+    #[test]
+    fn checked_in_crds_match_generated() {
+        assert_checked_in::<RateLimitPolicy>(
+            include_str!("../../deploy/crds/ratelimitpolicy.yaml"),
+            "deploy/crds/ratelimitpolicy.yaml",
+        );
+        assert_checked_in::<GatewayParameters>(
+            include_str!("../../deploy/crds/gatewayparameters.yaml"),
+            "deploy/crds/gatewayparameters.yaml",
+        );
+    }
+
+    #[test]
+    fn print_crd_streams_both() {
+        let stream = crd_yaml().unwrap();
+        let kinds: Vec<String> = serde_yaml::Deserializer::from_str(&stream)
+            .map(|doc| {
+                let crd = serde_yaml::Value::deserialize(doc).unwrap();
+                crd["spec"]["names"]["kind"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(kinds, ["GatewayParameters", "RateLimitPolicy"]);
+    }
+
+    /// Design 4.2's example, resources and all.
+    #[test]
+    fn gateway_parameters_parse() {
+        let spec: GatewayParametersSpec = serde_yaml::from_str(
+            "provisioning: Managed
+replicas: 1
+image: ghcr.io/epheo/portail:0.2.0
+resources: {limits: {cpu: \"2\", memory: 256Mi}, requests: {cpu: 100m}}
+service: {type: None}
+networks:
+- {name: br-ex-network, namespace: default, ips: [172.16.87.21/24], gateway: [172.16.87.1]}
+",
+        )
+        .unwrap();
+        assert_eq!(spec.provisioning, Some(Provisioning::Managed));
+        assert_eq!(spec.service.unwrap().type_, Some(ServiceType::None));
+        let limits = spec.resources.unwrap().limits.unwrap();
+        assert_eq!(limits["memory"].0, "256Mi");
+        assert_eq!(
+            spec.networks.unwrap()[0].ips.as_deref().unwrap(),
+            ["172.16.87.21/24"]
         );
     }
 }
