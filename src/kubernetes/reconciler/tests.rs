@@ -570,10 +570,14 @@ fn test_multiple_listeners() {
 fn test_tls_terminate_listener() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
+    let certs = HashMap::from([(
+        ("my-cert".to_string(), "default".to_string()),
+        (b"cert".to_vec(), b"key".to_vec()),
+    )]);
     let result = reconcile_to_config(
         &gw,
         &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
-        &HashMap::new(),
+        &certs,
         &empty_services(),
     )
     .unwrap();
