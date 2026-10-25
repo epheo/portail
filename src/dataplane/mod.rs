@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::DataplaneArgs;
 use crate::config::PerformanceConfig;
 use crate::logging::{error, info, warn};
-use crate::metrics::CONTROLLER_SYNC;
+use crate::metrics::{ControllerSync, CONTROLLER_SYNC};
 use crate::proxy::data_plane::DataPlane;
 use crate::routing::RouteTable;
 use crate::sync::{GatewayKey, InstanceReport, Snapshot, SyncRequest, HOLD, PROTOCOL};
@@ -121,6 +121,10 @@ struct SyncLoop {
     rebind_at: Option<Instant>,
     /// The last poll's failure, for the no-snapshot warning.
     last_error: Option<String>,
+    /// The version refused and why, until a snapshot is applied: every
+    /// report says so, as the controller would not send it again.
+    refused: Option<(String, String)>,
+    metrics: &'static ControllerSync,
 }
 
 /// A 200 whose snapshot this data plane cannot serve.
@@ -153,6 +157,8 @@ impl SyncLoop {
             rebinds: Backoff::default(),
             rebind_at: None,
             last_error: None,
+            refused: None,
+            metrics: &CONTROLLER_SYNC,
         }
     }
 
@@ -219,8 +225,10 @@ impl SyncLoop {
         let now = Instant::now();
         let snapshot = match answer {
             Answer::Snapshot(body) => decode(&body),
+            // The version confirmed may be one refused: the config served
+            // is older, and its age grows on.
             Answer::Unchanged => {
-                self.succeeded(true);
+                self.succeeded(self.refused.is_none());
                 return now;
             }
             // Answered at once, not held: paced like a failure.
@@ -257,6 +265,7 @@ impl SyncLoop {
     }
 
     async fn serve(&mut self, snapshot: Snapshot) {
+        self.refused = None;
         let report = self.applier.apply(&snapshot).await;
         self.have = snapshot.version.clone();
         self.report = Some(report);
@@ -277,13 +286,23 @@ impl SyncLoop {
             dns_epoch: self.applier.dns_epoch(),
             ..InstanceReport::default()
         });
-        self.report = Some(InstanceReport {
-            applied: version.clone(),
-            apply_error: Some(error),
-            listeners: Vec::new(),
-            ..previous
-        });
-        self.have = version;
+        self.have = version.clone();
+        self.refused = Some((version, error));
+        self.report = Some(self.as_reported(previous));
+    }
+
+    /// `report` of the snapshot served, as sent while a later one stands
+    /// refused: under the refused version, with why and no listener of it.
+    fn as_reported(&self, report: InstanceReport) -> InstanceReport {
+        match &self.refused {
+            Some((version, error)) => InstanceReport {
+                applied: version.clone(),
+                apply_error: Some(error.clone()),
+                listeners: Vec::new(),
+                ..report
+            },
+            None => report,
+        }
     }
 
     /// The controller serves this Gateway nothing: close every listener
@@ -298,6 +317,7 @@ impl SyncLoop {
         }
         self.have.clear();
         self.report = None;
+        self.refused = None;
         self.rebind_at = None;
     }
 
@@ -310,9 +330,9 @@ impl SyncLoop {
 
     /// The controller answered; `current`: what it said is served now.
     fn answered(&mut self, current: bool) {
-        CONTROLLER_SYNC.set_connected(true);
+        self.metrics.set_connected(true);
         if current {
-            CONTROLLER_SYNC.confirmed();
+            self.metrics.confirmed();
         }
         if self.last_error.take().is_some() {
             info!("Sync of Gateway {} recovered", self.gateway);
@@ -320,7 +340,7 @@ impl SyncLoop {
     }
 
     fn failed(&mut self, after: Option<Duration>, error: String) -> Instant {
-        CONTROLLER_SYNC.set_connected(false);
+        self.metrics.set_connected(false);
         let delay = self.failures.wait_at_least(after);
         warn!(
             "Sync of Gateway {} failed: {}; polling again in {:.1}s",
@@ -340,6 +360,7 @@ impl SyncLoop {
             return false;
         };
         let report = self.applier.apply(snapshot).await;
+        let report = self.as_reported(report);
         let moved = self.report.as_ref() != Some(&report);
         self.report = Some(report);
         self.schedule_rebind();
@@ -583,5 +604,67 @@ mod tests {
         let floor = after - Duration::from_millis(50);
         assert!(waits.iter().all(|w| *w >= floor), "{waits:?}");
         assert!(waits.iter().any(|w| *w > 2 * after), "{waits:?}");
+    }
+
+    fn body(snapshot: &Snapshot) -> bytes::Bytes {
+        serde_json::to_vec(snapshot).unwrap().into()
+    }
+
+    /// A refused version stays in every report until a snapshot applies,
+    /// and the 204s confirming it do not make the config served look
+    /// current. A rebind reported the older version with no error, and
+    /// each 204 reset the config age.
+    #[tokio::test]
+    async fn a_refusal_stays_visible_until_a_snapshot_applies() {
+        let (mut sync, _) = sync_loop();
+        let metrics: &'static ControllerSync = Box::leak(Box::new(ControllerSync::new()));
+        sync.metrics = metrics;
+        metrics.start();
+        let served = snapshot();
+        sync.handle(Answer::Snapshot(body(&served))).await;
+        assert_eq!(sync.report.as_ref().unwrap().applied, served.version);
+
+        let mut newer = serde_json::to_value(snapshot()).unwrap();
+        newer["protocol"] = serde_json::json!(PROTOCOL + 1);
+        newer["version"] = serde_json::json!("refused-version");
+        sync.handle(Answer::Snapshot(serde_json::to_vec(&newer).unwrap().into()))
+            .await;
+        let refused = |sync: &SyncLoop| {
+            let report = sync.report.as_ref().unwrap();
+            report.applied == "refused-version" && report.apply_error.is_some()
+        };
+        assert!(refused(&sync));
+
+        let pause = Duration::from_millis(50);
+        tokio::time::sleep(pause).await;
+        sync.handle(Answer::Unchanged).await;
+        assert!(
+            metrics.age().unwrap() >= pause,
+            "a 204 for the refused version"
+        );
+
+        sync.reapply().await;
+        assert!(
+            refused(&sync),
+            "a rebind hid the refusal: {:?}",
+            sync.report
+        );
+
+        let next = Snapshot::from_config(
+            crate::sync::GatewayRef {
+                generation: 2,
+                ..served.gateway.clone()
+            },
+            served.config.clone(),
+            vec![],
+        );
+        sync.handle(Answer::Snapshot(body(&next))).await;
+        let report = sync.report.as_ref().unwrap();
+        assert_eq!(
+            (report.applied.as_str(), &report.apply_error),
+            (next.version.as_str(), &None)
+        );
+        sync.handle(Answer::Unchanged).await;
+        assert!(metrics.age().unwrap() < pause);
     }
 }

@@ -471,7 +471,7 @@ pub struct ControllerSync {
 pub static CONTROLLER_SYNC: ControllerSync = ControllerSync::new();
 
 impl ControllerSync {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             started: OnceLock::new(),
             connected: std::sync::atomic::AtomicBool::new(false),
@@ -499,12 +499,17 @@ impl ControllerSync {
         }
     }
 
+    /// Since the last confirmation; `None` before [`Self::start`].
+    pub(crate) fn age(&self) -> Option<std::time::Duration> {
+        let confirmed = std::time::Duration::from_millis(self.confirmed_ms.load(Relaxed));
+        Some(self.started.get()?.elapsed().saturating_sub(confirmed))
+    }
+
     fn render(&self, out: &mut String) {
         use std::fmt::Write;
-        let Some(started) = self.started.get() else {
+        let Some(age) = self.age() else {
             return;
         };
-        let confirmed = std::time::Duration::from_millis(self.confirmed_ms.load(Relaxed));
         let _ = write!(
             out,
             "# HELP portail_controller_connected Whether the last sync poll was answered by the controller\n\
@@ -514,7 +519,7 @@ impl ControllerSync {
              # TYPE portail_config_age_seconds gauge\n\
              portail_config_age_seconds {:.3}\n",
             self.connected.load(Relaxed) as u8,
-            started.elapsed().saturating_sub(confirmed).as_secs_f64(),
+            age.as_secs_f64(),
         );
     }
 }
