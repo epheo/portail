@@ -153,7 +153,12 @@ pub struct ControllerArgs {
     /// the apiserver, and on OVN-Kubernetes from each apiserver node's
     /// management address: give 2 per Primary UDN data plane per apiserver
     /// node.
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_SYNC_PEER_CONNECTIONS)]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_SYNC_PEER_CONNECTIONS,
+        value_parser = parse_at_least_one
+    )]
     pub sync_peer_connections: usize,
 
     /// Name of the leader election Lease
@@ -279,6 +284,14 @@ fn parse_namespace(s: &str) -> Result<String, String> {
         Ok(s.to_string())
     } else {
         Err(format!("{s:?} is not a namespace name (a DNS-1123 label)"))
+    }
+}
+
+/// A count of 0 would refuse every connection.
+fn parse_at_least_one(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!("{s:?} is not a count of at least 1")),
     }
 }
 
@@ -446,6 +459,16 @@ mod tests {
             (8443, 9000, "registry.local/portail:dev")
         );
         assert_eq!(c.sync_peer_connections, 200);
+        for bad in ["0", "-1", "many"] {
+            let argv = [
+                "portail",
+                "controller",
+                "--namespace=ps",
+                "--sync-peer-connections",
+                bad,
+            ];
+            assert!(Args::try_parse_args(argv).is_err(), "{bad}");
+        }
     }
 
     #[test]
