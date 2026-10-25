@@ -34,6 +34,19 @@ spec:
               GatewayClass's parameters, then the Gateway's: a set field wins field by
               field; `networks` and `resources` replace whole.
             properties:
+              controllerTransport:
+                description: |-
+                  How the data-plane pods reach the controller (Managed). Direct: its
+                  Service. APIServerProxy: through the apiserver's service proxy, for
+                  pods that reach only the apiserver (OVN-Kubernetes Primary UDN); the
+                  Gateway's ServiceAccount needs the Role of
+                  deploy/components/apiserver-proxy. Default Direct.
+                enum:
+                - Direct
+                - APIServerProxy
+                - null
+                nullable: true
+                type: string
               image:
                 description: |-
                   Data-plane image (Managed). Default: the controller's

@@ -8,10 +8,11 @@ use k8s_openapi::api::apps::v1::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EnvVar, EnvVarSource, HTTPGetAction, ObjectFieldSelector,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ProjectedVolumeSource, SeccompProfile,
-    SecurityContext, Service, ServiceAccount, ServiceAccountTokenProjection, ServicePort,
-    ServiceSpec, TopologySpreadConstraint, Volume, VolumeMount, VolumeProjection,
+    Capabilities, ConfigMapProjection, Container, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath,
+    ObjectFieldSelector, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ProjectedVolumeSource, SeccompProfile, SecurityContext, Service, ServiceAccount,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, TopologySpreadConstraint, Volume,
+    VolumeMount, VolumeProjection,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -26,7 +27,7 @@ use crate::cli::{ControllerArgs, CONTROLLER_CA_ENV};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::controller::ca::ControllerCa;
 use crate::kubernetes::controller::params::Params;
-use crate::kubernetes::crds::{NetworkSelection, ServiceType};
+use crate::kubernetes::crds::{ControllerTransport, NetworkSelection, ServiceType};
 use crate::kubernetes::naming::{
     controller_audience, label_value, resource_name, LABEL_GATEWAY, LABEL_GATEWAY_NAME,
     LABEL_MANAGED_BY, LABEL_NAME, MANAGED_BY, NAME,
@@ -124,6 +125,15 @@ const TOKEN_FILE: &str = "token";
 /// The projected token lifetime: the projected-token default; kubelet
 /// refreshes it at 80%.
 const TOKEN_EXPIRATION_SECS: i64 = 3600;
+
+/// APIServerProxy's second projected volume, where the data plane's
+/// `--apiserver-token-file` and `--apiserver-ca-file` defaults (cli.rs)
+/// point: an API-audience token and the cluster CA.
+const APISERVER_DIR: &str = "/var/run/secrets/portail.epheo.eu/apiserver";
+const CA_FILE: &str = "ca.crt";
+/// Published in every namespace by the controller manager: the CA the
+/// apiserver's serving certificate chains to, under key `ca.crt`.
+const ROOT_CA_CONFIGMAP: &str = "kube-root-ca.crt";
 
 /// `--shutdown-delay`'s default 5s, plus the data plane's DRAIN_TIMEOUT 30s
 /// (src/proxy/data_plane.rs), plus 5s for the leave report and the exit.
@@ -281,6 +291,10 @@ fn render(
     if recreate {
         args.push("--shutdown-delay=0s".into());
     }
+    let proxied = params.controller_transport == ControllerTransport::ApiServerProxy;
+    if proxied {
+        args.extend(["--transport".into(), "apiserver-proxy".into()]);
+    }
 
     let mut env = vec![
         EnvVar {
@@ -340,12 +354,17 @@ fn render(
             }),
             ..Default::default()
         }),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "controller-token".into(),
-            mount_path: TOKEN_DIR.into(),
-            read_only: Some(true),
-            ..Default::default()
-        }]),
+        volume_mounts: Some(
+            std::iter::once(("controller-token", TOKEN_DIR))
+                .chain(proxied.then_some(("apiserver-token", APISERVER_DIR)))
+                .map(|(name, path)| VolumeMount {
+                    name: name.into(),
+                    mount_path: path.into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
         // No containerPorts: they are informational, and listener changes
         // would roll the pods (operator parity).
         ..Default::default()
@@ -374,21 +393,14 @@ fn render(
             }]
         }),
         containers: vec![container],
-        volumes: Some(vec![Volume {
-            name: "controller-token".into(),
-            projected: Some(ProjectedVolumeSource {
-                sources: Some(vec![VolumeProjection {
-                    service_account_token: Some(ServiceAccountTokenProjection {
-                        audience: Some(controller.audience.clone()),
-                        expiration_seconds: Some(TOKEN_EXPIRATION_SECS),
-                        path: TOKEN_FILE.into(),
-                    }),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]),
+        volumes: Some(
+            std::iter::once(projected(
+                "controller-token",
+                vec![token(Some(controller.audience.clone()))],
+            ))
+            .chain(proxied.then(apiserver_volume))
+            .collect(),
+        ),
         ..Default::default()
     };
 
@@ -417,6 +429,55 @@ fn render(
         service,
         pdb,
     }
+}
+
+fn projected(name: &str, sources: Vec<VolumeProjection>) -> Volume {
+    Volume {
+        name: name.into(),
+        projected: Some(ProjectedVolumeSource {
+            sources: Some(sources),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A pod-bound ServiceAccount token for `audience`, the apiserver's when
+/// `None`.
+fn token(audience: Option<String>) -> VolumeProjection {
+    VolumeProjection {
+        service_account_token: Some(ServiceAccountTokenProjection {
+            audience,
+            expiration_seconds: Some(TOKEN_EXPIRATION_SECS),
+            path: TOKEN_FILE.into(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// APIServerProxy: what the apiserver hop needs, and nothing more than a
+/// default mount would give, while automountServiceAccountToken stays
+/// false. The token is good for any API call the ServiceAccount may make:
+/// the apiserver-proxy Role allows one.
+fn apiserver_volume() -> Volume {
+    projected(
+        "apiserver-token",
+        vec![
+            token(None),
+            VolumeProjection {
+                config_map: Some(ConfigMapProjection {
+                    name: ROOT_CA_CONFIGMAP.into(),
+                    items: Some(vec![KeyToPath {
+                        key: CA_FILE.into(),
+                        path: CA_FILE.into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+    )
 }
 
 fn probe(path: &str, period: i32, failures: i32) -> Probe {
@@ -685,6 +746,48 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
             serde_json::json!([{"type": NETWORK_ADDRESS_TYPE, "value": "udn-a"}]),
         );
         golden("udn", &objects_of(&gw, None, None).await);
+    }
+
+    /// APIServerProxy: the transport flag, an API-audience token and the
+    /// cluster CA in a second projected volume, still no automounted
+    /// token.
+    #[tokio::test]
+    async fn golden_apiserver_proxy() {
+        let gw = gateway(
+            "svc-gw",
+            serde_json::json!([{"name": "http", "port": 8080, "protocol": "HTTP"}]),
+            serde_json::Value::Null,
+        );
+        golden(
+            "apiserver-proxy",
+            &objects_of(
+                &gw,
+                None,
+                Some("service: {type: ClusterIP}\ncontrollerTransport: APIServerProxy"),
+            )
+            .await,
+        );
+    }
+
+    /// The mounts are where the data plane's defaults read its tokens and
+    /// the apiserver's CA.
+    #[test]
+    fn the_mounts_match_the_data_plane_defaults() {
+        use clap::Parser;
+        let args = crate::cli::Args::try_parse_from([
+            "portail",
+            "dataplane",
+            "--gateway=ns/gw",
+            "--controller-address=https://ctl.ns.svc",
+        ])
+        .unwrap();
+        let Some(crate::cli::Command::Dataplane(args)) = args.command else {
+            panic!("data plane args");
+        };
+        let under = |dir: &str, file: &str| std::path::Path::new(dir).join(file);
+        assert_eq!(args.token_file, under(TOKEN_DIR, TOKEN_FILE));
+        assert_eq!(args.apiserver_token_file, under(APISERVER_DIR, TOKEN_FILE));
+        assert_eq!(args.apiserver_ca_file, under(APISERVER_DIR, CA_FILE));
     }
 
     fn deployment_of(objects: &[serde_json::Value]) -> &serde_json::Value {

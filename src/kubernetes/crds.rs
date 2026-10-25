@@ -162,6 +162,21 @@ pub struct GatewayParametersSpec {
     /// NetworkSelectionElements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub networks: Option<Vec<NetworkSelection>>,
+
+    /// How the data-plane pods reach the controller (Managed). Direct: its
+    /// Service. APIServerProxy: through the apiserver's service proxy, for
+    /// pods that reach only the apiserver (OVN-Kubernetes Primary UDN); the
+    /// Gateway's ServiceAccount needs the Role of
+    /// deploy/components/apiserver-proxy. Default Direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_transport: Option<ControllerTransport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ControllerTransport {
+    Direct,
+    #[serde(rename = "APIServerProxy")]
+    ApiServerProxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -357,10 +372,15 @@ resources: {limits: {cpu: \"2\", memory: 256Mi}, requests: {cpu: 100m}}
 service: {type: None}
 networks:
 - {name: br-ex-network, namespace: default, ips: [172.16.87.21/24], gateway: [172.16.87.1]}
+controllerTransport: APIServerProxy
 ",
         )
         .unwrap();
         assert_eq!(spec.provisioning, Some(Provisioning::Managed));
+        assert_eq!(
+            spec.controller_transport,
+            Some(ControllerTransport::ApiServerProxy)
+        );
         assert_eq!(spec.service.unwrap().type_, Some(ServiceType::None));
         let limits = spec.resources.unwrap().limits.unwrap();
         assert_eq!(limits["memory"].0, "256Mi");
