@@ -29,22 +29,21 @@ const MAX_LABEL: usize = crate::sync::MAX_DNS1123_LABEL;
 /// The name of a Gateway's ServiceAccount, Deployment, Service and PDB:
 /// `portail-<gateway>`, or, when that is no DNS-1123 label, the Gateway name
 /// cut to fit with a hash of the whole name appended. Same bytes as the
-/// operator's `resourceName`, so existing objects keep their names. `None`
-/// for a name no cut can make a label (one with a dot), as the operator
-/// refused it.
-pub fn resource_name(gateway: &str) -> Option<String> {
+/// operator's `resourceName` for every name it accepted, so existing objects
+/// keep their names.
+pub fn resource_name(gateway: &str) -> String {
     let name = format!("{PREFIX}{gateway}");
     if is_dns1123_label(&name) {
-        return Some(name);
+        return name;
     }
+    // A Gateway name is a DNS-1123 subdomain: a dot is the one character a
+    // label refuses. The hash is of the name as given, so `a.b` never
+    // takes `a-b`'s name.
+    let label = gateway.replace('.', "-");
     let max_cut = MAX_LABEL - PREFIX.len() - 1 - HASH_HEX_DIGITS;
-    let cut = gateway
-        .get(..max_cut)
-        .unwrap_or(gateway)
-        .trim_end_matches('-');
+    let cut = label.get(..max_cut).unwrap_or(&label).trim_end_matches('-');
     let hash = &sha256_hex(gateway.as_bytes())[..HASH_HEX_DIGITS];
-    let name = format!("{PREFIX}{cut}-{hash}");
-    is_dns1123_label(&name).then_some(name)
+    format!("{PREFIX}{cut}-{hash}")
 }
 
 /// A Gateway name as a label value: as it is up to 63 characters, else
@@ -71,18 +70,17 @@ mod tests {
 
     #[test]
     fn a_short_name_is_prefixed() {
-        assert_eq!(resource_name("test-gw").as_deref(), Some("portail-test-gw"));
+        assert_eq!(resource_name("test-gw"), "portail-test-gw");
         // 8 + 55 = 63: still fits.
         let fits = "a".repeat(55);
-        assert_eq!(resource_name(&fits), Some(format!("portail-{fits}")));
+        assert_eq!(resource_name(&fits), format!("portail-{fits}"));
     }
 
     /// resources_test.go's 57-character conformance Gateway, with the hash
     /// sha256sum gives for it.
     #[test]
     fn a_long_name_is_cut_and_hashed() {
-        let name =
-            resource_name("gateway-with-one-not-matching-port-and-section-name-route").unwrap();
+        let name = resource_name("gateway-with-one-not-matching-port-and-section-name-route");
         assert_eq!(
             name,
             "portail-gateway-with-one-not-matching-port-and-section-f8dae0cc"
@@ -94,14 +92,29 @@ mod tests {
     #[test]
     fn a_cut_ending_in_dashes_is_trimmed() {
         assert_eq!(
-            resource_name("abcdefghij-abcdefghij-abcdefghij-abcdefghij-a-bcdefghijk").as_deref(),
-            Some("portail-abcdefghij-abcdefghij-abcdefghij-abcdefghij-a-7f41598c")
+            resource_name("abcdefghij-abcdefghij-abcdefghij-abcdefghij-a-bcdefghijk"),
+            "portail-abcdefghij-abcdefghij-abcdefghij-abcdefghij-a-7f41598c"
         );
     }
 
+    /// Every legal Gateway name gets one, a dotted one too, with the
+    /// hash sha256sum gives for the name as written: `a.b` and `a-b` never
+    /// share a name.
     #[test]
-    fn a_dotted_name_has_no_resource_name() {
-        assert_eq!(resource_name("gw.example"), None);
+    fn a_dotted_name_gets_a_label() {
+        let long = "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z-0123456789-0123456789";
+        for (gateway, name) in [
+            ("gw.example", "portail-gw-example-f8a6900a"),
+            ("a.b", "portail-a-b-2e7336dc"),
+            ("a-b", "portail-a-b"),
+            (
+                long,
+                "portail-a-b-c-d-e-f-g-h-i-j-k-l-m-n-o-p-q-r-s-t-u-v-w-15874345",
+            ),
+        ] {
+            assert_eq!(resource_name(gateway), name);
+            assert!(is_dns1123_label(name), "{name}");
+        }
     }
 
     #[test]
