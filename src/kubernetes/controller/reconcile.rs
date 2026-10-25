@@ -5,6 +5,7 @@
 //! protocol puts the data planes' applies between them.
 
 use kube::runtime::controller::Action;
+use kube::runtime::reflector::ObjectRef;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -299,6 +300,17 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         }
         _ => (Provisioned::unmanaged(), false),
     };
+    // A delete in the meantime already ran its forget: a slot published
+    // now would serve a deleted Gateway until the next delete event.
+    let deleted = ctx
+        .cache
+        .gateways
+        .get(&ObjectRef::new(&key.name).within(&key.namespace))
+        .is_none();
+    if deleted {
+        ctx.hub.remove(&key);
+        return Step::Done(Action::await_change());
+    }
     Step::Continue(Box::new(Pass {
         key,
         plan,
@@ -1180,11 +1192,7 @@ mod tests {
     /// Deletion ran no reconcile, so they served on.
     #[tokio::test]
     async fn deleted_gateway_stops_serving() {
-        let port = std::net::TcpListener::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port();
         let mut p = Pipeline::new();
         let mut gw = testkit::gateway("gw", 1);
         gw.spec.listeners[0].port = port.into();
@@ -1198,6 +1206,27 @@ mod tests {
         assert!(
             std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
             "the deleted Gateway's port is released"
+        );
+    }
+
+    /// A pass of a Gateway deleted since it was queued serves nothing: the
+    /// delete's forget ran before this pass published, and the slot it
+    /// left served the deleted Gateway until the next delete event.
+    #[tokio::test]
+    async fn a_pass_after_the_delete_serves_nothing() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        p.delete(&gw).await;
+
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert!(p.served(&gw).is_none());
+        assert!(!p.ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            p.api.status_patch("gateways", "gw").is_none(),
+            "no status for a deleted Gateway"
         );
     }
 

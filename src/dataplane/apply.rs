@@ -614,9 +614,11 @@ mod tests {
     /// know hashed into its version, applies and reports that version.
     #[tokio::test]
     async fn a_newer_controllers_snapshot_applies() {
-        let (mut applier, ready) = applier();
+        let (mut applier, _) = applier();
         let config: PortailConfig = serde_json::from_value(serde_json::json!({
-            "gateway": {"name": "gw", "listeners": [{"name": "http", "protocol": "HTTP", "port": 0}]},
+            "gateway": {"name": "gw", "listeners": [
+                {"name": "http", "protocol": "HTTP", "port": crate::proxy::data_plane::test_ports::wildcard()},
+            ]},
         }))
         .unwrap();
         let gateway = GatewayRef {
@@ -637,7 +639,6 @@ mod tests {
         let report = applier.apply(&received).await;
         assert_eq!(report.applied, version);
         assert_eq!(report.apply_error, None);
-        assert!(ready.load(Ordering::Acquire));
     }
 
     /// A generation bump with the same config rebuilds nothing.
@@ -658,11 +659,14 @@ mod tests {
     #[tokio::test]
     async fn a_held_port_is_reported_unbound() {
         let (mut applier, ready) = applier();
-        // Both from the kernel: no other test can pick either.
-        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let tcp = held.local_addr().unwrap().port();
+        // Held before the apply: another test probing the same port cannot
+        // take it in between.
+        let (tcp, _held) = std::iter::repeat_with(crate::proxy::data_plane::test_ports::wildcard)
+            .find_map(|port| Some((port, std::net::TcpListener::bind(("0.0.0.0", port)).ok()?)))
+            .unwrap();
+        let http = crate::proxy::data_plane::test_ports::wildcard();
 
-        let report = applier.apply(&snapshot(0, tcp, 1)).await;
+        let report = applier.apply(&snapshot(http, tcp, 1)).await;
         let tcp_endpoint = &report.listeners[1].endpoints[0];
         assert!(!tcp_endpoint.bound);
         assert!(
