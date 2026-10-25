@@ -140,6 +140,9 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // exists is dropped, not acted on (see the wait for shutdown below).
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    if let Some(cli::Command::Controller(controller)) = &args.command {
+        return run_controller(controller.clone(), sigterm).await;
+    }
     // Both Kubernetes modes parse in full so manifests can be written
     // against them; their runtimes land with the packages that build them.
     if let Some(command) = &args.command {
@@ -240,6 +243,27 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     drain.run().await;
 
     info!("Portail shutdown complete");
+    Ok(())
+}
+
+/// `portail controller` until SIGTERM or SIGINT, then a graceful stop: the
+/// passes in flight finish and the lease is released for a standby. An
+/// error, a lost lease included, exits non-zero.
+async fn run_controller(
+    args: cli::ControllerArgs,
+    mut sigterm: tokio::signal::unix::Signal,
+) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    let mut controller = std::pin::pin!(kubernetes::controller::run(args, shutdown.clone()));
+    tokio::select! {
+        result = controller.as_mut() => return result,
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+    info!("Received shutdown signal");
+    shutdown.cancel();
+    controller.await?;
+    info!("Controller stopped");
     Ok(())
 }
 
