@@ -34,6 +34,7 @@ use kube::runtime::watcher;
 use kube::runtime::{reflector, Controller, WatchStreamExt};
 use kube::Client;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +53,7 @@ use crate::kubernetes::crds::{GatewayParameters, RateLimitPolicy};
 use crate::kubernetes::reconciler::RouteVerdicts;
 use crate::kubernetes::services::NamedPortCache;
 use crate::logging::{info, warn};
+use crate::sync::GatewayKey;
 
 use hub::Hub;
 use reconcile::reconcile;
@@ -120,8 +122,19 @@ struct ControllerCtx {
 pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
-    let leader = leader::start(&client, &args, &shutdown);
-    let ca = ca::load_or_create(&client, &args).await?;
+    // /livez from here on; /readyz once the CA is loaded and the caches
+    // synced. A standby is ready: it answers 503 and the client dials again.
+    let ready = Arc::new(AtomicBool::new(false));
+    tokio::spawn(crate::admin::serve(
+        SocketAddr::new(args.admin.admin_address, args.admin.readiness_port),
+        ready.clone(),
+        shutdown.clone(),
+    ));
+    let Some(ca) = load_ca(&client, &args, &shutdown).await? else {
+        return Ok(());
+    };
+    let elector = leader::start(&client, &args);
+    let leader = elector.leader();
 
     // --- Primary resource: Gateway ---
     // No `predicate_filter(predicates::generation)` here: it caches generation
@@ -295,6 +308,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
                 }
             }
             info!("Caches synced");
+            ready.store(true, Ordering::Release);
             let _ = caches_synced.unbounded_send(());
         }
     });
@@ -311,31 +325,42 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             }
         }
     });
+    // A leader gained writes class status once, as it reconciles every
+    // Gateway once.
     tokio::spawn(gatewayclass::run(
         ctx.clone(),
-        class_changes,
-        shutdown.clone(),
-    ));
-    let sync = tokio::spawn(server::serve(
-        ctx.clone(),
-        ca,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.sync_port),
+        futures::stream::select(class_changes, leader.gained()),
         shutdown.clone(),
     ));
 
-    // A report moved: reconcile its Gateway; moved DNS means backend pods
-    // came or went, and a named targetPort's number lives on the pods.
+    let tls = ca.server_config();
+    tokio::spawn(ca.keep_renewed(shutdown.clone()));
+    let (lapses, lapse_wakes) = server::Lapses::new();
+    let sync_server = server::SyncServer::new(
+        ctx.clone(),
+        auth::Authenticator::new(
+            client.clone(),
+            &args.namespace,
+            &args.service_name,
+            auth::own_service_account(),
+        ),
+        lapses,
+        shutdown.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        args.sync_port,
+    ))
+    .await?;
+    let sync = tokio::spawn(server::serve(sync_server, tls, listener));
+
     let named_ports = ctx.named_ports.clone();
     let report_triggers = ctx
         .reports
         .triggers()
         .expect("a fresh report store has its triggers")
-        .map(move |trigger| {
-            if trigger.dns_moved {
-                named_ports.dns_changed();
-            }
-            ObjectRef::<Gateway>::new(&trigger.gateway.name).within(&trigger.gateway.namespace)
-        });
+        .map(move |trigger| report_trigger(&named_ports, trigger));
+    let lapse_triggers = lapse_wakes.map(|gateway| gateway_ref(&gateway));
 
     // --- Gateway controller ---
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
@@ -388,34 +413,95 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             all_gateway_refs(&gw11)
         })
         .reconcile_on(report_triggers)
+        .reconcile_on(lapse_triggers)
         .reconcile_on(owned_triggers)
         .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
-        .shutdown_on_signal()
+        // In-flight passes finish before the lease is released below.
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(reconcile, error_policy, ctx);
 
     info!("Gateway API controller started, watching for resource changes");
 
-    tokio::select! {
-        _ = gw_controller.for_each(|result| async move {
-            if let Err(e) = result {
-                warn!("Gateway controller: {:#}", anyhow::Error::new(e));
-            }
-        }) => {
-            info!("Gateway controller stream ended");
+    let controller = gw_controller.for_each(|result| async move {
+        if let Err(e) = result {
+            warn!("Gateway controller: {:#}", anyhow::Error::new(e));
         }
-        exit = sync => {
-            return match exit {
-                Ok(result) => result.and_then(|()| Err(anyhow::anyhow!("sync server stopped"))),
-                Err(e) => Err(anyhow::anyhow!("sync server task failed: {}", e)),
-            };
+    });
+    until_stopped(controller, sync, leader.lost(), &shutdown).await?;
+    elector.stop().await;
+    Ok(())
+}
+
+/// Until the controller stream ends: on shutdown, once its passes in flight
+/// finished. A stopped sync server is an error unless shutting down; a lost
+/// lease ends it at once, while draining too: a stuck pass must not write
+/// after a standby took the lease.
+async fn until_stopped(
+    controller: impl std::future::Future<Output = ()>,
+    sync: impl std::future::Future<Output = Result<anyhow::Result<()>, tokio::task::JoinError>>,
+    lost: impl std::future::Future<Output = ()>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    let mut controller = std::pin::pin!(controller);
+    let mut lost = std::pin::pin!(lost);
+    enum Exit {
+        Controller,
+        Sync(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        Lost,
+    }
+    let exit = tokio::select! {
+        _ = controller.as_mut() => Exit::Controller,
+        exit = sync => Exit::Sync(exit),
+        _ = lost.as_mut() => Exit::Lost,
+    };
+    match exit {
+        Exit::Controller => info!("Gateway controller stopped"),
+        // A standby's turn: kubelet restarts this process as one.
+        Exit::Lost => anyhow::bail!("leader election lost"),
+        Exit::Sync(_) if shutdown.is_cancelled() => tokio::select! {
+            _ = controller => info!("Gateway controller stopped"),
+            _ = lost => anyhow::bail!("leader election lost"),
+        },
+        Exit::Sync(Ok(Ok(()))) => anyhow::bail!("sync server stopped"),
+        Exit::Sync(Ok(Err(e))) => return Err(e.context("sync server")),
+        Exit::Sync(Err(e)) => anyhow::bail!("sync server task failed: {}", e),
+    }
+    Ok(())
+}
+
+/// The CA, retried at the election's cadence while the apiserver does not
+/// answer; `None` on shutdown. A stored CA that cannot be used is fatal:
+/// someone must delete its Secret.
+async fn load_ca(
+    client: &Client,
+    args: &ControllerArgs,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Option<ca::ControllerCa>> {
+    loop {
+        match ca::load_or_create(client, &args.namespace, &args.service_name).await {
+            Ok(ca) => return Ok(Some(ca)),
+            Err(e @ ca::CaError::Invalid(_)) => return Err(e.into()),
+            Err(e) => warn!("{}; retrying in {:?}", e, leader::RETRY_PERIOD),
         }
-        _ = shutdown.cancelled() => {
-            info!("Controller received shutdown signal");
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(leader::RETRY_PERIOD) => {}
         }
     }
+}
 
-    Ok(())
+/// The reconcile a report change asks for. Moved DNS means backend pods
+/// came or went, and a named targetPort's number lives on the pods.
+fn report_trigger(named_ports: &NamedPortCache, trigger: reports::Trigger) -> ObjectRef<Gateway> {
+    if trigger.dns_moved {
+        named_ports.dns_changed();
+    }
+    gateway_ref(&trigger.gateway)
+}
+
+fn gateway_ref(gateway: &GatewayKey) -> ObjectRef<Gateway> {
+    ObjectRef::new(&gateway.name).within(&gateway.namespace)
 }
 
 /// The safety-net re-check of a converged Gateway, in seconds.
@@ -466,7 +552,117 @@ fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<Controlle
 
 #[cfg(test)]
 mod tests {
+    use super::testkit::{self, apply, Pipeline};
     use super::*;
+
+    #[test]
+    fn a_report_trigger_reconciles_its_gateway() {
+        let named_ports = NamedPortCache::new(Duration::from_secs(RESYNC_SECS));
+        let trigger = reports::Trigger {
+            gateway: GatewayKey::new("apps", "web"),
+            dns_moved: false,
+        };
+        assert_eq!(
+            report_trigger(&named_ports, trigger),
+            ObjectRef::<Gateway>::new("web").within("apps")
+        );
+    }
+
+    /// A data plane's DNS refresh saw backend pods move: the next pass reads
+    /// the named targetPorts its Gateway's headless backends use again.
+    #[tokio::test]
+    async fn a_moved_dns_epoch_reads_named_target_ports_again() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("db", "web", 80, serde_json::json!("http")),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "db", 80),
+        );
+        p.api.reply_to(
+            "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+            200,
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{"metadata": {"name": "db-1"}, "addressType": "IPv4",
+                           "endpoints": [], "ports": [{"name": "web", "port": 8080}]}],
+            }),
+        );
+        let slice_lists = |p: &Pipeline| {
+            p.api
+                .requests()
+                .iter()
+                .filter(|r| r.method == "GET" && r.path.contains("/endpointslices"))
+                .count()
+        };
+        let trigger = |dns_moved| reports::Trigger {
+            gateway: testkit::key(&gw),
+            dns_moved,
+        };
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 1);
+
+        report_trigger(&p.ctx.named_ports, trigger(false));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 0, "same pods, read from the cache");
+
+        report_trigger(&p.ctx.named_ports, trigger(true));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 1, "the pods moved");
+    }
+
+    /// Shutting down, the sync server stopped first and a pass is stuck: a
+    /// lost lease still ends the wait, so the pass cannot write after a
+    /// standby took over.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_ends_a_graceful_stop() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stopping = until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            tokio::time::sleep(Duration::from_secs(10)),
+            &shutdown,
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(60), stopping)
+            .await
+            .expect("the lost lease ended the drain");
+        assert!(stopped
+            .unwrap_err()
+            .to_string()
+            .contains("leader election lost"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_drain_stops_cleanly() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        until_stopped(
+            futures::future::ready(()),
+            futures::future::pending(),
+            futures::future::pending(),
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        // Not shutting down: a sync server that stops is an error.
+        let running = CancellationToken::new();
+        assert!(until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            futures::future::pending(),
+            &running,
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn success_requeue_cadence() {

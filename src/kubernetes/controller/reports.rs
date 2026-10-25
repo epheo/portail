@@ -29,7 +29,7 @@ struct Entry {
 
 /// A data plane polls again at once after each answer, and an answer comes
 /// within a hold: an instance silent for two holds is gone.
-const LIVENESS: Duration = Duration::from_secs(2 * HOLD.as_secs());
+pub(super) const LIVENESS: Duration = Duration::from_secs(2 * HOLD.as_secs());
 
 pub(crate) struct ReportStore {
     gateways: Mutex<HashMap<GatewayKey, HashMap<InstanceId, Entry>>>,
