@@ -525,7 +525,7 @@ pub(crate) async fn reconcile(
     ctx: &ControllerCtx,
     gateway: &Gateway,
     params: &Params,
-) -> anyhow::Result<Provisioned> {
+) -> Provisioned {
     let unmanaged = params.provisioning == Provisioning::Unmanaged;
     let result = if unmanaged {
         delete_all_but(ctx, gateway, &[])
@@ -545,7 +545,7 @@ pub(crate) async fn reconcile(
                 .unwrap_or_default()
         }
     };
-    Ok(match result {
+    match result {
         Ok(provisioned) => provisioned,
         Err(Failure::Refused(problem)) => Provisioned {
             bound_ports: live(),
@@ -567,7 +567,7 @@ pub(crate) async fn reconcile(
                 problem: None,
             }
         }
-    })
+    }
 }
 
 /// A Managed Gateway's pass: preflight, apply, delete what is obsolete.
@@ -977,9 +977,7 @@ mod tests {
         for kind in [Kind::ServiceAccount, Kind::Deployment, Kind::Service] {
             answer(&api, kind, "new", "1", None);
         }
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer)).await;
         assert_eq!(provisioned.problem, None);
         assert_eq!(
             provisioned.bound_ports,
@@ -1030,7 +1028,7 @@ mod tests {
         answer(&api, Kind::PodDisruptionBudget, "pdb-uid", "1", None);
         let gw = gateway();
         let p = params(2, ServiceType::LoadBalancer);
-        reconcile(&ctx, &gw, &p).await.unwrap();
+        reconcile(&ctx, &gw, &p).await;
         assert_eq!(
             writes(&api),
             patched(&[
@@ -1046,7 +1044,7 @@ mod tests {
             .all(|r| r.method != "PATCH" || r.path.contains("force=true")));
 
         api.clear();
-        let provisioned = reconcile(&ctx, &gw, &p).await.unwrap();
+        let provisioned = reconcile(&ctx, &gw, &p).await;
         assert!(api.requests().is_empty(), "{:?}", api.requests());
         assert_eq!(
             provisioned.bound_ports[&(Transport::Tcp, 80)],
@@ -1058,7 +1056,7 @@ mod tests {
         moved.resource_version = Some("2".into());
         apply(&mut cluster.deployments, partial(moved));
         answer(&api, Kind::Deployment, "deployment-uid", "2", None);
-        reconcile(&ctx, &gw, &p).await.unwrap();
+        reconcile(&ctx, &gw, &p).await;
         assert_eq!(writes(&api), patched(&[Kind::Deployment]));
     }
 
@@ -1082,9 +1080,7 @@ mod tests {
             "1",
             Some(json!({"name": NAME, "namespace": NS, "uid": "hand-written"})),
         );
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer)).await;
         assert_eq!(
             provisioned.problem.as_deref(),
             Some("name conflict: Deployment/portail-gw is not owned by this Gateway")
@@ -1108,9 +1104,7 @@ mod tests {
             partial(meta(NAME, "gw", "old-gw-uid", "sa-uid", true)),
         );
         let ctx = cluster.ctx(api.client());
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None)).await;
         let problem = provisioned.problem.unwrap();
         assert!(
             problem.starts_with(
@@ -1140,9 +1134,7 @@ mod tests {
         fail(&api, Kind::Deployment, &name, 500);
         let mut literal = testkit::gateway("gw-example-f8a6900a", 1);
         literal.spec.listeners[0].port = 80;
-        let provisioned = reconcile(&ctx, &literal, &params(1, ServiceType::None))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &literal, &params(1, ServiceType::None)).await;
         assert_eq!(
             provisioned.problem.unwrap(),
             format!("name conflict: ServiceAccount/{name} is not owned by this Gateway")
@@ -1175,9 +1167,7 @@ mod tests {
         answer(&api, Kind::Deployment, "deployment-uid", "1", None);
         answer(&api, Kind::Service, "service-uid", "1", None);
         answer(&api, Kind::PodDisruptionBudget, "pdb-uid", "1", None);
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None)).await;
         assert!(
             provisioned.bound_ports.is_empty(),
             "no Service: published ports"
@@ -1206,9 +1196,7 @@ mod tests {
         ] {
             answer(&api, kind, uid, "1", None);
         }
-        reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer))
-            .await
-            .unwrap();
+        reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer)).await;
         assert_eq!(
             deletes(&api),
             [(path(Kind::PodDisruptionBudget, NAME), "pdb-uid".to_string())]
@@ -1253,7 +1241,7 @@ mod tests {
         }
         let mut unmanaged = params(1, ServiceType::LoadBalancer);
         unmanaged.provisioning = Provisioning::Unmanaged;
-        let provisioned = reconcile(&ctx, &gateway(), &unmanaged).await.unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &unmanaged).await;
         assert!(provisioned.bound_ports.is_empty() && provisioned.problem.is_none());
         assert_eq!(
             deletes(&api),
@@ -1304,9 +1292,7 @@ mod tests {
         gw.metadata.deletion_timestamp = Some(
             k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Default::default()),
         );
-        let provisioned = reconcile(&ctx, &gw, &params(1, ServiceType::None))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gw, &params(1, ServiceType::None)).await;
         assert_eq!(provisioned.problem, None);
         assert!(api.requests().is_empty(), "{:?}", api.requests());
     }
@@ -1451,9 +1437,7 @@ mod tests {
         );
         let ctx = cluster.ctx(api.client());
         answer(&api, Kind::ServiceAccount, "new", "1", None);
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None))
-            .await
-            .unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None)).await;
         assert_eq!(
             provisioned.problem.as_deref(),
             Some("name conflict: Deployment/portail-gw is not owned by this Gateway")
@@ -1490,7 +1474,7 @@ mod tests {
         answer(&api, Kind::ServiceAccount, "sa-uid", "1", None);
         fail(&api, Kind::Deployment, NAME, 403);
         let p = params(1, ServiceType::None);
-        let provisioned = reconcile(&ctx, &gateway(), &p).await.unwrap();
+        let provisioned = reconcile(&ctx, &gateway(), &p).await;
         assert_eq!(
             provisioned.problem.as_deref(),
             Some("applying Deployment/portail-gw: refused with 403")
@@ -1499,7 +1483,7 @@ mod tests {
         assert!(!ctx.owned.retry_pending(&key));
         for code in [409, 429, 500, 503] {
             fail(&api, Kind::Deployment, NAME, code);
-            let provisioned = reconcile(&ctx, &gateway(), &p).await.unwrap();
+            let provisioned = reconcile(&ctx, &gateway(), &p).await;
             assert_eq!(provisioned.problem, None, "{code}");
             assert!(ctx.owned.retry_pending(&key), "{code}");
         }
