@@ -24,11 +24,12 @@ use crate::logging::debug;
 use crate::sync::{GatewayKey, InstanceReport, Snapshot, HOLD};
 
 /// How long the written Programmed stands while no live instance applied
-/// the published version. A polling data plane applies a version as it is
-/// published, and a pod replacing a leaving one (Recreate, a drain) or one
-/// reconnecting to a new leader reports within the two holds liveness
-/// allows an instance.
-const KEEP: Duration = Duration::from_secs(2 * HOLD.as_secs());
+/// the published version: one hold. A live data plane applies a version
+/// about a second after its publish, a replacement or a reconnecting one
+/// within a hold. Conformance waits 60s (LatestObservedGenerationSet) for
+/// the latest observedGeneration: the lapse to Pending, debounce included,
+/// must come well before.
+const KEEP: Duration = HOLD;
 
 const IP_ADDRESS: &str = "IPAddress";
 const HOSTNAME: &str = "Hostname";
@@ -68,13 +69,6 @@ pub(crate) fn gateway_status(
     let served = ctx.hub.current(key);
     let reports = ctx.reports.live(key);
     let service = owned_service(ctx, gateway);
-    let keep_from = served.as_deref().and_then(|s| {
-        ctx.hub
-            .published_at(key)
-            .into_iter()
-            .chain(ctx.reports.last_seen(key, &s.version))
-            .max()
-    });
     decide(&Inputs {
         gateway,
         accepted: &statuses.accepted,
@@ -88,7 +82,9 @@ pub(crate) fn gateway_status(
             .first()
             .and_then(|(_, r)| ctx.hub.generation_of(key, &r.applied)),
         service: service.as_deref(),
-        keep_until: keep_from.map(|t| t + KEEP),
+        published_at: ctx.hub.published_at(key),
+        first_published: ctx.hub.first_published_at(key),
+        last_leaving: ctx.reports.last_leaving(key),
         now: Instant::now(),
     })
 }
@@ -129,9 +125,12 @@ struct Inputs<'a> {
     /// The generation the first live instance serves, for the message.
     older: Option<i64>,
     service: Option<&'a Service>,
-    /// Until when the written Programmed stands while no live instance
-    /// applied the served version.
-    keep_until: Option<Instant>,
+    /// When the served version was published.
+    published_at: Option<Instant>,
+    /// When this controller first published the Gateway.
+    first_published: Option<Instant>,
+    /// When an instance last said it was leaving.
+    last_leaving: Option<Instant>,
     now: Instant,
 }
 
@@ -143,6 +142,14 @@ enum Verdict {
         until: Instant,
         otherwise: GatewayCondition,
     },
+}
+
+/// What status.addresses says.
+enum Addresses {
+    /// From a source that knows, maybe none: written as it is.
+    Known(Vec<(&'static str, String)>),
+    /// Nothing knows: what was written stays.
+    Unknown,
 }
 
 fn decide(i: &Inputs) -> GatewayStatus {
@@ -162,6 +169,12 @@ fn decide(i: &Inputs) -> GatewayStatus {
             "Gateway not accepted: {}",
             i.accepted.message
         )))
+    } else if let Some(message) = service.as_ref().and_then(|s| s.unassigned(i.gateway)) {
+        Verdict::Fresh(GatewayCondition {
+            ok: false,
+            reason: "AddressNotAssigned".to_string(),
+            message,
+        })
     } else {
         verdict
     };
@@ -196,14 +209,13 @@ fn decide(i: &Inputs) -> GatewayStatus {
         &i.accepted.message,
         generation,
     );
-    let addresses = (!addresses.is_empty())
-        .then(|| {
-            addresses
-                .iter()
-                .map(|(t, v)| status::address(t, v))
-                .collect()
-        })
-        .or_else(|| status::observed_list(&observed, "addresses"));
+    let written = status::observed_list(&observed, "addresses");
+    let addresses = match addresses {
+        // An empty list only clears what was written: no placeholder.
+        Addresses::Known(known) if known.is_empty() => written.map(|_| Vec::new()),
+        Addresses::Known(known) => Some(known.iter().map(|(t, v)| status::address(t, v)).collect()),
+        Addresses::Unknown => written,
+    };
     GatewayStatus {
         programmed: programmed["status"] == "True",
         desired: status::desired_gateway_status([accepted, programmed], entries, addresses),
@@ -308,19 +320,47 @@ fn bound(report: &InstanceReport, listener: &str) -> bool {
         .is_some_and(|l| !l.endpoints.is_empty() && l.endpoints.iter().all(|e| e.bound))
 }
 
-/// The Gateway's Programmed, each listener's in `listeners`, the addresses
-/// to report (empty: none known), and the listeners turned Pending for want
+/// Until when the written Programmed stands with no live instance at the
+/// served version, a hold after the latest of: the publish, while an
+/// instance at an older version is live to apply it; a goodbye, whose
+/// replacement is due; this controller's first publish of the Gateway, as
+/// data planes reconnect to a new leader. A data plane that died silently
+/// keeps nothing across new versions.
+fn keep_until(i: &Inputs) -> Option<Instant> {
+    let live_older = !i.reports.is_empty();
+    [
+        i.published_at.filter(|_| live_older),
+        i.last_leaving,
+        i.first_published,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .map(|t| t + KEEP)
+}
+
+/// Whether the spec names an address an instance could hold.
+fn names_addresses(gateway: &Gateway) -> bool {
+    gateway.spec.addresses.iter().flatten().any(|a| {
+        let t = a.r#type.as_deref().unwrap_or(IP_ADDRESS);
+        t == IP_ADDRESS || t == NETWORK_ADDRESS_TYPE
+    })
+}
+
+/// The Gateway's Programmed from the reports, each listener's in
+/// `listeners`, the addresses, and the listeners turned Pending for want
 /// of an instance at the served version.
 fn evaluate(
     i: &Inputs,
     listeners: &mut HashMap<String, ListenerStatus>,
     service: Option<&ServiceView>,
-) -> (Verdict, Vec<(&'static str, String)>, Vec<String>) {
-    let service_addresses = service.map(|s| s.addresses.clone()).unwrap_or_default();
+) -> (Verdict, Addresses, Vec<String>) {
+    let from_service = || service.map(|s| Addresses::Known(s.addresses.clone()));
     let Some(served) = i.served else {
         let message = "No configuration published for this Gateway yet";
         let marked = mark_pending(listeners, message);
-        return (Verdict::Fresh(pending(message)), service_addresses, marked);
+        let addresses = from_service().unwrap_or(Addresses::Unknown);
+        return (Verdict::Fresh(pending(message)), addresses, marked);
     };
     let at_version: Vec<&InstanceReport> = i
         .reports
@@ -337,14 +377,27 @@ fn evaluate(
             None => format!("No data plane applied generation {generation} yet"),
         };
         let marked = mark_pending(listeners, &message);
-        let verdict = match i.keep_until.filter(|until| *until > i.now) {
-            Some(until) => Verdict::Kept {
-                until,
-                otherwise: pending(&message),
-            },
-            None => Verdict::Fresh(pending(&message)),
+        let (verdict, addresses) = match keep_until(i).filter(|until| *until > i.now) {
+            Some(until) => (
+                Verdict::Kept {
+                    until,
+                    otherwise: pending(&message),
+                },
+                from_service().unwrap_or(Addresses::Unknown),
+            ),
+            None => {
+                // No pod and no address of its own to come back with: it
+                // has none. A spec address will be back with its pod.
+                let none = i.reports.is_empty() && !names_addresses(i.gateway);
+                let addresses = from_service().unwrap_or(if none {
+                    Addresses::Known(Vec::new())
+                } else {
+                    Addresses::Unknown
+                });
+                (Verdict::Fresh(pending(&message)), addresses)
+            }
         };
-        return (verdict, service_addresses, marked);
+        return (verdict, addresses, marked);
     }
 
     let config = &served.config;
@@ -353,35 +406,45 @@ fn evaluate(
         .map(|r| bind_addresses_resolved(&config.gateway.addresses, &r.networks, &r.interface_ips))
         .collect();
     let unusable = binds.iter().all(Option::is_none);
+    // Only listeners the translation could program count: one without a
+    // usable certificate is Invalid on its own, the rest still serve
+    // (Gateway API v1.4.1: Programmed says the configuration was generated).
+    let counted: Vec<&str> = config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|name| i.listeners.get(*name).is_some_and(|ls| ls.programmed))
+        .collect();
     // Gateway API v1.4.1 ListenerReasonPending: the listener is "not yet
     // online and ready to accept client traffic"; the data plane retries
     // its binds.
     let mut all_bound = true;
-    for l in &config.gateway.listeners {
+    for name in &counted {
         let error = at_version
             .iter()
-            .flat_map(|r| r.listeners.iter().filter(|x| x.name == l.name))
+            .flat_map(|r| r.listeners.iter().filter(|x| x.name == *name))
             .flat_map(|x| &x.endpoints)
             .find_map(|e| e.error.as_deref());
         let message = match error {
             Some(err) => format!("Listener port not bound: {err}"),
-            None if at_version.iter().any(|r| bound(r, &l.name)) => continue,
+            None if at_version.iter().any(|r| bound(r, name)) => continue,
             None if unusable => "Not bound: no address of this Gateway is on the pod".into(),
             None => "Listener port not bound yet".into(),
         };
         all_bound = false;
-        if let Some(ls) = listeners.get_mut(&l.name).filter(|ls| ls.programmed) {
+        if let Some(ls) = listeners.get_mut(*name) {
             ls.programmed = false;
             ls.programmed_reason = "Pending".into();
             ls.programmed_message = message;
         }
     }
 
-    // Every listener skipped as unconvertible: zero endpoints make the
-    // bind check vacuously true, but nothing serves.
     let condition = if let Some(e) = at_version.iter().find_map(|r| r.apply_error.as_deref()) {
         GatewayCondition::invalid(format!("Route table conversion failed: {e}"))
-    } else if config.gateway.listeners.is_empty() && !i.gateway.spec.listeners.is_empty() {
+    } else if counted.is_empty() && !i.gateway.spec.listeners.is_empty() {
+        // Zero listeners to bind make the bind check vacuously true, but
+        // nothing serves.
         GatewayCondition::invalid("No listener could be programmed")
     } else if unusable {
         GatewayCondition {
@@ -394,22 +457,20 @@ fn evaluate(
                 unresolved_networks(&config.gateway.addresses, &at_version[0].networks).join(", ")
             ),
         }
-    } else if let Some(message) = service.and_then(|s| s.unassigned(i.gateway)) {
-        GatewayCondition {
-            ok: false,
-            reason: "AddressNotAssigned".to_string(),
-            message,
-        }
     } else if all_bound {
         GatewayCondition::ok("Programmed", "Programmed")
     } else {
         debug!("Data plane not ready: not all listener ports are bound");
         GatewayCondition::invalid("Data plane not ready: not all listener ports are bound")
     };
-    let addresses = match service {
-        Some(_) => service_addresses,
-        None => instance_addresses(i.gateway, &at_version, &binds),
-    };
+    let addresses = from_service().unwrap_or_else(|| {
+        let held = instance_addresses(i.gateway, &at_version, &binds);
+        if held.is_empty() {
+            Addresses::Unknown
+        } else {
+            Addresses::Known(held)
+        }
+    });
     (Verdict::Fresh(condition), addresses, Vec::new())
 }
 
@@ -626,7 +687,10 @@ mod tests {
         accepted: GatewayCondition,
         problem: Option<String>,
         unpublished: Option<Unpublished>,
-        keep_until: Option<Instant>,
+        listeners: HashMap<String, ListenerStatus>,
+        published_at: Option<Instant>,
+        first_published: Option<Instant>,
+        last_leaving: Option<Instant>,
         now: Instant,
     }
 
@@ -640,7 +704,10 @@ mod tests {
                 accepted: GatewayCondition::ok("Accepted", "ok"),
                 problem: None,
                 unpublished: None,
-                keep_until: None,
+                listeners: programmable(),
+                published_at: None,
+                first_published: None,
+                last_leaving: None,
                 now: Instant::now(),
             }
         }
@@ -649,7 +716,7 @@ mod tests {
             decide(&Inputs {
                 gateway: &self.gw,
                 accepted: &self.accepted,
-                listeners: &programmable(),
+                listeners: &self.listeners,
                 attached: &HashMap::new(),
                 problem: self.problem.as_deref(),
                 unpublished: self.unpublished.as_ref(),
@@ -657,7 +724,9 @@ mod tests {
                 reports: &self.reports,
                 older: None,
                 service: self.service.as_ref(),
-                keep_until: self.keep_until,
+                published_at: self.published_at,
+                first_published: self.first_published,
+                last_leaving: self.last_leaving,
                 now: self.now,
             })
         }
@@ -828,12 +897,12 @@ mod tests {
         assert!(out.desired.get("addresses").is_none(), "{}", out.desired);
     }
 
-    /// An edit publishes a new version: until an instance applies it, the
-    /// written Programmed and addresses stand for two holds, the Gateway's
-    /// and each listener's, at their older generation. Then Pending, the
-    /// addresses still as written.
+    /// An edit publishes a new version: until the live instance applies
+    /// it, the written Programmed and addresses stand for a hold, the
+    /// Gateway's and each listener's, at their older generation. Then
+    /// Pending, the addresses still as written: the instance holds them.
     #[test]
-    fn the_written_programmed_stands_for_two_holds() {
+    fn the_written_programmed_stands_for_a_hold() {
         let first = gateway(1, &[]);
         let before = Case::new(
             first.clone(),
@@ -851,7 +920,7 @@ mod tests {
             snapshot(&edited, &[]),
             vec![report(V1, &["10.0.0.5"], true)],
         );
-        case.keep_until = Some(case.now + Duration::from_secs(20));
+        case.published_at = Some(case.now - (KEEP - Duration::from_secs(20)));
 
         let kept = case.run();
         let programmed = programmed_of(&kept.desired);
@@ -896,23 +965,10 @@ mod tests {
         added.name = "admin".into();
         edited.spec.listeners.push(added);
         let mut case = Case::new(edited.clone(), snapshot(&edited, &[]), vec![]);
-        case.keep_until = Some(case.now + Duration::from_secs(20));
-        let mut listeners = programmable();
-        listeners.insert("admin".into(), listeners["http"].clone());
-        let out = decide(&Inputs {
-            gateway: &case.gw,
-            accepted: &case.accepted,
-            listeners: &listeners,
-            attached: &HashMap::new(),
-            problem: None,
-            unpublished: None,
-            served: case.served.as_ref(),
-            reports: &case.reports,
-            older: None,
-            service: None,
-            keep_until: case.keep_until,
-            now: case.now,
-        });
+        case.first_published = Some(case.now);
+        let http = case.listeners["http"].clone();
+        case.listeners.insert("admin".into(), http);
+        let out = case.run();
         let by_name = |name: &str| {
             let entry = out.desired["listeners"]
                 .as_array()
@@ -924,6 +980,156 @@ mod tests {
         };
         assert_eq!(by_name("http")["status"], "True");
         assert_eq!(by_name("admin")["reason"], "Pending");
+    }
+
+    /// A Gateway written Programmed, edited to generation 2 and published
+    /// long after this controller first published it.
+    fn edited_after_programmed(spec_addresses: &[(&str, &str)]) -> Case {
+        let first = gateway(1, spec_addresses);
+        let before = Case::new(
+            first.clone(),
+            snapshot(&first, &[]),
+            vec![report(V1, &["10.0.0.5"], true)],
+        )
+        .run();
+        let mut edited = written(&first, &before.desired);
+        edited.metadata.generation = Some(2);
+        let mut case = Case::new(edited.clone(), snapshot(&edited, &[]), vec![]);
+        case.published_at = Some(case.now);
+        case.first_published = Some(case.now - Duration::from_secs(600));
+        case
+    }
+
+    /// A data plane that died silently keeps nothing: a new version with
+    /// no live instance is Pending at once. Each publish restarted the
+    /// keep, so a crashed Gateway stayed Programmed across edits.
+    #[test]
+    fn a_silent_data_plane_keeps_nothing_across_versions() {
+        let out = edited_after_programmed(&[]).run();
+        let programmed = programmed_of(&out.desired);
+        assert_eq!(programmed["reason"], "Pending", "{}", out.desired);
+        assert_eq!(programmed["observedGeneration"], 2);
+        assert_eq!(out.recheck, None);
+    }
+
+    /// What does keep the written Programmed for a hold: an instance live
+    /// at an older version (from the publish), a goodbye (its replacement
+    /// is due), this controller's first publish (data planes reconnect).
+    #[test]
+    fn a_live_older_instance_a_goodbye_or_a_new_leader_keep_programmed() {
+        let mut live_older = edited_after_programmed(&[]);
+        live_older.reports = live(vec![report(V1, &["10.0.0.5"], true)]);
+        let mut goodbye = edited_after_programmed(&[]);
+        goodbye.last_leaving = Some(goodbye.now - Duration::from_secs(10));
+        let mut new_leader = edited_after_programmed(&[]);
+        new_leader.first_published = Some(new_leader.now - Duration::from_secs(5));
+        for (case, left) in [
+            (live_older, KEEP),
+            (goodbye, KEEP - Duration::from_secs(10)),
+        ] {
+            let out = case.run();
+            assert_eq!(programmed_of(&out.desired)["status"], "True");
+            assert_eq!(out.recheck, Some(left));
+        }
+        let out = new_leader.run();
+        assert_eq!(out.recheck, Some(KEEP - Duration::from_secs(5)));
+    }
+
+    /// The lapse to Pending, debounce and one refused write included,
+    /// lands inside the 60s conformance waits for the latest
+    /// observedGeneration (LatestObservedGenerationSet).
+    #[test]
+    fn the_keep_lapses_inside_the_conformance_wait() {
+        let debounce = Duration::from_secs(1);
+        let failed_write_retry = Duration::from_secs(10);
+        assert!(KEEP + debounce + failed_write_retry < Duration::from_secs(60));
+    }
+
+    /// A LoadBalancer Service with no ingress knows the Gateway has no
+    /// address: the written one is cleared, with AddressNotAssigned.
+    #[test]
+    fn a_load_balancer_without_ingress_clears_written_addresses() {
+        let first = gateway(1, &[]);
+        let mut case = Case::new(
+            first.clone(),
+            snapshot(&first, &[]),
+            vec![report(V1, &["10.0.0.5"], true)],
+        );
+        case.service = Some(load_balancer(json!([{"ip": "203.0.113.7"}])));
+        let before = case.run();
+        case.gw = written(&first, &before.desired);
+        case.service = Some(load_balancer(json!([])));
+        let out = case.run();
+        assert_eq!(programmed_of(&out.desired)["reason"], "AddressNotAssigned");
+        assert_eq!(out.desired["addresses"], json!([]), "{}", out.desired);
+    }
+
+    /// Without a Service, no live instance and no address in the spec, the
+    /// Gateway has none: the written ones are cleared. With a spec
+    /// address, the pod comes back with it: unknown, kept.
+    #[test]
+    fn no_pod_and_no_spec_address_clears_written_addresses() {
+        let out = edited_after_programmed(&[]).run();
+        assert_eq!(programmed_of(&out.desired)["reason"], "Pending");
+        assert_eq!(out.desired["addresses"], json!([]), "{}", out.desired);
+
+        let out = edited_after_programmed(&[("IPAddress", "10.0.0.5")]).run();
+        assert_eq!(addresses(&out.desired), [ip("10.0.0.5")]);
+    }
+
+    /// An HTTPS listener whose certificate went away is Invalid on its own
+    /// (ResolvedRefs False from translation); the Gateway stays Programmed
+    /// while the rest bind. Its unbound port held the Gateway back.
+    #[test]
+    fn a_listener_without_its_certificate_does_not_hold_the_gateway() {
+        let mut gw = gateway(1, &[]);
+        let mut https = gw.spec.listeners[0].clone();
+        https.name = "https".into();
+        https.protocol = "HTTPS".into();
+        gw.spec.listeners.push(https);
+        let mut served = snapshot(&gw, &[]);
+        let mut config = served.to_config();
+        let mut listener = config.gateway.listeners[0].clone();
+        listener.name = "https".into();
+        listener.port = 8443;
+        config.gateway.listeners.push(listener);
+        served = Snapshot::from_config(served.gateway.clone(), config, vec![]);
+        let mut unbound = report(&served.version, &["10.0.0.5"], true);
+        unbound.listeners.push(ListenerReport {
+            name: "https".into(),
+            endpoints: vec![EndpointReport {
+                address: None,
+                port: 8443,
+                transport: Transport::Tcp,
+                bound: false,
+                error: Some("no certificate".into()),
+            }],
+        });
+        let mut case = Case::new(gw, served, vec![unbound]);
+        case.listeners.insert(
+            "https".into(),
+            ListenerStatus {
+                accepted: true,
+                resolved_refs: false,
+                resolved_refs_reason: "InvalidCertificateRef".into(),
+                programmed: false,
+                programmed_reason: "Invalid".into(),
+                programmed_message: "Listener has unresolved references".into(),
+                ..Default::default()
+            },
+        );
+        let out = case.run();
+        assert!(out.programmed, "{}", out.desired);
+        let https = out.desired["listeners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == "https")
+            .unwrap();
+        assert_eq!(
+            condition_of(&https["conditions"], "Programmed")["reason"],
+            "Invalid"
+        );
     }
 
     /// A Network address with no IP on the pod binds nothing: the Gateway
