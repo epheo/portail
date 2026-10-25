@@ -29,6 +29,11 @@ use crate::sync::{GatewayKey, InstanceReport, Snapshot, HOLD};
 /// must come well before.
 const KEEP: Duration = HOLD;
 
+/// How long, from leadership gained, no report says nothing: every data
+/// plane polls within a hold even at its longest backoff, and the poll it
+/// made just before the failover may have been held for another.
+const TAKEOVER_KEEP: Duration = Duration::from_secs(2 * HOLD.as_secs());
+
 const IP_ADDRESS: &str = "IPAddress";
 const HOSTNAME: &str = "Hostname";
 
@@ -84,6 +89,7 @@ pub(crate) fn gateway_status(
         service: service.as_deref(),
         published_at: ctx.hub.published_at(key),
         first_published: ctx.hub.first_published_at(key),
+        leading_since: ctx.leader.leading_since(),
         last_leaving: ctx.reports.last_leaving(key),
         now: Instant::now(),
     })
@@ -108,6 +114,8 @@ struct Inputs<'a> {
     published_at: Option<Instant>,
     /// When this controller first published the Gateway.
     first_published: Option<Instant>,
+    /// When this controller became the leader.
+    leading_since: Option<Instant>,
     /// When an instance last said it was leaving.
     last_leaving: Option<Instant>,
     now: Instant,
@@ -303,11 +311,13 @@ fn bound(report: &InstanceReport, listener: &str) -> bool {
 /// served version, a hold after the latest of: the publish, while an
 /// instance at an older version is live to apply it; a goodbye, whose
 /// replacement is due; this controller's first publish of the Gateway, as
-/// data planes reconnect to a new leader. A data plane that died silently
-/// keeps nothing across new versions.
+/// data planes reconnect to a new leader. With no report at all, also
+/// [`TAKEOVER_KEEP`] after leadership was gained: until every data plane
+/// polled this leader, none reporting is not none serving. A data plane
+/// that died silently keeps nothing across new versions.
 fn keep_until(i: &Inputs) -> Option<Instant> {
     let live_older = !i.reports.is_empty();
-    [
+    let edited = [
         i.published_at.filter(|_| live_older),
         i.last_leaving,
         i.first_published,
@@ -315,7 +325,12 @@ fn keep_until(i: &Inputs) -> Option<Instant> {
     .into_iter()
     .flatten()
     .max()
-    .map(|t| t + KEEP)
+    .map(|t| t + KEEP);
+    let taken_over = i
+        .leading_since
+        .filter(|_| !live_older)
+        .map(|t| t + TAKEOVER_KEEP);
+    edited.max(taken_over)
 }
 
 /// Whether the spec names an address an instance could hold.
@@ -670,6 +685,7 @@ mod tests {
         listeners: HashMap<String, ListenerStatus>,
         published_at: Option<Instant>,
         first_published: Option<Instant>,
+        leading_since: Option<Instant>,
         last_leaving: Option<Instant>,
         now: Instant,
     }
@@ -687,6 +703,7 @@ mod tests {
                 listeners: programmable(),
                 published_at: None,
                 first_published: None,
+                leading_since: None,
                 last_leaving: None,
                 now: Instant::now(),
             }
@@ -706,6 +723,7 @@ mod tests {
                 service: self.service.as_ref(),
                 published_at: self.published_at,
                 first_published: self.first_published,
+                leading_since: self.leading_since,
                 last_leaving: self.last_leaving,
                 now: self.now,
             })
@@ -1045,6 +1063,45 @@ mod tests {
         }
         let out = new_leader.run();
         assert_eq!(out.recheck, Some(KEEP - Duration::from_secs(5)));
+    }
+
+    /// A new leader that has no report yet does not know the data planes
+    /// are gone: the written Programmed and addresses stand two holds from
+    /// the takeover, then Pending with no address. They lapsed one hold
+    /// after its first publish, and a serving Gateway showed Pending and
+    /// no address for 18s.
+    #[test]
+    fn a_new_leader_with_no_report_keeps_programmed_for_two_holds() {
+        let gw = gateway(1, &[]);
+        let before = Case::new(
+            gw.clone(),
+            snapshot(&gw, &[]),
+            vec![report(V1, &["10.0.0.5"], true)],
+        )
+        .run();
+        assert_eq!(addresses(&before.desired), [ip("10.0.0.5")]);
+        let mut taken_over = Case::new(written(&gw, &before.desired), snapshot(&gw, &[]), vec![]);
+        taken_over.first_published = Some(taken_over.now - KEEP);
+        taken_over.leading_since = Some(taken_over.now - (TAKEOVER_KEEP - Duration::from_secs(1)));
+        let out = taken_over.run();
+        assert_eq!(
+            programmed_of(&out.desired)["status"],
+            "True",
+            "{}",
+            out.desired
+        );
+        assert_eq!(addresses(&out.desired), [ip("10.0.0.5")]);
+        assert_eq!(out.recheck, Some(Duration::from_secs(1)));
+
+        taken_over.leading_since = Some(taken_over.now - TAKEOVER_KEEP);
+        let out = taken_over.run();
+        assert_eq!(
+            programmed_of(&out.desired)["reason"],
+            "Pending",
+            "{}",
+            out.desired
+        );
+        assert!(addresses(&out.desired).is_empty(), "{}", out.desired);
     }
 
     /// The lapse to Pending, debounce and one refused write included,

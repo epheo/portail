@@ -52,6 +52,8 @@ struct Shared {
     role: watch::Sender<Role>,
     /// One sender per `gained` stream.
     gained: Mutex<Vec<mpsc::UnboundedSender<()>>>,
+    /// When this replica last became the leader.
+    since: Mutex<Option<Instant>>,
 }
 
 impl Leader {
@@ -59,6 +61,7 @@ impl Leader {
         Leader(Arc::new(Shared {
             role: watch::Sender::new(role),
             gained: Mutex::default(),
+            since: Mutex::new((role == Role::Leading).then(Instant::now)),
         }))
     }
 
@@ -92,6 +95,12 @@ impl Leader {
         rx
     }
 
+    /// When this replica became the leader, while it leads.
+    pub(crate) fn leading_since(&self) -> Option<Instant> {
+        let since = *self.0.since.lock().unwrap_or_else(|p| p.into_inner());
+        since.filter(|_| self.is_leader())
+    }
+
     /// Resolves once the lease is lost.
     pub(crate) async fn lost(&self) {
         let mut role = self.0.role.subscribe();
@@ -103,6 +112,7 @@ impl Leader {
         let mut gained = self.0.gained.lock().unwrap_or_else(|p| p.into_inner());
         let was = self.0.role.send_replace(role);
         if role == Role::Leading && was != Role::Leading {
+            *self.0.since.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
             gained.retain(|tx| tx.unbounded_send(()).is_ok());
         }
     }
