@@ -1611,81 +1611,82 @@ mod tests {
     /// A revoked hostname listener beside a catch-all HTTPS sibling on its
     /// port: its SNI is refused, never answered with the sibling's cert,
     /// and nothing failed.
-    #[tokio::test]
-    async fn a_revoked_hostname_listener_refuses_its_sni() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("catch-all") else {
-            return; // openssl unavailable
-        };
-        let port = free_port();
-        let listeners = [
-            https_with_cert(port, None, &cert),
-            revoked(https_listener("gone", port, Some("gone.example.org"), "x")),
-        ];
-        let (perf, routes) = (
-            test_perf(),
-            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
-        );
-        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
-        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
-        assert_eq!(
-            ensure(&mut dp, &listeners, &routes, &perf).await,
-            (0, vec![])
-        );
+    #[test]
+    fn a_revoked_hostname_listener_refuses_its_sni() {
+        alone("a_revoked_hostname_listener_refuses_its_sni", async {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("catch-all") else {
+                return; // openssl unavailable
+            };
+            let port = free_port();
+            let listeners = [
+                https_with_cert(port, None, &cert),
+                revoked(https_listener("gone", port, Some("gone.example.org"), "x")),
+            ];
+            let (perf, routes) = (
+                test_perf(),
+                Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+            );
+            let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+            assert_eq!(
+                ensure(&mut dp, &listeners, &routes, &perf).await,
+                (1, vec![])
+            );
 
-        assert!(presented(port, Some("gone.example.org")).await.is_err());
-        assert_eq!(presented(port, Some("other.org")).await, Ok(der(&cert.0)));
+            assert!(presented(port, Some("gone.example.org")).await.is_err());
+            assert_eq!(presented(port, Some("other.org")).await, Ok(der(&cert.0)));
+        });
     }
 
     /// A port whose only listener is revoked serves nothing: a fresh data
     /// plane does not bind it, and a running one closes it, both without
     /// an error. The running one kept the port open, refusing every
     /// handshake, while a fresh pod never bound it.
-    #[tokio::test]
-    async fn a_port_with_only_revoked_listeners_is_closed_as_never_bound() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
-            return; // openssl unavailable
-        };
-        let port = free_port();
-        let serving = https_with_cert(port, None, &cert);
-        let gone = [revoked(serving.clone())];
-        let (perf, routes) = (
-            test_perf(),
-            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
-        );
+    #[test]
+    fn a_port_with_only_revoked_listeners_is_closed_as_never_bound() {
+        alone(
+            "a_port_with_only_revoked_listeners_is_closed_as_never_bound",
+            async {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                let Some(cert) =
+                    crate::proxy::tls::test_util::generate_test_cert("app.example.org")
+                else {
+                    return; // openssl unavailable
+                };
+                let port = free_port();
+                let serving = https_with_cert(port, None, &cert);
+                let gone = [revoked(serving.clone())];
+                let (perf, routes) = (
+                    test_perf(),
+                    Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+                );
 
-        let mut fresh = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
-        assert_eq!(ensure(&mut fresh, &gone, &routes, &perf).await, (0, vec![]));
-        assert!(!fresh.endpoint_alive(&tcp(None, port)));
-        drop(fresh);
+                let mut fresh =
+                    DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+                assert_eq!(ensure(&mut fresh, &gone, &routes, &perf).await, (0, vec![]));
+                assert!(!fresh.endpoint_alive(&tcp(None, port)));
+                drop(fresh);
 
-        let mut running = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
-        bind_until(
-            &mut running,
-            std::slice::from_ref(&serving),
-            &routes,
-            &perf,
-            1,
-        )
-        .await;
-        assert_eq!(
-            ensure(&mut running, &gone, &routes, &perf).await,
-            (0, vec![])
+                let mut running =
+                    DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+                assert_eq!(
+                    ensure(&mut running, std::slice::from_ref(&serving), &routes, &perf).await,
+                    (1, vec![])
+                );
+                assert_eq!(
+                    ensure(&mut running, &gone, &routes, &perf).await,
+                    (0, vec![])
+                );
+                assert!(!running.endpoint_alive(&tcp(None, port)));
+                for accept_loop in running.close_unwanted(&gone) {
+                    accept_loop.await.unwrap();
+                }
+                assert!(
+                    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
+                    "the revoked port is released"
+                );
+            },
         );
-        assert!(!running.endpoint_alive(&tcp(None, port)));
-        for accept_loop in running.close_unwanted(&gone) {
-            accept_loop.await.unwrap();
-        }
-        // A child another test forks holds this process's sockets until
-        // its exec.
-        for _ in 0..200 {
-            if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the revoked port is not released");
     }
 
     /// A listener whose published port changes while its targetPort stays
@@ -2141,51 +2142,68 @@ mod tests {
     /// next ensure pass. This is the ".21 outage" shape: the old add-only
     /// bookkeeping kept reporting bound (readiness green, Programmed=True)
     /// while the kernel refused every connection, until pod restart.
-    #[tokio::test]
-    async fn dead_accept_loop_unreadies_then_rebinds() {
-        let listeners = vec![ListenerConfig {
-            name: "http".into(),
-            protocol: P::HTTP,
-            port: 23447,
-            target_port: None,
-            hostname: None,
-            address: None,
-            interface: None,
-            tls: None,
-            rate_limit: None,
-        }];
-        let perf = test_perf();
-        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
-        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+    #[test]
+    fn dead_accept_loop_unreadies_then_rebinds() {
+        alone("dead_accept_loop_unreadies_then_rebinds", async {
+            let listeners = vec![ListenerConfig {
+                name: "http".into(),
+                protocol: P::HTTP,
+                port: 23447,
+                target_port: None,
+                hostname: None,
+                address: None,
+                interface: None,
+                tls: None,
+                rate_limit: None,
+            }];
+            let perf = test_perf();
+            let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+            let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
 
-        let (opened, errors) = dp.add_tcp_listeners(&listeners, routes.clone(), &perf);
-        assert_eq!((opened, errors.len()), (1, 0));
-        assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
+            let (opened, errors) = dp.add_tcp_listeners(&listeners, routes.clone(), &perf);
+            assert_eq!((opened, errors.len()), (1, 0));
+            assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
 
-        // Kill the accept loop out-of-band — stands in for any task death.
-        if let Some(ListenerSlot::Running(handle, ..)) = dp.listener_tasks.get(&tcp(None, 23447)) {
-            handle.abort();
-        } else {
-            panic!("expected a running listener slot");
-        }
-        // Bounded wait for the abort to land (is_finished flips async).
-        for _ in 0..200 {
-            if !dp.endpoint_alive(&tcp(None, 23447)) {
-                break;
+            // Kill the accept loop out-of-band — stands in for any task death.
+            if let Some(ListenerSlot::Running(handle, ..)) =
+                dp.listener_tasks.get(&tcp(None, 23447))
+            {
+                handle.abort();
+            } else {
+                panic!("expected a running listener slot");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            !dp.is_ready_for_endpoints(&[tcp(None, 23447)]),
-            "a dead accept loop must not count as bound"
-        );
+            // Bounded wait for the abort to land (is_finished flips async).
+            for _ in 0..200 {
+                if !dp.endpoint_alive(&tcp(None, 23447)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !dp.is_ready_for_endpoints(&[tcp(None, 23447)]),
+                "a dead accept loop must not count as bound"
+            );
 
-        // The next pass reaps the corpse and rebinds the endpoint, retried
-        // as bind_until says.
-        assert!(dp.close_unwanted(&listeners).is_empty());
-        assert!(!dp.listener_tasks.contains_key(&tcp(None, 23447)), "reaped");
-        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
-        assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
+            // The next pass reaps the corpse and rebinds the endpoint.
+            assert!(dp.close_unwanted(&listeners).is_empty());
+            assert!(!dp.listener_tasks.contains_key(&tcp(None, 23447)), "reaped");
+            let (opened, errors) = dp.add_tcp_listeners(&listeners, routes.clone(), &perf);
+            assert_eq!((opened, errors.len()), (1, 0), "dead endpoint must rebind");
+            assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
+        });
+    }
+
+    /// Runs `test` in a process of its own, on a current-thread runtime:
+    /// it binds a port it just probed or closed, and a child another test
+    /// spawns holds this process's sockets until its exec.
+    fn alone(name: &str, test: impl std::future::Future<Output = ()>) {
+        if crate::proxy::test_util::in_own_process(module_path!(), name) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test);
+        }
     }
 
     /// Reconcile passes until `want` more listeners are bound, as the
@@ -2280,42 +2298,36 @@ mod tests {
 
     /// TCP and UDP listeners on one port are two sockets, in both bind
     /// paths: keyed without the transport, the second counted as bound.
-    #[tokio::test]
-    async fn tcp_and_udp_listeners_on_one_port_both_bind() {
-        let perf = test_perf();
-        // A probe socket of this test's can sit in a child another test
-        // forks until its exec: try another port then.
-        let (port, dp) = std::iter::repeat_with(|| {
+    #[test]
+    fn tcp_and_udp_listeners_on_one_port_both_bind() {
+        alone("tcp_and_udp_listeners_on_one_port_both_bind", async {
+            let perf = test_perf();
             let port = free_tcp_and_udp_port();
             let listeners = [http_listener(port, None), udp_listener(port)];
-            DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"))
-                .ok()
-                .map(|dp| (port, dp))
-        })
-        .take(10)
-        .flatten()
-        .next()
-        .expect("a port both bind on");
-        let listeners = [http_listener(port, None), udp_listener(port)];
-        let (tcp_endpoint, udp_endpoint) =
-            (Endpoint::of(&listeners[0]), Endpoint::of(&listeners[1]));
-        assert_eq!(udp_endpoint.transport, Transport::Udp);
-        let held = || {
-            (
-                std::net::TcpListener::bind(("0.0.0.0", port)).is_err(),
-                std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
-            )
-        };
+            let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+            let (tcp_endpoint, udp_endpoint) =
+                (Endpoint::of(&listeners[0]), Endpoint::of(&listeners[1]));
+            assert_eq!(udp_endpoint.transport, Transport::Udp);
+            let held = || {
+                (
+                    std::net::TcpListener::bind(("0.0.0.0", port)).is_err(),
+                    std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
+                )
+            };
 
-        assert!(dp.is_ready_for_endpoints(&[tcp_endpoint.clone(), udp_endpoint.clone()]));
-        assert_eq!(held(), (true, true), "construction binds both");
-        drop(dp);
+            assert!(dp.is_ready_for_endpoints(&[tcp_endpoint.clone(), udp_endpoint.clone()]));
+            assert_eq!(held(), (true, true), "construction binds both");
+            drop(dp);
 
-        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
-        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
-        bind_until(&mut dp, &listeners, &routes, &perf, 2).await;
-        assert!(dp.is_ready_for_endpoints(&[tcp_endpoint, udp_endpoint]));
-        assert_eq!(held(), (true, true), "a pass binds both");
+            let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+            let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+            assert_eq!(
+                ensure(&mut dp, &listeners, &routes, &perf).await,
+                (2, vec![])
+            );
+            assert!(dp.is_ready_for_endpoints(&[tcp_endpoint, udp_endpoint]));
+            assert_eq!(held(), (true, true), "a pass binds both");
+        });
     }
 
     /// A bind error names the endpoint that failed, not every endpoint of

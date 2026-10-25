@@ -539,55 +539,61 @@ mod tests {
         (SyncLoop::new(gateway, applier, ready.clone(), exits), ready)
     }
 
+    /// Runs `test` in a process of its own, on a current-thread runtime:
+    /// it binds a port it just probed, and a child another test spawns
+    /// holds this process's sockets until its exec.
+    fn alone(name: &str, test: impl std::future::Future<Output = ()>) {
+        if crate::proxy::test_util::in_own_process(module_path!(), name) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test);
+        }
+    }
+
     /// A Network address whose interface is not on the pod yet keeps the
     /// rebinds coming, though the listeners bound another one and the pod
     /// is Ready: its Multus interface may come up after the first apply.
-    #[tokio::test]
-    async fn an_unresolved_network_keeps_rebinding() {
-        let Some(ip) = addresses::local_interface_ips()
-            .into_iter()
-            .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-        else {
-            return; // no interface off loopback to match
-        };
-        let port = crate::proxy::data_plane::test_ports::wildcard();
-        let on = |addresses: &[&str]| {
-            let config: PortailConfig = serde_json::from_value(serde_json::json!({
-                "gateway": {"name": "gw", "addresses": addresses, "listeners": [
-                    {"name": "http", "protocol": "HTTP", "port": port},
-                ]},
-            }))
-            .unwrap();
-            let gateway = GatewayRef {
-                namespace: "ns".into(),
-                name: "gw".into(),
-                uid: "uid".into(),
-                generation: 1,
+    #[test]
+    fn an_unresolved_network_keeps_rebinding() {
+        alone("an_unresolved_network_keeps_rebinding", async {
+            let Some(ip) = addresses::local_interface_ips()
+                .into_iter()
+                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+            else {
+                return; // no interface off loopback to match
             };
-            let networks = vec![crate::sync::NetworkCidrs {
-                name: "here".into(),
-                cidrs: vec![format!("{ip}/32")],
-            }];
-            Snapshot::from_config(gateway, config, networks)
-        };
+            let port = crate::proxy::data_plane::test_ports::wildcard();
+            let on = |addresses: &[&str]| {
+                let config: PortailConfig = serde_json::from_value(serde_json::json!({
+                    "gateway": {"name": "gw", "addresses": addresses, "listeners": [
+                        {"name": "http", "protocol": "HTTP", "port": port},
+                    ]},
+                }))
+                .unwrap();
+                let gateway = GatewayRef {
+                    namespace: "ns".into(),
+                    name: "gw".into(),
+                    uid: "uid".into(),
+                    generation: 1,
+                };
+                let networks = vec![crate::sync::NetworkCidrs {
+                    name: "here".into(),
+                    cidrs: vec![format!("{ip}/32")],
+                }];
+                Snapshot::from_config(gateway, config, networks)
+            };
 
-        let (mut sync, ready) = sync_loop();
-        sync.serve(on(&["here"])).await;
-        // As the loop retries a bind: a probe socket of this test's can sit
-        // in a child another test forks until its exec.
-        for _ in 0..200 {
-            if ready.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            sync.reapply().await;
-        }
-        assert!(ready.load(Ordering::Acquire));
-        assert_eq!(sync.rebind_at, None);
+            let (mut sync, ready) = sync_loop();
+            sync.serve(on(&["here"])).await;
+            assert!(ready.load(Ordering::Acquire));
+            assert_eq!(sync.rebind_at, None);
 
-        sync.serve(on(&["here", "not-yet"])).await;
-        assert!(ready.load(Ordering::Acquire));
-        assert!(sync.rebind_at.is_some(), "no retry for the late network");
+            sync.serve(on(&["here", "not-yet"])).await;
+            assert!(ready.load(Ordering::Acquire));
+            assert!(sync.rebind_at.is_some(), "no retry for the late network");
+        });
     }
 
     /// Repeated 503s with Retry-After 1s slow down past it, as any failure
