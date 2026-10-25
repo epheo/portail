@@ -343,12 +343,12 @@ mod tests {
             (client, seen)
         }
 
-        /// A 200 signed by the controller.
-        fn snapshot(&self) -> Response<Full<Bytes>> {
+        /// A 200 signed by the controller for the poll `seen`.
+        fn snapshot(&self, seen: &Seen) -> Response<Full<Bytes>> {
             let body = br#"{"version":"v1"}"#;
             let key = self.controller_ca.leaf(&[CONTROLLER_NAME]);
             let mut response = Response::new(Full::new(Bytes::from_static(body)));
-            *response.headers_mut() = signed(&key, Signed::Snapshot, body);
+            *response.headers_mut() = signed(&key, Signed::Snapshot, &nonce_of(seen), body);
             response
         }
     }
@@ -360,7 +360,14 @@ mod tests {
             have: String::new(),
             data_plane_version: "test".into(),
             report: None,
+            nonce: String::new(),
         }
+    }
+
+    fn nonce_of(seen: &Seen) -> String {
+        serde_json::from_slice::<SyncRequest>(&seen.body)
+            .unwrap()
+            .nonce
     }
 
     /// The poll goes to the proxy path of the controller Service, the API
@@ -375,8 +382,8 @@ mod tests {
         let held = HOLD + Duration::from_secs(15);
         let answers = fixture.clone();
         let (mut client, seen) = fixture
-            .apiserver(move |_, _| {
-                let answer = answers.snapshot();
+            .apiserver(move |_, seen| {
+                let answer = answers.snapshot(&seen);
                 Box::pin(async move {
                     tokio::time::sleep(held).await;
                     Some(answer)
@@ -394,7 +401,14 @@ mod tests {
         assert_eq!(poll.headers[header::AUTHORIZATION], "Bearer api-token");
         assert_eq!(poll.headers[TOKEN_HEADER], "controller-token");
         let sent: SyncRequest = serde_json::from_slice(&poll.body).unwrap();
-        assert_eq!(sent, request());
+        assert!(!sent.nonce.is_empty(), "the client draws one per poll");
+        assert_eq!(
+            sent,
+            SyncRequest {
+                nonce: sent.nonce.clone(),
+                ..request()
+            }
+        );
     }
 
     /// Past twice the hold the poll is given up: the controller answers
@@ -404,8 +418,8 @@ mod tests {
         let fixture = Arc::new(Fixture::new());
         let answers = fixture.clone();
         let (mut client, _) = fixture
-            .apiserver(move |_, _| {
-                let answer = answers.snapshot();
+            .apiserver(move |_, seen| {
+                let answer = answers.snapshot(&seen);
                 Box::pin(async move {
                     tokio::time::sleep(2 * HOLD + Duration::from_secs(1)).await;
                     Some(answer)
@@ -425,11 +439,12 @@ mod tests {
         let fixture = Fixture::new();
         let rogue = TestCa::new().leaf(&[CONTROLLER_NAME]);
         let (mut client, _) = fixture
-            .apiserver(move |n, _| {
+            .apiserver(move |n, seen| {
                 let body = br#"{"version":"rogue"}"#;
                 let mut response = Response::new(Full::new(Bytes::from_static(body)));
                 if n == 1 {
-                    *response.headers_mut() = signed(&rogue, Signed::Snapshot, body);
+                    *response.headers_mut() =
+                        signed(&rogue, Signed::Snapshot, &nonce_of(&seen), body);
                 }
                 Box::pin(async move { Some(response) })
             })

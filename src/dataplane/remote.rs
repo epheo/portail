@@ -23,8 +23,8 @@ use tokio_rustls::TlsConnector;
 
 use crate::cli::CONTROLLER_CA_ENV;
 use crate::sync::{
-    ca_roots, AnswerVerifier, GatewayKey, Gone, Signed, SyncRequest, HOLD, STANDBY_HEADER,
-    TOKEN_HEADER,
+    ca_roots, new_nonce, AnswerVerifier, GatewayKey, Gone, Signed, SyncRequest, HOLD,
+    STANDBY_HEADER, TOKEN_HEADER,
 };
 
 /// Bounds a connect, TCP and TLS together: in-cluster connects take
@@ -61,7 +61,8 @@ const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub enum Answer {
     /// 200: a snapshot, as sent, signed by the controller.
     Snapshot(Bytes),
-    /// 204: the version served is current.
+    /// 204, signed by the controller over this poll's `have`: the version
+    /// served is current.
     Unchanged,
     /// 404, signed by the controller, recent and for this Gateway: it
     /// serves this Gateway nothing.
@@ -69,8 +70,9 @@ pub enum Answer {
     /// 503 from a replica that serves nothing: a standby, one still
     /// syncing, or one stopping. Another replica may, on a new connection.
     Standby(String),
-    /// A 200 or 404 not signed by the controller, or a gone answer stale
-    /// or for another Gateway: whoever sent it, nothing it says is served.
+    /// A 200, 204 or 404 not signed by the controller for this poll, or a
+    /// gone answer for another Gateway: whoever sent it, nothing it says is
+    /// served.
     Unverified(String),
     /// Anything else, a failed connect or request included: try again
     /// later, after `after` when the controller said so.
@@ -247,7 +249,13 @@ impl Client {
 
     async fn exchange(&mut self, request: &SyncRequest) -> Result<Answer, String> {
         let credentials = self.via.headers().await?;
-        let body = Bytes::from(serde_json::to_vec(request).map_err(|e| e.to_string())?);
+        let nonce = new_nonce();
+        let request = SyncRequest {
+            nonce: nonce.clone(),
+            ..request.clone()
+        };
+        let body = Bytes::from(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+        let have = request.have;
         let request = self.post(credentials, body);
         let response = match self.conn.take() {
             Some(mut conn) if !conn.sender.is_closed() => match send(&mut conn, request).await {
@@ -276,16 +284,16 @@ impl Client {
             .map_err(|e| format!("reading the answer: {}", e))?
             .to_bytes();
         let answer = match status {
-            StatusCode::OK => {
-                match self
-                    .answers
-                    .verify(Signed::Snapshot, &head.headers, &body, SystemTime::now())
-                {
-                    Ok(()) => Answer::Snapshot(body),
-                    Err(e) => return Ok(Answer::Unverified(format!("snapshot refused: {}", e))),
+            StatusCode::OK => match self.verify(Signed::Snapshot, &nonce, &head.headers, &body) {
+                Ok(()) => Answer::Snapshot(body),
+                Err(e) => return Ok(Answer::Unverified(format!("snapshot refused: {}", e))),
+            },
+            StatusCode::NO_CONTENT => {
+                match self.verify(Signed::Unchanged, &nonce, &head.headers, have.as_bytes()) {
+                    Ok(()) => Answer::Unchanged,
+                    Err(e) => return Ok(Answer::Unverified(format!("204 refused: {}", e))),
                 }
             }
-            StatusCode::NO_CONTENT => Answer::Unchanged,
             StatusCode::SERVICE_UNAVAILABLE if standby => {
                 if !self.via.redials_on_standby() {
                     self.conn = Some(conn);
@@ -309,7 +317,7 @@ impl Client {
                         error: format!("controller answered {}: {}", status, excerpt(&body)),
                     });
                 }
-                match self.gone(&head.headers, &body) {
+                match self.gone(&nonce, &head.headers, &body) {
                     Ok(()) => Answer::Gone,
                     Err(e) => return Ok(Answer::Unverified(format!("404 refused: {}", e))),
                 }
@@ -320,10 +328,20 @@ impl Client {
     }
 
     /// Whether a 404 is the controller's word that this Gateway is gone.
-    fn gone(&self, headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
-        let now = SystemTime::now();
-        self.answers.verify(Signed::Gone, headers, body, now)?;
-        Gone::check(body, &self.gateway, now)
+    fn gone(&self, nonce: &str, headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
+        self.verify(Signed::Gone, nonce, headers, body)?;
+        Gone::check(body, &self.gateway)
+    }
+
+    fn verify(
+        &self,
+        kind: Signed,
+        nonce: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<(), String> {
+        self.answers
+            .verify(kind, nonce, headers, body, SystemTime::now())
     }
 
     async fn send_new(
@@ -700,18 +718,39 @@ mod tests {
         standby: bool,
     ) -> (std::net::SocketAddr, String, Seen) {
         let ca = TestCa::new();
-        let (addr, seen) = stub::serve(ca.leaf(&["127.0.0.1"]), keep_alive, move |n, _| {
+        let leaf = ca.leaf(&["127.0.0.1"]);
+        let key = leaf.clone();
+        let (addr, seen) = stub::serve(leaf, keep_alive, move |n, seen| {
             let response = answer(n).map(|status| {
-                let mut response = Response::builder().status(status);
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
                 if standby && status == StatusCode::SERVICE_UNAVAILABLE {
-                    response = response.header(STANDBY_HEADER, "true");
+                    response
+                        .headers_mut()
+                        .insert(STANDBY_HEADER, HeaderValue::from_static("true"));
                 }
-                response.body(Full::new(Bytes::new())).unwrap()
+                if status == StatusCode::NO_CONTENT {
+                    let polled = polled(&seen);
+                    *response.headers_mut() = signed(
+                        &key,
+                        Signed::Unchanged,
+                        &polled.nonce,
+                        polled.have.as_bytes(),
+                    );
+                }
+                response
             });
             Box::pin(async move { response })
         })
         .await;
         (addr, ca.pem(), seen)
+    }
+
+    /// The poll a stub saw.
+    fn polled(seen: &stub::Seen) -> SyncRequest {
+        serde_json::from_slice(&seen.body).unwrap()
     }
 
     fn client(addr: std::net::SocketAddr, ca: &str, dir: &tempfile::TempDir) -> Client {
@@ -728,6 +767,7 @@ mod tests {
             have: String::new(),
             data_plane_version: String::new(),
             report: None,
+            nonce: String::new(),
         }
     }
 
@@ -780,129 +820,215 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
-    /// An answer of `status` with `body`, signed by `key` as `kind` when
-    /// given.
+    /// How a test controller answers one poll.
+    type Reply = Box<dyn Fn(&SyncRequest) -> Response<Full<Bytes>> + Send + Sync>;
+
+    /// An answer of `status` with `body`, signed by `key` as `kind` over
+    /// `nonce` when given.
     fn answer(
         status: StatusCode,
         body: &[u8],
-        signed_as: Option<(&rustls::sign::CertifiedKey, Signed)>,
+        signed_as: Option<(&rustls::sign::CertifiedKey, Signed, &str)>,
     ) -> Response<Full<Bytes>> {
         let mut response = Response::builder()
             .status(status)
             .body(Full::new(Bytes::copy_from_slice(body)))
             .unwrap();
-        if let Some((key, kind)) = signed_as {
-            *response.headers_mut() = signed(key, kind, body);
+        if let Some((key, kind, nonce)) = signed_as {
+            *response.headers_mut() = signed(key, kind, nonce, body);
         }
         response
     }
 
-    fn gone_body(gateway: GatewayKey, ago: Duration) -> Vec<u8> {
-        let issued = SystemTime::now() - ago;
-        serde_json::to_vec(&Gone {
-            gateway,
-            issued_at: issued
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        })
-        .unwrap()
+    fn gone_body(gateway: GatewayKey) -> Vec<u8> {
+        serde_json::to_vec(&Gone { gateway }).unwrap()
     }
 
-    /// Only what the controller signed is taken: a snapshot, and a recent
-    /// gone answer for this Gateway. Unsigned, tampered, another CA's
-    /// leaf, stale, another Gateway's, or a snapshot's signature on a gone
-    /// answer: each refused, and nothing served changes.
+    /// Only what the controller signed for this poll is taken: a snapshot,
+    /// a 204 over the poll's `have`, a gone answer for this Gateway.
+    /// Unsigned, tampered, another CA's leaf, an answer signed for another
+    /// poll (replayed), another Gateway's gone, or one kind's signature on
+    /// another: each refused, and nothing served changes.
     #[tokio::test]
-    async fn only_answers_the_controller_signed_are_taken() {
-        use crate::sync::GONE_MAX_AGE;
+    async fn only_answers_the_controller_signed_for_this_poll_are_taken() {
         let ca = TestCa::new();
-        let leaf = ca.leaf(&["127.0.0.1"]);
-        let rogue = TestCa::new().leaf(&["127.0.0.1"]);
-        let snapshot = br#"{"version":"v1"}"#;
+        let leaf = std::sync::Arc::new(ca.leaf(&["127.0.0.1"]));
+        let rogue = std::sync::Arc::new(TestCa::new().leaf(&["127.0.0.1"]));
+        const SNAPSHOT: &[u8] = br#"{"version":"v1"}"#;
         let own = || GatewayKey::new("ns", "gw");
-        let mut tampered = answer(StatusCode::OK, br#"{"version":"v2"}"#, None);
-        *tampered.headers_mut() = signed(&leaf, Signed::Snapshot, snapshot);
-        let unverified = |a: &Answer| matches!(a, Answer::Unverified(_));
-        let cases: Vec<(&str, Response<Full<Bytes>>, &dyn Fn(&Answer) -> bool)> = vec![
+        let ok = StatusCode::OK;
+        let gone = StatusCode::NOT_FOUND;
+        let unchanged = StatusCode::NO_CONTENT;
+        let reply = |f: Reply| f;
+        let (l, r) = (leaf.clone(), rogue.clone());
+        let cases: Vec<(&str, Reply, fn(&Answer) -> bool)> = vec![
             (
                 "signed snapshot",
-                answer(StatusCode::OK, snapshot, Some((&leaf, Signed::Snapshot))),
-                &|a| matches!(a, Answer::Snapshot(_)),
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| answer(ok, SNAPSHOT, Some((&l, Signed::Snapshot, &p.nonce)))
+                })),
+                |a| matches!(a, Answer::Snapshot(_)),
             ),
             (
                 "unsigned snapshot",
-                answer(StatusCode::OK, snapshot, None),
-                &unverified,
+                reply(Box::new(move |_| answer(ok, SNAPSHOT, None))),
+                unverified,
             ),
-            ("tampered snapshot", tampered, &unverified),
+            (
+                "tampered snapshot",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        let mut response = answer(ok, br#"{"version":"v2"}"#, None);
+                        *response.headers_mut() = signed(&l, Signed::Snapshot, &p.nonce, SNAPSHOT);
+                        response
+                    }
+                })),
+                unverified,
+            ),
             (
                 "another CA's snapshot",
-                answer(StatusCode::OK, snapshot, Some((&rogue, Signed::Snapshot))),
-                &unverified,
+                reply(Box::new(move |p| {
+                    answer(ok, SNAPSHOT, Some((&r, Signed::Snapshot, &p.nonce)))
+                })),
+                unverified,
+            ),
+            (
+                "a snapshot replayed from another poll",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |_| {
+                        answer(
+                            ok,
+                            SNAPSHOT,
+                            Some((&l, Signed::Snapshot, "an earlier poll")),
+                        )
+                    }
+                })),
+                unverified,
+            ),
+            (
+                "signed 204",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        let mut response = answer(unchanged, b"", None);
+                        *response.headers_mut() =
+                            signed(&l, Signed::Unchanged, &p.nonce, p.have.as_bytes());
+                        response
+                    }
+                })),
+                |a| matches!(a, Answer::Unchanged),
+            ),
+            (
+                "unsigned 204",
+                reply(Box::new(move |_| answer(unchanged, b"", None))),
+                unverified,
+            ),
+            (
+                "a 204 over another version",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        let mut response = answer(unchanged, b"", None);
+                        *response.headers_mut() = signed(&l, Signed::Unchanged, &p.nonce, b"v0");
+                        response
+                    }
+                })),
+                unverified,
             ),
             (
                 "signed gone",
-                answer(
-                    StatusCode::NOT_FOUND,
-                    &gone_body(own(), Duration::ZERO),
-                    Some((&leaf, Signed::Gone)),
-                ),
-                &|a| matches!(a, Answer::Gone),
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| answer(gone, &gone_body(own()), Some((&l, Signed::Gone, &p.nonce)))
+                })),
+                |a| matches!(a, Answer::Gone),
             ),
             (
-                "stale gone",
-                answer(
-                    StatusCode::NOT_FOUND,
-                    &gone_body(own(), GONE_MAX_AGE + Duration::from_secs(5)),
-                    Some((&leaf, Signed::Gone)),
-                ),
-                &unverified,
+                "a gone replayed from another poll",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |_| {
+                        answer(
+                            gone,
+                            &gone_body(own()),
+                            Some((&l, Signed::Gone, "an earlier poll")),
+                        )
+                    }
+                })),
+                unverified,
             ),
             (
                 "another Gateway's gone",
-                answer(
-                    StatusCode::NOT_FOUND,
-                    &gone_body(GatewayKey::new("ns", "other"), Duration::ZERO),
-                    Some((&leaf, Signed::Gone)),
-                ),
-                &unverified,
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        answer(
+                            gone,
+                            &gone_body(GatewayKey::new("ns", "other")),
+                            Some((&l, Signed::Gone, &p.nonce)),
+                        )
+                    }
+                })),
+                unverified,
             ),
             (
                 "a gone signed as a snapshot",
-                answer(
-                    StatusCode::NOT_FOUND,
-                    &gone_body(own(), Duration::ZERO),
-                    Some((&leaf, Signed::Snapshot)),
-                ),
-                &unverified,
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        answer(
+                            gone,
+                            &gone_body(own()),
+                            Some((&l, Signed::Snapshot, &p.nonce)),
+                        )
+                    }
+                })),
+                unverified,
             ),
             (
                 "unsigned 404",
-                answer(StatusCode::NOT_FOUND, b"gateway not served\n", None),
-                &unverified,
+                reply(Box::new(move |_| {
+                    answer(gone, b"gateway not served\n", None)
+                })),
+                unverified,
             ),
         ];
-        let (names, replies): (Vec<_>, Vec<_>) = cases
-            .into_iter()
-            .map(|(name, reply, expect)| (name, (std::sync::Mutex::new(Some(reply)), expect)))
-            .unzip();
-        let (responses, expected): (Vec<_>, Vec<_>) = replies.into_iter().unzip();
-        let responses = std::sync::Arc::new(responses);
-        let (addr, _) = stub::serve(ca.leaf(&["127.0.0.1"]), true, {
-            let responses = responses.clone();
-            move |n, _| {
-                let reply = responses[n - 1].lock().unwrap().take();
-                Box::pin(async move { reply })
+        let (names, rest): (Vec<_>, Vec<_>) =
+            cases.into_iter().map(|(n, f, e)| (n, (f, e))).unzip();
+        let (replies, expected): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
+        let replies = std::sync::Arc::new(replies);
+        let (addr, seen) = stub::serve((*leaf).clone(), true, {
+            let replies = replies.clone();
+            move |n, seen| {
+                let response = replies[n - 1](&polled(&seen));
+                Box::pin(async move { Some(response) })
             }
         })
         .await;
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(addr, &ca.pem(), &dir);
+        let request = SyncRequest {
+            have: "v1".into(),
+            ..poll()
+        };
         for (name, expect) in names.into_iter().zip(expected) {
-            let got = client.poll(&poll()).await;
+            let got = client.poll(&request).await;
             assert!(expect(&got), "{name}: {got:?}");
         }
+        let nonces: std::collections::HashSet<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| polled(s).nonce)
+            .collect();
+        assert_eq!(nonces.len(), replies.len(), "a fresh nonce per poll");
+    }
+
+    fn unverified(answer: &Answer) -> bool {
+        matches!(answer, Answer::Unverified(_))
     }
 
     #[test]

@@ -1,16 +1,17 @@
 //! Signed controller answers. Through the apiserver's service proxy a data
 //! plane's TLS ends at the apiserver, which dials the controller without
 //! verifying it: whoever may edit the controller Service or its endpoints
-//! could serve snapshots. So the controller signs every snapshot and every
-//! gone answer with its serving leaf's key and sends that leaf; a data
-//! plane checks the leaf against the controller CA, for the controller's
-//! name, valid now, and the signature over the body as received, on either
+//! could answer polls. So the controller signs every answer that steers a
+//! data plane, 200, 204 and 404, with its serving leaf's key and sends
+//! that leaf; a data plane checks the leaf against the controller CA, for
+//! the controller's name, valid now, and the signature, on either
 //! transport. The CA's own key never signs at runtime.
 //!
-//! A 204 is not signed: it changes nothing a data plane serves.
+//! The signature covers the poll's nonce: an answer to an earlier poll,
+//! replayed, never passes for this one's, and no clock is compared.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use base64::engine::general_purpose::STANDARD;
@@ -24,84 +25,77 @@ use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, SignatureScheme};
 use serde::{Deserialize, Serialize};
 
-use super::{GatewayKey, HOLD};
+use super::GatewayKey;
 
 /// The signature over an answer, base64: ECDSA P-256 SHA-256, DER.
 pub const SIGNATURE_HEADER: &str = "x-portail-signature";
 /// The leaf certificate whose key made it, base64 DER.
 pub const SIGNER_HEADER: &str = "x-portail-signer";
 
-/// A gone answer further than this from the data plane's clock, either
-/// way, is refused as a replay. Two holds, the client's request timeout: a
-/// genuine one is read well within it, and the rest absorbs clock skew
-/// between the controller's node and the data plane's.
-pub const GONE_MAX_AGE: Duration = Duration::from_secs(2 * HOLD.as_secs());
+/// Random bytes in a poll's nonce: as many as a UUID's, never repeated nor
+/// guessed in a data plane's life.
+const NONCE_BYTES: usize = 16;
 
-/// What a signature vouches for. Its context goes before the body in the
-/// message signed: a snapshot's signature never passes for a gone answer's,
-/// nor a TLS handshake's, made with the same key, for either.
+/// A fresh nonce for one poll, base64. From the system CSPRNG: a predicted
+/// nonce would let whoever relays a poll have an answer signed for a later
+/// one.
+pub fn new_nonce() -> String {
+    let mut bytes = [0u8; NONCE_BYTES];
+    aws_lc_rs::rand::fill(&mut bytes).expect("the system CSPRNG is available");
+    STANDARD.encode(bytes)
+}
+
+/// What a signature vouches for. Its context goes first in the message
+/// signed, then the poll's nonce: a snapshot's signature never passes for
+/// another kind's, an answer to another poll never for this one's, nor a
+/// TLS handshake's, made with the same key, for any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signed {
     /// A 200's body.
     Snapshot,
     /// A 404's body, a [`Gone`].
     Gone,
+    /// A 204, over the version it confirms, the poll's `have`.
+    Unchanged,
 }
 
 impl Signed {
-    fn message(self, body: &[u8]) -> Vec<u8> {
+    fn message(self, nonce: &str, body: &[u8]) -> Vec<u8> {
         let context: &[u8] = match self {
             Signed::Snapshot => b"portail sync v1 snapshot\n",
             Signed::Gone => b"portail sync v1 gone\n",
+            Signed::Unchanged => b"portail sync v1 unchanged\n",
         };
-        [context, body].concat()
+        [context, nonce.as_bytes(), b"\n", body].concat()
     }
 }
 
 /// The body of a 404 to a Gateway's own data plane: the controller serves
-/// it nothing, as of `issued_at` (Unix seconds).
+/// it nothing. It names the Gateway: a gone answer for another never
+/// closes this one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Gone {
     pub gateway: GatewayKey,
-    pub issued_at: u64,
 }
 
 impl Gone {
-    pub fn now(gateway: GatewayKey) -> Self {
-        Self {
-            gateway,
-            issued_at: unix_secs(SystemTime::now()),
-        }
-    }
-
-    /// Whether `body` says `gateway` is gone, within [`GONE_MAX_AGE`] of
-    /// `now`.
-    pub fn check(body: &[u8], gateway: &GatewayKey, now: SystemTime) -> Result<(), String> {
+    /// Whether `body` says `gateway` is gone.
+    pub fn check(body: &[u8], gateway: &GatewayKey) -> Result<(), String> {
         let gone: Gone =
             serde_json::from_slice(body).map_err(|e| format!("not a gone answer: {e}"))?;
         if gone.gateway != *gateway {
             return Err(format!("a gone answer for Gateway {}", gone.gateway));
         }
-        let skew = unix_secs(now).abs_diff(gone.issued_at);
-        if skew > GONE_MAX_AGE.as_secs() {
-            return Err(format!(
-                "a gone answer issued {skew}s away from this clock, over {}s",
-                GONE_MAX_AGE.as_secs()
-            ));
-        }
         Ok(())
     }
 }
 
-fn unix_secs(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-/// The headers that sign `body`, an answer of `kind`, with `key`.
+/// The headers that sign `body`, an answer of `kind` to the poll of
+/// `nonce`, with `key`.
 pub fn sign(
     key: &CertifiedKey,
     kind: Signed,
+    nonce: &str,
     body: &[u8],
 ) -> Result<[(&'static str, HeaderValue); 2], String> {
     let signer = key
@@ -109,7 +103,7 @@ pub fn sign(
         .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
         .ok_or("the serving key does not sign ECDSA P-256 SHA-256")?;
     let signature = signer
-        .sign(&kind.message(body))
+        .sign(&kind.message(nonce, body))
         .map_err(|e| e.to_string())?;
     let leaf = key.end_entity_cert().map_err(|e| e.to_string())?;
     let value = |bytes: &[u8]| {
@@ -155,11 +149,12 @@ impl AnswerVerifier {
         Ok(Self { certs, signer })
     }
 
-    /// Whether `body`, an answer of `kind` with `headers`, is signed by a
-    /// controller leaf valid at `now`.
+    /// Whether `body`, an answer of `kind` with `headers` to the poll of
+    /// `nonce`, is signed by a controller leaf valid at `now`.
     pub fn verify(
         &self,
         kind: Signed,
+        nonce: &str,
         headers: &HeaderMap,
         body: &[u8],
         now: SystemTime,
@@ -182,7 +177,7 @@ impl AnswerVerifier {
             .and_then(|cert| {
                 cert.verify_signature(
                     webpki::aws_lc_rs::ECDSA_P256_SHA256,
-                    &kind.message(body),
+                    &kind.message(nonce, body),
                     &signature,
                 )
             })
@@ -198,10 +193,13 @@ pub(crate) mod testing {
         KeyPair, KeyUsagePurpose,
     };
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::time::Duration;
 
     /// A CA, as PEM, and leaves it issues.
     pub struct TestCa {
         issuer: CertifiedIssuer<'static, KeyPair>,
+        /// The CA's key, PKCS#8.
+        key: Vec<u8>,
     }
 
     impl TestCa {
@@ -209,9 +207,10 @@ pub(crate) mod testing {
             let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
             params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-            let issuer =
-                CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
-            Self { issuer }
+            let key = KeyPair::generate().unwrap();
+            let der = key.serialize_der();
+            let issuer = CertifiedIssuer::self_signed(params, key).unwrap();
+            Self { issuer, key: der }
         }
 
         pub fn pem(&self) -> String {
@@ -237,12 +236,7 @@ pub(crate) mod testing {
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             let key = KeyPair::generate().unwrap();
             let cert = params.signed_by(&key, &self.issuer).unwrap();
-            CertifiedKey::from_der(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-                &rustls::crypto::aws_lc_rs::default_provider(),
-            )
-            .unwrap()
+            certified(cert.der().clone(), key.serialize_der())
         }
 
         /// A serving leaf for `names`, valid for a day around now.
@@ -251,12 +245,37 @@ pub(crate) mod testing {
             let now = SystemTime::now();
             self.leaf_between(names, now - day, now + day)
         }
+
+        /// A leaf for `names` whose only extended key usage is client
+        /// auth.
+        pub fn client_leaf(&self, names: &[&str]) -> CertifiedKey {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut params = CertificateParams::new(names).unwrap();
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let key = KeyPair::generate().unwrap();
+            let cert = params.signed_by(&key, &self.issuer).unwrap();
+            certified(cert.der().clone(), key.serialize_der())
+        }
+
+        /// The CA certificate with its own key, as a signer.
+        pub fn as_signer(&self) -> CertifiedKey {
+            certified(self.issuer.der().clone(), self.key.clone())
+        }
+    }
+
+    fn certified(cert: CertificateDer<'static>, pkcs8: Vec<u8>) -> CertifiedKey {
+        CertifiedKey::from_der(
+            vec![cert],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
+            &rustls::crypto::aws_lc_rs::default_provider(),
+        )
+        .unwrap()
     }
 
     /// `headers` with the signature of `body` by `key` in them.
-    pub fn signed(key: &CertifiedKey, kind: Signed, body: &[u8]) -> HeaderMap {
+    pub fn signed(key: &CertifiedKey, kind: Signed, nonce: &str, body: &[u8]) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        for (name, value) in sign(key, kind, body).unwrap() {
+        for (name, value) in sign(key, kind, nonce, body).unwrap() {
             headers.insert(name, value);
         }
         headers
@@ -267,8 +286,10 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{signed, TestCa};
     use super::*;
+    use std::time::Duration;
 
     const NAME: &str = "portail-controller.portail-system.svc";
+    const NONCE: &str = "bm9uY2Ugb2YgdGhpcyBwb2xs";
 
     fn verifier(ca: &TestCa) -> AnswerVerifier {
         AnswerVerifier::new(ca.roots(), NAME).unwrap()
@@ -279,36 +300,58 @@ mod tests {
         let ca = TestCa::new();
         let key = ca.leaf(&[NAME]);
         let body = br#"{"version":"v1"}"#;
-        let headers = signed(&key, Signed::Snapshot, body);
+        let headers = signed(&key, Signed::Snapshot, NONCE, body);
         let now = SystemTime::now();
         verifier(&ca)
-            .verify(Signed::Snapshot, &headers, body, now)
+            .verify(Signed::Snapshot, NONCE, &headers, body, now)
             .unwrap();
 
         let tampered = br#"{"version":"v2"}"#;
         let refused = verifier(&ca)
-            .verify(Signed::Snapshot, &headers, tampered, now)
+            .verify(Signed::Snapshot, NONCE, &headers, tampered, now)
             .unwrap_err();
         assert!(refused.contains("bad signature"), "{refused}");
     }
 
-    /// The context in the message: a snapshot's signature is no gone
-    /// answer's, though the bytes are the same.
+    /// An answer signed for an earlier poll, replayed: its nonce is not
+    /// this poll's.
+    #[test]
+    fn an_answer_to_another_poll_is_refused() {
+        let ca = TestCa::new();
+        let body = br#"{"version":"v1"}"#;
+        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, NONCE, body);
+        let refused = verifier(&ca)
+            .verify(
+                Signed::Snapshot,
+                &new_nonce(),
+                &headers,
+                body,
+                SystemTime::now(),
+            )
+            .unwrap_err();
+        assert!(refused.contains("bad signature"), "{refused}");
+    }
+
+    /// The context in the message: a snapshot's signature is no gone or
+    /// unchanged answer's, though the bytes are the same.
     #[test]
     fn a_signature_vouches_for_one_kind() {
         let ca = TestCa::new();
         let body = b"{}";
-        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, body);
-        let refused = verifier(&ca)
-            .verify(Signed::Gone, &headers, body, SystemTime::now())
-            .unwrap_err();
-        assert!(refused.contains("bad signature"), "{refused}");
+        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, NONCE, body);
+        for kind in [Signed::Gone, Signed::Unchanged] {
+            let refused = verifier(&ca)
+                .verify(kind, NONCE, &headers, body, SystemTime::now())
+                .unwrap_err();
+            assert!(refused.contains("bad signature"), "{kind:?}: {refused}");
+        }
     }
 
-    /// Another CA's leaf, an expired leaf, a leaf for another name: each
-    /// refused for its certificate, though its signature is good.
+    /// Another CA's leaf, an expired leaf, one not yet valid, a leaf for
+    /// another name, one for client auth only, the CA itself: each refused
+    /// for its certificate, though its signature is good.
     #[test]
-    fn the_signer_must_be_a_controller_leaf_valid_now() {
+    fn the_signer_must_be_a_controller_serving_leaf_valid_now() {
         let ca = TestCa::new();
         let body = b"{}";
         let now = SystemTime::now();
@@ -324,11 +367,13 @@ mod tests {
                 ca.leaf_between(&[NAME], now + day, now + 3 * day),
             ),
             ("another name", ca.leaf(&["portail-controller.other.svc"])),
+            ("client auth only", ca.client_leaf(&[NAME])),
+            ("the CA itself", ca.as_signer()),
         ];
         for (why, key) in cases {
-            let headers = signed(&key, Signed::Snapshot, body);
+            let headers = signed(&key, Signed::Snapshot, NONCE, body);
             let refused = verifier(&ca)
-                .verify(Signed::Snapshot, &headers, body, now)
+                .verify(Signed::Snapshot, NONCE, &headers, body, now)
                 .unwrap_err();
             assert!(refused.contains("signer certificate"), "{why}: {refused}");
         }
@@ -338,59 +383,49 @@ mod tests {
     fn an_answer_without_its_headers_is_unsigned() {
         let ca = TestCa::new();
         let body = b"{}";
-        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, body);
+        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, NONCE, body);
         for missing in [SIGNATURE_HEADER, SIGNER_HEADER] {
             let mut partial = headers.clone();
             partial.remove(missing);
             let refused = verifier(&ca)
-                .verify(Signed::Snapshot, &partial, body, SystemTime::now())
+                .verify(Signed::Snapshot, NONCE, &partial, body, SystemTime::now())
                 .unwrap_err();
             assert!(refused.contains(missing), "{refused}");
         }
         let mut garbled = headers;
         garbled.insert(SIGNATURE_HEADER, HeaderValue::from_static("not base64!"));
         assert!(verifier(&ca)
-            .verify(Signed::Snapshot, &garbled, body, SystemTime::now())
+            .verify(Signed::Snapshot, NONCE, &garbled, body, SystemTime::now())
             .is_err());
     }
 
     #[test]
-    fn a_gone_answer_is_for_this_gateway_and_recent() {
+    fn a_gone_answer_is_for_this_gateway() {
         let gateway = GatewayKey::new("ns", "gw");
-        let now = SystemTime::now();
-        let body = |gateway: &GatewayKey, at: SystemTime| {
+        let body = |gateway: &GatewayKey| {
             serde_json::to_vec(&Gone {
                 gateway: gateway.clone(),
-                issued_at: unix_secs(at),
             })
             .unwrap()
         };
-        Gone::check(&body(&gateway, now), &gateway, now).unwrap();
-        let edge = now - GONE_MAX_AGE;
-        Gone::check(&body(&gateway, edge), &gateway, now).unwrap();
-
-        let second = Duration::from_secs(1);
-        let refused = [
-            body(&GatewayKey::new("ns", "other"), now),
-            body(&gateway, edge - second),
-            body(&gateway, now + GONE_MAX_AGE + second),
+        Gone::check(&body(&gateway), &gateway).unwrap();
+        for refused in [
+            body(&GatewayKey::new("ns", "other")),
             b"gateway not served\n".to_vec(),
-        ];
-        for body in refused {
+        ] {
             assert!(
-                Gone::check(&body, &gateway, now).is_err(),
+                Gone::check(&refused, &gateway).is_err(),
                 "{}",
-                String::from_utf8_lossy(&body)
+                String::from_utf8_lossy(&refused)
             );
         }
     }
 
     #[test]
-    fn a_gone_answer_reads_as_sent() {
-        let gone = Gone::now(GatewayKey::new("ns", "gw"));
-        let json = serde_json::to_value(&gone).unwrap();
-        assert_eq!(json["gateway"]["name"], "gw");
-        assert!(json["issuedAt"].as_u64().unwrap() > 0);
+    fn nonces_are_sixteen_fresh_bytes() {
+        let (a, b) = (new_nonce(), new_nonce());
+        assert_ne!(a, b);
+        assert_eq!(STANDARD.decode(&a).unwrap().len(), NONCE_BYTES);
     }
 
     #[test]

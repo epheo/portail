@@ -24,6 +24,10 @@ use tokio_util::sync::CancellationToken;
 /// The Gateway every stub snapshot is for.
 pub const GATEWAY: &str = "default/gw";
 
+/// The controller Service the stub's leaf also names, as a data plane
+/// polling through the apiserver checks it.
+pub const CONTROLLER_NAME: &str = "portail-controller.portail-system.svc";
+
 /// What the stub answers a poll; a leaving one gets 204 at once, as from
 /// the controller.
 // Set a few times per test: the snapshot's size inline costs nothing.
@@ -41,6 +45,9 @@ pub enum Mode {
     /// As `Serve`, the snapshot signed by a leaf of another CA: what an
     /// endpoint impersonating the controller could send.
     Forged(Snapshot),
+    /// As `Serve` with `sent`, under the controller's signature of
+    /// `signed`: a body changed on its way.
+    Tampered { signed: Snapshot, sent: Snapshot },
 }
 
 /// A request as it arrived.
@@ -237,11 +244,14 @@ async fn answer(
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_string();
-    let authorization = request
-        .headers()
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let authorization = header(hyper::header::AUTHORIZATION.as_str());
     let body = match request.into_body().collect().await {
         Ok(body) => body.to_bytes(),
         Err(_) => {
@@ -275,6 +285,7 @@ async fn answer(
         ));
     }
     let have = sync.have.clone();
+    let nonce = sync.nonce.clone();
     let gateway = sync.gateway.clone();
     let leaving = sync.report.as_ref().is_some_and(|report| report.leaving);
     state.requests.lock().unwrap().push(Recorded {
@@ -284,9 +295,16 @@ async fn answer(
         authorization,
         request: sync,
     });
+    // The controller signs every 200, 204 and 404 over the poll's nonce.
+    let sign_as =
+        |response, key: &CertifiedKey, kind, body: &[u8]| signed(response, key, kind, &nonce, body);
+    let unchanged = || {
+        let response = reply(&state, connection, StatusCode::NO_CONTENT, None, b"");
+        sign_as(response, &state.signer, Signed::Unchanged, have.as_bytes())
+    };
 
     if leaving {
-        return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, b""));
+        return Ok(unchanged());
     }
     let mut mode = state.mode.subscribe();
     let deadline = tokio::time::Instant::now() + state.hold;
@@ -294,9 +312,9 @@ async fn answer(
         let current = mode.borrow_and_update().clone();
         match current {
             Mode::Gone => {
-                let gone = serde_json::to_vec(&Gone::now(gateway)).unwrap();
+                let gone = serde_json::to_vec(&Gone { gateway }).unwrap();
                 let response = reply(&state, connection, StatusCode::NOT_FOUND, None, &gone);
-                return Ok(signed(response, &state.signer, Signed::Gone, &gone));
+                return Ok(sign_as(response, &state.signer, Signed::Gone, &gone));
             }
             Mode::Unavailable(after) => {
                 let status = StatusCode::SERVICE_UNAVAILABLE;
@@ -305,20 +323,29 @@ async fn answer(
             Mode::Serve(Some(snapshot)) if snapshot.version != have => {
                 let json = serde_json::to_vec(&snapshot).unwrap();
                 let response = reply(&state, connection, StatusCode::OK, None, &json);
-                return Ok(signed(response, &state.signer, Signed::Snapshot, &json));
+                return Ok(sign_as(response, &state.signer, Signed::Snapshot, &json));
             }
             Mode::Forged(snapshot) if snapshot.version != have => {
                 let json = serde_json::to_vec(&snapshot).unwrap();
                 let response = reply(&state, connection, StatusCode::OK, None, &json);
-                return Ok(signed(response, &state.forger, Signed::Snapshot, &json));
+                return Ok(sign_as(response, &state.forger, Signed::Snapshot, &json));
             }
-            Mode::Serve(_) | Mode::Forged(_) => {}
+            Mode::Tampered { signed, sent } if sent.version != have => {
+                let json = serde_json::to_vec(&sent).unwrap();
+                let original = serde_json::to_vec(&signed).unwrap();
+                let response = reply(&state, connection, StatusCode::OK, None, &json);
+                return Ok(sign_as(
+                    response,
+                    &state.signer,
+                    Signed::Snapshot,
+                    &original,
+                ));
+            }
+            Mode::Serve(_) | Mode::Forged(_) | Mode::Tampered { .. } => {}
         }
         tokio::select! {
             _ = mode.changed() => {}
-            _ = tokio::time::sleep_until(deadline) => {
-                return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, b""));
-            }
+            _ = tokio::time::sleep_until(deadline) => return Ok(unchanged()),
         }
     }
 }
@@ -344,28 +371,29 @@ fn reply(
         .unwrap()
 }
 
-/// `response` with the signature of `body` by `key`.
+/// `response` with the signature of `body` by `key`, over `nonce`.
 fn signed(
     mut response: Response<Full<Bytes>>,
     key: &CertifiedKey,
     kind: Signed,
+    nonce: &str,
     body: &[u8],
 ) -> Response<Full<Bytes>> {
-    for (name, value) in sign(key, kind, body).unwrap() {
+    for (name, value) in sign(key, kind, nonce, body).unwrap() {
         response.headers_mut().insert(name, value);
     }
     response
 }
 
 /// A CA's PEM, and a server config whose certificate it signed for `ip`
-/// with that certificate's key.
+/// and [`CONTROLLER_NAME`], with that certificate's key.
 fn test_pki(ip: std::net::IpAddr) -> (String, rustls::ServerConfig, CertifiedKey) {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec![ip.to_string()])
+    let leaf = CertificateParams::new(vec![ip.to_string(), CONTROLLER_NAME.to_string()])
         .unwrap()
         .signed_by(&leaf_key, &ca)
         .unwrap();
