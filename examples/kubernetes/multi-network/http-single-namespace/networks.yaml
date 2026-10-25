@@ -1,0 +1,21 @@
+apiVersion: k8s.ovn.org/v1
+kind: UserDefinedNetwork
+metadata:
+  name: udn-frontend
+spec:
+  topology: Layer2
+  layer2:
+    role: Secondary
+    subnets:
+    - "10.10.1.0/24"
+---
+apiVersion: k8s.ovn.org/v1
+kind: UserDefinedNetwork
+metadata:
+  name: udn-backend
+spec:
+  topology: Layer2
+  layer2:
+    role: Secondary
+    subnets:
+    - "10.10.2.0/24"

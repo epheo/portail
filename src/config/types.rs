@@ -111,9 +111,10 @@ pub enum TlsMode {
 pub struct CertificateRef {
     pub name: String,
     /// The Secret's namespace in Kubernetes mode: with `name`, the key a
-    /// port's merged refs are told apart by. `None` in a file config,
-    /// whose names are files in one directory.
-    #[serde(skip)]
+    /// port's merged refs are told apart by, and the one a snapshot's PEMs
+    /// are matched back by. `None` in a file config, whose names are files
+    /// in one directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// The listener hostname associated with this cert (for SNI routing).
     /// e.g. "*.desku.be", "example.org", etc.
@@ -484,7 +485,9 @@ pub struct BackendRef {
     /// Set by the Kubernetes reconciler on a ref it may not forward to
     /// (RefNotPermitted, BackendNotFound, InvalidKind). The ref keeps its
     /// weight and its share of traffic fails; it is never resolved.
-    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
+    /// Deserialized so it survives the controller-to-data-plane snapshot; a
+    /// file setting it only fails that backend's share.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalid: bool,
 }
 

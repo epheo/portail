@@ -1,0 +1,35 @@
+# Test backend: nginx, also attached to udn-backend.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-web
+  labels:
+    app: backend-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-web
+  template:
+    metadata:
+      labels:
+        app: backend-web
+      annotations:
+        k8s.v1.cni.cncf.io/networks: udn-backend
+    spec:
+      containers:
+      - name: nginx
+        image: docker.io/nginxinc/nginx-unprivileged:alpine
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: backend-web
+  ports:
+  - port: 8080
+    targetPort: 8080

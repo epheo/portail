@@ -2,10 +2,7 @@ use anyhow::Result;
 use portail::logging::{error, info};
 use portail::*;
 
-mod cli;
-
 use arc_swap::ArcSwap;
-use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
 use proxy::data_plane::DataPlane;
@@ -17,7 +14,7 @@ fn main() -> Result<()> {
     // Install rustls CryptoProvider early — needed by kube client in K8s mode
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let args = Args::parse();
+    let args = Args::try_parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
     if let Err(error) = args.validate() {
         eprintln!("Invalid arguments: {}", error);
@@ -90,13 +87,12 @@ fn main() -> Result<()> {
 
     // Size the Tokio runtime to the POD, not the NODE. The default multi-thread
     // runtime eagerly spawns one worker per `available_parallelism()` (the node's
-    // CPU count), but each operator-provisioned data plane serves a single
-    // Gateway. Packing many per-Gateway pods onto one node would otherwise spawn
+    // CPU count), but each provisioned data plane serves a single Gateway.
+    // Packing many per-Gateway pods onto one node would otherwise spawn
     // (pods × node_cpus) worker threads and exhaust the node's PID/thread budget
     // long before its CPU or memory — a hard ceiling on Gateway density. Cap to a
     // small default; high-traffic gateways or standalone use scale up via
-    // PORTAIL_WORKER_THREADS. (The operator should also set CPU/mem requests+limits
-    // and can stamp PORTAIL_WORKER_THREADS to match the pod's CPU allocation.)
+    // PORTAIL_WORKER_THREADS, which provisioning stamps from the pod's cpu limit.
     let worker_threads = std::env::var("PORTAIL_WORKER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -144,6 +140,26 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // exists is dropped, not acted on (see the wait for shutdown below).
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    match args.command {
+        Some(cli::Command::Controller(controller)) => {
+            return run_controller(controller, sigterm).await;
+        }
+        Some(cli::Command::Dataplane(dataplane)) => {
+            let stop = CancellationToken::new();
+            let on_signal = stop.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                info!("Received shutdown signal");
+                on_signal.cancel();
+            });
+            return dataplane::run(dataplane, stop).await;
+        }
+        None => {}
+    }
+
     // Before listeners: a request must never race the writer task's spawn.
     if let Some(target) = &args.access_log {
         portail::access_log::init(target)?;
@@ -152,19 +168,10 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // RateLimitPolicy configures one.
     portail::rate_limit::spawn_sweeper();
     let mut performance_config = portail_config.performance.clone();
-    // Either source enables h2; the flag is the K8s-mode path (no config file).
     if args.http2 {
         performance_config.http2 = true;
     }
-    // Kubernetes mode binds nothing up front: every listener comes from a
-    // reconciled Gateway. The default config's example :8080 listener is a
-    // standalone-only convenience — binding it here made k8s-mode startup
-    // fail outright whenever anything else on the host held that port.
-    let listeners = if args.kubernetes {
-        Vec::new()
-    } else {
-        portail_config.gateway.listeners.clone()
-    };
+    let listeners = portail_config.gateway.listeners.clone();
     let cert_dir = args
         .cert_dir
         .clone()
@@ -178,10 +185,9 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
         portail_config.udp_routes.len()
     );
 
-    // Build initial route table from configuration. Strict: in standalone
-    // mode a backend that fails DNS resolution should fail startup loudly,
-    // not silently serve 5xx. (Kubernetes mode starts from an empty default
-    // config, so strictness costs nothing there.)
+    // Build initial route table from configuration. Strict: a backend that
+    // fails DNS resolution should fail startup loudly, not silently serve
+    // 5xx.
     let route_table = portail_config
         .to_route_table_strict()
         .map_err(|e| anyhow::anyhow!("Failed to convert configuration to route table: {}", e))?;
@@ -203,68 +209,30 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     info!("Portail ready: {} listeners", listeners.len());
     let drain = data_plane.lock().unwrap().drain_handle();
 
-    // In Kubernetes mode, spawn the Gateway API controller with DataPlane access
     let shutdown_token = CancellationToken::new();
-    let mut controller = None;
-    if args.kubernetes {
-        let k8s_routes = routes.clone();
-        let controller_name = args.controller_name.clone();
-        let token = shutdown_token.clone();
-        let k8s_data_plane = data_plane.clone();
-        let k8s_perf = performance_config.clone();
-        let manage_gateway_status = args.manage_gateway_status;
-        let gateway_scope = args
-            .gateway_scope()
-            .map_err(|e| anyhow::anyhow!("--gateway: {}", e))?;
-        let watch_shape = kubernetes::controller::WatchShape::parse(args.watch_shape.as_deref());
+    // The admin endpoint (/metrics + /readyz) is opt-in: there is no
+    // readinessProbe to feed, but benches and dashboards may want the
+    // scrape. Listeners are already up at this point, so ready = true.
+    if let Some(metrics_port) = args.metrics_port {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let addr = SocketAddr::new(args.admin_address, metrics_port);
+        tokio::spawn(admin::serve(addr, ready, shutdown_token.clone()));
+    }
 
-        // Readiness flag — flipped true by the reconciler once the data plane
-        // has bound its listener ports. Served on the readiness endpoint so the
-        // operator's readinessProbe gates LB traffic and the Programmed status.
-        let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(admin::serve(
-            SocketAddr::new(args.admin_address, args.readiness_port),
-            ready_flag.clone(),
-            shutdown_token.clone(),
-        ));
-
-        controller = Some(tokio::spawn(kubernetes::controller::run_controller(
-            k8s_routes,
-            controller_name,
-            token,
-            k8s_data_plane,
-            k8s_perf,
-            manage_gateway_status,
-            ready_flag,
-            gateway_scope,
-            watch_shape,
-        )));
-        info!("Kubernetes Gateway API controller started");
-    } else {
-        // Standalone admin endpoint (/metrics + /readyz) is opt-in: there is
-        // no readinessProbe to feed, but benches and dashboards may want the
-        // scrape. Listeners are already up at this point, so ready = true.
-        if let Some(metrics_port) = args.metrics_port {
-            let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let addr = SocketAddr::new(args.admin_address, metrics_port);
-            tokio::spawn(admin::serve(addr, ready, shutdown_token.clone()));
-        }
-
-        // Watch the config file for SIGHUP-triggered reloads
-        if let Some(config_path) = args.config.clone() {
-            let reload_routes = routes;
-            let reload_health = data_plane.lock().unwrap().health().clone();
-            let reload_shutdown = shutdown_token.clone();
-            tokio::spawn(async move {
-                config_watcher::watch_config(
-                    config_path,
-                    reload_routes,
-                    reload_health,
-                    reload_shutdown,
-                )
-                .await;
-            });
-        }
+    // Watch the config file for SIGHUP-triggered reloads
+    if let Some(config_path) = args.config.clone() {
+        let reload_routes = routes;
+        let reload_health = data_plane.lock().unwrap().health().clone();
+        let reload_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            config_watcher::watch_config(
+                config_path,
+                reload_routes,
+                reload_health,
+                reload_shutdown,
+            )
+            .await;
+        });
     }
 
     // Wait for shutdown: SIGINT (^C) or SIGTERM. Handling SIGTERM is not
@@ -274,39 +242,39 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // ignored: every pod sat out its full terminationGracePeriod and died by
     // SIGKILL, holding its (host-network) ports for those 30s and stalling
     // every rollout behind EADDRINUSE retries.
-    //
-    // A controller that stops on its own is a failure: the pod would sit
-    // NotReady forever while /livez answers, so the process exits non-zero
-    // for kubelet to restart it.
-    let controller_exit = async {
-        match controller {
-            Some(task) => task.await,
-            None => std::future::pending().await,
-        }
-    };
-    let failure = tokio::select! {
-        // Signals first: kube's own SIGTERM handling also ends the
-        // controller, and that is a shutdown, not a failure.
-        biased;
-        _ = tokio::signal::ctrl_c() => None,
-        _ = sigterm.recv() => None,
-        exit = controller_exit => Some(match exit {
-            Ok(Ok(())) => anyhow::anyhow!("Kubernetes controller stopped"),
-            Ok(Err(e)) => e.context("Kubernetes controller failed"),
-            Err(e) => anyhow::anyhow!("Kubernetes controller task failed: {}", e),
-        }),
-    };
-    match &failure {
-        None => info!("Received shutdown signal"),
-        Some(e) => error!("{:#}", e),
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
     }
+    info!("Received shutdown signal");
     shutdown_token.cancel();
 
     info!("Shutting down Portail");
     drain.run().await;
 
     info!("Portail shutdown complete");
-    failure.map_or(Ok(()), Err)
+    Ok(())
+}
+
+/// `portail controller` until SIGTERM or SIGINT, then a graceful stop: the
+/// passes in flight finish and the lease is released for a standby. An
+/// error, a lost lease included, exits non-zero.
+async fn run_controller(
+    args: cli::ControllerArgs,
+    mut sigterm: tokio::signal::unix::Signal,
+) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    let mut controller = std::pin::pin!(kubernetes::controller::run(args, shutdown.clone()));
+    tokio::select! {
+        result = controller.as_mut() => return result,
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+    info!("Received shutdown signal");
+    shutdown.cancel();
+    controller.await?;
+    info!("Controller stopped");
+    Ok(())
 }
 
 /// Handle validation modes (--validate-only, --check-config). `config` is

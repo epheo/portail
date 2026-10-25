@@ -1,9 +1,8 @@
-//! Local address discovery and Gateway `spec.addresses` resolution.
-//!
-//! Home of everything that answers "which IPs can this pod actually bind":
-//! interface enumeration via `getifaddrs()`, the `portail.epheo.eu/Network`
-//! address type (NetworkAttachmentDefinition subnet → local IP), and the
-//! bind-address filter that separates pod-local IPs from LB VIPs.
+//! Gateway `spec.addresses` on the controller side: the
+//! `portail.epheo.eu/Network` address type, read as the CIDRs of its
+//! NetworkAttachmentDefinition.
+//! Matching CIDRs against interfaces is the data plane's
+//! ([`crate::dataplane::addresses`]).
 
 use kube::api::Api;
 use kube::Client;
@@ -14,65 +13,24 @@ use std::sync::{Arc, Mutex};
 use gateway_api::gateways::Gateway;
 
 use crate::logging::{info, warn};
+use crate::sync::NetworkCidrs;
 
 /// Custom address type for binding a Gateway to a named network interface.
 /// Used in `spec.addresses[].type` to auto-discover UDN/Multus IPs.
 pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
 
-/// Addresses available to this gateway instance for binding / reporting.
-/// `status.addresses` (LB VIP / cloud-assigned IPs) is owned by the operator,
-/// so portail only needs locally-bindable IPs.
-#[derive(Debug)]
-pub(crate) struct UsableAddresses {
-    /// IPs from local network interfaces (includes secondary/UDN interfaces).
-    pub interface_ips: Vec<String>,
-    /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP).
-    pub network_ips: HashMap<String, String>,
-}
-
-impl UsableAddresses {
-    /// All known addresses as a set (for membership checks).
-    pub fn all(&self) -> HashSet<&str> {
-        self.interface_ips
-            .iter()
-            .chain(self.network_ips.values())
-            .map(|s| s.as_str())
-            .collect()
-    }
-
-    /// Best locally-bindable address — first interface IP, else `0.0.0.0`.
-    pub fn preferred_ip(&self) -> &str {
-        self.interface_ips
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("0.0.0.0")
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.interface_ips.is_empty() && self.network_ips.is_empty()
-    }
-}
-
-/// What a NetworkAttachmentDefinition says about this pod on its network.
-enum NetworkIp {
-    Local(String),
-    /// No IP of this pod is in the network, or the network is gone.
+/// What a NetworkAttachmentDefinition says about its network.
+enum NetworkRead {
+    Cidrs(Vec<String>),
+    /// The network is gone, or names no subnet.
     Absent,
     /// The NAD could not be read: says nothing about the network.
     Unknown(kube::Error),
 }
 
-/// Resolve a network name to this pod's local IP on that network.
-///
-/// Reads the NetworkAttachmentDefinition to get the subnet CIDR, then matches
-/// it against local interface IPs discovered via `getifaddrs()`.
-async fn resolve_network_to_local_ip(
-    client: &Client,
-    network_name: &str,
-    namespace: &str,
-    local_ips: &[String],
-) -> NetworkIp {
-    // Read the NAD in the Gateway's namespace
+/// Read a network's NetworkAttachmentDefinition in `namespace` for its
+/// subnet.
+async fn read_network(client: &Client, network_name: &str, namespace: &str) -> NetworkRead {
     let nad_api: Api<kube::api::DynamicObject> = Api::namespaced_with(
         client.clone(),
         namespace,
@@ -84,109 +42,54 @@ async fn resolve_network_to_local_ip(
             plural: "network-attachment-definitions".into(),
         },
     );
-    let nad = match nad_api.get(network_name).await {
-        Ok(n) => n,
+    match nad_api.get(network_name).await {
+        Ok(nad) => match nad_cidrs(&nad.data) {
+            Some(cidrs) => NetworkRead::Cidrs(cidrs),
+            None => {
+                warn!("NetworkAttachmentDefinition {namespace}/{network_name} names no subnet");
+                NetworkRead::Absent
+            }
+        },
         Err(kube::Error::Api(e)) if e.code == 404 => {
             warn!("NetworkAttachmentDefinition {namespace}/{network_name} not found");
-            return NetworkIp::Absent;
+            NetworkRead::Absent
         }
-        Err(e) => return NetworkIp::Unknown(e),
-    };
-
-    let local = local_ip_in(&nad.data, local_ips);
-    if local.is_none() {
-        warn!("No local interface IP is in the subnet of network {namespace}/{network_name}");
-    }
-    local.map_or(NetworkIp::Absent, NetworkIp::Local)
-}
-
-/// The first of `local_ips` in the subnet a NAD's spec.config names.
-fn local_ip_in(nad: &serde_json::Value, local_ips: &[String]) -> Option<String> {
-    let config_str = nad["spec"]["config"].as_str()?;
-    let config: serde_json::Value = serde_json::from_str(config_str).ok()?;
-    let (net_addr, prefix_len) = parse_cidr(config["subnets"].as_str()?)?;
-    local_ips
-        .iter()
-        .find(|ip| {
-            ip.parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| ip_in_subnet(ip, net_addr, prefix_len))
-        })
-        .cloned()
-}
-
-fn parse_cidr(cidr: &str) -> Option<(std::net::Ipv4Addr, u32)> {
-    let (addr_str, len_str) = cidr.split_once('/')?;
-    let addr: std::net::Ipv4Addr = addr_str.parse().ok()?;
-    let len: u32 = len_str.parse().ok()?;
-    Some((addr, len))
-}
-
-fn ip_in_subnet(ip: std::net::Ipv4Addr, network: std::net::Ipv4Addr, prefix_len: u32) -> bool {
-    if prefix_len > 32 {
-        return false;
-    }
-    let mask = if prefix_len == 0 {
-        0u32
-    } else {
-        !0u32 << (32 - prefix_len)
-    };
-    u32::from(ip) & mask == u32::from(network) & mask
-}
-
-/// Enumerate IPv4/IPv6 addresses from all local network interfaces.
-/// Discovers routable IPs for bind-address filtering and status reporting.
-fn discover_local_interface_ips() -> Vec<String> {
-    let mut ips = Vec::new();
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            return ips;
-        }
-        let mut ifa = ifaddrs;
-        while !ifa.is_null() {
-            let addr = (*ifa).ifa_addr;
-            if !addr.is_null() {
-                let family = (*addr).sa_family as i32;
-                if family == libc::AF_INET {
-                    let sa = addr as *const libc::sockaddr_in;
-                    let ip = std::net::Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr));
-                    if !ip.is_loopback() {
-                        ips.push(ip.to_string());
-                    }
-                } else if family == libc::AF_INET6 {
-                    let sa = addr as *const libc::sockaddr_in6;
-                    let ip = std::net::Ipv6Addr::from((*sa).sin6_addr.s6_addr);
-                    let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
-                    if !ip.is_loopback() && !is_link_local {
-                        ips.push(ip.to_string());
-                    }
-                }
-            }
-            ifa = (*ifa).ifa_next;
-        }
-        libc::freeifaddrs(ifaddrs);
-    }
-    ips
-}
-
-/// Enumerate IPs available on this pod's local interfaces (pod IP, host IPs
-/// in hostNetwork mode, secondary network IPs from Multus, etc.). The operator
-/// owns Gateway `status.addresses`, so portail only needs locally-bindable IPs.
-pub(crate) fn discover_usable_addresses() -> UsableAddresses {
-    UsableAddresses {
-        interface_ips: discover_local_interface_ips(),
-        network_ips: HashMap::new(),
+        Err(e) => NetworkRead::Unknown(e),
     }
 }
 
-/// The last local IP each network resolved to, by (namespace, network).
+/// The CIDRs a NAD's spec.config `subnets` names: a comma list, one per IP
+/// family on an OVN-Kubernetes dual-stack network. The data plane matches
+/// the IPv4 ones only.
+fn nad_cidrs(nad: &serde_json::Value) -> Option<Vec<String>> {
+    let config: serde_json::Value = serde_json::from_str(nad["spec"]["config"].as_str()?).ok()?;
+    let cidrs: Vec<String> = config["subnets"]
+        .as_str()?
+        .split(',')
+        .filter_map(|entry| subnet_cidr(entry.trim()))
+        .collect();
+    (!cidrs.is_empty()).then_some(cidrs)
+}
+
+/// One `subnets` entry as `address/prefix`, IPv4 or IPv6. An OVN-Kubernetes
+/// layer3 entry adds the per-node host subnet length ("10.128.0.0/14/23"):
+/// a pod's IP is in the network, so the network's CIDR is the one to match.
+fn subnet_cidr(entry: &str) -> Option<String> {
+    let mut parts = entry.splitn(3, '/');
+    let addr: std::net::IpAddr = parts.next()?.parse().ok()?;
+    let len: u8 = parts.next()?.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (len <= max).then(|| format!("{addr}/{len}"))
+}
+
+/// The last CIDRs each network was read with, by (namespace, network).
 #[derive(Default)]
-pub(crate) struct NetworkIps(Mutex<HashMap<(String, String), String>>);
+pub(crate) struct NetworkCidrCache(Mutex<HashMap<(String, String), Vec<String>>>);
 
-impl NetworkIps {
+impl NetworkCidrCache {
     /// Keep only the networks some Gateway of `gateways` names. A dropped
-    /// entry left its IP for a later failed read of a re-added network to
-    /// bind, and unscoped mode kept one per network ever named.
+    /// entry left its CIDRs for a later failed read of a re-added network
+    /// to bind, and the controller would keep one per network ever named.
     pub(crate) fn retain_named(&self, gateways: &[Arc<Gateway>]) {
         let named: HashSet<(String, String)> = gateways
             .iter()
@@ -207,171 +110,75 @@ impl NetworkIps {
     }
 }
 
-/// Resolve `portail.epheo.eu/Network` entries in `spec.addresses` to local IPs.
-/// Reads each named NetworkAttachmentDefinition for its subnet and matches it
-/// against the addresses we already discovered via `getifaddrs()`.
+/// The CIDRs of the networks `gateway`'s Network addresses name, for its
+/// data planes to find their own IPs in.
 ///
-/// A NAD that cannot be read keeps the network's last IP, while the pod
-/// still has it: unbinding on an apiserver blip was an outage. Only an
-/// answer that the network has no IP here (or is gone) unbinds it.
-pub(crate) async fn resolve_network_addresses(
+/// A NAD that cannot be read keeps the network's last CIDRs: unbinding on
+/// an apiserver blip was an outage. Only an answer that the network is gone
+/// drops them. With no last CIDRs, `Err`: no read says the network is
+/// gone, so the snapshot served stays as it is.
+pub(crate) async fn resolve_network_cidrs(
     client: &Client,
     gateway: &Gateway,
     gw_ns: &str,
-    usable: &mut UsableAddresses,
-    last: &NetworkIps,
-) {
+    last: &NetworkCidrCache,
+) -> Result<Vec<NetworkCidrs>, String> {
     let Some(spec_addrs) = &gateway.spec.addresses else {
-        return;
+        return Ok(Vec::new());
     };
     let gw_name = gateway.name_any();
+    let mut networks = Vec::new();
     for addr in spec_addrs {
         if addr.r#type.as_deref() != Some(NETWORK_ADDRESS_TYPE) {
             continue;
         }
         let network_name = addr.value.as_deref().unwrap_or("");
         let key = (gw_ns.to_string(), network_name.to_string());
-        let resolved =
-            resolve_network_to_local_ip(client, network_name, gw_ns, &usable.interface_ips).await;
+        let read = read_network(client, network_name, gw_ns).await;
         let mut known = last.0.lock().unwrap_or_else(|p| p.into_inner());
-        let ip = match resolved {
-            NetworkIp::Local(ip) => {
-                if known.get(&key) != Some(&ip) {
-                    info!("Gateway {gw_ns}/{gw_name}: resolved network '{network_name}' to {ip}");
-                    known.insert(key, ip.clone());
+        let cidrs = match read {
+            NetworkRead::Cidrs(cidrs) => {
+                if known.get(&key) != Some(&cidrs) {
+                    info!(
+                        "Gateway {gw_ns}/{gw_name}: network '{network_name}' is {}",
+                        cidrs.join(", ")
+                    );
+                    known.insert(key, cidrs.clone());
                 }
-                ip
+                cidrs
             }
-            NetworkIp::Absent => {
+            NetworkRead::Absent => {
                 known.remove(&key);
                 continue;
             }
-            NetworkIp::Unknown(e) => {
-                match known
-                    .get(&key)
-                    .filter(|ip| usable.interface_ips.contains(ip))
-                {
-                    Some(ip) => {
-                        warn!(
-                            "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
-                             not read ({e}); keeping {ip}"
-                        );
-                        ip.clone()
-                    }
-                    None => {
-                        warn!(
-                            "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
-                             not read ({e}); network unresolved"
-                        );
-                        continue;
-                    }
+            NetworkRead::Unknown(e) => match known.get(&key) {
+                Some(cidrs) => {
+                    warn!(
+                        "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
+                         not read ({e}); keeping {}",
+                        cidrs.join(", ")
+                    );
+                    cidrs.clone()
                 }
-            }
+                None => {
+                    return Err(format!(
+                        "NetworkAttachmentDefinition {gw_ns}/{network_name} not read ({e}), \
+                         and never read before"
+                    ));
+                }
+            },
         };
-        usable.network_ips.insert(network_name.to_string(), ip);
+        networks.push(NetworkCidrs {
+            name: network_name.to_string(),
+            cidrs,
+        });
     }
-}
-
-/// Swap each resolved `portail.epheo.eu/Network` name in `addresses` for this
-/// pod's IP on that network. An unresolved name stays as it is.
-pub(crate) fn substitute_network_ips(addresses: &mut [String], usable: &UsableAddresses) {
-    for addr in addresses {
-        if let Some(ip) = usable.network_ips.get(addr.as_str()) {
-            *addr = ip.clone();
-        }
-    }
-}
-
-/// Pick which spec.addresses are bind-targets on this pod. LB VIPs are external
-/// routing identities handled by kube-proxy/MetalLB and bind to 0.0.0.0; only
-/// pod-local interface IPs and resolved Network-type IPs get bound specifically.
-/// `Some(empty)` binds every interface; `None` binds nothing.
-pub(crate) fn compute_bind_addresses(
-    addresses: &[String],
-    usable: &UsableAddresses,
-) -> Option<Vec<String>> {
-    let network_ip_set: HashSet<&str> = usable.network_ips.values().map(|s| s.as_str()).collect();
-    let bindable: Vec<String> = addresses
-        .iter()
-        .filter(|addr| {
-            usable.interface_ips.iter().any(|ip| ip == *addr)
-                || network_ip_set.contains(addr.as_str())
-        })
-        .cloned()
-        .collect();
-    // A Network name left after substitution did not resolve. Falling back to
-    // every interface would expose the listeners on networks the Gateway
-    // never named.
-    if bindable.is_empty() && !unresolved_networks(addresses).is_empty() {
-        return None;
-    }
-    Some(bindable)
-}
-
-/// Network names that did not resolve: IPAddress values are IP literals
-/// (CRD-validated), so anything else left after substitution is a name.
-pub(crate) fn unresolved_networks(addresses: &[String]) -> Vec<&str> {
-    addresses
-        .iter()
-        .filter(|a| a.parse::<std::net::IpAddr>().is_err())
-        .map(String::as_str)
-        .collect()
+    Ok(networks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_cidr_accepts_valid_and_rejects_garbage() {
-        assert_eq!(
-            parse_cidr("10.128.0.0/14"),
-            Some(("10.128.0.0".parse().unwrap(), 14))
-        );
-        assert_eq!(parse_cidr("192.168.1.0/24").unwrap().1, 24);
-        assert_eq!(parse_cidr("10.0.0.0"), None); // no prefix
-        assert_eq!(parse_cidr("not-an-ip/24"), None);
-        assert_eq!(parse_cidr("10.0.0.0/abc"), None);
-        assert_eq!(parse_cidr(""), None);
-    }
-
-    #[test]
-    fn ip_in_subnet_edge_prefixes() {
-        let ip: std::net::Ipv4Addr = "10.128.2.7".parse().unwrap();
-        let net: std::net::Ipv4Addr = "10.128.0.0".parse().unwrap();
-        assert!(ip_in_subnet(ip, net, 14));
-        assert!(!ip_in_subnet("10.132.0.1".parse().unwrap(), net, 14));
-        // /0 matches everything
-        assert!(ip_in_subnet("8.8.8.8".parse().unwrap(), net, 0));
-        // /32 is an exact match only
-        assert!(ip_in_subnet(net, net, 32));
-        assert!(!ip_in_subnet(ip, net, 32));
-        // out-of-range prefix is rejected, not wrapped
-        assert!(!ip_in_subnet(ip, net, 33));
-    }
-
-    #[test]
-    fn compute_bind_addresses_keeps_local_ips_drops_lb_vips() {
-        let usable = UsableAddresses {
-            interface_ips: vec!["10.244.1.5".into()],
-            network_ips: HashMap::from([("udn-a".into(), "192.168.10.3".into())]),
-        };
-        let spec_addrs = vec![
-            "10.244.1.5".to_string(),   // pod IP — bindable
-            "192.168.10.3".to_string(), // resolved Network IP — bindable
-            "203.0.113.10".to_string(), // LB VIP — external, not bindable here
-        ];
-        assert_eq!(
-            compute_bind_addresses(&spec_addrs, &usable),
-            Some(vec!["10.244.1.5".to_string(), "192.168.10.3".to_string()])
-        );
-        assert_eq!(compute_bind_addresses(&[], &usable), Some(vec![]));
-        // A VIP alone binds every interface; the Service carries it.
-        assert_eq!(
-            compute_bind_addresses(&["203.0.113.10".to_string()], &usable),
-            Some(vec![])
-        );
-    }
 
     fn gateway_with_addresses(addrs: &[(&str, &str)]) -> Gateway {
         use gateway_api::gateways::{GatewayAddresses, GatewaySpec};
@@ -398,70 +205,92 @@ mod tests {
         }
     }
 
-    /// A Network entry binds this pod's IP on that network, not every
-    /// interface. convert_gateway used to drop it, so the substitution never
-    /// ran and listeners bound the wildcard.
+    /// A Network entry reaches the config as its name, for the data plane
+    /// to swap for its IP. convert_gateway used to drop it, so listeners
+    /// bound the wildcard.
     #[test]
-    fn network_address_binds_its_local_ip() {
+    fn a_network_address_reaches_the_config_by_name() {
         let gw = gateway_with_addresses(&[
             (NETWORK_ADDRESS_TYPE, "udn-a"),
             ("Hostname", "gw.example.com"),
         ]);
-        let mut config =
+        let config =
             crate::kubernetes::converters::convert_gateway(&gw, &Default::default()).unwrap();
         assert_eq!(config.addresses, vec!["udn-a".to_string()]);
-
-        let usable = UsableAddresses {
-            interface_ips: vec!["10.244.1.5".into(), "192.168.10.3".into()],
-            network_ips: HashMap::from([("udn-a".into(), "192.168.10.3".into())]),
-        };
-        substitute_network_ips(&mut config.addresses, &usable);
-        assert_eq!(
-            compute_bind_addresses(&config.addresses, &usable),
-            Some(vec!["192.168.10.3".to_string()])
-        );
     }
 
-    /// Only the networks some Gateway still names keep their last IP.
     #[test]
-    fn network_ips_keep_only_named_networks() {
-        let ips = NetworkIps::default();
+    fn a_nad_names_its_subnet() {
+        let nad =
+            |config: serde_json::Value| serde_json::json!({"spec": {"config": config.to_string()}});
+        assert_eq!(
+            nad_cidrs(&nad(serde_json::json!({"subnets": "10.10.1.0/24"}))),
+            Some(vec!["10.10.1.0/24".to_string()])
+        );
+        assert_eq!(
+            nad_cidrs(&nad(serde_json::json!({"subnets": "junk"}))),
+            None
+        );
+        assert_eq!(nad_cidrs(&nad(serde_json::json!({}))), None);
+    }
+
+    /// An OVN-Kubernetes dual-stack NAD names one subnet per family in one
+    /// value; the data plane finds its IPv4 address in the IPv4 one. The
+    /// value parsed as no CIDR, and the network bound nothing.
+    #[test]
+    fn a_dual_stack_nad_resolves_its_ipv4_network() {
+        let nad = |subnets: &str| {
+            let config = serde_json::json!({"topology": "layer2", "subnets": subnets});
+            serde_json::json!({"spec": {"config": config.to_string()}})
+        };
+        let cidrs = nad_cidrs(&nad("10.10.1.0/24, fd00:10:10:1::/64")).unwrap();
+        assert_eq!(cidrs, vec!["10.10.1.0/24", "fd00:10:10:1::/64"]);
+
+        let networks = [NetworkCidrs {
+            name: "udn-a".into(),
+            cidrs,
+        }];
+        let local = ["fd00:10:10:1::7".to_string(), "10.10.1.7".to_string()];
+        let resolved =
+            crate::dataplane::addresses::resolve_networks(&["udn-a".into()], &networks, &local);
+        assert_eq!(resolved.get("udn-a").map(String::as_str), Some("10.10.1.7"));
+
+        assert_eq!(
+            nad_cidrs(&nad("10.128.0.0/14/23,fd00:10:128::/48/64")),
+            Some(vec![
+                "10.128.0.0/14".to_string(),
+                "fd00:10:128::/48".to_string()
+            ]),
+            "layer3 entries carry a host subnet length"
+        );
+        assert_eq!(
+            nad_cidrs(&nad("junk,10.10.1.0/33,fd00::/129,10.10.2.0/24")),
+            Some(vec!["10.10.2.0/24".to_string()])
+        );
+        assert_eq!(nad_cidrs(&nad("junk, ")), None);
+    }
+
+    /// Only the networks some Gateway still names keep their last CIDRs.
+    #[test]
+    fn network_cidrs_keep_only_named_networks() {
+        let cache = NetworkCidrCache::default();
         for (ns, network) in [
             ("default", "udn-a"),
             ("default", "udn-b"),
             ("gone", "udn-a"),
         ] {
-            ips.0
+            cache
+                .0
                 .lock()
                 .unwrap()
-                .insert((ns.into(), network.into()), "192.168.10.3".into());
+                .insert((ns.into(), network.into()), vec!["192.168.10.0/24".into()]);
         }
         let gw = gateway_with_addresses(&[(NETWORK_ADDRESS_TYPE, "udn-a"), ("IPAddress", "udn-b")]);
-        ips.retain_named(&[Arc::new(gw)]);
-        let kept: Vec<_> = ips.0.lock().unwrap().keys().cloned().collect();
+        cache.retain_named(&[Arc::new(gw)]);
+        let kept: Vec<_> = cache.0.lock().unwrap().keys().cloned().collect();
         assert_eq!(kept, vec![("default".to_string(), "udn-a".to_string())]);
 
-        ips.retain_named(&[]);
-        assert!(ips.0.lock().unwrap().is_empty());
-    }
-
-    /// An unresolved Network name never falls back to every interface.
-    #[test]
-    fn unresolved_network_binds_nothing() {
-        let usable = UsableAddresses {
-            interface_ips: vec!["10.244.1.5".into()],
-            network_ips: HashMap::new(),
-        };
-        let mut addrs = vec!["udn-a".to_string()];
-        substitute_network_ips(&mut addrs, &usable);
-        assert_eq!(compute_bind_addresses(&addrs, &usable), None);
-        assert_eq!(unresolved_networks(&addrs), vec!["udn-a"]);
-
-        // A local address still binds; the unresolved name adds nothing.
-        addrs.push("10.244.1.5".to_string());
-        assert_eq!(
-            compute_bind_addresses(&addrs, &usable),
-            Some(vec!["10.244.1.5".to_string()])
-        );
+        cache.retain_named(&[]);
+        assert!(cache.0.lock().unwrap().is_empty());
     }
 }

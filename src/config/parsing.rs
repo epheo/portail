@@ -52,78 +52,77 @@ pub(crate) mod human_duration {
     }
 }
 
-/// Parse human-readable duration strings to Duration
+/// Parse human-readable duration strings to Duration: a bare number of
+/// seconds, or segments like "1m30s" and "1.5s" (units h, m, s, ms, us,
+/// ns), summed. Gateway API durations (GEP-2257) are such segment lists, and
+/// [`format_duration`] writes them, so a config survives its JSON form.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim().to_lowercase();
 
     if let Ok(secs) = s.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
     }
-
-    let (number_part, suffix) = if s.ends_with("ns") {
-        (s.trim_end_matches("ns"), Duration::from_nanos(1))
-    } else if s.ends_with("us") || s.ends_with("μs") {
-        (
-            s.trim_end_matches("us").trim_end_matches("μs"),
-            Duration::from_micros(1),
-        )
-    } else if s.ends_with("ms") {
-        (s.trim_end_matches("ms"), Duration::from_millis(1))
-    } else if s.ends_with("s") {
-        (s.trim_end_matches("s"), Duration::from_secs(1))
-    } else if s.ends_with("m") {
-        (s.trim_end_matches("m"), Duration::from_secs(60))
-    } else if s.ends_with("h") {
-        (s.trim_end_matches("h"), Duration::from_secs(3600))
-    } else {
-        return Err(anyhow!(
-            "Invalid duration format: {}. Expected format like '10s', '500ms', '1m'",
-            s
-        ));
-    };
-
-    let number: f64 = number_part
-        .parse()
-        .map_err(|_| anyhow!("Invalid number in duration: {}", s))?;
-
-    if number < 0.0 {
-        return Err(anyhow!("Duration cannot be negative: {}", s));
+    if s.is_empty() {
+        return Err(anyhow!("Empty duration"));
     }
 
-    Ok(Duration::from_nanos(
-        (number * suffix.as_nanos() as f64) as u64,
-    ))
+    let mut total = Duration::ZERO;
+    let mut rest = s.as_str();
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .ok_or_else(|| anyhow!("Duration segment without a unit: {}", s))?;
+        let (number_part, tail) = rest.split_at(digits);
+        let (unit, tail) = [
+            ("ns", Duration::from_nanos(1)),
+            ("us", Duration::from_micros(1)),
+            ("μs", Duration::from_micros(1)),
+            ("ms", Duration::from_millis(1)),
+            ("s", Duration::from_secs(1)),
+            ("m", Duration::from_secs(60)),
+            ("h", Duration::from_secs(3600)),
+        ]
+        .into_iter()
+        .find_map(|(suffix, unit)| tail.strip_prefix(suffix).map(|tail| (unit, tail)))
+        .ok_or_else(|| {
+            anyhow!(
+                "Invalid duration format: {}. Expected format like '10s', '500ms', '1m'",
+                s
+            )
+        })?;
+        let number: f64 = number_part
+            .parse()
+            .map_err(|_| anyhow!("Invalid number in duration: {}", s))?;
+        if number < 0.0 {
+            return Err(anyhow!("Duration cannot be negative: {}", s));
+        }
+        total += Duration::from_nanos((number * unit.as_nanos() as f64) as u64);
+        rest = tail;
+    }
+    Ok(total)
 }
 
 /// Format Duration to human-readable string, preserving sub-unit remainders.
-/// e.g. 90s → "1m30s", 3661s → "1h1m1s"
+/// e.g. 90s -> "1m30s", 3661s -> "1h1m1s", 1.5s -> "1s500ms"
 pub(crate) fn format_duration(duration: &Duration) -> String {
     let total_secs = duration.as_secs();
     let nanos = duration.subsec_nanos();
 
-    if total_secs == 0 {
-        if nanos >= 1_000_000 {
-            return format!("{}ms", nanos / 1_000_000);
-        } else if nanos >= 1_000 {
-            return format!("{}us", nanos / 1_000);
-        } else {
-            return format!("{}ns", nanos);
+    let mut result = String::new();
+    for (value, unit) in [
+        (total_secs / 3600, "h"),
+        ((total_secs % 3600) / 60, "m"),
+        (total_secs % 60, "s"),
+        (u64::from(nanos / 1_000_000), "ms"),
+        (u64::from(nanos / 1_000 % 1_000), "us"),
+        (u64::from(nanos % 1_000), "ns"),
+    ] {
+        if value > 0 {
+            result.push_str(&format!("{}{}", value, unit));
         }
     }
-
-    let mut result = String::new();
-    let hours = total_secs / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    if hours > 0 {
-        result.push_str(&format!("{}h", hours));
-    }
-    if minutes > 0 {
-        result.push_str(&format!("{}m", minutes));
-    }
-    if secs > 0 || result.is_empty() {
-        result.push_str(&format!("{}s", secs));
+    if result.is_empty() {
+        result.push_str("0s");
     }
     result
 }

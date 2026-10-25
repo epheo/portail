@@ -1,11 +1,16 @@
 //! Controller test harness: a kube Client over an in-process tower service
-//! that records every request, and reflector stores the tests fill directly.
+//! that records every request, reflector stores the tests fill directly,
+//! and [`Pipeline`], the controller and one data plane wired in-process.
 
-use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use arc_swap::ArcSwap;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service, ServiceAccount};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use kube::core::PartialObjectMeta;
+use kube::runtime::controller::Action;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher;
 use kube::Client;
@@ -14,12 +19,19 @@ use serde_json::{json, Value};
 use gateway_api::experimental::tcproutes::TCPRoute;
 use gateway_api::experimental::tlsroutes::TLSRoute;
 use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::gatewayclasses::{GatewayClass, GatewayClassParametersRef, GatewayClassSpec};
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewaySpec};
 use gateway_api::httproutes::{HTTPRoute, HTTPRouteParentRefs, HTTPRouteSpec};
 use gateway_api::referencegrants::ReferenceGrant;
 
-use super::{ControllerCtx, ResourceCache};
-use crate::kubernetes::crds::RateLimitPolicy;
+use super::reconcile::{finish, forget_deleted_gateways, publish, Step};
+use super::reports::InstanceId;
+use super::{ControllerCtx, ReconcileError, ResourceCache};
+use crate::dataplane::Applier;
+use crate::kubernetes::crds::{
+    GatewayParameters, GatewayParametersSpec, Provisioning, RateLimitPolicy,
+};
+use crate::sync::{GatewayKey, Snapshot};
 
 pub(super) const CONTROLLER: &str = "epheo.eu/portail";
 
@@ -161,6 +173,7 @@ fn object_at(path: &str) -> Value {
 /// Reflector stores a test fills by hand, as watch events would.
 #[derive(Default)]
 pub(super) struct TestCluster {
+    pub gateway_classes: Writer<GatewayClass>,
     pub gateways: Writer<Gateway>,
     pub http_routes: Writer<HTTPRoute>,
     pub tcp_routes: Writer<TCPRoute>,
@@ -171,6 +184,10 @@ pub(super) struct TestCluster {
     pub secrets: Writer<Secret>,
     pub reference_grants: Writer<ReferenceGrant>,
     pub policies: Writer<RateLimitPolicy>,
+    pub parameters: Writer<GatewayParameters>,
+    pub service_accounts: Writer<PartialObjectMeta<ServiceAccount>>,
+    pub deployments: Writer<PartialObjectMeta<Deployment>>,
+    pub pdbs: Writer<PartialObjectMeta<PodDisruptionBudget>>,
 }
 
 /// Store `obj` as a watch Apply event would.
@@ -183,17 +200,15 @@ where
 }
 
 impl TestCluster {
-    /// A scoped controller context (one Gateway, operator-managed status
-    /// off) over these stores, with an empty data plane.
+    /// A controller context over these stores; it leads, its caches synced
+    /// (no kind is tracked).
     pub fn ctx(&self, client: Client) -> Arc<ControllerCtx> {
-        let perf = crate::config::PerformanceConfig::default();
-        let data_plane =
-            crate::proxy::data_plane::DataPlane::new(&[], &perf, std::path::Path::new("/unused"))
-                .unwrap();
         Arc::new(ControllerCtx {
             client,
             controller_name: CONTROLLER.to_string(),
+            dataplane_image: "ghcr.io/epheo/portail:test".to_string(),
             cache: ResourceCache {
+                gateway_classes: self.gateway_classes.as_reader(),
                 gateways: self.gateways.as_reader(),
                 http_routes: self.http_routes.as_reader(),
                 tcp_routes: self.tcp_routes.as_reader(),
@@ -204,25 +219,148 @@ impl TestCluster {
                 secrets: self.secrets.as_reader(),
                 reference_grants: self.reference_grants.as_reader(),
                 rate_limit_policies: self.policies.as_reader(),
-                gateway_classes: None,
+                gateway_parameters: self.parameters.as_reader(),
             },
-            routes: Arc::new(ArcSwap::from_pointee(crate::routing::RouteTable::new())),
-            published: Arc::new(ArcSwapOption::empty()),
-            data_plane: Arc::new(std::sync::Mutex::new(data_plane)),
-            performance_config: perf,
-            manage_gateway_status: true,
-            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_applied: Arc::new(std::sync::Mutex::new(None)),
             route_verdicts: Arc::default(),
-            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
-            gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            network_ips: Arc::default(),
+            networks: Arc::default(),
+            certs: Arc::default(),
             named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(
                 std::time::Duration::from_secs(super::RESYNC_SECS),
             )),
-            started: std::time::Instant::now(),
+            hub: Arc::default(),
+            reports: Arc::default(),
+            leader: super::leader::Leader::always(),
+            synced: super::watch::Listings::default(),
+            owned: super::provision::Owned::new(
+                self.service_accounts.as_reader(),
+                self.deployments.as_reader(),
+                self.pdbs.as_reader(),
+                super::provision::ControllerEndpoint::for_tests(),
+            ),
+            departures: Default::default(),
         })
     }
+}
+
+/// GatewayClass `name` naming `controller`.
+pub(super) fn gateway_class(name: &str, controller: &str) -> GatewayClass {
+    GatewayClass {
+        metadata: kube::core::ObjectMeta {
+            name: Some(name.into()),
+            generation: Some(1),
+            ..Default::default()
+        },
+        spec: GatewayClassSpec {
+            controller_name: controller.into(),
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+/// The regression anchor of the controller split: a reconcile with one
+/// data plane in the loop, in-process. Each pass translates and publishes,
+/// applies the hub's snapshot (or clears on a 404), records the report and
+/// writes status from it, as the sync protocol orders them.
+pub(super) struct Pipeline {
+    pub api: MockApi,
+    pub cluster: TestCluster,
+    pub ctx: Arc<ControllerCtx>,
+    pub applier: Applier,
+    /// The data plane's /readyz.
+    pub ready: Arc<AtomicBool>,
+}
+
+impl Pipeline {
+    /// Over an empty cluster but for GatewayClass `portail` of this
+    /// controller, which [`gateway`] uses. Its Gateways are Unmanaged: the
+    /// data plane in the loop is the hand-written one.
+    pub fn new() -> Self {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        let mut unmanaged = GatewayParameters::new(
+            "unmanaged",
+            GatewayParametersSpec {
+                provisioning: Some(Provisioning::Unmanaged),
+                ..Default::default()
+            },
+        );
+        unmanaged.metadata.namespace = Some("default".into());
+        apply(&mut cluster.parameters, unmanaged);
+        let mut class = gateway_class("portail", CONTROLLER);
+        class.spec.parameters_ref = Some(GatewayClassParametersRef {
+            group: "portail.epheo.eu".into(),
+            kind: "GatewayParameters".into(),
+            name: "unmanaged".into(),
+            namespace: Some("default".into()),
+        });
+        apply(&mut cluster.gateway_classes, class);
+        let ctx = cluster.ctx(api.client());
+        let perf = crate::config::PerformanceConfig::default();
+        let data_plane =
+            crate::proxy::data_plane::DataPlane::new(&[], &perf, std::path::Path::new("/unused"))
+                .unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let applier = Applier::new(
+            Arc::new(Mutex::new(data_plane)),
+            Arc::new(ArcSwap::from_pointee(crate::routing::RouteTable::new())),
+            perf,
+            ready.clone(),
+        );
+        Self {
+            api,
+            cluster,
+            ctx,
+            applier,
+            ready,
+        }
+    }
+
+    /// One reconcile of `gw`, its data plane in the loop.
+    pub async fn pass(&mut self, gw: &Gateway) -> Result<Action, ReconcileError> {
+        let step = publish(gw, &self.ctx).await;
+        self.sync(gw).await;
+        match step {
+            Step::Done(action) => Ok(action),
+            Step::Continue(pass) => finish(gw, &self.ctx, *pass).await,
+        }
+    }
+
+    /// `gw` deleted: the store's delete event, the controller forgetting
+    /// it, its data plane answered 404.
+    pub async fn delete(&mut self, gw: &Gateway) {
+        self.cluster
+            .gateways
+            .apply_watcher_event(&watcher::Event::Delete(gw.clone()));
+        forget_deleted_gateways(&self.ctx);
+        self.sync(gw).await;
+    }
+
+    /// What the hub serves for `gw`.
+    pub fn served(&self, gw: &Gateway) -> Option<Arc<Snapshot>> {
+        self.ctx.hub.current(&key(gw))
+    }
+
+    /// The data plane's poll: apply what the hub serves, or clear.
+    async fn sync(&mut self, gw: &Gateway) {
+        let key = key(gw);
+        match self.ctx.hub.current(&key) {
+            Some(snapshot) => {
+                let report = self.applier.apply(&snapshot).await;
+                self.ctx
+                    .reports
+                    .record(&key, InstanceId("pipeline-pod".into()), report);
+            }
+            None => self.applier.clear().await,
+        }
+    }
+}
+
+pub(super) fn key(gw: &Gateway) -> GatewayKey {
+    GatewayKey::new(
+        gw.metadata.namespace.as_deref().unwrap_or("default"),
+        gw.metadata.name.as_deref().unwrap_or_default(),
+    )
 }
 
 /// A Gateway with one HTTP listener on an ephemeral port, so binds never

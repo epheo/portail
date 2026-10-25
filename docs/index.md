@@ -1,10 +1,9 @@
 # Portail Documentation
 
-Portail is a Kubernetes Gateway API implementation.
-Control plane and data plane are a single Rust binary -- no sidecar,
-self-sufficient standalone or cluster-wide, or provisioned as per-Gateway
-data planes by [portail-operator](https://github.com/epheo/portail-operator).
-How you deploy it is your business.
+Portail is a Kubernetes Gateway API implementation in one Rust binary:
+a leader-elected controller, one data plane per Gateway that the controller
+provisions or that you run yourself, or a standalone proxy fed by a file.
 
-- [Deployment](deployment.md) -- deployment patterns, networking, installation
+- [Deployment](deployment.md) -- installation, GatewayParameters, networking, failure behavior
 - [Configuration](configuration.md) -- CLI flags, standalone mode, TLS
+- [Upgrading](upgrading.md) -- from 0.1.x to 0.2.0

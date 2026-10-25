@@ -8,7 +8,9 @@ use anyhow::{anyhow, Result};
 use gateway_api::experimental::tcproutes::*;
 use gateway_api::experimental::tlsroutes::*;
 use gateway_api::experimental::udproutes::*;
-use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
+use gateway_api::gateways::{
+    Gateway, GatewayListeners, GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
+};
 use gateway_api::httproutes::*;
 
 use crate::config::*;
@@ -22,6 +24,23 @@ use super::parent_ref::L4BackendRefAccess;
 
 /// TLS certificate data keyed by (secret_name, namespace) → (cert_pem, key_pem).
 pub(crate) type CertData = std::collections::HashMap<(String, String), (Vec<u8>, Vec<u8>)>;
+
+/// The [`CertData`] key of a certificateRef naming a core Secret; `None`
+/// for any other group or kind, which nothing reads: a Secret of the same
+/// name must not stand in for it.
+pub(crate) fn secret_ref_key(
+    r: &GatewayListenersTlsCertificateRefs,
+    gw_ns: &str,
+) -> Option<(String, String)> {
+    let core_secret = r.group.as_deref().unwrap_or("").is_empty()
+        && r.kind.as_deref().unwrap_or("Secret") == "Secret";
+    core_secret.then(|| {
+        (
+            r.name.clone(),
+            r.namespace.as_deref().unwrap_or(gw_ns).to_string(),
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Gateway + Listener conversion
@@ -99,29 +118,25 @@ fn convert_listener(
             Some(GatewayListenersTlsMode::Passthrough) => TlsMode::Passthrough,
             _ => TlsMode::Terminate,
         };
+        // A ref without a resolved cert is left out, never sent without
+        // PEM: the data plane would take the unchanged set of refs for a
+        // bad rotation and keep serving a revoked or deleted cert.
         let certificate_refs = t
             .certificate_refs
-            .as_ref()
-            .map(|refs| {
-                refs.iter()
-                    .map(|r| {
-                        let secret_ns = r.namespace.as_deref().unwrap_or(gw_ns);
-                        let key = (r.name.clone(), secret_ns.to_string());
-                        let (cert_pem, key_pem) = cert_data
-                            .get(&key)
-                            .map(|(c, k)| (Some(c.clone()), Some(k.clone())))
-                            .unwrap_or((None, None));
-                        CertificateRef {
-                            name: r.name.clone(),
-                            namespace: Some(secret_ns.to_string()),
-                            hostname: l.hostname.clone(),
-                            cert_pem,
-                            key_pem,
-                        }
-                    })
-                    .collect()
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                let key = secret_ref_key(r, gw_ns)?;
+                let (cert_pem, key_pem) = cert_data.get(&key)?;
+                Some(CertificateRef {
+                    name: key.0,
+                    namespace: Some(key.1),
+                    hostname: l.hostname.clone(),
+                    cert_pem: Some(cert_pem.clone()),
+                    key_pem: Some(key_pem.clone()),
+                })
             })
-            .unwrap_or_default();
+            .collect();
         TlsConfig {
             mode,
             certificate_refs,
@@ -715,4 +730,76 @@ pub(crate) fn parse_backend_dns_name(dns_name: &str) -> Option<(String, String)>
 /// Extract namespace from ObjectMeta, defaulting to "default".
 pub(crate) fn route_namespace(meta: &kube::core::ObjectMeta) -> &str {
     meta.namespace.as_deref().unwrap_or("default")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway_api::gateways::{GatewayListenersTls, GatewaySpec};
+
+    /// A listener carries the refs whose cert resolved, and only those:
+    /// one sent without PEM kept a revoked cert served (see
+    /// `convert_listener`).
+    #[test]
+    fn a_listener_carries_only_refs_with_a_resolved_cert() {
+        let refs = ["good", "revoked"].map(|name| GatewayListenersTlsCertificateRefs {
+            name: name.into(),
+            namespace: Some("certs".into()),
+            ..Default::default()
+        });
+        let gw = Gateway {
+            metadata: kube::core::ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "portail".into(),
+                listeners: vec![GatewayListeners {
+                    name: "https".into(),
+                    port: 443,
+                    protocol: "HTTPS".into(),
+                    hostname: Some("app.example.com".into()),
+                    tls: Some(GatewayListenersTls {
+                        mode: Some(GatewayListenersTlsMode::Terminate),
+                        certificate_refs: Some(refs.to_vec()),
+                        ..Default::default()
+                    }),
+                    allowed_routes: None,
+                }],
+                ..Default::default()
+            },
+            status: None,
+        };
+        let certs = CertData::from([(
+            ("good".to_string(), "certs".to_string()),
+            (b"cert".to_vec(), b"key".to_vec()),
+        )]);
+
+        let config = convert_gateway(&gw, &certs).unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
+        let carried: Vec<_> = tls
+            .certificate_refs
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.namespace.as_deref(),
+                    r.hostname.as_deref(),
+                    r.cert_pem.as_deref(),
+                    r.key_pem.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![(
+                "good",
+                Some("certs"),
+                Some("app.example.com"),
+                Some(b"cert".as_slice()),
+                Some(b"key".as_slice())
+            )]
+        );
+    }
 }

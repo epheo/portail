@@ -1,0 +1,18 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw-frontend
+spec:
+  gatewayClassName: portail
+  infrastructure:
+    parametersRef:
+      group: portail.epheo.eu
+      kind: GatewayParameters
+      name: gw-frontend
+  addresses:
+  - type: portail.epheo.eu/Network
+    value: udn-frontend
+  listeners:
+  - name: http
+    port: 8080
+    protocol: HTTP

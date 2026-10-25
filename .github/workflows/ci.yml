@@ -27,8 +27,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: No Kubernetes code in the data plane
+        run: scripts/check-no-kube.sh
+
       - name: Test
         run: cargo test --release
+
+  manifests:
+    name: Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The runner image ships kubectl, and kubectl ships kustomize.
+      - name: Every kustomization builds
+        run: scripts/check-manifests.sh
 
   # Blocking on purpose: publish.yml calls this workflow, so a new advisory
   # holds the release too.

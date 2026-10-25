@@ -7,7 +7,8 @@
 //! served never reaches `ResolvedRefs=True`. Resolution happens once; both
 //! the config build and the status conditions consume its result.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use gateway_api::gateways::Gateway;
 use gateway_api::referencegrants::ReferenceGrant;
@@ -15,7 +16,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
-use crate::kubernetes::converters::CertData;
+use crate::kubernetes::converters::{secret_ref_key, CertData};
 use crate::kubernetes::reconciler::{listener_conflicts, listener_is_served};
 use crate::kubernetes::reference_grants::is_reference_allowed;
 use crate::kubernetes::status;
@@ -47,10 +48,76 @@ impl CertRefError {
 }
 
 /// Outcome of resolving every certificateRef on a Gateway: PEM bytes for the
-/// refs that validated, the first error for each ref that did not.
+/// refs to serve, the first error for each ref that did not validate. A ref
+/// can be in both: a bad rotation serves its last good pair, unresolved.
 pub(super) struct ResolvedCerts {
     pub valid: CertData,
     pub errors: HashMap<(String, String), CertRefError>,
+}
+
+/// The last pair each TLS Secret validated with, by (name, namespace), with
+/// its UID. A rotation to PEM that fails to load keeps serving that pair,
+/// on a data plane started since too. A Secret deleted, or created again
+/// under its name, was not rotated: it keeps nothing.
+#[derive(Default)]
+pub(super) struct LastGoodCerts(Mutex<HashMap<(String, String), LastGood>>);
+
+struct LastGood {
+    uid: String,
+    pair: (Vec<u8>, Vec<u8>),
+}
+
+impl LastGoodCerts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), LastGood>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Make `pair`, validated from `secret`, the last good one of `key`,
+    /// when `secret` is still the object `store` holds. Passes of Gateways
+    /// sharing a Secret run concurrently: one that read an older version
+    /// must not overwrite a newer pair, which a bad rotation would lose.
+    fn record(
+        &self,
+        key: &(String, String),
+        secret: &Secret,
+        pair: &(Vec<u8>, Vec<u8>),
+        store: &Store<Secret>,
+    ) {
+        let Some(uid) = secret.metadata.uid.clone() else {
+            return;
+        };
+        // Check and insert under one lock: a newer pass that recorded
+        // first found the store at its version, so this read sees that one
+        // or a later one.
+        let mut last_good = self.lock();
+        let current = store.get(&ObjectRef::new(&key.0).within(&key.1));
+        if current.is_some_and(|c| {
+            c.metadata.uid == secret.metadata.uid
+                && c.metadata.resource_version == secret.metadata.resource_version
+        }) {
+            let pair = pair.clone();
+            last_good.insert(key.clone(), LastGood { uid, pair });
+        }
+    }
+
+    /// Keep only the Secrets some Gateway of `gateways` references. A pair
+    /// whose Secret no listener names any more would otherwise outlive
+    /// every Gateway that served it.
+    pub(super) fn retain_referenced(&self, gateways: &[Arc<Gateway>]) {
+        let referenced: HashSet<(String, String)> = gateways
+            .iter()
+            .flat_map(|gw| {
+                let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+                gw.spec
+                    .listeners
+                    .iter()
+                    .filter_map(|l| l.tls.as_ref()?.certificate_refs.as_ref())
+                    .flatten()
+                    .filter_map(move |r| secret_ref_key(r, ns))
+            })
+            .collect();
+        self.lock().retain(|key, _| referenced.contains(key));
+    }
 }
 
 fn missing_secret(secret_ns: &str, name: &str) -> CertRefError {
@@ -96,11 +163,13 @@ pub(super) fn resolve_cert_ref(
 /// Resolve TLS certificates for a Gateway from the reflector Secret store.
 /// Iterates all listeners, checks cross-namespace ReferenceGrant permissions,
 /// looks up Secrets, and validates each pair with the real rustls parse.
+/// A pair that validates becomes its Secret's last good one in `last_good`.
 pub(super) fn resolve_gateway_certs(
     gateway: &Gateway,
     gw_ns: &str,
     reference_grants: &[ReferenceGrant],
     store_secrets: &Store<Secret>,
+    last_good: &LastGoodCerts,
 ) -> ResolvedCerts {
     let mut resolved = ResolvedCerts {
         valid: CertData::new(),
@@ -111,9 +180,12 @@ pub(super) fn resolve_gateway_certs(
         let Some(cert_refs) = &tls.certificate_refs else {
             continue;
         };
-        for cert_ref in cert_refs {
-            let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
-            let key = (cert_ref.name.clone(), secret_ns.to_string());
+        // validate_gateway reports the refs of another group or kind.
+        for (cert_ref, key) in cert_refs
+            .iter()
+            .filter_map(|r| Some((r, secret_ref_key(r, gw_ns)?)))
+        {
+            let secret_ns = key.1.as_str();
             if resolved.valid.contains_key(&key) || resolved.errors.contains_key(&key) {
                 continue; // same Secret referenced by several listeners
             }
@@ -132,6 +204,7 @@ pub(super) fn resolve_gateway_certs(
             let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
             let secret = store_secrets.get(&secret_ref);
 
+            let uid = secret.as_ref().and_then(|s| s.metadata.uid.clone());
             match resolve_cert_ref(
                 secret.as_deref(),
                 cross_ns_allowed,
@@ -139,15 +212,43 @@ pub(super) fn resolve_gateway_certs(
                 &cert_ref.name,
             ) {
                 Ok(pair) => {
+                    if let Some(secret) = &secret {
+                        last_good.record(&key, secret, &pair, store_secrets);
+                    }
                     resolved.valid.insert(key, pair);
                 }
                 Err(e) => {
+                    // Not permitted says nothing about the Secret: another
+                    // Gateway may still serve its last good pair.
+                    let kept = match &e {
+                        CertRefError::NotPermitted(_) => None,
+                        CertRefError::Invalid(_) => {
+                            let mut last_good = last_good.lock();
+                            match last_good.get(&key) {
+                                Some(last) if uid.as_ref() == Some(&last.uid) => {
+                                    Some(last.pair.clone())
+                                }
+                                _ => {
+                                    last_good.remove(&key);
+                                    None
+                                }
+                            }
+                        }
+                    };
                     warn!(
-                        "Certificate ref {}/{}: {}",
+                        "Certificate ref {}/{}: {}{}",
                         secret_ns,
                         cert_ref.name,
-                        e.message()
+                        e.message(),
+                        if kept.is_some() {
+                            "; serving its last good certificate"
+                        } else {
+                            ""
+                        }
                     );
+                    if let Some(pair) = kept {
+                        resolved.valid.insert(key.clone(), pair);
+                    }
                     resolved.errors.insert(key, e);
                 }
             }
@@ -208,20 +309,16 @@ pub(super) fn validate_gateway(
         if let Some(tls) = &listener.tls {
             if let Some(cert_refs) = &tls.certificate_refs {
                 for cert_ref in cert_refs {
-                    let group = cert_ref.group.as_deref().unwrap_or("");
-                    let kind_str = cert_ref.kind.as_deref().unwrap_or("Secret");
-                    if !group.is_empty() || kind_str != "Secret" {
+                    let Some(key) = secret_ref_key(cert_ref, gw_ns) else {
                         refs_failed = true;
                         ls.resolved_refs_reason = "InvalidCertificateRef".into();
                         ls.resolved_refs_message = format!(
                             "Unsupported certificateRef group/kind: {}/{}",
-                            group, kind_str
+                            cert_ref.group.as_deref().unwrap_or(""),
+                            cert_ref.kind.as_deref().unwrap_or("Secret")
                         );
                         continue;
-                    }
-
-                    let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
-                    let key = (cert_ref.name.clone(), secret_ns.to_string());
+                    };
 
                     // Resolution (ReferenceGrant check + Secret lookup + real
                     // rustls parse) ran once in resolve_gateway_certs; the
@@ -362,6 +459,7 @@ pub(super) fn validate_gateway(
 
 #[cfg(test)]
 mod tests {
+    use super::super::testkit::{self, apply, Pipeline};
     use super::*;
     use crate::proxy::tls::test_util::generate_test_cert;
     use gateway_api::gateways::{
@@ -370,6 +468,8 @@ mod tests {
     };
     use k8s_openapi::ByteString;
     use kube::core::ObjectMeta;
+    use kube::runtime::reflector::store::Writer;
+    use kube::runtime::watcher;
     use std::collections::BTreeMap;
 
     fn tls_secret(name: &str, ns: &str, cert: &[u8], key: &[u8]) -> Secret {
@@ -649,6 +749,47 @@ mod tests {
         assert!(gw_cond.message.contains("tcp-a (HostnameConflict)"));
     }
 
+    /// TCP and UDP listeners on one port are distinct by protocol and each
+    /// binds its own socket: Gateway API v1.4.1 GatewaySpec.listeners,
+    /// Compatible Listeners. They were ProtocolConflict, so DNS on 53 over
+    /// both took neither. Two UDP listeners on a port still conflict.
+    #[test]
+    fn tcp_and_udp_listeners_share_a_port() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners = vec![
+            listener("dns-tcp", 53, "TCP", None),
+            listener("dns-udp", 53, "UDP", None),
+            listener("web", 8080, "HTTP", None),
+            listener("quic", 8080, "UDP", None),
+        ];
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        for name in ["dns-tcp", "dns-udp", "web", "quic"] {
+            let ls = &listeners[name];
+            assert!(ls.accepted && !ls.conflicted && ls.programmed, "{name}");
+        }
+        assert!(gw_cond.ok);
+        assert_eq!(gw_cond.reason, "Accepted");
+
+        gw.spec
+            .listeners
+            .push(listener("dns-udp-b", 53, "UDP", None));
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        for name in ["dns-udp", "dns-udp-b"] {
+            assert_eq!(
+                listeners[name].conflicted_reason, "HostnameConflict",
+                "{name}"
+            );
+        }
+        assert!(
+            listeners["dns-tcp"].accepted,
+            "its UDP siblings' conflict is theirs"
+        );
+    }
+
     /// One socket serves HTTPS and TLS on a port, told apart by SNI, so
     /// they conflict only on a shared hostname. Both were ProtocolConflict,
     /// and nothing bound the port.
@@ -724,5 +865,500 @@ mod tests {
         let web = &listeners["web"];
         assert!(web.accepted && !web.conflicted);
         assert!(gw_cond.ok);
+    }
+
+    /// A Secret in the store as the apiserver holds it: with its UID.
+    fn stored(writer: &mut Writer<Secret>, uid: &str, ns: &str, pair: &(Vec<u8>, Vec<u8>)) {
+        let mut secret = tls_secret("cert", ns, &pair.0, &pair.1);
+        secret.metadata.uid = Some(uid.into());
+        writer.apply_watcher_event(&watcher::Event::Apply(secret));
+    }
+
+    fn garbage() -> (Vec<u8>, Vec<u8>) {
+        (
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec(),
+            b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".to_vec(),
+        )
+    }
+
+    /// `https_gateway` with its ref to Secret `cert` in `ns`.
+    fn gateway_with_cert_in(ns: &str) -> Gateway {
+        let mut gw = https_gateway("cert");
+        let tls = gw.spec.listeners[0].tls.as_mut().unwrap();
+        tls.certificate_refs.as_mut().unwrap()[0].namespace = Some(ns.into());
+        gw
+    }
+
+    /// Gateways of `default` may reference Secrets of `certs`.
+    fn secret_grant() -> ReferenceGrant {
+        use gateway_api::referencegrants::{
+            ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        };
+        ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("gateways-read-certs".into()),
+                namespace: Some("certs".into()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: "gateway.networking.k8s.io".into(),
+                    kind: "Gateway".into(),
+                    namespace: "default".into(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: "".into(),
+                    kind: "Secret".into(),
+                    name: None,
+                }],
+            },
+        }
+    }
+
+    fn cert_key(ns: &str) -> (String, String) {
+        ("cert".into(), ns.into())
+    }
+
+    /// How many certificateRefs the HTTPS listener of `gw` reaches the data
+    /// plane with. The listener itself always does, with no ref left: left
+    /// out, its SNI would fall to a catch-all sibling's cert.
+    fn carried_refs(gw: &Gateway, resolved: &ResolvedCerts) -> usize {
+        let config = crate::kubernetes::converters::convert_gateway(gw, &resolved.valid).unwrap();
+        let [https] = config.listeners.as_slice() else {
+            panic!("the HTTPS listener is sent: {:?}", config.listeners);
+        };
+        https.tls.as_ref().unwrap().certificate_refs.len()
+    }
+
+    /// A TLS Secret at `resource_version`, in `default`.
+    fn secret_at(uid: &str, resource_version: &str, pair: &(Vec<u8>, Vec<u8>)) -> Secret {
+        let mut secret = tls_secret("cert", "default", &pair.0, &pair.1);
+        secret.metadata.uid = Some(uid.into());
+        secret.metadata.resource_version = Some(resource_version.into());
+        secret
+    }
+
+    /// Passes of two Gateways sharing a Secret run concurrently: the one
+    /// that read an older version, recording last, keeps the newer pair.
+    /// It overwrote it, and a bad rotation then served the older cert.
+    #[test]
+    fn an_older_read_never_overwrites_the_last_good_pair() {
+        let (Some(old), Some(new)) = (
+            generate_test_cert("app.example.com"),
+            generate_test_cert("app.example.com"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let (older, newer) = (
+            secret_at("uid-1", "10", &old),
+            secret_at("uid-1", "11", &new),
+        );
+        let mut secrets = Writer::<Secret>::default();
+        secrets.apply_watcher_event(&watcher::Event::Apply(newer.clone()));
+        let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
+        let key = cert_key("default");
+
+        last.record(&key, &newer, &new, &store);
+        last.record(&key, &older, &old, &store);
+
+        let rotated = secret_at("uid-1", "12", &garbage());
+        secrets.apply_watcher_event(&watcher::Event::Apply(rotated));
+        let resolved = resolve_gateway_certs(&https_gateway("cert"), "default", &[], &store, &last);
+        assert_eq!(resolved.valid.get(&key), Some(&new));
+    }
+
+    /// A revoked ReferenceGrant or a deleted Secret resolves no pair at
+    /// all. The ref still reached the data plane, without PEM, and it took
+    /// that unchanged set of refs for a bad rotation: it kept serving the
+    /// cert.
+    #[test]
+    fn a_revoked_grant_or_a_deleted_secret_resolves_nothing() {
+        let Some(good) = generate_test_cert("app.example.com") else {
+            return; // openssl unavailable
+        };
+        let mut secrets = Writer::<Secret>::default();
+        stored(&mut secrets, "uid-1", "certs", &good);
+        let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
+        let gw = gateway_with_cert_in("certs");
+        let grants = [secret_grant()];
+        let key = cert_key("certs");
+
+        let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
+        assert_eq!(resolved.valid.get(&key), Some(&good));
+        assert_eq!(carried_refs(&gw, &resolved), 1);
+
+        let resolved = resolve_gateway_certs(&gw, "default", &[], &store, &last);
+        assert!(resolved.valid.is_empty(), "revoked grant");
+        assert_eq!(resolved.errors[&key].reason(), "RefNotPermitted");
+        assert_eq!(carried_refs(&gw, &resolved), 0, "revoked grant");
+
+        let mut deleted = tls_secret("cert", "certs", &good.0, &good.1);
+        deleted.metadata.uid = Some("uid-1".into());
+        secrets.apply_watcher_event(&watcher::Event::Delete(deleted));
+        let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
+        assert!(resolved.valid.is_empty(), "deleted Secret");
+        assert_eq!(resolved.errors[&key].reason(), "InvalidCertificateRef");
+        assert_eq!(carried_refs(&gw, &resolved), 0, "deleted Secret");
+
+        stored(&mut secrets, "uid-1", "certs", &garbage());
+        let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
+        assert!(resolved.valid.is_empty(), "the deletion forgot the pair");
+    }
+
+    /// A Secret rotated to PEM that fails to load keeps serving its last
+    /// good pair, unresolved; only that Secret, by UID, ever gets it back.
+    #[test]
+    fn a_bad_rotation_serves_the_last_good_pair_unresolved() {
+        let (Some(good), Some(next)) = (
+            generate_test_cert("app.example.com"),
+            generate_test_cert("app.example.com"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let mut secrets = Writer::<Secret>::default();
+        let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
+        let gw = https_gateway("cert");
+        let key = cert_key("default");
+        let resolve = || resolve_gateway_certs(&gw, "default", &[], &store, &last);
+
+        stored(&mut secrets, "uid-1", "default", &good);
+        assert_eq!(resolve().valid.get(&key), Some(&good));
+
+        stored(&mut secrets, "uid-1", "default", &garbage());
+        let resolved = resolve();
+        assert_eq!(resolved.valid.get(&key), Some(&good), "the last good pair");
+        assert_eq!(resolved.errors[&key].reason(), "InvalidCertificateRef");
+        let (listeners, _) = validate_gateway(&gw, "default", &resolved);
+        assert!(!listeners["https"].resolved_refs);
+        assert_eq!(
+            listeners["https"].resolved_refs_reason,
+            "InvalidCertificateRef"
+        );
+
+        stored(&mut secrets, "uid-2", "default", &garbage());
+        assert!(resolve().valid.is_empty(), "another Secret under its name");
+        stored(&mut secrets, "uid-1", "default", &garbage());
+        assert!(resolve().valid.is_empty(), "forgotten with the old UID");
+
+        stored(&mut secrets, "uid-2", "default", &next);
+        assert_eq!(resolve().valid.get(&key), Some(&next));
+        stored(&mut secrets, "uid-2", "default", &garbage());
+        assert_eq!(resolve().valid.get(&key), Some(&next));
+    }
+
+    /// A certificateRef of another kind never resolves the Secret that
+    /// shares its name: it was served, though reported unresolved.
+    #[test]
+    fn a_ref_of_another_kind_never_resolves_a_secret() {
+        let Some(good) = generate_test_cert("app.example.com") else {
+            return; // openssl unavailable
+        };
+        let mut secrets = Writer::<Secret>::default();
+        stored(&mut secrets, "uid-1", "default", &good);
+        let mut gw = https_gateway("cert");
+        let tls = gw.spec.listeners[0].tls.as_mut().unwrap();
+        tls.certificate_refs.as_mut().unwrap()[0].kind = Some("ConfigMap".into());
+
+        let resolved = resolve_gateway_certs(
+            &gw,
+            "default",
+            &[],
+            &secrets.as_reader(),
+            &LastGoodCerts::default(),
+        );
+        assert!(resolved.valid.is_empty());
+        let (listeners, _) = validate_gateway(&gw, "default", &resolved);
+        assert!(!listeners["https"].resolved_refs);
+        let config = crate::kubernetes::converters::convert_gateway(&gw, &resolved.valid).unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
+        assert!(tls.certificate_refs.is_empty());
+    }
+
+    /// Only the Secrets some Gateway references keep their last good pair.
+    #[test]
+    fn last_good_certs_keep_only_referenced_secrets() {
+        let last = LastGoodCerts::default();
+        for ns in ["default", "certs"] {
+            last.0.lock().unwrap().insert(
+                cert_key(ns),
+                LastGood {
+                    uid: "uid".into(),
+                    pair: garbage(),
+                },
+            );
+        }
+        last.retain_referenced(&[Arc::new(gateway_with_cert_in("certs"))]);
+        let kept: Vec<_> = last.0.lock().unwrap().keys().cloned().collect();
+        assert_eq!(kept, vec![cert_key("certs")]);
+
+        last.retain_referenced(&[]);
+        assert!(last.0.lock().unwrap().is_empty());
+    }
+
+    const SNI: &str = "app.example.com";
+
+    /// Far past a loopback handshake: only a hung one reaches it.
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The cert the data plane on `port` presents for `sni`, or why it
+    /// presents none.
+    async fn presented(port: u16, sni: &str) -> Result<Vec<u8>, String> {
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+        let handshake = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp);
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(Ok(tls)) => Ok(tls.get_ref().1.peer_certificates().unwrap()[0].to_vec()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("handshake timed out".into()),
+        }
+    }
+
+    fn der(pem: &[u8]) -> Vec<u8> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(pem)
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The pipeline's Gateway with its HTTPS listener on `port`, its cert
+    /// Secret `cert` in `ns`.
+    fn pipeline_gateway(port: u16, ns: &str) -> Gateway {
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners = gateway_with_cert_in(ns).spec.listeners;
+        gw.spec.listeners[0].port = port.into();
+        gw
+    }
+
+    /// Condition `kind` of `listener` in the last status write of the
+    /// pipeline's Gateway.
+    fn condition(p: &Pipeline, listener: &str, kind: &str) -> serde_json::Value {
+        let patch = p.api.status_patch("gateways", "gw").unwrap();
+        let listener = patch["status"]["listeners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == listener)
+            .unwrap();
+        listener["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == kind)
+            .unwrap()
+            .clone()
+    }
+
+    /// Listener `name` of what the hub serves for `gw` keeps its TLS
+    /// config, with no certificateRef left.
+    fn served_without_refs(p: &Pipeline, gw: &Gateway, name: &str) {
+        let served = p.served(gw).unwrap();
+        let listener = served
+            .config
+            .gateway
+            .listeners
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("{name} is served"));
+        assert!(listener.tls.as_ref().unwrap().certificate_refs.is_empty());
+    }
+
+    /// Accepted True, ResolvedRefs False for `reason`: the listener stays,
+    /// its refs do not resolve.
+    fn unresolved(p: &Pipeline, listener: &str, reason: &str) {
+        assert_eq!(condition(p, listener, "Accepted")["status"], "True");
+        let resolved_refs = condition(p, listener, "ResolvedRefs");
+        assert_eq!(resolved_refs["status"], "False", "{resolved_refs}");
+        assert_eq!(resolved_refs["reason"], reason);
+    }
+
+    /// A revoked ReferenceGrant refuses the listener's SNI in the pass
+    /// that sees it. The data plane kept the cert, as for a bad rotation.
+    #[tokio::test]
+    async fn a_revoked_reference_grant_refuses_the_sni_at_once() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(good) = generate_test_cert(SNI) else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "certs", &good);
+        apply(&mut p.cluster.reference_grants, secret_grant());
+        let gw = pipeline_gateway(port, "certs");
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+
+        p.cluster
+            .reference_grants
+            .apply_watcher_event(&watcher::Event::Delete(secret_grant()));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let after = presented(port, SNI).await;
+        assert!(after.is_err(), "served after the revoke: {after:?}");
+        unresolved(&p, "https", "RefNotPermitted");
+        served_without_refs(&p, &gw, "https");
+    }
+
+    /// A deleted Secret refuses the listener's SNI in the pass that sees
+    /// it; the data plane kept the cert, as for a bad rotation.
+    #[tokio::test]
+    async fn a_deleted_secret_refuses_the_sni_at_once() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(good) = generate_test_cert(SNI) else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "default", &good);
+        let gw = pipeline_gateway(port, "default");
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+
+        let mut deleted = tls_secret("cert", "default", &good.0, &good.1);
+        deleted.metadata.uid = Some("uid-1".into());
+        p.cluster
+            .secrets
+            .apply_watcher_event(&watcher::Event::Delete(deleted));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let after = presented(port, SNI).await;
+        assert!(after.is_err(), "served after the delete: {after:?}");
+        unresolved(&p, "https", "InvalidCertificateRef");
+        served_without_refs(&p, &gw, "https");
+    }
+
+    /// A hostname listener whose grant is revoked refuses its SNI beside a
+    /// catch-all HTTPS sibling on its port: the SNI is its by listener
+    /// precedence, so the sibling's cert must not answer it. Left out of
+    /// the snapshot, the listener would hand its SNI to the sibling.
+    #[tokio::test]
+    async fn a_revoked_hostname_listener_never_falls_to_a_catch_all_sibling() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(own), Some(sibling)) = (generate_test_cert(SNI), generate_test_cert("any"))
+        else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "certs", &own);
+        let mut fallback = tls_secret("fallback", "default", &sibling.0, &sibling.1);
+        fallback.metadata.uid = Some("uid-2".into());
+        apply(&mut p.cluster.secrets, fallback);
+        apply(&mut p.cluster.reference_grants, secret_grant());
+        let mut gw = pipeline_gateway(port, "certs");
+        gw.spec.listeners[0].hostname = Some(SNI.into());
+        let mut catch_all = https_gateway("fallback").spec.listeners.remove(0);
+        catch_all.name = "catch-all".into();
+        catch_all.port = port.into();
+        gw.spec.listeners.push(catch_all);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&own.0)));
+        assert_eq!(
+            presented(port, "other.example.com").await,
+            Ok(der(&sibling.0))
+        );
+
+        p.cluster
+            .reference_grants
+            .apply_watcher_event(&watcher::Event::Delete(secret_grant()));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let after = presented(port, SNI).await;
+        assert!(after.is_err(), "served after the revoke: {after:?}");
+        assert_eq!(
+            presented(port, "other.example.com").await,
+            Ok(der(&sibling.0)),
+            "the sibling still serves"
+        );
+        unresolved(&p, "https", "RefNotPermitted");
+        served_without_refs(&p, &gw, "https");
+    }
+
+    /// A bad rotation keeps the last good cert served, ResolvedRefs False,
+    /// and the snapshot carries it: a data plane that starts after the
+    /// rotation serves it too. The snapshot carried no cert at all.
+    #[tokio::test]
+    async fn a_bad_rotation_serves_the_last_good_cert() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(good) = generate_test_cert(SNI) else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "default", &good);
+        let gw = pipeline_gateway(port, "default");
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+
+        stored(&mut p.cluster.secrets, "uid-1", "default", &garbage());
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+        unresolved(&p, "https", "InvalidCertificateRef");
+        let served = p.served(&gw).unwrap();
+        let certs: Vec<&[u8]> = served
+            .certificates
+            .iter()
+            .map(|c| c.cert_pem.as_bytes())
+            .collect();
+        assert_eq!(certs, vec![good.0.as_slice()]);
+    }
+
+    /// TCP and UDP listeners on one port both bind, with nothing else on
+    /// it. Alone: a child another test spawns holds this process's probe
+    /// sockets until its exec, and a bind right after the probe fails.
+    #[test]
+    fn tcp_and_udp_listeners_on_one_port_both_bind() {
+        if !crate::proxy::test_util::in_own_process(
+            module_path!(),
+            "tcp_and_udp_listeners_on_one_port_both_bind",
+        ) {
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let port = loop {
+                    let port = crate::proxy::data_plane::test_ports::wildcard();
+                    if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+                        break port;
+                    }
+                };
+                let mut p = Pipeline::new();
+                let mut gw = testkit::gateway("gw", 1);
+                gw.spec.listeners = vec![
+                    listener("dns-tcp", port.into(), "TCP", None),
+                    listener("dns-udp", port.into(), "UDP", None),
+                ];
+                apply(&mut p.cluster.gateways, gw.clone());
+                p.pass(&gw).await.unwrap();
+
+                assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                assert!(
+                    std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
+                    "the UDP port is the data plane's"
+                );
+                let patch = p.api.status_patch("gateways", "gw").unwrap();
+                for listener in patch["status"]["listeners"].as_array().unwrap() {
+                    let programmed = listener["conditions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c["type"] == "Programmed")
+                        .unwrap();
+                    assert_eq!(programmed["status"], "True", "{listener}");
+                }
+            });
     }
 }

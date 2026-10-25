@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration bench bench-baseline bench-check fmt clippy conformance
+.PHONY: build test test-all test-integration bench bench-baseline bench-check fmt clippy manifests conformance
 
 build:
 	cargo build --release
@@ -30,6 +30,10 @@ fmt:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
-# Creates its own kind cluster; needs the operator checkout (OPERATOR_DIR, default ../portail-operator).
+manifests:
+	scripts/check-manifests.sh
+
+# Creates its own kind cluster and installs deploy/conformance on it.
+# PROGRAMMED_SAMPLES=N also times N Gateway creates to Programmed first.
 conformance:
 	cd conformance && go test -v -timeout 45m -run TestConformance -count=1

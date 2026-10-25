@@ -1,0 +1,131 @@
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: portail-controller
+    app.kubernetes.io/name: portail
+    gateway.networking.k8s.io/gateway-name: portail
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
+    portail.epheo.eu/gateway: portail
+  name: portail-portail
+  namespace: edge
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    controller: true
+    kind: Gateway
+    name: portail
+    uid: portail-uid
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: portail-controller
+    app.kubernetes.io/name: portail
+    gateway.networking.k8s.io/gateway-name: portail
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
+    portail.epheo.eu/gateway: portail
+  name: portail-portail
+  namespace: edge
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    controller: true
+    kind: Gateway
+    name: portail
+    uid: portail-uid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      portail.epheo.eu/gateway: portail
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"udn-a"}]'
+      labels:
+        app.kubernetes.io/managed-by: portail-controller
+        app.kubernetes.io/name: portail
+        gateway.networking.k8s.io/gateway-name: portail
+        portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
+        portail.epheo.eu/gateway: portail
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - args:
+        - dataplane
+        - --gateway
+        - edge/portail
+        - --controller-address
+        - https://portail-controller.portail-system.svc:9443
+        - --admin-address
+        - $(POD_IP)
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: PORTAIL_CONTROLLER_CA
+          value: |
+            -----BEGIN CERTIFICATE-----
+            MIIB
+            -----END CERTIFICATE-----
+        - name: PORTAIL_WORKER_THREADS
+          value: '2'
+        image: ghcr.io/epheo/portail:test
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /livez
+            port: 19099
+          periodSeconds: 10
+        name: portail
+        readinessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /readyz
+            port: 19099
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: '2'
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        startupProbe:
+          failureThreshold: 30
+          httpGet:
+            path: /livez
+            port: 19099
+          periodSeconds: 1
+        volumeMounts:
+        - mountPath: /var/run/secrets/portail.epheo.eu/controller
+          name: controller-token
+          readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: portail-portail
+      terminationGracePeriodSeconds: 40
+      volumes:
+      - name: controller-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: portail-controller.portail-system.svc
+              expirationSeconds: 3600
+              path: token

@@ -603,7 +603,9 @@ impl PortailConfig {
 }
 
 /// Rule filters in the table's form. A mirror DNS cannot resolve is left
-/// out when the policy is lenient: primary traffic never depends on it.
+/// out when the policy is lenient: primary traffic never depends on it. A
+/// mirror to a refused backend (`invalid`) is left out always, its share of
+/// copies lost as a refused backend's share of requests fails.
 fn rule_filters(
     filters: &[CompiledFilter],
     resolver: &mut Resolver,
@@ -612,6 +614,7 @@ fn rule_filters(
     for f in filters {
         match f {
             CompiledFilter::Ready(filter) => out.push(filter.clone()),
+            CompiledFilter::Mirror { backend, .. } if backend.invalid => {}
             CompiledFilter::Mirror { backend, fraction } => {
                 // Copies go to one endpoint (HTTPRequestMirrorFilter.backendRef).
                 // The smallest address, not the resolver's first: records
@@ -698,6 +701,29 @@ mod tests {
 
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("-5s").is_err());
+        assert!(parse_duration("1m-5s").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("5x").is_err());
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+    }
+
+    /// A snapshot carries durations as text: 90s went out as "1m30s",
+    /// which did not parse back, and 1.5s as "1s".
+    #[test]
+    fn durations_survive_their_text_form() {
+        use super::super::parsing::format_duration;
+        for d in [
+            Duration::ZERO,
+            Duration::from_nanos(7),
+            Duration::from_micros(250),
+            Duration::from_millis(1500),
+            Duration::from_secs(90),
+            Duration::from_secs(3661),
+            Duration::new(3661, 1_002_003),
+        ] {
+            assert_eq!(parse_duration(&format_duration(&d)).unwrap(), d, "{d:?}");
+        }
     }
 
     #[test]
@@ -725,6 +751,30 @@ mod tests {
             }
         }
         ports
+    }
+
+    /// The controller's snapshot carries a config through JSON: a lost
+    /// `invalid` would forward to a refused backend, a lost namespace would
+    /// leave the ref without its PEMs.
+    #[test]
+    fn invalid_backends_and_cert_namespaces_survive_json() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [{
+                "name": "h", "protocol": "HTTPS", "port": 443,
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "c", "namespace": "certs"}]}
+            }]},
+            "httpRoutes": [{"hostnames": ["a.example"], "rules": [{"backendRefs": [
+                {"name": "127.0.0.1", "port": 8001, "invalid": true},
+                {"name": "127.0.0.1", "port": 8002}
+            ]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let again: PortailConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        let refs = &again.http_routes[0].rules[0].backend_refs;
+        assert!(refs[0].invalid && !refs[1].invalid);
+        let tls = again.gateway.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(tls.certificate_refs[0].namespace.as_deref(), Some("certs"));
     }
 
     #[test]
@@ -1357,6 +1407,32 @@ mod tests {
         } else {
             panic!("expected RequestMirror filter");
         }
+    }
+
+    /// A refused mirror backend is never resolved: no copy goes to it. A
+    /// file's `invalid: true` was ignored on a mirror and the copies went.
+    #[test]
+    fn an_invalid_mirror_backend_gets_no_copies() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "filters": [{"type": "RequestMirror", "requestMirror": {
+                        "backendRef": {"name": "127.0.0.1", "port": 9999, "invalid": true}}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(rule.filters.is_empty(), "{:?}", rule.filters.len());
+        assert_eq!(rule.backends.len(), 1, "the route still serves");
     }
 
     #[test]

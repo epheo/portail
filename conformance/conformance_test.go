@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,10 +25,10 @@ import (
 const (
 	clusterName       = "portail"
 	gatewayAPIVersion = "v1.4.1"
-	// Kept current by the release workflow's version-sync step.
+	// scripts/release.sh sets it; publish.yml refuses a tag it does not match.
 	portailVersion = "v0.1.29"
 	portailImage   = "ghcr.io/epheo/portail:latest"
-	operatorImage  = "quay.io/epheo/portail-operator:latest"
+	controllerNS   = "portail-system"
 )
 
 var kubeconfigPath string
@@ -65,12 +67,11 @@ func TestMain(m *testing.M) {
 
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
-	// No TimeoutConfig overrides — per-Gateway scoping landed in the
-	// per-gateway-scoping branch, so the suite's upstream defaults
-	// (60s GatewayStatus/RouteCondition/RouteMustHaveParents,
-	// 30s MaxTimeToConsistency, 60s DefaultTestTimeout) leave ample
-	// headroom over the empirically measured worst case (~13s) for
-	// fresh Gateway provisioning through portail-operator.
+	// No TimeoutConfig overrides: the upstream defaults (60s GatewayStatus,
+	// RouteCondition and RouteMustHaveParents, 30s MaxTimeToConsistency,
+	// 60s DefaultTestTimeout) were ample over the worst Gateway create to
+	// Programmed measured through portail-operator (about 13s). Measure
+	// it again with PROGRAMMED_SAMPLES.
 	if addrs := os.Getenv("USABLE_ADDRESSES"); addrs != "" {
 		opts.UsableNetworkAddresses = parseAddresses(addrs)
 	}
@@ -88,11 +89,6 @@ func setup(provider *cluster.Provider, runtime string, cleanup func()) error {
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
-  kubeadmConfigPatches:
-  - |
-    kind: KubeletConfiguration
-    allowedUnsafeSysctls:
-    - "net.ipv4.ip_unprivileged_port_start"
 `)
 	if err := provider.Create(clusterName,
 		cluster.CreateWithRawConfig(kindConfig),
@@ -118,19 +114,6 @@ nodes:
 	}
 	log.Println("Loading portail image into Kind...")
 	if err := loadImageIntoKind(provider, runtime, portailImage); err != nil {
-		return err
-	}
-
-	// Build + load the operator image — it provisions the per-Gateway data planes.
-	operatorDir := os.Getenv("OPERATOR_DIR")
-	if operatorDir == "" {
-		operatorDir = filepath.Join(filepath.Dir(projectDir), "portail-operator")
-	}
-	log.Println("Building and loading operator image...")
-	if err := sh(runtime, "build", "--no-cache", "-t", operatorImage, "-f", filepath.Join(operatorDir, "Containerfile"), operatorDir); err != nil {
-		return err
-	}
-	if err := loadImageIntoKind(provider, runtime, operatorImage); err != nil {
 		return err
 	}
 
@@ -164,31 +147,39 @@ nodes:
 		return err
 	}
 
-	log.Println("Deploying portail-operator...")
-	if err := kc("apply", "-k", filepath.Join(operatorDir, "config", "default")); err != nil {
+	// The overlay's GatewayParameters needs its CRD established: one apply
+	// of both would refuse it as an unknown kind.
+	log.Println("Installing portail (deploy/conformance)...")
+	deployDir := filepath.Join(projectDir, "deploy")
+	if err := kc("apply", "--server-side", "-k", filepath.Join(deployDir, "crds")); err != nil {
 		return err
 	}
-	// kustomize ships a placeholder image; point the manager at the loaded one.
-	if err := kc("-n", "portail-operator-system", "set", "image",
-		"deployment/portail-operator-controller-manager", "manager="+operatorImage); err != nil {
+	if err := kc("wait", "--for=condition=established", "--timeout=60s",
+		"crd/gatewayparameters.portail.epheo.eu", "crd/ratelimitpolicies.portail.epheo.eu"); err != nil {
 		return err
 	}
-	// One data-plane replica per Gateway keeps the single Kind node's pod/thread
-	// count manageable (appended; Go's flag package takes the last value).
-	if err := kc("-n", "portail-operator-system", "patch",
-		"deployment/portail-operator-controller-manager", "--type=json",
-		"-p", `[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--default-replicas=1"}]`); err != nil {
+	if err := kc("apply", "--server-side", "-k", filepath.Join(deployDir, "conformance")); err != nil {
 		return err
 	}
-	if err := kc("wait", "deployment/portail-operator-controller-manager",
-		"-n", "portail-operator-system", "--for=condition=available", "--timeout=180s"); err != nil {
+	if err := kc("wait", "deployment/portail-controller", "-n", controllerNS,
+		"--for=condition=available", "--timeout=180s"); err != nil {
 		return err
 	}
 
-	// The operator creates and accepts the GatewayClass under leader election.
+	// The controller leader writes the GatewayClass status.
 	log.Println("Waiting for GatewayClass 'portail' to be accepted...")
 	if err := waitForGatewayClassAccepted("portail", 2*time.Minute); err != nil {
 		return err
+	}
+
+	if n := os.Getenv("PROGRAMMED_SAMPLES"); n != "" {
+		samples, err := strconv.Atoi(n)
+		if err != nil || samples < 1 {
+			return fmt.Errorf("PROGRAMMED_SAMPLES=%q: want a positive count", n)
+		}
+		if err := measureProgrammed(samples); err != nil {
+			return err
+		}
 	}
 
 	out, err := exec.Command(runtime, "run", "--rm", portailImage, "--supported-features").Output()
@@ -198,9 +189,9 @@ nodes:
 	features := strings.TrimSpace(string(out))
 	log.Printf("Supported features: %s", features)
 
-	// Reserve the top of the MetalLB pool as the "usable" static address for
-	// the GatewayStaticAddresses tests (the operator maps spec.addresses to the
-	// Service's requested LB IP). Auto-assigned VIPs come from the same pool.
+	// The top of the MetalLB pool is the suite's "usable" address. Its
+	// GatewayStaticAddresses tests are skipped while portail does not claim
+	// the feature; auto-assigned VIPs come from the same pool.
 	usableIP := poolEndIP(poolRange)
 
 	// Execute tests on the Kind network: MetalLB L2 VIPs are only reachable
@@ -427,7 +418,7 @@ func loadImageIntoKind(provider *cluster.Provider, runtime, image string) error 
 }
 
 // waitForGatewayClassAccepted blocks until the named GatewayClass reports
-// Accepted=True (the operator sets this under leader election).
+// Accepted=True.
 func waitForGatewayClassAccepted(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -441,6 +432,56 @@ func waitForGatewayClassAccepted(name string, timeout time.Duration) error {
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// measureProgrammed creates and deletes a one-listener Gateway samples times,
+// timing each create to Programmed, and logs the median, p95 and worst.
+// kubectl wait watches the condition, so a sample is not rounded to a poll.
+// Each sample has its own name: a data plane of the previous one, still
+// awaiting garbage collection, would hold the name and delay the next.
+func measureProgrammed(samples int) error {
+	path := filepath.Join(os.TempDir(), "programmed-probe.yaml")
+	defer os.Remove(path)
+
+	took := make([]time.Duration, 0, samples)
+	for i := 0; i < samples; i++ {
+		name := fmt.Sprintf("programmed-probe-%d", i)
+		gateway := fmt.Sprintf(`apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+  namespace: default
+spec:
+  gatewayClassName: portail
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+`, name)
+		if err := os.WriteFile(path, []byte(gateway), 0644); err != nil {
+			return err
+		}
+		start := time.Now()
+		if err := kc("apply", "-f", path); err != nil {
+			return err
+		}
+		// The suite's own GatewayStatus timeout: a slower sample would fail it.
+		if err := kc("wait", "-n", "default", "gateway/"+name,
+			"--for=condition=Programmed", "--timeout=60s"); err != nil {
+			return fmt.Errorf("sample %d: %w", i, err)
+		}
+		took = append(took, time.Since(start))
+		if err := kc("delete", "-f", path); err != nil {
+			return err
+		}
+	}
+	sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
+	quantile := func(q float64) time.Duration {
+		return took[int(q*float64(len(took)-1)+0.5)]
+	}
+	log.Printf("Gateway create to Programmed over %d samples: median %s, p95 %s, worst %s",
+		samples, quantile(0.5), quantile(0.95), took[len(took)-1])
+	return nil
 }
 
 // poolEndIP returns the last IP of a "start-end" MetalLB pool range.

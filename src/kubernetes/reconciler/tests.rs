@@ -570,10 +570,14 @@ fn test_multiple_listeners() {
 fn test_tls_terminate_listener() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
+    let certs = HashMap::from([(
+        ("my-cert".to_string(), "default".to_string()),
+        (b"cert".to_vec(), b"key".to_vec()),
+    )]);
     let result = reconcile_to_config(
         &gw,
         &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
-        &HashMap::new(),
+        &certs,
         &empty_services(),
     )
     .unwrap();
@@ -2798,113 +2802,6 @@ fn test_route_acceptance_tracked() {
     assert_eq!(result.route_status[0].namespace, "default");
 }
 
-// --- fronting-Service targetPort resolution ---
-
-use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-
-fn fronting_service(ns: &str, gw: &str, ports: &[(i32, Option<IntOrString>)]) -> Service {
-    let mut labels = BTreeMap::new();
-    labels.insert("portail.epheo.eu/gateway".to_string(), gw.to_string());
-    Service {
-        metadata: ObjectMeta {
-            name: Some(format!("portail-{gw}")),
-            namespace: Some(ns.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            ports: Some(
-                ports
-                    .iter()
-                    .map(|(p, t)| ServicePort {
-                        port: *p,
-                        target_port: t.clone(),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-#[test]
-fn target_ports_maps_privileged_and_unprivileged() {
-    let svc = fronting_service(
-        "default",
-        "gw",
-        &[
-            (80, Some(IntOrString::Int(8000))),
-            (443, Some(IntOrString::Int(8001))),
-            (8080, Some(IntOrString::Int(8080))),
-        ],
-    );
-    let map = resolve_listener_target_ports(&[Arc::new(svc)], "default", "gw");
-    assert_eq!(map.get(&80), Some(&8000));
-    assert_eq!(map.get(&443), Some(&8001));
-    assert_eq!(map.get(&8080), Some(&8080));
-}
-
-#[test]
-fn target_ports_empty_without_matching_service() {
-    let wrong_gw = fronting_service("default", "other", &[(80, Some(IntOrString::Int(8000)))]);
-    assert!(resolve_listener_target_ports(&[Arc::new(wrong_gw)], "default", "gw").is_empty());
-
-    let wrong_ns = fronting_service("elsewhere", "gw", &[(80, Some(IntOrString::Int(8000)))]);
-    assert!(resolve_listener_target_ports(&[Arc::new(wrong_ns)], "default", "gw").is_empty());
-
-    assert!(resolve_listener_target_ports(&[], "default", "gw").is_empty());
-}
-
-#[test]
-fn target_ports_skips_named_target_port() {
-    let svc = fronting_service(
-        "default",
-        "gw",
-        &[
-            (80, Some(IntOrString::String("http".to_string()))),
-            (443, Some(IntOrString::Int(8001))),
-        ],
-    );
-    let map = resolve_listener_target_ports(&[Arc::new(svc)], "default", "gw");
-    assert_eq!(map.get(&80), None);
-    assert_eq!(map.get(&443), Some(&8001));
-}
-
-#[test]
-fn reconcile_stamps_listener_target_port_from_fronting_service() {
-    let gw = test_gateway(); // listener "http" published on 8080
-    let snapshot = ClusterSnapshot {
-        http_routes: vec![],
-        tcp_routes: vec![],
-        tls_routes: vec![],
-        udp_routes: vec![],
-        namespace_labels: default_ns_labels(),
-        reference_grants: vec![],
-        rate_limit_policies: vec![],
-        services: vec![Arc::new(fronting_service(
-            "default",
-            "test-gw",
-            &[(8080, Some(IntOrString::Int(18080)))],
-        ))],
-    };
-    let result = reconcile_to_config(&gw, &snapshot, &HashMap::new(), &empty_services()).unwrap();
-    let http = result
-        .config
-        .gateway
-        .listeners
-        .iter()
-        .find(|l| l.port == 8080)
-        .expect("http listener present");
-    assert_eq!(
-        http.target_port,
-        Some(18080),
-        "listener must carry the fronting Service's targetPort"
-    );
-}
-
 /// `status_parents_json` must yield exactly what serializing the whole
 /// route and reading `/status/parents` used to yield — the fingerprint's
 /// clobber detection depends on that equivalence.
@@ -3620,6 +3517,70 @@ fn udp_route_attaches_like_tcp() {
     );
     assert!(status_of(&result, "older").accepted);
     assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+}
+
+/// DNS over TCP and UDP on one port: both listeners are served, each with
+/// its own kind of route. They were ProtocolConflict, and neither bound.
+#[test]
+fn tcp_and_udp_listeners_on_one_port_both_serve() {
+    let gw = attach_gateway(vec![
+        gw_listener("dns-tcp", 53, "TCP"),
+        gw_listener("dns-udp", 53, "UDP"),
+    ]);
+    let tcp = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let udp = UDPRoute {
+        metadata: ObjectMeta {
+            name: Some("u".to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(100),
+            ..Default::default()
+        },
+        spec: UDPRouteSpec {
+            parent_refs: Some(vec![UDPRouteParentRefs {
+                name: "gw".to_string(),
+                port: Some(53),
+                ..Default::default()
+            }]),
+            rules: vec![UDPRouteRules {
+                backend_refs: vec![UDPRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(7002),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![tcp], vec![udp]));
+
+    let listeners: Vec<(&str, Protocol)> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| (l.name.as_str(), l.protocol.clone()))
+        .collect();
+    assert_eq!(
+        listeners,
+        vec![("dns-tcp", Protocol::TCP), ("dns-udp", Protocol::UDP)]
+    );
+    for (name, listener) in [("t", "dns-tcp"), ("u", "dns-udp")] {
+        let status = status_of(&result, name);
+        assert!(status.accepted, "{name}");
+        assert_eq!(status.listener_names, vec![listener.to_string()], "{name}");
+    }
+    assert_eq!(tcp_backend_port(&table, 53), Some(7001));
+    assert_eq!(
+        table.find_udp_backends(53).unwrap()[0].socket_addr.port(),
+        7002
+    );
 }
 
 /// TLSRoutes claiming the same SNI on one listener overwrote each other in

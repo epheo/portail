@@ -1,27 +1,40 @@
-//! Gateway API controller: kube-rs Controller wiring and shared context.
+//! The Gateway API controller (`portail controller`): cluster-wide
+//! reflectors, one reconcile per Gateway, the hub of snapshots data planes
+//! sync from, and the reports they send back.
 //!
-//! Submodules: [`watch`] (reflector plumbing + WatchShape), [`reconcile`]
-//! (the per-Gateway reconcile pass), [`validate`] (cert resolution and
-//! listener/Gateway condition computation).
+//! Submodules: [`watch`] (reflector plumbing), [`translate`] (Gateway to
+//! config and status), [`reconcile`] (the pass), [`hub`] and [`reports`]
+//! (the sync state), [`validate`] (cert resolution and listener
+//! conditions); `leader`, `server`, `auth`, `ca`, `params`, `provision`,
+//! `programmed`, `gatewayclass` hold the runtime the split adds.
 
+mod auth;
+mod ca;
+mod gatewayclass;
+mod hub;
+mod leader;
+mod params;
+mod programmed;
+mod provision;
 mod reconcile;
+mod reports;
+mod server;
 #[cfg(test)]
 mod testkit;
+mod translate;
 mod validate;
 mod watch;
 
-pub use watch::WatchShape;
-
-use arc_swap::{ArcSwap, ArcSwapOption};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::api::Api;
 use kube::runtime::controller::Action;
-use kube::runtime::reflector::Store;
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
 use kube::runtime::{reflector, Controller, WatchStreamExt};
 use kube::Client;
-use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -34,19 +47,21 @@ use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 use gateway_api::referencegrants::ReferenceGrant;
 
-use crate::kubernetes::addresses::NetworkIps;
-use crate::kubernetes::crds::RateLimitPolicy;
-use crate::kubernetes::dns_refresh::Published;
+use crate::cli::ControllerArgs;
+use crate::kubernetes::addresses::NetworkCidrCache;
+use crate::kubernetes::crds::{GatewayParameters, RateLimitPolicy};
 use crate::kubernetes::reconciler::RouteVerdicts;
 use crate::kubernetes::services::NamedPortCache;
 use crate::logging::{info, warn};
-use crate::routing::RouteTable;
+use crate::sync::GatewayKey;
 
+use hub::Hub;
 use reconcile::reconcile;
+use reports::ReportStore;
 use watch::{
-    all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_gated,
-    create_reflector_gated_with_config, drop_unread_metadata, map_policy_to_gateways,
-    map_route_to_gateways, map_secret_to_gateways, PendingWatches,
+    all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_with_config,
+    drop_unread_metadata, map_policy_to_gateways, map_route_to_gateways, map_secret_to_gateways,
+    Listings, PendingWatches,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -64,6 +79,8 @@ impl std::error::Error for ReconcileError {}
 /// Semantic grouping of reflector stores — cached local copies of cluster resources.
 #[derive(Clone)]
 struct ResourceCache {
+    /// Gateways whose class names this controller are ours.
+    gateway_classes: Store<GatewayClass>,
     gateways: Store<Gateway>,
     http_routes: Store<HTTPRoute>,
     tcp_routes: Store<TCPRoute>,
@@ -75,113 +92,73 @@ struct ResourceCache {
     reference_grants: Store<ReferenceGrant>,
     /// Portail's own policy CRD; empty store when the CRD is not installed.
     rate_limit_policies: Store<RateLimitPolicy>,
-    /// `Some` only in legacy unscoped mode, where portail sees every Gateway
-    /// in the cluster and must filter by GatewayClass controllerName itself.
-    /// Scoped mode trusts the operator's scoping and opens no class watch.
-    gateway_classes: Option<Store<GatewayClass>>,
+    /// Empty store when the CRD is not installed.
+    gateway_parameters: Store<GatewayParameters>,
 }
 
-#[derive(Clone)]
 struct ControllerCtx {
     client: Client,
     controller_name: String,
+    /// The data-plane image of a Managed Gateway whose parameters name none.
+    dataplane_image: String,
     cache: ResourceCache,
-    routes: Arc<ArcSwap<RouteTable>>,
-    /// Last config the reconciler built and the table built from it, published
-    /// for the background DNS-refresh task to re-resolve without an apiserver
-    /// round-trip. `None` until the first successful reconcile.
-    published: Arc<ArcSwapOption<Published>>,
-    data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
-    performance_config: crate::config::PerformanceConfig,
-    /// When false, the operator owns Gateway lifecycle status
-    /// (Accepted/Programmed/addresses); portail reports only listener + route status.
-    manage_gateway_status: bool,
-    /// Flipped to true once the data plane has bound this instance's listener
-    /// ports. Surfaced via the readiness endpoint for the pod's readinessProbe.
-    ready: Arc<std::sync::atomic::AtomicBool>,
-    /// The data plane's last apply: the effective config's fingerprint and
-    /// its build outcome. A pass with the same fingerprint and live
-    /// listeners skips the bind and the rebuild: no table is built, so
-    /// nothing is resolved or compiled for one. Route acceptance compiles
-    /// apart, once per route generation: see `route_verdicts`.
-    last_applied: Arc<std::sync::Mutex<Option<reconcile::Applied>>>,
     route_verdicts: Arc<RouteVerdicts>,
-    /// Serializes the apply section of reconcile (merge → ensure → table
-    /// build → swap → status). kube-rs reconciles different Gateways
-    /// concurrently in unscoped mode, and interleaved passes could publish a
-    /// table built from a stale merge over the shared data plane. Uncontended
-    /// in scoped mode (one Gateway per process).
-    apply_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Last built config and bind addresses per Gateway. In scoped mode this
-    /// holds exactly one entry; in legacy unscoped mode (one process
-    /// watching every Gateway) the entries are merged before each
-    /// route-table build so reconciling Gateway A cannot clobber Gateway B's
-    /// routes in the shared table, nor bind them on its addresses.
-    gateway_configs: Arc<std::sync::Mutex<reconcile::GatewayConfigs>>,
     named_ports: Arc<NamedPortCache>,
-    network_ips: Arc<NetworkIps>,
-    /// When the controller came up — cold-start latency context for the
-    /// "Data plane ready" log line and the not-ready watchdog.
-    started: std::time::Instant,
+    networks: Arc<NetworkCidrCache>,
+    certs: Arc<validate::LastGoodCerts>,
+    hub: Arc<Hub>,
+    reports: Arc<ReportStore>,
+    leader: leader::Leader,
+    /// Whether every reflector delivered its initial list, and which did
+    /// not. The sync server answers 503 until then, /readyz names them.
+    synced: Listings,
+    owned: provision::Owned,
+    /// Wakes the class pass, which removes departed Gateways' entries.
+    departures: gatewayclass::Departures,
 }
 
-pub async fn run_controller(
-    routes: Arc<ArcSwap<RouteTable>>,
-    controller_name: String,
-    shutdown: CancellationToken,
-    data_plane: Arc<std::sync::Mutex<crate::proxy::data_plane::DataPlane>>,
-    performance_config: crate::config::PerformanceConfig,
-    manage_gateway_status: bool,
-    ready: Arc<std::sync::atomic::AtomicBool>,
-    gateway_scope: Option<(String, String)>,
-    watch_shape: WatchShape,
-) -> anyhow::Result<()> {
+/// `portail controller`: run until `shutdown`, the lease is lost or the
+/// Gateway watch ends.
+pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
-
-    // Let the data plane flip /readyz false itself the instant an accept
-    // loop dies, instead of waiting for the next reconcile pass to notice.
-    match data_plane.lock() {
-        Ok(mut dp) => dp.set_ready_flag(ready.clone()),
-        Err(poisoned) => poisoned.into_inner().set_ready_flag(ready.clone()),
-    }
+    // /livez from here on; /readyz once the CA is loaded and the caches
+    // synced. A standby is ready: it answers 503 and the client dials again.
+    let ready = Arc::new(AtomicBool::new(false));
+    tokio::spawn(crate::admin::serve(
+        SocketAddr::new(args.admin.admin_address, args.admin.readiness_port),
+        ready.clone(),
+        shutdown.clone(),
+    ));
+    let Some(ca) = load_ca(&client, &args, &shutdown).await? else {
+        return Ok(());
+    };
+    let elector = leader::start(&client, &args);
+    let leader = elector.leader();
 
     // --- Primary resource: Gateway ---
     // No `predicate_filter(predicates::generation)` here: it caches generation
     // per key and never clears on delete, so deleting and recreating a Gateway
     // with the same name (recreates restart at generation 1) would be
     // suppressed and the recreated Gateway never reconciled. Status-only watch
-    // echoes of our own writes are instead absorbed by reconcile: the
-    // data-plane fingerprint skips the rebuild, and status that already
+    // echoes of our own writes are instead absorbed by reconcile: an
+    // unchanged snapshot is not published again, and status that already
     // matches the store is not written.
-    //
-    // When `gateway_scope` is set (operator-managed Deployments), narrow the
-    // watch to that single Gateway via namespace + `metadata.name` field
-    // selector. The reflector store then holds exactly one object, and every
-    // downstream mapper that already filters by `route_targets_gateway` /
-    // `all_gateway_refs` naturally collapses to "this Gateway or nothing."
-    // Unset = legacy unscoped mode (watch all Gateways cluster-wide).
-    if let Some((ns, name)) = &gateway_scope {
-        info!("Controller scoped to Gateway {}/{}", ns, name);
-    }
+    let listings = Listings::default();
+    let gw_listing = listings.track("Gateway", false);
     let gw_writer = reflector::store::Writer::default();
     let store_gateways = gw_writer.as_reader();
-    let (gw_api, gw_watcher_config) = match &gateway_scope {
-        Some((ns, name)) => (
-            Api::<Gateway>::namespaced(client.clone(), ns),
-            watcher::Config::default().fields(&format!("metadata.name={}", name)),
-        ),
-        None => (
-            Api::<Gateway>::all(client.clone()),
-            watcher::Config::default(),
-        ),
-    };
     // A deletion runs no reconcile. A relist (InitDone) may also have
     // dropped Gateways deleted while the watch was down.
     let gateway_gone = Arc::new(tokio::sync::Notify::new());
     let gw_stream = reflector::reflector(
         gw_writer,
-        watcher::watcher(gw_api, gw_watcher_config).modify(drop_unread_metadata),
+        watcher::watcher(
+            Api::<Gateway>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .modify(drop_unread_metadata)
+        .inspect(move |event| gw_listing.observe(event)),
     )
     .default_backoff()
     .inspect({
@@ -204,90 +181,87 @@ pub async fn run_controller(
     // included) reach reconcile, which absorbs them.
 
     // HTTPRoute is required (GA); TCP/TLS/UDPRoute are experimental (optional).
-    // All route watches stay CLUSTER-WIDE and unconditional: a route in any
-    // namespace, of any kind, may parentRef this Gateway and must get a status
-    // (attached, or rejected with NotAllowedByListeners / NoMatchingParent) —
-    // which requires observing it, so route watches cannot be shape-scoped. The
-    // three optional CRDs are probed concurrently so a contended apiserver does
-    // not serialize the cold start.
+    // A route in any namespace, of any kind, may parentRef a Gateway and must
+    // get a status (attached, or rejected with NotAllowedByListeners /
+    // NoMatchingParent), which requires observing it.
     let (store_http_routes, http_route_stream) =
-        create_reflector(Api::<HTTPRoute>::all(client.clone()));
-    // RateLimitPolicy rides the optional-CRD path like the experimental
-    // routes, and stays cluster-wide and ungated for the same reason routes
-    // do: a policy in any namespace may target this Gateway and must get an
-    // ancestor status, which requires observing it.
-    let pending_watches = PendingWatches::default();
-    let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector) = tokio::join!(
-        create_optional_reflector(
-            Api::<TCPRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<TLSRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<UDPRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<RateLimitPolicy>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
+        create_reflector(Api::<HTTPRoute>::all(client.clone()), &listings);
+    // RateLimitPolicy and GatewayParameters ride the optional-CRD path like
+    // the experimental routes: a plain Gateway API install lacks the routes,
+    // a missing GatewayParameters CRD must not hold every Gateway either.
+    let pending_watches = Arc::new(PendingWatches::default());
+    let (store_tcp_routes, tcp_route_stream) = create_optional_reflector(
+        Api::<TCPRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
     );
-    let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
-    let (store_tls_routes, tls_route_stream) = tls_reflector;
-    let (store_udp_routes, udp_route_stream) = udp_reflector;
-    let (store_rate_limit_policies, policy_stream) = policy_reflector;
+    let (store_tls_routes, tls_route_stream) = create_optional_reflector(
+        Api::<TLSRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_udp_routes, udp_route_stream) = create_optional_reflector(
+        Api::<UDPRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_rate_limit_policies, policy_stream) = create_optional_reflector(
+        Api::<RateLimitPolicy>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_gateway_parameters, params_stream) = create_optional_reflector(
+        Api::<GatewayParameters>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
     tokio::spawn(pending_watches.recheck_every(
         client.clone(),
         Duration::from_secs(RESYNC_SECS),
         shutdown.clone(),
     ));
-    // GatewayClass status is owned by portail-operator now; portail no longer
-    // runs its own GatewayClass controller.
 
-    // The Namespace watch is opened only when a listener uses
-    // `allowedRoutes: Selector` (the only consumer of namespace labels).
-    let (store_namespaces, namespace_stream) = create_reflector_gated(
-        watch_shape.namespaces,
-        Api::<Namespace>::all(client.clone()),
-    );
-    let (store_services, service_stream) = create_reflector(Api::<Service>::all(client.clone()));
+    let (store_namespaces, namespace_stream) =
+        create_reflector(Api::<Namespace>::all(client.clone()), &listings);
+    let (store_services, service_stream) =
+        create_reflector(Api::<Service>::all(client.clone()), &listings);
     let (store_reference_grants, reference_grant_stream) =
-        create_reflector(Api::<ReferenceGrant>::all(client.clone()));
-
-    // GatewayClass — unscoped mode only. Watching every Gateway cluster-wide
-    // means Gateways owned by OTHER controllers land in the store too; the
-    // reconciler filters them by class controllerName, which needs the
-    // classes themselves. Scoped mode is pre-filtered by the operator.
-    let unscoped = gateway_scope.is_none();
+        create_reflector(Api::<ReferenceGrant>::all(client.clone()), &listings);
+    // Every Gateway is watched, other controllers' too: the class tells
+    // which are ours.
     let (store_gateway_classes, gateway_class_stream) =
-        create_reflector_gated(unscoped, Api::<GatewayClass>::all(client.clone()));
-
-    // TLS secrets — field-filtered to type=kubernetes.io/tls, and opened only
-    // when the Gateway has a TLS-terminate listener (watch shape).
-    let (store_secrets, secret_stream) = create_reflector_gated_with_config(
-        watch_shape.tls_secrets,
+        create_reflector(Api::<GatewayClass>::all(client.clone()), &listings);
+    let (class_events, class_changes) = gatewayclass::class_events();
+    let gateway_class_stream = class_events.on(gateway_class_stream);
+    // A class seen before its parameters is judged again when they come.
+    let params_stream = class_events.on(params_stream);
+    // TLS secrets, field-filtered to type=kubernetes.io/tls.
+    let (store_secrets, secret_stream) = create_reflector_with_config(
         Api::<Secret>::all(client.clone()),
         watcher::Config::default()
             .fields("type=kubernetes.io/tls")
             .streaming_lists(),
+        &listings,
     );
-
-    let store_gateways_for_controller = store_gateways.clone();
-
-    let published = Arc::new(ArcSwapOption::<Published>::empty());
+    let (owned, owned_triggers) = provision::Owned::start(
+        &client,
+        store_gateways.clone(),
+        &listings,
+        provision::ControllerEndpoint::new(&args, &ca),
+    );
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),
-        controller_name: controller_name.clone(),
+        controller_name: args.controller_name.clone(),
+        dataplane_image: args.dataplane_image.clone(),
         cache: ResourceCache {
-            gateways: store_gateways,
+            gateway_classes: store_gateway_classes,
+            gateways: store_gateways.clone(),
             http_routes: store_http_routes,
             tcp_routes: store_tcp_routes,
             tls_routes: store_tls_routes,
@@ -297,104 +271,115 @@ pub async fn run_controller(
             secrets: store_secrets,
             reference_grants: store_reference_grants,
             rate_limit_policies: store_rate_limit_policies,
-            gateway_classes: unscoped.then_some(store_gateway_classes),
+            gateway_parameters: store_gateway_parameters,
         },
-        routes,
-        published: published.clone(),
-        data_plane,
-        performance_config,
-        manage_gateway_status,
-        ready,
-        last_applied: Arc::new(std::sync::Mutex::new(None)),
         route_verdicts: Arc::default(),
-        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
-        gateway_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        network_ips: Arc::default(),
         // A stale read lasts as long as before the cache: every requeue
         // listed the slices again.
         named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
-        started: std::time::Instant::now(),
+        networks: Arc::default(),
+        certs: Arc::default(),
+        hub: Arc::default(),
+        reports: Arc::default(),
+        leader: leader.clone(),
+        synced: listings.clone(),
+        owned,
+        departures: Default::default(),
     });
 
-    // Scoped mode serves one Gateway; its deletion ends the pod instead.
-    if unscoped {
+    // Every Gateway is reconciled once the caches are synced: passes before
+    // that returned without a trace. Until then the kinds holding it are
+    // named, with why.
+    let (caches_synced, synced_trigger) = futures::channel::mpsc::unbounded::<()>();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let mut warn_every = tokio::time::interval(Duration::from_secs(UNLISTED_WARN_SECS));
+            warn_every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // interval()'s first tick fires immediately.
+            warn_every.tick().await;
+            while !listings.is_synced() {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = listings.changed() => {}
+                    _ = warn_every.tick() => warn!(
+                        "Caches not synced, nothing is published: {}",
+                        listings
+                            .unlisted()
+                            .iter()
+                            .map(|(kind, cause)| format!("{kind} ({cause})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+            info!("Caches synced");
+            ready.store(true, Ordering::Release);
+            let _ = caches_synced.unbounded_send(());
+        }
+    });
+
+    tokio::spawn({
         let ctx = ctx.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        async move {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    _ = gateway_gone.notified() => reconcile::prune_deleted_gateways(&ctx).await,
+                    _ = gateway_gone.notified() => reconcile::forget_deleted_gateways(&ctx),
                 }
             }
-        });
-    }
-
-    // Cold-start visibility: a pod sitting NotReady because the apiserver is
-    // slow to deliver the first Gateway (or because binds keep failing) used
-    // to do so in total silence — post-mortems burned hours on exactly that
-    // gap. Diagnostic only: nothing gates on this timer.
-    {
-        let watchdog_ready = ctx.ready.clone();
-        let watchdog_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = watchdog_shutdown.cancelled() => {}
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    if !watchdog_ready.load(std::sync::atomic::Ordering::Acquire) {
-                        warn!(
-                            "Not ready 30s after controller start: no listener bound yet — \
-                             apiserver slow, Gateway missing, or binds failing (see errors above)"
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    // STRICT_DNS freshness: re-resolve headless/Service FQDNs on an interval and
-    // swap the route table only when the resolved set changes. This is why the
-    // cluster-wide EndpointSlice watch is unnecessary — DNS already publishes the
-    // per-pod A-records, so pod churn is picked up here without an apiserver watch.
-    let health = match ctx.data_plane.lock() {
-        Ok(dp) => dp.health().clone(),
-        Err(poisoned) => poisoned.into_inner().health().clone(),
-    };
-    // A swap means pods came or went: named targetPorts, whose numbers live
-    // on the pods, are read again by a reconcile of every Gateway. That keeps
-    // them as fresh as the pod IPs, on the same interval.
-    let (pods_changed, named_port_refresh) = futures::channel::mpsc::unbounded::<()>();
-    let named_ports = ctx.named_ports.clone();
-    crate::kubernetes::dns_refresh::spawn_dns_refresh(
-        published,
-        ctx.routes.clone(),
-        health,
-        ctx.performance_config.dns_refresh_interval,
+        }
+    });
+    tokio::spawn(gatewayclass::run(
+        ctx.clone(),
+        class_changes,
         shutdown.clone(),
-        move || {
-            if named_ports.dns_changed() {
-                let _ = pods_changed.unbounded_send(());
-            }
-        },
+    ));
+
+    let tls = ca.server_config();
+    tokio::spawn(ca.keep_renewed(shutdown.clone()));
+    let (lapses, lapse_wakes) = server::Lapses::new();
+    let sync_server = server::SyncServer::new(
+        ctx.clone(),
+        auth::Authenticator::new(
+            client.clone(),
+            &args.namespace,
+            &args.service_name,
+            auth::own_service_account(),
+        ),
+        lapses,
+        shutdown.clone(),
     );
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        args.sync_port,
+    ))
+    .await?;
+    let sync = tokio::spawn(server::serve(sync_server, tls, listener));
+
+    let named_ports = ctx.named_ports.clone();
+    let report_triggers = ctx
+        .reports
+        .triggers()
+        .expect("a fresh report store has its triggers")
+        .map(move |trigger| report_trigger(&named_ports, trigger));
+    let lapse_triggers = lapse_wakes.map(|gateway| gateway_ref(&gateway));
 
     // --- Gateway controller ---
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
     // Secret → map to Gateways referencing it in TLS config (targeted)
-    // Service, Namespace, ReferenceGrant → all Gateways (broad, infrequent changes)
-
+    // Service, Namespace, ReferenceGrant, GatewayClass, GatewayParameters →
+    // all Gateways (broad, infrequent changes)
     // Each watches_stream closure captures an owned gateway store clone via move.
-    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8] =
-        std::array::from_fn::<_, 8, _>(|_| store_gateways_for_controller.clone());
-    let [cn1, cn2, cn3, cn4, cn8] = std::array::from_fn::<_, 5, _>(|_| controller_name.clone());
+    let [gw1, gw2, gw3, gw4, gw5, gw6, gw7, gw8, gw9, gw10, gw11] =
+        std::array::from_fn::<_, 11, _>(|_| store_gateways.clone());
+    let [cn1, cn2, cn3, cn4, cn5] =
+        std::array::from_fn::<_, 5, _>(|_| args.controller_name.clone());
 
-    let gw_controller = Controller::for_stream(gw_stream, store_gateways_for_controller)
+    let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
         // ones its status says we reported on.
-        // No predicate_filter here: it caches generation per object key and never
-        // clears on delete, so delete+recreate with the same name (common in
-        // conformance tests) would be suppressed. The echo of our own status
-        // writes finds nothing to write.
         .watches_stream(http_route_stream, move |route: HTTPRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw1, &cn1)
         })
@@ -413,60 +398,132 @@ pub async fn run_controller(
         })
         // RateLimitPolicy: targeted like routes, by targetRef and status.
         .watches_stream(policy_stream, move |policy: RateLimitPolicy| {
-            map_policy_to_gateways(&policy, &gw8, &cn8)
+            map_policy_to_gateways(&policy, &gw6, &cn5)
         })
-        // Service, Namespace, ReferenceGrant: broad — reconcile all Gateways.
-        // These have complex multi-hop mappings; the 1s debounce coalesces bursts.
-        // (No EndpointSlice watch: backend pod churn is picked up by the DNS-refresh
-        // task, since a headless Service publishes per-pod A-records at its FQDN.)
-        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw6))
-        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw7))
-        .watches_stream(reference_grant_stream, {
-            let gw = ctx.cache.gateways.clone();
-            move |_: ReferenceGrant| all_gateway_refs(&gw)
+        // These have multi-hop mappings; the 1s debounce coalesces bursts.
+        // (No EndpointSlice watch: backend pod churn is picked up by the data
+        // planes' DNS refresh, which their reports carry back.)
+        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw7))
+        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw8))
+        .watches_stream(reference_grant_stream, move |_: ReferenceGrant| {
+            all_gateway_refs(&gw9)
         })
-        // GatewayClass (unscoped only; pending stream when scoped): a class
-        // appearing or changing controllerName flips which Gateways are ours,
-        // so re-evaluate all of them.
-        .watches_stream(gateway_class_stream, {
-            let gw = ctx.cache.gateways.clone();
-            move |_: GatewayClass| all_gateway_refs(&gw)
+        // A class appearing or changing controllerName flips which Gateways
+        // are ours, so re-evaluate all of them.
+        .watches_stream(gateway_class_stream, move |_: GatewayClass| {
+            all_gateway_refs(&gw10)
         })
-        .reconcile_all_on(named_port_refresh)
+        .watches_stream(params_stream, move |_: GatewayParameters| {
+            all_gateway_refs(&gw11)
+        })
+        .reconcile_on(report_triggers)
+        .reconcile_on(lapse_triggers)
+        .reconcile_on(owned_triggers)
+        .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
-        .shutdown_on_signal()
+        // In-flight passes finish before the lease is released below.
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(reconcile, error_policy, ctx);
 
     info!("Gateway API controller started, watching for resource changes");
 
-    tokio::select! {
-        _ = gw_controller.for_each(|result| async move {
-            match result {
-                Ok((_obj_ref, _action)) => {}
-                Err(e) => warn!("Gateway reconciliation error: {}", e),
-            }
-        }) => {
-            info!("Gateway controller stream ended");
+    let controller = gw_controller.for_each(|result| async move {
+        if let Err(e) = result {
+            warn!("Gateway controller: {:#}", anyhow::Error::new(e));
         }
-        _ = shutdown.cancelled() => {
-            info!("Controller received shutdown signal");
+    });
+    until_stopped(controller, sync, leader.lost(), &shutdown).await?;
+    elector.stop().await;
+    Ok(())
+}
+
+/// Until the controller stream ends: on shutdown, once its passes in flight
+/// finished. A stopped sync server is an error unless shutting down; a lost
+/// lease ends it at once, while draining too: a stuck pass must not write
+/// after a standby took the lease.
+async fn until_stopped(
+    controller: impl std::future::Future<Output = ()>,
+    sync: impl std::future::Future<Output = Result<anyhow::Result<()>, tokio::task::JoinError>>,
+    lost: impl std::future::Future<Output = ()>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    let mut controller = std::pin::pin!(controller);
+    let mut lost = std::pin::pin!(lost);
+    enum Exit {
+        Controller,
+        Sync(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        Lost,
+    }
+    let exit = tokio::select! {
+        _ = controller.as_mut() => Exit::Controller,
+        exit = sync => Exit::Sync(exit),
+        _ = lost.as_mut() => Exit::Lost,
+    };
+    match exit {
+        Exit::Controller => info!("Gateway controller stopped"),
+        // A standby's turn: kubelet restarts this process as one.
+        Exit::Lost => anyhow::bail!("leader election lost"),
+        Exit::Sync(_) if shutdown.is_cancelled() => tokio::select! {
+            _ = controller => info!("Gateway controller stopped"),
+            _ = lost => anyhow::bail!("leader election lost"),
+        },
+        Exit::Sync(Ok(Ok(()))) => anyhow::bail!("sync server stopped"),
+        Exit::Sync(Ok(Err(e))) => return Err(e.context("sync server")),
+        Exit::Sync(Err(e)) => anyhow::bail!("sync server task failed: {}", e),
+    }
+    Ok(())
+}
+
+/// The CA, retried at the election's cadence while the apiserver does not
+/// answer; `None` on shutdown. A stored CA that cannot be used is fatal:
+/// someone must delete its Secret.
+async fn load_ca(
+    client: &Client,
+    args: &ControllerArgs,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Option<ca::ControllerCa>> {
+    loop {
+        match ca::load_or_create(client, &args.namespace, &args.service_name).await {
+            Ok(ca) => return Ok(Some(ca)),
+            Err(e @ ca::CaError::Invalid(_)) => return Err(e.into()),
+            Err(e) => warn!("{}; retrying in {:?}", e, leader::RETRY_PERIOD),
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(leader::RETRY_PERIOD) => {}
         }
     }
+}
 
-    Ok(())
+/// The reconcile a report change asks for. Moved DNS means backend pods
+/// came or went, and a named targetPort's number lives on the pods.
+fn report_trigger(named_ports: &NamedPortCache, trigger: reports::Trigger) -> ObjectRef<Gateway> {
+    if trigger.dns_moved {
+        named_ports.dns_changed();
+    }
+    gateway_ref(&trigger.gateway)
+}
+
+fn gateway_ref(gateway: &GatewayKey) -> ObjectRef<Gateway> {
+    ObjectRef::new(&gateway.name).within(&gateway.namespace)
 }
 
 /// The safety-net re-check of a converged Gateway, in seconds.
 const RESYNC_SECS: u64 = 600;
 
-/// Requeue cadence after a reconcile that APPLIED changes. A *converged*
-/// Gateway — its data plane Programmed and every attached route Accepted —
-/// only needs a slow safety-net re-check (600s). An unconverged one re-runs
-/// in 5s so a status write that raced an unsynced reflector cache (or a
-/// missed watch event) heals well inside the conformance 60s accept-gate.
-/// A route held permanently not-Accepted only pays this fast cadence once:
-/// the next pass finds nothing to rebuild or write and drops to the
-/// `skip_requeue_secs` cadence.
+/// How often the kinds holding the caches unsynced are logged: the
+/// cold-start diagnostic cadence the in-pod controller's not-ready
+/// watchdog used.
+const UNLISTED_WARN_SECS: u64 = 30;
+
+/// Requeue cadence after a reconcile that published or wrote something. A
+/// *converged* Gateway — its data plane Programmed and every attached route
+/// Accepted — only needs a slow safety-net re-check (600s). An unconverged
+/// one re-runs in 5s so a status write that raced an unsynced reflector
+/// cache (or a missed watch event) heals well inside the conformance 60s
+/// accept-gate. A route held permanently not-Accepted only pays this fast
+/// cadence once: the next pass finds nothing to publish or write and drops
+/// to the `skip_requeue_secs` cadence.
 fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
         RESYNC_SECS
@@ -475,7 +532,7 @@ fn success_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     }
 }
 
-/// Requeue cadence after a reconcile that rebuilt and wrote nothing: the
+/// Requeue cadence after a reconcile that published and wrote nothing: the
 /// fast heal cadence has nothing to heal, so back off to a periodic re-check.
 fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     if programmed && all_routes_accepted {
@@ -485,14 +542,131 @@ fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     }
 }
 
+/// The retry of a failed pass: the cadence v0.1.x error_policy used, slow
+/// enough not to press a failing apiserver, well inside the safety net.
+const ERROR_REQUEUE_SECS: u64 = 30;
+
 fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
-    warn!("Gateway reconciliation error, requeueing in 30s");
-    Action::requeue(Duration::from_secs(30))
+    warn!(
+        "Gateway reconciliation error, requeueing in {}s",
+        ERROR_REQUEUE_SECS
+    );
+    Action::requeue(Duration::from_secs(ERROR_REQUEUE_SECS))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::testkit::{self, apply, Pipeline};
     use super::*;
+
+    #[test]
+    fn a_report_trigger_reconciles_its_gateway() {
+        let named_ports = NamedPortCache::new(Duration::from_secs(RESYNC_SECS));
+        let trigger = reports::Trigger {
+            gateway: GatewayKey::new("apps", "web"),
+            dns_moved: false,
+        };
+        assert_eq!(
+            report_trigger(&named_ports, trigger),
+            ObjectRef::<Gateway>::new("web").within("apps")
+        );
+    }
+
+    /// A data plane's DNS refresh saw backend pods move: the next pass reads
+    /// the named targetPorts its Gateway's headless backends use again.
+    #[tokio::test]
+    async fn a_moved_dns_epoch_reads_named_target_ports_again() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("db", "web", 80, serde_json::json!("http")),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "db", 80),
+        );
+        p.api.reply_to(
+            "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+            200,
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{"metadata": {"name": "db-1"}, "addressType": "IPv4",
+                           "endpoints": [], "ports": [{"name": "web", "port": 8080}]}],
+            }),
+        );
+        let slice_lists = |p: &Pipeline| {
+            p.api
+                .requests()
+                .iter()
+                .filter(|r| r.method == "GET" && r.path.contains("/endpointslices"))
+                .count()
+        };
+        let trigger = |dns_moved| reports::Trigger {
+            gateway: testkit::key(&gw),
+            dns_moved,
+        };
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 1);
+
+        report_trigger(&p.ctx.named_ports, trigger(false));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 0, "same pods, read from the cache");
+
+        report_trigger(&p.ctx.named_ports, trigger(true));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        assert_eq!(slice_lists(&p), 1, "the pods moved");
+    }
+
+    /// Shutting down, the sync server stopped first and a pass is stuck: a
+    /// lost lease still ends the wait, so the pass cannot write after a
+    /// standby took over.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_ends_a_graceful_stop() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stopping = until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            tokio::time::sleep(Duration::from_secs(10)),
+            &shutdown,
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(60), stopping)
+            .await
+            .expect("the lost lease ended the drain");
+        assert!(stopped
+            .unwrap_err()
+            .to_string()
+            .contains("leader election lost"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_drain_stops_cleanly() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        until_stopped(
+            futures::future::ready(()),
+            futures::future::pending(),
+            futures::future::pending(),
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        // Not shutting down: a sync server that stops is an error.
+        let running = CancellationToken::new();
+        assert!(until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            futures::future::pending(),
+            &running,
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn success_requeue_cadence() {

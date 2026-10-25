@@ -423,11 +423,12 @@ impl PortailProcess {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
     }
 
-    /// Spawn in Kubernetes mode against the apiserver at `apiserver`
-    /// (`None`: a kubeconfig path that does not exist, so no cluster is
-    /// found). Returns at once: no port is bound without a Gateway, and
-    /// the admin endpoint on `admin_port` may never come up.
-    pub fn start_kubernetes(apiserver: Option<SocketAddr>, admin_port: u16) -> Self {
+    /// Spawn a Kubernetes mode, `mode` being the subcommand and its flags,
+    /// against the apiserver at `apiserver` (`None`: a kubeconfig path that
+    /// does not exist, so no cluster is found). Returns at once: no port is
+    /// bound without a Gateway, and the admin endpoint on `admin_port` may
+    /// never come up.
+    pub fn start_kubernetes(mode: &[&str], apiserver: Option<SocketAddr>, admin_port: u16) -> Self {
         let kubeconfig = tempfile::Builder::new()
             .suffix(".yaml")
             .tempfile()
@@ -444,7 +445,7 @@ impl PortailProcess {
         let binary = cargo_bin_path();
         let mut child = unsafe {
             Command::new(&binary)
-                .arg("--kubernetes")
+                .args(mode)
                 .arg("--readiness-port")
                 .arg(admin_port.to_string())
                 .env("KUBECONFIG", &kubeconfig_path)
