@@ -81,7 +81,6 @@ impl Hub {
     /// The Gateway's channel, `None` until its first publish. Creates the
     /// slot: subscribe only to a Gateway known to be ours, or a poll for one
     /// that never comes holds to expiry instead of answering 404.
-    #[allow(dead_code)] // The sync server subscribes; it serves nothing yet.
     pub(crate) fn subscribe(&self, key: &GatewayKey) -> watch::Receiver<Option<Arc<Snapshot>>> {
         self.slots()
             .entry(key.clone())

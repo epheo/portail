@@ -56,7 +56,6 @@ impl ReportStore {
     /// Record `instance`'s report for `gateway` and when it was seen. A
     /// report that differs from the instance's last one triggers a
     /// reconcile of the Gateway.
-    #[allow(dead_code)] // The sync server records; it serves nothing yet.
     pub(crate) fn record(
         &self,
         gateway: &GatewayKey,
