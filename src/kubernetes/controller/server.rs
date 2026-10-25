@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -101,8 +102,8 @@ impl SyncServer {
         })
     }
 
-    /// One request, answered.
-    pub(crate) async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    /// One request from `peer`, answered.
+    pub(crate) async fn handle<B>(&self, request: Request<B>, peer: IpAddr) -> Response<Full<Bytes>>
     where
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -131,7 +132,7 @@ impl SyncServer {
             Ok(claimed) => claimed,
             Err(refusal) => return refused(refusal),
         };
-        let instance = match self.auth.authenticate(&claimed, &token, &key).await {
+        let instance = match self.auth.authenticate(&claimed, &token, &key, peer).await {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
@@ -443,9 +444,15 @@ pub(crate) async fn serve(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 backoff.reset();
-                tokio::spawn(connection(server.clone(), acceptor.clone(), stream, slot));
+                tokio::spawn(connection(
+                    server.clone(),
+                    acceptor.clone(),
+                    stream,
+                    peer.ip(),
+                    slot,
+                ));
             }
             Err(e) => {
                 if let Some(pause) = backoff.after(&e) {
@@ -461,6 +468,7 @@ async fn connection(
     server: Arc<SyncServer>,
     acceptor: TlsAcceptor,
     stream: TcpStream,
+    peer: IpAddr,
     _slot: OwnedSemaphorePermit,
 ) {
     // A peer that cannot complete a handshake is no data plane; the data
@@ -472,7 +480,7 @@ async fn connection(
         let server = server.clone();
         move |request| {
             let server = server.clone();
-            async move { Ok::<_, Infallible>(server.handle(request).await) }
+            async move { Ok::<_, Infallible>(server.handle(request, peer).await) }
         }
     });
     let conn = http1::Builder::new()
@@ -494,7 +502,9 @@ async fn connection(
 
 #[cfg(test)]
 mod tests {
-    use super::super::auth::testing::{authenticator, gateway_token, review, token_of, REVIEWS};
+    use super::super::auth::testing::{
+        authenticator, gateway_token, peer, review, token_of, PEER, REVIEWS,
+    };
     use super::super::auth::METRICS_SERIAL;
     use super::super::testkit::{self, apply, gateway_class, MockApi, TestCluster, CONTROLLER};
     use super::*;
@@ -579,7 +589,7 @@ mod tests {
         }
 
         async fn sync(&self, request: Request<Full<Bytes>>) -> Response<Full<Bytes>> {
-            self.server.handle(request).await
+            self.server.handle(request, PEER).await
         }
     }
 
@@ -881,7 +891,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            f.server.handle(request).await.status(),
+            f.server.handle(request, PEER).await.status(),
             StatusCode::UNAUTHORIZED
         );
         assert!(!read.load(Ordering::SeqCst));
@@ -902,7 +912,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            f.server.handle(request).await.status(),
+            f.server.handle(request, PEER).await.status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
@@ -1016,7 +1026,7 @@ mod tests {
         );
         let poll = tokio::spawn({
             let server = f.server.clone();
-            async move { server.handle(request).await }
+            async move { server.handle(request, PEER).await }
         });
         tokio::time::sleep(Duration::from_millis(1)).await;
         let live = f.ctx.reports.live(&key());
@@ -1108,7 +1118,7 @@ mod tests {
                     Some(&gateway_token("default", "gw", 100 + n)),
                     &body(&key(), "", None),
                 );
-                tokio::spawn(async move { server.handle(request).await })
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
             })
             .collect();
         let mut waited = 0;
@@ -1221,14 +1231,14 @@ mod tests {
         };
         let read = Arc::new(AtomicBool::new(false));
         let other = token_of("default", "portail-other", 0);
-        let response = f.server.handle(watched(&other, &read)).await;
+        let response = f.server.handle(watched(&other, &read), PEER).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!read.load(Ordering::SeqCst));
         assert_eq!(f.reviews(), 0);
 
         f.api.reply_to(REVIEWS, 201, review(false, "", None));
         let rejected = gateway_token("default", "gw", 1);
-        let response = f.server.handle(watched(&rejected, &read)).await;
+        let response = f.server.handle(watched(&rejected, &read), PEER).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!read.load(Ordering::SeqCst));
         assert_eq!(f.reviews(), 1);
@@ -1296,6 +1306,8 @@ mod tests {
     async fn body_reads_are_capped_and_a_stalled_body_ends_in_5s() {
         let f = Arc::new(fixture());
         let token = gateway_token("default", "gw", 0);
+        f.publish(1);
+        assert_eq!(f.sync(poll("")).await.status(), StatusCode::OK, "reviewed");
         let started = Instant::now();
         let stalled: Vec<_> = (0..MAX_BODY_READS)
             .map(|_| {
@@ -1304,7 +1316,7 @@ mod tests {
                     .body(Stalled)
                     .unwrap();
                 let server = f.server.clone();
-                tokio::spawn(async move { server.handle(request).await })
+                tokio::spawn(async move { server.handle(request, PEER).await })
             })
             .collect();
         for _ in 0..100 {
@@ -1318,8 +1330,8 @@ mod tests {
             assert_eq!(request.await.unwrap().status(), StatusCode::BAD_REQUEST);
         }
         assert_eq!(started.elapsed(), PEER_TIMEOUT);
-        let v1 = f.publish(1);
-        assert_eq!(version_of(f.sync(poll("")).await).await, v1, "freed");
+        let v2 = f.publish(2);
+        assert_eq!(version_of(f.sync(poll("")).await).await, v2, "freed");
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@
 //! expired verdict serves one more TTL.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,11 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 /// TokenReview is a create). A review takes milliseconds: 16 in flight
 /// still clear hundreds of reconnects per second after a failover.
 const MAX_REVIEWS_IN_FLIGHT: usize = 16;
+/// TokenReviews in flight per peer IP: one pod gets at most 2 of the 16
+/// unknown permits, so a flood from one pod never fills them; a data plane
+/// needs one at a time. Renewals count, but are not refused: known tokens
+/// are a bounded set.
+const MAX_REVIEWS_PER_PEER: usize = 2;
 /// Renewals of known tokens in flight, apart from the unknown pool. Each
 /// live instance renews once per TTL, spread over it: at milliseconds per
 /// review, 4 renew hundreds of instances a second, and 16 + 4 stays at 10%
@@ -48,7 +54,9 @@ const MAX_RENEWALS_IN_FLIGHT: usize = 4;
 /// it only bounds memory and how long a replay is answered from memory.
 const CACHE_TTL: Duration = HOLD;
 /// How long an expired positive verdict may still serve while no renewal
-/// can be made: one more TTL, so a revoked token works at most two.
+/// can be made: one more TTL, so a revoked token works at most two. A
+/// deleted pod can thus receive snapshots for up to about 90s after its
+/// last positive review while renewals fail: the stale grace plus one hold.
 const STALE_TTL: Duration = HOLD;
 /// A TokenReview is one in-memory check by the apiserver (signature, and
 /// the bound pod in its cache): milliseconds. 5s is generous and frees a
@@ -59,6 +67,10 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(5);
 /// which a flood of forgeries fills first. A few hundred bytes each: about
 /// 1 MiB at the cap.
 const MAX_VERDICTS: usize = 4096;
+/// Accepted verdicts kept per pod: its token and the one kubelet just
+/// rotated out. A tenant minting tokens for its own pods pushes out only
+/// its own.
+const MAX_VERDICTS_PER_POD: usize = 2;
 
 const SA_PREFIX: &str = "system:serviceaccount:";
 /// The TokenReview extra a pod-bound token carries.
@@ -151,12 +163,12 @@ pub(crate) fn own_service_account() -> Option<ServiceAccount> {
     ServiceAccount::from_username(claims(token.trim())?["sub"].as_str()?)
 }
 
-/// What a TokenReview said a token is.
+/// What a TokenReview said a token is: always a pod-bound token, the
+/// instance it names.
 #[derive(Clone, Debug)]
 struct Reviewed {
     account: ServiceAccount,
-    /// `None` for a token not bound to a pod.
-    pod_uid: Option<String>,
+    pod_uid: String,
 }
 
 type TokenHash = [u8; 32];
@@ -179,12 +191,28 @@ enum Cached {
 
 /// Why a review gave no verdict.
 enum Unreviewed {
-    /// Its pool had no permit.
-    Busy,
     /// The apiserver did not answer in time, or answered an error.
     Failed,
     /// TokenReview said no.
     Rejected,
+}
+
+/// A review in flight for a peer IP, counted until dropped.
+struct PeerReview<'a> {
+    peers: &'a Mutex<HashMap<IpAddr, usize>>,
+    peer: IpAddr,
+}
+
+impl Drop for PeerReview<'_> {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = peers.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                peers.remove(&self.peer);
+            }
+        }
+    }
 }
 
 pub(crate) struct Authenticator {
@@ -196,6 +224,8 @@ pub(crate) struct Authenticator {
     refused: Vec<ServiceAccount>,
     unknown: Semaphore,
     renewals: Semaphore,
+    /// Reviews in flight by peer IP.
+    peers: Mutex<HashMap<IpAddr, usize>>,
     verdicts: Mutex<Verdicts>,
 }
 
@@ -218,6 +248,7 @@ impl Authenticator {
             refused: std::iter::once(reserved).chain(own).collect(),
             unknown: Semaphore::new(MAX_REVIEWS_IN_FLIGHT),
             renewals: Semaphore::new(MAX_RENEWALS_IN_FLIGHT),
+            peers: Mutex::default(),
             verdicts: Mutex::default(),
         }
     }
@@ -229,13 +260,14 @@ impl Authenticator {
             .ok_or_else(|| rejected(SyncAuthStage::Precheck, Refusal::Unauthenticated))
     }
 
-    /// The instance `token` belongs to, if it may sync `gateway`. `claimed`
-    /// is what [`Self::precheck`] read from it.
+    /// The instance `token` belongs to, if it may sync `gateway`, asked from
+    /// `peer`. `claimed` is what [`Self::precheck`] read from it.
     pub(crate) async fn authenticate(
         &self,
         claimed: &ServiceAccount,
         token: &str,
         gateway: &GatewayKey,
+        peer: IpAddr,
     ) -> Result<InstanceId, Refusal> {
         let expected = ServiceAccount::of(gateway);
         // Computed from the request: the store is not read for a stranger,
@@ -256,32 +288,58 @@ impl Authenticator {
                 ))
             }
             // The pre-check already refused a token past its own exp.
-            Cached::Expired(stale) => match self.review(&self.renewals, hash, token).await {
-                Ok(reviewed) => reviewed,
-                Err(Unreviewed::Busy | Unreviewed::Failed) => {
-                    METRICS.sync_auth_stale_verdicts_total.inc();
-                    stale
+            Cached::Expired(stale) => {
+                // A permit frees within a review's timeout unless the
+                // apiserver hangs, and then the stale verdict serves.
+                let renewal = tokio::time::timeout(REVIEW_TIMEOUT, self.renewals.acquire()).await;
+                let reviewed = match renewal {
+                    Ok(Ok(_permit)) => {
+                        let _peer = self.peer_review(peer, usize::MAX);
+                        self.review(hash, token).await
+                    }
+                    Ok(Err(_)) | Err(_) => Err(Unreviewed::Failed),
+                };
+                match reviewed {
+                    Ok(reviewed) => reviewed,
+                    Err(Unreviewed::Failed) => {
+                        METRICS.sync_auth_stale_verdicts_total.inc();
+                        stale
+                    }
+                    Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
                 }
-                Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
-            },
-            Cached::Unknown => match self.review(&self.unknown, hash, token).await {
-                Ok(reviewed) => reviewed,
-                Err(Unreviewed::Busy) => {
+            }
+            Cached::Unknown => {
+                let peer_review = self.peer_review(peer, MAX_REVIEWS_PER_PEER);
+                let permit = self.unknown.try_acquire();
+                let (Some(_peer), Ok(_permit)) = (peer_review, permit) else {
                     METRICS.sync_throttled_total.inc();
                     return Err(Refusal::Throttled);
+                };
+                match self.review(hash, token).await {
+                    Ok(reviewed) => reviewed,
+                    Err(Unreviewed::Failed) => return Err(Refusal::Unavailable),
+                    Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
                 }
-                Err(Unreviewed::Failed) => return Err(Refusal::Unavailable),
-                Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
-            },
+            }
         };
         if reviewed.account != expected {
             return Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden));
         }
-        // A token not bound to a pod names no instance to report as.
-        match reviewed.pod_uid {
-            Some(uid) => Ok(InstanceId(uid)),
-            None => Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden)),
+        Ok(InstanceId(reviewed.pod_uid))
+    }
+
+    /// Count a review for `peer`, unless it has `cap` in flight already.
+    fn peer_review(&self, peer: IpAddr, cap: usize) -> Option<PeerReview<'_>> {
+        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        let n = peers.entry(peer).or_insert(0);
+        if *n >= cap {
+            return None;
         }
+        *n += 1;
+        Some(PeerReview {
+            peers: &self.peers,
+            peer,
+        })
     }
 
     fn cached(&self, hash: &TokenHash) -> Cached {
@@ -327,19 +385,27 @@ impl Authenticator {
             let cutoff = ages[MAX_VERDICTS / 4];
             verdicts.by_token.retain(|_, (at, _)| *at > cutoff);
         }
+        if let Some(reviewed) = &verdict {
+            let mut same_pod: Vec<(Instant, TokenHash)> = verdicts
+                .by_token
+                .iter()
+                .filter(|(h, (_, v))| {
+                    **h != hash && v.as_ref().is_some_and(|r| r.pod_uid == reviewed.pod_uid)
+                })
+                .map(|(h, (at, _))| (*at, *h))
+                .collect();
+            if same_pod.len() >= MAX_VERDICTS_PER_POD {
+                same_pod.sort_unstable();
+                for (_, old) in &same_pod[..=same_pod.len() - MAX_VERDICTS_PER_POD] {
+                    verdicts.by_token.remove(old);
+                }
+            }
+        }
         verdicts.by_token.insert(hash, (now, verdict));
     }
 
-    /// A TokenReview of `token` from `pool`; its verdict is cached.
-    async fn review(
-        &self,
-        pool: &Semaphore,
-        hash: TokenHash,
-        token: &str,
-    ) -> Result<Reviewed, Unreviewed> {
-        let Ok(_permit) = pool.try_acquire() else {
-            return Err(Unreviewed::Busy);
-        };
+    /// A TokenReview of `token`, its permits taken; its verdict is cached.
+    async fn review(&self, hash: TokenHash, token: &str) -> Result<Reviewed, Unreviewed> {
         let request = TokenReview {
             spec: TokenReviewSpec {
                 audiences: Some(vec![self.audience.clone()]),
@@ -390,12 +456,14 @@ impl Authenticator {
         }
         let user = status.user.as_ref()?;
         let account = ServiceAccount::from_username(user.username.as_deref()?)?;
+        // A token bound to no pod names no instance to report as: rejected,
+        // and kept as a rejection, so it never takes an accepted slot.
         let pod_uid = user
             .extra
             .as_ref()
             .and_then(|extra| extra.get(POD_UID))
             .and_then(|values| values.first())
-            .cloned();
+            .cloned()?;
         Some(Reviewed { account, pod_uid })
     }
 }
@@ -431,6 +499,13 @@ pub(super) mod testing {
     pub const SERVICE: &str = "portail-controller";
     pub const AUDIENCE: &str = "portail-controller.portail-system.svc";
     pub const REVIEWS: &str = "/apis/authentication.k8s.io/v1/tokenreviews";
+    /// The peer a test request comes from, unless it says otherwise.
+    pub const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+
+    /// Peer `n`, another pod.
+    pub fn peer(n: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(0x0a01_0000 + n))
+    }
 
     pub fn b64(value: &Value) -> String {
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
@@ -606,7 +681,10 @@ mod tests {
         let authenticated = metrics::tokenreview_requests(TokenReviewResult::Authenticated);
 
         for _ in 0..3 {
-            let instance = auth.authenticate(&claimed, &token, &gw).await.unwrap();
+            let instance = auth
+                .authenticate(&claimed, &token, &gw, PEER)
+                .await
+                .unwrap();
             assert_eq!(instance, InstanceId("pod-1".into()));
         }
         assert_eq!(reviews(&api), 1);
@@ -616,7 +694,9 @@ mod tests {
         );
 
         tokio::time::advance(HOLD).await;
-        auth.authenticate(&claimed, &token, &gw).await.unwrap();
+        auth.authenticate(&claimed, &token, &gw, PEER)
+            .await
+            .unwrap();
         assert_eq!(reviews(&api), 2, "the verdict expired with the hold");
     }
 
@@ -637,7 +717,7 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw).await,
+                auth.authenticate(&claimed, &token, &gw, PEER).await,
                 Err(Refusal::Unauthenticated)
             );
         }
@@ -651,7 +731,7 @@ mod tests {
 
         tokio::time::advance(HOLD).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw).await,
+            auth.authenticate(&claimed, &token, &gw, PEER).await,
             Err(Refusal::Unauthenticated)
         );
         assert_eq!(reviews(&api), 2);
@@ -675,7 +755,7 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw).await,
+                auth.authenticate(&claimed, &token, &gw, PEER).await,
                 Err(Refusal::Unavailable)
             );
         }
@@ -694,7 +774,7 @@ mod tests {
                 Some("pod-1"),
             ),
         );
-        assert!(auth.authenticate(&claimed, &token, &gw).await.is_ok());
+        assert!(auth.authenticate(&claimed, &token, &gw, PEER).await.is_ok());
     }
 
     /// Who may sync which Gateway: only its own ServiceAccount, in its own
@@ -747,7 +827,7 @@ mod tests {
             }
             let token = token_of(ns, name, n as u32);
             let claimed = auth.precheck(&token).unwrap();
-            let got = auth.authenticate(&claimed, &token, gw).await.err();
+            let got = auth.authenticate(&claimed, &token, gw, PEER).await.err();
             assert_eq!(got, answer, "{why}");
         }
 
@@ -763,7 +843,7 @@ mod tests {
             let token = gateway_token(&gw.namespace, &gw.name, n);
             let claimed = auth.precheck(&token).unwrap();
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw).await,
+                auth.authenticate(&claimed, &token, &gw, PEER).await,
                 Err(Refusal::Forbidden),
                 "{gw}"
             );
@@ -771,7 +851,8 @@ mod tests {
         assert_eq!(reviews(&api), 0);
         assert_eq!(counter(SyncAuthStage::Authz), authz + 2);
 
-        // A token bound to no pod names no instance.
+        // A token bound to no pod names no instance: rejected, and cached
+        // as a rejection.
         api.reply_to(
             REVIEWS,
             201,
@@ -780,9 +861,10 @@ mod tests {
         let token = gateway_token("apps", "web", 20);
         let claimed = auth.precheck(&token).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &token, &web).await,
-            Err(Refusal::Forbidden)
+            auth.authenticate(&claimed, &token, &web, PEER).await,
+            Err(Refusal::Unauthenticated)
         );
+        assert!(matches!(auth.cached(&token_hash(&token)), Cached::Rejected));
     }
 
     #[tokio::test]
@@ -796,18 +878,22 @@ mod tests {
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &token, &GatewayKey::new("apps", "web"))
+            auth.authenticate(&claimed, &token, &GatewayKey::new("apps", "web"), PEER)
                 .await,
             Err(Refusal::Unauthenticated)
         );
     }
 
-    /// A kube client whose TokenReviews answer `known` tokens at once, as
-    /// pods `pod-<n>` of `apps/web`, and leave every other one hanging,
-    /// counting them.
-    fn split_client(known: Vec<String>, hanging: Arc<AtomicUsize>) -> Client {
+    /// A kube client whose TokenReviews answer `known` tokens, as pods
+    /// `pod-<n>` of `apps/web` (the first `slow` of them a second late), and
+    /// leave every other one hanging, counting them.
+    fn split_client(
+        known: Vec<String>,
+        slow: Arc<AtomicUsize>,
+        hanging: Arc<AtomicUsize>,
+    ) -> Client {
         let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-            let (known, hanging) = (known.clone(), hanging.clone());
+            let (known, slow, hanging) = (known.clone(), slow.clone(), hanging.clone());
             async move {
                 let bytes = req.into_body().collect_bytes().await.unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -816,6 +902,9 @@ mod tests {
                     hanging.fetch_add(1, Ordering::SeqCst);
                     return futures::future::pending().await;
                 };
+                if n < slow.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
                 let answer = review(
                     true,
                     "system:serviceaccount:apps:portail-web",
@@ -850,11 +939,14 @@ mod tests {
         let hanging = Arc::new(AtomicUsize::new(0));
         let auth = Arc::new(authenticator(split_client(
             vec![known.clone()],
+            Arc::default(),
             hanging.clone(),
         )));
         let gw = GatewayKey::new("apps", "web");
         let claimed = auth.precheck(&known).unwrap();
-        auth.authenticate(&claimed, &known, &gw).await.unwrap();
+        auth.authenticate(&claimed, &known, &gw, PEER)
+            .await
+            .unwrap();
 
         for _ in 0..3 {
             tokio::time::advance(HOLD).await;
@@ -864,8 +956,8 @@ mod tests {
                     tokio::spawn(async move {
                         let forged = gateway_token("apps", "web", 1000 + n);
                         let claimed = auth.precheck(&forged).unwrap();
-                        auth.authenticate(&claimed, &forged, &GatewayKey::new("apps", "web"))
-                            .await
+                        let gw = GatewayKey::new("apps", "web");
+                        auth.authenticate(&claimed, &forged, &gw, peer(n)).await
                     })
                 })
                 .collect();
@@ -874,12 +966,13 @@ mod tests {
             let extra = gateway_token("apps", "web", 999);
             let extra_claim = auth.precheck(&extra).unwrap();
             assert_eq!(
-                auth.authenticate(&extra_claim, &extra, &gw).await,
+                auth.authenticate(&extra_claim, &extra, &gw, peer(999))
+                    .await,
                 Err(Refusal::Throttled),
                 "the unknown pool is saturated"
             );
             assert_eq!(
-                auth.authenticate(&claimed, &known, &gw).await,
+                auth.authenticate(&claimed, &known, &gw, PEER).await,
                 Ok(InstanceId("pod-0".into())),
                 "the known instance syncs on"
             );
@@ -904,7 +997,9 @@ mod tests {
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
-        auth.authenticate(&claimed, &token, &gw).await.unwrap();
+        auth.authenticate(&claimed, &token, &gw, PEER)
+            .await
+            .unwrap();
 
         api.reply_to(
             REVIEWS,
@@ -915,7 +1010,7 @@ mod tests {
         let stale = METRICS.sync_auth_stale_verdicts_total.get();
         tokio::time::advance(CACHE_TTL).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw).await,
+            auth.authenticate(&claimed, &token, &gw, PEER).await,
             Ok(InstanceId("pod-1".into()))
         );
         assert_eq!(reviews(&api), 2, "a renewal was tried");
@@ -923,7 +1018,7 @@ mod tests {
 
         tokio::time::advance(STALE_TTL).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw).await,
+            auth.authenticate(&claimed, &token, &gw, PEER).await,
             Err(Refusal::Unavailable),
             "two TTLs: unknown again"
         );
@@ -932,17 +1027,20 @@ mod tests {
     /// A kube client whose TokenReviews answer every token as pod `pod-1`
     /// of `apps/web` while `answer` is set, and hang otherwise.
     fn switched_client(answer: Arc<AtomicBool>, hanging: Arc<AtomicUsize>) -> Client {
-        let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
             let (answer, hanging) = (answer.clone(), hanging.clone());
             async move {
                 if !answer.load(Ordering::SeqCst) {
                     hanging.fetch_add(1, Ordering::SeqCst);
                     return futures::future::pending().await;
                 }
+                let bytes = req.into_body().collect_bytes().await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let jti = claims(body["spec"]["token"].as_str().unwrap()).unwrap()["jti"].clone();
                 let reply = review(
                     true,
                     "system:serviceaccount:apps:portail-web",
-                    Some("pod-1"),
+                    Some(&format!("pod-{jti}")),
                 );
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
@@ -957,10 +1055,10 @@ mod tests {
         Client::new(service, "default")
     }
 
-    /// The renewal pool is busy: an expired verdict serves at once, and a
-    /// review with no answer gives its permit back within 5s.
+    /// A review with no answer gives its permit back within 5s, and the
+    /// expired verdict serves.
     #[tokio::test(start_paused = true)]
-    async fn a_busy_renewal_pool_serves_expired_verdicts_and_frees_in_5s() {
+    async fn a_review_without_an_answer_frees_its_permit_in_5s() {
         let _serial = METRICS_SERIAL.lock().await;
         let answer = Arc::new(AtomicBool::new(true));
         let hanging = Arc::new(AtomicUsize::new(0));
@@ -969,49 +1067,135 @@ mod tests {
             hanging.clone(),
         )));
         let gw = GatewayKey::new("apps", "web");
-        let tokens: Vec<String> = (0..=MAX_RENEWALS_IN_FLIGHT as u32)
+        let tokens: Vec<String> = (0..MAX_RENEWALS_IN_FLIGHT as u32)
             .map(|n| gateway_token("apps", "web", n))
             .collect();
         for token in &tokens {
             let claimed = auth.precheck(token).unwrap();
-            auth.authenticate(&claimed, token, &gw).await.unwrap();
+            auth.authenticate(&claimed, token, &gw, PEER).await.unwrap();
         }
 
         answer.store(false, Ordering::SeqCst);
         tokio::time::advance(CACHE_TTL).await;
         let started = Instant::now();
-        let renewing: Vec<_> = tokens[..MAX_RENEWALS_IN_FLIGHT]
+        let renewing: Vec<_> = tokens
             .iter()
             .cloned()
-            .map(|token| {
+            .enumerate()
+            .map(|(n, token)| {
                 let auth = auth.clone();
                 tokio::spawn(async move {
                     let claimed = auth.precheck(&token).unwrap();
+                    let gw = GatewayKey::new("apps", "web");
                     let got = auth
-                        .authenticate(&claimed, &token, &GatewayKey::new("apps", "web"))
+                        .authenticate(&claimed, &token, &gw, peer(n as u32))
                         .await;
                     (got, started.elapsed())
                 })
             })
             .collect();
-        settle().await;
+        for (n, renewal) in renewing.into_iter().enumerate() {
+            let (got, elapsed) = renewal.await.unwrap();
+            assert_eq!(got, Ok(InstanceId(format!("pod-{n}"))), "served stale");
+            assert_eq!(elapsed, REVIEW_TIMEOUT);
+        }
         assert_eq!(hanging.load(Ordering::SeqCst), MAX_RENEWALS_IN_FLIGHT);
+    }
+
+    /// Every renewal permit is taken by slow reviews: the next known token
+    /// waits for one and is renewed, rather than served stale until it falls
+    /// into the unknown pool.
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_waits_for_a_permit() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let tokens: Vec<String> = (0..=MAX_RENEWALS_IN_FLIGHT as u32)
+            .map(|n| gateway_token("apps", "web", n))
+            .collect();
+        let slow = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(authenticator(split_client(
+            tokens.clone(),
+            slow.clone(),
+            Arc::default(),
+        )));
+        let gw = GatewayKey::new("apps", "web");
+        for (n, token) in tokens.iter().enumerate() {
+            let claimed = auth.precheck(token).unwrap();
+            auth.authenticate(&claimed, token, &gw, peer(n as u32))
+                .await
+                .unwrap();
+        }
+
+        slow.store(MAX_RENEWALS_IN_FLIGHT, Ordering::SeqCst);
+        tokio::time::advance(CACHE_TTL).await;
+        let renewing: Vec<_> = tokens[..MAX_RENEWALS_IN_FLIGHT]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(n, token)| {
+                let auth = auth.clone();
+                tokio::spawn(async move {
+                    let claimed = auth.precheck(&token).unwrap();
+                    let gw = GatewayKey::new("apps", "web");
+                    auth.authenticate(&claimed, &token, &gw, peer(n as u32))
+                        .await
+                })
+            })
+            .collect();
+        settle().await;
 
         let last = &tokens[MAX_RENEWALS_IN_FLIGHT];
         let claimed = auth.precheck(last).unwrap();
-        let at_once = tokio::time::timeout(
-            Duration::from_millis(1),
-            auth.authenticate(&claimed, last, &gw),
-        )
-        .await
-        .expect("served without waiting for a review");
-        assert_eq!(at_once, Ok(InstanceId("pod-1".into())));
-
+        let stale = METRICS.sync_auth_stale_verdicts_total.get();
+        let n = MAX_RENEWALS_IN_FLIGHT as u32;
+        assert_eq!(
+            auth.authenticate(&claimed, last, &gw, peer(n)).await,
+            Ok(InstanceId(format!("pod-{n}")))
+        );
+        assert!(
+            matches!(auth.cached(&token_hash(last)), Cached::Fresh(_)),
+            "renewed, not served stale"
+        );
+        assert_eq!(METRICS.sync_auth_stale_verdicts_total.get(), stale);
         for renewal in renewing {
-            let (got, elapsed) = renewal.await.unwrap();
-            assert_eq!(got, Ok(InstanceId("pod-1".into())), "served stale");
-            assert_eq!(elapsed, REVIEW_TIMEOUT);
+            assert!(renewal.await.unwrap().is_ok());
         }
+    }
+
+    /// A flood of forged tokens from one pod takes at most two review
+    /// permits: a new pod elsewhere is still reviewed.
+    #[tokio::test(start_paused = true)]
+    async fn one_peer_takes_at_most_two_reviews() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let newcomer = gateway_token("apps", "web", 0);
+        let hanging = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(authenticator(split_client(
+            vec![newcomer.clone()],
+            Arc::default(),
+            hanging.clone(),
+        )));
+        let gw = GatewayKey::new("apps", "web");
+        let flood: Vec<_> = (0..MAX_REVIEWS_IN_FLIGHT as u32)
+            .map(|n| {
+                let auth = auth.clone();
+                tokio::spawn(async move {
+                    let forged = gateway_token("apps", "web", 1000 + n);
+                    let claimed = auth.precheck(&forged).unwrap();
+                    let gw = GatewayKey::new("apps", "web");
+                    auth.authenticate(&claimed, &forged, &gw, PEER).await
+                })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(hanging.load(Ordering::SeqCst), MAX_REVIEWS_PER_PEER);
+        let throttled = flood.iter().filter(|f| f.is_finished()).count();
+        assert_eq!(throttled, MAX_REVIEWS_IN_FLIGHT - MAX_REVIEWS_PER_PEER);
+
+        let claimed = auth.precheck(&newcomer).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &newcomer, &gw, peer(1)).await,
+            Ok(InstanceId("pod-0".into()))
+        );
+        flood.iter().for_each(|f| f.abort());
     }
 
     fn hash(n: u32) -> TokenHash {
@@ -1023,7 +1207,7 @@ mod tests {
     fn accepted(n: u32) -> Option<Reviewed> {
         Some(Reviewed {
             account: sa("apps", "portail-web"),
-            pod_uid: Some(format!("pod-{n}")),
+            pod_uid: format!("pod-{n}"),
         })
     }
 
@@ -1063,6 +1247,36 @@ mod tests {
         let verdicts = auth.verdicts.lock().unwrap();
         assert_eq!(verdicts.by_token.len(), 1);
         assert!(verdicts.by_token.capacity() < MAX_VERDICTS, "shrunk");
+    }
+
+    /// A tenant minting pod-bound tokens for its own pod keeps two
+    /// accepted verdicts, never pushing out a running data plane's.
+    #[tokio::test(start_paused = true)]
+    async fn one_pod_keeps_two_accepted_verdicts() {
+        let auth = authenticator(MockApi::default().client());
+        auth.remember(hash(0), accepted(0));
+        let tenant = |n: u32| {
+            let mut reviewed = accepted(7);
+            reviewed.as_mut().unwrap().account = sa("tenant", "portail-x");
+            let _ = n;
+            reviewed
+        };
+        for n in 1..=2 * MAX_VERDICTS as u32 {
+            tokio::time::advance(Duration::from_micros(1)).await;
+            auth.remember(hash(n), tenant(n));
+        }
+        assert!(matches!(auth.cached(&hash(0)), Cached::Fresh(_)), "evicted");
+        let verdicts = auth.verdicts.lock().unwrap();
+        let of_tenant = verdicts
+            .by_token
+            .values()
+            .filter(|(_, v)| v.is_some())
+            .count()
+            - 1;
+        assert_eq!(of_tenant, 2);
+        let newest = 2 * MAX_VERDICTS as u32;
+        assert!(verdicts.by_token.contains_key(&hash(newest)));
+        assert!(verdicts.by_token.contains_key(&hash(newest - 1)));
     }
 
     #[test]
