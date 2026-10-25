@@ -143,10 +143,11 @@ impl FakeApiserver {
             "GET" => match objects.get(path) {
                 Some(object) => (200, object.clone()),
                 // The controller's own objects, and API discovery of the
-                // optional CRDs: absent.
+                // optional CRDs (/apis/<group>/<version>; /api/v1/<kind> is
+                // a core collection): absent.
                 None if path.ends_with("/portail-controller-ca")
                     || path.ends_with("/portail-controller")
-                    || path.matches('/').count() == 3 =>
+                    || (path.starts_with("/apis/") && path.matches('/').count() == 3) =>
                 {
                     not_found()
                 }
