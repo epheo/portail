@@ -240,7 +240,7 @@ Trust:
 Scale:
 
 - On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod. The controller caps open connections per address with `--sync-peer-connections` (default 32; a data plane holds one or two): set it to at least twice the Primary UDN data planes per apiserver node.
-- Reviews of new tokens from one address are paced, two at once and five a second, not refused: after a controller restart such a fleet reconnects over a few seconds.
+- Reviews of new tokens are shared per address too, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
 - Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
@@ -287,8 +287,8 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
-- The sync endpoint and the data planes speak TLS 1.3 only.
-- The controller signs every snapshot, "unchanged" and "Gateway gone" answer with its serving key, never the CA's, over a nonce the data plane draws for each poll. A data plane takes an answer only when the signing certificate chains to the controller CA, is a serving certificate for the controller Service, valid now, and the signature covers this poll's nonce and the body ("unchanged": the version it confirms); a "gone" answer must also name its Gateway.
+- A data plane dialing the controller speaks TLS 1.3 only; the sync endpoint takes TLS 1.2 too, which an apiserver on an older Go FIPS stack proxies polls with.
+- The controller signs every answer that steers a data plane with its serving key, never the CA's, over a nonce the data plane draws for each poll: a snapshot, "Gateway gone", "unchanged" (only over the version it serves, when the poll has it), "pending" (no snapshot yet) and "leave" (to a leaving poll). A data plane takes an answer only when the signing certificate chains to the controller CA, is a serving certificate for the controller Service, valid now, and the signature covers this poll's nonce and the body; a "gone" answer must also name its Gateway. Only "unchanged" and a snapshot confirm a configuration current.
 - An answer that fails, or a body over 64 MiB, changes nothing served: the data plane counts the controller as disconnected, backs off, and its reports carry why as an apply error until the controller answers again.
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
