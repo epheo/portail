@@ -30,7 +30,7 @@ spec:
       - name: portail
         # The controller's image, deploy/install's tag: data planes upgrade
         # with it. scripts/release.sh sets both.
-        image: ghcr.io/epheo/portail:0.2.0
+        image: ghcr.io/epheo/portail:0.2.1
         args:
         - dataplane
         - --gateway=portail-system/edge
