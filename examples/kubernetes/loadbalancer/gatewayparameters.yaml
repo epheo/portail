@@ -1,0 +1,8 @@
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: example-gw
+spec:
+  # Two pods on different nodes when there are several, and a PDB: drains
+  # and rollouts keep one serving.
+  replicas: 2

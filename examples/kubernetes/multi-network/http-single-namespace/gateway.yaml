@@ -4,6 +4,11 @@ metadata:
   name: gw-frontend
 spec:
   gatewayClassName: portail
+  infrastructure:
+    parametersRef:
+      group: portail.epheo.eu
+      kind: GatewayParameters
+      name: gw-frontend
   addresses:
   - type: portail.epheo.eu/Network
     value: udn-frontend

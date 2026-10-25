@@ -1,10 +1,9 @@
-# Route PostgreSQL traffic from the frontend network to the backend namespace.
-# The ReferenceGrant in tenant-backend authorizes this cross-namespace reference.
+# The ReferenceGrant in tenant-backend permits the cross-namespace backendRef.
 apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: frontend-to-postgres
-  namespace: portail-system
+  namespace: tenant-frontend
 spec:
   parentRefs:
   - name: gw-frontend
