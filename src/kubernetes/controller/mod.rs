@@ -59,7 +59,7 @@ use reports::ReportStore;
 use watch::{
     all_gateway_refs, create_optional_reflector, create_reflector, create_reflector_with_config,
     drop_unread_metadata, map_policy_to_gateways, map_route_to_gateways, map_secret_to_gateways,
-    PendingWatches,
+    Listings, PendingWatches,
 };
 
 /// A reconcile pass failed; the controller runtime retries via `error_policy`.
@@ -95,22 +95,6 @@ struct ResourceCache {
     gateway_parameters: Store<GatewayParameters>,
 }
 
-/// Whether every reflector delivered its initial list. Before, a
-/// translation misses objects: it would publish and write status as if they
-/// were gone. The sync server answers 503 until then.
-#[derive(Clone, Default)]
-struct CachesSynced(Arc<std::sync::atomic::AtomicBool>);
-
-impl CachesSynced {
-    fn mark(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    fn is_synced(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
 struct ControllerCtx {
     client: Client,
     controller_name: String,
@@ -123,7 +107,9 @@ struct ControllerCtx {
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
     leader: leader::Leader,
-    synced: CachesSynced,
+    /// Whether every reflector delivered its initial list, and which did
+    /// not. The sync server answers 503 until then, /readyz names them.
+    synced: Listings,
     #[allow(dead_code)] // Read by provision::reconcile once it provisions.
     owned: provision::Owned,
 }
@@ -144,6 +130,8 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     // echoes of our own writes are instead absorbed by reconcile: an
     // unchanged snapshot is not published again, and status that already
     // matches the store is not written.
+    let listings = Listings::default();
+    let gw_listing = listings.track("Gateway", false);
     let gw_writer = reflector::store::Writer::default();
     let store_gateways = gw_writer.as_reader();
     // A deletion runs no reconcile. A relist (InitDone) may also have
@@ -155,7 +143,8 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             Api::<Gateway>::all(client.clone()),
             watcher::Config::default(),
         )
-        .modify(drop_unread_metadata),
+        .modify(drop_unread_metadata)
+        .inspect(move |event| gw_listing.observe(event)),
     )
     .default_backoff()
     .inspect({
@@ -180,46 +169,43 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     // HTTPRoute is required (GA); TCP/TLS/UDPRoute are experimental (optional).
     // A route in any namespace, of any kind, may parentRef a Gateway and must
     // get a status (attached, or rejected with NotAllowedByListeners /
-    // NoMatchingParent), which requires observing it. The optional CRDs are
-    // probed concurrently so a contended apiserver does not serialize the
-    // cold start.
+    // NoMatchingParent), which requires observing it.
     let (store_http_routes, http_route_stream) =
-        create_reflector(Api::<HTTPRoute>::all(client.clone()));
+        create_reflector(Api::<HTTPRoute>::all(client.clone()), &listings);
     // RateLimitPolicy and GatewayParameters ride the optional-CRD path like
-    // the experimental routes.
-    let pending_watches = PendingWatches::default();
-    let (tcp_reflector, tls_reflector, udp_reflector, policy_reflector, params_reflector) = tokio::join!(
-        create_optional_reflector(
-            Api::<TCPRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<TLSRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<UDPRoute>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<RateLimitPolicy>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
-        create_optional_reflector(
-            Api::<GatewayParameters>::all(client.clone()),
-            &client,
-            &pending_watches
-        ),
+    // the experimental routes: a plain Gateway API install lacks the routes,
+    // a missing GatewayParameters CRD must not hold every Gateway either.
+    let pending_watches = Arc::new(PendingWatches::default());
+    let (store_tcp_routes, tcp_route_stream) = create_optional_reflector(
+        Api::<TCPRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
     );
-    let (store_tcp_routes, tcp_route_stream) = tcp_reflector;
-    let (store_tls_routes, tls_route_stream) = tls_reflector;
-    let (store_udp_routes, udp_route_stream) = udp_reflector;
-    let (store_rate_limit_policies, policy_stream) = policy_reflector;
-    let (store_gateway_parameters, params_stream) = params_reflector;
+    let (store_tls_routes, tls_route_stream) = create_optional_reflector(
+        Api::<TLSRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_udp_routes, udp_route_stream) = create_optional_reflector(
+        Api::<UDPRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_rate_limit_policies, policy_stream) = create_optional_reflector(
+        Api::<RateLimitPolicy>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
+    let (store_gateway_parameters, params_stream) = create_optional_reflector(
+        Api::<GatewayParameters>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
     tokio::spawn(pending_watches.recheck_every(
         client.clone(),
         Duration::from_secs(RESYNC_SECS),
@@ -227,14 +213,15 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     ));
 
     let (store_namespaces, namespace_stream) =
-        create_reflector(Api::<Namespace>::all(client.clone()));
-    let (store_services, service_stream) = create_reflector(Api::<Service>::all(client.clone()));
+        create_reflector(Api::<Namespace>::all(client.clone()), &listings);
+    let (store_services, service_stream) =
+        create_reflector(Api::<Service>::all(client.clone()), &listings);
     let (store_reference_grants, reference_grant_stream) =
-        create_reflector(Api::<ReferenceGrant>::all(client.clone()));
+        create_reflector(Api::<ReferenceGrant>::all(client.clone()), &listings);
     // Every Gateway is watched, other controllers' too: the class tells
     // which are ours.
     let (store_gateway_classes, gateway_class_stream) =
-        create_reflector(Api::<GatewayClass>::all(client.clone()));
+        create_reflector(Api::<GatewayClass>::all(client.clone()), &listings);
     let (class_changed, class_changes) = futures::channel::mpsc::unbounded::<()>();
     let gateway_class_stream = gateway_class_stream.inspect(move |_| {
         let _ = class_changed.unbounded_send(());
@@ -245,6 +232,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         watcher::Config::default()
             .fields("type=kubernetes.io/tls")
             .streaming_lists(),
+        &listings,
     );
     let (owned, owned_triggers) = provision::Owned::start(&client);
 
@@ -274,41 +262,38 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         hub: Arc::default(),
         reports: Arc::default(),
         leader: leader.clone(),
-        synced: CachesSynced::default(),
+        synced: listings.clone(),
         owned,
     });
 
     // Every Gateway is reconciled once the caches are synced: passes before
-    // that returned without a trace.
+    // that returned without a trace. Until then the kinds holding it are
+    // named, with why.
     let (caches_synced, synced_trigger) = futures::channel::mpsc::unbounded::<()>();
     tokio::spawn({
-        let ctx = ctx.clone();
         let shutdown = shutdown.clone();
         async move {
-            let c = &ctx.cache;
-            let lists: Vec<futures::future::BoxFuture<'_, _>> = vec![
-                Box::pin(c.gateway_classes.wait_until_ready()),
-                Box::pin(c.gateways.wait_until_ready()),
-                Box::pin(c.http_routes.wait_until_ready()),
-                Box::pin(c.tcp_routes.wait_until_ready()),
-                Box::pin(c.tls_routes.wait_until_ready()),
-                Box::pin(c.udp_routes.wait_until_ready()),
-                Box::pin(c.namespaces.wait_until_ready()),
-                Box::pin(c.services.wait_until_ready()),
-                Box::pin(c.secrets.wait_until_ready()),
-                Box::pin(c.reference_grants.wait_until_ready()),
-                Box::pin(c.rate_limit_policies.wait_until_ready()),
-                Box::pin(c.gateway_parameters.wait_until_ready()),
-            ];
-            tokio::select! {
-                _ = shutdown.cancelled() => {}
-                // Err: a writer dropped, its watch ended: the controller stops.
-                listed = futures::future::try_join_all(lists) => if listed.is_ok() {
-                    ctx.synced.mark();
-                    info!("Caches synced");
-                    let _ = caches_synced.unbounded_send(());
+            let mut warn_every = tokio::time::interval(Duration::from_secs(UNLISTED_WARN_SECS));
+            warn_every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // interval()'s first tick fires immediately.
+            warn_every.tick().await;
+            while !listings.is_synced() {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = listings.changed() => {}
+                    _ = warn_every.tick() => warn!(
+                        "Caches not synced, nothing is published: {}",
+                        listings
+                            .unlisted()
+                            .iter()
+                            .map(|(kind, cause)| format!("{kind} ({cause})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 }
             }
+            info!("Caches synced");
+            let _ = caches_synced.unbounded_send(());
         }
     });
 
@@ -412,7 +397,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     tokio::select! {
         _ = gw_controller.for_each(|result| async move {
             if let Err(e) = result {
-                warn!("Gateway reconciliation error: {}", e);
+                warn!("Gateway controller: {:#}", anyhow::Error::new(e));
             }
         }) => {
             info!("Gateway controller stream ended");
@@ -433,6 +418,11 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
 
 /// The safety-net re-check of a converged Gateway, in seconds.
 const RESYNC_SECS: u64 = 600;
+
+/// How often the kinds holding the caches unsynced are logged: the
+/// cold-start diagnostic cadence the in-pod controller's not-ready
+/// watchdog used.
+const UNLISTED_WARN_SECS: u64 = 30;
 
 /// Requeue cadence after a reconcile that published or wrote something. A
 /// *converged* Gateway — its data plane Programmed and every attached route

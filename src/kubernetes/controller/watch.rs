@@ -1,6 +1,9 @@
 //! Reflector/watch plumbing: store+stream construction (plain and
-//! optional-CRD) and the secondary-resource → Gateway mappers.
+//! optional-CRD), the initial-list bookkeeping the caches-synced signal
+//! reads, and the secondary-resource → Gateway mappers.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -17,6 +20,137 @@ use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::parent_ref::ParentRefAccess;
 use crate::logging::{info, warn};
 
+/// Every watched kind's initial list: done, or what holds it. Nothing is
+/// published before every kind listed: a translation would miss the
+/// objects of one not listed yet.
+#[derive(Clone, Default)]
+pub(super) struct Listings(Arc<ListingsInner>);
+
+#[derive(Default)]
+struct ListingsInner {
+    kinds: Mutex<BTreeMap<String, Listing>>,
+    changed: tokio::sync::Notify,
+}
+
+struct Listing {
+    /// A refused list (404, 403) counts as listed, empty: the kind is a CRD
+    /// a cluster may lack or not grant, and every Gateway would wait on it.
+    optional: bool,
+    listed: bool,
+    /// The last error while not listed.
+    cause: Option<String>,
+}
+
+impl Listings {
+    fn kinds(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Listing>> {
+        self.0.kinds.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Follow `kind`'s initial list.
+    pub(super) fn track(&self, kind: &str, optional: bool) -> ListTracker {
+        self.kinds().insert(
+            kind.to_string(),
+            Listing {
+                optional,
+                listed: false,
+                cause: None,
+            },
+        );
+        ListTracker {
+            listings: self.clone(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// Every tracked kind listed.
+    pub(super) fn is_synced(&self) -> bool {
+        self.kinds().values().all(|l| l.listed)
+    }
+
+    /// The kinds not listed yet, each with what holds it.
+    pub(super) fn unlisted(&self) -> Vec<(String, String)> {
+        self.kinds()
+            .iter()
+            .filter(|(_, l)| !l.listed)
+            .map(|(kind, l)| {
+                let cause = l.cause.as_deref().unwrap_or("not listed yet");
+                (kind.clone(), cause.to_string())
+            })
+            .collect()
+    }
+
+    /// Wakes after a change to any kind.
+    pub(super) async fn changed(&self) {
+        self.0.changed.notified().await
+    }
+
+    fn update(&self, kind: &str, change: impl FnOnce(&mut Listing)) {
+        if let Some(listing) = self.kinds().get_mut(kind) {
+            change(listing);
+        }
+        // One waiter, the synced task: a permit kept for it is a wake it
+        // would otherwise miss between its check and its wait.
+        self.0.changed.notify_one();
+    }
+}
+
+/// One kind's entry in [`Listings`].
+#[derive(Clone)]
+pub(super) struct ListTracker {
+    listings: Listings,
+    kind: String,
+}
+
+impl ListTracker {
+    /// Record what a watch event says about the initial list.
+    pub(super) fn observe<K>(&self, event: &Result<watcher::Event<K>, watcher::Error>) {
+        match event {
+            Ok(watcher::Event::InitDone) => self.listings.update(&self.kind, |l| l.listed = true),
+            Err(e) => self.failed(&e.to_string(), status_code(e)),
+            Ok(_) => {}
+        }
+    }
+
+    /// The kind holds no object: its CRD is not installed.
+    fn listed_empty(&self, why: &str) {
+        warn!("{} counted as listed and empty: {}", self.kind, why);
+        self.listings.update(&self.kind, |l| l.listed = true);
+    }
+
+    /// Something holds the initial list: `code` is the HTTP status, if any.
+    fn failed(&self, cause: &str, code: Option<u16>) {
+        let mut refused = false;
+        self.listings.update(&self.kind, |l| {
+            if l.listed {
+                return;
+            }
+            if l.optional && matches!(code, Some(403 | 404)) {
+                l.listed = true;
+                refused = true;
+            } else {
+                l.cause = Some(cause.to_string());
+            }
+        });
+        if refused {
+            warn!(
+                "{} list refused ({}): counted as listed and empty; its watch retries",
+                self.kind, cause
+            );
+        }
+    }
+}
+
+/// The HTTP status of a watch error the apiserver answered.
+fn status_code(e: &watcher::Error) -> Option<u16> {
+    match e {
+        watcher::Error::InitialListFailed(kube::Error::Api(r))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(r))
+        | watcher::Error::WatchFailed(kube::Error::Api(r)) => Some(r.code),
+        watcher::Error::WatchError(r) => Some(r.code),
+        _ => None,
+    }
+}
+
 /// Create a reflector for a resource type, returning the store and a stream.
 /// The stream is consumed by `Controller::watches_stream()` which both drives
 /// the reflector (keeping the store up to date) and triggers reconciliation
@@ -28,7 +162,10 @@ use crate::logging::{info, warn};
 /// on a loaded apiserver (measured 1s isolated, 20s+ or never under load).
 /// Streaming lists are far lighter on the apiserver under that load. Requires
 /// server WatchList support (k8s >= 1.27; default-on >= 1.30).
-pub(super) fn create_reflector<K>(api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
+pub(super) fn create_reflector<K>(
+    api: Api<K>,
+    listings: &Listings,
+) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
         + Clone
@@ -39,17 +176,21 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
-    create_reflector_with_config(api, watcher::Config::default().streaming_lists())
+    create_reflector_with_config(api, watcher::Config::default().streaming_lists(), listings)
 }
 
-/// Like `create_reflector`, for a CRD that may not be installed. When API
-/// discovery does not serve it, the store stays empty and the stream waits
-/// until [`PendingWatches::recheck_every`] finds it served, so a CRD
-/// installed after startup is watched without a restart.
-pub(super) async fn create_optional_reflector<K>(
+/// Like `create_reflector`, for a CRD that may not be installed or
+/// readable, which counts as listed and empty (see [`Listing::optional`]).
+/// API discovery decides whether to watch: when it does not serve the CRD,
+/// the store stays empty and the stream waits until
+/// [`PendingWatches::recheck_every`] finds it served, so a CRD installed
+/// after startup is watched without a restart. A discovery that fails says
+/// neither: it is retried, never taken as an answer.
+pub(super) fn create_optional_reflector<K>(
     api: Api<K>,
     client: &Client,
-    pending: &PendingWatches,
+    pending: &Arc<PendingWatches>,
+    listings: &Listings,
 ) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
@@ -67,24 +208,25 @@ where
         plural: K::plural(&dt).into_owned(),
         kind: K::kind(&dt).into_owned(),
     };
-    if crd_served(client, &watch.api_version, &watch.plural).await != Some(false) {
-        return create_reflector(api);
-    }
-    warn!(
-        "CRD not installed, its watcher waits for it: {}",
-        watch.kind
-    );
-    let mut writer = reflector::store::Writer::default();
-    // Listed, and empty: a CRD nobody installed holds no object, and the
-    // controller must not wait for its list to call its caches synced.
-    writer.apply_watcher_event(&watcher::Event::Init);
-    writer.apply_watcher_event(&watcher::Event::InitDone);
+    let tracker = listings.track(&watch.kind, true);
+    let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
     let (start, started) = tokio::sync::oneshot::channel();
-    pending.add(watch, start);
+    tokio::spawn(discover(
+        client.clone(),
+        watch,
+        start,
+        pending.clone(),
+        tracker.clone(),
+    ));
     let stream = futures::stream::once(async move {
         match started.await {
-            Ok(()) => reflector_stream(writer, api, watcher::Config::default().streaming_lists()),
+            Ok(()) => reflector_stream(
+                writer,
+                api,
+                watcher::Config::default().streaming_lists(),
+                tracker,
+            ),
             Err(_) => Box::pin(futures::stream::pending()),
         }
     })
@@ -92,16 +234,55 @@ where
     (reader, Box::pin(stream))
 }
 
-/// Whether API discovery serves `plural` in `api_version`; `None` when
-/// discovery itself failed.
-async fn crd_served(client: &Client, api_version: &str, plural: &str) -> Option<bool> {
-    match client.list_api_group_resources(api_version).await {
-        Ok(list) => Some(list.resources.iter().any(|r| r.name == plural)),
-        Err(kube::Error::Api(e)) if e.code == 404 => Some(false),
-        Err(e) => {
-            warn!("API discovery of {} failed: {}", api_version, e);
-            None
+/// Ask API discovery whether `watch`'s CRD is served, with the backoff kube
+/// watchers use until it answers: start the watch, or park it on `pending`.
+async fn discover(
+    client: Client,
+    watch: PendingWatch,
+    mut start: tokio::sync::oneshot::Sender<()>,
+    pending: Arc<PendingWatches>,
+    tracker: ListTracker,
+) {
+    let mut backoff = watcher::DefaultBackoff::default();
+    loop {
+        match crd_served(&client, &watch.api_version, &watch.plural).await {
+            Ok(true) => {
+                let _ = start.send(());
+                return;
+            }
+            Ok(false) => {
+                tracker.listed_empty("its CRD is not installed; its watch starts once it is");
+                pending.add(watch, start);
+                return;
+            }
+            Err(e) => {
+                let delay = backoff
+                    .next()
+                    .unwrap_or(Duration::from_secs(RETRY_CAP_SECS));
+                let cause = format!("API discovery of {} failed: {}", watch.api_version, e);
+                warn!("{}; retrying in {:.1}s", cause, delay.as_secs_f32());
+                tracker.failed(&cause, None);
+                tokio::select! {
+                    // The stream is gone: the controller stopped.
+                    _ = start.closed() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
         }
+    }
+}
+
+/// The retry delay should kube's backoff end, which it does not: its own
+/// cap.
+const RETRY_CAP_SECS: u64 = 30;
+
+/// Whether API discovery serves `plural` in `api_version`; `Err` when
+/// discovery itself failed, which says neither.
+async fn crd_served(client: &Client, api_version: &str, plural: &str) -> Result<bool, kube::Error> {
+    match client.list_api_group_resources(api_version).await {
+        Ok(list) => Ok(list.resources.iter().any(|r| r.name == plural)),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -124,22 +305,16 @@ impl PendingWatches {
         watches.push((watch, start));
     }
 
-    fn is_empty(&self) -> bool {
-        self.watches
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty()
-    }
-
-    /// Recheck every `interval` until no watch waits. Its own timer, not
-    /// reconcile's: a cluster with no Gateway of ours never reconciles.
+    /// Recheck every `interval` until shutdown. Its own timer, not
+    /// reconcile's: a cluster with no Gateway of ours never reconciles. It
+    /// runs while none waits too: a failed discovery parks one later.
     pub async fn recheck_every(
-        self,
+        self: Arc<Self>,
         client: Client,
         interval: Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        while !self.is_empty() {
+        loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(interval) => self.recheck(&client).await,
@@ -157,7 +332,7 @@ impl PendingWatches {
             .map(|(w, _)| (w.api_version.clone(), w.plural.clone()))
             .collect();
         for (api_version, plural) in waiting {
-            if crd_served(client, &api_version, &plural).await != Some(true) {
+            if !matches!(crd_served(client, &api_version, &plural).await, Ok(true)) {
                 continue;
             }
             let mut watches = self.watches.lock().unwrap_or_else(|p| p.into_inner());
@@ -352,6 +527,7 @@ pub(super) type BoxedReflectorStream<K> =
 pub(super) fn create_reflector_with_config<K>(
     api: Api<K>,
     config: watcher::Config,
+    listings: &Listings,
 ) -> (Store<K>, BoxedReflectorStream<K>)
 where
     K: kube::Resource
@@ -363,15 +539,18 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
+    let dt = K::DynamicType::default();
+    let tracker = listings.track(&K::kind(&dt), false);
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
-    (reader, reflector_stream(writer, api, config))
+    (reader, reflector_stream(writer, api, config, tracker))
 }
 
 fn reflector_stream<K>(
     writer: reflector::store::Writer<K>,
     api: Api<K>,
     config: watcher::Config,
+    tracker: ListTracker,
 ) -> BoxedReflectorStream<K>
 where
     K: kube::Resource
@@ -386,7 +565,9 @@ where
     Box::pin(
         reflector::reflector(
             writer,
-            watcher::watcher(api, config).modify(drop_unread_metadata),
+            watcher::watcher(api, config)
+                .modify(drop_unread_metadata)
+                .inspect(move |event| tracker.observe(event)),
         )
         .default_backoff()
         .touched_objects(), // touched_objects includes deletes; applied_objects drops them
@@ -411,6 +592,7 @@ pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
 mod tests {
     use super::super::testkit::{self, apply, MockApi, CONTROLLER};
     use super::*;
+    use gateway_api::experimental::tcproutes::TCPRoute;
 
     fn served_gateways(names: &[&str]) -> Store<Gateway> {
         let mut writer = reflector::store::Writer::default();
@@ -513,22 +695,40 @@ mod tests {
         }
     }
 
+    fn status(code: u16, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "reason": reason, "code": code, "message": reason,
+        })
+    }
+
+    /// A TCPRoute reflector of `api`'s, its stream driven.
+    fn tcproutes(
+        api: &MockApi,
+        pending: &Arc<PendingWatches>,
+        listings: &Listings,
+    ) -> (Store<TCPRoute>, tokio::task::JoinHandle<()>) {
+        let client = api.client();
+        let (store, stream) = create_optional_reflector(
+            Api::<TCPRoute>::all(client.clone()),
+            &client,
+            pending,
+            listings,
+        );
+        (store, tokio::spawn(stream.for_each(|_| async {})))
+    }
+
     /// A CRD installed after startup is watched from the next recheck, on
     /// the recheck's own timer. Rechecks ran inside reconcile only: with
     /// no Gateway to reconcile, never.
     #[tokio::test(start_paused = true)]
     async fn optional_crd_installed_later_starts_its_watch() {
-        use gateway_api::experimental::tcproutes::TCPRoute;
         let api = MockApi::default();
         discovery_serves_tcproutes(&api, false);
-        let client = api.client();
-        let pending = PendingWatches::default();
-        let (_store, stream) =
-            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
-                .await;
-        let driver = tokio::spawn(stream.for_each(|_| async {}));
+        let pending = Arc::new(PendingWatches::default());
+        let (_store, driver) = tcproutes(&api, &pending, &Listings::default());
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let rechecks = tokio::spawn(pending.recheck_every(client, RECHECK, shutdown.clone()));
+        tokio::spawn(pending.recheck_every(api.client(), RECHECK, shutdown.clone()));
         settle().await;
         assert!(!tcproutes_watched(&api), "no watch before the CRD exists");
 
@@ -539,41 +739,117 @@ mod tests {
             tcproutes_watched(&api),
             "the watch starts once discovery serves the CRD"
         );
-        assert!(rechecks.is_finished(), "nothing waits: rechecks stop");
+        api.clear();
+        tokio::time::sleep(RECHECK).await;
+        settle().await;
+        assert_eq!(discovery_reads(&api), 0, "nothing waits: no more rechecks");
+        shutdown.cancel();
         driver.abort();
     }
 
-    /// A missing CRD's store counts as listed: the caches would otherwise
-    /// never be synced on a cluster without it.
+    /// A missing CRD counts as listed: the caches would otherwise never be
+    /// synced on a cluster without it.
     #[tokio::test(start_paused = true)]
     async fn a_missing_crd_counts_as_listed() {
-        use gateway_api::experimental::tcproutes::TCPRoute;
         let api = MockApi::default();
         discovery_serves_tcproutes(&api, false);
-        let client = api.client();
-        let pending = PendingWatches::default();
-        let (store, _stream) =
-            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
-                .await;
-        let ready = tokio::time::timeout(RECHECK, store.wait_until_ready()).await;
-        assert!(matches!(ready, Ok(Ok(()))), "never listed");
+        let listings = Listings::default();
+        let (store, _driver) = tcproutes(&api, &Arc::default(), &listings);
+        assert!(!listings.is_synced(), "not before discovery answered");
+        settle().await;
+        assert!(listings.is_synced(), "{:?}", listings.unlisted());
         assert!(store.is_empty());
+    }
+
+    /// A failed discovery says neither served nor not: it is retried with
+    /// backoff, and the kind waits unlisted, named with the failure. It
+    /// started a watch blindly, which 404ed forever on a cluster without
+    /// the CRD and held the caches unsynced.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_discovery_retries_then_starts_the_watch() {
+        let api = MockApi::default();
+        api.reply_to(TCPROUTE_GROUP, 504, status(504, "Timeout"));
+        let listings = Listings::default();
+        let (_store, driver) = tcproutes(&api, &Arc::default(), &listings);
+        settle().await;
+        assert!(!tcproutes_watched(&api), "no watch on a failed discovery");
+        let unlisted = listings.unlisted();
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].0, "TCPRoute");
+        assert!(unlisted[0].1.contains("discovery"), "{unlisted:?}");
+
+        discovery_serves_tcproutes(&api, true);
+        // Past the longest delay of kube's watcher backoff.
+        tokio::time::sleep(Duration::from_secs(RETRY_CAP_SECS)).await;
+        settle().await;
+        assert!(discovery_reads(&api) >= 2, "retried");
+        assert!(
+            tcproutes_watched(&api),
+            "the watch starts once discovery answers"
+        );
+        driver.abort();
+    }
+
+    /// An optional kind whose list is refused, gone (404) or not granted
+    /// (403), counts as listed and empty; its watch keeps retrying.
+    #[tokio::test(start_paused = true)]
+    async fn an_optional_list_refused_counts_as_listed() {
+        for (code, reason) in [(404, "NotFound"), (403, "Forbidden")] {
+            let api = MockApi::default();
+            // First: the longer prefix must win over discovery's.
+            api.reply_to(
+                &format!("{TCPROUTE_GROUP}/tcproutes"),
+                code,
+                status(code, reason),
+            );
+            discovery_serves_tcproutes(&api, true);
+            let listings = Listings::default();
+            let (store, driver) = tcproutes(&api, &Arc::default(), &listings);
+            settle().await;
+            assert!(tcproutes_watched(&api), "{code}");
+            assert!(listings.is_synced(), "{code}: {:?}", listings.unlisted());
+            assert!(store.is_empty());
+            driver.abort();
+        }
+    }
+
+    /// A core kind that cannot list holds the caches unsynced, and is
+    /// named with why.
+    #[tokio::test(start_paused = true)]
+    async fn a_core_list_refused_keeps_the_caches_unsynced() {
+        use gateway_api::httproutes::HTTPRoute;
+        let api = MockApi::default();
+        api.reply_to(
+            "/apis/gateway.networking.k8s.io/v1/httproutes",
+            403,
+            status(403, "Forbidden"),
+        );
+        let listings = Listings::default();
+        let (_store, stream) = create_reflector(Api::<HTTPRoute>::all(api.client()), &listings);
+        let driver = tokio::spawn(stream.for_each(|_| async {}));
+        settle().await;
+        assert!(!listings.is_synced());
+        let unlisted = listings.unlisted();
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].0, "HTTPRoute");
+        assert!(
+            unlisted[0].1.contains("403") || unlisted[0].1.contains("Forbidden"),
+            "{unlisted:?}"
+        );
+        driver.abort();
     }
 
     /// Discovery is read once per resync interval while a CRD is missing.
     #[tokio::test(start_paused = true)]
     async fn discovery_is_read_once_per_interval() {
-        use gateway_api::experimental::tcproutes::TCPRoute;
         let api = MockApi::default();
         discovery_serves_tcproutes(&api, false);
-        let client = api.client();
-        let pending = PendingWatches::default();
-        let _reflector =
-            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
-                .await;
+        let pending = Arc::new(PendingWatches::default());
+        let _reflector = tcproutes(&api, &pending, &Listings::default());
+        settle().await;
         assert_eq!(discovery_reads(&api), 1, "the startup check");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let rechecks = tokio::spawn(pending.recheck_every(client, RECHECK, shutdown.clone()));
+        let rechecks = tokio::spawn(pending.recheck_every(api.client(), RECHECK, shutdown.clone()));
 
         tokio::time::sleep(RECHECK - Duration::from_secs(1)).await;
         settle().await;

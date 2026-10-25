@@ -192,10 +192,9 @@ where
 }
 
 impl TestCluster {
-    /// A controller context over these stores; it leads, its caches synced.
+    /// A controller context over these stores; it leads, its caches synced
+    /// (no kind is tracked).
     pub fn ctx(&self, client: Client) -> Arc<ControllerCtx> {
-        let synced = super::CachesSynced::default();
-        synced.mark();
         Arc::new(ControllerCtx {
             client,
             controller_name: CONTROLLER.to_string(),
@@ -222,7 +221,7 @@ impl TestCluster {
             hub: Arc::default(),
             reports: Arc::default(),
             leader: super::leader::Leader::always(),
-            synced,
+            synced: super::watch::Listings::default(),
             owned: super::provision::Owned,
         })
     }

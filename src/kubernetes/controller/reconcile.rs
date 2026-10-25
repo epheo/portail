@@ -1257,10 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_is_published_before_the_caches_sync() {
         let mut p = Pipeline::new();
-        p.ctx
-            .synced
-            .0
-            .store(false, std::sync::atomic::Ordering::Release);
+        let routes = p.ctx.synced.track("HTTPRoute", false);
         let gw = testkit::gateway("gw", 1);
         apply(&mut p.cluster.gateways, gw.clone());
 
@@ -1268,7 +1265,7 @@ mod tests {
         assert!(p.served(&gw).is_none());
         assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
 
-        p.ctx.synced.mark();
+        routes.observe::<HTTPRoute>(&Ok(kube::runtime::watcher::Event::InitDone));
         p.pass(&gw).await.unwrap();
         assert!(p.served(&gw).is_some());
     }
