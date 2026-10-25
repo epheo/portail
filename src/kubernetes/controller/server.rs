@@ -46,7 +46,9 @@ const SYNC_PREFIX: &str = "/v1/sync/";
 /// Gateway is two orders below.
 const MAX_BODY: usize = 1024 * 1024;
 /// Bodies read at once, as many as TokenReviews in flight: 16 MiB at most,
-/// and a report reads in milliseconds.
+/// and a report reads in milliseconds. One pod reads one at a time: a data
+/// plane sends one request at a time, and a tenant stalling bodies on its
+/// own valid token then holds one read, not all.
 const MAX_BODY_READS: usize = 16;
 /// The longest request head, and hyper's read buffer: a token is at most
 /// 16 KiB (the pre-check refuses more), the rest of a head a few hundred
@@ -84,6 +86,8 @@ pub(crate) struct SyncServer {
     peer_connections: Mutex<HashMap<IpAddr, usize>>,
     per_peer: usize,
     body_reads: Semaphore,
+    /// The pods whose body is being read.
+    body_readers: Mutex<std::collections::HashSet<InstanceId>>,
     shutdown: CancellationToken,
 }
 
@@ -121,6 +125,7 @@ impl SyncServer {
             peer_connections: Mutex::default(),
             per_peer,
             body_reads: Semaphore::new(MAX_BODY_READS),
+            body_readers: Mutex::default(),
             shutdown,
         })
     }
@@ -178,16 +183,22 @@ impl SyncServer {
         if declared.is_some_and(|len| len > MAX_BODY as u64) {
             return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB");
         }
-        let Ok(_reading) = self.body_reads.try_acquire() else {
-            return unavailable("too many bodies being read");
-        };
-        let body = Limited::new(request.into_body(), MAX_BODY);
-        let bytes = match tokio::time::timeout(PEER_TIMEOUT, body.collect()).await {
-            Ok(Ok(collected)) => collected.to_bytes(),
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB")
+        // Both slots are held for the read only, never through the hold.
+        let bytes = {
+            let Some(_reader) = BodyReader::start(&self.body_readers, &instance) else {
+                return unavailable("a body of this pod is being read");
+            };
+            let Ok(_reading) = self.body_reads.try_acquire() else {
+                return unavailable("too many bodies being read");
+            };
+            let body = Limited::new(request.into_body(), MAX_BODY);
+            match tokio::time::timeout(PEER_TIMEOUT, body.collect()).await {
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                    return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB")
+                }
+                Ok(Err(_)) | Err(_) => return text(StatusCode::BAD_REQUEST, "body not read"),
             }
-            Ok(Err(_)) | Err(_) => return text(StatusCode::BAD_REQUEST, "body not read"),
         };
         let sync: SyncRequest = match serde_json::from_slice(&bytes) {
             Ok(sync) => sync,
@@ -453,6 +464,38 @@ impl Lapses {
             };
             tokio::time::sleep_until(deadline).await;
         }
+    }
+}
+
+/// A pod's body read, until dropped.
+struct BodyReader<'a> {
+    readers: &'a Mutex<std::collections::HashSet<InstanceId>>,
+    instance: InstanceId,
+}
+
+impl<'a> BodyReader<'a> {
+    /// `None` while `instance` has a body being read.
+    fn start(
+        readers: &'a Mutex<std::collections::HashSet<InstanceId>>,
+        instance: &InstanceId,
+    ) -> Option<Self> {
+        let started = readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(instance.clone());
+        started.then(|| Self {
+            readers,
+            instance: instance.clone(),
+        })
+    }
+}
+
+impl Drop for BodyReader<'_> {
+    fn drop(&mut self) {
+        self.readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.instance);
     }
 }
 
@@ -1510,12 +1553,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn body_reads_are_capped_and_a_stalled_body_ends_in_5s() {
         let f = Arc::new(fixture());
-        let token = gateway_token("default", "gw", 0);
         f.publish(1);
-        assert_eq!(f.sync(poll("")).await.status(), StatusCode::OK, "reviewed");
+        // One reviewed token per pod: one pod reads one body at a time.
+        let tokens: Vec<String> = (0..=MAX_BODY_READS as u32)
+            .map(|n| gateway_token("default", "gw", n))
+            .collect();
+        for (n, token) in tokens.iter().enumerate() {
+            f.api
+                .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
+            let reviewed = post(Some(token), &body(&key(), "", None));
+            assert_eq!(f.sync(reviewed).await.status(), StatusCode::OK);
+        }
         let started = Instant::now();
-        let stalled: Vec<_> = (0..MAX_BODY_READS)
-            .map(|_| {
+        let stalled: Vec<_> = tokens[..MAX_BODY_READS]
+            .iter()
+            .map(|token| {
                 let request = Request::post(path_of(&key()))
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Stalled)
@@ -1527,7 +1579,8 @@ mod tests {
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
-        let over = f.sync(poll("")).await;
+        let last = post(Some(&tokens[MAX_BODY_READS]), &body(&key(), "", None));
+        let over = f.sync(last).await;
         assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(over.headers()[header::RETRY_AFTER], "1");
 
@@ -1762,5 +1815,78 @@ mod tests {
         assert!(started.elapsed() >= PEER_TIMEOUT - Duration::from_millis(100));
         drop(tls);
         f.shutdown.cancel();
+    }
+
+    /// One pod reads one body at a time: a tenant with a valid token
+    /// stalling bodies holds one read, not every other data plane's.
+    #[tokio::test(start_paused = true)]
+    async fn one_pod_reads_one_body_at_a_time() {
+        let f = Arc::new(fixture());
+        let v1 = f.publish(1);
+        assert_eq!(
+            version_of(f.sync(poll("")).await).await,
+            v1,
+            "pod-1 reviewed"
+        );
+        let token = gateway_token("default", "gw", 0);
+        let stalled: Vec<_> = (0..MAX_BODY_READS as u32)
+            .map(|n| {
+                let request = Request::post(path_of(&key()))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Stalled)
+                    .unwrap();
+                let server = f.server.clone();
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let refused = stalled.iter().filter(|s| s.is_finished()).count();
+        assert_eq!(refused, MAX_BODY_READS - 1, "all but one answered at once");
+
+        f.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-2")));
+        let other = post(
+            Some(&gateway_token("default", "gw", 1)),
+            &body(&key(), "", None),
+        );
+        assert_eq!(version_of(f.sync(other).await).await, v1, "pod-2 syncs");
+        stalled.iter().for_each(|s| s.abort());
+    }
+
+    /// More data planes hold polls than bodies may be read at once.
+    #[tokio::test(start_paused = true)]
+    async fn held_polls_hold_no_body_read() {
+        let f = Arc::new(fixture());
+        let v1 = f.publish(1);
+        let pods = 0..=MAX_BODY_READS as u32;
+        for n in pods.clone() {
+            f.api
+                .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
+            let reviewed = post(
+                Some(&gateway_token("default", "gw", n)),
+                &body(&key(), "", None),
+            );
+            assert_eq!(version_of(f.sync(reviewed).await).await, v1);
+        }
+        let held: Vec<_> = pods
+            .map(|n| {
+                let request = post(
+                    Some(&gateway_token("default", "gw", n)),
+                    &body(&key(), &v1, None),
+                );
+                let server = f.server.clone();
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(held.iter().all(|h| !h.is_finished()), "every poll holds");
+        let v2 = f.publish(2);
+        for poll in held {
+            assert_eq!(version_of(poll.await.unwrap()).await, v2);
+        }
     }
 }
