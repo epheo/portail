@@ -76,7 +76,7 @@ Managed data planes still run the image the controller was built for: set Gatewa
 One image, two Kubernetes modes:
 
 - `portail controller`: watches Gateway API resources cluster-wide, translates each Gateway into its data plane's configuration, provisions data planes and writes every status. Leader-elected: standbys keep their caches warm and write nothing.
-- `portail dataplane --gateway <ns>/<name>`: serves one Gateway. It has no Kubernetes client, no RBAC and no API token: it long-polls the controller over TLS, `POST /v1/sync/<ns>/<name>` on port 9443, and reports which listeners it bound.
+- `portail dataplane --gateway <ns>/<name>`: serves one Gateway. It has no Kubernetes client, no RBAC and no API token: it long-polls the controller over TLS, `POST /v1/sync/<ns>/<name>` on port 9443, and reports which listeners it bound. One opt-in exception, for pods that reach only the apiserver: [Primary UDN](#primary-udn).
 
 One data plane serves exactly one Gateway: Gateways never share a route table or a socket.
 TLS keys travel only from the controller to the data plane of the Gateway that references them, and stay in its memory.
@@ -139,6 +139,7 @@ spec:
     namespace: default
     ips: ["172.16.87.21/24"]
     gateway: ["172.16.87.1"]
+  controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
 ```
 
 Referenced from:
@@ -153,6 +154,7 @@ Defaults:
 - `provisioning: Managed`, `replicas: 1`.
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
 - `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
+- `controllerTransport: Direct`.
 
 Rules:
 
@@ -172,6 +174,74 @@ Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Ne
 | Controller down, a pod restarts | dark until the controller returns | the other replica serves |
 
 Two replicas spread across nodes when there are several.
+
+## Primary UDN
+
+On OVN-Kubernetes, a pod in a namespace with a Primary User Defined Network reaches the apiserver and DNS on the default network, and nothing else: its data plane cannot dial the controller Service.
+GatewayParameters `controllerTransport: APIServerProxy` makes it poll through the apiserver's service proxy:
+
+```
+POST https://kubernetes.default.svc/api/v1/namespaces/portail-system/services/https:portail-controller:9443/proxy/v1/sync/<ns>/<name>
+```
+
+Use it only for pods that cannot reach the controller Service: Direct is one hop shorter and holds no API token.
+
+RBAC: add `deploy/components/apiserver-proxy` to your kustomization of `deploy/install`, with a RoleBinding of its Role to each such Gateway's ServiceAccount, `portail-<gateway>` in the Gateway's namespace:
+
+```yaml
+# kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z
+- rolebinding.yaml
+components:
+- https://github.com/epheo/portail//deploy/components/apiserver-proxy?ref=vX.Y.Z
+```
+
+```yaml
+# rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portail-controller-proxy
+  namespace: portail-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portail-controller-proxy
+subjects:          # one per Gateway polling through the apiserver
+- kind: ServiceAccount
+  name: portail-svc-gw
+  namespace: demo-primary
+```
+
+- The Role grants `services/proxy` on `https:portail-controller:9443`, verb `create` (a POST): nothing else, and only on that Service port.
+- Without the binding the data plane logs `apiserver answered 403 Forbidden ... configuration error`, backs off and keeps polling; nothing it serves changes.
+
+The pod gets:
+
+- `--transport apiserver-proxy`;
+- a second projected volume at `/var/run/secrets/portail.epheo.eu/apiserver`: a token of the API audience, one hour, rotated by kubelet, and `kube-root-ca.crt`;
+- still `automountServiceAccountToken: false`: the API token is opt-in per Gateway, and its RBAC allows the one proxy call.
+
+An Unmanaged data plane does the same by hand: `--transport apiserver-proxy`, and the two files at the `--apiserver-token-file` and `--apiserver-ca-file` paths ([configuration](configuration.md#portail-dataplane)).
+
+Trust:
+
+- The data plane's TLS ends at the apiserver, verified against `kube-root-ca.crt` as `kubernetes.default.svc`; the apiserver dials the controller without verifying it.
+- So the data plane takes a snapshot, or a "Gateway gone", only when the controller signed it (see [Security](#security)): whoever may edit the controller Service or its endpoints cannot forge a configuration. They could replay an older snapshot the controller signed for the same Gateway.
+- The controller authenticates the data plane as on Direct: a TokenReview of its controller token, carried in `X-Portail-Token` since the apiserver takes `Authorization` for its own hop.
+- The controller's per-peer limits do not apply to the apiserver's endpoints, read from the EndpointSlices of `default/kubernetes` every 10 minutes: every proxied data plane arrives from them, authenticated and authorized by the apiserver. Its global limits still apply.
+
+Scale:
+
+- Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
+- The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
+- Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
+- With two controller replicas the apiserver picks an endpoint per request; a standby's answer is retried within a second.
+
+See `examples/kubernetes/primary-udn/`.
 
 ## Unmanaged Gateways
 
@@ -212,6 +282,8 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
+- It signs every snapshot and every "Gateway gone" answer with its serving key, never the CA's. A data plane takes an answer only when the signing certificate chains to the controller CA, names the controller Service and is valid now, and the signature covers the body; a "gone" answer must also name its Gateway and be issued within a minute of the data plane's clock.
+- An answer that fails changes nothing served: the data plane backs off, and its reports carry why as an apply error until the controller answers again.
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 

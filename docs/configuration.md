@@ -50,13 +50,17 @@ These flags take no subcommand: `portail --http2 dataplane ...` is refused.
 | `--controller-address <URL>` | The controller's sync endpoint, e.g. `https://portail-controller.portail-system.svc:9443` (required) |
 | `--controller-ca-file <FILE>` | PEM of the CA the controller's serving certificate chains to (default: the PEM in env `PORTAIL_CONTROLLER_CA`) |
 | `--token-file <FILE>` | Projected ServiceAccount token presented to the controller, re-read per request (default: `/var/run/secrets/portail.epheo.eu/controller/token`) |
+| `--transport <direct\|apiserver-proxy>` | How to reach the controller (default: `direct`). `apiserver-proxy` polls through the apiserver's service proxy, to the Service `--controller-address` names (`<service>.<namespace>.svc`), for pods that reach only the apiserver: see [Primary UDN](deployment.md#primary-udn) |
+| `--apiserver-address <URL>` | With `apiserver-proxy`: the apiserver (default: `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`); its certificate must name `kubernetes.default.svc` |
+| `--apiserver-token-file <FILE>` | With `apiserver-proxy`: a projected ServiceAccount token of the API audience, re-read per request (default: `/var/run/secrets/portail.epheo.eu/apiserver/token`) |
+| `--apiserver-ca-file <FILE>` | With `apiserver-proxy`: the CA the apiserver's certificate chains to, the only one trusted (default: `/var/run/secrets/portail.epheo.eu/apiserver/ca.crt`) |
 | `--shutdown-delay <DURATION>` | On SIGTERM, keep serving this long before draining (default: `5s`) |
 | `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |
 | `--admin-address <IP>` | Bind address of the admin endpoint (default: `0.0.0.0`). Kubelet probes reach the pod IP, so loopback would fail readiness; the pod IP keeps `/metrics` off public VIP and Multus interfaces |
 | `--access-log <PATH>` | As in standalone mode |
 | `--http2` | As in standalone mode |
 
-Managed data planes run with `--gateway`, `--controller-address`, `--admin-address=$(POD_IP)`, and `--shutdown-delay=0s` under a `Recreate` rollout.
+Managed data planes run with `--gateway`, `--controller-address`, `--admin-address=$(POD_IP)`, `--shutdown-delay=0s` under a `Recreate` rollout, and `--transport apiserver-proxy` under GatewayParameters `controllerTransport: APIServerProxy`, with the API token and `kube-root-ca.crt` mounted at the `--apiserver-*-file` defaults.
 `--access-log` and `--http2` are for Unmanaged data planes: GatewayParameters do not set them yet.
 
 ## Environment Variables
@@ -67,6 +71,7 @@ Managed data planes run with `--gateway`, `--controller-address`, `--admin-addre
 | `PORTAIL_MAX_BLOCKING_THREADS` | Tokio blocking-thread cap (default: `32`) |
 | `POD_NAMESPACE` | The controller's `--namespace` default |
 | `PORTAIL_CONTROLLER_CA` | The data plane's controller CA, as PEM, when `--controller-ca-file` is not given |
+| `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | Set by kubelet: the data plane's `--apiserver-address` default with `--transport apiserver-proxy` |
 
 ## Admin Endpoint
 
