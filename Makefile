@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration bench bench-baseline bench-check fmt clippy conformance
+.PHONY: build test test-all test-integration bench bench-baseline bench-check fmt clippy manifests conformance
 
 build:
 	cargo build --release
@@ -29,6 +29,9 @@ fmt:
 
 clippy:
 	cargo clippy --all-targets -- -D warnings
+
+manifests:
+	scripts/check-manifests.sh
 
 # Creates its own kind cluster and installs deploy/conformance on it.
 # PROGRAMMED_SAMPLES=N also times N Gateway creates to Programmed first.
