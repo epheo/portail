@@ -460,9 +460,16 @@ fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     }
 }
 
+/// The retry of a failed pass: the cadence v0.1.x error_policy used, slow
+/// enough not to press a failing apiserver, well inside the safety net.
+const ERROR_REQUEUE_SECS: u64 = 30;
+
 fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<ControllerCtx>) -> Action {
-    warn!("Gateway reconciliation error, requeueing in 30s");
-    Action::requeue(Duration::from_secs(30))
+    warn!(
+        "Gateway reconciliation error, requeueing in {}s",
+        ERROR_REQUEUE_SECS
+    );
+    Action::requeue(Duration::from_secs(ERROR_REQUEUE_SECS))
 }
 
 #[cfg(test)]

@@ -70,5 +70,7 @@ pub(crate) async fn reconcile(
 }
 
 /// The Gateway left this controller (its class names another): delete its
-/// owned objects.
-pub(crate) async fn release(_ctx: &ControllerCtx, _gateway: &Gateway) {}
+/// owned objects. `Err` leaves some for a retry.
+pub(crate) async fn release(_ctx: &ControllerCtx, _gateway: &Gateway) -> anyhow::Result<()> {
+    Ok(())
+}

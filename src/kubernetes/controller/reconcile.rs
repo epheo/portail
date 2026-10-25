@@ -22,13 +22,13 @@ use super::provision::Provisioned;
 use super::translate::{translate, Observed, Plan, Rejected, Statuses};
 use super::{
     params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
-    ReconcileError,
+    ReconcileError, ERROR_REQUEUE_SECS,
 };
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::{PolicyAcceptance, RouteAcceptance};
 use crate::kubernetes::status;
-use crate::logging::{debug, info};
+use crate::logging::{debug, info, warn};
 use crate::sync::{GatewayKey, GatewayRef, Snapshot};
 
 /// Per-listener attachedRoutes. The spec counts ROUTES attached to a
@@ -271,7 +271,13 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                     key, gateway.spec.gateway_class_name
                 );
             }
-            provision::release(ctx, gateway).await;
+            // Its data planes are told 404 and stop reporting: what they
+            // said last is another controller's business now.
+            ctx.reports.retain(|k| k != &key);
+            if let Err(e) = provision::release(ctx, gateway).await {
+                warn!("Gateway {}: releasing its data plane failed: {:#}", key, e);
+                return Step::Done(Action::requeue(Duration::from_secs(ERROR_REQUEUE_SECS)));
+            }
             return Step::Done(Action::await_change());
         }
         ClassOwner::Missing => {
@@ -1350,7 +1356,8 @@ mod tests {
     }
 
     /// A class naming another controller takes its Gateways out of the hub
-    /// (their data planes get 404); a missing class leaves them served.
+    /// (their data planes get 404) and drops their reports; a missing class
+    /// leaves them served.
     #[tokio::test]
     async fn only_a_class_of_another_controller_takes_a_gateway_away() {
         let mut p = Pipeline::new();
@@ -1376,6 +1383,10 @@ mod tests {
         p.pass(&gw).await.unwrap();
         assert!(p.served(&gw).is_none());
         assert!(!p.ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            p.ctx.reports.live(&testkit::key(&gw)).is_empty(),
+            "another controller's Gateway keeps no report here"
+        );
     }
 
     /// The pipeline end to end: HTTPS, HTTP and TCP listeners bind, the
