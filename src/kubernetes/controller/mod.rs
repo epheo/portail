@@ -338,6 +338,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     ));
 
     let tls = ca.server_config();
+    let signer = ca.serving_key();
     tokio::spawn(ca.keep_renewed(shutdown.clone()));
     let (lapses, lapse_wakes) = server::Lapses::new();
     let sync_server = server::SyncServer::new(
@@ -348,6 +349,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             &args.service_name,
             auth::own_service_account(),
         ),
+        signer,
         lapses,
         shutdown.clone(),
     );

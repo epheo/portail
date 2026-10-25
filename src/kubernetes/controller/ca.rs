@@ -99,6 +99,17 @@ impl ResolvesServerCert for ServingCert {
     }
 }
 
+/// The serving leaf as re-issues swap it: sync answers are signed with its
+/// key, never the CA's.
+#[derive(Clone, Debug)]
+pub(crate) struct ServingKey(Arc<ServingCert>);
+
+impl ServingKey {
+    pub(crate) fn current(&self) -> Arc<CertifiedKey> {
+        self.0 .0.load_full()
+    }
+}
+
 /// Load the CA of `namespace` from its Secret, creating it when absent, and
 /// publish its certificate; serve as Service `service`.
 pub(crate) async fn load_or_create(
@@ -305,6 +316,10 @@ impl ControllerCa {
     /// against.
     pub(crate) fn ca_pem(&self) -> &str {
         &self.cert_pem
+    }
+
+    pub(crate) fn serving_key(&self) -> ServingKey {
+        ServingKey(self.serving.clone())
     }
 
     /// The TLS config of the sync endpoint: HTTP/1.1, the current leaf.
