@@ -69,6 +69,11 @@ pub enum Answer {
     /// 204, signed by the controller over this poll's `have`: the version
     /// served is current.
     Unchanged,
+    /// 204, signed "pending": the controller has no snapshot for this
+    /// Gateway yet. It answered, and confirms nothing.
+    Pending,
+    /// 204 to a leaving poll, signed "leave": the controller took it.
+    Left,
     /// 404, signed by the controller, recent and for this Gateway: it
     /// serves this Gateway nothing.
     Gone,
@@ -266,6 +271,7 @@ impl Client {
             ..request.clone()
         };
         let body = Bytes::from(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+        let leaving = request.report.as_ref().is_some_and(|r| r.leaving);
         let have = request.have;
         let request = self.post(credentials, body);
         let response = match self.conn.take() {
@@ -318,9 +324,20 @@ impl Client {
                 Err(e) => return Ok(Answer::Unverified(format!("snapshot refused: {}", e))),
             },
             StatusCode::NO_CONTENT => {
-                match self.verify(Signed::Unchanged, &nonce, &head.headers, have.as_bytes()) {
-                    Ok(()) => Answer::Unchanged,
-                    Err(e) => return Ok(Answer::Unverified(format!("204 refused: {}", e))),
+                let as_kind = |kind, over: &[u8]| self.verify(kind, &nonce, &head.headers, over);
+                if leaving {
+                    match as_kind(Signed::Leave, b"") {
+                        Ok(()) => Answer::Left,
+                        Err(e) => return Ok(Answer::Unverified(format!("204 refused: {}", e))),
+                    }
+                } else {
+                    match as_kind(Signed::Unchanged, have.as_bytes()) {
+                        Ok(()) => Answer::Unchanged,
+                        Err(_) if as_kind(Signed::Pending, b"").is_ok() => Answer::Pending,
+                        // A leave acknowledgement lands here too: never a
+                        // confirmation of what a poll serves.
+                        Err(e) => return Ok(Answer::Unverified(format!("204 refused: {}", e))),
+                    }
                 }
             }
             StatusCode::SERVICE_UNAVAILABLE if standby => {
@@ -978,6 +995,30 @@ mod tests {
                 unverified,
             ),
             (
+                "signed pending",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        let mut response = answer(unchanged, b"", None);
+                        *response.headers_mut() = signed(&l, Signed::Pending, &p.nonce, b"");
+                        response
+                    }
+                })),
+                |a| matches!(a, Answer::Pending),
+            ),
+            (
+                "a leave acknowledgement to a poll not leaving",
+                reply(Box::new({
+                    let l = l.clone();
+                    move |p| {
+                        let mut response = answer(unchanged, b"", None);
+                        *response.headers_mut() = signed(&l, Signed::Leave, &p.nonce, b"");
+                        response
+                    }
+                })),
+                unverified,
+            ),
+            (
                 "signed gone",
                 reply(Box::new({
                     let l = l.clone();
@@ -1116,6 +1157,45 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// A leaving poll takes a leave acknowledgement and nothing else: an
+    /// "unchanged" to it would be one minted for another poll.
+    #[tokio::test]
+    async fn a_leaving_poll_takes_only_a_leave_acknowledgement() {
+        let ca = TestCa::new();
+        let leaf = ca.leaf(&["127.0.0.1"]);
+        let key = leaf.clone();
+        let (addr, _) = stub::serve(leaf, true, move |n, seen| {
+            let polled = polled(&seen);
+            let mut response = answer(StatusCode::NO_CONTENT, b"", None);
+            *response.headers_mut() = match n {
+                1 => signed(&key, Signed::Leave, &polled.nonce, b""),
+                _ => signed(
+                    &key,
+                    Signed::Unchanged,
+                    &polled.nonce,
+                    polled.have.as_bytes(),
+                ),
+            };
+            Box::pin(async move { Some(response) })
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(addr, &ca.pem(), &dir);
+        let leaving = SyncRequest {
+            have: "v1".into(),
+            report: Some(crate::sync::InstanceReport {
+                applied: "v1".into(),
+                leaving: true,
+                ..Default::default()
+            }),
+            ..poll()
+        };
+        let got = client.poll(&leaving).await;
+        assert!(matches!(got, Answer::Left), "{got:?}");
+        let got = client.poll(&leaving).await;
+        assert!(unverified(&got), "{got:?}");
     }
 
     fn unverified(answer: &Answer) -> bool {
