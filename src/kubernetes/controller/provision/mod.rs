@@ -166,12 +166,20 @@ impl Retries {
     }
 }
 
-/// A change to an owned object, as the reflector left its store.
+/// A change to an owned object.
 struct Touched {
     kind: Kind,
     meta: ObjectMeta,
-    /// Gone from the store: deleted.
+    /// Deleted.
     gone: bool,
+}
+
+/// What an owned-object reflector reports.
+enum Change {
+    Touched(Box<Touched>),
+    /// The kind was listed again; deletions missed in a watch gap emit no
+    /// event of their own.
+    Relisted(Kind),
 }
 
 impl Owned {
@@ -200,12 +208,22 @@ impl Owned {
         let changes = futures::stream::select_all([sa_changes, deployment_changes, pdb_changes])
             .filter_map({
                 let applied = applied.clone();
-                move |touched| {
-                    if touched.gone {
-                        forget_deleted(&applied, &touched);
-                    }
-                    let gateway = controller_gateway(&touched.meta)
-                        .filter(|gateway| gateways.get(gateway).is_some());
+                let deployments = deployments.clone();
+                move |change| {
+                    let gateway = match change {
+                        Change::Relisted(Kind::Deployment) => {
+                            prune_relisted(&applied, &deployments);
+                            None
+                        }
+                        Change::Relisted(_) => None,
+                        Change::Touched(touched) => {
+                            if touched.gone {
+                                forget_deleted(&applied, &touched);
+                            }
+                            controller_gateway(&touched.meta)
+                                .filter(|gateway| gateways.get(gateway).is_some())
+                        }
+                    };
                     futures::future::ready(gateway)
                 }
             });
@@ -347,7 +365,7 @@ fn owned_reflector<K>(
     listings: &Listings,
     kind: Kind,
     install: &str,
-) -> (Store<PartialObjectMeta<K>>, BoxStream<'static, Touched>)
+) -> (Store<PartialObjectMeta<K>>, BoxStream<'static, Change>)
 where
     K: Resource<DynamicType = (), Scope = NamespaceResourceScope>
         + Clone
@@ -371,23 +389,25 @@ where
             .inspect(move |event| tracker.observe(event)),
     )
     .default_backoff()
-    .touched_objects()
-    .filter_map({
-        let store = store.clone();
-        move |touched| {
-            let touched = match touched {
-                Ok(obj) => Some(Touched {
-                    kind,
-                    gone: store.get(&ObjectRef::from_obj(&obj)).is_none(),
-                    meta: obj.metadata,
-                }),
-                Err(e) => {
-                    warn!("Owned {} watch: {}", kind.name(), e);
-                    None
-                }
-            };
-            futures::future::ready(touched)
-        }
+    .filter_map(move |event| {
+        let touched = |obj: PartialObjectMeta<K>, gone| {
+            Some(Change::Touched(Box::new(Touched {
+                kind,
+                meta: obj.metadata,
+                gone,
+            })))
+        };
+        let change = match event {
+            Ok(watcher::Event::Apply(obj) | watcher::Event::InitApply(obj)) => touched(obj, false),
+            Ok(watcher::Event::Delete(obj)) => touched(obj, true),
+            Ok(watcher::Event::InitDone) => Some(Change::Relisted(kind)),
+            Ok(watcher::Event::Init) => None,
+            Err(e) => {
+                warn!("Owned {} watch: {}", kind.name(), e);
+                None
+            }
+        };
+        futures::future::ready(change)
     })
     .boxed();
     (store, changes)
@@ -410,6 +430,21 @@ fn forget_deleted(applied: &AppliedObjects, touched: &Touched) {
             applied.remove(&owner.uid);
         }
     }
+}
+
+/// Keep the records of the Gateways that own a Deployment in the relisted
+/// cache: one deleted in a watch gap left no deletion event to forget it
+/// by.
+fn prune_relisted(applied: &AppliedObjects, deployments: &Store<PartialObjectMeta<Deployment>>) {
+    let owners: HashSet<String> = deployments
+        .state()
+        .iter()
+        .filter_map(|d| controller_owner(&d.metadata).map(|o| o.uid.clone()))
+        .collect();
+    applied
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|gateway_uid, _| owners.contains(gateway_uid));
 }
 
 fn meta_of<K>(
@@ -1673,6 +1708,32 @@ mod tests {
         let mut namesake = gateway();
         namesake.metadata.uid = Some("other-uid".into());
         assert!(owned_service(&ctx, &namesake).is_none());
+    }
+
+    /// A relist after a watch gap delivers no deletion for what went in
+    /// the gap: the records of Gateways owning no Deployment any more go.
+    #[test]
+    fn a_relist_forgets_gateways_gone_in_the_gap() {
+        let applied = AppliedObjects::default();
+        let record = Applied {
+            uid: "u".into(),
+            version: "1".into(),
+            hash: "h".into(),
+        };
+        for gateway_uid in ["kept-uid", "gone-uid"] {
+            applied
+                .lock()
+                .unwrap()
+                .insert(gateway_uid.into(), [(Kind::Service, record.clone())].into());
+        }
+        let mut deployments = Writer::<PartialObjectMeta<Deployment>>::default();
+        apply(
+            &mut deployments,
+            partial(meta(NAME, "kept", "kept-uid", "d", true)),
+        );
+        prune_relisted(&applied, &deployments.as_reader());
+        let left: Vec<String> = applied.lock().unwrap().keys().cloned().collect();
+        assert_eq!(left, ["kept-uid"]);
     }
 
     /// An owned object triggers its Gateway; another object none.
