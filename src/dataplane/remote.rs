@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use bytes::Bytes;
-use http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE, HOST, RETRY_AFTER};
+use http::header::{HeaderName, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
@@ -40,6 +40,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * HOLD.as_secs());
 /// namespace and name: the controller checks the token against the path
 /// before it reads the body.
 const SYNC_PATH: &str = "/v1/sync";
+
+/// The longest answer body read. Gateway API allows 64 listeners of 64
+/// certificateRefs: 4096 certificates at 8 KiB of PEM chain and key is
+/// 32 MiB; twice that leaves the routes room.
+const MAX_ANSWER: usize = 64 * 1024 * 1024;
 
 /// The share of an error answer's body a log line keeps: a reason, not a
 /// proxy's error page.
@@ -90,6 +95,8 @@ pub struct Client {
     answers: AnswerVerifier,
     /// Idle between polls; taken by the poll that uses it.
     conn: Option<Conn>,
+    /// The longest answer body read, [`MAX_ANSWER`] but in tests.
+    max_answer: usize,
 }
 
 /// Where a poll is sent, and the TLS peer it must reach.
@@ -231,6 +238,7 @@ impl Client {
             gateway,
             answers,
             conn: None,
+            max_answer: MAX_ANSWER,
         }
     }
 
@@ -278,11 +286,29 @@ impl Client {
         let (head, body) = response.into_parts();
         let status = head.status;
         let standby = head.headers.contains_key(STANDBY_HEADER);
-        let body = body
-            .collect()
-            .await
-            .map_err(|e| format!("reading the answer: {}", e))?
-            .to_bytes();
+        // Read before it is verified: whoever answers must not make it
+        // hold more than the largest snapshot.
+        let declared = head
+            .headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(len) = declared.filter(|len| *len > self.max_answer as u64) {
+            return Ok(Answer::Unverified(format!(
+                "an answer of {} bytes, over {}",
+                len, self.max_answer
+            )));
+        }
+        let body = match Limited::new(body, self.max_answer).collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                return Ok(Answer::Unverified(format!(
+                    "an answer over {} bytes",
+                    self.max_answer
+                )))
+            }
+            Err(e) => return Err(format!("reading the answer: {}", e)),
+        };
         let answer = match status {
             StatusCode::OK => match self.verify(Signed::Snapshot, &nonce, &head.headers, &body) {
                 Ok(()) => Answer::Snapshot(body),
@@ -1025,6 +1051,38 @@ mod tests {
             .map(|s| polled(s).nonce)
             .collect();
         assert_eq!(nonces.len(), replies.len(), "a fresh nonce per poll");
+    }
+
+    /// An answer bigger than the largest snapshot is refused unread: by
+    /// its Content-Length, or once a chunked body passes the cap.
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused_before_it_is_read() {
+        let ca = TestCa::new();
+        let (addr, _) = stub::serve(ca.leaf(&["127.0.0.1"]), true, |n, _| {
+            let body = Full::new(Bytes::from(vec![b' '; 2048]));
+            let mut response = Response::new(body);
+            if n == 2 {
+                response.headers_mut().insert(
+                    http::header::TRANSFER_ENCODING,
+                    HeaderValue::from_static("chunked"),
+                );
+            }
+            Box::pin(async move { Some(response) })
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(addr, &ca.pem(), &dir);
+        client.max_answer = 1024;
+        let declared = client.poll(&poll()).await;
+        assert!(
+            matches!(&declared, Answer::Unverified(e) if e.contains("2048 bytes")),
+            "{declared:?}"
+        );
+        let streamed = client.poll(&poll()).await;
+        assert!(
+            matches!(&streamed, Answer::Unverified(e) if e == "an answer over 1024 bytes"),
+            "{streamed:?}"
+        );
     }
 
     fn unverified(answer: &Answer) -> bool {
