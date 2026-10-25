@@ -3,11 +3,30 @@
 The controller serves the Gateway's configuration and writes its status; the pods are yours.
 Use it for what the controller will not render: `hostNetwork`, init containers with `NET_ADMIN`, a DaemonSet, an SCC.
 
+Install the controller once per cluster, at a release tag:
+
 ```bash
-kubectl apply --server-side -k ../../../deploy/install   # once per cluster
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+```
+
+At a commit of main, override its image in a kustomization of your own, as in [the examples README](../README.md):
+
+```yaml
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=<full commit sha>
+images:
+- name: ghcr.io/epheo/portail
+  newTag: sha-<full commit sha>
+```
+
+Then:
+
+```bash
 kubectl apply -k .
 kubectl -n portail-system get gateway edge
 ```
+
+`deployment.yaml` runs the release `deploy/install` names; with the main override, set its image to `ghcr.io/epheo/portail:sha-<full commit sha>` too.
 
 - `gatewayparameters.yaml`: `provisioning: Unmanaged`; the controller creates and deletes nothing for Gateways using it.
 - `serviceaccount.yaml`: `portail-<gateway>` in the Gateway's namespace, the only identity the controller serves this Gateway to.
@@ -20,7 +39,7 @@ kubectl -n portail-system get gateway edge
 - A projected token with audience `portail-controller.<controller namespace>.svc` at `/var/run/secrets/portail.epheo.eu/controller/token`.
 - The controller CA: `--controller-ca-file`, or its PEM in env `PORTAIL_CONTROLLER_CA`.
 - `--gateway <namespace>/<name>` and `--controller-address https://portail-controller.<controller namespace>.svc:9443`.
-- The controller's image version: data planes upgrade with it.
+- The controller's image: data planes upgrade with it.
 
 Each pod reports to the controller; `Programmed` needs one live pod at the current configuration.
 `status.addresses` lists what the pods report: the `IPAddress` values of `spec.addresses` found on a pod, resolved Network addresses, else each pod's first interface IP.

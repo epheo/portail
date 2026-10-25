@@ -3,8 +3,25 @@
 A Managed Gateway with two data-plane replicas.
 The controller creates `portail-example-gw`: a ServiceAccount, a Deployment, a LoadBalancer Service and a PodDisruptionBudget.
 
+Install the controller once per cluster, at a release tag:
+
 ```bash
-kubectl apply --server-side -k ../../../deploy/install   # once per cluster
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+```
+
+At a commit of main, override its image in a kustomization of your own, as in [the examples README](../README.md):
+
+```yaml
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=<full commit sha>
+images:
+- name: ghcr.io/epheo/portail
+  newTag: sha-<full commit sha>
+```
+
+Then:
+
+```bash
 kubectl apply -k .
 kubectl get gateway example-gw
 ```

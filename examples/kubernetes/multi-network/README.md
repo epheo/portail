@@ -54,7 +54,21 @@ The data plane binds published ports directly there: a port below 1024 gets `NET
 
 ## Examples
 
-Install the controller first: `kubectl apply --server-side -k ../../../deploy/install`.
+Install the controller once per cluster, at a release tag:
+
+```bash
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+```
+
+At a commit of main, override its image in a kustomization of your own, as in [the examples README](../README.md):
+
+```yaml
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=<full commit sha>
+images:
+- name: ghcr.io/epheo/portail
+  newTag: sha-<full commit sha>
+```
 
 ### [http-single-namespace/](http-single-namespace/)
 

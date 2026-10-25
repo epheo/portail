@@ -11,18 +11,34 @@ kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/re
 
 ## Install
 
-From a release:
+Install a release, from its asset:
 
 ```bash
 kubectl apply --server-side -f https://github.com/epheo/portail/releases/download/vX.Y.Z/install.yaml
 ```
 
-Or from the repository, at a tag or commit:
+Or from the repository at its tag:
 
 ```bash
 kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
 kubectl -n portail-system rollout status deploy/portail-controller
 ```
+
+`deploy/install` names the image of the release that last set it.
+At any other commit it runs an older image, possibly one without the `controller` subcommand.
+A commit of main has its own image, `:sha-<full commit sha>`: set it in a kustomization of your own, then `kubectl apply --server-side -k <its directory>`:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=<full commit sha>
+images:
+- name: ghcr.io/epheo/portail
+  newTag: sha-<full commit sha>
+```
+
+That image renders Managed data planes of the same commit.
 
 `deploy/install` creates:
 
@@ -33,7 +49,8 @@ kubectl -n portail-system rollout status deploy/portail-controller
 - ClusterIP Service `portail-controller`, port 9443 (`sync`), which data planes dial.
 - GatewayClass `portail`.
 
-`deploy/ha` is the same with two controller replicas, a PodDisruptionBudget and a soft spread across nodes:
+`deploy/ha` is the same with two controller replicas, a PodDisruptionBudget and a soft spread across nodes.
+It is for multi-node clusters: on a single node both replicas sit on that node, and the budget of one available blocks its drain.
 
 ```bash
 kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/ha?ref=vX.Y.Z"
