@@ -1,6 +1,9 @@
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::sync::GatewayKey;
 
 /// Command-line interface for Portail Gateway Controller
 #[derive(Parser, Debug)]
@@ -8,9 +11,14 @@ use std::path::PathBuf;
 #[command(name = "portail")]
 #[command(about = "High-Performance Kubernetes Gateway API Controller")]
 #[command(
-    long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying."
+    long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.\n\nWithout a subcommand it runs standalone, from --config or its built-in default config."
 )]
+// The flags below are standalone mode's: a subcommand takes its own.
+#[command(args_conflicts_with_subcommands = true)]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Specify configuration file path (supports .json, .yaml, .yml extensions)
     #[arg(short, long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -26,7 +34,7 @@ pub struct Args {
     pub check_config: bool,
 
     /// Enable verbose logging output
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     #[arg(action = ArgAction::Count)]
     pub verbose: u8,
 
@@ -37,7 +45,7 @@ pub struct Args {
     /// Generate example configuration file
     #[arg(long, value_name = "TYPE")]
     #[arg(value_parser = clap::builder::PossibleValuesParser::new(
-        portail::config::examples::EXAMPLES.iter().map(|(name, _, _)| *name)
+        crate::config::examples::EXAMPLES.iter().map(|(name, _, _)| *name)
     ))]
     pub generate_config: Option<String>,
 
@@ -50,14 +58,6 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub cert_dir: Option<PathBuf>,
 
-    /// Watch Kubernetes Gateway API resources instead of loading a config file
-    #[arg(long)]
-    pub kubernetes: bool,
-
-    /// Controller name to match against GatewayClass spec.controllerName
-    #[arg(long, default_value = "portail.epheo.eu/gateway-controller")]
-    pub controller_name: String,
-
     /// Print supported features (for conformance test integration) and exit
     #[arg(long)]
     pub supported_features: bool,
@@ -69,34 +69,16 @@ pub struct Args {
     #[arg(long)]
     pub print_crd: bool,
 
-    /// Manage Gateway lifecycle status (set false under portail-operator)
-    ///
-    /// Covers Accepted/Programmed/addresses. Set false when running under
-    /// portail-operator, which owns that status; portail then only reports
-    /// per-listener status and route status.
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-    pub manage_gateway_status: bool,
-
-    /// Port for the /readyz + /metrics admin endpoint (Kubernetes mode)
-    ///
-    /// Default 19099: in the conventional proxy-management range, well clear
-    /// of common Gateway listener ports (80, 443, 8080, 8081, 8443, ...) so
-    /// it does not collide with the data plane within the same pod.
-    #[arg(long, default_value_t = 19099)]
-    pub readiness_port: u16,
-
-    /// Serve /metrics + /readyz on this port in standalone mode (off by default)
+    /// Serve /metrics + /readyz on this port (off by default)
     ///
     /// Opt-in because standalone mode has no readinessProbe needing one.
     /// Readiness reports ready once listeners are up.
     #[arg(long, value_name = "PORT")]
     pub metrics_port: Option<u16>,
 
-    /// Bind address of the admin endpoint (/livez, /readyz, /metrics), both modes
+    /// Bind address of the admin endpoint (/livez, /readyz, /metrics)
     ///
-    /// Default 0.0.0.0, every interface: kubelet probes reach the pod IP,
-    /// so a loopback bind would fail readiness. The pod IP (downward API
-    /// status.podIP) keeps /metrics off public VIP and Multus interfaces.
+    /// Default 0.0.0.0, every interface.
     #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
     pub admin_address: IpAddr,
 
@@ -111,33 +93,151 @@ pub struct Args {
     ///
     /// Opt-in front end: TLS-terminate listeners advertise h2 via ALPN and
     /// bridge each stream through the HTTP/1.1 engine. Equivalent to
-    /// `performance.http2: true`; the flag is the Kubernetes-mode path,
-    /// where no config file exists.
+    /// `performance.http2: true`.
     #[arg(long)]
     pub http2: bool,
+}
 
-    /// Restrict to a single Gateway (format: namespace/name); operator sets this
-    ///
-    /// Set by portail-operator (per-Gateway data-plane Deployments); absent =
-    /// legacy unscoped mode that watches all Gateways cluster-wide.
-    #[arg(long, value_name = "NS/NAME")]
-    pub gateway: Option<String>,
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Watch Gateway API resources cluster-wide, serve each Gateway's data
+    /// plane its configuration, provision data planes and write status
+    Controller(ControllerArgs),
+    /// Serve one Gateway from the configuration the controller sends
+    Dataplane(DataplaneArgs),
+}
 
-    /// Operator-set watch shape (comma tokens); absent watches all secondary resources
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Controller(_) => "controller",
+            Command::Dataplane(_) => "dataplane",
+        }
+    }
+}
+
+/// The admin endpoint of both Kubernetes modes: /livez, /readyz, /metrics.
+#[derive(clap::Args, Debug, Clone)]
+pub struct AdminArgs {
+    /// Port of the admin endpoint
     ///
-    /// Which *gate-able* secondary resources this single-Gateway data plane
-    /// needs to watch, so it does not open cluster-wide watches it will never
-    /// use. Tokens: `tls` (a TLS-terminate listener means watch TLS Secrets)
-    /// and `ns-labels` (an `allowedRoutes: Selector` listener means watch
-    /// Namespace labels). Route watches (HTTP/TCP/TLS/UDP) are never gated:
-    /// any route may parentRef this Gateway and must receive a status, so no
-    /// route token exists; unknown tokens are ignored for operator
-    /// forward/backward-compatibility. Absent = legacy broad mode (watch
-    /// every gate-able resource); present narrows to only the listed extras.
-    /// portail-operator computes it from the Gateway's listeners and re-rolls
-    /// the pod when the shape changes.
-    #[arg(long, value_name = "TOKENS")]
-    pub watch_shape: Option<String>,
+    /// Default 19099: in the conventional proxy-management range, well clear
+    /// of common Gateway listener ports (80, 443, 8080, 8081, 8443, ...) so
+    /// it does not collide with the data plane within the same pod.
+    #[arg(long, default_value_t = 19099)]
+    pub readiness_port: u16,
+
+    /// Bind address of the admin endpoint
+    ///
+    /// Default 0.0.0.0, every interface: kubelet probes reach the pod IP,
+    /// so a loopback bind would fail readiness. The pod IP (downward API
+    /// status.podIP) keeps /metrics off public VIP and Multus interfaces.
+    #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+    pub admin_address: IpAddr,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ControllerArgs {
+    /// Controller name to match against GatewayClass spec.controllerName
+    #[arg(long, default_value = "portail.epheo.eu/gateway-controller")]
+    pub controller_name: String,
+
+    /// Namespace of the controller's lease, CA Secret and ConfigMap, and Service
+    #[arg(long, env = "POD_NAMESPACE")]
+    pub namespace: String,
+
+    /// The ClusterIP Service data planes dial; `<service>.<namespace>.svc`
+    /// is also the audience of their tokens
+    #[arg(long, default_value = "portail-controller")]
+    pub service_name: String,
+
+    /// Port of the sync endpoint
+    ///
+    /// Default 9443, the controller-runtime webhook port convention, apart
+    /// from the admin port.
+    #[arg(long, default_value_t = 9443)]
+    pub sync_port: u16,
+
+    /// Name of the leader election Lease
+    #[arg(long, default_value = "portail-controller")]
+    pub leader_election_id: String,
+
+    /// Data-plane image of Managed Gateways without a GatewayParameters image
+    ///
+    /// Default: the image this binary was published as.
+    #[arg(long, value_name = "IMAGE", default_value_t = default_dataplane_image())]
+    pub dataplane_image: String,
+
+    #[command(flatten)]
+    pub admin: AdminArgs,
+}
+
+/// Where a data plane reads the controller CA's PEM when
+/// `--controller-ca-file` is not given: managed pods get it in their template.
+pub const CONTROLLER_CA_ENV: &str = "PORTAIL_CONTROLLER_CA";
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct DataplaneArgs {
+    /// The Gateway this data plane serves
+    #[arg(long, value_name = "NS/NAME", value_parser = parse_gateway_key)]
+    pub gateway: GatewayKey,
+
+    /// The controller's sync endpoint, e.g. https://portail-controller.portail-system.svc:9443
+    #[arg(long, value_name = "URL")]
+    pub controller_address: String,
+
+    /// PEM file of the CA the controller's serving cert chains to; default:
+    /// the PEM in env PORTAIL_CONTROLLER_CA
+    #[arg(long, value_name = "FILE")]
+    pub controller_ca_file: Option<PathBuf>,
+
+    /// Projected ServiceAccount token presented to the controller, re-read
+    /// per request (kubelet rotates it)
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/var/run/secrets/portail.epheo.eu/controller/token"
+    )]
+    pub token_file: PathBuf,
+
+    /// On SIGTERM, keep serving this long before draining
+    ///
+    /// Default 5s: the rendered readinessProbe period. Endpoint removal
+    /// reaches kube-proxy in about a second and LB health checks commonly
+    /// run on a 5s cadence.
+    #[arg(long, value_name = "DURATION", default_value = "5s", value_parser = parse_duration)]
+    pub shutdown_delay: Duration,
+
+    #[command(flatten)]
+    pub admin: AdminArgs,
+
+    /// Write a JSON access log line per HTTP response to PATH ("-" = stdout)
+    #[arg(long, value_name = "PATH")]
+    pub access_log: Option<String>,
+
+    /// Enable HTTP/2 on TLS-terminate listeners (ALPN h2 + http/1.1)
+    #[arg(long)]
+    pub http2: bool,
+}
+
+/// The data-plane image a controller renders by default: the reference the
+/// image was published under, baked in at build time (publish.yml passes
+/// `PORTAIL_IMAGE`), else this version's release tag. Cargo's version only
+/// moves at release, so a :main build without the bake would render the
+/// previous release's data plane.
+pub fn default_dataplane_image() -> String {
+    match option_env!("PORTAIL_IMAGE") {
+        Some(image) if !image.is_empty() => image.to_string(),
+        _ => format!("ghcr.io/epheo/portail:{}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+fn parse_gateway_key(s: &str) -> Result<GatewayKey, String> {
+    s.parse()
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    crate::config::parsing::parse_duration(s).map_err(|e| e.to_string())
 }
 
 impl Args {
@@ -152,14 +252,6 @@ impl Args {
                 "--check-config and --validate-only require --config to be specified".to_string(),
             );
         }
-
-        if self.kubernetes && self.config.is_some() {
-            return Err("--kubernetes and --config are mutually exclusive".to_string());
-        }
-
-        // Validate --gateway format early so a malformed scope fails fast.
-        self.gateway_scope()?;
-
         Ok(())
     }
 
@@ -171,26 +263,6 @@ impl Args {
     /// Determine if the application should exit early (generation mode)
     pub fn is_generation_mode(&self) -> bool {
         self.generate_config.is_some()
-    }
-
-    /// Parse `--gateway namespace/name` into a `(namespace, name)` scope.
-    /// Returns `Ok(None)` when unset, `Err` with a clear message on malformed input.
-    pub fn gateway_scope(&self) -> Result<Option<(String, String)>, String> {
-        match self.gateway.as_deref() {
-            None => Ok(None),
-            Some(s) => {
-                let (ns, name) = s
-                    .split_once('/')
-                    .ok_or_else(|| format!("--gateway must be 'namespace/name', got {:?}", s))?;
-                if ns.is_empty() || name.is_empty() {
-                    return Err(format!(
-                        "--gateway namespace and name must be non-empty, got {:?}",
-                        s
-                    ));
-                }
-                Ok(Some((ns.to_string(), name.to_string())))
-            }
-        }
     }
 }
 
@@ -226,12 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn test_kubernetes_and_config_mutually_exclusive() {
-        let args = parse(&["portail", "--kubernetes", "--config", "config.yaml"]);
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
     fn test_validate_only_conflicts_with_check_config() {
         assert!(Args::try_parse_from(["portail", "--validate-only", "--check-config"]).is_err());
     }
@@ -249,8 +315,163 @@ mod tests {
     #[test]
     fn test_generate_config_rejects_unknown_example() {
         assert!(Args::try_parse_from(["portail", "--generate-config", "nope"]).is_err());
-        for (name, _, _) in portail::config::examples::EXAMPLES {
+        for (name, _, _) in crate::config::examples::EXAMPLES {
             assert!(Args::try_parse_from(["portail", "--generate-config", name]).is_ok());
+        }
+    }
+
+    #[test]
+    fn no_subcommand_runs_standalone() {
+        let args = parse(&["portail"]);
+        assert!(args.command.is_none());
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn controller_takes_its_flags_with_their_defaults() {
+        let Some(Command::Controller(c)) =
+            parse(&["portail", "controller", "--namespace", "ps"]).command
+        else {
+            panic!("not the controller");
+        };
+        assert_eq!(c.controller_name, "portail.epheo.eu/gateway-controller");
+        assert_eq!(c.namespace, "ps");
+        assert_eq!(c.service_name, "portail-controller");
+        assert_eq!(c.sync_port, 9443);
+        assert_eq!(c.leader_election_id, "portail-controller");
+        assert_eq!(c.dataplane_image, default_dataplane_image());
+        assert_eq!(c.admin.readiness_port, 19099);
+
+        let Some(Command::Controller(c)) = parse(&[
+            "portail",
+            "controller",
+            "--namespace=ps",
+            "--controller-name=example.com/gw",
+            "--service-name=ctl",
+            "--sync-port=8443",
+            "--leader-election-id=lease",
+            "--dataplane-image=registry.local/portail:dev",
+            "--readiness-port=9000",
+            "--admin-address=10.0.0.5",
+            "-v",
+        ])
+        .command
+        else {
+            panic!("not the controller");
+        };
+        assert_eq!(
+            (
+                c.sync_port,
+                c.admin.readiness_port,
+                c.dataplane_image.as_str()
+            ),
+            (8443, 9000, "registry.local/portail:dev")
+        );
+    }
+
+    #[test]
+    fn dataplane_takes_its_flags_with_their_defaults() {
+        let Some(Command::Dataplane(d)) = parse(&[
+            "portail",
+            "dataplane",
+            "--gateway",
+            "portail-system/public",
+            "--controller-address",
+            "https://portail-controller.portail-system.svc:9443",
+        ])
+        .command
+        else {
+            panic!("not the data plane");
+        };
+        assert_eq!(d.gateway, GatewayKey::new("portail-system", "public"));
+        assert_eq!(d.shutdown_delay, Duration::from_secs(5));
+        assert_eq!(
+            d.token_file,
+            PathBuf::from("/var/run/secrets/portail.epheo.eu/controller/token")
+        );
+        assert!(d.controller_ca_file.is_none() && !d.http2 && d.access_log.is_none());
+
+        let Some(Command::Dataplane(d)) = parse(&[
+            "portail",
+            "dataplane",
+            "--gateway=ns/gw",
+            "--controller-address=https://ctl:9443",
+            "--controller-ca-file=/ca.crt",
+            "--token-file=/token",
+            "--shutdown-delay=0s",
+            "--readiness-port=9000",
+            "--admin-address=10.0.0.5",
+            "--access-log=-",
+            "--http2",
+        ])
+        .command
+        else {
+            panic!("not the data plane");
+        };
+        assert_eq!(d.shutdown_delay, Duration::ZERO);
+        assert!(d.http2 && d.access_log.as_deref() == Some("-"));
+    }
+
+    #[test]
+    fn a_dataplane_needs_its_gateway_and_controller() {
+        let base = ["portail", "dataplane"];
+        assert!(Args::try_parse_from(base).is_err());
+        assert!(Args::try_parse_from([&base[..], &["--gateway", "ns/gw"]].concat()).is_err());
+        assert!(Args::try_parse_from(
+            [
+                &base[..],
+                &["--gateway", "gw", "--controller-address", "https://c"]
+            ]
+            .concat()
+        )
+        .is_err());
+    }
+
+    /// The legacy Kubernetes mode is gone, and standalone flags do not
+    /// leak into the subcommands.
+    #[test]
+    fn removed_flags_are_rejected() {
+        for argv in [
+            &["portail", "--kubernetes"][..],
+            &["portail", "--gateway", "ns/gw"],
+            &["portail", "--watch-shape", "tls"],
+            &["portail", "--manage-gateway-status", "false"],
+            &["portail", "--controller-name", "x"],
+            &["portail", "--readiness-port", "19099"],
+            &[
+                "portail",
+                "--config",
+                "c.yaml",
+                "controller",
+                "--namespace",
+                "ps",
+            ],
+            &[
+                "portail",
+                "dataplane",
+                "--gateway=ns/gw",
+                "--controller-address=x",
+                "--config=c",
+            ],
+            &[
+                "portail",
+                "dataplane",
+                "--gateway=ns/gw",
+                "--controller-address=x",
+                "--transport=direct",
+            ],
+        ] {
+            assert!(Args::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn the_baked_image_defaults_to_this_release() {
+        if option_env!("PORTAIL_IMAGE").is_none_or(str::is_empty) {
+            assert_eq!(
+                default_dataplane_image(),
+                format!("ghcr.io/epheo/portail:{}", env!("CARGO_PKG_VERSION"))
+            );
         }
     }
 }

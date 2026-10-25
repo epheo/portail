@@ -2,6 +2,7 @@
 #![allow(clippy::type_complexity)]
 pub mod access_log;
 pub mod admin;
+pub mod cli;
 pub mod config;
 pub mod config_watcher;
 pub mod kubernetes;

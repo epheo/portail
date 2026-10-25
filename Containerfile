@@ -16,7 +16,11 @@ COPY src/ src/
 COPY benches/ benches/
 # Compile-time dependency: config/examples.rs embeds these via include_str!
 COPY examples/standalone/ examples/standalone/
-RUN cargo build --release --locked --bin portail && strip target/release/portail
+# The reference this image is published under (publish.yml sets it): the
+# controller's default data-plane image. Unset, the binary falls back to
+# its version's release tag.
+ARG PORTAIL_IMAGE=
+RUN PORTAIL_IMAGE="${PORTAIL_IMAGE}" cargo build --release --locked --bin portail && strip target/release/portail
 
 # Only the stage PREBUILT selects gets built, so the default build needs no host binary.
 FROM builder AS binary-0
@@ -36,5 +40,6 @@ COPY --from=binary /src/target/release/portail /usr/local/bin/portail
 # when present (src/privileges.rs). `setcap` needs libcap + CAP_SETFCAP at build.
 RUN setcap cap_net_bind_service=+p /usr/local/bin/portail
 USER 1000
+# No default CMD: manifests always pass a mode; with no arguments the binary
+# runs standalone on its built-in default config.
 ENTRYPOINT ["/usr/local/bin/portail"]
-CMD ["--kubernetes"]

@@ -1944,32 +1944,6 @@ fn test_stalled_backend_body_reaped_by_idle_timeout() {
     handle.join().unwrap();
 }
 
-/// Kubernetes mode: the controller holds the data plane as long as it
-/// runs, so the drain must not need to own it. An apiserver that never
-/// answers keeps the controller, and its handle, alive across the SIGTERM.
-#[test]
-fn test_sigterm_drains_in_kubernetes_mode() {
-    // Listening but never accepting: every apiserver request hangs.
-    let apiserver = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let mut proxy = PortailProcess::start_kubernetes(Some(apiserver.local_addr().unwrap()), 25081);
-    assert!(
-        wait_for_listener(proxy.proxy_addr, Duration::from_secs(5)),
-        "admin endpoint never came up:\n{}",
-        proxy.output()
-    );
-
-    proxy.terminate();
-    let status = proxy
-        .wait_exit(Duration::from_secs(10))
-        .expect("no exit within 10s of SIGTERM");
-    assert!(status.success(), "{status}:\n{}", proxy.output());
-    let output = proxy.output();
-    assert!(
-        output.contains("Data plane shutdown complete"),
-        "drain skipped:\n{output}"
-    );
-}
-
 /// Out of fds, accept() fails at once and the listener stays readable: the
 /// data-plane and admin accept loops must back off rather than spin a core
 /// (and log every retry).
@@ -2034,16 +2008,34 @@ fn test_admin_endpoint_binds_its_address() {
     assert!(std::net::TcpStream::connect(other).is_err());
 }
 
-/// A controller that stops, here because no cluster config exists, must
-/// take the process down for kubelet to restart it, not leave the pod
-/// NotReady forever while /livez still answers 200.
+/// Both Kubernetes modes parse their flags, then exit 2 until their
+/// runtimes land: never a half-built mode that looks like it serves.
 #[test]
-fn test_controller_failure_exits_nonzero() {
-    let mut proxy = PortailProcess::start_kubernetes(None, 25085);
-    let status = proxy
-        .wait_exit(Duration::from_secs(10))
-        .unwrap_or_else(|| panic!("still running without a controller:\n{}", proxy.output()));
-    assert!(!status.success(), "{status}:\n{}", proxy.output());
+fn test_kubernetes_modes_are_not_implemented_in_this_build() {
+    for (mode, port) in [
+        (&["controller", "--namespace", "portail-system"][..], 25085),
+        (
+            &[
+                "dataplane",
+                "--gateway",
+                "default/gw",
+                "--controller-address",
+                "https://portail-controller.portail-system.svc:9443",
+            ],
+            25086,
+        ),
+    ] {
+        let mut proxy = PortailProcess::start_kubernetes(mode, None, port);
+        let status = proxy
+            .wait_exit(Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("{mode:?} still running:\n{}", proxy.output()));
+        assert_eq!(status.code(), Some(2), "{mode:?}:\n{}", proxy.output());
+        assert!(
+            proxy.output().contains("not implemented in this build"),
+            "{mode:?}:\n{}",
+            proxy.output()
+        );
+    }
 }
 
 /// A copy of `portail::proxy::worker::LINGER_IDLE`, which is crate-private:
