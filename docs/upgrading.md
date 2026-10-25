@@ -36,11 +36,19 @@ Check a config file before the upgrade: `portail --config FILE --validate-only`.
    kubectl -n portail-system rollout status deploy/portail-controller
    ```
 
+   Until step 2, the old `portail --kubernetes` pods and the controller both write Gateway status: same controllerName, and the old pods' ServiceAccount is now bound to the controller's ClusterRole. Status flaps meanwhile, without effect on traffic; step 4 heals it.
+
 2. Delete the old data planes, their Services and, on OpenShift, their SCC. The old examples named them all `portail`:
 
    ```bash
    kubectl -n portail-system delete daemonset/portail deployment/portail service/portail --ignore-not-found
    kubectl delete scc portail --ignore-not-found
+   ```
+
+   The old `multi-network/http-single-namespace` example ran Deployment `portail` in the namespace it was applied to, not `portail-system`: delete it there too.
+
+   ```bash
+   kubectl -n <that namespace> delete deployment/portail --ignore-not-found
    ```
 
 3. For each Gateway, choose:
