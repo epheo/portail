@@ -21,8 +21,8 @@ use gateway_api::httproutes::HTTPRoute;
 use super::provision::Provisioned;
 use super::translate::{translate, Observed, Plan, Rejected, Statuses};
 use super::{
-    params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
-    ReconcileError, ERROR_REQUEUE_SECS,
+    gatewayclass, params, programmed, provision, skip_requeue_secs, success_requeue_secs,
+    ControllerCtx, ReconcileError, ERROR_REQUEUE_SECS,
 };
 use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::naming::FIELD_MANAGER;
@@ -224,6 +224,17 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
     ctx.networks.retain_named(&gateways);
+    // Our route and policy entries for them go too (follow-up 11).
+    if ctx.leader.is_leader() && ctx.synced.is_synced() {
+        let departed = gatewayclass::departed(ctx);
+        if !departed.is_empty() {
+            tokio::spawn(gatewayclass::remove_departed(
+                ctx.client.clone(),
+                ctx.controller_name.clone(),
+                departed,
+            ));
+        }
+    }
 }
 
 /// What [`publish`] leaves for [`finish`].
@@ -270,6 +281,13 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                     "Gateway {} class '{}' names another controller; no longer served",
                     key, gateway.spec.gateway_class_name
                 );
+                let departed = gatewayclass::departed(ctx);
+                gatewayclass::remove_departed(
+                    ctx.client.clone(),
+                    ctx.controller_name.clone(),
+                    departed,
+                )
+                .await;
             }
             // Its data planes are told 404 and stop reporting: what they
             // said last is another controller's business now.
