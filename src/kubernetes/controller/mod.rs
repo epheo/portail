@@ -93,7 +93,6 @@ struct ResourceCache {
     /// Portail's own policy CRD; empty store when the CRD is not installed.
     rate_limit_policies: Store<RateLimitPolicy>,
     /// Empty store when the CRD is not installed.
-    #[allow(dead_code)] // Read by params::resolve once it resolves refs.
     gateway_parameters: Store<GatewayParameters>,
 }
 
@@ -113,7 +112,6 @@ struct ControllerCtx {
     /// Whether every reflector delivered its initial list, and which did
     /// not. The sync server answers 503 until then, /readyz names them.
     synced: Listings,
-    #[allow(dead_code)] // Read by provision::reconcile once it provisions.
     owned: provision::Owned,
 }
 
@@ -248,7 +246,12 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             .streaming_lists(),
         &listings,
     );
-    let (owned, owned_triggers) = provision::Owned::start(&client);
+    let (owned, owned_triggers) = provision::Owned::start(
+        &client,
+        store_gateways.clone(),
+        &listings,
+        provision::ControllerEndpoint::new(&args, ca.ca_pem()),
+    );
 
     let ctx = Arc::new(ControllerCtx {
         client: client.clone(),

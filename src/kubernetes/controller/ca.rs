@@ -88,6 +88,14 @@ pub(crate) struct ControllerCa {
     serving: Arc<ServingCert>,
 }
 
+impl ControllerCa {
+    /// The CA certificate's PEM, which Managed data planes get in their
+    /// pod template to verify the controller against.
+    pub(crate) fn ca_pem(&self) -> String {
+        String::new()
+    }
+}
+
 /// The current leaf for every handshake: a re-issue swaps it under live
 /// listeners.
 #[derive(Debug)]

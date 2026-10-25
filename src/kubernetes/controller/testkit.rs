@@ -6,7 +6,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service, ServiceAccount};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use kube::core::PartialObjectMeta;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher;
@@ -16,7 +19,7 @@ use serde_json::{json, Value};
 use gateway_api::experimental::tcproutes::TCPRoute;
 use gateway_api::experimental::tlsroutes::TLSRoute;
 use gateway_api::experimental::udproutes::UDPRoute;
-use gateway_api::gatewayclasses::{GatewayClass, GatewayClassSpec};
+use gateway_api::gatewayclasses::{GatewayClass, GatewayClassParametersRef, GatewayClassSpec};
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewaySpec};
 use gateway_api::httproutes::{HTTPRoute, HTTPRouteParentRefs, HTTPRouteSpec};
 use gateway_api::referencegrants::ReferenceGrant;
@@ -25,7 +28,9 @@ use super::reconcile::{finish, forget_deleted_gateways, publish, Step};
 use super::reports::InstanceId;
 use super::{ControllerCtx, ReconcileError, ResourceCache};
 use crate::dataplane::Applier;
-use crate::kubernetes::crds::{GatewayParameters, RateLimitPolicy};
+use crate::kubernetes::crds::{
+    GatewayParameters, GatewayParametersSpec, Provisioning, RateLimitPolicy,
+};
 use crate::sync::{GatewayKey, Snapshot};
 
 pub(super) const CONTROLLER: &str = "epheo.eu/portail";
@@ -180,6 +185,9 @@ pub(super) struct TestCluster {
     pub reference_grants: Writer<ReferenceGrant>,
     pub policies: Writer<RateLimitPolicy>,
     pub parameters: Writer<GatewayParameters>,
+    pub service_accounts: Writer<PartialObjectMeta<ServiceAccount>>,
+    pub deployments: Writer<PartialObjectMeta<Deployment>>,
+    pub pdbs: Writer<PartialObjectMeta<PodDisruptionBudget>>,
 }
 
 /// Store `obj` as a watch Apply event would.
@@ -223,7 +231,12 @@ impl TestCluster {
             reports: Arc::default(),
             leader: super::leader::Leader::always(),
             synced: super::watch::Listings::default(),
-            owned: super::provision::Owned,
+            owned: super::provision::Owned::new(
+                self.service_accounts.as_reader(),
+                self.deployments.as_reader(),
+                self.pdbs.as_reader(),
+                super::provision::ControllerEndpoint::for_tests(),
+            ),
         })
     }
 }
@@ -259,14 +272,28 @@ pub(super) struct Pipeline {
 
 impl Pipeline {
     /// Over an empty cluster but for GatewayClass `portail` of this
-    /// controller, which [`gateway`] uses.
+    /// controller, which [`gateway`] uses. Its Gateways are Unmanaged: the
+    /// data plane in the loop is the hand-written one.
     pub fn new() -> Self {
         let api = MockApi::default();
         let mut cluster = TestCluster::default();
-        apply(
-            &mut cluster.gateway_classes,
-            gateway_class("portail", CONTROLLER),
+        let mut unmanaged = GatewayParameters::new(
+            "unmanaged",
+            GatewayParametersSpec {
+                provisioning: Some(Provisioning::Unmanaged),
+                ..Default::default()
+            },
         );
+        unmanaged.metadata.namespace = Some("default".into());
+        apply(&mut cluster.parameters, unmanaged);
+        let mut class = gateway_class("portail", CONTROLLER);
+        class.spec.parameters_ref = Some(GatewayClassParametersRef {
+            group: "portail.epheo.eu".into(),
+            kind: "GatewayParameters".into(),
+            name: "unmanaged".into(),
+            namespace: Some("default".into()),
+        });
+        apply(&mut cluster.gateway_classes, class);
         let ctx = cluster.ctx(api.client());
         let perf = crate::config::PerformanceConfig::default();
         let data_plane =
