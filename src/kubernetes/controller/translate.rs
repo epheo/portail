@@ -244,11 +244,13 @@ pub(crate) async fn translate(
         rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
     };
 
+    ctx.certs.retain_referenced(&ctx.cache.gateways.state());
     let resolved_certs = resolve_gateway_certs(
         gateway,
         &gw_ns,
         &snapshot.reference_grants,
         &ctx.cache.secrets,
+        &ctx.certs,
     );
     let (services, mut named_reqs) = resolve_services(&snapshot.services);
     let (listeners, accepted) = validate_gateway(gateway, &gw_ns, &resolved_certs);

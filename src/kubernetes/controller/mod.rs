@@ -104,6 +104,7 @@ struct ControllerCtx {
     route_verdicts: Arc<RouteVerdicts>,
     named_ports: Arc<NamedPortCache>,
     networks: Arc<NetworkCidrCache>,
+    certs: Arc<validate::LastGoodCerts>,
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
     leader: leader::Leader,
@@ -259,6 +260,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         // listed the slices again.
         named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
         networks: Arc::default(),
+        certs: Arc::default(),
         hub: Arc::default(),
         reports: Arc::default(),
         leader: leader.clone(),
