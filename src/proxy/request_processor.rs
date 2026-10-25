@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::borrow::Cow;
 use std::net::SocketAddr;
 
-use crate::logging::{debug, error};
+use crate::logging::{debug, warn};
 use crate::metrics::METRICS;
 use crate::proxy::backend_pool::LogThrottle;
 use crate::proxy::health::HealthRegistry;
@@ -492,8 +492,10 @@ fn analyze_l4_request<'a>(
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
     let unroutable = |throttle: &LogThrottle, condition: &str| {
+        // A client reaches this with bytes no route takes (a scanner on a
+        // public port does all day): not a fault of this process.
         if let Some(suppressed) = throttle.admit_now() {
-            error!(
+            warn!(
                 "{} routing failed for port {}: {}; {} more since the last such line, on any port",
                 proto, server_port, condition, suppressed
             );
