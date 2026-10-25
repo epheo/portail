@@ -3,6 +3,8 @@
 //! rides out a controller outage and stops gracefully. The binary runs
 //! with no cluster: no KUBERNETES_SERVICE_HOST, no API token.
 
+#[path = "helpers/apiserver_stub.rs"]
+mod apiserver_stub;
 #[path = "helpers/controller_stub.rs"]
 mod controller_stub;
 mod helpers;
@@ -11,7 +13,10 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use controller_stub::{free_port, http_snapshot, snapshot, ControllerStub, Mode, GATEWAY};
+use apiserver_stub::ApiserverStub;
+use controller_stub::{
+    free_port, http_snapshot, snapshot, ControllerStub, Mode, CONTROLLER_NAME, GATEWAY,
+};
 use helpers::*;
 use portail::sync::{EndpointReport, Snapshot, Transport};
 
@@ -34,19 +39,23 @@ struct DataPlane {
 /// Spawn `portail dataplane` for [`GATEWAY`] against `stub`, presenting
 /// token `token-1`, with `args` added.
 fn start_dataplane(stub: &ControllerStub, args: &[&str]) -> DataPlane {
+    start_dataplane_at(stub, &stub.url(), args)
+}
+
+/// [`start_dataplane`], `address` its `--controller-address`.
+fn start_dataplane_at(stub: &ControllerStub, address: &str, args: &[&str]) -> DataPlane {
     let dir = tempfile::tempdir().unwrap();
     let ca = dir.path().join("ca.crt");
     std::fs::write(&ca, &stub.ca_pem).unwrap();
     let token = dir.path().join("token");
     std::fs::write(&token, "token-1").unwrap();
     let admin_port = free_port();
-    let url = stub.url();
     let mut mode = vec![
         "dataplane",
         "--gateway",
         GATEWAY,
         "--controller-address",
-        &url,
+        address,
         "--controller-ca-file",
         ca.to_str().unwrap(),
         "--token-file",
@@ -312,6 +321,81 @@ fn a_tampered_snapshot_under_a_valid_signature_is_not_served() {
         .unwrap_or_else(|| panic!("no refusal reported:\n{}", dp.process.output()));
     assert_eq!(refused.request.have, first.version);
     assert_eq!(get(port, "/").unwrap().1, b"a");
+}
+
+/// The controller Service's port as the apiserver proxies it.
+const PROXY_PREFIX: &str =
+    "/api/v1/namespaces/portail-system/services/https:portail-controller:9443/proxy";
+
+/// A data plane polling through `apiserver`, presenting API token
+/// `api_token`.
+fn start_proxied_dataplane(
+    stub: &ControllerStub,
+    apiserver: &ApiserverStub,
+    api_token: &str,
+) -> (DataPlane, tempfile::TempDir) {
+    let api = tempfile::tempdir().unwrap();
+    let (ca, token) = (api.path().join("ca.crt"), api.path().join("token"));
+    std::fs::write(&ca, &apiserver.ca_pem).unwrap();
+    std::fs::write(&token, api_token).unwrap();
+    let url = apiserver.url();
+    let dp = start_dataplane_at(
+        stub,
+        &format!("https://{CONTROLLER_NAME}:9443"),
+        &[
+            "--transport",
+            "apiserver-proxy",
+            "--apiserver-address",
+            &url,
+            "--apiserver-ca-file",
+            ca.to_str().unwrap(),
+            "--apiserver-token-file",
+            token.to_str().unwrap(),
+        ],
+    );
+    (dp, api)
+}
+
+/// Through the apiserver's service proxy, as a Primary UDN pod polls: the
+/// API token for the apiserver, which drops it, the controller token in
+/// X-Portail-Token; the snapshot is served and the reports go back.
+#[test]
+fn syncs_through_the_apiservers_service_proxy() {
+    let backend = TestBackend::spawn("proxied");
+    let port = free_port();
+    let served = http_snapshot(port, backend.addr);
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(served.clone())));
+    let apiserver = ApiserverStub::start(PROXY_PREFIX, "api-token", stub.addr);
+    let (dp, _api) = start_proxied_dataplane(&stub, &apiserver, "api-token");
+
+    dp.wait_readyz(200, SETTLE);
+    wait_serving(&dp, port, "proxied");
+    let reported = stub
+        .wait_for(0, SETTLE, applied(&served.version))
+        .unwrap_or_else(|| panic!("no report:\n{}", dp.process.output()));
+    assert_eq!(reported.path, "/v1/sync/default/gw");
+    assert_eq!(reported.authorization, None, "the apiserver's to take");
+    assert_eq!(reported.token.as_deref(), Some("token-1"));
+}
+
+/// An apiserver that refuses the hop, as without the RoleBinding: a
+/// configuration error, said so, and the data plane polls on.
+#[test]
+fn an_apiserver_refusal_is_a_configuration_error() {
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(None));
+    let apiserver = ApiserverStub::start(PROXY_PREFIX, "api-token", stub.addr);
+    let (dp, _api) = start_proxied_dataplane(&stub, &apiserver, "another-token");
+    let deadline = Instant::now() + SETTLE;
+    while !dp.process.output().contains("configuration error") {
+        assert!(
+            Instant::now() < deadline,
+            "no configuration error logged:\n{}",
+            dp.process.output()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(dp.readyz(), Some(503));
+    assert!(stub.requests().is_empty(), "nothing reached the controller");
 }
 
 /// A 503 closes the connection, so the Service can pick a replica again,
