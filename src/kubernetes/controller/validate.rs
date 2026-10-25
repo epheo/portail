@@ -649,6 +649,47 @@ mod tests {
         assert!(gw_cond.message.contains("tcp-a (HostnameConflict)"));
     }
 
+    /// TCP and UDP listeners on one port are distinct by protocol and each
+    /// binds its own socket: Gateway API v1.4.1 GatewaySpec.listeners,
+    /// Compatible Listeners. They were ProtocolConflict, so DNS on 53 over
+    /// both took neither. Two UDP listeners on a port still conflict.
+    #[test]
+    fn tcp_and_udp_listeners_share_a_port() {
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners = vec![
+            listener("dns-tcp", 53, "TCP", None),
+            listener("dns-udp", 53, "UDP", None),
+            listener("web", 8080, "HTTP", None),
+            listener("quic", 8080, "UDP", None),
+        ];
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
+        for name in ["dns-tcp", "dns-udp", "web", "quic"] {
+            let ls = &listeners[name];
+            assert!(ls.accepted && !ls.conflicted && ls.programmed, "{name}");
+        }
+        assert!(gw_cond.ok);
+        assert_eq!(gw_cond.reason, "Accepted");
+
+        gw.spec
+            .listeners
+            .push(listener("dns-udp-b", 53, "UDP", None));
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        for name in ["dns-udp", "dns-udp-b"] {
+            assert_eq!(
+                listeners[name].conflicted_reason, "HostnameConflict",
+                "{name}"
+            );
+        }
+        assert!(
+            listeners["dns-tcp"].accepted,
+            "its UDP siblings' conflict is theirs"
+        );
+    }
+
     /// One socket serves HTTPS and TLS on a port, told apart by SNI, so
     /// they conflict only on a shared hostname. Both were ProtocolConflict,
     /// and nothing bound the port.
