@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -27,6 +27,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 
+use super::apiserver_peers::ApiserverPeers;
 use super::reports::InstanceId;
 use crate::kubernetes::naming;
 use crate::logging::{debug, warn};
@@ -254,6 +255,8 @@ pub(crate) struct Authenticator {
     /// Unknown-token reviews allowed by peer IP.
     review_rates: Mutex<HashMap<IpAddr, ReviewBucket>>,
     verdicts: Mutex<Verdicts>,
+    /// Peers no per-peer cap applies to.
+    apiserver: Arc<ApiserverPeers>,
 }
 
 impl Authenticator {
@@ -278,7 +281,20 @@ impl Authenticator {
             peers: Mutex::default(),
             review_rates: Mutex::default(),
             verdicts: Mutex::default(),
+            apiserver: Arc::default(),
         }
+    }
+
+    /// No per-peer cap, of connections or reviews, applies to `apiserver`'s
+    /// peers; the global caps do.
+    pub(crate) fn exempting(mut self, apiserver: Arc<ApiserverPeers>) -> Self {
+        self.apiserver = apiserver;
+        self
+    }
+
+    /// Whether `peer` is exempt from the per-peer caps.
+    pub(crate) fn exempts(&self, peer: IpAddr) -> bool {
+        self.apiserver.contains(peer)
     }
 
     /// The first stage, on the request headers alone: the ServiceAccount
@@ -322,7 +338,8 @@ impl Authenticator {
                 let renewal = tokio::time::timeout(REVIEW_TIMEOUT, self.renewals.acquire()).await;
                 let reviewed = match renewal {
                     Ok(Ok(_permit)) => {
-                        let _peer = self.peer_review(peer, usize::MAX);
+                        let _peer =
+                            (!self.exempts(peer)).then(|| self.peer_review(peer, usize::MAX));
                         self.review(hash, token).await
                     }
                     Ok(Err(_)) | Err(_) => Err(Unreviewed::Failed),
@@ -337,13 +354,17 @@ impl Authenticator {
                 }
             }
             Cached::Unknown => {
-                let peer_review = self.peer_review(peer, MAX_REVIEWS_PER_PEER);
+                let exempt = self.exempts(peer);
+                let peer_review = match exempt {
+                    true => Some(None),
+                    false => self.peer_review(peer, MAX_REVIEWS_PER_PEER).map(Some),
+                };
                 let permit = self.unknown.try_acquire();
                 let (Some(_peer), Ok(_permit)) = (peer_review, permit) else {
                     METRICS.sync_throttled_total.inc();
                     return Err(Refusal::Throttled);
                 };
-                if !self.charge_review(peer) {
+                if !exempt && !self.charge_review(peer) {
                     METRICS.sync_throttled_total.inc();
                     return Err(Refusal::Throttled);
                 }
@@ -1303,6 +1324,55 @@ mod tests {
             assert!(sync(200 + n, PEER).await.is_ok(), "refilled: {n}");
         }
         assert_eq!(sync(300, PEER).await, Err(Refusal::Throttled));
+    }
+
+    /// The apiserver's endpoints, which every proxied data plane comes
+    /// from, are held to the global caps only: reviews in flight past a
+    /// peer's share and its burst, until the 16 are taken. Any other peer
+    /// keeps its share.
+    #[tokio::test(start_paused = true)]
+    async fn the_apiserver_is_held_to_the_global_caps_only() {
+        let serial = METRICS_SERIAL.lock().await;
+        let hanging = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(
+            authenticator(
+                split_client(vec![], Arc::default(), hanging.clone()),
+                &serial,
+            )
+            .exempting(Arc::new(ApiserverPeers::of([PEER]))),
+        );
+        assert!(auth.exempts(PEER) && !auth.exempts(peer(1)));
+        let forged = |n: u32, from: IpAddr| {
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                let forged = gateway_token("apps", "web", n);
+                let claimed = auth.precheck(&forged).unwrap();
+                let gw = GatewayKey::new("apps", "web");
+                auth.authenticate(&claimed, &forged, &gw, from).await
+            })
+        };
+        let in_flight = || hanging.load(Ordering::SeqCst);
+        let refused =
+            |polls: &[tokio::task::JoinHandle<_>]| polls.iter().filter(|p| p.is_finished()).count();
+
+        let proxied = REVIEW_BURST_PER_PEER as usize + MAX_REVIEWS_PER_PEER;
+        let mut polls: Vec<_> = (0..proxied as u32).map(|n| forged(n, PEER)).collect();
+        settle().await;
+        assert_eq!((in_flight(), refused(&polls)), (proxied, 0));
+
+        let pod: Vec<_> = (100..104).map(|n| forged(n, peer(1))).collect();
+        settle().await;
+        assert_eq!(in_flight(), proxied + MAX_REVIEWS_PER_PEER);
+        assert_eq!(refused(&pod), pod.len() - MAX_REVIEWS_PER_PEER, "its share");
+
+        let left = MAX_REVIEWS_IN_FLIGHT - in_flight();
+        let more: Vec<_> = (200..=200 + left as u32).map(|n| forged(n, PEER)).collect();
+        settle().await;
+        assert_eq!(in_flight(), MAX_REVIEWS_IN_FLIGHT);
+        assert_eq!(refused(&more), 1, "the global cap");
+        polls.extend(pod);
+        polls.extend(more);
+        polls.iter().for_each(|p| p.abort());
     }
 
     fn hash(n: u32) -> TokenHash {
