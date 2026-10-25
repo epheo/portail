@@ -614,6 +614,11 @@ impl ControllerSync {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Relaxed)
+    }
+
     /// Since the last confirmation; `None` before [`Self::start`].
     pub(crate) fn age(&self) -> Option<std::time::Duration> {
         let confirmed = std::time::Duration::from_millis(self.confirmed_ms.load(Relaxed));

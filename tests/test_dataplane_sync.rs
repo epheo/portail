@@ -280,6 +280,40 @@ fn a_snapshot_the_controller_did_not_sign_is_not_served() {
     assert_eq!(clean.request.report.unwrap().apply_error, None);
 }
 
+/// A body changed on its way, under the controller's own signature of
+/// another, is not served: only the bytes the controller signed are.
+#[test]
+fn a_tampered_snapshot_under_a_valid_signature_is_not_served() {
+    let (a, b, c) = (
+        TestBackend::spawn("a"),
+        TestBackend::spawn("b"),
+        TestBackend::spawn("c"),
+    );
+    let port = free_port();
+    let first = http_snapshot(port, a.addr);
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(first.clone())));
+    let dp = start_dataplane(&stub, &[]);
+    wait_serving(&dp, port, "a");
+
+    let from = stub.requests().len();
+    stub.set(Mode::Tampered {
+        signed: http_snapshot(port, b.addr),
+        sent: http_snapshot(port, c.addr),
+    });
+    let refused = stub
+        .wait_for(from, SETTLE, |r| {
+            r.request.report.as_ref().is_some_and(|report| {
+                report
+                    .apply_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("bad signature"))
+            })
+        })
+        .unwrap_or_else(|| panic!("no refusal reported:\n{}", dp.process.output()));
+    assert_eq!(refused.request.have, first.version);
+    assert_eq!(get(port, "/").unwrap().1, b"a");
+}
+
 /// A 503 closes the connection, so the Service can pick a replica again,
 /// and its Retry-After wins over the backoff.
 #[test]

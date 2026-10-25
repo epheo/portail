@@ -20,7 +20,7 @@ pub use report::{EndpointReport, InstanceReport, ListenerReport, SyncRequest, Tr
 #[cfg(test)]
 pub(crate) use signed::testing as signed_testing;
 pub use signed::{
-    ca_roots, sign, AnswerVerifier, Gone, Signed, GONE_MAX_AGE, SIGNATURE_HEADER, SIGNER_HEADER,
+    ca_roots, new_nonce, sign, AnswerVerifier, Gone, Signed, SIGNATURE_HEADER, SIGNER_HEADER,
 };
 pub use snapshot::{
     AppProtocol, Backends, CertificatePem, ExternalName, HeadlessTargetPort, NetworkCidrs, Snapshot,

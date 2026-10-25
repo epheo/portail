@@ -188,6 +188,8 @@ impl SyncLoop {
             have: self.have.clone(),
             data_plane_version: env!("CARGO_PKG_VERSION").to_string(),
             report,
+            // Each poll's own, drawn by the client as it sends it.
+            nonce: String::new(),
         }
     }
 
@@ -675,6 +677,26 @@ mod tests {
 
     fn body(snapshot: &Snapshot) -> bytes::Bytes {
         serde_json::to_vec(snapshot).unwrap().into()
+    }
+
+    /// A 204 not signed by the controller for this poll changes nothing:
+    /// the pod counts as disconnected and the config age grows on. An
+    /// unsigned 204 confirmed the config current, and any endpoint of the
+    /// controller Service could freeze it so.
+    #[tokio::test]
+    async fn an_unverified_204_is_disconnected_not_confirmed() {
+        let (mut sync, _) = sync_loop();
+        let metrics: &'static ControllerSync = Box::leak(Box::new(ControllerSync::new()));
+        sync.metrics = metrics;
+        metrics.start();
+        sync.handle(Answer::Snapshot(body(&snapshot()))).await;
+        assert!(metrics.is_connected());
+        let pause = Duration::from_millis(50);
+        tokio::time::sleep(pause).await;
+        sync.handle(Answer::Unverified("204 refused: unsigned".into()))
+            .await;
+        assert!(!metrics.is_connected());
+        assert!(metrics.age().unwrap() >= pause, "confirmed");
     }
 
     /// An answer not signed by the controller changes nothing served: the

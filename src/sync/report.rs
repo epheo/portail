@@ -25,6 +25,11 @@ pub struct SyncRequest {
     /// Absent before the first apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<InstanceReport>,
+    /// Fresh random bytes per poll, base64: the controller signs its
+    /// answer over them (`signed`), so an answer to another poll never
+    /// passes for this one's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nonce: String,
 }
 
 /// One data-plane instance's state after its last apply.

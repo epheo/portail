@@ -174,12 +174,6 @@ impl SyncServer {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
-        // Its own data plane only learns that it is gone, and must: a
-        // restarted controller holds no verdict for its token, and a
-        // refusal would leave it serving the deleted Gateway.
-        if !self.serves(&key) {
-            return self.gone(&key);
-        }
         let declared = request
             .headers()
             .get(header::CONTENT_LENGTH)
@@ -224,8 +218,12 @@ impl SyncServer {
                 ),
             );
         }
+        // Its own data plane only learns that it is gone, and must: a
+        // restarted controller holds no verdict for its token, and a
+        // refusal would leave it serving the deleted Gateway. The answer
+        // is signed over the poll's nonce, so it is read first.
         if !self.serves(&key) {
-            return self.gone(&key);
+            return self.gone(&key, &sync.nonce);
         }
         if let Some(report) = sync.report {
             let leaving = report.leaving;
@@ -236,10 +234,10 @@ impl SyncServer {
             // A stopping data plane waits on this answer before it drains:
             // there is nothing left to hold it for.
             if leaving {
-                return no_content();
+                return self.unchanged(&sync.nonce, &sync.have);
             }
         }
-        self.poll(&key, &sync.have, &instance).await
+        self.poll(&key, &sync.have, &sync.nonce, &instance).await
     }
 
     /// Whether `key` is a Gateway of ours. A missing class keeps it served:
@@ -261,11 +259,12 @@ impl SyncServer {
     }
 
     /// The snapshot when its version is not `have`, at once or when one is
-    /// published within the hold; else 204.
+    /// published within the hold; else 204. Signed over `nonce`.
     async fn poll(
         &self,
         key: &GatewayKey,
         have: &str,
+        nonce: &str,
         instance: &InstanceId,
     ) -> Response<Full<Bytes>> {
         let hold = self.holds.begin(instance);
@@ -274,29 +273,29 @@ impl SyncServer {
         let mut current = self.ctx.hub.subscribe(key);
         if !self.serves(key) {
             self.ctx.hub.remove(key);
-            return self.gone(key);
+            return self.gone(key, nonce);
         }
         let deadline = Instant::now() + HOLD;
         loop {
             let snapshot = current.borrow_and_update().clone();
             if let Some(snapshot) = snapshot.filter(|s| s.version != have) {
-                return self.served(&snapshot);
+                return self.served(&snapshot, nonce);
             }
             tokio::select! {
                 changed = current.changed() => if changed.is_err() {
-                    return self.gone(key);
+                    return self.gone(key, nonce);
                 },
-                _ = tokio::time::sleep_until(deadline) => return no_content(),
+                _ = tokio::time::sleep_until(deadline) => return self.unchanged(nonce, have),
                 // The instance asked again: this answer has no reader.
-                _ = hold.superseded.cancelled() => return no_content(),
+                _ = hold.superseded.cancelled() => return self.unchanged(nonce, have),
                 _ = self.shutdown.cancelled() => return standby("shutting down"),
             }
         }
     }
 
-    fn served(&self, snapshot: &Snapshot) -> Response<Full<Bytes>> {
+    fn served(&self, snapshot: &Snapshot, nonce: &str) -> Response<Full<Bytes>> {
         match serde_json::to_vec(snapshot) {
-            Ok(json) => self.signed(Signed::Snapshot, json),
+            Ok(json) => self.signed(StatusCode::OK, Signed::Snapshot, nonce, json),
             Err(e) => text(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("snapshot not serialized: {e}"),
@@ -306,29 +305,52 @@ impl SyncServer {
 
     /// The 404 that tells `key`'s own data plane its Gateway is gone. It
     /// closes the connection, as every refusal does.
-    fn gone(&self, key: &GatewayKey) -> Response<Full<Bytes>> {
-        let body = serde_json::to_vec(&Gone::now(key.clone()))
-            .expect("a Gateway key and a number serialize");
-        let mut response = self.signed(Signed::Gone, body);
-        *response.status_mut() = StatusCode::NOT_FOUND;
+    fn gone(&self, key: &GatewayKey, nonce: &str) -> Response<Full<Bytes>> {
+        let gone = Gone {
+            gateway: key.clone(),
+        };
+        let body = serde_json::to_vec(&gone).expect("a Gateway key serializes");
+        let mut response = self.signed(StatusCode::NOT_FOUND, Signed::Gone, nonce, body);
         response
             .headers_mut()
             .insert(header::CONNECTION, HeaderValue::from_static("close"));
         response
     }
 
-    /// `body`, a JSON answer of `kind`, with its signature.
-    fn signed(&self, kind: Signed, body: Vec<u8>) -> Response<Full<Bytes>> {
-        let signature = match sign(&self.signer.current(), kind, &body) {
+    /// The 204 that confirms `have` is current, signed over it: an
+    /// unsigned one would let any endpoint freeze a data plane's config.
+    fn unchanged(&self, nonce: &str, have: &str) -> Response<Full<Bytes>> {
+        let signature = match sign(
+            &self.signer.current(),
+            Signed::Unchanged,
+            nonce,
+            have.as_bytes(),
+        ) {
             Ok(signature) => signature,
-            Err(e) => {
-                return text(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("answer not signed: {e}"),
-                )
-            }
+            Err(e) => return not_signed(&e),
+        };
+        let mut response = Response::new(Full::default());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        for (name, value) in signature {
+            response.headers_mut().insert(name, value);
+        }
+        response
+    }
+
+    /// `body`, a JSON answer of `kind` with `status`, signed over `nonce`.
+    fn signed(
+        &self,
+        status: StatusCode,
+        kind: Signed,
+        nonce: &str,
+        body: Vec<u8>,
+    ) -> Response<Full<Bytes>> {
+        let signature = match sign(&self.signer.current(), kind, nonce, &body) {
+            Ok(signature) => signature,
+            Err(e) => return not_signed(&e),
         };
         let mut response = Response::new(Full::new(Bytes::from(body)));
+        *response.status_mut() = status;
         let headers = response.headers_mut();
         headers.insert(
             header::CONTENT_TYPE,
@@ -397,10 +419,11 @@ fn refused(refusal: Refusal) -> Response<Full<Bytes>> {
     }
 }
 
-fn no_content() -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::default());
-    *response.status_mut() = StatusCode::NO_CONTENT;
-    response
+fn not_signed(error: &str) -> Response<Full<Bytes>> {
+    text(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!("answer not signed: {error}"),
+    )
 }
 
 /// One held poll per instance: a data plane asks again when its report
@@ -1135,6 +1158,7 @@ mod tests {
             have,
             data_plane_version: "test".into(),
             report: None,
+            nonce: String::new(),
         };
         match client.poll(&request).await {
             Answer::Gone => p.applier.clear().await,
@@ -1143,31 +1167,51 @@ mod tests {
         assert!(!p.ready.load(Ordering::Acquire), "its listeners closed");
     }
 
-    /// Snapshots and gone answers carry the serving leaf's signature, which
-    /// a data plane trusting the CA takes for the Service's name; a gone
-    /// answer names its Gateway. Through the apiserver's proxy that is all
-    /// that tells the controller from any endpoint of its Service.
-    #[tokio::test]
-    async fn snapshots_and_gone_answers_are_signed_by_the_serving_leaf() {
+    /// Snapshots, 204s and gone answers carry the serving leaf's signature
+    /// over the poll's nonce, which a data plane trusting the CA takes for
+    /// the Service's name; a 204 is signed over the version it confirms, a
+    /// gone answer names its Gateway. Through the apiserver's proxy that is
+    /// all that tells the controller from any endpoint of its Service.
+    #[tokio::test(start_paused = true)]
+    async fn every_answer_is_signed_over_the_polls_nonce() {
         use crate::sync::{ca_roots, AnswerVerifier};
         use std::time::SystemTime;
         let f = fixture().await;
         let roots = ca_roots(f.ca.ca_pem().as_bytes(), "controller CA").unwrap();
         let verifier = AnswerVerifier::new(roots, "portail-controller.portail-system.svc").unwrap();
+        let polled = |gateway: &GatewayKey, have: &str, nonce: &str| {
+            let mut body = body(gateway, have, None);
+            body["nonce"] = json!(nonce);
+            body
+        };
+        let answer = |response: Response<Full<Bytes>>| async move {
+            let headers = response.headers().clone();
+            let (status, body) = text_of(response).await;
+            (status, headers, body)
+        };
         let v1 = f.publish(1);
-        let response = f.sync(poll("")).await;
-        let headers = response.headers().clone();
-        let (status, json) = text_of(response).await;
+        let token = gateway_token("default", "gw", 0);
+        let (status, headers, json) =
+            answer(f.sync(post(Some(&token), &polled(&key(), "", "n1"))).await).await;
         assert_eq!(status, StatusCode::OK);
+        let now = SystemTime::now();
         verifier
-            .verify(
-                Signed::Snapshot,
-                &headers,
-                json.as_bytes(),
-                SystemTime::now(),
-            )
+            .verify(Signed::Snapshot, "n1", &headers, json.as_bytes(), now)
             .unwrap();
+        assert!(verifier
+            .verify(Signed::Snapshot, "n0", &headers, json.as_bytes(), now)
+            .is_err());
         assert!(json.contains(&v1));
+
+        let (status, headers, _) =
+            answer(f.sync(post(Some(&token), &polled(&key(), &v1, "n2"))).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        verifier
+            .verify(Signed::Unchanged, "n2", &headers, v1.as_bytes(), now)
+            .unwrap();
+        assert!(verifier
+            .verify(Signed::Unchanged, "n2", &headers, b"other", now)
+            .is_err());
 
         let ghost = GatewayKey::new("default", "ghost");
         f.api.reply_to(
@@ -1179,21 +1223,20 @@ mod tests {
                 Some("pod-9"),
             ),
         );
-        let response = f
-            .sync(post(
+        let (status, headers, gone) = answer(
+            f.sync(post(
                 Some(&gateway_token("default", "ghost", 0)),
-                &body(&ghost, "", None),
+                &polled(&ghost, "", "n3"),
             ))
-            .await;
-        let headers = response.headers().clone();
-        let (status, gone) = text_of(response).await;
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let now = SystemTime::now();
         verifier
-            .verify(Signed::Gone, &headers, gone.as_bytes(), now)
+            .verify(Signed::Gone, "n3", &headers, gone.as_bytes(), now)
             .unwrap();
-        Gone::check(gone.as_bytes(), &ghost, now).unwrap();
-        assert!(Gone::check(gone.as_bytes(), &key(), now).is_err());
+        Gone::check(gone.as_bytes(), &ghost).unwrap();
+        assert!(Gone::check(gone.as_bytes(), &key()).is_err());
     }
 
     #[tokio::test]
