@@ -2,7 +2,7 @@
 //! objects under them and sync authorization expects the ServiceAccount
 //! they name, so both must compute the same bytes.
 
-use crate::sync::sha256_hex;
+use crate::sync::{is_dns1123_label, sha256_hex};
 
 /// `app.kubernetes.io/name` on everything provisioned.
 pub const LABEL_NAME: &str = "app.kubernetes.io/name";
@@ -23,8 +23,8 @@ const PREFIX: &str = "portail-";
 /// Hex digits of SHA-256 a shortened name or value ends with (operator
 /// parity: resources.go `hashLen`).
 const HASH_HEX_DIGITS: usize = 8;
-/// DNS-1123 label and label-value length limit.
-const MAX_LABEL: usize = 63;
+/// Label-value length limit, the DNS-1123 label one.
+const MAX_LABEL: usize = crate::sync::MAX_DNS1123_LABEL;
 
 /// The name of a Gateway's ServiceAccount, Deployment, Service and PDB:
 /// `portail-<gateway>`, or, when that is no DNS-1123 label, the Gateway name
@@ -63,18 +63,6 @@ pub fn label_value(gateway: &str) -> String {
 /// Service's in-cluster name, which the apiserver refuses as its own.
 pub fn controller_audience(service: &str, namespace: &str) -> String {
     format!("{service}.{namespace}.svc")
-}
-
-/// RFC 1123 label: lowercase alphanumerics and '-', alphanumeric at both
-/// ends, at most 63 characters.
-fn is_dns1123_label(s: &str) -> bool {
-    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
-    let bytes = s.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_LABEL
-        && bytes.iter().all(|&c| alnum(c) || c == b'-')
-        && alnum(bytes[0])
-        && alnum(bytes[bytes.len() - 1])
 }
 
 #[cfg(test)]

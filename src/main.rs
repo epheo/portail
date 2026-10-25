@@ -3,7 +3,6 @@ use portail::logging::{error, info};
 use portail::*;
 
 use arc_swap::ArcSwap;
-use clap::Parser;
 use cli::Args;
 use config::PortailConfig;
 use proxy::data_plane::DataPlane;
@@ -15,7 +14,7 @@ fn main() -> Result<()> {
     // Install rustls CryptoProvider early — needed by kube client in K8s mode
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let args = Args::parse();
+    let args = Args::try_parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
     if let Err(error) = args.validate() {
         eprintln!("Invalid arguments: {}", error);

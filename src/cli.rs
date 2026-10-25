@@ -1,9 +1,9 @@
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::sync::GatewayKey;
+use crate::sync::{is_dns1123_label, GatewayKey};
 
 /// Command-line interface for Portail Gateway Controller
 #[derive(Parser, Debug)]
@@ -13,8 +13,6 @@ use crate::sync::GatewayKey;
 #[command(
     long_about = "Portail is a Kubernetes Gateway API Controller. It provides sub-100μs P99 latency and >1M RPS throughput for HTTP and TCP proxying.\n\nWithout a subcommand it runs standalone, from --config or its built-in default config."
 )]
-// The flags below are standalone mode's: a subcommand takes its own.
-#[command(args_conflicts_with_subcommands = true)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -143,7 +141,7 @@ pub struct ControllerArgs {
     pub controller_name: String,
 
     /// Namespace of the controller's lease, CA Secret and ConfigMap, and Service
-    #[arg(long, env = "POD_NAMESPACE")]
+    #[arg(long, env = "POD_NAMESPACE", value_parser = parse_namespace)]
     pub namespace: String,
 
     /// The ClusterIP Service data planes dial; `<service>.<namespace>.svc`
@@ -232,6 +230,15 @@ pub fn default_dataplane_image() -> String {
     }
 }
 
+/// A namespace is a DNS-1123 label; an empty POD_NAMESPACE is no default.
+fn parse_namespace(s: &str) -> Result<String, String> {
+    if is_dns1123_label(s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!("{s:?} is not a namespace name (a DNS-1123 label)"))
+    }
+}
+
 fn parse_gateway_key(s: &str) -> Result<GatewayKey, String> {
     s.parse()
 }
@@ -241,6 +248,32 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 }
 
 impl Args {
+    /// Parse `argv`. The flags of [`Args`] are standalone mode's: with a
+    /// subcommand only `-v` may come before it.
+    pub fn try_parse_args<I, T>(argv: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut command = Self::command();
+        let matches = command.try_get_matches_from_mut(argv)?;
+        if matches.subcommand().is_some() {
+            let standalone = command.get_arguments().find(|arg| {
+                arg.get_id() != "verbose"
+                    && matches.value_source(arg.get_id().as_str())
+                        == Some(clap::parser::ValueSource::CommandLine)
+            });
+            if let Some(arg) = standalone {
+                let flag = arg.get_long().unwrap_or(arg.get_id().as_str());
+                return Err(command.error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!("--{flag} is a standalone flag: it takes no subcommand"),
+                ));
+            }
+        }
+        Self::from_arg_matches(&matches).map_err(|e| e.format(&mut command))
+    }
+
     /// Validate argument combinations and requirements.
     /// Config file extension/format checking lives in
     /// `PortailConfig::load_from_file` — the single source of truth for
@@ -271,7 +304,7 @@ mod tests {
     use super::*;
 
     fn parse(argv: &[&str]) -> Args {
-        Args::try_parse_from(argv).unwrap()
+        Args::try_parse_args(argv).unwrap()
     }
 
     #[test]
@@ -299,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_validate_only_conflicts_with_check_config() {
-        assert!(Args::try_parse_from(["portail", "--validate-only", "--check-config"]).is_err());
+        assert!(Args::try_parse_args(["portail", "--validate-only", "--check-config"]).is_err());
     }
 
     #[test]
@@ -309,14 +342,14 @@ mod tests {
         let pod_ip: IpAddr = "10.128.0.7".parse().unwrap();
         let args = parse(&["portail", "--admin-address", "10.128.0.7"]);
         assert_eq!(args.admin_address, pod_ip);
-        assert!(Args::try_parse_from(["portail", "--admin-address", "pod-ip"]).is_err());
+        assert!(Args::try_parse_args(["portail", "--admin-address", "pod-ip"]).is_err());
     }
 
     #[test]
     fn test_generate_config_rejects_unknown_example() {
-        assert!(Args::try_parse_from(["portail", "--generate-config", "nope"]).is_err());
+        assert!(Args::try_parse_args(["portail", "--generate-config", "nope"]).is_err());
         for (name, _, _) in crate::config::examples::EXAMPLES {
-            assert!(Args::try_parse_from(["portail", "--generate-config", name]).is_ok());
+            assert!(Args::try_parse_args(["portail", "--generate-config", name]).is_ok());
         }
     }
 
@@ -415,9 +448,9 @@ mod tests {
     #[test]
     fn a_dataplane_needs_its_gateway_and_controller() {
         let base = ["portail", "dataplane"];
-        assert!(Args::try_parse_from(base).is_err());
-        assert!(Args::try_parse_from([&base[..], &["--gateway", "ns/gw"]].concat()).is_err());
-        assert!(Args::try_parse_from(
+        assert!(Args::try_parse_args(base).is_err());
+        assert!(Args::try_parse_args([&base[..], &["--gateway", "ns/gw"]].concat()).is_err());
+        assert!(Args::try_parse_args(
             [
                 &base[..],
                 &["--gateway", "gw", "--controller-address", "https://c"]
@@ -461,8 +494,66 @@ mod tests {
                 "--transport=direct",
             ],
         ] {
-            assert!(Args::try_parse_from(argv).is_err(), "{argv:?}");
+            assert!(Args::try_parse_args(argv).is_err(), "{argv:?}");
         }
+    }
+
+    /// -v is the one flag that may come before a subcommand, as after it.
+    #[test]
+    fn verbose_goes_before_or_after_a_subcommand() {
+        for argv in [
+            &["portail", "-v", "controller", "--namespace", "ps"][..],
+            &["portail", "controller", "--namespace", "ps", "-vv"],
+            &[
+                "portail",
+                "-v",
+                "dataplane",
+                "--gateway=ns/gw",
+                "--controller-address=x",
+            ],
+        ] {
+            let args = Args::try_parse_args(argv).unwrap();
+            assert!(args.command.is_some() && args.verbose >= 1, "{argv:?}");
+        }
+        for argv in [
+            &[
+                "portail",
+                "--admin-address",
+                "0.0.0.0",
+                "controller",
+                "--namespace=ps",
+            ][..],
+            &[
+                "portail",
+                "--http2",
+                "dataplane",
+                "--gateway=ns/gw",
+                "--controller-address=x",
+            ],
+            &[
+                "portail",
+                "--metrics-port",
+                "9000",
+                "controller",
+                "--namespace=ps",
+            ],
+        ] {
+            let error = Args::try_parse_args(argv).unwrap_err();
+            assert!(error.to_string().contains("standalone flag"), "{error}");
+        }
+    }
+
+    /// An empty POD_NAMESPACE, or a name no namespace can have, is no
+    /// default: the lease and CA objects would be refused later.
+    #[test]
+    fn the_namespace_is_a_dns_label() {
+        for bad in ["", "Portail", "portail_system", "-ps", "a.b"] {
+            let argv = ["portail", "controller", "--namespace", bad];
+            assert!(Args::try_parse_args(argv).is_err(), "{bad:?}");
+        }
+        assert!(
+            Args::try_parse_args(["portail", "controller", "--namespace=portail-system"]).is_ok()
+        );
     }
 
     #[test]

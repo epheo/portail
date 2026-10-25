@@ -87,6 +87,21 @@ impl GatewayRef {
     }
 }
 
+/// RFC 1123 label length limit.
+pub(crate) const MAX_DNS1123_LABEL: usize = 63;
+
+/// RFC 1123 label, as Kubernetes names namespaces: lowercase alphanumerics
+/// and '-', alphanumeric at both ends, at most 63 characters.
+pub fn is_dns1123_label(s: &str) -> bool {
+    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let bytes = s.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_DNS1123_LABEL
+        && bytes.iter().all(|&c| alnum(c) || c == b'-')
+        && alnum(bytes[0])
+        && alnum(bytes[bytes.len() - 1])
+}
+
 /// SHA-256 of `data` in lowercase hex.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use std::fmt::Write;
