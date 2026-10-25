@@ -445,6 +445,128 @@ fn tcp_and_udp_listeners_share_a_port() {
     assert_eq!(bound, [(Transport::Tcp, true), (Transport::Udp, true)]);
 }
 
+/// A report that moves while a poll is held cancels it: the port held
+/// elsewhere at the first apply binds on a retry, and the bound report
+/// reaches the controller long before the hold would have ended.
+#[test]
+fn a_report_change_cancels_the_held_poll() {
+    let backend = TestBackend::spawn("ok");
+    let port = free_port();
+    let elsewhere = std::net::TcpListener::bind(("0.0.0.0", port)).unwrap();
+    let served = http_snapshot(port, backend.addr);
+    let stub = ControllerStub::start(HOLD, Mode::Serve(Some(served.clone())));
+    let dp = start_dataplane(&stub, &[]);
+
+    let bound = |bound: bool| {
+        let version = served.version.clone();
+        move |r: &controller_stub::Recorded| {
+            r.request.report.as_ref().is_some_and(|report| {
+                report.applied == version
+                    && report.listeners[0]
+                        .endpoints
+                        .iter()
+                        .all(|e| e.bound == bound)
+            })
+        }
+    };
+    let unbound = stub.wait_for(0, SETTLE, bound(false));
+    assert!(
+        unbound.is_some(),
+        "no unbound report:\n{}",
+        dp.process.output()
+    );
+    drop(elsewhere);
+    let released = Instant::now();
+
+    let report = stub.wait_for(0, HOLD / 2, bound(true)).unwrap_or_else(|| {
+        panic!(
+            "the bound report waited for the hold:\n{}",
+            dp.process.output()
+        )
+    });
+    assert!(report.at - released < HOLD / 2);
+    wait_serving(&dp, port, "ok");
+}
+
+/// An HTTPS listener with no certificateRef left, as the controller sends
+/// one whose grant was revoked: no warning, not in readiness, reported
+/// unbound with why; its sibling serves.
+#[test]
+fn a_listener_without_certificates_is_reported_not_failed() {
+    let backend = TestBackend::spawn("ok");
+    let (https, http) = (free_port(), free_port());
+    let served = snapshot(serde_json::json!({
+        "gateway": {"name": "gw", "listeners": [
+            {"name": "https", "protocol": "HTTPS", "port": https,
+             "tls": {"mode": "Terminate", "certificateRefs": []}},
+            {"name": "http", "protocol": "HTTP", "port": http},
+        ]},
+        "httpRoutes": [{
+            "parentRefs": [{"name": "gw", "sectionName": "http"}],
+            "rules": [{"backendRefs": [{"name": backend.addr.ip().to_string(), "port": backend.addr.port()}]}],
+        }],
+    }));
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(served.clone())));
+    let dp = start_dataplane(&stub, &[]);
+
+    dp.wait_readyz(200, SETTLE);
+    wait_serving(&dp, http, "ok");
+    assert!(refuses(https));
+    let report = stub
+        .wait_for(0, SETTLE, applied(&served.version))
+        .and_then(|r| r.request.report)
+        .unwrap();
+    let endpoint = &report.listeners[0].endpoints[0];
+    assert!(!endpoint.bound);
+    assert!(
+        endpoint
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no certificateRef")),
+        "{endpoint:?}"
+    );
+    let output = dp.process.output();
+    assert!(
+        !output.contains("TLS config build failed") && !output.contains("Failed to bind"),
+        "{output}"
+    );
+}
+
+/// With the controller unreachable (it takes connections and never
+/// answers), the leave report gives up at the connect timeout: shutdown
+/// does not wait on it.
+#[test]
+fn leaving_an_unreachable_controller_takes_the_connect_timeout_at_most() {
+    /// `portail::dataplane::remote::CONNECT_TIMEOUT`.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    let backend = TestBackend::spawn("ok");
+    let port = free_port();
+    let stub = ControllerStub::start(HOLD, Mode::Serve(Some(http_snapshot(port, backend.addr))));
+    let mut dp = start_dataplane(&stub, &["--shutdown-delay", "0s"]);
+    wait_serving(&dp, port, "ok");
+
+    stub.go_down();
+    // Listening, never accepting: the kernel completes the TCP handshake
+    // and the TLS one hangs.
+    let _blackhole = std::net::TcpListener::bind(stub.addr).unwrap();
+    let stopped = Instant::now();
+    dp.process.terminate();
+    let status = dp
+        .process
+        .wait_exit(SETTLE)
+        .unwrap_or_else(|| panic!("no exit:\n{}", dp.process.output()));
+    // Process exit and log flushing on a loaded host.
+    let margin = Duration::from_millis(1500);
+    assert!(
+        stopped.elapsed() < CONNECT_TIMEOUT + margin,
+        "exit {:?} after SIGTERM:\n{}",
+        stopped.elapsed(),
+        dp.process.output()
+    );
+    assert!(status.success());
+    assert!(dp.process.output().contains("Leave not reported"));
+}
+
 /// Long enough for the poll backoff to reach its ceiling (the hold) and
 /// the no-snapshot watchdog's time (the hold) to pass, with margin.
 const OUTAGE: Duration = Duration::from_secs(2 * HOLD.as_secs() + 5);
