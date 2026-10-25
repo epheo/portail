@@ -1,0 +1,16 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: svc-gw
+  namespace: demo-primary
+spec:
+  gatewayClassName: portail
+  infrastructure:
+    parametersRef:
+      group: portail.epheo.eu
+      kind: GatewayParameters
+      name: apiserver-proxy
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP

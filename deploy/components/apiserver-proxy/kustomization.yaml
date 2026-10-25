@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+# Lets data planes reach the controller through the apiserver's service
+# proxy: GatewayParameters controllerTransport: APIServerProxy, for pods
+# on an OVN-Kubernetes Primary UDN. Add it to an overlay of deploy/install
+# or deploy/ha. The RoleBinding is the admin's: one subject per such
+# Gateway's ServiceAccount, portail-<gateway> in its namespace (see
+# examples/kubernetes/primary-udn).
+resources:
+- role.yaml

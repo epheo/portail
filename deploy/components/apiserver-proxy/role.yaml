@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portail-controller-proxy
+  namespace: portail-system
+rules:
+# A proxied POST is a create. resourceNames must spell the proxy path's
+# scheme:service:port exactly: portail-controller:9443 alone is refused.
+# get may be needed beside create on some clusters: to be confirmed on
+# hetznet, where create and get together were measured.
+- apiGroups: [""]
+  resources: [services/proxy]
+  resourceNames: ["https:portail-controller:9443"]
+  verbs: [create]

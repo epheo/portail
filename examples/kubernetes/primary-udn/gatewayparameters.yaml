@@ -1,0 +1,9 @@
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: apiserver-proxy
+  namespace: demo-primary
+spec:
+  # A Primary UDN pod reaches the apiserver, not the controller Service:
+  # its data plane polls through the apiserver's service proxy.
+  controllerTransport: APIServerProxy
