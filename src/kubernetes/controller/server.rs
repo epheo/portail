@@ -734,15 +734,17 @@ mod tests {
         server: Arc<SyncServer>,
         wakes: mpsc::UnboundedReceiver<GatewayKey>,
         shutdown: CancellationToken,
+        serial: tokio::sync::MutexGuard<'static, ()>,
     }
 
     /// A leading, synced controller serving Gateway `default/gw`, whose
     /// tokens TokenReview accepts as pod `pod-1`.
-    fn fixture() -> Fixture {
-        fixture_with(|_| {})
+    async fn fixture() -> Fixture {
+        fixture_with(|_| {}).await
     }
 
-    fn fixture_with(edit: impl FnOnce(&mut ControllerCtx)) -> Fixture {
+    async fn fixture_with(edit: impl FnOnce(&mut ControllerCtx)) -> Fixture {
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
         let mut cluster = TestCluster::default();
@@ -757,7 +759,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let server = SyncServer::new(
             ctx.clone(),
-            authenticator(api.client()),
+            authenticator(api.client(), &serial),
             lapses,
             shutdown.clone(),
         );
@@ -768,6 +770,7 @@ mod tests {
             server,
             wakes,
             shutdown,
+            serial,
         }
     }
 
@@ -857,7 +860,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_poll_holds_answers_204_at_expiry_and_200_on_a_change() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
 
         // Nothing published yet: held, then 204.
         let started = Instant::now();
@@ -889,7 +892,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_newer_request_of_the_instance_ends_its_held_poll() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
         let v1 = f.publish(1);
         let first = tokio::spawn({
             let (f, v1) = (f.clone(), v1.clone());
@@ -912,7 +915,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_removed_gateway_ends_its_polls_with_404() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
         let v1 = f.publish(1);
         let held = tokio::spawn({
             let f = f.clone();
@@ -927,8 +930,7 @@ mod tests {
     /// whose class names another controller, gets 404 and leaves no slot.
     #[tokio::test(start_paused = true)]
     async fn a_gateway_not_ours_gets_no_slot() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let mut f = fixture();
+        let mut f = fixture().await;
         let ghost = GatewayKey::new("default", "ghost");
         f.api.reply_to(
             REVIEWS,
@@ -970,8 +972,7 @@ mod tests {
     /// review, and only its own data plane learns that it is gone.
     #[tokio::test]
     async fn a_gateway_not_served_is_gone_only_to_its_own_data_plane() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let mut f = fixture();
+        let mut f = fixture().await;
         let ghost = GatewayKey::new("default", "ghost");
         let (status, text) = text_of(
             f.sync(post(
@@ -1033,7 +1034,7 @@ mod tests {
     /// would leave them serving the deleted Gateway.
     #[tokio::test]
     async fn a_restarted_controller_tells_a_deleted_gateways_data_plane_it_is_gone() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         use crate::dataplane::remote::{Answer, Client};
         use crate::sync::SyncRequest;
         let mut p = testkit::Pipeline::new();
@@ -1051,7 +1052,7 @@ mod tests {
             .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
         let restarted = SyncServer::new(
             p.ctx.clone(),
-            authenticator(p.api.client()),
+            authenticator(p.api.client(), &serial),
             Lapses::new().0,
             CancellationToken::new(),
         );
@@ -1085,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_class_keeps_the_gateway_served() {
-        let mut f = fixture();
+        let mut f = fixture().await;
         let v1 = f.publish(1);
         let mut orphan = testkit::gateway("gw", 1);
         orphan.spec.gateway_class_name = "deleted".into();
@@ -1095,12 +1096,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_standby_or_unsynced_controller_answers_503_before_any_review() {
-        for f in [
-            fixture_with(|ctx| ctx.leader = super::super::leader::Leader::standby()),
-            fixture_with(|ctx| {
+        let edits: [fn(&mut ControllerCtx); 2] = [
+            |ctx| ctx.leader = super::super::leader::Leader::standby(),
+            |ctx| {
                 let _ = ctx.synced.track("Gateway", false);
-            }),
-        ] {
+            },
+        ];
+        for edit in edits {
+            let f = fixture_with(edit).await;
             let response = f.sync(poll("")).await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(response.headers()[header::RETRY_AFTER], "1");
@@ -1110,8 +1113,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_token_comes_from_authorization_or_x_portail_token() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let f = fixture();
+        let f = fixture().await;
         let v1 = f.publish(1);
         let token = gateway_token("default", "gw", 0);
         let request = |header_name: &str, value: String| {
@@ -1137,8 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn precheck_failures_answer_one_401_without_a_review() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let f = fixture();
+        let f = fixture().await;
         let other_sa = token_of("default", "portail-other", 0);
         let wrong_ns = token_of("apps", "portail-gw", 0);
         let wrong_aud = super::super::auth::testing::jwt(json!({
@@ -1213,8 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_junk_token_is_refused_before_its_body_is_read() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let f = fixture();
+        let f = fixture().await;
         let read = Arc::new(AtomicBool::new(false));
         let request = Request::post(path_of(&key()))
             .header(header::AUTHORIZATION, "Bearer junk")
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_over_1_mib_is_refused() {
-        let f = fixture();
+        let f = fixture().await;
         let read = Arc::new(AtomicBool::new(false));
         let request = Request::post(path_of(&key()))
             .header(
@@ -1267,8 +1267,7 @@ mod tests {
     /// Managed or Unmanaged makes no difference to who may sync.
     #[tokio::test]
     async fn the_answer_matrix() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let mut f = fixture();
+        let mut f = fixture().await;
         let mut unmanaged = testkit::gateway("gw", 1);
         unmanaged.spec.infrastructure = Some(serde_json::from_value(json!({
             "parametersRef": {"group": "portail.epheo.eu", "kind": "GatewayParameters", "name": "unmanaged"},
@@ -1360,7 +1359,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_report_is_recorded_and_wakes_its_gateway_when_it_lapses() {
-        let mut f = fixture();
+        let mut f = fixture().await;
         let mut triggers = f.ctx.reports.triggers().unwrap();
         let v1 = f.publish(1);
         let report = json!({"applied": v1, "dnsEpoch": 3});
@@ -1397,7 +1396,7 @@ mod tests {
     /// it waits on that answer, bounded, before it drains.
     #[tokio::test(start_paused = true)]
     async fn a_leaving_report_is_answered_at_once() {
-        let f = fixture();
+        let f = fixture().await;
         let v1 = f.publish(1);
         let started = Instant::now();
         let response = f
@@ -1415,7 +1414,7 @@ mod tests {
     /// wake, not at the resync: the pass the wake runs no longer counts it.
     #[tokio::test]
     async fn a_silent_instance_turns_its_gateway_pending_on_the_lapse() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         use super::super::reconcile::{finish, publish, Step};
         let mut p = testkit::Pipeline::new();
         p.api
@@ -1425,7 +1424,7 @@ mod tests {
         let (lapses, mut wakes) = Lapses::new();
         let server = SyncServer::new(
             p.ctx.clone(),
-            authenticator(p.api.client()),
+            authenticator(p.api.client(), &serial),
             lapses,
             CancellationToken::new(),
         );
@@ -1490,7 +1489,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_report_pushes_its_lapse_back() {
-        let mut f = fixture();
+        let mut f = fixture().await;
         let v1 = f.publish(1);
         let report = || {
             post(
@@ -1522,12 +1521,11 @@ mod tests {
 
     #[tokio::test]
     async fn seventeen_unknown_tokens_put_sixteen_reviews_in_flight() {
-        let _serial = METRICS_SERIAL.lock().await;
         let in_flight = Arc::new(AtomicUsize::new(0));
-        let f = fixture();
+        let f = fixture().await;
         let server = SyncServer::new(
             f.ctx.clone(),
-            authenticator(stalled_client(in_flight.clone())),
+            authenticator(stalled_client(in_flight.clone()), &f.serial),
             Lapses::new().0,
             CancellationToken::new(),
         );
@@ -1568,7 +1566,7 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ns = super::super::auth::testing::NS;
         let ca = super::super::ca::ControllerCa::generated(ns, "portail-controller");
-        let f = fixture();
+        let f = fixture().await;
         let v1 = f.publish(1);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1607,7 +1605,9 @@ mod tests {
             rustls::pki_types::ServerName::try_from("portail-controller.other.svc").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let g = fixture();
+        // A fixture holds METRICS_SERIAL: one at a time.
+        drop(f);
+        let g = fixture().await;
         tokio::spawn(serve(g.server.clone(), ca.server_config(), listener));
         let tcp = TcpStream::connect(addr).await.unwrap();
         assert!(connector.connect(wrong, tcp).await.is_err());
@@ -1639,8 +1639,7 @@ mod tests {
     /// review; a token TokenReview rejects never has its body read either.
     #[tokio::test]
     async fn the_body_is_read_only_once_the_token_is_reviewed() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let f = fixture();
+        let f = fixture().await;
         let watched = |token: &str, read: &Arc<AtomicBool>| {
             Request::post(path_of(&key()))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1667,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_body_must_name_the_gateway_of_the_path() {
-        let f = fixture();
+        let f = fixture().await;
         let request = Request::post(path_of(&key()))
             .header(
                 header::AUTHORIZATION,
@@ -1682,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_path_without_one_gateway_is_404() {
-        let f = fixture();
+        let f = fixture().await;
         let token = gateway_token("default", "gw", 0);
         for path in [
             "/v1/sync",
@@ -1725,7 +1724,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn body_reads_are_capped_and_a_stalled_body_ends_in_5s() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
         f.publish(1);
         // One reviewed token per pod: one pod reads one body at a time.
         let tokens: Vec<String> = (0..=MAX_BODY_READS as u32)
@@ -1768,10 +1767,10 @@ mod tests {
     #[tokio::test]
     async fn connections_over_the_cap_wait_to_be_accepted() {
         let (ca, connector, name) = tls_client();
-        let f = fixture();
+        let f = fixture().await;
         let server = SyncServer::with_connections(
             f.ctx.clone(),
-            authenticator(f.api.client()),
+            authenticator(f.api.client(), &f.serial),
             Lapses::new().0,
             f.shutdown.clone(),
             1,
@@ -1804,7 +1803,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_head_over_32_kib_is_refused() {
         let (ca, connector, name) = tls_client();
-        let f = fixture();
+        let f = fixture().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(f.server.clone(), ca.server_config(), listener));
@@ -1828,7 +1827,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_silent_peer_is_dropped_in_5s() {
         let (ca, _, _) = tls_client();
-        let f = fixture();
+        let f = fixture().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(f.server.clone(), ca.server_config(), listener));
@@ -1845,8 +1844,7 @@ mod tests {
     /// so a peer cannot pin a slot with one junk request per head timeout.
     #[tokio::test]
     async fn refusals_close_the_connection() {
-        let _serial = METRICS_SERIAL.lock().await;
-        let f = fixture();
+        let f = fixture().await;
         f.publish(1);
         let closes = |response: &Response<Full<Bytes>>| {
             response
@@ -1875,10 +1873,10 @@ mod tests {
     #[tokio::test]
     async fn one_peer_holds_its_share_of_connections() {
         let (ca, connector, name) = tls_client();
-        let f = fixture();
+        let f = fixture().await;
         let server = SyncServer::with_connections(
             f.ctx.clone(),
-            authenticator(f.api.client()),
+            authenticator(f.api.client(), &f.serial),
             Lapses::new().0,
             f.shutdown.clone(),
             MAX_CONNECTIONS,
@@ -1935,7 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_that_stops_reading_frees_its_slot() {
         let (ca, connector, name) = tls_client();
-        let f = fixture();
+        let f = fixture().await;
         let mut snapshot = Snapshot::from_config(
             crate::sync::GatewayRef {
                 namespace: "default".into(),
@@ -1957,7 +1955,7 @@ mod tests {
         assert!(f.ctx.hub.publish(snapshot));
         let server = SyncServer::with_connections(
             f.ctx.clone(),
-            authenticator(f.api.client()),
+            authenticator(f.api.client(), &f.serial),
             Lapses::new().0,
             f.shutdown.clone(),
             1,
@@ -1994,7 +1992,7 @@ mod tests {
     /// stalling bodies holds one read, not every other data plane's.
     #[tokio::test(start_paused = true)]
     async fn one_pod_reads_one_body_at_a_time() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
         let v1 = f.publish(1);
         assert_eq!(
             version_of(f.sync(poll("")).await).await,
@@ -2031,7 +2029,7 @@ mod tests {
     /// More data planes hold polls than bodies may be read at once.
     #[tokio::test(start_paused = true)]
     async fn held_polls_hold_no_body_read() {
-        let f = Arc::new(fixture());
+        let f = Arc::new(fixture().await);
         let v1 = f.publish(1);
         let pods = 0..=MAX_BODY_READS as u32;
         for n in pods.clone() {

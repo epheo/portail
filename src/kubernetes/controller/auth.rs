@@ -486,9 +486,8 @@ fn token_hash(token: &str) -> TokenHash {
     hash
 }
 
-/// Tests that count auth metrics hold this: the counters are process-wide.
 #[cfg(test)]
-pub(super) static METRICS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) use crate::metrics::SYNC_AUTH_SERIAL as METRICS_SERIAL;
 
 #[cfg(test)]
 pub(super) mod testing {
@@ -566,7 +565,12 @@ pub(super) mod testing {
         })
     }
 
-    pub fn authenticator(client: Client) -> Authenticator {
+    /// Built only under [`super::METRICS_SERIAL`]: its reviews and
+    /// refusals move process-wide counters other tests count.
+    pub fn authenticator(
+        client: Client,
+        _serial: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Authenticator {
         let own = ServiceAccount {
             namespace: NS.into(),
             name: "portail-ctl".into(),
@@ -667,7 +671,7 @@ mod tests {
     /// A valid token is reviewed once per hold.
     #[tokio::test(start_paused = true)]
     async fn an_accepted_token_is_reviewed_once_per_hold() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(
             REVIEWS,
@@ -678,7 +682,7 @@ mod tests {
                 Some("pod-1"),
             ),
         );
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
@@ -706,10 +710,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_rejected_token_is_answered_from_memory_for_a_hold() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(REVIEWS, 201, review(false, "", None));
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
@@ -743,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_review_is_not_cached() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(
             REVIEWS,
@@ -751,7 +755,7 @@ mod tests {
             json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
                    "reason": "ServiceUnavailable", "message": "etcd", "code": 503}),
         );
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
@@ -785,9 +789,9 @@ mod tests {
     /// namespace, and never the controller's.
     #[tokio::test]
     async fn authorization_matrix() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let web = GatewayKey::new("apps", "web");
 
         let cases = [
@@ -873,12 +877,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_audience_unaware_review_rejects() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         let mut answer = review(true, "system:serviceaccount:apps:portail-web", Some("p"));
         answer["status"]["audiences"] = json!([]);
         api.reply_to(REVIEWS, 201, answer);
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
         assert_eq!(
@@ -938,14 +942,13 @@ mod tests {
     /// still reviewed, from its own pool.
     #[tokio::test(start_paused = true)]
     async fn forged_tokens_do_not_starve_a_known_instance() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let known = gateway_token("apps", "web", 0);
         let hanging = Arc::new(AtomicUsize::new(0));
-        let auth = Arc::new(authenticator(split_client(
-            vec![known.clone()],
-            Arc::default(),
-            hanging.clone(),
-        )));
+        let auth = Arc::new(authenticator(
+            split_client(vec![known.clone()], Arc::default(), hanging.clone()),
+            &serial,
+        ));
         let gw = GatewayKey::new("apps", "web");
         let claimed = auth.precheck(&known).unwrap();
         auth.authenticate(&claimed, &known, &gw, PEER)
@@ -986,7 +989,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_expired_verdict_serves_one_more_hold_while_reviews_fail() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(
             REVIEWS,
@@ -997,7 +1000,7 @@ mod tests {
                 Some("pod-1"),
             ),
         );
-        let auth = authenticator(api.client());
+        let auth = authenticator(api.client(), &serial);
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
@@ -1063,13 +1066,13 @@ mod tests {
     /// expired verdict serves.
     #[tokio::test(start_paused = true)]
     async fn a_review_without_an_answer_frees_its_permit_in_5s() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let answer = Arc::new(AtomicBool::new(true));
         let hanging = Arc::new(AtomicUsize::new(0));
-        let auth = Arc::new(authenticator(switched_client(
-            answer.clone(),
-            hanging.clone(),
-        )));
+        let auth = Arc::new(authenticator(
+            switched_client(answer.clone(), hanging.clone()),
+            &serial,
+        ));
         let gw = GatewayKey::new("apps", "web");
         let tokens: Vec<String> = (0..MAX_RENEWALS_IN_FLIGHT as u32)
             .map(|n| gateway_token("apps", "web", n))
@@ -1111,16 +1114,15 @@ mod tests {
     /// into the unknown pool.
     #[tokio::test(start_paused = true)]
     async fn a_renewal_waits_for_a_permit() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let tokens: Vec<String> = (0..=MAX_RENEWALS_IN_FLIGHT as u32)
             .map(|n| gateway_token("apps", "web", n))
             .collect();
         let slow = Arc::new(AtomicUsize::new(0));
-        let auth = Arc::new(authenticator(split_client(
-            tokens.clone(),
-            slow.clone(),
-            Arc::default(),
-        )));
+        let auth = Arc::new(authenticator(
+            split_client(tokens.clone(), slow.clone(), Arc::default()),
+            &serial,
+        ));
         let gw = GatewayKey::new("apps", "web");
         for (n, token) in tokens.iter().enumerate() {
             let claimed = auth.precheck(token).unwrap();
@@ -1169,14 +1171,13 @@ mod tests {
     /// permits: a new pod elsewhere is still reviewed.
     #[tokio::test(start_paused = true)]
     async fn one_peer_takes_at_most_two_reviews() {
-        let _serial = METRICS_SERIAL.lock().await;
+        let serial = METRICS_SERIAL.lock().await;
         let newcomer = gateway_token("apps", "web", 0);
         let hanging = Arc::new(AtomicUsize::new(0));
-        let auth = Arc::new(authenticator(split_client(
-            vec![newcomer.clone()],
-            Arc::default(),
-            hanging.clone(),
-        )));
+        let auth = Arc::new(authenticator(
+            split_client(vec![newcomer.clone()], Arc::default(), hanging.clone()),
+            &serial,
+        ));
         let gw = GatewayKey::new("apps", "web");
         let flood: Vec<_> = (0..MAX_REVIEWS_IN_FLIGHT as u32)
             .map(|n| {
@@ -1220,7 +1221,8 @@ mod tests {
     /// oldest go; a sweep gives the room back.
     #[tokio::test(start_paused = true)]
     async fn the_verdict_cache_is_capped() {
-        let auth = authenticator(MockApi::default().client());
+        let serial = METRICS_SERIAL.lock().await;
+        let auth = authenticator(MockApi::default().client(), &serial);
         let len = |auth: &Authenticator| auth.verdicts.lock().unwrap().by_token.len();
         for n in 0..10 {
             auth.remember(hash(n), accepted(n));
@@ -1257,7 +1259,8 @@ mod tests {
     /// accepted verdicts, never pushing out a running data plane's.
     #[tokio::test(start_paused = true)]
     async fn one_pod_keeps_two_accepted_verdicts() {
-        let auth = authenticator(MockApi::default().client());
+        let serial = METRICS_SERIAL.lock().await;
+        let auth = authenticator(MockApi::default().client(), &serial);
         auth.remember(hash(0), accepted(0));
         let tenant = |n: u32| {
             let mut reviewed = accepted(7);

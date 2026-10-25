@@ -153,6 +153,12 @@ impl TokenReviewResult {
     }
 }
 
+/// Held by every test that builds a sync Authenticator or moves or counts
+/// these counters: they are process-wide, and one test's reviews moved
+/// another's deltas.
+#[cfg(test)]
+pub(crate) static SYNC_AUTH_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static SYNC_AUTH_REJECTED: [Counter; SyncAuthStage::ALL.len()] =
     [const { Counter(AtomicU64::new(0)) }; SyncAuthStage::ALL.len()];
 static TOKENREVIEW_REQUESTS: [Counter; TokenReviewResult::ALL.len()] =
@@ -818,6 +824,7 @@ mod tests {
 
     #[test]
     fn sync_auth_series_render_from_zero() {
+        let _serial = SYNC_AUTH_SERIAL.blocking_lock();
         let text = render(false);
         for stage in ["precheck", "negative_cache", "tokenreview", "authz"] {
             let series = format!("portail_sync_auth_rejected_total{{stage=\"{stage}\"}} ");
