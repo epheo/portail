@@ -308,7 +308,8 @@ fn conditions_current(observed: &Value, desired: &Value) -> bool {
 /// resourceVersion is the one a CRD's status subresource enforces: its
 /// update strategy takes every field but status from the stored object, uid
 /// included, before validation compares uids.
-async fn apply_status<K>(api: Api<K>, obj: &K, status: Value) -> Write
+/// Returns the object written, `None` when the write failed.
+async fn apply_status<K>(api: Api<K>, obj: &K, status: Value) -> Option<K>
 where
     K: kube::Resource + Clone + DeserializeOwned + Debug,
     <K as kube::Resource>::DynamicType: Default,
@@ -344,17 +345,17 @@ where
         )
         .await
     {
-        Ok(_) => {
+        Ok(written) => {
             debug!("Updated {} status", what);
-            Write::Patched
+            Some(written)
         }
         Err(kube::Error::Api(e)) if e.code == 409 => {
             debug!("{} changed since read; its update re-runs this pass", what);
-            Write::Failed
+            None
         }
         Err(e) => {
             warn!("Failed to update {} status: {}", what, e);
-            Write::Failed
+            None
         }
     }
 }
@@ -400,6 +401,7 @@ pub(crate) async fn write_gateway_status(
         desired,
     )
     .await
+    .map_or(Write::Failed, |_| Write::Patched)
 }
 
 /// The GatewayClass status this controller owns, without timestamps:
@@ -434,12 +436,14 @@ fn feature_names(status: &Value) -> Vec<&str> {
     names
 }
 
-fn class_status_current(observed: &Value, desired: &Value) -> bool {
-    conditions_current(observed, desired) && feature_names(observed) == feature_names(desired)
-}
-
 /// Bring the GatewayClass status to `desired`, from
-/// [`desired_class_status`] for this class.
+/// [`desired_class_status`] for this class: conditions server-side
+/// applied, the feature list replaced whole when its set differs.
+///
+/// An apply keeps list entries other managers own: a list frozen by an
+/// older writer (`portail`, the operator's `manager`) would keep a feature
+/// dropped since, and every pass would send an apply that changes nothing.
+/// A JSON merge patch replaces the list, on the resourceVersion read.
 pub(crate) async fn write_class_status(
     client: &Client,
     class: &GatewayClass,
@@ -450,11 +454,55 @@ pub(crate) async fn write_class_status(
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok())
         .unwrap_or_else(|| json!({}));
-    if class_status_current(&observed, &desired) {
+    let conditions_due = !conditions_current(&observed, &desired);
+    let features_due = feature_names(&observed) != feature_names(&desired);
+    if !conditions_due && !features_due {
         return Write::Current;
     }
-    stamp_status(&mut desired, &observed, &now());
-    apply_status(Api::<GatewayClass>::all(client.clone()), class, desired).await
+    let api = Api::<GatewayClass>::all(client.clone());
+    let mut resource_version = class.metadata.resource_version.clone();
+    if conditions_due {
+        let mut conditions = json!({ "conditions": desired["conditions"].take() });
+        stamp_status(&mut conditions, &observed, &now());
+        match apply_status(api.clone(), class, conditions).await {
+            Some(written) => resource_version = written.metadata.resource_version,
+            None => return Write::Failed,
+        }
+    }
+    if features_due {
+        let mut patch = json!({
+            "status": { "supportedFeatures": desired["supportedFeatures"].take() },
+        });
+        if let Some(rv) = resource_version {
+            patch["metadata"] = json!({ "resourceVersion": rv });
+        }
+        let name = class.name_any();
+        match api
+            .patch_status(
+                &name,
+                &PatchParams::apply(FIELD_MANAGER),
+                &Patch::Merge(patch),
+            )
+            .await
+        {
+            Ok(_) => debug!("Updated GatewayClass {} supportedFeatures", name),
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                debug!(
+                    "GatewayClass {} changed since read; its next pass writes",
+                    name
+                );
+                return Write::Failed;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to update GatewayClass {} supportedFeatures: {}",
+                    name, e
+                );
+                return Write::Failed;
+            }
+        }
+    }
+    Write::Patched
 }
 
 /// Per-parent status entry for a route.
@@ -1129,6 +1177,11 @@ mod tests {
         .unwrap();
         class.metadata.generation = Some(generation);
         class
+    }
+
+    /// Whether a class write is due: [`write_class_status`]'s test.
+    fn class_status_current(observed: &Value, desired: &Value) -> bool {
+        conditions_current(observed, desired) && feature_names(observed) == feature_names(desired)
     }
 
     /// `desired` as the store holds it once written.

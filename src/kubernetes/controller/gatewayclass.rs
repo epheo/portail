@@ -274,7 +274,7 @@ pub(super) async fn remove_departed(
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{self, apply, Pipeline, CONTROLLER};
+    use super::super::testkit::{self, apply, Pipeline, Recorded, CONTROLLER};
     use super::*;
     use kube::runtime::reflector::store::Writer;
     use kube::runtime::watcher;
@@ -283,7 +283,7 @@ mod tests {
     const CLASSES: &str = "/apis/gateway.networking.k8s.io/v1/gatewayclasses";
 
     /// A Pipeline whose class `portail` has a uid, and whose apiserver
-    /// answers class writes.
+    /// answers class writes at resourceVersion 8.
     fn pipeline() -> Pipeline {
         let mut p = Pipeline::new();
         apply(&mut p.cluster.gateway_classes, class("portail", CONTROLLER));
@@ -293,7 +293,7 @@ mod tests {
             json!({
                 "apiVersion": "gateway.networking.k8s.io/v1",
                 "kind": "GatewayClass",
-                "metadata": {"name": "portail"},
+                "metadata": {"name": "portail", "resourceVersion": "8"},
                 "spec": {"controllerName": CONTROLLER},
             }),
         );
@@ -315,9 +315,25 @@ mod tests {
             .collect()
     }
 
-    /// Our class only: Accepted at its generation, the features sorted,
-    /// applied by our field manager on its uid, to the status alone (no
-    /// finalizer). The echo of the write is not written again.
+    /// The server-side apply of a class's conditions; the merge patch of
+    /// its features list carries no apiVersion and no force.
+    fn is_apply(write: &Recorded) -> bool {
+        write.path.contains("force=true")
+    }
+
+    fn feature_list(status: &Value) -> Vec<&str> {
+        status["supportedFeatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Our class only: Accepted at its generation applied by our field
+    /// manager on the uid and resourceVersion read, to the status alone (no
+    /// finalizer); the features, sorted, replace the list on the
+    /// resourceVersion the apply left. The echo is not written again.
     #[tokio::test]
     async fn a_class_of_ours_is_accepted_once() {
         let mut p = pipeline();
@@ -328,38 +344,38 @@ mod tests {
         assert!(pass(&p.ctx).await);
 
         let writes = class_writes(&p);
-        assert_eq!(writes.len(), 1, "{writes:?}");
-        let write = &writes[0];
-        assert_eq!(write.method, "PATCH");
-        assert!(
-            write
-                .path
-                .starts_with(&format!("{CLASSES}/portail/status?")),
-            "{}",
-            write.path
-        );
-        assert!(write.path.contains("fieldManager=portail-controller"));
-        assert_eq!(write.body["metadata"]["uid"], "portail-uid");
-        assert_eq!(write.body["metadata"]["resourceVersion"], "7");
-        assert!(write.body["metadata"].get("finalizers").is_none());
-        let status = &write.body["status"];
-        let accepted = &status["conditions"][0];
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        let (applied, features) = (&writes[0], &writes[1]);
+        assert!(is_apply(applied), "{}", applied.path);
+        assert!(applied
+            .path
+            .starts_with(&format!("{CLASSES}/portail/status?")));
+        assert!(applied.path.contains("fieldManager=portail-controller"));
+        assert_eq!(applied.body["metadata"]["uid"], "portail-uid");
+        assert_eq!(applied.body["metadata"]["resourceVersion"], "7");
+        assert!(applied.body["metadata"].get("finalizers").is_none());
+        assert!(applied.body["status"].get("supportedFeatures").is_none());
+        let accepted = &applied.body["status"]["conditions"][0];
         assert_eq!(accepted["type"], "Accepted");
         assert_eq!(accepted["status"], "True");
         assert_eq!(accepted["observedGeneration"], 1);
-        let features: Vec<&str> = status["supportedFeatures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
-        let mut sorted = features.clone();
+
+        assert!(!is_apply(features), "{}", features.path);
+        assert!(features
+            .path
+            .starts_with(&format!("{CLASSES}/portail/status?")));
+        assert!(features.body.get("apiVersion").is_none());
+        assert_eq!(features.body["metadata"]["resourceVersion"], "8");
+        let listed = feature_list(&features.body["status"]);
+        let mut sorted = listed.clone();
         sorted.sort_unstable();
-        assert_eq!(features, sorted);
-        assert!(features.contains(&"HTTPRoute"));
+        assert_eq!(listed, sorted);
+        assert!(listed.contains(&"HTTPRoute"));
 
         let mut stored = class("portail", CONTROLLER);
-        stored.status = Some(serde_json::from_value(status.clone()).unwrap());
+        let mut status = applied.body["status"].clone();
+        status["supportedFeatures"] = features.body["status"]["supportedFeatures"].clone();
+        stored.status = Some(serde_json::from_value(status).unwrap());
         apply(&mut p.cluster.gateway_classes, stored.clone());
         p.api.clear();
         assert!(pass(&p.ctx).await);
@@ -370,6 +386,38 @@ mod tests {
         assert!(pass(&p.ctx).await);
         let bumped = p.api.status_patch("gatewayclasses", "portail").unwrap();
         assert_eq!(bumped["status"]["conditions"][0]["observedGeneration"], 2);
+    }
+
+    /// A list an older writer froze keeps a feature dropped since; an
+    /// apply would leave that entry, its owner's, and be sent again on
+    /// every pass. The list is replaced whole, the conditions left alone.
+    #[tokio::test]
+    async fn a_frozen_feature_list_is_replaced_whole() {
+        let mut p = pipeline();
+        let desired = status::desired_class_status(
+            &class("portail", CONTROLLER),
+            &GatewayCondition::ok("Accepted", "GatewayClass accepted by portail controller"),
+        );
+        let mut frozen = desired.clone();
+        frozen["conditions"][0]["lastTransitionTime"] = json!("2026-03-01T00:00:00Z");
+        frozen["supportedFeatures"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "GatewayStaticAddresses"}));
+        let mut stored = class("portail", CONTROLLER);
+        stored.status = Some(serde_json::from_value(frozen).unwrap());
+        apply(&mut p.cluster.gateway_classes, stored);
+
+        assert!(pass(&p.ctx).await);
+        let writes = class_writes(&p);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(!is_apply(&writes[0]));
+        assert_eq!(writes[0].body["metadata"]["resourceVersion"], "7");
+        assert_eq!(
+            writes[0].body["status"]["supportedFeatures"],
+            desired["supportedFeatures"]
+        );
+        assert!(writes[0].body["status"].get("conditions").is_none());
     }
 
     fn parameters(name: &str) -> GatewayParameters {
@@ -423,10 +471,11 @@ mod tests {
         }
     }
 
+    /// The first PATCH to `plural/name` once one is sent.
     async fn eventually(p: &Pipeline, plural: &str, name: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Some(patch) = p.api.status_patch(plural, name) {
+                if let Some(patch) = p.api.status_patches(plural, name).into_iter().next() {
                     return patch;
                 }
                 tokio::task::yield_now().await;
