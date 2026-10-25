@@ -19,6 +19,9 @@ struct Slot {
     previous: Option<Arc<Snapshot>>,
     /// When `current` was published.
     published: Option<Instant>,
+    /// When this controller first published the Gateway: its leadership
+    /// began, or the Gateway became its.
+    first_published: Option<Instant>,
 }
 
 impl Slot {
@@ -27,6 +30,7 @@ impl Slot {
             current: watch::Sender::new(None),
             previous: None,
             published: None,
+            first_published: None,
         }
     }
 }
@@ -57,7 +61,9 @@ impl Hub {
             return false;
         }
         slot.previous = slot.current.send_replace(Some(Arc::new(snapshot)));
-        slot.published = Some(Instant::now());
+        let now = Instant::now();
+        slot.published = Some(now);
+        slot.first_published.get_or_insert(now);
         true
     }
 
@@ -91,6 +97,11 @@ impl Hub {
     /// When the current snapshot of `key` was published.
     pub(crate) fn published_at(&self, key: &GatewayKey) -> Option<Instant> {
         self.slots().get(key)?.published
+    }
+
+    /// When `key` was first published, by this controller.
+    pub(crate) fn first_published_at(&self, key: &GatewayKey) -> Option<Instant> {
+        self.slots().get(key)?.first_published
     }
 
     /// The Gateway generation `version` was translated from, while it is
@@ -186,6 +197,7 @@ mod tests {
         assert_eq!(hub.published_at(&key), Some(first), "same version");
         hub.publish(snapshot("gw", 2));
         assert!(hub.published_at(&key).unwrap() > first);
+        assert_eq!(hub.first_published_at(&key), Some(first));
     }
 
     #[test]

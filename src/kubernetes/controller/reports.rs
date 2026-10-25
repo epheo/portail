@@ -112,6 +112,17 @@ impl ReportStore {
             .max()
     }
 
+    /// When an instance of `gateway` last said it was leaving: its
+    /// replacement is due. Kept until that instance is pruned.
+    pub(crate) fn last_leaving(&self, gateway: &GatewayKey) -> Option<Instant> {
+        self.gateways()
+            .get(gateway)?
+            .values()
+            .filter(|e| e.report.leaving)
+            .map(|e| e.seen)
+            .max()
+    }
+
     /// Forget every Gateway `live` rejects.
     pub(crate) fn retain(&self, live: impl Fn(&GatewayKey) -> bool) {
         self.gateways().retain(|key, _| live(key));
@@ -205,5 +216,23 @@ mod tests {
             store.last_seen(&gw, "v1").is_some(),
             "not live, still known"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_goodbye_outlives_liveness() {
+        let store = ReportStore::default();
+        let gw = GatewayKey::new("default", "gw");
+        store.record(&gw, InstanceId("a".into()), report("v1", 0));
+        assert_eq!(store.last_leaving(&gw), None, "nobody left");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut leaving = report("v1", 0);
+        leaving.leaving = true;
+        store.record(&gw, InstanceId("b".into()), leaving);
+        let left = store.last_leaving(&gw).unwrap();
+        assert_eq!(left, Instant::now());
+
+        tokio::time::advance(LIVENESS).await;
+        assert!(store.live(&gw).is_empty());
+        assert_eq!(store.last_leaving(&gw), Some(left), "not live, still known");
     }
 }
