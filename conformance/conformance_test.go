@@ -26,7 +26,7 @@ const (
 	clusterName       = "portail"
 	gatewayAPIVersion = "v1.4.1"
 	// scripts/release.sh sets it; publish.yml refuses a tag it does not match.
-	portailVersion = "v0.2.0"
+	portailVersion = "v0.2.1"
 	portailImage   = "ghcr.io/epheo/portail:latest"
 	controllerNS   = "portail-system"
 )
