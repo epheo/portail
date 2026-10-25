@@ -7,6 +7,7 @@
 //! which the data plane must run without (CI greps for it).
 
 mod report;
+mod signed;
 mod snapshot;
 
 use std::fmt;
@@ -16,6 +17,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use report::{EndpointReport, InstanceReport, ListenerReport, SyncRequest, Transport};
+#[cfg(test)]
+pub(crate) use signed::testing as signed_testing;
+pub use signed::{
+    ca_roots, sign, AnswerVerifier, Gone, Signed, GONE_MAX_AGE, SIGNATURE_HEADER, SIGNER_HEADER,
+};
 pub use snapshot::{
     AppProtocol, Backends, CertificatePem, ExternalName, HeadlessTargetPort, NetworkCidrs, Snapshot,
 };
@@ -36,6 +42,11 @@ pub const HOLD: Duration = Duration::from_secs(30);
 /// so the data plane dials again at once instead of backing off as from an
 /// overloaded controller.
 pub const STANDBY_HEADER: &str = "x-portail-standby";
+
+/// The controller-audience token's header besides Authorization: the
+/// apiserver's service proxy takes Authorization for its own hop and drops
+/// it.
+pub const TOKEN_HEADER: &str = "x-portail-token";
 
 /// A Gateway's identity on the wire: what a data plane serves, what the
 /// controller keys snapshots and reports by.

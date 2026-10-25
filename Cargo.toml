@@ -63,6 +63,9 @@ base64 = "0.22"
 # The controller's own CA and serving cert, on the same aws-lc-rs backend
 # rustls uses instead of rcgen's default ring.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Verifies a signed controller answer against the public key of the leaf it
+# carries; already in the tree through rustls, with these features.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
 
 
 
