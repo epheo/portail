@@ -93,6 +93,114 @@ metrics! {
     backends_recovered_total: "Backend health recoveries (probe or passive)",
     reconcile_runs_total: "Gateway reconcile passes that published a new snapshot or wrote status",
     reconcile_skips_total: "Gateway reconcile passes that published and wrote nothing",
+    sync_throttled_total: "Sync requests answered 503 because TokenReviews in flight were at their cap",
+}
+
+// --- Sync endpoint authentication (controller) -----------------------------
+//
+// Fixed label sets, rendered from zero: an alert on a rate needs the series
+// before its first increment.
+
+/// Where the sync endpoint refused a request before serving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncAuthStage {
+    /// The token's unverified claims: malformed, oversized, another
+    /// audience, not this Gateway's ServiceAccount, expired.
+    Precheck,
+    /// A TokenReview rejected the same token within the cache TTL.
+    NegativeCache,
+    TokenReview,
+    /// Authenticated, but not as an identity that may sync this Gateway.
+    Authz,
+}
+
+impl SyncAuthStage {
+    const ALL: [Self; 4] = [
+        Self::Precheck,
+        Self::NegativeCache,
+        Self::TokenReview,
+        Self::Authz,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Precheck => "precheck",
+            Self::NegativeCache => "negative_cache",
+            Self::TokenReview => "tokenreview",
+            Self::Authz => "authz",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenReviewResult {
+    Authenticated,
+    Rejected,
+    /// No answer: transport error, timeout or an apiserver error status.
+    Error,
+}
+
+impl TokenReviewResult {
+    const ALL: [Self; 3] = [Self::Authenticated, Self::Rejected, Self::Error];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::Rejected => "rejected",
+            Self::Error => "error",
+        }
+    }
+}
+
+static SYNC_AUTH_REJECTED: [Counter; SyncAuthStage::ALL.len()] =
+    [const { Counter(AtomicU64::new(0)) }; SyncAuthStage::ALL.len()];
+static TOKENREVIEW_REQUESTS: [Counter; TokenReviewResult::ALL.len()] =
+    [const { Counter(AtomicU64::new(0)) }; TokenReviewResult::ALL.len()];
+
+pub fn record_sync_auth_rejected(stage: SyncAuthStage) {
+    SYNC_AUTH_REJECTED[stage as usize].inc();
+}
+
+pub fn sync_auth_rejected(stage: SyncAuthStage) -> u64 {
+    SYNC_AUTH_REJECTED[stage as usize].get()
+}
+
+pub fn record_tokenreview(result: TokenReviewResult) {
+    TOKENREVIEW_REQUESTS[result as usize].inc();
+}
+
+pub fn tokenreview_requests(result: TokenReviewResult) -> u64 {
+    TOKENREVIEW_REQUESTS[result as usize].get()
+}
+
+fn render_sync_auth(out: &mut String) {
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "# HELP portail_sync_auth_rejected_total Sync requests refused before a snapshot, by the stage that refused them\n\
+         # TYPE portail_sync_auth_rejected_total counter\n"
+    );
+    for stage in SyncAuthStage::ALL {
+        let _ = writeln!(
+            out,
+            "portail_sync_auth_rejected_total{{stage=\"{}\"}} {}",
+            stage.label(),
+            sync_auth_rejected(stage)
+        );
+    }
+    let _ = write!(
+        out,
+        "# HELP portail_tokenreview_requests_total TokenReviews the sync endpoint sent, by result\n\
+         # TYPE portail_tokenreview_requests_total counter\n"
+    );
+    for result in TokenReviewResult::ALL {
+        let _ = writeln!(
+            out,
+            "portail_tokenreview_requests_total{{result=\"{}\"}} {}",
+            result.label(),
+            tokenreview_requests(result)
+        );
+    }
 }
 
 // --- Latency histograms ----------------------------------------------------
@@ -492,6 +600,7 @@ pub fn render(ready: bool) -> String {
         render_labeled_family(&mut out, family, name, label, help);
     }
     render_listeners(&mut out);
+    render_sync_auth(&mut out);
     render_histogram(
         &mut out,
         "request_duration_seconds",
@@ -600,6 +709,24 @@ mod tests {
             assert_eq!(b.load(Relaxed), 2, "bucket {}", i);
         }
         assert_eq!(h.count.load(Relaxed), 2 * LE_NANOS.len() as u64);
+    }
+
+    #[test]
+    fn sync_auth_series_render_from_zero() {
+        let text = render(false);
+        for stage in ["precheck", "negative_cache", "tokenreview", "authz"] {
+            let series = format!("portail_sync_auth_rejected_total{{stage=\"{stage}\"}} ");
+            assert!(text.contains(&series), "{series}");
+        }
+        for result in ["authenticated", "rejected", "error"] {
+            let series = format!("portail_tokenreview_requests_total{{result=\"{result}\"}} ");
+            assert!(text.contains(&series), "{series}");
+        }
+        assert!(text.contains("# TYPE portail_sync_throttled_total counter"));
+
+        let before = sync_auth_rejected(SyncAuthStage::NegativeCache);
+        record_sync_auth_rejected(SyncAuthStage::NegativeCache);
+        assert!(sync_auth_rejected(SyncAuthStage::NegativeCache) > before);
     }
 
     #[test]
