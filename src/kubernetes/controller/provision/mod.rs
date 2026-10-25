@@ -478,6 +478,14 @@ pub(crate) async fn reconcile(
         .map(|s| ports::existing_targets(&s))
         .unwrap_or_default();
     let (objects, bound_ports) = render::desired(gateway, params, &existing, &owned.controller);
+    // A foreground deletion waits on the children: applying them again
+    // would race the garbage collector until the Gateway is gone.
+    if gateway.metadata.deletion_timestamp.is_some() {
+        return Ok(Provisioned {
+            bound_ports,
+            problem: None,
+        });
+    }
     let mut wanted = vec![
         Wanted::of(Kind::ServiceAccount, &objects.service_account),
         Wanted::of(Kind::Deployment, &objects.deployment),
@@ -1169,6 +1177,82 @@ mod tests {
         }
         release(&ctx, &gateway()).await.unwrap();
         assert_eq!(deletes(&api).len(), 4);
+    }
+
+    /// A Gateway being deleted gets nothing applied or deleted.
+    #[tokio::test]
+    async fn a_deleting_gateway_is_left_to_garbage_collection() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        own_all(&mut cluster);
+        let ctx = cluster.ctx(api.client());
+        let mut gw = gateway();
+        gw.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Default::default()),
+        );
+        let provisioned = reconcile(&ctx, &gw, &params(1, ServiceType::None))
+            .await
+            .unwrap();
+        assert_eq!(provisioned.problem, None);
+        assert!(api.requests().is_empty(), "{:?}", api.requests());
+    }
+
+    /// Unusable parameters apply and delete nothing, and the snapshot
+    /// served stays.
+    #[tokio::test]
+    async fn invalid_parameters_touch_nothing() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        apply(
+            &mut cluster.gateway_classes,
+            testkit::gateway_class("portail", CONTROLLER),
+        );
+        let gw = gateway();
+        apply(&mut cluster.gateways, gw.clone());
+        let ctx = cluster.ctx(api.client());
+        for kind in [Kind::ServiceAccount, Kind::Deployment, Kind::Service] {
+            answer(&api, kind, "new", "1", None);
+        }
+        let Step::Continue(_) = publish(&gw, &ctx).await else {
+            panic!("published");
+        };
+        let served = ctx.hub.current(&testkit::key(&gw)).unwrap().version.clone();
+
+        own_all(&mut cluster);
+        let mut broken = gw.clone();
+        broken.metadata.generation = Some(2);
+        broken.spec.listeners[0].port = 81;
+        broken.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "absent".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut cluster.gateways, broken.clone());
+        api.clear();
+        let Step::Continue(pass) = publish(&broken, &ctx).await else {
+            panic!("a pass");
+        };
+        finish(&broken, &ctx, *pass).await.unwrap();
+        assert_eq!(
+            ctx.hub.current(&testkit::key(&gw)).unwrap().version,
+            served,
+            "the snapshot served stays"
+        );
+        assert!(writes(&api)
+            .iter()
+            .all(|(method, path)| method == "PATCH" && path.ends_with("/gateways/gw/status")));
+        let patch = api.status_patch("gateways", "gw").unwrap();
+        let accepted = patch["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .unwrap()
+            .clone();
+        assert_eq!(accepted["reason"], "InvalidParameters", "{accepted}");
     }
 
     /// A class naming another controller releases the Gateway's objects in
