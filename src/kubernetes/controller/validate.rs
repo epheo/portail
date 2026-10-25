@@ -1129,4 +1129,41 @@ mod tests {
             .collect();
         assert_eq!(certs, vec![good.0.as_slice()]);
     }
+
+    /// TCP and UDP listeners on one port both bind, with nothing else on
+    /// it.
+    #[tokio::test]
+    #[ignore = "needs binds keyed by transport (P1)"]
+    async fn tcp_and_udp_listeners_on_one_port_both_bind() {
+        let port = loop {
+            let port = crate::proxy::data_plane::test_ports::wildcard();
+            if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+                break port;
+            }
+        };
+        let mut p = Pipeline::new();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners = vec![
+            listener("dns-tcp", port.into(), "TCP", None),
+            listener("dns-udp", port.into(), "UDP", None),
+        ];
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        assert!(
+            std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
+            "the UDP port is the data plane's"
+        );
+        let patch = p.api.status_patch("gateways", "gw").unwrap();
+        for listener in patch["status"]["listeners"].as_array().unwrap() {
+            let programmed = listener["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "Programmed")
+                .unwrap();
+            assert_eq!(programmed["status"], "True", "{listener}");
+        }
+    }
 }
