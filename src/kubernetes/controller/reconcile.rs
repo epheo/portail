@@ -310,13 +310,15 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         _ => (Provisioned::unmanaged(), false),
     };
     // A delete in the meantime already ran its forget: a slot published
-    // now would serve a deleted Gateway until the next delete event.
-    let deleted = ctx
+    // now would serve a deleted Gateway until the next delete event, or,
+    // when it was recreated (another uid), the old one's snapshot, and
+    // finish would write the old one's status onto the new object.
+    let stale = ctx
         .cache
         .gateways
         .get(&ObjectRef::new(&key.name).within(&key.namespace))
-        .is_none();
-    if deleted {
+        .is_none_or(|now| now.metadata.uid != gateway.metadata.uid);
+    if stale {
         ctx.hub.remove(&key);
         return Step::Done(Action::await_change());
     }
@@ -1290,6 +1292,28 @@ mod tests {
             p.api.status_patch("gateways", "gw").is_none(),
             "no status for a deleted Gateway"
         );
+    }
+
+    /// A pass of a Gateway recreated since it was queued (another uid)
+    /// serves nothing and writes nothing: the old object's snapshot stayed
+    /// served, and its status went onto the new object.
+    #[tokio::test]
+    async fn a_pass_of_a_recreated_gateway_serves_nothing() {
+        let mut p = Pipeline::new();
+        let old = testkit::gateway("gw", 1);
+        let mut new = testkit::gateway("gw", 1);
+        new.metadata.uid = Some("gw-uid-2".into());
+        apply(&mut p.cluster.gateways, new.clone());
+
+        p.pass(&old).await.unwrap();
+        assert!(p.served(&old).is_none());
+        assert!(
+            p.api.status_patch("gateways", "gw").is_none(),
+            "the old pass's status on the new object"
+        );
+
+        p.pass(&new).await.unwrap();
+        assert_eq!(p.served(&new).unwrap().gateway.uid, "gw-uid-2");
     }
 
     /// A TCP listener carries the oldest route; the newer one is Conflicted
