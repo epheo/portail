@@ -112,7 +112,7 @@ fn by_identity(a: &Observed, b: &Observed) -> std::cmp::Ordering {
     (a.kind, &a.namespace, &a.name).cmp(&(b.kind, &b.namespace, &b.name))
 }
 
-fn observed_route<R: GatewayRoute + kube::Resource>(r: &R) -> Observed {
+pub(super) fn observed_route<R: GatewayRoute + kube::Resource>(r: &R) -> Observed {
     Observed {
         kind: R::KIND,
         namespace: r.route_namespace().to_string(),
@@ -124,7 +124,7 @@ fn observed_route<R: GatewayRoute + kube::Resource>(r: &R) -> Observed {
     }
 }
 
-fn observed_policy(p: &RateLimitPolicy) -> Observed {
+pub(super) fn observed_policy(p: &RateLimitPolicy) -> Observed {
     Observed {
         kind: "RateLimitPolicy",
         namespace: p.namespace().unwrap_or_default(),

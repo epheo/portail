@@ -185,7 +185,7 @@ async fn write_policy_statuses(
 
 /// Whose a Gateway is, by its class.
 #[derive(Debug, PartialEq, Eq)]
-enum ClassOwner {
+pub(super) enum ClassOwner {
     Ours,
     /// The class names another controller: the Gateway is not ours to
     /// serve, write status for, or provision.
@@ -195,7 +195,7 @@ enum ClassOwner {
     Missing,
 }
 
-fn class_owner(
+pub(super) fn class_owner(
     classes: &[Arc<GatewayClass>],
     class_name: &str,
     controller_name: &str,
