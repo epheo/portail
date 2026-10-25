@@ -116,9 +116,12 @@ impl Hop {
     /// A hop to `target`, whose certificate must chain to `roots` for
     /// `server_name`.
     pub fn new(target: Target, server_name: ServerName<'static>, roots: RootCertStore) -> Self {
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // TLS 1.3 only: the controller serves nothing older, and every
+        // apiserver speaks it.
+        let mut tls =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Self {
             host: target.host,
@@ -628,8 +631,18 @@ pub(super) mod stub {
         keep_alive: bool,
         answer: impl Fn(usize, Seen) -> Reply + Send + Sync + 'static,
     ) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+        serve_tls(leaf, keep_alive, rustls::DEFAULT_VERSIONS, answer).await
+    }
+
+    /// [`serve`], speaking only TLS `versions`.
+    pub async fn serve_tls(
+        leaf: CertifiedKey,
+        keep_alive: bool,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        answer: impl Fn(usize, Seen) -> Reply + Send + Sync + 'static,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let mut tls = rustls::ServerConfig::builder()
+        let mut tls = rustls::ServerConfig::builder_with_protocol_versions(versions)
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Fixed(Arc::new(leaf))));
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -1083,6 +1096,26 @@ mod tests {
             matches!(&streamed, Answer::Unverified(e) if e == "an answer over 1024 bytes"),
             "{streamed:?}"
         );
+    }
+
+    /// TLS 1.2 is not spoken: a controller offering only it is no
+    /// controller of this build.
+    #[tokio::test]
+    async fn a_peer_without_tls_1_3_is_refused() {
+        let ca = TestCa::new();
+        let (addr, seen) = stub::serve_tls(
+            ca.leaf(&["127.0.0.1"]),
+            true,
+            &[&rustls::version::TLS12],
+            |_, _| Box::pin(async { None }),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        match client(addr, &ca.pem(), &dir).poll(&poll()).await {
+            Answer::Retry { error, .. } => assert!(error.contains("TLS"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     fn unverified(answer: &Answer) -> bool {
