@@ -1870,6 +1870,7 @@ dependencies = [
  "regex-syntax",
  "rewrk-core",
  "rustls",
+ "rustls-webpki",
  "schemars",
  "serde",
  "serde_json",
