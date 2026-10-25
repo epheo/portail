@@ -1,0 +1,128 @@
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: portail-controller
+    app.kubernetes.io/name: portail
+    gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/gateway: public
+  name: portail-public
+  namespace: edge
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    controller: true
+    kind: Gateway
+    name: public
+    uid: public-uid
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: portail-controller
+    app.kubernetes.io/name: portail
+    gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/gateway: public
+  name: portail-public
+  namespace: edge
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    controller: true
+    kind: Gateway
+    name: public
+    uid: public-uid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      portail.epheo.eu/gateway: public
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"br-ex-network","namespace":"default","ips":["172.16.87.21/24"],"default-route":["172.16.87.1"]}]'
+      labels:
+        app.kubernetes.io/managed-by: portail-controller
+        app.kubernetes.io/name: portail
+        gateway.networking.k8s.io/gateway-name: public
+        portail.epheo.eu/gateway: public
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - args:
+        - dataplane
+        - --gateway
+        - edge/public
+        - --controller-address
+        - https://portail-controller.portail-system.svc:9443
+        - --admin-address
+        - $(POD_IP)
+        - --shutdown-delay=0s
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: PORTAIL_CONTROLLER_CA
+          value: |
+            -----BEGIN CERTIFICATE-----
+            MIIB
+            -----END CERTIFICATE-----
+        - name: PORTAIL_WORKER_THREADS
+          value: '2'
+        image: ghcr.io/epheo/portail:test
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /livez
+            port: 19099
+          periodSeconds: 10
+        name: portail
+        readinessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /readyz
+            port: 19099
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: '2'
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        startupProbe:
+          failureThreshold: 30
+          httpGet:
+            path: /readyz
+            port: 19099
+          periodSeconds: 1
+        volumeMounts:
+        - mountPath: /var/run/secrets/portail.epheo.eu/controller
+          name: controller-token
+          readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: portail-public
+      terminationGracePeriodSeconds: 40
+      volumes:
+      - name: controller-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: portail-controller.portail-system.svc
+              expirationSeconds: 3600
+              path: token

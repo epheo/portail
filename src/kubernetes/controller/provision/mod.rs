@@ -6,6 +6,7 @@
 //! ports, as an Unmanaged one does.
 
 mod ports;
+mod render;
 
 use std::collections::BTreeMap;
 
