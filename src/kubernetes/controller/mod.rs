@@ -350,7 +350,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         args.sync_port,
     ))
     .await?;
-    let mut sync = tokio::spawn(server::serve(sync_server, tls, listener));
+    let sync = tokio::spawn(server::serve(sync_server, tls, listener));
 
     let named_ports = ctx.named_ports.clone();
     let report_triggers = ctx
@@ -421,11 +421,28 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
 
     info!("Gateway API controller started, watching for resource changes");
 
-    let mut controller = std::pin::pin!(gw_controller.for_each(|result| async move {
+    let controller = gw_controller.for_each(|result| async move {
         if let Err(e) = result {
             warn!("Gateway controller: {:#}", anyhow::Error::new(e));
         }
-    }));
+    });
+    until_stopped(controller, sync, leader.lost(), &shutdown).await?;
+    elector.stop().await;
+    Ok(())
+}
+
+/// Until the controller stream ends: on shutdown, once its passes in flight
+/// finished. A stopped sync server is an error unless shutting down; a lost
+/// lease ends it at once, while draining too: a stuck pass must not write
+/// after a standby took the lease.
+async fn until_stopped(
+    controller: impl std::future::Future<Output = ()>,
+    sync: impl std::future::Future<Output = Result<anyhow::Result<()>, tokio::task::JoinError>>,
+    lost: impl std::future::Future<Output = ()>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    let mut controller = std::pin::pin!(controller);
+    let mut lost = std::pin::pin!(lost);
     enum Exit {
         Controller,
         Sync(Result<anyhow::Result<()>, tokio::task::JoinError>),
@@ -433,19 +450,21 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     }
     let exit = tokio::select! {
         _ = controller.as_mut() => Exit::Controller,
-        exit = &mut sync => Exit::Sync(exit),
-        _ = leader.lost() => Exit::Lost,
+        exit = sync => Exit::Sync(exit),
+        _ = lost.as_mut() => Exit::Lost,
     };
     match exit {
         Exit::Controller => info!("Gateway controller stopped"),
         // A standby's turn: kubelet restarts this process as one.
         Exit::Lost => anyhow::bail!("leader election lost"),
-        Exit::Sync(_) if shutdown.is_cancelled() => controller.await,
+        Exit::Sync(_) if shutdown.is_cancelled() => tokio::select! {
+            _ = controller => info!("Gateway controller stopped"),
+            _ = lost => anyhow::bail!("leader election lost"),
+        },
         Exit::Sync(Ok(Ok(()))) => anyhow::bail!("sync server stopped"),
         Exit::Sync(Ok(Err(e))) => return Err(e.context("sync server")),
         Exit::Sync(Err(e)) => anyhow::bail!("sync server task failed: {}", e),
     }
-    elector.stop().await;
     Ok(())
 }
 
@@ -595,6 +614,52 @@ mod tests {
         p.api.clear();
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 1, "the pods moved");
+    }
+
+    /// Shutting down, the sync server stopped first and a pass is stuck: a
+    /// lost lease still ends the wait, so the pass cannot write after a
+    /// standby took over.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_ends_a_graceful_stop() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stopping = until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            tokio::time::sleep(Duration::from_secs(10)),
+            &shutdown,
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(60), stopping)
+            .await
+            .expect("the lost lease ended the drain");
+        assert!(stopped
+            .unwrap_err()
+            .to_string()
+            .contains("leader election lost"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_drain_stops_cleanly() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        until_stopped(
+            futures::future::ready(()),
+            futures::future::pending(),
+            futures::future::pending(),
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        // Not shutting down: a sync server that stops is an error.
+        let running = CancellationToken::new();
+        assert!(until_stopped(
+            futures::future::pending(),
+            futures::future::ready(Ok(Ok(()))),
+            futures::future::pending(),
+            &running,
+        )
+        .await
+        .is_err());
     }
 
     #[test]
