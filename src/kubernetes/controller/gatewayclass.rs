@@ -96,13 +96,18 @@ pub(crate) async fn run(
             _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)),
                 if retry.is_some() => {}
         }
-        // A burst is one pass: the initial list sends a change per class.
+        // A burst is one pass: the initial list sends a change per class,
+        // and a lease taken with the caches synced wakes twice at once.
         loop {
             match changes.next().now_or_never() {
                 Some(Some(())) => {}
                 Some(None) => return,
                 None => break,
             }
+        }
+        while let Some(Some(())) = gained.next().now_or_never() {}
+        if !was_synced && synced.as_mut().now_or_never().is_some() {
+            was_synced = true;
         }
         retry = (!pass(&ctx).await)
             .then(|| tokio::time::Instant::now() + Duration::from_secs(ERROR_REQUEUE_SECS));
