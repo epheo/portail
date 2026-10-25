@@ -1,12 +1,17 @@
-# Gateway on the frontend network.
-# Portail resolves vpc-frontend to its local IP on that network.
+# In tenant-frontend: the ClusterUserDefinedNetworks attach only pods of
+# namespaces they select, and a Gateway's data plane runs in its namespace.
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: gw-frontend
-  namespace: portail-system
+  namespace: tenant-frontend
 spec:
   gatewayClassName: portail
+  infrastructure:
+    parametersRef:
+      group: portail.epheo.eu
+      kind: GatewayParameters
+      name: gw-frontend
   addresses:
   - type: portail.epheo.eu/Network
     value: vpc-frontend

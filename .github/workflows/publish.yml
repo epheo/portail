@@ -38,17 +38,19 @@ jobs:
           if [ "${{ github.ref_type }}" = tag ]; then
             TAG="${{ github.ref_name }}"
             BARE="${TAG#v}"
-            # The tag must name the version the binary and the conformance
-            # report already carry, or `portail --version` would disagree
-            # with the image.
+            # The tag must name the version the binary, the conformance
+            # report and deploy/install already carry, or `portail --version`
+            # would disagree with the image, or install.yaml run another one.
             CARGO=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
             CONFORMANCE=$(sed -n 's/.*portailVersion *= *"\(v[^"]*\)".*/\1/p' conformance/conformance_test.go)
-            if [ "$CARGO" != "$BARE" ] || [ "$CONFORMANCE" != "$TAG" ]; then
-              echo "::error::tag $TAG but Cargo.toml says $CARGO and conformance says $CONFORMANCE; run scripts/release.sh $BARE first"
+            INSTALL=$(kubectl kustomize deploy/install | sed -n 's/^ *image: \(.*\)$/\1/p')
+            if [ "$CARGO" != "$BARE" ] || [ "$CONFORMANCE" != "$TAG" ] || [ "${INSTALL##*:}" != "$BARE" ]; then
+              echo "::error::tag $TAG but Cargo.toml says $CARGO, conformance says $CONFORMANCE and deploy/install runs $INSTALL; run scripts/release.sh $BARE first"
               exit 1
             fi
             {
               echo "release=$TAG"
+              echo "bake=$IMAGE:$BARE"
               echo "list<<EOF"
               echo "$IMAGE:$BARE"
               echo "$IMAGE:${BARE%.*}"
@@ -57,6 +59,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           else
             {
+              echo "bake=$IMAGE:sha-${{ github.sha }}"
               echo "list<<EOF"
               echo "$IMAGE:main"
               echo "$IMAGE:sha-${{ github.sha }}"
@@ -81,11 +84,17 @@ jobs:
           file: Containerfile
           push: true
           tags: ${{ steps.tags.outputs.list }}
+          # The controller's default data-plane image: the immutable tag of
+          # this very build. Cargo's version moves only at release, so a :main
+          # controller would otherwise render the previous release.
+          build-args: PORTAIL_IMAGE=${{ steps.tags.outputs.bake }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: GitHub Release
         if: steps.tags.outputs.release != ''
-        run: gh release create "${{ steps.tags.outputs.release }}" --title "${{ steps.tags.outputs.release }}" --generate-notes
+        run: |
+          kubectl kustomize deploy/install > install.yaml
+          gh release create "${{ steps.tags.outputs.release }}" install.yaml --title "${{ steps.tags.outputs.release }}" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

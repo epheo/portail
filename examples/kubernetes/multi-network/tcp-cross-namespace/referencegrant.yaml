@@ -1,15 +1,14 @@
-# Allows TCPRoutes in portail-system to reference Services in tenant-backend.
-# Without this, cross-namespace backendRefs are rejected by the Gateway API spec.
+# Without it, the Gateway API refuses a backendRef into another namespace.
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
-  name: allow-portail-routes
+  name: allow-tenant-frontend-routes
   namespace: tenant-backend
 spec:
   from:
   - group: gateway.networking.k8s.io
     kind: TCPRoute
-    namespace: portail-system
+    namespace: tenant-frontend
   to:
   - group: ""
     kind: Service

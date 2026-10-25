@@ -1,64 +1,60 @@
-# Deployment with LoadBalancer Service
+# Gateway behind a LoadBalancer Service
 
-One Deployment per Gateway, exposed via a Service(type=LoadBalancer). A LoadBalancer provider (MetalLB, cloud CCM) assigns a VIP.
+A Managed Gateway with two data-plane replicas.
+The controller creates `portail-example-gw`: a ServiceAccount, a Deployment, a LoadBalancer Service and a PodDisruptionBudget.
+
+Install the controller once per cluster, at a release tag:
+
+```bash
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+```
+
+At a commit of main, override its image in a kustomization of your own, as in [the examples README](../README.md):
+
+```yaml
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=<full commit sha>
+images:
+- name: ghcr.io/epheo/portail
+  newTag: sha-<full commit sha>
+```
+
+Then:
 
 ```bash
 kubectl apply -k .
+kubectl get gateway example-gw
 ```
 
-## When to use
+- `gatewayparameters.yaml`: `replicas: 2`; the Service type defaults to LoadBalancer.
+- `gateway.yaml`: references it through `spec.infrastructure.parametersRef`.
+- `httproute.yaml`: routes `example.com` to `my-service:8080`.
+- `metallb-pool.yaml`: an address pool for MetalLB, if the cluster has no other LoadBalancer provider; not applied by default.
 
-- Multi-node production clusters
-- When you need HA with multiple replicas
-- When you have MetalLB or a cloud LoadBalancer provider
+## Ports and privileges
 
-## Pros
+The Service publishes 80 and 443.
+The pods bind unprivileged target ports (8000 and up) instead, so they run with every capability dropped.
 
-- HA: multiple replicas spread across nodes
-- No `hostNetwork` required, only `NET_BIND_SERVICE` for privileged ports
-- No port conflicts between Gateways (each has its own pods)
-- Kubernetes-native: standard Deployment + Service pattern
-- Each Gateway is isolated in its own network namespace
+## Addresses
 
-## Cons
+`status.addresses` is the LoadBalancer ingress the provider assigns.
+An `IPAddress` in `spec.addresses` is not requested from the provider: `Programmed` is `False` with reason `AddressNotAssigned` unless it assigns that address anyway.
 
-- One Deployment + Service per Gateway
+## NodePort or ClusterIP
+
+Set `service.type` in `gatewayparameters.yaml`:
+
+```yaml
+spec:
+  replicas: 2
+  service:
+    type: ClusterIP   # or NodePort
+```
+
+`status.addresses` is then the Service's cluster IP.
 
 ## MetalLB
 
-This example includes MetalLB. Edit `metallb-pool.yaml` to match your network. The default range `10.89.0.200-10.89.0.250` works with Kind's Podman network (`10.89.0.0/24`). Docker uses `172.18.0.0/16`, adjust to e.g. `172.18.255.200-172.18.255.250`. The conformance test computes this automatically.
-
-If using a cloud provider with its own LoadBalancer controller, remove the MetalLB resources from `kustomization.yaml`.
-
-## Multi-interface / MetalLB address pools
-
-To bind different Gateways to different network interfaces, use MetalLB address pools:
-
-```yaml
-# On the Service:
-metadata:
-  annotations:
-    metallb.universe.tf/address-pool: "public-pool"
-```
-
-Create separate Gateways for each interface, each with its own Deployment and Service pointing to a different MetalLB pool.
-
-## How isolation works
-
-Portail reconciles all Gateways for its GatewayClass.
-A LoadBalancer VIP in `spec.addresses` is not on any pod interface, so portail does not bind it: listeners bind all interfaces and the Service carries the VIP to them.
-Only an address already on a pod interface is bound specifically; a missing one does not set `Programmed=False`.
-
-## Using NodePort or ClusterIP instead
-
-This same Deployment + Service pattern works with any Service type. Change `spec.type` in `service.yaml`:
-
-- `NodePort` -- exposes on every node at a high port (30000+), works without a LB provider
-- `ClusterIP` -- cluster-internal only, for internal API gateways and inter-namespace routing
-
-If using NodePort or ClusterIP, remove the MetalLB resources from `kustomization.yaml`.
-
-## Configuration
-
-- `spec.addresses` on the Gateway, set to the VIP assigned by your LoadBalancer provider
-- `replicas` scale as needed for throughput and availability
+Edit the range in `metallb-pool.yaml` to free addresses of your network, then apply it.
+`10.89.0.200-10.89.0.250` fits kind on Podman (`10.89.0.0/24`); on Docker kind uses `172.18.0.0/16`.

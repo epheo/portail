@@ -1,0 +1,9 @@
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: conformance
+  namespace: portail-system
+spec:
+  # Pinned: the one kind node runs the data plane of every Gateway the
+  # suite creates.
+  replicas: 1

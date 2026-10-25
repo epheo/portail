@@ -1,0 +1,7 @@
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: unmanaged
+  namespace: portail-system
+spec:
+  provisioning: Unmanaged

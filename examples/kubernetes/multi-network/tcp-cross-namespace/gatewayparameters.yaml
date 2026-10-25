@@ -1,0 +1,10 @@
+# The Network address attaches the data plane to vpc-frontend; this adds
+# vpc-backend, so the one pod sits on both networks.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: gw-frontend
+  namespace: tenant-frontend
+spec:
+  networks:
+  - name: vpc-backend

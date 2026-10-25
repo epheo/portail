@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portail-edge
+  namespace: portail-system
+  labels:
+    app.kubernetes.io/name: portail
+    portail.epheo.eu/gateway: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      portail.epheo.eu/gateway: edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portail
+        portail.epheo.eu/gateway: edge
+    spec:
+      serviceAccountName: portail-edge
+      # The data plane talks to the controller only, never to the API.
+      automountServiceAccountToken: false
+      # --shutdown-delay 5s, the 30s drain, 5s to report leaving and exit.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: portail
+        # The controller's image, deploy/install's tag: data planes upgrade
+        # with it. scripts/release.sh sets both.
+        image: ghcr.io/epheo/portail:0.1.28
+        args:
+        - dataplane
+        - --gateway=portail-system/edge
+        - --controller-address=https://portail-controller.portail-system.svc:9443
+        - --controller-ca-file=/etc/portail/controller-ca/ca.crt
+        # Keeps /metrics off every interface but the pod IP.
+        - --admin-address=$(POD_IP)
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 19099
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 19099
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: "2"
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+            # An Unmanaged data plane binds the published port, 80 here. The
+            # image carries cap_net_bind_service as a file capability; this
+            # add lets the non-root process raise it.
+            add: [NET_BIND_SERVICE]
+        volumeMounts:
+        - name: controller-token
+          mountPath: /var/run/secrets/portail.epheo.eu/controller
+          readOnly: true
+        - name: controller-ca
+          mountPath: /etc/portail/controller-ca
+          readOnly: true
+      volumes:
+      # The audience is the controller Service: the API server refuses this
+      # token, the controller accepts it for this ServiceAccount only.
+      - name: controller-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: portail-controller.portail-system.svc
+              path: token
+      # Published by the controller in its own namespace; a pod elsewhere
+      # needs a copy in its namespace.
+      - name: controller-ca
+        configMap:
+          name: portail-controller-ca

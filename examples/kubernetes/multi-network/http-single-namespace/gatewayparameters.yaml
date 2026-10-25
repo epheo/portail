@@ -1,0 +1,9 @@
+# The Network address attaches the data plane to udn-frontend; this adds
+# udn-backend, so the one pod sits on both networks.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: gw-frontend
+spec:
+  networks:
+  - name: udn-backend

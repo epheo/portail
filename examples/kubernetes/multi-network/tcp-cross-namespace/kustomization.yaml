@@ -1,10 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- ../../base
 - namespaces.yaml
 - networks.yaml
-- deployment.yaml
+- gatewayparameters.yaml
 - gateway.yaml
 - tcproute.yaml
 - referencegrant.yaml

@@ -20,5 +20,7 @@ fi
 sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 sed -i "/^name = \"portail\"$/{n;s/^version = \".*\"/version = \"${version}\"/}" Cargo.lock
 sed -i "s/\(portailVersion *= *\)\"v[^\"]*\"/\1\"v${version}\"/" conformance/conformance_test.go
+sed -i "s/^\( *newTag: *\)\"[^\"]*\"$/\1\"${version}\"/" deploy/install/kustomization.yaml
+sed -i "s|^\( *image: ghcr.io/epheo/portail:\)[0-9.]*$|\1${version}|" examples/kubernetes/unmanaged/deployment.yaml
 
 git diff --stat
