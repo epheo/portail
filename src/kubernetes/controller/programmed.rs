@@ -812,6 +812,38 @@ mod tests {
         assert!(!g.is_empty() && g.iter().all(|g| *g == 3), "{g:?}");
     }
 
+    /// A data plane that refused the version serves the previous table and
+    /// reports the version with no listener: it binds nothing of it, and
+    /// an empty list must not read as every listener bound.
+    #[test]
+    fn a_refused_version_binds_nothing() {
+        let gw = gateway(1, &[]);
+        let mut refused = report(V1, &["10.0.0.5"], true);
+        refused.listeners.clear();
+        refused.apply_error = Some("duplicate route".into());
+        let out = Case::new(gw.clone(), snapshot(&gw, &[]), vec![refused]).run();
+        assert!(!out.programmed, "{}", out.desired);
+        assert_eq!(programmed_of(&out.desired)["status"], "False");
+        let listener = listener_programmed(&out.desired);
+        assert_eq!(listener["status"], "False", "{listener}");
+        assert_eq!(listener["reason"], "Pending");
+    }
+
+    /// A listener reported with no endpoint (no bind address resolved for
+    /// it) is not bound: no endpoint is not every endpoint bound.
+    #[test]
+    fn a_listener_with_no_endpoint_is_not_bound() {
+        let gw = gateway(1, &[]);
+        let mut empty = report(V1, &["10.0.0.5"], true);
+        empty.listeners[0].endpoints.clear();
+        let out = Case::new(gw.clone(), snapshot(&gw, &[]), vec![empty]).run();
+        assert!(!out.programmed, "{}", out.desired);
+        assert_eq!(programmed_of(&out.desired)["status"], "False");
+        let listener = listener_programmed(&out.desired);
+        assert_eq!(listener["status"], "False", "{listener}");
+        assert_eq!(listener["reason"], "Pending");
+    }
+
     /// A bind error keeps the listener Pending with the error, and the
     /// Gateway not Programmed.
     #[test]
