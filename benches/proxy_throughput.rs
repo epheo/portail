@@ -23,7 +23,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use hyper::{Body, Method, Request, Uri};
+use hyper_014::{Body, Method, Request, Uri};
 use rewrk_core::{
     Batch, HttpProtocol, Producer, ReWrkBenchmark, RequestBatch, Sample, SampleCollector,
 };

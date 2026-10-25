@@ -33,7 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Configuration and CLI dependencies
 serde_yaml = "0.9"
-clap = { version = "4.0", features = ["derive"] }
+# env: the namespace and controller CA defaults of the subcommands.
+clap = { version = "4.0", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # TLS dependencies
@@ -50,6 +51,19 @@ futures = "0.3"
 # via gateway-api, this only promotes it to a direct dependency.
 schemars = "1"
 
+# Controller/data-plane sync (HTTP/1.1 long-poll over TLS). Already in the
+# tree through kube-client; these promote them and add the server half.
+hyper = { version = "1.12", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# Snapshot version and naming hashes (SHA-256), already linked by rustls.
+aws-lc-rs = "1.18"
+# Unverified JWT claims pre-check before a TokenReview; already in the tree.
+base64 = "0.22"
+# The controller's own CA and serving cert, on the same aws-lc-rs backend
+# rustls uses instead of rcgen's default ring.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+
 
 
 
@@ -57,7 +71,8 @@ schemars = "1"
 [dev-dependencies]
 tokio = { version = "1.40", features = ["test-util"] }
 criterion = "0.7"
-hyper = "0.14"
+# rewrk-core speaks hyper 0.14; the sync code uses hyper 1.
+hyper_014 = { package = "hyper", version = "0.14" }
 libc = "0.2"
 rewrk-core = "0.1.3"
 tempfile = "3"
