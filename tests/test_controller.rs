@@ -140,6 +140,11 @@ impl FakeApiserver {
                 }
                 None => not_found(),
             },
+            // API discovery's group list: no optional CRD group is served.
+            "GET" if path == "/apis" => (
+                200,
+                json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": []}),
+            ),
             "GET" => match objects.get(path) {
                 Some(object) => (200, object.clone()),
                 // The controller's own objects, and API discovery of the
