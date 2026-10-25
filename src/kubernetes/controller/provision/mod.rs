@@ -94,6 +94,21 @@ impl Kind {
         }
     }
 
+    /// What moves when the object changes in a way an apply could undo: the
+    /// generation of a Deployment or PDB, which only spec changes move
+    /// (their status moves resourceVersion on every rollout step); the
+    /// resourceVersion of the others, which have no generation.
+    fn version(self, meta: &ObjectMeta) -> String {
+        match self {
+            Kind::Deployment | Kind::PodDisruptionBudget => {
+                meta.generation.map(|g| g.to_string()).unwrap_or_default()
+            }
+            Kind::ServiceAccount | Kind::Service => {
+                meta.resource_version.clone().unwrap_or_default()
+            }
+        }
+    }
+
     fn resource(self) -> ApiResource {
         match self {
             Kind::ServiceAccount => ApiResource::erase::<ServiceAccount>(&()),
@@ -105,14 +120,14 @@ impl Kind {
 }
 
 /// An object as this controller last applied it: while the live one keeps
-/// that uid and resourceVersion, and the desired one that hash, applying
+/// that uid and [`Kind::version`], and the desired one that hash, applying
 /// again would change nothing. A pass runs on every route, Service or
 /// report change; re-applying four objects each time would load the
 /// apiserver with no-op patches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Applied {
     uid: String,
-    resource_version: String,
+    version: String,
     hash: String,
 }
 
@@ -440,7 +455,8 @@ enum Live {
     Absent,
     Ours {
         uid: String,
-        resource_version: String,
+        /// [`Kind::version`].
+        version: String,
     },
     /// This install's, its controller a deleted Gateway of the same name:
     /// foreign until garbage collection takes it.
@@ -448,15 +464,15 @@ enum Live {
     Foreign,
 }
 
-fn judge(meta: Option<ObjectMeta>, gateway: &Gateway, install: &str) -> Live {
+fn judge(kind: Kind, meta: Option<ObjectMeta>, gateway: &Gateway, install: &str) -> Live {
     let Some(meta) = meta else {
         return Live::Absent;
     };
     let uid = gateway.metadata.uid.as_deref().unwrap_or_default();
     if is_ours(&meta, uid, install) {
         return Live::Ours {
+            version: kind.version(&meta),
             uid: meta.uid.unwrap_or_default(),
-            resource_version: meta.resource_version.unwrap_or_default(),
         };
     }
     match controller_owner(&meta) {
@@ -619,7 +635,7 @@ async fn provision(
                 .await
                 .map_err(|e| Failure::of(e, format!("reading {}/{name}", w.kind.name())))?,
         };
-        match judge(meta, gateway, &owned.controller.install) {
+        match judge(w.kind, meta, gateway, &owned.controller.install) {
             Live::Stale => {
                 stale = true;
                 conflicts.push(format!("{}/{name}", w.kind.name()));
@@ -656,11 +672,11 @@ async fn provision(
         let force = match state {
             Live::Ours {
                 uid: object_uid,
-                resource_version,
+                version,
             } => {
                 let current = Applied {
                     uid: object_uid,
-                    resource_version,
+                    version,
                     hash: hash.clone(),
                 };
                 if owned.applied(&uid, w.kind).as_ref() == Some(&current) {
@@ -690,8 +706,8 @@ async fn provision(
             &uid,
             w.kind,
             Some(Applied {
+                version: w.kind.version(&meta),
                 uid: meta.uid.unwrap_or_default(),
-                resource_version: meta.resource_version.unwrap_or_default(),
                 hash,
             }),
         );
@@ -825,11 +841,24 @@ mod tests {
     /// finds `found`, or nothing. Writes carry a query, reads do not, and
     /// the first registered prefix wins.
     fn answer(api: &MockApi, kind: Kind, uid: &str, rv: &str, found: Option<serde_json::Value>) {
+        answer_at(api, kind, uid, (rv, 1), found)
+    }
+
+    /// As [`answer`], the written object at this resourceVersion and
+    /// generation.
+    fn answer_at(
+        api: &MockApi,
+        kind: Kind,
+        uid: &str,
+        (rv, generation): (&str, i64),
+        found: Option<serde_json::Value>,
+    ) {
         let ar = kind.resource();
         let written = json!({
             "apiVersion": ar.api_version,
             "kind": ar.kind,
-            "metadata": {"name": NAME, "namespace": NS, "uid": uid, "resourceVersion": rv},
+            "metadata": {"name": NAME, "namespace": NS, "uid": uid, "resourceVersion": rv,
+                         "generation": generation},
         });
         replies(api, kind, NAME, (200, written), found);
     }
@@ -891,6 +920,7 @@ mod tests {
             namespace: Some(NS.into()),
             uid: Some(object_uid.into()),
             resource_version: Some("1".into()),
+            generation: Some(1),
             labels: labeled.then(|| {
                 [
                     (LABEL_MANAGED_BY.to_string(), MANAGED_BY.to_string()),
@@ -1011,7 +1041,9 @@ mod tests {
     }
 
     /// An object as it was applied is not applied again; one changed since
-    /// (its resourceVersion moved) is, forced: it is ours.
+    /// is, forced: it is ours. A Deployment's or PDB's change is a spec
+    /// change (its generation moved): their status moves resourceVersion on
+    /// every rollout step. A ServiceAccount's or Service's is any change.
     #[tokio::test]
     async fn only_a_changed_object_is_applied_again() {
         let api = MockApi::default();
@@ -1052,12 +1084,29 @@ mod tests {
             "the live Service's target stays"
         );
 
-        let mut moved = meta(NAME, "gw", "gw-uid", "deployment-uid", true);
-        moved.resource_version = Some("2".into());
-        apply(&mut cluster.deployments, partial(moved));
-        answer(&api, Kind::Deployment, "deployment-uid", "2", None);
+        let mut status_only = meta(NAME, "gw", "gw-uid", "deployment-uid", true);
+        status_only.resource_version = Some("2".into());
+        apply(&mut cluster.deployments, partial(status_only.clone()));
+        let mut pdb_status = meta(NAME, "gw", "gw-uid", "pdb-uid", true);
+        pdb_status.resource_version = Some("2".into());
+        apply(&mut cluster.pdbs, partial(pdb_status));
         reconcile(&ctx, &gw, &p).await;
-        assert_eq!(writes(&api), patched(&[Kind::Deployment]));
+        assert!(writes(&api).is_empty(), "status only: {:?}", writes(&api));
+
+        let mut spec_edit = status_only;
+        spec_edit.resource_version = Some("3".into());
+        spec_edit.generation = Some(2);
+        apply(&mut cluster.deployments, partial(spec_edit));
+        answer_at(&api, Kind::Deployment, "deployment-uid", ("4", 2), None);
+        let mut sa_edit = meta(NAME, "gw", "gw-uid", "sa-uid", true);
+        sa_edit.resource_version = Some("2".into());
+        apply(&mut cluster.service_accounts, partial(sa_edit));
+        answer(&api, Kind::ServiceAccount, "sa-uid", "2", None);
+        reconcile(&ctx, &gw, &p).await;
+        assert_eq!(
+            writes(&api),
+            patched(&[Kind::ServiceAccount, Kind::Deployment])
+        );
     }
 
     /// One foreign name stops the whole apply, and every delete, and says
@@ -1539,7 +1588,7 @@ mod tests {
         let applied = AppliedObjects::default();
         let record = Applied {
             uid: "u".into(),
-            resource_version: "1".into(),
+            version: "1".into(),
             hash: "h".into(),
         };
         applied.lock().unwrap().insert(
