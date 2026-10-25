@@ -305,8 +305,9 @@ fn sync(ca_pem: &str, token: &str, gateway: &str) -> u16 {
         .unwrap();
     let mut tls = rustls::StreamOwned::new(conn, sock);
     let (namespace, name) = gateway.split_once('/').unwrap();
-    let body =
-        json!({"protocol": 1, "gateway": {"namespace": namespace, "name": name}}).to_string();
+    let body = json!({"protocol": 1, "gateway": {"namespace": namespace, "name": name},
+               "nonce": "AAAAAAAAAAAAAAAAAAAAAA=="})
+    .to_string();
     let request = format!(
         "POST /v1/sync/{gateway} HTTP/1.1\r\nHost: {AUDIENCE}\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

@@ -44,8 +44,8 @@ use super::ControllerCtx;
 use crate::logging::{info, warn};
 use crate::proxy::worker::AcceptBackoff;
 use crate::sync::{
-    sign, GatewayKey, Gone, Signed, Snapshot, SyncRequest, HOLD, PROTOCOL, STANDBY_HEADER,
-    TOKEN_HEADER,
+    sign, valid_nonce, GatewayKey, Gone, Signed, Snapshot, SyncRequest, HOLD, PROTOCOL,
+    STANDBY_HEADER, TOKEN_HEADER,
 };
 
 /// Followed by `{namespace}/{name}` of the Gateway.
@@ -217,6 +217,9 @@ impl SyncServer {
                     sync.protocol
                 ),
             );
+        }
+        if !valid_nonce(&sync.nonce) {
+            return text(StatusCode::BAD_REQUEST, "nonce: not base64 of 16 bytes");
         }
         // Its own data plane only learns that it is gone, and must: a
         // restarted controller holds no verdict for its token, and a
@@ -889,12 +892,16 @@ mod tests {
         super::super::ca::ControllerCa::generated(ns, "portail-controller").serving_key()
     }
 
+    /// A valid nonce: base64 of 16 bytes.
+    const NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+
     fn body(gateway: &GatewayKey, have: &str, report: Option<Value>) -> Value {
         let mut body = json!({
             "protocol": PROTOCOL,
             "gateway": gateway,
             "have": have,
             "dataPlaneVersion": "test",
+            "nonce": NONCE,
         });
         if let Some(report) = report {
             body["report"] = report;
@@ -1174,7 +1181,7 @@ mod tests {
     /// all that tells the controller from any endpoint of its Service.
     #[tokio::test(start_paused = true)]
     async fn every_answer_is_signed_over_the_polls_nonce() {
-        use crate::sync::{ca_roots, AnswerVerifier};
+        use crate::sync::{ca_roots, new_nonce, AnswerVerifier};
         use std::time::SystemTime;
         let f = fixture().await;
         let roots = ca_roots(f.ca.ca_pem().as_bytes(), "controller CA").unwrap();
@@ -1189,28 +1196,29 @@ mod tests {
             let (status, body) = text_of(response).await;
             (status, headers, body)
         };
+        let (n0, n1, n2, n3) = (new_nonce(), new_nonce(), new_nonce(), new_nonce());
         let v1 = f.publish(1);
         let token = gateway_token("default", "gw", 0);
         let (status, headers, json) =
-            answer(f.sync(post(Some(&token), &polled(&key(), "", "n1"))).await).await;
+            answer(f.sync(post(Some(&token), &polled(&key(), "", &n1))).await).await;
         assert_eq!(status, StatusCode::OK);
         let now = SystemTime::now();
         verifier
-            .verify(Signed::Snapshot, "n1", &headers, json.as_bytes(), now)
+            .verify(Signed::Snapshot, &n1, &headers, json.as_bytes(), now)
             .unwrap();
         assert!(verifier
-            .verify(Signed::Snapshot, "n0", &headers, json.as_bytes(), now)
+            .verify(Signed::Snapshot, &n0, &headers, json.as_bytes(), now)
             .is_err());
         assert!(json.contains(&v1));
 
         let (status, headers, _) =
-            answer(f.sync(post(Some(&token), &polled(&key(), &v1, "n2"))).await).await;
+            answer(f.sync(post(Some(&token), &polled(&key(), &v1, &n2))).await).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         verifier
-            .verify(Signed::Unchanged, "n2", &headers, v1.as_bytes(), now)
+            .verify(Signed::Unchanged, &n2, &headers, v1.as_bytes(), now)
             .unwrap();
         assert!(verifier
-            .verify(Signed::Unchanged, "n2", &headers, b"other", now)
+            .verify(Signed::Unchanged, &n2, &headers, b"other", now)
             .is_err());
 
         let ghost = GatewayKey::new("default", "ghost");
@@ -1226,14 +1234,14 @@ mod tests {
         let (status, headers, gone) = answer(
             f.sync(post(
                 Some(&gateway_token("default", "ghost", 0)),
-                &polled(&ghost, "", "n3"),
+                &polled(&ghost, "", &n3),
             ))
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         verifier
-            .verify(Signed::Gone, "n3", &headers, gone.as_bytes(), now)
+            .verify(Signed::Gone, &n3, &headers, gone.as_bytes(), now)
             .unwrap();
         Gone::check(gone.as_bytes(), &ghost).unwrap();
         assert!(Gone::check(gone.as_bytes(), &key()).is_err());
@@ -1847,6 +1855,30 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!read.load(Ordering::SeqCst));
         assert_eq!(f.reviews(), 1);
+    }
+
+    /// The controller signs over the nonce: only one a data plane could
+    /// have drawn, 16 bytes in base64, is taken.
+    #[tokio::test]
+    async fn a_nonce_not_base64_of_16_bytes_is_refused() {
+        let f = fixture().await;
+        f.publish(1);
+        use base64::Engine;
+        let fifteen = base64::engine::general_purpose::STANDARD.encode([7u8; 15]);
+        for nonce in [json!(null), json!(""), json!("not base64!"), json!(fifteen)] {
+            let mut sent = body(&key(), "", None);
+            match nonce {
+                Value::Null => drop(sent.as_object_mut().unwrap().remove("nonce")),
+                nonce => sent["nonce"] = nonce,
+            }
+            let (status, text) = text_of(
+                f.sync(post(Some(&gateway_token("default", "gw", 0)), &sent))
+                    .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {text}");
+            assert!(text.contains("nonce"), "{text}");
+        }
     }
 
     #[tokio::test]
