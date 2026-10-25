@@ -260,23 +260,6 @@ impl Authenticator {
             .ok_or_else(|| rejected(SyncAuthStage::Precheck, Refusal::Unauthenticated))
     }
 
-    /// Whether `token` holds an accepted verdict, fresh or expired, as
-    /// `gateway`'s ServiceAccount: such a data plane may learn its Gateway
-    /// is gone without another review.
-    pub(crate) fn reviewed_for(&self, token: &str, gateway: &GatewayKey) -> bool {
-        match self.cached(&token_hash(token)) {
-            Cached::Fresh(reviewed) | Cached::Expired(reviewed) => {
-                reviewed.account == ServiceAccount::of(gateway)
-            }
-            Cached::Rejected | Cached::Unknown => false,
-        }
-    }
-
-    /// The pre-check's 401, for a request this authenticator never sees.
-    pub(crate) fn refuse_unreviewed(&self) -> Refusal {
-        rejected(SyncAuthStage::Precheck, Refusal::Unauthenticated)
-    }
-
     /// The instance `token` belongs to, if it may sync `gateway`, asked from
     /// `peer`. `claimed` is what [`Self::precheck`] read from it.
     pub(crate) async fn authenticate(

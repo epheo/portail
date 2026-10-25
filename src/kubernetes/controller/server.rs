@@ -160,21 +160,18 @@ impl SyncServer {
             Ok(claimed) => claimed,
             Err(refusal) => return refused(refusal),
         };
-        if !self.serves(&key) {
-            // No review for a Gateway we do not serve: its account cannot
-            // fill the verdict cache. Only a token already reviewed as its
-            // data plane learns that it is gone; anyone else gets the
-            // pre-check's 401, no oracle of Gateway names.
-            return if self.auth.reviewed_for(&token, &key) {
-                not_served()
-            } else {
-                refused(self.auth.refuse_unreviewed())
-            };
-        }
+        // Served or not, a Gateway's name is authenticated alike: a refusal
+        // never tells the two apart.
         let instance = match self.auth.authenticate(&claimed, &token, &key, peer).await {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
+        // Its own data plane only learns that it is gone, and must: a
+        // restarted controller holds no verdict for its token, and a
+        // refusal would leave it serving the deleted Gateway.
+        if !self.serves(&key) {
+            return not_served();
+        }
         let declared = request
             .headers()
             .get(header::CONTENT_LENGTH)
@@ -926,23 +923,34 @@ mod tests {
         assert_eq!(held.await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
-    /// The store says first: a poll for a Gateway that is not there, or
+    /// A poll of its own data plane for a Gateway that is not there, or
     /// whose class names another controller, gets 404 and leaves no slot.
     #[tokio::test(start_paused = true)]
     async fn a_gateway_not_ours_gets_no_slot() {
         let _serial = METRICS_SERIAL.lock().await;
         let mut f = fixture();
         let ghost = GatewayKey::new("default", "ghost");
+        f.api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:default:portail-ghost",
+                Some("pod-9"),
+            ),
+        );
         let response = f
             .sync(post(
                 Some(&gateway_token("default", "ghost", 0)),
                 &body(&ghost, "", Some(json!({"applied": "x"}))),
             ))
             .await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(!f.ctx.hub.remove(&ghost), "no slot was created");
         assert!(f.ctx.reports.live(&ghost).is_empty(), "no report recorded");
 
+        f.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
         assert_eq!(f.sync(poll("")).await.status(), StatusCode::NO_CONTENT);
         assert!(f.ctx.hub.remove(&key()));
         let mut other = testkit::gateway("gw", 1);
@@ -956,18 +964,18 @@ mod tests {
         assert!(!f.ctx.hub.remove(&key()));
     }
 
-    /// A Gateway the store lacks, or of another class, costs no review:
-    /// its account cannot fill the verdict cache, and a stranger gets the
-    /// pre-check's 401, no oracle of Gateway names. A data plane already
-    /// reviewed for it learns it is gone.
+    /// A Gateway the store lacks, or of another class, is authenticated as
+    /// a served one: a token whose subject is not the path's account gets
+    /// the pre-check's 401 with no review, a rejected one 401 after its
+    /// review, and only its own data plane learns that it is gone.
     #[tokio::test]
-    async fn a_gateway_not_served_costs_no_review() {
+    async fn a_gateway_not_served_is_gone_only_to_its_own_data_plane() {
         let _serial = METRICS_SERIAL.lock().await;
         let mut f = fixture();
         let ghost = GatewayKey::new("default", "ghost");
         let (status, text) = text_of(
             f.sync(post(
-                Some(&gateway_token("default", "ghost", 0)),
+                Some(&gateway_token("default", "gw", 0)),
                 &body(&ghost, "", None),
             ))
             .await,
@@ -977,11 +985,36 @@ mod tests {
             (status, text.as_str()),
             (StatusCode::UNAUTHORIZED, "unauthenticated\n")
         );
-        assert_eq!(f.reviews(), 0);
+        assert_eq!(f.reviews(), 0, "another account's token costs no review");
 
-        let v1 = f.publish(1);
-        assert_eq!(version_of(f.sync(poll("")).await).await, v1);
+        f.api.reply_to(REVIEWS, 201, review(false, "", None));
+        let forged = post(
+            Some(&gateway_token("default", "ghost", 0)),
+            &body(&ghost, "", None),
+        );
+        let (status, text) = text_of(f.sync(forged).await).await;
+        assert_eq!(
+            (status, text.as_str()),
+            (StatusCode::UNAUTHORIZED, "unauthenticated\n")
+        );
         assert_eq!(f.reviews(), 1);
+
+        f.api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:default:portail-ghost",
+                Some("pod-9"),
+            ),
+        );
+        let own = post(
+            Some(&gateway_token("default", "ghost", 1)),
+            &body(&ghost, "", None),
+        );
+        assert_eq!(f.sync(own).await.status(), StatusCode::NOT_FOUND);
+        assert!(!f.ctx.hub.remove(&ghost), "no slot was created");
+
         let mut theirs = testkit::gateway("gw", 1);
         theirs.spec.gateway_class_name = "theirs".into();
         apply(
@@ -989,13 +1022,65 @@ mod tests {
             gateway_class("theirs", "example.com/other"),
         );
         apply(&mut f.cluster.gateways, theirs);
+        f.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
         assert_eq!(f.sync(poll("")).await.status(), StatusCode::NOT_FOUND);
-        let stranger = post(
-            Some(&gateway_token("default", "gw", 1)),
-            &body(&key(), "", None),
+    }
+
+    /// A controller restarted holds no verdict for its data planes'
+    /// tokens. A Gateway deleted meanwhile is still gone to its own data
+    /// plane, which closes its listeners, rather than refused, which
+    /// would leave them serving the deleted Gateway.
+    #[tokio::test]
+    async fn a_restarted_controller_tells_a_deleted_gateways_data_plane_it_is_gone() {
+        let _serial = METRICS_SERIAL.lock().await;
+        use crate::dataplane::remote::{Answer, Client};
+        use crate::sync::SyncRequest;
+        let mut p = testkit::Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert!(p.ready.load(Ordering::Acquire), "the data plane serves");
+        let have = p.served(&gw).unwrap().version.clone();
+
+        p.cluster
+            .gateways
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(gw.clone()));
+        super::super::reconcile::forget_deleted_gateways(&p.ctx);
+        p.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
+        let restarted = SyncServer::new(
+            p.ctx.clone(),
+            authenticator(p.api.client()),
+            Lapses::new().0,
+            CancellationToken::new(),
         );
-        assert_eq!(f.sync(stranger).await.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(f.reviews(), 1, "neither cost a review");
+        let ca = super::super::ca::ControllerCa::generated_for_localhost();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve(restarted, ca.server_config(), listener));
+
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token.path(), gateway_token("default", "gw", 0)).unwrap();
+        let mut client = Client::new(
+            &format!("https://localhost:{port}"),
+            &key(),
+            ca.ca_pem().as_bytes(),
+            token.path().to_path_buf(),
+        )
+        .unwrap();
+        let request = SyncRequest {
+            protocol: PROTOCOL,
+            gateway: key(),
+            have,
+            data_plane_version: "test".into(),
+            report: None,
+        };
+        match client.poll(&request).await {
+            Answer::Gone => p.applier.clear().await,
+            other => panic!("{other:?}"),
+        }
+        assert!(!p.ready.load(Ordering::Acquire), "its listeners closed");
     }
 
     #[tokio::test]
@@ -1252,16 +1337,25 @@ mod tests {
         assert_eq!(metrics::sync_auth_rejected(SyncAuthStage::Authz), authz + 2);
 
         let reviews = f.reviews();
+        f.api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:default:portail-web",
+                Some("pod-7"),
+            ),
+        );
         let unknown = body(&GatewayKey::new("default", "web"), "", None);
         let response = f
             .sync(post(Some(&gateway_token("default", "web", 7)), &unknown))
             .await;
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
-            "an unknown Gateway"
+            StatusCode::NOT_FOUND,
+            "an unknown Gateway, to its own account"
         );
-        assert_eq!(f.reviews(), reviews);
+        assert_eq!(f.reviews(), reviews + 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1321,6 +1415,7 @@ mod tests {
     /// wake, not at the resync: the pass the wake runs no longer counts it.
     #[tokio::test]
     async fn a_silent_instance_turns_its_gateway_pending_on_the_lapse() {
+        let _serial = METRICS_SERIAL.lock().await;
         use super::super::reconcile::{finish, publish, Step};
         let mut p = testkit::Pipeline::new();
         p.api

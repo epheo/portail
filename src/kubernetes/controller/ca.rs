@@ -259,13 +259,21 @@ impl ControllerCa {
         namespace: &str,
         service: &str,
     ) -> Result<Self, CaError> {
+        let svc = naming::controller_audience(service, namespace);
+        Self::serving(
+            cert_pem,
+            key_pem,
+            vec![svc.clone(), format!("{svc}.cluster.local")],
+        )
+    }
+
+    /// The CA, its leaf issued for `names`.
+    fn serving(cert_pem: String, key_pem: &str, names: Vec<String>) -> Result<Self, CaError> {
         let key =
             KeyPair::from_pem(key_pem).map_err(|e| CaError::Invalid(format!("{KEY_KEY}: {e}")))?;
         let ca_der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
             .map_err(|e| CaError::Invalid(format!("{CERT_KEY}: {e}")))?;
         let issuer = Issuer::new(ca_params(), key);
-        let svc = naming::controller_audience(service, namespace);
-        let names = vec![svc.clone(), format!("{svc}.cluster.local")];
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let leaf = issue(&issuer, &names, &provider)
             .map_err(|e| CaError::Invalid(format!("issuing the serving cert: {e}")))?;
@@ -284,6 +292,13 @@ impl ControllerCa {
     pub(super) fn generated(namespace: &str, service: &str) -> Self {
         let (cert, key) = generate().unwrap();
         ControllerCa::new(cert, &key, namespace, service).unwrap()
+    }
+
+    /// A new CA serving as `localhost`, which a test dials.
+    #[cfg(test)]
+    pub(super) fn generated_for_localhost() -> Self {
+        let (cert, key) = generate().unwrap();
+        ControllerCa::serving(cert, &key, vec!["localhost".into()]).unwrap()
     }
 
     /// The CA certificate, PEM: what data planes verify the controller
