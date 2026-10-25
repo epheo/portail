@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::channel::mpsc;
-use http::{header, HeaderMap, Method, Request, Response, StatusCode};
+use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body;
 use hyper::server::conn::http1;
@@ -38,7 +38,7 @@ use super::reports::{InstanceId, LIVENESS};
 use super::ControllerCtx;
 use crate::logging::{info, warn};
 use crate::proxy::worker::AcceptBackoff;
-use crate::sync::{GatewayKey, Snapshot, SyncRequest, HOLD, PROTOCOL};
+use crate::sync::{GatewayKey, Snapshot, SyncRequest, HOLD, PROTOCOL, STANDBY_HEADER};
 
 /// Followed by `{namespace}/{name}` of the Gateway.
 const SYNC_PREFIX: &str = "/v1/sync/";
@@ -149,11 +149,11 @@ impl SyncServer {
         }
         // Only the leader writes status, so only it takes reports.
         if !self.ctx.leader.is_leader() {
-            return unavailable("not the leader");
+            return standby("not the leader");
         }
         // A 404 is only authoritative once the store is complete.
         if !self.ctx.synced.is_synced() {
-            return unavailable("caches not synced");
+            return standby("caches not synced");
         }
         let token = token(request.headers()).unwrap_or_default().to_string();
         let claimed = match self.auth.precheck(&token) {
@@ -281,7 +281,7 @@ impl SyncServer {
                 _ = tokio::time::sleep_until(deadline) => return no_content(),
                 // The instance asked again: this answer has no reader.
                 _ = hold.superseded.cancelled() => return no_content(),
-                _ = self.shutdown.cancelled() => return unavailable("shutting down"),
+                _ = self.shutdown.cancelled() => return standby("shutting down"),
             }
         }
     }
@@ -321,6 +321,15 @@ fn unavailable(body: &str) -> Response<Full<Bytes>> {
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, RETRY_AFTER_SECS.into());
+    response
+}
+
+/// A 503 that says this replica serves nothing, not that it is overloaded.
+fn standby(body: &str) -> Response<Full<Bytes>> {
+    let mut response = unavailable(body);
+    response
+        .headers_mut()
+        .insert(STANDBY_HEADER, HeaderValue::from_static("true"));
     response
 }
 
@@ -1107,6 +1116,7 @@ mod tests {
             let response = f.sync(poll("")).await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(response.headers()[STANDBY_HEADER], "true");
             assert_eq!(f.reviews(), 0);
         }
     }
@@ -1553,6 +1563,10 @@ mod tests {
         let response = finished.into_iter().next().unwrap().await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert!(
+            !response.headers().contains_key(STANDBY_HEADER),
+            "an overloaded leader is no standby"
+        );
         assert_eq!(METRICS.sync_throttled_total.get(), throttled + 1);
         held.iter().for_each(|p| p.abort());
     }

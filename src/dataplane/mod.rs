@@ -237,6 +237,7 @@ impl SyncLoop {
                 self.gone().await;
                 return now + self.failures.wait();
             }
+            Answer::Standby(error) => return self.standby(error),
             Answer::Retry { after, error } => return self.failed(after, error),
         };
         match snapshot {
@@ -337,6 +338,18 @@ impl SyncLoop {
         if self.last_error.take().is_some() {
             info!("Sync of Gateway {} recovered", self.gateway);
         }
+    }
+
+    /// A replica that serves nothing answered: poll again soon on a new
+    /// connection, which may reach another, and leave the backoff as it is.
+    fn standby(&mut self, error: String) -> Instant {
+        self.metrics.set_connected(false);
+        let delay = remote::STANDBY_RETRY.mul_f64(fastrand::f64());
+        if self.last_error.as_ref() != Some(&error) {
+            warn!("Sync of Gateway {}: {}; dialing again", self.gateway, error);
+        }
+        self.last_error = Some(error);
+        Instant::now() + delay
     }
 
     fn failed(&mut self, after: Option<Duration>, error: String) -> Instant {
@@ -594,6 +607,24 @@ mod tests {
             assert!(ready.load(Ordering::Acquire));
             assert!(sync.rebind_at.is_some(), "no retry for the late network");
         });
+    }
+
+    /// A standby's 503s are polled again within a second each, and leave
+    /// the backoff where it was: after a failover each new connection may
+    /// reach the leader. They doubled the ceiling up to the hold, and data
+    /// planes came back up to 50s after the takeover.
+    #[tokio::test]
+    async fn a_standby_is_dialed_again_within_a_second() {
+        let (mut sync, _) = sync_loop();
+        for _ in 0..8 {
+            let before = Instant::now();
+            let at = sync.handle(Answer::Standby("not the leader".into())).await;
+            assert!(at - before <= remote::STANDBY_RETRY, "{:?}", at - before);
+        }
+        assert_eq!(
+            sync.failures.next_ceiling(),
+            Backoff::default().next_ceiling()
+        );
     }
 
     /// Repeated 503s with Retry-After 1s slow down past it, as any failure

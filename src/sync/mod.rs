@@ -31,6 +31,12 @@ pub const PROTOCOL: u32 = 1;
 /// TokenReview cache lives as long.
 pub const HOLD: Duration = Duration::from_secs(30);
 
+/// Set on a 503 from a replica that serves no snapshot: a standby, one
+/// still syncing its caches, or one stopping. Another replica may serve,
+/// so the data plane dials again at once instead of backing off as from an
+/// overloaded controller.
+pub const STANDBY_HEADER: &str = "x-portail-standby";
+
 /// A Gateway's identity on the wire: what a data plane serves, what the
 /// controller keys snapshots and reports by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

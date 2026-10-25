@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
 use crate::cli::CONTROLLER_CA_ENV;
-use crate::sync::{GatewayKey, SyncRequest, HOLD};
+use crate::sync::{GatewayKey, SyncRequest, HOLD, STANDBY_HEADER};
 
 /// Bounds a connect, TCP and TLS together: in-cluster connects take
 /// milliseconds, so this only cuts short a dead endpoint during failover.
@@ -41,6 +41,13 @@ const SYNC_PATH: &str = "/v1/sync";
 /// proxy's error page.
 const ERROR_BODY_LOG_BYTES: usize = 512;
 
+/// The longest wait before polling again after a standby's 503, uniform
+/// below it. That is no overload: each new connection picks again among the
+/// controller Service's endpoints (about half the time the leader, with two
+/// replicas), so a few quick tries find it after a failover, and the jitter
+/// keeps a fleet from coming back in step.
+pub const STANDBY_RETRY: Duration = Duration::from_secs(1);
+
 /// The first backoff ceiling: the rendered startupProbe period, so a data
 /// plane started beside a controller still coming up retries within it.
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
@@ -54,6 +61,9 @@ pub enum Answer {
     Unchanged,
     /// 404: the controller serves this Gateway nothing.
     Gone,
+    /// 503 from a replica that serves nothing: a standby, one still
+    /// syncing, or one stopping. Another replica may, on a new connection.
+    Standby(String),
     /// Anything else, a failed connect or request included: try again
     /// later, after `after` when the controller said so.
     Retry {
@@ -184,6 +194,7 @@ impl Client {
         let (conn, response) = response;
         let status = response.status();
         let after = retry_after(response.headers());
+        let standby = response.headers().contains_key(STANDBY_HEADER);
         let body = response
             .into_body()
             .collect()
@@ -194,8 +205,13 @@ impl Client {
             StatusCode::OK => Answer::Snapshot(body),
             StatusCode::NO_CONTENT => Answer::Unchanged,
             StatusCode::NOT_FOUND => Answer::Gone,
-            // A standby or a controller still syncing; dropping the
-            // connection lets the Service pick a replica again.
+            // Dropping the connection lets the Service pick a replica again.
+            StatusCode::SERVICE_UNAVAILABLE if standby => {
+                return Ok(Answer::Standby(format!(
+                    "controller replica not serving: {}",
+                    excerpt(&body)
+                )))
+            }
             status => {
                 return Ok(Answer::Retry {
                     after,
@@ -444,6 +460,19 @@ mod tests {
         String,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        server_with(keep_alive, answer, false).await
+    }
+
+    /// [`server`], its 503s marked as a standby's when `standby`.
+    async fn server_with(
+        keep_alive: bool,
+        answer: fn(usize) -> Option<StatusCode>,
+        standby: bool,
+    ) -> (
+        std::net::SocketAddr,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -482,10 +511,13 @@ mod tests {
                             // writes, a poll it may then take as unsent.
                             let _ = request.into_body().collect().await;
                             match answer(n) {
-                                Some(status) => Ok(Response::builder()
-                                    .status(status)
-                                    .body(Full::new(Bytes::new()))
-                                    .unwrap()),
+                                Some(status) => {
+                                    let mut response = Response::builder().status(status);
+                                    if standby && status == StatusCode::SERVICE_UNAVAILABLE {
+                                        response = response.header(STANDBY_HEADER, "true");
+                                    }
+                                    Ok(response.body(Full::new(Bytes::new())).unwrap())
+                                }
                                 None => Err(std::io::Error::other("hang up")),
                             }
                         }
@@ -515,6 +547,24 @@ mod tests {
             data_plane_version: String::new(),
             report: None,
         }
+    }
+
+    /// A standby's 503 says so, and drops the connection: the next poll
+    /// connects again and may reach the leader. An overloaded replica's 503
+    /// is a failure to back off from.
+    #[tokio::test]
+    async fn a_standby_is_told_from_an_overloaded_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, ca, _) =
+            server_with(true, |_| Some(StatusCode::SERVICE_UNAVAILABLE), true).await;
+        let mut standby = client(addr, &ca, &dir);
+        let answer = standby.poll(&poll()).await;
+        assert!(matches!(answer, Answer::Standby(_)), "{answer:?}");
+        assert!(standby.conn.is_none(), "a new connection next time");
+
+        let (addr, ca, _) = server(true, |_| Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+        let answer = client(addr, &ca, &dir).poll(&poll()).await;
+        assert!(matches!(answer, Answer::Retry { .. }), "{answer:?}");
     }
 
     /// A poll written and lost (the controller crashed or rolled while
