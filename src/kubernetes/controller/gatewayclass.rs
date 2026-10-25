@@ -492,6 +492,42 @@ mod tests {
             .collect()
     }
 
+    /// Deleting a Gateway removes our route parent and policy ancestor
+    /// entries naming it; another controller's entries and ours for a live
+    /// Gateway stay. They stayed forever: deletion runs no pass.
+    #[tokio::test]
+    async fn a_deleted_gateway_loses_our_entries() {
+        let mut p = pipeline();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.gateways, testkit::gateway("gw2", 1));
+        apply(
+            &mut p.cluster.http_routes,
+            route_reporting("gw2", &["gw", "gw2"]),
+        );
+        let mut policy = testkit::rate_limit_policy("p", "other-gw");
+        policy.status = Some(
+            serde_json::from_value(json!({ "ancestors": [
+                testkit::status_entry(CONTROLLER, "gw", "ancestorRef"),
+            ]}))
+            .unwrap(),
+        );
+        apply(&mut p.cluster.policies, policy);
+
+        p.delete(&gw).await;
+        let route = eventually(&p, "httproutes", "r").await;
+        assert_eq!(
+            parent_names(&route),
+            [
+                (CONTROLLER.to_string(), "gw2".to_string()),
+                ("example.com/other".to_string(), "gw".to_string()),
+            ]
+        );
+        assert_eq!(route["metadata"]["resourceVersion"], "1");
+        let policy = eventually(&p, "ratelimitpolicies", "p").await;
+        assert_eq!(policy["status"]["ancestors"], json!([]));
+    }
+
     /// Our class turning to another controller makes its Gateways
     /// someone else's: our entries for them go.
     #[tokio::test]
@@ -511,5 +547,57 @@ mod tests {
             [("example.com/other".to_string(), "gw".to_string())]
         );
         assert!(class_writes(&p).is_empty(), "not our class any more");
+    }
+
+    /// A Gateway moving to another controller's class drops our entries
+    /// in the pass that stops serving it.
+    #[tokio::test]
+    async fn a_gateway_moved_to_a_foreign_class_drops_our_entries() {
+        let mut p = pipeline();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        apply(
+            &mut p.cluster.gateway_classes,
+            class("other", "example.com/other"),
+        );
+        apply(&mut p.cluster.http_routes, route_reporting("gw", &["gw"]));
+        let mut moved = gw;
+        moved.spec.gateway_class_name = "other".into();
+        apply(&mut p.cluster.gateways, moved.clone());
+
+        p.api.clear();
+        p.pass(&moved).await.unwrap();
+        assert!(p.served(&moved).is_none());
+        let route = p.api.status_patch("httproutes", "r").unwrap();
+        assert_eq!(
+            parent_names(&route),
+            [("example.com/other".to_string(), "gw".to_string())]
+        );
+    }
+
+    /// A missing class takes nothing away, our entries included; unsynced
+    /// stores remove nothing either.
+    #[tokio::test]
+    async fn a_missing_class_or_unsynced_stores_keep_our_entries() {
+        let mut p = pipeline();
+        apply(&mut p.cluster.gateways, testkit::gateway("gw", 1));
+        apply(&mut p.cluster.http_routes, route_reporting("gw", &["gw"]));
+        p.cluster
+            .gateway_classes
+            .apply_watcher_event(&watcher::Event::Delete(class("portail", CONTROLLER)));
+        assert!(pass(&p.ctx).await);
+        assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
+
+        let _unlisted = p.ctx.synced.track("HTTPRoute", false);
+        p.cluster
+            .gateways
+            .apply_watcher_event(&watcher::Event::Delete(testkit::gateway("gw", 1)));
+        super::super::reconcile::forget_deleted_gateways(&p.ctx);
+        assert!(pass(&p.ctx).await);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
     }
 }
