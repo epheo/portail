@@ -13,7 +13,7 @@ use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_net
 use super::dns_refresh::{spawn_dns_refresh, Published};
 use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
 use crate::logging::{error, info, warn};
-use crate::proxy::data_plane::DataPlane;
+use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;
 use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Snapshot, Transport};
 
@@ -47,8 +47,8 @@ struct Applied {
 struct DataPlaneState {
     rebuilt: bool,
     build_error: Option<String>,
-    /// From this apply's binds, keyed by published port.
-    bind_errors: Vec<(u16, String)>,
+    /// From this apply's binds.
+    bind_errors: Vec<BindError>,
 }
 
 fn lock(data_plane: &Mutex<DataPlane>) -> MutexGuard<'_, DataPlane> {
@@ -239,8 +239,8 @@ impl Applier {
     }
 
     /// Bind the data plane to `binds` (see [`Served::binds`]) and close what
-    /// they no longer hold. Returns the bind errors, keyed by published port.
-    async fn ensure_listeners(&self, binds: &[ListenerConfig]) -> Vec<(u16, String)> {
+    /// they no longer hold. Returns the bind errors.
+    async fn ensure_listeners(&self, binds: &[ListenerConfig]) -> Vec<BindError> {
         info!(
             "Ensuring data plane listeners for ports: {:?}",
             binds.iter().map(|l| l.port).collect::<Vec<_>>()
@@ -257,19 +257,15 @@ impl Applier {
         if opened > 0 {
             info!("Opened {} new port(s)", opened);
         }
-        for (port, err) in &errors {
-            warn!("Failed to bind port {}: {}", port, err);
+        for e in &errors {
+            warn!("Failed to bind {}: {}", e.endpoint, e.error);
         }
         errors
     }
 
-    /// Each listener's endpoints, bound or not, the bind error of its port
-    /// on the unbound ones.
-    fn listener_reports(
-        &self,
-        served: &Served,
-        bind_errors: &[(u16, String)],
-    ) -> Vec<ListenerReport> {
+    /// Each listener's endpoints, bound or not, the unbound ones with their
+    /// bind error.
+    fn listener_reports(&self, served: &Served, bind_errors: &[BindError]) -> Vec<ListenerReport> {
         let dp = lock(&self.data_plane);
         served
             .config
@@ -287,11 +283,11 @@ impl Applier {
                             EndpointReport {
                                 error: bind_errors
                                     .iter()
-                                    .find(|(port, _)| !bound && *port == l.port)
-                                    .map(|(_, e)| e.clone()),
-                                address: endpoint.0,
-                                port: endpoint.1,
-                                transport: Transport::of(&l.protocol),
+                                    .find(|e| !bound && e.endpoint == endpoint)
+                                    .map(|e| e.error.clone()),
+                                address: endpoint.address,
+                                port: endpoint.port,
+                                transport: endpoint.transport,
                                 bound,
                             }
                         })
@@ -333,7 +329,7 @@ impl Served {
 
     /// The endpoints its listeners must have live to be ready. Unbindable
     /// listeners still count, so readiness stays down.
-    fn required(&self) -> Vec<(Option<String>, u16)> {
+    fn required(&self) -> Vec<Endpoint> {
         required_endpoints(
             &self.config.gateway.listeners,
             self.bind.as_deref().unwrap_or_default(),
@@ -341,26 +337,21 @@ impl Served {
     }
 }
 
-/// (address, bound-port) pairs the data plane must be bound to for these
-/// listeners to be ready. Keyed on each listener's bound port (`target_port`
-/// when the controller decoupled it from the published port).
-fn required_endpoints(
-    listeners: &[ListenerConfig],
-    bind_addresses: &[String],
-) -> Vec<(Option<String>, u16)> {
+/// The endpoints the data plane must be bound to for these listeners to
+/// be ready. Keyed on each listener's bound port (`target_port` when the
+/// controller decoupled it from the published port).
+fn required_endpoints(listeners: &[ListenerConfig], bind_addresses: &[String]) -> Vec<Endpoint> {
+    let on = |address: Option<&String>, l: &ListenerConfig| Endpoint {
+        address: address.cloned(),
+        port: l.target_port.unwrap_or(l.port),
+        transport: Transport::of(&l.protocol),
+    };
     if bind_addresses.is_empty() {
-        listeners
-            .iter()
-            .map(|l| (None, l.target_port.unwrap_or(l.port)))
-            .collect()
+        listeners.iter().map(|l| on(None, l)).collect()
     } else {
         bind_addresses
             .iter()
-            .flat_map(|addr| {
-                listeners
-                    .iter()
-                    .map(move |l| (Some(addr.clone()), l.target_port.unwrap_or(l.port)))
-            })
+            .flat_map(|addr| listeners.iter().map(move |l| on(Some(addr), l)))
             .collect()
     }
 }
@@ -454,14 +445,22 @@ mod tests {
         }
     }
 
+    fn tcp(address: Option<&str>, port: u16) -> Endpoint {
+        Endpoint {
+            address: address.map(str::to_string),
+            port,
+            transport: Transport::Tcp,
+        }
+    }
+
     #[test]
     fn required_endpoints_keys_on_bound_port() {
         let listeners = [lc(80, Some(8000)), lc(8080, None)];
         let eps = required_endpoints(&listeners, &[]);
-        assert!(eps.contains(&(None, 8000)));
-        assert!(eps.contains(&(None, 8080)));
+        assert!(eps.contains(&tcp(None, 8000)));
+        assert!(eps.contains(&tcp(None, 8080)));
         assert!(
-            !eps.contains(&(None, 80)),
+            !eps.contains(&tcp(None, 80)),
             "published port must not be the readiness key"
         );
     }
@@ -474,8 +473,22 @@ mod tests {
             &["10.0.0.1".to_string(), "10.0.0.2".to_string()],
         );
         assert_eq!(eps.len(), 2);
-        assert!(eps.contains(&(Some("10.0.0.1".to_string()), 8001)));
-        assert!(eps.contains(&(Some("10.0.0.2".to_string()), 8001)));
+        assert!(eps.contains(&tcp(Some("10.0.0.1"), 8001)));
+        assert!(eps.contains(&tcp(Some("10.0.0.2"), 8001)));
+    }
+
+    /// A UDP listener needs a UDP socket: a TCP one on its port is not it.
+    #[test]
+    fn required_endpoints_carry_the_transport() {
+        let udp = ListenerConfig {
+            protocol: Protocol::UDP,
+            ..lc(53, None)
+        };
+        let eps = required_endpoints(&[lc(53, None), udp], &[]);
+        assert_eq!(
+            eps.iter().map(|e| e.transport).collect::<Vec<_>>(),
+            [Transport::Tcp, Transport::Udp]
+        );
     }
 
     /// The skip gate is only sound if the fingerprint is deterministic and
@@ -677,6 +690,47 @@ mod tests {
             "{tcp_endpoint:?}"
         );
         assert!(!ready.load(Ordering::Acquire));
+    }
+
+    /// A TCP and a UDP listener on one port both bind, and the report says
+    /// so per transport.
+    #[tokio::test]
+    async fn tcp_and_udp_on_one_port_both_report_bound() {
+        let (mut applier, ready) = applier();
+        let port = std::iter::repeat_with(crate::proxy::data_plane::test_ports::wildcard)
+            .find(|&port| std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok())
+            .unwrap();
+        let config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": [
+                {"name": "tcp", "protocol": "TCP", "port": port},
+                {"name": "udp", "protocol": "UDP", "port": port},
+            ]},
+        }))
+        .unwrap();
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation: 1,
+        };
+
+        let report = applier
+            .apply(&Snapshot::from_config(gateway, config, vec![]))
+            .await;
+        let endpoints: Vec<(&str, Transport, bool)> = report
+            .listeners
+            .iter()
+            .flat_map(|l| {
+                l.endpoints
+                    .iter()
+                    .map(move |e| (l.name.as_str(), e.transport, e.bound))
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            [("tcp", Transport::Tcp, true), ("udp", Transport::Udp, true)]
+        );
+        assert!(ready.load(Ordering::Acquire));
     }
 
     /// Runs `test` in a process of its own, on a current-thread runtime:
