@@ -77,8 +77,8 @@ impl Applier {
         }
     }
 
-    /// Bring the data plane in line with `snapshot` and report the result.
-    /// The caller verifies the snapshot first.
+    /// Bring the data plane in line with `snapshot` and report the result,
+    /// under the snapshot's version as sent.
     pub async fn apply(&mut self, snapshot: &Snapshot) -> InstanceReport {
         let config = snapshot.to_config();
         let local = local_interface_ips();
@@ -608,6 +608,36 @@ mod tests {
             assert!(ready.load(Ordering::Acquire));
             assert!(!bindable(http) && !bindable(tcp));
         });
+    }
+
+    /// A newer controller's snapshot, with a field this data plane does not
+    /// know hashed into its version, applies and reports that version.
+    #[tokio::test]
+    async fn a_newer_controllers_snapshot_applies() {
+        let (mut applier, ready) = applier();
+        let config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": [{"name": "http", "protocol": "HTTP", "port": 0}]},
+        }))
+        .unwrap();
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation: 1,
+        };
+        let mut json =
+            serde_json::to_value(Snapshot::from_config(gateway, config, vec![])).unwrap();
+        json["runtime"] = serde_json::json!({"workers": 4});
+        json["version"] = serde_json::json!("");
+        let version =
+            crate::sync::sha256_hex(&serde_json::to_vec(&json).unwrap())[..16].to_string();
+        json["version"] = serde_json::json!(version);
+        let received: Snapshot = serde_json::from_value(json).unwrap();
+
+        let report = applier.apply(&received).await;
+        assert_eq!(report.applied, version);
+        assert_eq!(report.apply_error, None);
+        assert!(ready.load(Ordering::Acquire));
     }
 
     /// A generation bump with the same config rebuilds nothing.

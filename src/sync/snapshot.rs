@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use super::{sha256_hex, GatewayRef, PROTOCOL};
 use crate::config::PortailConfig;
 
-/// One Gateway's data-plane config. `version` is a content hash: equal
-/// versions serve equal tables, so an unchanged translation is never
-/// applied twice and a reconnect to another controller replica resumes.
+/// One Gateway's data-plane config. `version` is a hash of the snapshot as
+/// sent: equal versions serve equal tables, so an unchanged translation is
+/// never applied twice and a reconnect to another controller replica
+/// resumes. A data plane compares versions and never hashes: one older
+/// than its controller drops the fields it does not know, and its own hash
+/// would differ.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -190,27 +193,20 @@ impl Snapshot {
         .seal()
     }
 
-    /// Stamp `version` from the content; call after any change to it.
+    /// Stamp `version`: the first [`VERSION_HEX_DIGITS`] of SHA-256 over
+    /// the snapshot's JSON with `version` empty, the bytes the controller
+    /// sends but for that field. Every field counts, a later one too;
+    /// every list is sorted or in spec order, so equal content hashes
+    /// equal. Call after any change.
     pub fn seal(mut self) -> Self {
-        self.version = self.content_version();
+        self.version.clear();
+        // No map with non-string keys and no fallible serializer anywhere
+        // in these types.
+        let json = serde_json::to_vec(&self).expect("a snapshot serializes");
+        let mut hex = sha256_hex(&json);
+        hex.truncate(VERSION_HEX_DIGITS);
+        self.version = hex;
         self
-    }
-
-    /// Whether `version` is this content's: a snapshot changed after its
-    /// seal, or by a peer hashing otherwise, is refused.
-    pub fn verify(&self) -> anyhow::Result<()> {
-        if self.protocol != PROTOCOL {
-            anyhow::bail!("snapshot protocol {} is not {}", self.protocol, PROTOCOL);
-        }
-        let content = self.content_version();
-        if self.version != content {
-            anyhow::bail!(
-                "snapshot version {} does not match its content ({})",
-                self.version,
-                content
-            );
-        }
-        Ok(())
     }
 
     /// The config a route table builds from: PEMs and overrides back in
@@ -254,36 +250,6 @@ impl Snapshot {
             .map(|a| ((a.host.clone(), a.port), a.app_protocol.clone()))
             .collect();
         config
-    }
-
-    /// The first [`VERSION_HEX_DIGITS`] of SHA-256 over the canonical JSON
-    /// of everything but `version`. Canonical: struct fields serialize in
-    /// declaration order, and every list is sorted or ordered by the spec.
-    fn content_version(&self) -> String {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Content<'a> {
-            protocol: u32,
-            gateway: &'a GatewayRef,
-            config: &'a PortailConfig,
-            certificates: &'a [CertificatePem],
-            backends: &'a Backends,
-            networks: &'a [NetworkCidrs],
-        }
-        let json = serde_json::to_vec(&Content {
-            protocol: self.protocol,
-            gateway: &self.gateway,
-            config: &self.config,
-            certificates: &self.certificates,
-            backends: &self.backends,
-            networks: &self.networks,
-        })
-        // No map with non-string keys and no fallible serializer anywhere
-        // in these types.
-        .expect("a snapshot serializes");
-        let mut hex = sha256_hex(&json);
-        hex.truncate(VERSION_HEX_DIGITS);
-        hex
     }
 }
 
@@ -355,7 +321,6 @@ mod tests {
         let config = translated();
         let snapshot = Snapshot::from_config(gateway(), config.clone(), vec![]);
         let received = over_the_wire(&snapshot);
-        received.verify().unwrap();
         assert_eq!(received.version, snapshot.version);
 
         let restored = received.to_config();
@@ -389,7 +354,6 @@ mod tests {
         for (name, yaml, _) in crate::config::examples::EXAMPLES {
             let config: PortailConfig = serde_yaml::from_str(yaml).unwrap();
             let received = over_the_wire(&Snapshot::from_config(gateway(), config.clone(), vec![]));
-            received.verify().unwrap();
             assert_eq!(
                 serde_json::to_value(received.to_config()).unwrap(),
                 serde_json::to_value(&config).unwrap(),
@@ -448,52 +412,81 @@ mod tests {
         );
     }
 
+    /// The version is the hash of the bytes sent, `version` emptied: what
+    /// the controller sends, what a peer could check it against.
     #[test]
-    fn the_version_moves_with_the_content() {
+    fn the_version_hashes_the_bytes_sent() {
+        let snapshot = Snapshot::from_config(gateway(), translated(), vec![]);
+        assert_eq!(snapshot.version.len(), VERSION_HEX_DIGITS);
+        let mut unversioned = snapshot.clone();
+        unversioned.version.clear();
+        let sent = serde_json::to_vec(&unversioned).unwrap();
+        assert!(sha256_hex(&sent).starts_with(&snapshot.version));
+        assert_eq!(snapshot.clone().seal().version, snapshot.version, "stable");
+    }
+
+    /// Every field moves the version, whichever list or struct it is in.
+    #[test]
+    fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        assert_eq!(base.version.len(), VERSION_HEX_DIGITS);
-
-        let mut rotated = translated();
-        rotated.gateway.listeners[0]
-            .tls
-            .as_mut()
-            .unwrap()
-            .certificate_refs[0]
-            .cert_pem = Some(b"-----BEGIN CERTIFICATE-----\nBBBB\n".to_vec());
-        assert_ne!(
-            Snapshot::from_config(gateway(), rotated, vec![]).version,
-            base.version
-        );
-
-        let bumped = GatewayRef {
-            generation: 8,
-            ..gateway()
-        };
-        assert_ne!(
-            Snapshot::from_config(bumped, translated(), vec![]).version,
-            base.version
-        );
+        let changes: [(&str, fn(&mut Snapshot)); 12] = [
+            ("protocol", |s| s.protocol += 1),
+            ("gateway.namespace", |s| s.gateway.namespace.push('x')),
+            ("gateway.name", |s| s.gateway.name.push('x')),
+            ("gateway.uid", |s| s.gateway.uid.push('x')),
+            ("gateway.generation", |s| s.gateway.generation += 1),
+            ("config", |s| s.config.http_routes.clear()),
+            ("certificates", |s| s.certificates[0].cert_pem.push('B')),
+            ("headlessTargetPorts", |s| {
+                s.backends.headless_target_ports[0].target_port += 1
+            }),
+            ("externalNames", |s| {
+                s.backends.external_names[0].targets.clear()
+            }),
+            ("appProtocols", |s| {
+                s.backends.app_protocols[0].app_protocol.push('x')
+            }),
+            ("networks", |s| {
+                s.networks.push(NetworkCidrs {
+                    name: "udn-a".into(),
+                    cidrs: vec!["10.10.1.0/24".into()],
+                })
+            }),
+            ("performance", |s| s.config.performance.http2 = true),
+        ];
+        for (field, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(changed.seal().version, base.version, "{field}");
+        }
     }
 
+    /// A newer controller's snapshot carries a field this data plane does
+    /// not know, hashed into the version. It decodes, keeps that version
+    /// as sent, and is applied as such: nothing here hashes it again.
     #[test]
-    fn a_changed_snapshot_fails_verification() {
-        let mut snapshot = Snapshot::from_config(gateway(), translated(), vec![]);
-        snapshot.config.http_routes.clear();
-        assert!(snapshot.verify().is_err());
-        assert!(snapshot.seal().verify().is_ok());
+    fn a_newer_controllers_envelope_decodes_with_its_version() {
+        let mut json =
+            serde_json::to_value(Snapshot::from_config(gateway(), translated(), vec![])).unwrap();
+        json["runtime"] = serde_json::json!({"workers": 4});
+        json["gateway"]["labels"] = serde_json::json!({});
+        json["version"] = serde_json::json!("");
+        let version =
+            sha256_hex(&serde_json::to_vec(&json).unwrap())[..VERSION_HEX_DIGITS].to_string();
+        json["version"] = serde_json::json!(version);
+
+        let received: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(received.version, version);
     }
 
-    /// Envelopes take fields a newer peer adds; the config does not, so a
-    /// data plane that cannot read a newer config keeps its table.
+    /// The config stays strict: a data plane that cannot read a newer
+    /// config keeps its table.
     #[test]
     fn unknown_fields_pass_the_envelope_not_the_config() {
         let mut json =
             serde_json::to_value(Snapshot::from_config(gateway(), translated(), vec![])).unwrap();
         json["runtime"] = serde_json::json!({"workers": 4});
-        json["gateway"]["labels"] = serde_json::json!({});
-        let received: Snapshot = serde_json::from_value(json.clone()).unwrap();
-        received.verify().unwrap();
-
+        assert!(serde_json::from_value::<Snapshot>(json.clone()).is_ok());
         json["config"]["gateway"]["shards"] = serde_json::json!(2);
         assert!(serde_json::from_value::<Snapshot>(json).is_err());
     }

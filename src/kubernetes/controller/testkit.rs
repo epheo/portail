@@ -315,7 +315,6 @@ impl Pipeline {
         let key = key(gw);
         match self.ctx.hub.current(&key) {
             Some(snapshot) => {
-                snapshot.verify().unwrap();
                 let report = self.applier.apply(&snapshot).await;
                 self.ctx
                     .reports
