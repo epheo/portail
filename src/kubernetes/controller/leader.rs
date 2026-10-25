@@ -252,13 +252,15 @@ impl LeaseLock {
         }
     }
 
-    fn observe(&mut self, record: LeaseSpec, now: Instant) {
+    fn observe(&mut self, record: LeaseSpec, at: Instant) {
         if self.observed.as_ref().map(|(r, _)| r) != Some(&record) {
-            self.observed = Some((record, now));
+            self.observed = Some((record, at));
         }
     }
 
-    async fn try_acquire_or_renew(&mut self, now: Instant) -> Result<Outcome, kube::Error> {
+    /// One round; the lease's validity is judged at `started`, when the
+    /// round began, the later of the two instants never in its favor.
+    async fn try_acquire_or_renew(&mut self, started: Instant) -> Result<Outcome, kube::Error> {
         let wall = MicroTime(Utc::now());
         let duration_secs = i32::try_from(LEASE_DURATION.as_secs()).unwrap_or(i32::MAX);
         let Some(mut lease) = self.api.get_opt(&self.name).await? else {
@@ -278,7 +280,7 @@ impl LeaseLock {
             };
             return match self.api.create(&PostParams::default(), &lease).await {
                 Ok(created) => {
-                    self.observe(created.spec.unwrap_or_default(), now);
+                    self.observe(created.spec.unwrap_or_default(), Instant::now());
                     Ok(Outcome::Held)
                 }
                 Err(e) if is_conflict(&e) => Ok(Outcome::Contended),
@@ -286,13 +288,15 @@ impl LeaseLock {
             };
         };
         let record = lease.spec.clone().unwrap_or_default();
-        self.observe(record.clone(), now);
+        // When the read returned: a slow apiserver may have read the record
+        // long after `started`, and the countdown must not start before it did.
+        self.observe(record.clone(), Instant::now());
         let holder = record.holder_identity.clone().unwrap_or_default();
         let mine = holder == self.identity;
         let valid_for =
             Duration::from_secs(record.lease_duration_seconds.unwrap_or(0).max(0) as u64);
-        let changed_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
-        if !holder.is_empty() && !mine && changed_at + valid_for > now {
+        let changed_at = self.observed.as_ref().map_or(started, |(_, at)| *at);
+        if !holder.is_empty() && !mine && changed_at + valid_for > started {
             return Ok(Outcome::HeldBy(holder));
         }
         lease.spec = Some(LeaseSpec {
@@ -317,7 +321,7 @@ impl LeaseLock {
             .await
         {
             Ok(updated) => {
-                self.observe(updated.spec.unwrap_or_default(), now);
+                self.observe(updated.spec.unwrap_or_default(), Instant::now());
                 Ok(Outcome::Held)
             }
             Err(e) if is_conflict(&e) => Ok(Outcome::Contended),
@@ -434,11 +438,27 @@ mod tests {
 
     /// A replica's client to `leases`; every request fails while `down`.
     fn client(leases: Arc<FakeLeases>, down: Arc<AtomicBool>) -> Client {
+        slow_client(leases, down, Arc::default())
+    }
+
+    /// Like [`client`]; the next GET first waits `slow` at the apiserver,
+    /// then reads the Lease.
+    fn slow_client(
+        leases: Arc<FakeLeases>,
+        down: Arc<AtomicBool>,
+        slow: Arc<Mutex<Option<Duration>>>,
+    ) -> Client {
         let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-            let (leases, down) = (leases.clone(), down.clone());
+            let (leases, down, slow) = (leases.clone(), down.clone(), slow.clone());
             async move {
                 let (parts, body) = req.into_parts();
                 let bytes = body.collect_bytes().await.unwrap_or_default();
+                let wait = (parts.method == http::Method::GET)
+                    .then(|| slow.lock().unwrap().take())
+                    .flatten();
+                if let Some(wait) = wait {
+                    tokio::time::sleep(wait).await;
+                }
                 let (code, reply) = if down.load(Ordering::SeqCst) {
                     FakeLeases::status(500, "InternalError")
                 } else {
@@ -560,6 +580,42 @@ mod tests {
             .await
             .expect("lost resolves");
         assert_eq!(leases.holder().as_deref(), Some("x"), "never written back");
+    }
+
+    /// A read the apiserver answers late saw the Lease when it returned, not
+    /// when it was sent: the countdown starts then, as client-go stamps
+    /// observedTime after its Get.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_read_counts_down_from_when_it_returned() {
+        let leases = Arc::new(FakeLeases::default());
+        let a = Replica::start(&leases, "a");
+        sleep(0.1).await;
+        a.down.store(true, Ordering::SeqCst);
+        let slow = Arc::new(Mutex::new(Some(Duration::from_secs(9))));
+        let api = Api::namespaced(slow_client(leases.clone(), Arc::default(), slow), NS);
+        let mut b = LeaseLock::new(api, NAME, "b".into());
+
+        let sent = Instant::now();
+        assert!(matches!(
+            b.try_acquire_or_renew(sent).await.unwrap(),
+            Outcome::HeldBy(_)
+        ));
+        let read = Instant::now();
+        assert_eq!(read - sent, Duration::from_secs(9));
+
+        tokio::time::sleep_until(read + LEASE_DURATION - Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                b.try_acquire_or_renew(Instant::now()).await.unwrap(),
+                Outcome::HeldBy(_)
+            ),
+            "the record has been seen unchanged for less than a lease"
+        );
+        tokio::time::sleep_until(read + LEASE_DURATION).await;
+        assert!(matches!(
+            b.try_acquire_or_renew(Instant::now()).await.unwrap(),
+            Outcome::Held
+        ));
     }
 
     #[test]
