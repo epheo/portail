@@ -110,9 +110,8 @@ struct SyncLoop {
     report: Option<InstanceReport>,
     /// Polls that failed in a row.
     failures: Backoff,
-    /// Re-applies of a snapshot whose endpoints did not all bind: a port
-    /// held elsewhere, or an address not yet on the pod (interfaces are
-    /// read on apply).
+    /// Re-applies of a snapshot not fully bound: a port held elsewhere, or
+    /// an address not yet on the pod (interfaces are read on apply).
     rebinds: Backoff,
     rebind_at: Option<Instant>,
     /// The last poll's failure, for the no-snapshot warning.
@@ -339,14 +338,25 @@ impl SyncLoop {
             return false;
         };
         let report = self.applier.apply(snapshot).await;
-        self.schedule_rebind();
         let moved = self.report.as_ref() != Some(&report);
         self.report = Some(report);
+        self.schedule_rebind();
         moved
     }
 
+    /// Retry while an endpoint is unbound, or a Network address has no
+    /// interface on the pod yet: its listeners bind the other addresses
+    /// and turn Ready meanwhile.
     fn schedule_rebind(&mut self) {
-        self.rebind_at = if self.ready.load(Ordering::Acquire) {
+        let unresolved = match (&self.current, &self.report) {
+            (Some(snapshot), Some(report)) => !addresses::unresolved_networks(
+                &snapshot.config.gateway.addresses,
+                &report.networks,
+            )
+            .is_empty(),
+            _ => false,
+        };
+        self.rebind_at = if self.ready.load(Ordering::Acquire) && !unresolved {
             self.rebinds.reset();
             None
         } else {
@@ -492,5 +502,62 @@ mod tests {
         let mut json = serde_json::to_value(snapshot()).unwrap();
         json["runtime"] = serde_json::json!({"workers": 4});
         assert!(decode(&serde_json::to_vec(&json).unwrap()).is_ok());
+    }
+
+    fn sync_loop() -> (SyncLoop, Arc<AtomicBool>) {
+        let perf = PerformanceConfig::default();
+        let data_plane = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let exits = data_plane.listener_exits();
+        let ready = Arc::new(AtomicBool::new(false));
+        let applier = Applier::new(
+            Arc::new(Mutex::new(data_plane)),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+            perf,
+            ready.clone(),
+        );
+        let gateway = GatewayKey::new("ns", "gw");
+        (SyncLoop::new(gateway, applier, ready.clone(), exits), ready)
+    }
+
+    /// A Network address whose interface is not on the pod yet keeps the
+    /// rebinds coming, though the listeners bound another one and the pod
+    /// is Ready: its Multus interface may come up after the first apply.
+    #[tokio::test]
+    async fn an_unresolved_network_keeps_rebinding() {
+        let Some(ip) = addresses::local_interface_ips()
+            .into_iter()
+            .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+        else {
+            return; // no interface off loopback to match
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let on = |addresses: &[&str]| {
+            let config: PortailConfig = serde_json::from_value(serde_json::json!({
+                "gateway": {"name": "gw", "addresses": addresses, "listeners": [
+                    {"name": "http", "protocol": "HTTP", "port": port},
+                ]},
+            }))
+            .unwrap();
+            let gateway = GatewayRef {
+                namespace: "ns".into(),
+                name: "gw".into(),
+                uid: "uid".into(),
+                generation: 1,
+            };
+            let networks = vec![crate::sync::NetworkCidrs {
+                name: "here".into(),
+                cidrs: vec![format!("{ip}/32")],
+            }];
+            Snapshot::from_config(gateway, config, networks)
+        };
+
+        let (mut sync, ready) = sync_loop();
+        sync.serve(on(&["here"])).await;
+        assert!(ready.load(Ordering::Acquire));
+        assert_eq!(sync.rebind_at, None);
+
+        sync.serve(on(&["here", "not-yet"])).await;
+        assert!(ready.load(Ordering::Acquire));
+        assert!(sync.rebind_at.is_some(), "no retry for the late network");
     }
 }
