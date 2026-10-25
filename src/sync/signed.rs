@@ -45,6 +45,15 @@ pub fn new_nonce() -> String {
     STANDARD.encode(bytes)
 }
 
+/// Whether `nonce` is one [`new_nonce`] could have drawn: the controller
+/// signs over nothing else, so a caller cannot have it sign arbitrary
+/// bytes there.
+pub fn valid_nonce(nonce: &str) -> bool {
+    STANDARD
+        .decode(nonce)
+        .is_ok_and(|bytes| bytes.len() == NONCE_BYTES)
+}
+
 /// What a signature vouches for. Its context goes first in the message
 /// signed, then the poll's nonce: a snapshot's signature never passes for
 /// another kind's, an answer to another poll never for this one's, nor a
@@ -425,7 +434,12 @@ mod tests {
     fn nonces_are_sixteen_fresh_bytes() {
         let (a, b) = (new_nonce(), new_nonce());
         assert_ne!(a, b);
-        assert_eq!(STANDARD.decode(&a).unwrap().len(), NONCE_BYTES);
+        assert!(valid_nonce(&a) && valid_nonce(&b));
+        let fifteen = STANDARD.encode([0u8; 15]);
+        let seventeen = STANDARD.encode([0u8; 17]);
+        for bad in ["", "not base64!", fifteen.as_str(), seventeen.as_str()] {
+            assert!(!valid_nonce(bad), "{bad:?}");
+        }
     }
 
     #[test]
