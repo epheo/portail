@@ -323,10 +323,13 @@ impl ControllerCa {
     }
 
     /// The TLS config of the sync endpoint: HTTP/1.1, the current leaf.
+    /// TLS 1.3 only: every peer is a data plane of this build or the
+    /// apiserver's proxy (Go, 1.3 by default), and 1.2 would only add
+    /// weaker handshakes to the surface.
     pub(crate) fn server_config(&self) -> Arc<rustls::ServerConfig> {
         let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
-            .with_safe_default_protocol_versions()
-            .expect("the aws-lc-rs provider supports the default protocol versions")
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("the aws-lc-rs provider supports TLS 1.3")
             .with_no_client_auth()
             .with_cert_resolver(self.serving.clone());
         config.alpn_protocols = vec![b"http/1.1".to_vec()];

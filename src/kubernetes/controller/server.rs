@@ -1778,6 +1778,27 @@ mod tests {
         g.shutdown.cancel();
     }
 
+    /// The sync endpoint speaks TLS 1.3 only.
+    #[tokio::test]
+    async fn a_tls_1_2_client_is_refused() {
+        let (ca, _, name) = tls_client();
+        let f = fixture().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(f.server.clone(), ca.server_config(), listener));
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::pem::PemObject::from_pem_slice(ca.ca_pem().as_bytes()).unwrap())
+            .unwrap();
+        let old = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(old));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        assert!(connector.connect(name, tcp).await.is_err());
+        f.shutdown.cancel();
+    }
+
     /// The CA and a TLS client trusting only it, for the Service's name.
     fn tls_client() -> (
         super::super::ca::ControllerCa,
