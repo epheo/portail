@@ -74,7 +74,11 @@ where
         "CRD not installed, its watcher waits for it: {}",
         watch.kind
     );
-    let writer = reflector::store::Writer::default();
+    let mut writer = reflector::store::Writer::default();
+    // Listed, and empty: a CRD nobody installed holds no object, and the
+    // controller must not wait for its list to call its caches synced.
+    writer.apply_watcher_event(&watcher::Event::Init);
+    writer.apply_watcher_event(&watcher::Event::InitDone);
     let reader = writer.as_reader();
     let (start, started) = tokio::sync::oneshot::channel();
     pending.add(watch, start);
@@ -537,6 +541,23 @@ mod tests {
         );
         assert!(rechecks.is_finished(), "nothing waits: rechecks stop");
         driver.abort();
+    }
+
+    /// A missing CRD's store counts as listed: the caches would otherwise
+    /// never be synced on a cluster without it.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_crd_counts_as_listed() {
+        use gateway_api::experimental::tcproutes::TCPRoute;
+        let api = MockApi::default();
+        discovery_serves_tcproutes(&api, false);
+        let client = api.client();
+        let pending = PendingWatches::default();
+        let (store, _stream) =
+            create_optional_reflector(Api::<TCPRoute>::all(client.clone()), &client, &pending)
+                .await;
+        let ready = tokio::time::timeout(RECHECK, store.wait_until_ready()).await;
+        assert!(matches!(ready, Ok(Ok(()))), "never listed");
+        assert!(store.is_empty());
     }
 
     /// Discovery is read once per resync interval while a CRD is missing.

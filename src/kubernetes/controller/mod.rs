@@ -95,6 +95,22 @@ struct ResourceCache {
     gateway_parameters: Store<GatewayParameters>,
 }
 
+/// Whether every reflector delivered its initial list. Before, a
+/// translation misses objects: it would publish and write status as if they
+/// were gone. The sync server answers 503 until then.
+#[derive(Clone, Default)]
+struct CachesSynced(Arc<std::sync::atomic::AtomicBool>);
+
+impl CachesSynced {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_synced(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 struct ControllerCtx {
     client: Client,
     controller_name: String,
@@ -107,6 +123,7 @@ struct ControllerCtx {
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
     leader: leader::Leader,
+    synced: CachesSynced,
     #[allow(dead_code)] // Read by provision::reconcile once it provisions.
     owned: provision::Owned,
 }
@@ -257,7 +274,42 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         hub: Arc::default(),
         reports: Arc::default(),
         leader: leader.clone(),
+        synced: CachesSynced::default(),
         owned,
+    });
+
+    // Every Gateway is reconciled once the caches are synced: passes before
+    // that returned without a trace.
+    let (caches_synced, synced_trigger) = futures::channel::mpsc::unbounded::<()>();
+    tokio::spawn({
+        let ctx = ctx.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let c = &ctx.cache;
+            let lists: Vec<futures::future::BoxFuture<'_, _>> = vec![
+                Box::pin(c.gateway_classes.wait_until_ready()),
+                Box::pin(c.gateways.wait_until_ready()),
+                Box::pin(c.http_routes.wait_until_ready()),
+                Box::pin(c.tcp_routes.wait_until_ready()),
+                Box::pin(c.tls_routes.wait_until_ready()),
+                Box::pin(c.udp_routes.wait_until_ready()),
+                Box::pin(c.namespaces.wait_until_ready()),
+                Box::pin(c.services.wait_until_ready()),
+                Box::pin(c.secrets.wait_until_ready()),
+                Box::pin(c.reference_grants.wait_until_ready()),
+                Box::pin(c.rate_limit_policies.wait_until_ready()),
+                Box::pin(c.gateway_parameters.wait_until_ready()),
+            ];
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                // Err: a writer dropped, its watch ended: the controller stops.
+                listed = futures::future::try_join_all(lists) => if listed.is_ok() {
+                    ctx.synced.mark();
+                    info!("Caches synced");
+                    let _ = caches_synced.unbounded_send(());
+                }
+            }
+        }
     });
 
     tokio::spawn({
@@ -350,7 +402,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         })
         .reconcile_on(report_triggers)
         .reconcile_on(owned_triggers)
-        .reconcile_all_on(leader.gained())
+        .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx);

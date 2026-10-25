@@ -252,6 +252,9 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         gateway.name_any(),
     );
     debug!("Reconciling Gateway {}", key);
+    if !ctx.synced.is_synced() {
+        return Step::Done(Action::await_change());
+    }
     if !ctx.leader.is_leader() {
         return Step::Done(Action::await_change());
     }
@@ -1238,6 +1241,28 @@ mod tests {
             std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
             "the deleted Gateway's port is released"
         );
+    }
+
+    /// Before every reflector listed, a pass publishes and writes nothing:
+    /// it would serve and report a cluster missing the objects not listed
+    /// yet.
+    #[tokio::test]
+    async fn nothing_is_published_before_the_caches_sync() {
+        let mut p = Pipeline::new();
+        p.ctx
+            .synced
+            .0
+            .store(false, std::sync::atomic::Ordering::Release);
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+
+        p.pass(&gw).await.unwrap();
+        assert!(p.served(&gw).is_none());
+        assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
+
+        p.ctx.synced.mark();
+        p.pass(&gw).await.unwrap();
+        assert!(p.served(&gw).is_some());
     }
 
     /// A pass of a Gateway deleted since it was queued serves nothing: the
