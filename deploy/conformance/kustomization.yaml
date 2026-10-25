@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The install the conformance harness runs on kind, with the image it
+# builds and loads. Apply deploy/crds first: the GatewayParameters below
+# needs its CRD established.
+resources:
+- ../install
+- gatewayparameters.yaml
+images:
+- name: ghcr.io/epheo/portail
+  newTag: latest
+patches:
+- target:
+    kind: Deployment
+    name: portail-controller
+  patch: |-
+    # A :latest image defaults to Always and would be pulled over the
+    # loaded one; a local build bakes no data-plane image reference.
+    - op: add
+      path: /spec/template/spec/containers/0/imagePullPolicy
+      value: IfNotPresent
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --dataplane-image=ghcr.io/epheo/portail:latest
+# Class parameters, so the suite exercises that path.
+- target:
+    kind: GatewayClass
+    name: portail
+  patch: |-
+    - op: add
+      path: /spec/parametersRef
+      value:
+        group: portail.epheo.eu
+        kind: GatewayParameters
+        name: conformance
+        namespace: portail-system
