@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use super::GatewayKey;
 use crate::config::Protocol;
 
-/// The body of `POST /v1/sync`. The instance's identity is the pod its
-/// token is bound to, never a field here.
+/// The body of `POST /v1/sync/{namespace}/{name}`; `gateway` must name the
+/// Gateway of the path. The instance's identity is the pod its token is
+/// bound to, never a field here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRequest {
