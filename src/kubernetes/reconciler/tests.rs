@@ -570,10 +570,14 @@ fn test_multiple_listeners() {
 fn test_tls_terminate_listener() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
+    let certs = HashMap::from([(
+        ("my-cert".to_string(), "default".to_string()),
+        (b"cert".to_vec(), b"key".to_vec()),
+    )]);
     let result = reconcile_to_config(
         &gw,
         &test_snapshot(vec![], vec![], vec![], vec![], &ns_labels, vec![]),
-        &HashMap::new(),
+        &certs,
         &empty_services(),
     )
     .unwrap();
@@ -3513,6 +3517,70 @@ fn udp_route_attaches_like_tcp() {
     );
     assert!(status_of(&result, "older").accepted);
     assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+}
+
+/// DNS over TCP and UDP on one port: both listeners are served, each with
+/// its own kind of route. They were ProtocolConflict, and neither bound.
+#[test]
+fn tcp_and_udp_listeners_on_one_port_both_serve() {
+    let gw = attach_gateway(vec![
+        gw_listener("dns-tcp", 53, "TCP"),
+        gw_listener("dns-udp", 53, "UDP"),
+    ]);
+    let tcp = tcp_route(
+        "t",
+        100,
+        vec![tcp_parent(None, None)],
+        &[&[("127.0.0.1", 7001, 1)]],
+    );
+    let udp = UDPRoute {
+        metadata: ObjectMeta {
+            name: Some("u".to_string()),
+            namespace: Some("default".to_string()),
+            creation_timestamp: created(100),
+            ..Default::default()
+        },
+        spec: UDPRouteSpec {
+            parent_refs: Some(vec![UDPRouteParentRefs {
+                name: "gw".to_string(),
+                port: Some(53),
+                ..Default::default()
+            }]),
+            rules: vec![UDPRouteRules {
+                backend_refs: vec![UDPRouteRulesBackendRefs {
+                    name: "127.0.0.1".to_string(),
+                    port: Some(7002),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        status: None,
+    };
+    let (result, table) = reconcile_table(&gw, &snapshot_of(vec![], vec![tcp], vec![udp]));
+
+    let listeners: Vec<(&str, Protocol)> = result
+        .config
+        .gateway
+        .listeners
+        .iter()
+        .map(|l| (l.name.as_str(), l.protocol.clone()))
+        .collect();
+    assert_eq!(
+        listeners,
+        vec![("dns-tcp", Protocol::TCP), ("dns-udp", Protocol::UDP)]
+    );
+    for (name, listener) in [("t", "dns-tcp"), ("u", "dns-udp")] {
+        let status = status_of(&result, name);
+        assert!(status.accepted, "{name}");
+        assert_eq!(status.listener_names, vec![listener.to_string()], "{name}");
+    }
+    assert_eq!(tcp_backend_port(&table, 53), Some(7001));
+    assert_eq!(
+        table.find_udp_backends(53).unwrap()[0].socket_addr.port(),
+        7002
+    );
 }
 
 /// TLSRoutes claiming the same SNI on one listener overwrote each other in

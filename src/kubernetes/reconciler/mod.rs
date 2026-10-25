@@ -578,8 +578,10 @@ mod policy_tests {
 /// distinct hostnames for HTTP, HTTPS and TLS; TCP and UDP have none. All
 /// indistinct listeners are rejected: the spec forbids picking a winner.
 /// HTTPS and TLS passthrough are one family here: one socket serves both,
-/// told apart by SNI, so only their hostnames must differ. A listener the
-/// data plane does not serve conflicts with none: it is rejected alone, as
+/// told apart by SNI, so only their hostnames must differ. A UDP listener
+/// shares its port with any TCP-borne one: distinct by protocol, and
+/// compatible, as its socket is its own. A listener the data plane does
+/// not serve conflicts with none: it is rejected alone, as
 /// GatewaySpec.listeners has it for TCP listeners an implementation does
 /// not support ("the previous rule does not apply").
 pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
@@ -589,11 +591,15 @@ pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str
             other => other,
         }
     }
+    let udp = |l: &GatewayListeners| l.protocol == "UDP";
     let served: Vec<&GatewayListeners> =
         listeners.iter().filter(|l| listener_is_served(l)).collect();
     let mut conflicts: HashMap<&str, &'static str> = HashMap::new();
     for (i, a) in served.iter().enumerate() {
-        for b in served[i + 1..].iter().filter(|b| b.port == a.port) {
+        for b in served[i + 1..]
+            .iter()
+            .filter(|b| b.port == a.port && udp(a) == udp(b))
+        {
             let reason = if family(&a.protocol) != family(&b.protocol) {
                 "ProtocolConflict"
             } else if matches!(a.protocol.as_str(), "TCP" | "UDP") || a.hostname == b.hostname {
