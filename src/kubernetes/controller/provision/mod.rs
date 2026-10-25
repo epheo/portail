@@ -11,8 +11,9 @@
 mod ports;
 mod render;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -35,7 +36,7 @@ use serde::Serialize;
 
 use super::params::Params;
 use super::watch::{drop_unread_metadata, Listings};
-use super::ControllerCtx;
+use super::{ControllerCtx, ERROR_REQUEUE_SECS};
 use crate::config::PortailConfig;
 use crate::kubernetes::crds::Provisioning;
 use crate::kubernetes::naming::{resource_name, FIELD_MANAGER, LABEL_MANAGED_BY, MANAGED_BY};
@@ -126,6 +127,28 @@ pub(crate) struct Owned {
     pdbs: Store<PartialObjectMeta<PodDisruptionBudget>>,
     controller: ControllerEndpoint,
     applied: AppliedObjects,
+    retries: Retries,
+}
+
+/// Gateways whose provisioning failed with a retry pending, and the
+/// trigger stream the retry goes through.
+struct Retries {
+    trigger: futures::channel::mpsc::UnboundedSender<ObjectRef<Gateway>>,
+    pending: Arc<Mutex<HashSet<ObjectRef<Gateway>>>>,
+}
+
+impl Retries {
+    fn new() -> (
+        Self,
+        futures::channel::mpsc::UnboundedReceiver<ObjectRef<Gateway>>,
+    ) {
+        let (trigger, triggers) = futures::channel::mpsc::unbounded();
+        let retries = Retries {
+            trigger,
+            pending: Arc::default(),
+        };
+        (retries, triggers)
+    }
 }
 
 /// A change to an owned object, as the reflector left its store.
@@ -158,7 +181,8 @@ impl Owned {
             install,
         );
         let applied = AppliedObjects::default();
-        let triggers = futures::stream::select_all([sa_changes, deployment_changes, pdb_changes])
+        let (retries, retried) = Retries::new();
+        let changes = futures::stream::select_all([sa_changes, deployment_changes, pdb_changes])
             .filter_map({
                 let applied = applied.clone();
                 move |touched| {
@@ -169,16 +193,16 @@ impl Owned {
                         .filter(|gateway| gateways.get(gateway).is_some());
                     futures::future::ready(gateway)
                 }
-            })
-            .boxed();
+            });
         let owned = Owned {
             service_accounts,
             deployments,
             pdbs,
             controller,
             applied,
+            retries,
         };
-        (owned, triggers)
+        (owned, futures::stream::select(changes, retried).boxed())
     }
 
     /// Over stores a test fills.
@@ -195,7 +219,35 @@ impl Owned {
             pdbs,
             controller,
             applied: AppliedObjects::default(),
+            retries: Retries::new().0,
         }
+    }
+
+    /// Reconcile `gateway` again at the error cadence, once however many
+    /// passes fail meanwhile.
+    fn retry_later(&self, gateway: ObjectRef<Gateway>) {
+        let pending = self.retries.pending.clone();
+        if !pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(gateway.clone())
+        {
+            return;
+        }
+        let trigger = self.retries.trigger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(ERROR_REQUEUE_SECS)).await;
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&gateway);
+            let _ = trigger.unbounded_send(gateway);
+        });
+    }
+
+    #[cfg(test)]
+    fn retry_pending(&self, gateway: &ObjectRef<Gateway>) -> bool {
+        self.retries.pending.lock().unwrap().contains(gateway)
     }
 
     /// The cached metadata of `kind` `namespace/name`: the label-selected
@@ -420,7 +472,7 @@ fn judge(meta: Option<ObjectMeta>, gateway: &Gateway, install: &str) -> Live {
 
 /// Why a call failed, and what that means for the pass.
 enum Failure {
-    /// A retry may cure it: the pass is skipped and retried.
+    /// A retry may cure it.
     Retry(anyhow::Error),
     /// The apiserver refused the call itself (RBAC, validation): status
     /// says why until something changes.
@@ -465,24 +517,65 @@ impl Wanted {
 }
 
 /// Bring `gateway`'s objects in line with `params` before its snapshot is
-/// published. `Err` is a failure worth retrying (a transport error, 5xx,
-/// a conflict): nothing is published this pass. One a retry will not cure
-/// is `Provisioned::problem`.
+/// published. The snapshot is published whatever happens here: a failed
+/// apply must not hold route and certificate changes back. A refusal a
+/// retry will not cure (RBAC, validation) is `Provisioned::problem`; any
+/// other failure is retried at the error cadence.
 pub(crate) async fn reconcile(
     ctx: &ControllerCtx,
     gateway: &Gateway,
     params: &Params,
 ) -> anyhow::Result<Provisioned> {
-    if params.provisioning == Provisioning::Unmanaged {
-        return match delete_all_but(ctx, gateway, &[]).await {
-            Ok(()) => Ok(Provisioned::unmanaged()),
-            Err(Failure::Refused(problem)) => Ok(Provisioned {
-                problem: Some(problem),
-                ..Provisioned::unmanaged()
-            }),
-            Err(Failure::Retry(e)) => Err(e),
-        };
-    }
+    let unmanaged = params.provisioning == Provisioning::Unmanaged;
+    let result = if unmanaged {
+        delete_all_but(ctx, gateway, &[])
+            .await
+            .map(|()| Provisioned::unmanaged())
+    } else {
+        provision(ctx, gateway, params).await
+    };
+    // On a failure the data planes bind what the live Service targets: the
+    // desired one may not have been applied.
+    let live = || {
+        if unmanaged {
+            BTreeMap::new()
+        } else {
+            owned_service(ctx, gateway)
+                .map(|s| ports::existing_targets(&s))
+                .unwrap_or_default()
+        }
+    };
+    Ok(match result {
+        Ok(provisioned) => provisioned,
+        Err(Failure::Refused(problem)) => Provisioned {
+            bound_ports: live(),
+            problem: Some(problem),
+        },
+        Err(Failure::Retry(e)) => {
+            let namespace = gateway.namespace().unwrap_or_else(|| "default".into());
+            warn!(
+                "Gateway {}/{}: provisioning failed, retrying in {}s: {:#}",
+                namespace,
+                gateway.name_any(),
+                ERROR_REQUEUE_SECS,
+                e
+            );
+            ctx.owned
+                .retry_later(ObjectRef::new(&gateway.name_any()).within(&namespace));
+            Provisioned {
+                bound_ports: live(),
+                problem: None,
+            }
+        }
+    })
+}
+
+/// A Managed Gateway's pass: preflight, apply, delete what is obsolete.
+async fn provision(
+    ctx: &ControllerCtx,
+    gateway: &Gateway,
+    params: &Params,
+) -> Result<Provisioned, Failure> {
     let owned = &ctx.owned;
     let namespace = gateway.namespace().unwrap_or_else(|| "default".into());
     let uid = gateway.metadata.uid.clone().unwrap_or_default();
@@ -522,15 +615,9 @@ pub(crate) async fn reconcile(
             Some(meta) => Some(meta),
             // Not labeled ours, or not listed yet; Services are all cached.
             None if w.kind == Kind::Service => None,
-            None => match get_metadata(&ctx.client, w.kind, &namespace, &name).await {
-                Ok(meta) => meta,
-                Err(e) => {
-                    return refused_or_retry(
-                        Failure::of(e, format!("reading {}/{name}", w.kind.name())),
-                        bound_ports,
-                    )
-                }
-            },
+            None => get_metadata(&ctx.client, w.kind, &namespace, &name)
+                .await
+                .map_err(|e| Failure::of(e, format!("reading {}/{name}", w.kind.name())))?,
         };
         match judge(meta, gateway, &owned.controller.install) {
             Live::Stale => {
@@ -585,43 +672,37 @@ pub(crate) async fn reconcile(
             // instead of being taken over.
             _ => false,
         };
-        match apply(&ctx.client, w, &namespace, &name, force).await {
-            Ok(meta) => {
-                info!(
-                    "Gateway {}/{}: applied {} {}",
-                    namespace,
-                    gateway.name_any(),
-                    w.kind.name(),
-                    name
-                );
-                owned.record(
-                    &uid,
-                    w.kind,
-                    Some(Applied {
-                        uid: meta.uid.unwrap_or_default(),
-                        resource_version: meta.resource_version.unwrap_or_default(),
-                        hash,
-                    }),
-                );
-            }
+        let meta = match apply(&ctx.client, w, &namespace, &name, force).await {
+            Ok(meta) => meta,
             Err(e) => {
                 owned.record(&uid, w.kind, None);
-                return refused_or_retry(
-                    Failure::of(e, format!("applying {}/{name}", w.kind.name())),
-                    bound_ports,
-                );
+                return Err(Failure::of(e, format!("applying {}/{name}", w.kind.name())));
             }
-        }
+        };
+        info!(
+            "Gateway {}/{}: applied {} {}",
+            namespace,
+            gateway.name_any(),
+            w.kind.name(),
+            name
+        );
+        owned.record(
+            &uid,
+            w.kind,
+            Some(Applied {
+                uid: meta.uid.unwrap_or_default(),
+                resource_version: meta.resource_version.unwrap_or_default(),
+                hash,
+            }),
+        );
     }
 
     let keep: Vec<(Kind, &str)> = wanted.iter().map(|w| (w.kind, name.as_str())).collect();
-    match delete_all_but(ctx, gateway, &keep).await {
-        Ok(()) => Ok(Provisioned {
-            bound_ports,
-            problem: None,
-        }),
-        Err(failure) => refused_or_retry(failure, bound_ports),
-    }
+    delete_all_but(ctx, gateway, &keep).await?;
+    Ok(Provisioned {
+        bound_ports,
+        problem: None,
+    })
 }
 
 /// The Service fronting `gateway`'s data plane, if it is ours: a foreign
@@ -633,19 +714,6 @@ pub(crate) fn owned_service(ctx: &ControllerCtx, gateway: &Gateway) -> Option<Ar
         .services
         .get(&ObjectRef::new(&resource_name(&gateway.name_any())).within(&namespace))
         .filter(|s| is_ours(&s.metadata, uid, &ctx.owned.controller.install))
-}
-
-fn refused_or_retry(
-    failure: Failure,
-    bound_ports: BTreeMap<(Transport, u16), u16>,
-) -> anyhow::Result<Provisioned> {
-    match failure {
-        Failure::Refused(problem) => Ok(Provisioned {
-            bound_ports,
-            problem: Some(problem),
-        }),
-        Failure::Retry(e) => Err(e),
-    }
 }
 
 /// The Gateway left this controller (its class names another): delete its
@@ -1412,15 +1480,14 @@ mod tests {
         assert!(release(&ctx, &gateway()).await.is_err());
     }
 
-    /// A refusal a retry will not cure is the problem status shows; a 5xx
-    /// or a conflict is retried with nothing published.
+    /// A refusal a retry will not cure is the problem status shows; a 5xx,
+    /// throttling or a conflict schedules one retry and shows nothing.
     #[tokio::test]
     async fn refused_or_retried() {
         let api = MockApi::default();
         let cluster = TestCluster::default();
         let ctx = cluster.ctx(api.client());
         answer(&api, Kind::ServiceAccount, "sa-uid", "1", None);
-        answer(&api, Kind::Deployment, "d", "1", None);
         fail(&api, Kind::Deployment, NAME, 403);
         let p = params(1, ServiceType::None);
         let provisioned = reconcile(&ctx, &gateway(), &p).await.unwrap();
@@ -1428,10 +1495,57 @@ mod tests {
             provisioned.problem.as_deref(),
             Some("applying Deployment/portail-gw: refused with 403")
         );
-        for code in [409, 500, 503] {
+        let key = ObjectRef::new("gw").within(NS);
+        assert!(!ctx.owned.retry_pending(&key));
+        for code in [409, 429, 500, 503] {
             fail(&api, Kind::Deployment, NAME, code);
-            assert!(reconcile(&ctx, &gateway(), &p).await.is_err(), "{code}");
+            let provisioned = reconcile(&ctx, &gateway(), &p).await.unwrap();
+            assert_eq!(provisioned.problem, None, "{code}");
+            assert!(ctx.owned.retry_pending(&key), "{code}");
         }
+    }
+
+    /// A failed apply (an admission webhook down, throttling) does not hold
+    /// the Gateway's snapshot back: it is published with the targets the
+    /// live Service routes to, and the apply is retried.
+    #[tokio::test]
+    async fn a_failed_apply_still_publishes_the_live_targets() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        apply(
+            &mut cluster.gateway_classes,
+            testkit::gateway_class("portail", CONTROLLER),
+        );
+        own_all(&mut cluster);
+        let mut gw = gateway();
+        // A new listener: the desired Service would target it on 8000.
+        gw.spec.listeners.push(
+            serde_json::from_value(json!(
+                {"name": "https", "port": 443, "protocol": "HTTP"}
+            ))
+            .unwrap(),
+        );
+        apply(&mut cluster.gateways, gw.clone());
+        let ctx = cluster.ctx(api.client());
+        answer(&api, Kind::ServiceAccount, "sa-uid", "1", None);
+        fail(&api, Kind::Deployment, NAME, 500);
+        let Step::Continue(_) = publish(&gw, &ctx).await else {
+            panic!("published");
+        };
+        let snapshot = ctx.hub.current(&testkit::key(&gw)).unwrap();
+        let targets: Vec<Option<u16>> = snapshot
+            .config
+            .gateway
+            .listeners
+            .iter()
+            .map(|l| l.target_port)
+            .collect();
+        assert_eq!(
+            targets,
+            [Some(8123), None],
+            "the live Service's, else published"
+        );
+        assert!(ctx.owned.retry_pending(&ObjectRef::new("gw").within(NS)));
     }
 
     /// A deleted Deployment drops every record of its Gateway; another
