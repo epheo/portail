@@ -132,6 +132,17 @@ impl SyncServer {
             Ok(claimed) => claimed,
             Err(refusal) => return refused(refusal),
         };
+        if !self.serves(&key) {
+            // No review for a Gateway we do not serve: its account cannot
+            // fill the verdict cache. Only a token already reviewed as its
+            // data plane learns that it is gone; anyone else gets the
+            // pre-check's 401, no oracle of Gateway names.
+            return if self.auth.reviewed_for(&token, &key) {
+                not_served()
+            } else {
+                refused(self.auth.refuse_unreviewed())
+            };
+        }
         let instance = match self.auth.authenticate(&claimed, &token, &key, peer).await {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
@@ -716,31 +727,22 @@ mod tests {
 
     /// The store says first: a poll for a Gateway that is not there, or
     /// whose class names another controller, gets 404 and leaves no slot.
-    #[tokio::test]
-    async fn a_gateway_not_ours_is_404_and_gets_no_slot() {
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_not_ours_gets_no_slot() {
         let mut f = fixture();
         let ghost = GatewayKey::new("default", "ghost");
-        f.api.reply_to(
-            REVIEWS,
-            201,
-            review(
-                true,
-                "system:serviceaccount:default:portail-ghost",
-                Some("pod-2"),
-            ),
-        );
         let response = f
             .sync(post(
                 Some(&gateway_token("default", "ghost", 0)),
                 &body(&ghost, "", Some(json!({"applied": "x"}))),
             ))
             .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!f.ctx.hub.remove(&ghost), "no slot was created");
         assert!(f.ctx.reports.live(&ghost).is_empty(), "no report recorded");
 
-        f.api
-            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
+        assert_eq!(f.sync(poll("")).await.status(), StatusCode::NO_CONTENT);
+        assert!(f.ctx.hub.remove(&key()));
         let mut other = testkit::gateway("gw", 1);
         other.spec.gateway_class_name = "theirs".into();
         apply(
@@ -750,6 +752,47 @@ mod tests {
         apply(&mut f.cluster.gateways, other);
         assert_eq!(f.sync(poll("")).await.status(), StatusCode::NOT_FOUND);
         assert!(!f.ctx.hub.remove(&key()));
+    }
+
+    /// A Gateway the store lacks, or of another class, costs no review:
+    /// its account cannot fill the verdict cache, and a stranger gets the
+    /// pre-check's 401, no oracle of Gateway names. A data plane already
+    /// reviewed for it learns it is gone.
+    #[tokio::test]
+    async fn a_gateway_not_served_costs_no_review() {
+        let mut f = fixture();
+        let ghost = GatewayKey::new("default", "ghost");
+        let (status, text) = text_of(
+            f.sync(post(
+                Some(&gateway_token("default", "ghost", 0)),
+                &body(&ghost, "", None),
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (StatusCode::UNAUTHORIZED, "unauthenticated\n")
+        );
+        assert_eq!(f.reviews(), 0);
+
+        let v1 = f.publish(1);
+        assert_eq!(version_of(f.sync(poll("")).await).await, v1);
+        assert_eq!(f.reviews(), 1);
+        let mut theirs = testkit::gateway("gw", 1);
+        theirs.spec.gateway_class_name = "theirs".into();
+        apply(
+            &mut f.cluster.gateway_classes,
+            gateway_class("theirs", "example.com/other"),
+        );
+        apply(&mut f.cluster.gateways, theirs);
+        assert_eq!(f.sync(poll("")).await.status(), StatusCode::NOT_FOUND);
+        let stranger = post(
+            Some(&gateway_token("default", "gw", 1)),
+            &body(&key(), "", None),
+        );
+        assert_eq!(f.sync(stranger).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(f.reviews(), 1, "neither cost a review");
     }
 
     #[tokio::test]
@@ -948,6 +991,11 @@ mod tests {
 
         let ns = super::super::auth::testing::NS;
         let controller = GatewayKey::new(ns, "controller");
+        for name in ["ctl", "controller"] {
+            let mut reserved = testkit::gateway(name, 1);
+            reserved.metadata.namespace = Some(ns.into());
+            apply(&mut f.cluster.gateways, reserved);
+        }
         let wrong_protocol = {
             let mut b = body(&key(), "", None);
             b["protocol"] = json!(PROTOCOL + 1);
@@ -979,7 +1027,7 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             (
-                "an unknown Gateway",
+                "its own account",
                 gateway_token("default", "gw", 5),
                 body(&GatewayKey::new("default", "gw"), "", None),
                 StatusCode::OK,
@@ -998,20 +1046,17 @@ mod tests {
         }
         assert_eq!(metrics::sync_auth_rejected(SyncAuthStage::Authz), authz + 2);
 
-        f.api.reply_to(
-            REVIEWS,
-            201,
-            review(
-                true,
-                "system:serviceaccount:default:portail-web",
-                Some("pod-3"),
-            ),
-        );
+        let reviews = f.reviews();
         let unknown = body(&GatewayKey::new("default", "web"), "", None);
         let response = f
             .sync(post(Some(&gateway_token("default", "web", 7)), &unknown))
             .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unknown Gateway"
+        );
+        assert_eq!(f.reviews(), reviews);
     }
 
     #[tokio::test(start_paused = true)]
