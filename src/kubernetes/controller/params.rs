@@ -74,7 +74,6 @@ pub(crate) fn resolve(ctx: &ControllerCtx, gateway: &Gateway) -> Result<Params, 
 /// Whether `class`'s parametersRef can be used, as its Accepted condition
 /// says: `Err` is Accepted=False InvalidParameters, for the class and its
 /// Gateways alike.
-#[allow(dead_code)] // For gatewayclass.rs (P4): class Accepted.
 pub(crate) fn check_class(ctx: &ControllerCtx, class: &GatewayClass) -> Result<(), String> {
     let layers: Vec<_> = class_layer(&ctx.cache.gateway_parameters, class)?
         .into_iter()

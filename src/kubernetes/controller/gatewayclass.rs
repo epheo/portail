@@ -20,11 +20,12 @@ use gateway_api::experimental::udproutes::UDPRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::httproutes::HTTPRoute;
 
+use super::params;
 use super::reconcile::{class_owner, ClassOwner};
 use super::translate::{observed_policy, observed_route, Observed};
 use super::watch::StatusReports;
 use super::{ControllerCtx, ERROR_REQUEUE_SECS, RESYNC_SECS};
-use crate::kubernetes::crds::{GatewayParameters, RateLimitPolicy};
+use crate::kubernetes::crds::RateLimitPolicy;
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::GatewayRoute;
 use crate::kubernetes::status::{self, GatewayCondition, Write};
@@ -129,7 +130,7 @@ async fn pass(ctx: &ControllerCtx) -> bool {
         {
             continue;
         }
-        let accepted = accepted(&class, &ctx.cache.gateway_parameters);
+        let accepted = accepted(ctx, &class);
         let desired = status::desired_class_status(&class, &accepted);
         ok &= status::write_class_status(&ctx.client, &class, desired).await != Write::Failed;
     }
@@ -139,38 +140,16 @@ async fn pass(ctx: &ControllerCtx) -> bool {
     ok
 }
 
-/// Accepted, or InvalidParameters when the class names parameters that
-/// cannot be found.
-fn accepted(class: &GatewayClass, parameters: &Store<GatewayParameters>) -> GatewayCondition {
-    let accepted = GatewayCondition::ok("Accepted", "GatewayClass accepted by portail controller");
-    let Some(r) = &class.spec.parameters_ref else {
-        return accepted;
-    };
-    let problem = if r.group != "portail.epheo.eu" || r.kind != "GatewayParameters" {
-        format!(
-            "parametersRef names {}/{}; only portail.epheo.eu/GatewayParameters is supported",
-            r.group, r.kind
-        )
-    } else if let Some(ns) = &r.namespace {
-        if parameters
-            .get(&ObjectRef::new(&r.name).within(ns))
-            .is_some()
-        {
-            return accepted;
-        }
-        format!("GatewayParameters {}/{} not found", ns, r.name)
-    } else {
-        // Gateway API GatewayClass.parametersRef: the namespace "MUST be
-        // set for namespace-scoped resources".
-        format!(
-            "parametersRef to GatewayParameters {} has no namespace",
-            r.name
-        )
-    };
-    GatewayCondition {
-        ok: false,
-        reason: "InvalidParameters".into(),
-        message: problem,
+/// Accepted, or InvalidParameters when the class's parameters cannot be
+/// used: the same verdict its Gateways get.
+fn accepted(ctx: &ControllerCtx, class: &GatewayClass) -> GatewayCondition {
+    match params::check_class(ctx, class) {
+        Ok(()) => GatewayCondition::ok("Accepted", "GatewayClass accepted by portail controller"),
+        Err(why) => GatewayCondition {
+            ok: false,
+            reason: "InvalidParameters".into(),
+            message: why,
+        },
     }
 }
 
@@ -309,7 +288,7 @@ async fn remove_departed(client: &Client, controller: &str, departed: Vec<Depart
 mod tests {
     use super::super::testkit::{self, apply, Pipeline, Recorded, CONTROLLER};
     use super::*;
-    use kube::runtime::reflector::store::Writer;
+    use crate::kubernetes::crds::GatewayParameters;
     use kube::runtime::watcher;
     use serde_json::json;
 
@@ -483,44 +462,48 @@ mod tests {
     }
 
     fn with_ref(group: &str, kind: &str, namespace: Option<&str>) -> GatewayClass {
+        naming(group, kind, namespace, "public")
+    }
+
+    fn naming(group: &str, kind: &str, namespace: Option<&str>, name: &str) -> GatewayClass {
         let mut class = class("portail", CONTROLLER);
         class.spec.parameters_ref = Some(gateway_api::gatewayclasses::GatewayClassParametersRef {
             group: group.into(),
             kind: kind.into(),
-            name: "public".into(),
+            name: name.into(),
             namespace: namespace.map(Into::into),
         });
         class
     }
 
-    /// Parameters named but not usable: InvalidParameters, with why.
-    #[test]
-    fn class_parameters_that_cannot_be_found_are_invalid() {
-        let mut writer = Writer::<GatewayParameters>::default();
-        apply(&mut writer, parameters("public"));
-        let store = writer.as_reader();
+    /// Parameters named but not usable, by reference or by content:
+    /// InvalidParameters, with why, as their Gateways get it.
+    #[tokio::test]
+    async fn class_parameters_that_cannot_be_used_are_invalid() {
+        let mut p = Pipeline::new();
+        apply(&mut p.cluster.parameters, parameters("public"));
+        let mut static_ips = parameters("static-ips");
+        static_ips.spec =
+            serde_yaml::from_str("replicas: 2\nnetworks: [{name: br-ex, ips: [172.16.87.21/24]}]")
+                .unwrap();
+        apply(&mut p.cluster.parameters, static_ips);
+        let mut no_replicas = parameters("no-replicas");
+        no_replicas.spec = serde_yaml::from_str("replicas: 0").unwrap();
+        apply(&mut p.cluster.parameters, no_replicas);
         let group = "portail.epheo.eu";
+        let kind = "GatewayParameters";
+        let ns = Some("portail-system");
 
-        assert!(accepted(&class("portail", CONTROLLER), &store).ok);
-        assert!(
-            accepted(
-                &with_ref(group, "GatewayParameters", Some("portail-system")),
-                &store
-            )
-            .ok
-        );
+        assert!(accepted(&p.ctx, &class("portail", CONTROLLER)).ok);
+        assert!(accepted(&p.ctx, &with_ref(group, kind, ns)).ok);
         for (class, why) in [
-            (
-                with_ref("example.com", "Config", Some("portail-system")),
-                "example.com/Config",
-            ),
-            (with_ref(group, "GatewayParameters", None), "no namespace"),
-            (
-                with_ref(group, "GatewayParameters", Some("elsewhere")),
-                "not found",
-            ),
+            (with_ref("example.com", "Config", ns), "not a Config"),
+            (with_ref(group, kind, None), "needs a namespace"),
+            (with_ref(group, kind, Some("elsewhere")), "not found"),
+            (naming(group, kind, ns, "static-ips"), "need replicas 1"),
+            (naming(group, kind, ns, "no-replicas"), "at least 1"),
         ] {
-            let condition = accepted(&class, &store);
+            let condition = accepted(&p.ctx, &class);
             assert!(!condition.ok, "{why}");
             assert_eq!(condition.reason, "InvalidParameters");
             assert!(condition.message.contains(why), "{}", condition.message);

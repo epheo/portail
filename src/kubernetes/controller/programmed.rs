@@ -3,22 +3,20 @@
 //! published version bound, never the spec alone.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::time::Duration;
 
 use gateway_api::gateways::Gateway;
 use k8s_openapi::api::core::v1::Service;
-use kube::runtime::reflector::ObjectRef;
 use kube::ResourceExt;
 use serde_json::Value;
 use tokio::time::Instant;
 
+use super::provision;
 use super::reports::InstanceId;
 use super::translate::Statuses;
 use super::ControllerCtx;
 use crate::dataplane::addresses::{bind_addresses_resolved, unresolved_networks};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
-use crate::kubernetes::naming;
 use crate::kubernetes::status::{self, condition, GatewayCondition, ListenerStatus};
 use crate::logging::debug;
 use crate::sync::{GatewayKey, InstanceReport, Snapshot, HOLD};
@@ -68,7 +66,9 @@ pub(crate) fn gateway_status(
 ) -> GatewayStatus {
     let served = ctx.hub.current(key);
     let reports = ctx.reports.live(key);
-    let service = owned_service(ctx, gateway);
+    // A Service on its way out no longer routes to the Gateway.
+    let service =
+        provision::owned_service(ctx, gateway).filter(|s| s.metadata.deletion_timestamp.is_none());
     decide(&Inputs {
         gateway,
         accepted: &statuses.accepted,
@@ -87,27 +87,6 @@ pub(crate) fn gateway_status(
         last_leaving: ctx.reports.last_leaving(key),
         now: Instant::now(),
     })
-}
-
-/// The Service provisioning made for `gateway`: its name, a controller
-/// ownerReference to this Gateway's uid, our managed-by label. A
-/// hand-written Service of that name is not the Gateway's address.
-fn owned_service(ctx: &ControllerCtx, gateway: &Gateway) -> Option<Arc<Service>> {
-    let uid = gateway.metadata.uid.as_deref()?;
-    let name = naming::resource_name(&gateway.name_any());
-    let ns = gateway.namespace()?;
-    let svc = ctx.cache.services.get(&ObjectRef::new(&name).within(&ns))?;
-    let owned = svc.metadata.deletion_timestamp.is_none()
-        && svc
-            .labels()
-            .get(naming::LABEL_MANAGED_BY)
-            .map(String::as_str)
-            == Some(naming::MANAGED_BY)
-        && svc
-            .owner_references()
-            .iter()
-            .any(|o| o.controller == Some(true) && o.uid == uid);
-    owned.then_some(svc)
 }
 
 /// What a Gateway's status is computed from.
@@ -595,6 +574,7 @@ mod tests {
     use super::*;
     use crate::sync::{EndpointReport, GatewayRef, ListenerReport, Transport};
     use serde_json::json;
+    use std::sync::Arc;
 
     const V1: &str = "v1";
 
@@ -1492,29 +1472,5 @@ mod tests {
         );
         assert_eq!(write.body["metadata"]["uid"], "gw-uid");
         assert_eq!(write.body["metadata"]["resourceVersion"], "1");
-    }
-
-    /// A Service of the Gateway's name not made for it is not its address.
-    #[tokio::test]
-    async fn only_an_owned_service_fronts_the_gateway() {
-        let mut cluster = testkit::TestCluster::default();
-        let gw = gateway(1, &[]);
-        let mut foreign = load_balancer(json!([{"ip": "203.0.113.7"}]));
-        foreign.metadata.owner_references = None;
-        apply(&mut cluster.services, foreign);
-        let ctx = cluster.ctx(testkit::MockApi::default().client());
-        assert!(owned_service(&ctx, &gw).is_none());
-
-        apply(
-            &mut cluster.services,
-            load_balancer(json!([{"ip": "203.0.113.7"}])),
-        );
-        assert!(owned_service(&ctx, &gw).is_some());
-        let mut recreated = gw.clone();
-        recreated.metadata.uid = Some("gw-uid-2".into());
-        assert!(
-            owned_service(&ctx, &recreated).is_none(),
-            "the old Gateway's"
-        );
     }
 }
