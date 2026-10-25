@@ -242,6 +242,44 @@ fn follows_versions_204s_and_404s() {
     wait_serving(&dp, port, "b");
 }
 
+/// A snapshot signed by anyone but the controller is not served: the
+/// table stays, the next reports say why under the version served, and
+/// the controller's next snapshot is served as usual.
+#[test]
+fn a_snapshot_the_controller_did_not_sign_is_not_served() {
+    let (a, b) = (TestBackend::spawn("a"), TestBackend::spawn("b"));
+    let port = free_port();
+    let first = http_snapshot(port, a.addr);
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(first.clone())));
+    let dp = start_dataplane(&stub, &[]);
+    wait_serving(&dp, port, "a");
+    assert!(stub.wait_for(0, SETTLE, applied(&first.version)).is_some());
+
+    let from = stub.requests().len();
+    let second = http_snapshot(port, b.addr);
+    stub.set(Mode::Forged(second.clone()));
+    let refused = stub
+        .wait_for(from, SETTLE, |r| {
+            r.request.report.as_ref().is_some_and(|report| {
+                report
+                    .apply_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("snapshot refused"))
+            })
+        })
+        .unwrap_or_else(|| panic!("no refusal reported:\n{}", dp.process.output()));
+    assert_eq!(refused.request.have, first.version);
+    assert_eq!(refused.request.report.unwrap().applied, first.version);
+    assert_eq!(get(port, "/").unwrap().1, b"a");
+
+    stub.set(Mode::Serve(Some(second.clone())));
+    wait_serving(&dp, port, "b");
+    let clean = stub
+        .wait_for(from, SETTLE, applied(&second.version))
+        .unwrap();
+    assert_eq!(clean.request.report.unwrap().apply_error, None);
+}
+
 /// A 503 closes the connection, so the Service can pick a replica again,
 /// and its Retry-After wins over the backoff.
 #[test]
