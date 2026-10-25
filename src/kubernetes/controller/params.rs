@@ -246,9 +246,13 @@ fn merge(
 /// The merged parameters with every default filled in, checked across
 /// fields.
 fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params, String> {
+    let provisioning = spec.provisioning.unwrap_or(Provisioning::Managed);
     let replicas = spec.replicas.unwrap_or(1);
     let networks = spec.networks.unwrap_or_default();
-    if replicas > 1
+    // Unmanaged pods are their owner's: replicas and networks render
+    // nothing there.
+    if provisioning == Provisioning::Managed
+        && replicas > 1
         && networks
             .iter()
             .any(|n| n.ips.iter().flatten().next().is_some())
@@ -273,7 +277,7 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
                 ServiceType::LoadBalancer
             });
     Ok(Params {
-        provisioning: spec.provisioning.unwrap_or(Provisioning::Managed),
+        provisioning,
         replicas,
         image: spec.image.unwrap_or_default(),
         resources,
@@ -540,6 +544,26 @@ networks: [{name: br-ex-network, namespace: default, ips: [172.16.87.21/24]}]
         );
         let err = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap_err();
         assert!(err.contains("static ips need replicas 1, not 2"), "{err}");
+    }
+
+    /// Replicas and networks are Managed fields: an Unmanaged Gateway's
+    /// pods are the owner's, however many and wherever their IPs.
+    #[tokio::test]
+    async fn static_ips_with_two_replicas_are_fine_unmanaged() {
+        let mut cluster = cluster(None);
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "provisioning: Unmanaged
+replicas: 2
+networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
+",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.provisioning, Provisioning::Unmanaged);
     }
 
     /// The class's replicas meet the Gateway's static ips: the merged
