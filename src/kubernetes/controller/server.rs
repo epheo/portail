@@ -177,8 +177,14 @@ impl SyncServer {
             return not_served();
         }
         if let Some(report) = sync.report {
+            let leaving = report.leaving;
             self.ctx.reports.record(&key, instance.clone(), report);
             self.lapses.seen(&key, &instance);
+            // A stopping data plane waits on this answer before it drains:
+            // there is nothing left to hold it for.
+            if leaving {
+                return no_content();
+            }
         }
         self.poll(&key, &sync.have, &instance).await
     }
@@ -1031,6 +1037,24 @@ mod tests {
             f.ctx.reports.live(&key()).is_empty(),
             "the wake sees it gone"
         );
+    }
+
+    /// A stopping data plane's last report is taken and answered at once:
+    /// it waits on that answer, bounded, before it drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaving_report_is_answered_at_once() {
+        let f = fixture();
+        let v1 = f.publish(1);
+        let started = Instant::now();
+        let response = f
+            .sync(post(
+                Some(&gateway_token("default", "gw", 0)),
+                &body(&key(), &v1, Some(json!({"applied": v1, "leaving": true}))),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(f.ctx.reports.live(&key()).is_empty(), "no longer live");
     }
 
     #[tokio::test(start_paused = true)]
