@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: portail-controller
     app.kubernetes.io/name: portail
     gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
     portail.epheo.eu/gateway: public
   name: portail-public
   namespace: edge
@@ -23,6 +24,7 @@ metadata:
     app.kubernetes.io/managed-by: portail-controller
     app.kubernetes.io/name: portail
     gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
     portail.epheo.eu/gateway: public
   name: portail-public
   namespace: edge
@@ -48,6 +50,7 @@ spec:
         app.kubernetes.io/managed-by: portail-controller
         app.kubernetes.io/name: portail
         gateway.networking.k8s.io/gateway-name: public
+        portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
         portail.epheo.eu/gateway: public
     spec:
       automountServiceAccountToken: false
@@ -139,6 +142,7 @@ metadata:
     app.kubernetes.io/managed-by: portail-controller
     app.kubernetes.io/name: portail
     gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
     portail.epheo.eu/gateway: public
   name: portail-public
   namespace: edge
@@ -169,6 +173,7 @@ metadata:
     app.kubernetes.io/managed-by: portail-controller
     app.kubernetes.io/name: portail
     gateway.networking.k8s.io/gateway-name: public
+    portail.epheo.eu/controller-name: epheo.eu-portail-afb1ac62
     portail.epheo.eu/gateway: public
   name: portail-public
   namespace: edge

@@ -30,8 +30,9 @@ use crate::kubernetes::naming::{
 };
 use crate::sync::Transport;
 
-/// How a Managed data plane reaches the controller, rendered into its pod
-/// template.
+/// The controller as its Managed data planes see it: where to reach it,
+/// how to trust it, and the install identity every object it provisions
+/// carries.
 #[derive(Clone, Debug)]
 pub(crate) struct ControllerEndpoint {
     /// The controller Service's sync URL.
@@ -41,6 +42,8 @@ pub(crate) struct ControllerEndpoint {
     /// The controller CA, which the data plane verifies the controller
     /// against.
     pub ca_pem: String,
+    /// [`LABEL_CONTROLLER`]'s value for this install.
+    pub install: String,
 }
 
 impl ControllerEndpoint {
@@ -52,6 +55,7 @@ impl ControllerEndpoint {
             ),
             audience: controller_audience(&args.service_name, &args.namespace),
             ca_pem,
+            install: install_label(&args.controller_name),
         }
     }
 
@@ -62,7 +66,50 @@ impl ControllerEndpoint {
             address: "https://portail-controller.portail-system.svc:9443".into(),
             audience: "portail-controller.portail-system.svc".into(),
             ca_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+            install: install_label(super::super::testkit::CONTROLLER),
         }
+    }
+}
+
+/// The install an object belongs to, valued by [`install_label`]. Every
+/// portail install writes managed-by portail-controller and owns its
+/// objects by Gateway uid; only this tells two installs (two
+/// controllerNames) apart, so one never deletes or takes over the other's
+/// objects when a Gateway moves between their classes.
+pub(crate) const LABEL_CONTROLLER: &str = "portail.epheo.eu/controller-name";
+
+/// Hex digits of SHA-256 a shortened value ends with, as naming's.
+const HASH_HEX_DIGITS: usize = 8;
+
+/// A controllerName as a label value: as it is when it is one, else with
+/// each character a label value refuses (its '/' at least) turned to '-',
+/// cut to fit, and a hash of the whole name appended, so two names never
+/// share a value.
+pub(crate) fn install_label(controller_name: &str) -> String {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let edge = |c: char| c.is_ascii_alphanumeric();
+    let max = crate::sync::MAX_DNS1123_LABEL;
+    if controller_name.len() <= max
+        && controller_name.chars().all(allowed)
+        && controller_name.starts_with(edge)
+        && controller_name.ends_with(edge)
+    {
+        return controller_name.to_string();
+    }
+    let cleaned: String = controller_name
+        .chars()
+        .map(|c| if allowed(c) { c } else { '-' })
+        .collect();
+    let keep = max - 1 - HASH_HEX_DIGITS;
+    let cut = cleaned
+        .get(..keep)
+        .unwrap_or(&cleaned)
+        .trim_matches(|c: char| !edge(c));
+    let hash = &crate::sync::sha256_hex(controller_name.as_bytes())[..HASH_HEX_DIGITS];
+    if cut.is_empty() {
+        hash.to_string()
+    } else {
+        format!("{cut}-{hash}")
     }
 }
 
@@ -131,6 +178,7 @@ fn render(
         (LABEL_MANAGED_BY, MANAGED_BY),
         (LABEL_GATEWAY, value.as_str()),
         (LABEL_GATEWAY_NAME, value.as_str()),
+        (LABEL_CONTROLLER, controller.install.as_str()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -714,6 +762,32 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
             ),
             None
         );
+    }
+
+    /// Any controllerName gets a valid label value; two names never share
+    /// one.
+    #[test]
+    fn an_install_label_for_every_controller_name() {
+        assert_eq!(install_label("portail-a"), "portail-a");
+        let default = install_label("portail.epheo.eu/gateway-controller");
+        assert!(
+            default.starts_with("portail.epheo.eu-gateway-controller-"),
+            "{default}"
+        );
+        let long = format!("example.com/{}", "x".repeat(80));
+        for name in ["a/b", "a-b", "example.com/~weird%path!", long.as_str(), "/"] {
+            let value = install_label(name);
+            assert!(value.len() <= 63, "{value}");
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                    && value.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && value.ends_with(|c: char| c.is_ascii_alphanumeric()),
+                "{name}: {value}"
+            );
+        }
+        assert_ne!(install_label("a/b"), install_label("a-b"));
     }
 
     #[test]

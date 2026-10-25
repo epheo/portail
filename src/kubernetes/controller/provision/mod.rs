@@ -2,11 +2,11 @@
 //! Service and PodDisruptionBudget, named by `naming::resource_name`,
 //! server-side applied, owned by the Gateway.
 //!
-//! Ours is an object with a controller ownerReference to the Gateway's uid.
-//! Any other object under a wanted name is foreign and stops the whole
-//! apply: no stray LoadBalancer next to a hand-written Deployment. Only
-//! objects that are ours and labeled managed-by portail-controller are ever
-//! deleted.
+//! Ours is an object with a controller ownerReference to the Gateway's uid
+//! and this install's identity label. Any other object under a wanted name
+//! is foreign and stops the whole apply: no stray LoadBalancer next to a
+//! hand-written Deployment. Only objects that are ours and labeled
+//! managed-by portail-controller are ever deleted.
 
 mod ports;
 mod render;
@@ -146,12 +146,17 @@ impl Owned {
         listings: &Listings,
         controller: ControllerEndpoint,
     ) -> (Self, BoxStream<'static, ObjectRef<Gateway>>) {
+        let install = controller.install.as_str();
         let (service_accounts, sa_changes) =
-            owned_reflector::<ServiceAccount>(client, listings, Kind::ServiceAccount);
+            owned_reflector::<ServiceAccount>(client, listings, Kind::ServiceAccount, install);
         let (deployments, deployment_changes) =
-            owned_reflector::<Deployment>(client, listings, Kind::Deployment);
-        let (pdbs, pdb_changes) =
-            owned_reflector::<PodDisruptionBudget>(client, listings, Kind::PodDisruptionBudget);
+            owned_reflector::<Deployment>(client, listings, Kind::Deployment, install);
+        let (pdbs, pdb_changes) = owned_reflector::<PodDisruptionBudget>(
+            client,
+            listings,
+            Kind::PodDisruptionBudget,
+            install,
+        );
         let applied = AppliedObjects::default();
         let triggers = futures::stream::select_all([sa_changes, deployment_changes, pdb_changes])
             .filter_map({
@@ -239,11 +244,8 @@ impl Owned {
             )
             .filter(|(_, m)| {
                 m.namespace.as_deref() == Some(namespace)
-                    && is_ours(m, gateway_uid)
-                    && m.labels
-                        .as_ref()
-                        .and_then(|l| l.get(LABEL_MANAGED_BY))
-                        .is_some_and(|v| v == MANAGED_BY)
+                    && is_ours(m, gateway_uid, &self.controller.install)
+                    && label(m, LABEL_MANAGED_BY) == Some(MANAGED_BY)
             })
             .map(|(kind, m)| (kind, m.clone()))
             .collect()
@@ -271,11 +273,13 @@ impl Owned {
     }
 }
 
-/// A label-selected metadata reflector of `K` across namespaces.
+/// A metadata reflector of `K` across namespaces, selecting this install's
+/// objects.
 fn owned_reflector<K>(
     client: &Client,
     listings: &Listings,
     kind: Kind,
+    install: &str,
 ) -> (Store<PartialObjectMeta<K>>, BoxStream<'static, Touched>)
 where
     K: Resource<DynamicType = (), Scope = NamespaceResourceScope>
@@ -289,7 +293,10 @@ where
     let tracker = listings.track(kind.name(), false);
     let writer = Writer::default();
     let store = writer.as_reader();
-    let config = watcher::Config::default().labels(&format!("{LABEL_MANAGED_BY}={MANAGED_BY}"));
+    let config = watcher::Config::default().labels(&format!(
+        "{LABEL_MANAGED_BY}={MANAGED_BY},{}={install}",
+        render::LABEL_CONTROLLER
+    ));
     let changes = reflector(
         writer,
         metadata_watcher(Api::<K>::all(client.clone()), config)
@@ -366,8 +373,14 @@ fn controller_gateway(meta: &ObjectMeta) -> Option<ObjectRef<Gateway>> {
     Some(ObjectRef::new(&owner.name).within(meta.namespace.as_deref()?))
 }
 
-fn is_ours(meta: &ObjectMeta, gateway_uid: &str) -> bool {
-    controller_owner(meta).is_some_and(|o| !gateway_uid.is_empty() && o.uid == gateway_uid)
+fn label<'a>(meta: &'a ObjectMeta, key: &str) -> Option<&'a str> {
+    meta.labels.as_ref()?.get(key).map(String::as_str)
+}
+
+/// Controlled by the Gateway of `gateway_uid`, and this install's.
+fn is_ours(meta: &ObjectMeta, gateway_uid: &str, install: &str) -> bool {
+    label(meta, render::LABEL_CONTROLLER) == Some(install)
+        && controller_owner(meta).is_some_and(|o| !gateway_uid.is_empty() && o.uid == gateway_uid)
 }
 
 /// An object under a wanted name, as this Gateway sees it.
@@ -377,25 +390,30 @@ enum Live {
         uid: String,
         resource_version: String,
     },
-    /// Its controller is a deleted Gateway of the same name: foreign until
-    /// garbage collection takes it.
+    /// This install's, its controller a deleted Gateway of the same name:
+    /// foreign until garbage collection takes it.
     Stale,
     Foreign,
 }
 
-fn judge(meta: Option<ObjectMeta>, gateway: &Gateway) -> Live {
+fn judge(meta: Option<ObjectMeta>, gateway: &Gateway, install: &str) -> Live {
     let Some(meta) = meta else {
         return Live::Absent;
     };
     let uid = gateway.metadata.uid.as_deref().unwrap_or_default();
-    if is_ours(&meta, uid) {
+    if is_ours(&meta, uid, install) {
         return Live::Ours {
             uid: meta.uid.unwrap_or_default(),
             resource_version: meta.resource_version.unwrap_or_default(),
         };
     }
     match controller_owner(&meta) {
-        Some(o) if o.name == gateway.name_any() => Live::Stale,
+        Some(o)
+            if o.name == gateway.name_any()
+                && label(&meta, render::LABEL_CONTROLLER) == Some(install) =>
+        {
+            Live::Stale
+        }
         _ => Live::Foreign,
     }
 }
@@ -514,7 +532,7 @@ pub(crate) async fn reconcile(
                 }
             },
         };
-        match judge(meta, gateway) {
+        match judge(meta, gateway, &owned.controller.install) {
             Live::Stale => {
                 stale = true;
                 conflicts.push(format!("{}/{name}", w.kind.name()));
@@ -611,7 +629,7 @@ pub(crate) fn owned_service(ctx: &ControllerCtx, gateway: &Gateway) -> Option<Ar
     ctx.cache
         .services
         .get(&ObjectRef::new(&resource_name(&gateway.name_any())).within(&namespace))
-        .filter(|s| is_ours(&s.metadata, uid))
+        .filter(|s| is_ours(&s.metadata, uid, &ctx.owned.controller.install))
 }
 
 fn refused_or_retry(
@@ -802,8 +820,16 @@ mod tests {
             namespace: Some(NS.into()),
             uid: Some(object_uid.into()),
             resource_version: Some("1".into()),
-            labels: labeled
-                .then(|| [(LABEL_MANAGED_BY.to_string(), MANAGED_BY.to_string())].into()),
+            labels: labeled.then(|| {
+                [
+                    (LABEL_MANAGED_BY.to_string(), MANAGED_BY.to_string()),
+                    (
+                        render::LABEL_CONTROLLER.to_string(),
+                        ControllerEndpoint::for_tests().install,
+                    ),
+                ]
+                .into()
+            }),
             owner_references: Some(vec![OwnerReference {
                 api_version: "gateway.networking.k8s.io/v1".into(),
                 kind: "Gateway".into(),
@@ -814,6 +840,15 @@ mod tests {
             }]),
             ..Default::default()
         }
+    }
+
+    /// `meta` as another install (another controllerName) labels it.
+    fn of_another_install(mut meta: ObjectMeta) -> ObjectMeta {
+        meta.labels.get_or_insert_default().insert(
+            render::LABEL_CONTROLLER.into(),
+            render::install_label("example.com/other"),
+        );
+        meta
     }
 
     fn partial<K>(metadata: ObjectMeta) -> PartialObjectMeta<K> {
@@ -1262,10 +1297,10 @@ mod tests {
         assert_eq!(accepted["reason"], "InvalidParameters", "{accepted}");
     }
 
-    /// A class naming another controller releases the Gateway's objects in
-    /// the pass; nothing is applied.
+    /// Our objects go when our Gateway moves to another controller's class;
+    /// nothing is applied.
     #[tokio::test]
-    async fn a_class_of_another_controller_releases_the_objects() {
+    async fn our_objects_go_when_the_gateway_moves_to_another_controller() {
         let api = MockApi::default();
         let mut cluster = TestCluster::default();
         apply(
@@ -1289,6 +1324,69 @@ mod tests {
         };
         assert_eq!(deletes(&api).len(), 4);
         assert_eq!(writes(&api).len(), 4, "deletes only");
+    }
+
+    /// Another install releases every Gateway of a class it does not run,
+    /// ours included: objects carrying our identity are never its to
+    /// delete, Services included, which every install caches whole.
+    #[tokio::test]
+    async fn another_install_never_touches_our_objects() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        // Seen from this install, the Gateway is another controller's.
+        apply(
+            &mut cluster.gateway_classes,
+            testkit::gateway_class("portail", "example.com/other"),
+        );
+        let theirs = |kind: &str| {
+            of_another_install(meta(NAME, "gw", "gw-uid", &format!("{kind}-uid"), true))
+        };
+        apply(&mut cluster.service_accounts, partial(theirs("sa")));
+        apply(&mut cluster.deployments, partial(theirs("deployment")));
+        apply(&mut cluster.pdbs, partial(theirs("pdb")));
+        apply(
+            &mut cluster.services,
+            Service {
+                metadata: theirs("service"),
+                ..Default::default()
+            },
+        );
+        let gw = gateway();
+        apply(&mut cluster.gateways, gw.clone());
+        let ctx = cluster.ctx(api.client());
+        let Step::Done(_) = publish(&gw, &ctx).await else {
+            panic!("not ours: no pass");
+        };
+        assert!(api.requests().is_empty(), "{:?}", writes(&api));
+    }
+
+    /// An object of another install under a wanted name is foreign, even
+    /// owned by this Gateway (it moved between the installs' classes): it
+    /// is not taken over.
+    #[tokio::test]
+    async fn another_installs_object_is_foreign() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        apply(
+            &mut cluster.deployments,
+            partial(of_another_install(meta(
+                NAME,
+                "gw",
+                "gw-uid",
+                "deployment-uid",
+                true,
+            ))),
+        );
+        let ctx = cluster.ctx(api.client());
+        answer(&api, Kind::ServiceAccount, "new", "1", None);
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None))
+            .await
+            .unwrap();
+        assert_eq!(
+            provisioned.problem.as_deref(),
+            Some("name conflict: Deployment/portail-gw is not owned by this Gateway")
+        );
+        assert!(writes(&api).is_empty(), "{:?}", writes(&api));
     }
 
     /// A delete that finds the object gone or replaced is done; one the
