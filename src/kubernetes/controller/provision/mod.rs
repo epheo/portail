@@ -555,8 +555,11 @@ pub(crate) async fn reconcile(
                  collection)",
             );
         }
+        // Published ports: whatever runs under those names (a hand-written
+        // data plane as the Gateway's ServiceAccount, the Gateway left
+        // Managed by mistake) binds what it bound, nothing remapped.
         return Ok(Provisioned {
-            bound_ports,
+            bound_ports: BTreeMap::new(),
             problem: Some(problem),
         });
     }
@@ -1011,13 +1014,14 @@ mod tests {
             "1",
             Some(json!({"name": NAME, "namespace": NS, "uid": "hand-written"})),
         );
-        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::None))
+        let provisioned = reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer))
             .await
             .unwrap();
         assert_eq!(
             provisioned.problem.as_deref(),
             Some("name conflict: Deployment/portail-gw is not owned by this Gateway")
         );
+        assert!(provisioned.bound_ports.is_empty(), "published ports");
         assert!(writes(&api).is_empty(), "{:?}", writes(&api));
     }
 
@@ -1535,6 +1539,11 @@ mod tests {
         let Step::Continue(pass) = publish(&gw, &ctx).await else {
             panic!("a pass");
         };
+        // Whoever runs under the conflicting names (a hand-written data
+        // plane as portail-gw, the Gateway left Managed by mistake) keeps
+        // its published ports: nothing it binds is remapped.
+        let snapshot = ctx.hub.current(&testkit::key(&gw)).unwrap();
+        assert_eq!(snapshot.config.gateway.listeners[0].target_port, None);
         finish(&gw, &ctx, *pass).await.unwrap();
         let patch = api.status_patch("gateways", "gw").unwrap();
         let programmed = patch["status"]["conditions"]
