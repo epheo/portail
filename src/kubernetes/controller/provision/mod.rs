@@ -470,11 +470,7 @@ pub(crate) async fn reconcile(
     let uid = gateway.metadata.uid.clone().unwrap_or_default();
     let name = resource_name(&gateway.name_any());
 
-    let existing = ctx
-        .cache
-        .services
-        .get(&ObjectRef::new(&name).within(&namespace))
-        .filter(|s| is_ours(&s.metadata, &uid))
+    let existing = owned_service(ctx, gateway)
         .map(|s| ports::existing_targets(&s))
         .unwrap_or_default();
     let (objects, bound_ports) = render::desired(gateway, params, &existing, &owned.controller);
@@ -605,6 +601,17 @@ pub(crate) async fn reconcile(
         }),
         Err(failure) => refused_or_retry(failure, bound_ports),
     }
+}
+
+/// The Service fronting `gateway`'s data plane, if it is ours: a foreign
+/// Service under its name says nothing about it, its addresses included.
+pub(crate) fn owned_service(ctx: &ControllerCtx, gateway: &Gateway) -> Option<Arc<Service>> {
+    let uid = gateway.metadata.uid.as_deref()?;
+    let namespace = gateway.namespace().unwrap_or_else(|| "default".into());
+    ctx.cache
+        .services
+        .get(&ObjectRef::new(&resource_name(&gateway.name_any())).within(&namespace))
+        .filter(|s| is_ours(&s.metadata, uid))
 }
 
 fn refused_or_retry(
@@ -1354,6 +1361,19 @@ mod tests {
         assert!(!kinds.contains(&Kind::PodDisruptionBudget) && kinds.len() == 2);
         forget_deleted(&applied, &gone(Kind::Deployment));
         assert!(applied.lock().unwrap().is_empty());
+    }
+
+    /// Only a Service of ours fronts the Gateway: a foreign one under its
+    /// name gives neither targets nor addresses.
+    #[tokio::test]
+    async fn only_our_service_fronts_the_gateway() {
+        let mut cluster = TestCluster::default();
+        own_all(&mut cluster);
+        let ctx = cluster.ctx(MockApi::default().client());
+        assert!(owned_service(&ctx, &gateway()).is_some());
+        let mut namesake = gateway();
+        namesake.metadata.uid = Some("other-uid".into());
+        assert!(owned_service(&ctx, &namesake).is_none());
     }
 
     /// An owned object triggers its Gateway; another object none.
