@@ -345,74 +345,58 @@ pub(super) async fn finish(
         invalid_parameters,
         published,
     } = pass;
-    let (mut statuses, error): (Statuses, Option<String>) = match plan {
+    let (statuses, error): (Statuses, Option<String>) = match plan {
         Ok(plan) => (plan.statuses, None),
         Err(rejected) => (rejected.statuses, Some(rejected.error)),
     };
-    if let Some(message) = invalid_parameters {
-        statuses.accepted = status::GatewayCondition {
-            ok: false,
-            reason: "InvalidParameters".into(),
-            message,
-        };
-    }
-
-    let served = ctx.hub.current(&key);
-    let reports = ctx.reports.live(&key);
-    let mut programmed = programmed::evaluate(
-        gateway,
-        &key,
-        &ctx.hub,
-        served.as_deref(),
-        &reports,
-        &mut statuses.listeners,
-    );
-    if let Some(e) = &error {
-        programmed.condition =
-            status::GatewayCondition::invalid(format!("Reconciliation failed: {}", e));
-    } else if let Some(problem) = &provisioned.problem {
-        programmed.condition = status::GatewayCondition::invalid(problem.clone());
-    }
-    let is_programmed = programmed.condition.ok;
+    let unpublished = match (invalid_parameters, &error) {
+        (Some(message), _) => Some(programmed::Unpublished::InvalidParameters(message)),
+        (None, Some(e)) => Some(programmed::Unpublished::Rejected(e.clone())),
+        (None, None) => None,
+    };
 
     // Status is compared with what the store holds, object by object, so a
     // spec bump, a recreated Gateway or a wiped status is written again, and
     // the echo of our own write is not.
     let listener_route_counts = count_attached_routes(&gateway.spec.listeners, &statuses.routes);
-    let mut writes = Writes::default();
-    writes.record(
-        status::write_gateway_status(
-            &ctx.client,
-            gateway,
-            status::desired_gateway_status(
-                gateway,
-                &statuses.accepted,
-                &programmed.condition,
-                &listener_route_counts,
-                &statuses.listeners,
-                &programmed.usable,
-                true,
-            ),
-        )
-        .await,
+    let gateway_status = programmed::gateway_status(
+        ctx,
+        gateway,
+        &key,
+        &statuses,
+        &listener_route_counts,
+        provisioned.problem.as_deref(),
+        unpublished.as_ref(),
     );
-    write_route_statuses(
-        ctx,
-        &key,
-        &statuses.routes,
-        &statuses.observed_routes,
-        is_programmed,
-        &mut writes,
-    )
-    .await;
-    write_policy_statuses(
-        ctx,
-        &key,
-        &statuses.policies,
-        &statuses.observed_policies,
-        &mut writes,
-    )
-    .await;
+    let is_programmed = gateway_status.programmed;
+    let mut writes = Writes::default();
+    writes.record(status::write_gateway_status(&ctx.client, gateway, gateway_status.desired).await);
+    // Route entries name the Gateway, not its uid: none from a pass of a
+    // Gateway deleted or recreated since.
+    let current = ctx
+        .cache
+        .gateways
+        .get(&ObjectRef::new(&key.name).within(&key.namespace))
+        .is_some_and(|now| now.metadata.uid == gateway.metadata.uid);
+    if gateway_status.routes && current {
+        write_route_statuses(
+            ctx,
+            &key,
+            &statuses.routes,
+            &statuses.observed_routes,
+            is_programmed,
+            &mut writes,
+        )
+        .await;
+        write_policy_statuses(
+            ctx,
+            &key,
+            &statuses.policies,
+            &statuses.observed_policies,
+            &mut writes,
+        )
+        .await;
+    }
 
     if let Some(e) = error {
         return Err(ReconcileError(e));
@@ -434,7 +418,10 @@ pub(super) async fn finish(
         debug!("Gateway {} unchanged: nothing published or written", key);
         skip_requeue_secs(is_programmed, all_routes_accepted)
     };
-    Ok(Action::requeue(Duration::from_secs(requeue_secs)))
+    let requeue = Duration::from_secs(requeue_secs);
+    Ok(Action::requeue(
+        gateway_status.recheck.map_or(requeue, |r| r.min(requeue)),
+    ))
 }
 
 pub(super) async fn reconcile(
@@ -1311,6 +1298,45 @@ mod tests {
 
         p.pass(&new).await.unwrap();
         assert_eq!(p.served(&new).unwrap().gateway.uid, "gw-uid-2");
+    }
+
+    /// Parameters that cannot be used publish nothing, and no status comes
+    /// from the translation that was not published: a route's and the
+    /// listeners' stay as written for the published one. Both were written
+    /// from the unpublished translation.
+    #[tokio::test]
+    async fn invalid_parameters_write_nothing_of_the_unpublished_translation() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        let route = testkit::http_route("r", &["gw"], 1);
+        apply(&mut p.cluster.http_routes, route.clone());
+        p.pass(&gw).await.unwrap();
+        let mut route =
+            testkit::with_route_status(route, &p.api.status_patch("httproutes", "r").unwrap());
+        route.metadata.generation = Some(2);
+        apply(&mut p.cluster.http_routes, route);
+        let mut gw =
+            testkit::with_gateway_status(gw, &p.api.status_patch("gateways", "gw").unwrap());
+        gw.metadata.generation = Some(2);
+        gw.spec.listeners[0].name = "renamed".into();
+        apply(&mut p.cluster.gateways, gw.clone());
+
+        p.api.clear();
+        let pass = Pass {
+            key: testkit::key(&gw),
+            plan: translate(&p.ctx, &gw).await,
+            provisioned: Provisioned::unmanaged(),
+            invalid_parameters: Some("GatewayParameters default/missing not found".into()),
+            published: false,
+        };
+        finish(&gw, &p.ctx, pass).await.unwrap();
+        assert!(p.api.status_patch("httproutes", "r").is_none());
+        let patch = p.api.status_patch("gateways", "gw").unwrap();
+        assert_eq!(patch["status"]["listeners"][0]["name"], "http", "{patch}");
+        let accepted = &patch["status"]["conditions"][0];
+        assert_eq!(accepted["reason"], "InvalidParameters");
+        assert_eq!(accepted["observedGeneration"], 2);
     }
 
     /// A TCP listener carries the oldest route; the newer one is Conflicted

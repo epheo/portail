@@ -2,7 +2,6 @@
 //! timestamps, compared with the observed status, written only when they
 //! differ. Timestamps are added at write time.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 
 use k8s_openapi::chrono::Utc;
@@ -12,10 +11,11 @@ use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use gateway_api::gateways::Gateway;
+use gateway_api::gatewayclasses::GatewayClass;
+use gateway_api::gateways::{Gateway, GatewayListeners};
 
-use crate::kubernetes::addresses::{UsableAddresses, NETWORK_ADDRESS_TYPE};
-
+use crate::kubernetes::features::SUPPORTED_FEATURES;
+use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::logging::{debug, warn};
 
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
@@ -79,7 +79,7 @@ pub(crate) enum Write {
 
 /// One condition without `lastTransitionTime`, so a desired status compares
 /// with an observed one; [`stamp_conditions`] adds the time at write.
-fn condition(
+pub(crate) fn condition(
     cond_type: &str,
     ok: bool,
     reason: &str,
@@ -188,110 +188,77 @@ impl GatewayCondition {
     }
 }
 
-/// The Gateway status portail owns, without timestamps: the listeners
-/// always; conditions and addresses only with `manage_conditions`, since
-/// portail-operator owns them otherwise.
-pub(crate) fn desired_gateway_status(
-    gateway: &Gateway,
-    accepted: &GatewayCondition,
-    programmed: &GatewayCondition,
-    listener_route_counts: &HashMap<String, i32>,
-    listener_statuses: &HashMap<String, ListenerStatus>,
-    usable: &UsableAddresses,
-    manage_conditions: bool,
+/// One `status.listeners` entry, without timestamps.
+pub(crate) fn listener_entry(
+    listener: &GatewayListeners,
+    ls: &ListenerStatus,
+    attached_routes: i32,
+    generation: Option<i64>,
 ) -> Value {
-    let generation = gateway.metadata.generation;
-    let listeners: Vec<Value> = gateway
-        .spec
-        .listeners
-        .iter()
-        .map(|l| {
-            let attached = listener_route_counts.get(&l.name).copied().unwrap_or(0);
-            let ls = listener_statuses.get(&l.name).cloned().unwrap_or_default();
-            json!({
-                "name": l.name,
-                "attachedRoutes": attached,
-                "supportedKinds": if ls.supported_kinds.is_empty() && ls.resolved_refs {
-                    supported_kinds_for_protocol(&l.protocol)
-                } else {
-                    ls.supported_kinds.clone()
-                },
-                "conditions": [
-                    condition("Accepted", ls.accepted, &ls.accepted_reason, &ls.accepted_message, generation),
-                    condition("Programmed", ls.programmed, &ls.programmed_reason, &ls.programmed_message, generation),
-                    condition("ResolvedRefs", ls.resolved_refs, &ls.resolved_refs_reason, &ls.resolved_refs_message, generation),
-                    condition("Conflicted", ls.conflicted, &ls.conflicted_reason, &ls.conflicted_message, generation),
-                ],
-            })
-        })
-        .collect();
+    json!({
+        "name": listener.name,
+        "attachedRoutes": attached_routes,
+        "supportedKinds": if ls.supported_kinds.is_empty() && ls.resolved_refs {
+            supported_kinds_for_protocol(&listener.protocol)
+        } else {
+            ls.supported_kinds.clone()
+        },
+        "conditions": [
+            condition("Accepted", ls.accepted, &ls.accepted_reason, &ls.accepted_message, generation),
+            condition("Programmed", ls.programmed, &ls.programmed_reason, &ls.programmed_message, generation),
+            condition("ResolvedRefs", ls.resolved_refs, &ls.resolved_refs_reason, &ls.resolved_refs_message, generation),
+            condition("Conflicted", ls.conflicted, &ls.conflicted_reason, &ls.conflicted_message, generation),
+        ],
+    })
+}
 
-    let mut status = json!({ "listeners": listeners });
-    if manage_conditions {
-        // Accepted=True may carry ListenersNotValid: some listeners rejected.
-        status["conditions"] = json!([
-            condition(
-                "Accepted",
-                accepted.ok,
-                &accepted.reason,
-                &accepted.message,
-                generation
-            ),
-            condition(
-                "Programmed",
-                programmed.ok,
-                &programmed.reason,
-                &programmed.message,
-                generation
-            ),
-        ]);
-        status["addresses"] = json!(status_addresses(gateway, usable));
+/// One `status.addresses` entry.
+pub(crate) fn address(address_type: &str, value: &str) -> Value {
+    json!({ "type": address_type, "value": value })
+}
+
+/// The Gateway status this controller owns, without timestamps:
+/// `[Accepted, Programmed]`, every listener entry, and the addresses.
+/// `addresses: None` leaves the field out: no placeholder is ever written.
+pub(crate) fn desired_gateway_status(
+    conditions: [Value; 2],
+    listeners: Vec<Value>,
+    addresses: Option<Vec<Value>>,
+) -> Value {
+    let mut status = json!({ "conditions": conditions, "listeners": listeners });
+    if let Some(addresses) = addresses {
+        status["addresses"] = json!(addresses);
     }
     status
 }
 
-/// status.addresses from local address discovery: the spec's addresses this
-/// pod has (Network entries as their resolved IP), else the pod's own IP.
-fn status_addresses(gateway: &Gateway, usable: &UsableAddresses) -> Vec<Value> {
-    let Some(spec_addrs) = gateway.spec.addresses.as_deref().filter(|a| !a.is_empty()) else {
-        return vec![json!({
-            "type": "IPAddress",
-            "value": usable.preferred_ip(),
-        })];
-    };
-    let known = usable.all();
-    spec_addrs
+/// The Gateway status as the store holds it, `{}` when it has none.
+pub(crate) fn observed_gateway_status(gateway: &Gateway) -> Value {
+    gateway
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// The condition of `cond_type` in an observed `conditions` list, without
+/// its lastTransitionTime: written again, it keeps that time.
+pub(crate) fn observed_condition(conditions: &Value, cond_type: &str) -> Option<Value> {
+    conditions
+        .as_array()?
         .iter()
-        .filter_map(|a| {
-            let addr_type = a.r#type.as_deref().unwrap_or("IPAddress");
-            match addr_type {
-                t if t == NETWORK_ADDRESS_TYPE => {
-                    let name = a.value.as_deref().unwrap_or("");
-                    let ip = usable.network_ips.get(name)?;
-                    Some(json!({
-                        "type": "IPAddress",
-                        "value": ip,
-                    }))
-                }
-                "IPAddress" => {
-                    let v = a.value.as_deref().unwrap_or("");
-                    (usable.is_empty() || known.contains(v)).then(|| {
-                        json!({
-                            "type": "IPAddress",
-                            "value": v,
-                        })
-                    })
-                }
-                "Hostname" => a.value.as_ref().map(|v| {
-                    json!({
-                        "type": "Hostname",
-                        "value": v,
-                    })
-                }),
-                _ => None,
-            }
-        })
-        .collect()
+        .find(|c| str_at(c, "type") == cond_type)
+        .map(without_transition_times)
+}
+
+/// An observed list (`listeners`, `addresses`) without lastTransitionTimes,
+/// `None` when absent or empty.
+pub(crate) fn observed_list(status: &Value, field: &str) -> Option<Vec<Value>> {
+    status
+        .get(field)
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .map(|items| items.iter().map(without_transition_times).collect())
 }
 
 /// Whether the observed Gateway status already carries `desired`, timestamps
@@ -309,11 +276,8 @@ fn gateway_status_current(observed: &Value, desired: &Value) -> bool {
     if by_key(observed.get("listeners"), "name") != by_key(desired.get("listeners"), "name") {
         return false;
     }
-    if let Some(conditions) = desired.get("conditions").and_then(Value::as_array) {
-        let observed_conditions = by_key(observed.get("conditions"), "type");
-        if !conditions.iter().all(|c| observed_conditions.contains(c)) {
-            return false;
-        }
+    if !conditions_current(observed, desired) {
+        return false;
     }
     let empty = json!([]);
     match desired.get("addresses") {
@@ -322,29 +286,87 @@ fn gateway_status_current(observed: &Value, desired: &Value) -> bool {
     }
 }
 
-/// Bring the Gateway status to `desired`, which must come from
-/// [`desired_gateway_status`] for this Gateway. Server-side apply: portail's
-/// field manager owns exactly what `desired` lists.
-pub(crate) async fn write_gateway_status(
-    client: &Client,
-    gateway: &Gateway,
-    mut desired: Value,
-) -> Write {
-    let observed = gateway
-        .status
-        .as_ref()
-        .and_then(|s| serde_json::to_value(s).ok())
-        .unwrap_or_else(|| json!({}));
-    if gateway_status_current(&observed, &desired) {
-        return Write::Current;
-    }
+/// Whether every desired condition is among the observed ones, timestamps
+/// aside. Another writer's condition types do not make ours stale.
+fn conditions_current(observed: &Value, desired: &Value) -> bool {
+    let observed: Vec<Value> = observed
+        .get("conditions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(without_transition_times).collect())
+        .unwrap_or_default();
+    desired
+        .get("conditions")
+        .and_then(Value::as_array)
+        .is_none_or(|conditions| conditions.iter().all(|c| observed.contains(c)))
+}
 
-    let now = now();
+/// Server-side apply `status` onto `obj` as this pass read it: a pass for
+/// an object deleted (or changed) since never writes onto the one there
+/// now, a recreated one of the same name included.
+///
+/// Both the uid and the resourceVersion read are preconditions. The
+/// resourceVersion is the one a CRD's status subresource enforces: its
+/// update strategy takes every field but status from the stored object, uid
+/// included, before validation compares uids.
+async fn apply_status<K>(api: Api<K>, obj: &K, status: Value) -> Write
+where
+    K: kube::Resource + Clone + DeserializeOwned + Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    let dt = Default::default();
+    let name = obj.name_any();
+    let what = match obj.namespace() {
+        Some(ns) => format!("{} {}/{}", K::kind(&dt), ns, name),
+        None => format!("{} {}", K::kind(&dt), name),
+    };
+    let meta = obj.meta();
+    let mut metadata = json!({ "name": name });
+    if let Some(ns) = &meta.namespace {
+        metadata["namespace"] = json!(ns);
+    }
+    if let Some(uid) = &meta.uid {
+        metadata["uid"] = json!(uid);
+    }
+    if let Some(rv) = &meta.resource_version {
+        metadata["resourceVersion"] = json!(rv);
+    }
+    let body = json!({
+        "apiVersion": K::api_version(&dt),
+        "kind": K::kind(&dt),
+        "metadata": metadata,
+        "status": status,
+    });
+    match api
+        .patch_status(
+            &name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(body),
+        )
+        .await
+    {
+        Ok(_) => {
+            debug!("Updated {} status", what);
+            Write::Patched
+        }
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            debug!("{} changed since read; its update re-runs this pass", what);
+            Write::Failed
+        }
+        Err(e) => {
+            warn!("Failed to update {} status: {}", what, e);
+            Write::Failed
+        }
+    }
+}
+
+/// Stamp each condition of `desired` (top level and per listener) from the
+/// observed one of the same type.
+fn stamp_status(desired: &mut Value, observed: &Value, now: &str) {
     let observed_conditions = observed["conditions"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    stamp_conditions(&mut desired, &observed_conditions, &now);
+    stamp_conditions(desired, &observed_conditions, now);
     if let Some(listeners) = desired.get_mut("listeners").and_then(Value::as_array_mut) {
         for listener in listeners {
             let prior = observed["listeners"]
@@ -353,39 +375,86 @@ pub(crate) async fn write_gateway_status(
                 .and_then(|p| p["conditions"].as_array())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            stamp_conditions(listener, prior, &now);
+            stamp_conditions(listener, prior, now);
         }
     }
+}
 
-    let name = gateway.name_any();
-    let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
-    let body = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": {
-            "name": name,
-            "namespace": ns,
-        },
-        "status": desired,
-    });
-    let api: Api<Gateway> = Api::namespaced(client.clone(), &ns);
-    match api
-        .patch_status(
-            &name,
-            &PatchParams::apply("portail").force(),
-            &Patch::Apply(body),
-        )
-        .await
-    {
-        Ok(_) => {
-            debug!("Updated Gateway {}/{} status", ns, name);
-            Write::Patched
-        }
-        Err(e) => {
-            warn!("Failed to update Gateway {}/{} status: {}", ns, name, e);
-            Write::Failed
-        }
+/// Bring the Gateway status to `desired`, which must come from
+/// [`desired_gateway_status`] for this Gateway. Server-side apply: the
+/// field manager owns exactly what `desired` lists.
+pub(crate) async fn write_gateway_status(
+    client: &Client,
+    gateway: &Gateway,
+    mut desired: Value,
+) -> Write {
+    let observed = observed_gateway_status(gateway);
+    if gateway_status_current(&observed, &desired) {
+        return Write::Current;
     }
+    stamp_status(&mut desired, &observed, &now());
+    let ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
+    apply_status(
+        Api::<Gateway>::namespaced(client.clone(), &ns),
+        gateway,
+        desired,
+    )
+    .await
+}
+
+/// The GatewayClass status this controller owns, without timestamps:
+/// Accepted and the supported features, sorted by name as the field
+/// requires.
+pub(crate) fn desired_class_status(class: &GatewayClass, accepted: &GatewayCondition) -> Value {
+    let mut features: Vec<&str> = SUPPORTED_FEATURES.to_vec();
+    features.sort_unstable();
+    features.dedup();
+    json!({
+        "conditions": [condition(
+            "Accepted",
+            accepted.ok,
+            &accepted.reason,
+            &accepted.message,
+            class.metadata.generation,
+        )],
+        "supportedFeatures": features
+            .iter()
+            .map(|name| json!({ "name": name }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn feature_names(status: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = status
+        .get("supportedFeatures")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|f| str_at(f, "name")).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+}
+
+fn class_status_current(observed: &Value, desired: &Value) -> bool {
+    conditions_current(observed, desired) && feature_names(observed) == feature_names(desired)
+}
+
+/// Bring the GatewayClass status to `desired`, from
+/// [`desired_class_status`] for this class.
+pub(crate) async fn write_class_status(
+    client: &Client,
+    class: &GatewayClass,
+    mut desired: Value,
+) -> Write {
+    let observed = class
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if class_status_current(&observed, &desired) {
+        return Write::Current;
+    }
+    stamp_status(&mut desired, &observed, &now());
+    apply_status(Api::<GatewayClass>::all(client.clone()), class, desired).await
 }
 
 /// Per-parent status entry for a route.
@@ -567,11 +636,74 @@ where
         return Write::Current;
     }
     let stamped = stamp_owned(desired, &observed.entries, is_ours, ref_field, &now());
+    let entries = merge_owned(&observed.entries, is_ours, stamped);
+    patch_entries::<K>(
+        client,
+        namespace,
+        name,
+        list_field,
+        observed,
+        entries,
+        field_manager,
+    )
+    .await
+}
+
+/// Remove the entries `departed` picks from an atomic status list, every
+/// other entry kept verbatim; the same read-modify-write as
+/// [`write_owned_entries`].
+pub(crate) async fn remove_entries<K>(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    list_field: &str,
+    observed: &ObservedEntries,
+    departed: impl Fn(&Value) -> bool,
+    field_manager: &str,
+) -> Write
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    if !observed.entries.iter().any(&departed) {
+        return Write::Current;
+    }
+    let entries = merge_owned(&observed.entries, departed, vec![]);
+    patch_entries::<K>(
+        client,
+        namespace,
+        name,
+        list_field,
+        observed,
+        entries,
+        field_manager,
+    )
+    .await
+}
+
+/// Write `entries` as the whole `status.<list_field>`, on the condition
+/// that the object is still at the resourceVersion they were read from.
+async fn patch_entries<K>(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    list_field: &str,
+    observed: &ObservedEntries,
+    entries: Vec<Value>,
+    field_manager: &str,
+) -> Write
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
     let mut status = serde_json::Map::new();
-    status.insert(
-        list_field.to_string(),
-        Value::Array(merge_owned(&observed.entries, is_ours, stamped)),
-    );
+    status.insert(list_field.to_string(), Value::Array(entries));
     let mut patch = json!({ "status": status });
     if let Some(rv) = &observed.resource_version {
         patch["metadata"] = json!({ "resourceVersion": rv });
@@ -859,12 +991,13 @@ mod tests {
     }
 
     fn gateway() -> Gateway {
-        use gateway_api::gateways::{GatewayListeners, GatewaySpec};
+        use gateway_api::gateways::GatewaySpec;
         Gateway {
             metadata: kube::core::ObjectMeta {
                 name: Some("gw".into()),
                 namespace: Some("default".into()),
                 generation: Some(5),
+                uid: Some("gw-uid".into()),
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -886,33 +1019,25 @@ mod tests {
         }
     }
 
-    fn desired_for(gw: &Gateway, manage: bool) -> Value {
-        let statuses: HashMap<String, ListenerStatus> = gw
-            .spec
-            .listeners
-            .iter()
-            .map(|l| {
-                let ls = ListenerStatus {
-                    accepted: true,
-                    resolved_refs: true,
-                    programmed: true,
-                    ..Default::default()
-                };
-                (l.name.clone(), ls)
-            })
-            .collect();
-        let usable = UsableAddresses {
-            interface_ips: vec!["10.0.0.1".into()],
-            network_ips: HashMap::new(),
+    fn desired_for(gw: &Gateway, addresses: Option<Vec<Value>>) -> Value {
+        let generation = gw.metadata.generation;
+        let ls = ListenerStatus {
+            accepted: true,
+            resolved_refs: true,
+            programmed: true,
+            ..Default::default()
         };
         desired_gateway_status(
-            gw,
-            &GatewayCondition::ok("Accepted", "ok"),
-            &GatewayCondition::ok("Programmed", "ok"),
-            &HashMap::new(),
-            &statuses,
-            &usable,
-            manage,
+            [
+                condition("Accepted", true, "Accepted", "ok", generation),
+                condition("Programmed", true, "Programmed", "ok", generation),
+            ],
+            gw.spec
+                .listeners
+                .iter()
+                .map(|l| listener_entry(l, &ls, 0, generation))
+                .collect(),
+            addresses,
         )
     }
 
@@ -920,11 +1045,7 @@ mod tests {
     /// Gateway status, listeners in reverse to show order does not matter.
     fn stored_gateway_status(desired: &Value) -> Value {
         let mut written = desired.clone();
-        let now = now();
-        stamp_conditions(&mut written, &[], &now);
-        for l in written["listeners"].as_array_mut().unwrap() {
-            stamp_conditions(l, &[], &now);
-        }
+        stamp_status(&mut written, &json!({}), &now());
         written["listeners"].as_array_mut().unwrap().reverse();
         let typed: gateway_api::gateways::GatewayStatus = serde_json::from_value(written).unwrap();
         serde_json::to_value(typed).unwrap()
@@ -933,30 +1054,39 @@ mod tests {
     #[test]
     fn written_gateway_status_reads_back_current() {
         let gw = gateway();
-        for manage in [true, false] {
-            let desired = desired_for(&gw, manage);
+        let addresses = Some(vec![address("IPAddress", "10.0.0.1")]);
+        for addresses in [addresses, None] {
+            let desired = desired_for(&gw, addresses.clone());
             assert!(!gateway_status_current(&json!({}), &desired));
             let stored = stored_gateway_status(&desired);
-            assert!(gateway_status_current(&stored, &desired), "manage={manage}");
+            assert!(gateway_status_current(&stored, &desired), "{addresses:?}");
         }
     }
 
-    /// Generation, a wiped status and a foreign condition type each decide
-    /// on their own whether a write is due.
+    /// Generation, a wiped status, moved addresses and a foreign condition
+    /// type each decide on their own whether a write is due.
     #[test]
     fn gateway_status_diff_sees_generation_and_wipes() {
         let mut gw = gateway();
-        let stored = stored_gateway_status(&desired_for(&gw, true));
+        let addresses = Some(vec![address("IPAddress", "10.0.0.1")]);
+        let stored = stored_gateway_status(&desired_for(&gw, addresses.clone()));
 
         gw.metadata.generation = Some(6);
-        assert!(!gateway_status_current(&stored, &desired_for(&gw, true)));
-        assert!(!gateway_status_current(&stored, &desired_for(&gw, false)));
+        assert!(!gateway_status_current(
+            &stored,
+            &desired_for(&gw, addresses.clone())
+        ));
 
         gw.metadata.generation = Some(5);
-        let desired = desired_for(&gw, true);
+        let desired = desired_for(&gw, addresses);
         let mut wiped = stored.clone();
         wiped.as_object_mut().unwrap().remove("listeners");
         assert!(!gateway_status_current(&wiped, &desired));
+
+        let moved = desired_for(&gw, Some(vec![address("IPAddress", "10.0.0.2")]));
+        assert!(!gateway_status_current(&stored, &moved));
+        // No addresses to say: the observed ones are not ours to judge.
+        assert!(gateway_status_current(&stored, &desired_for(&gw, None)));
 
         // Another writer's condition type does not make ours stale.
         let mut with_foreign = stored.clone();
@@ -971,5 +1101,106 @@ mod tests {
                 "lastTransitionTime": "2020-01-01T00:00:00Z",
             }));
         assert!(gateway_status_current(&with_foreign, &desired));
+    }
+
+    /// An observed condition taken back carries no time, so it compares
+    /// equal to what the store holds and is stamped with the time it had.
+    #[test]
+    fn a_kept_condition_keeps_its_time() {
+        let stored = stored_gateway_status(&desired_for(&gateway(), None));
+        let kept = observed_condition(&stored["conditions"], "Programmed").unwrap();
+        assert!(kept.get("lastTransitionTime").is_none());
+        assert_eq!(kept["observedGeneration"], 5);
+        let mut rewritten = json!({ "conditions": [kept] });
+        stamp_status(&mut rewritten, &stored, "2099-01-01T00:00:00Z");
+        assert_eq!(
+            rewritten["conditions"][0]["lastTransitionTime"],
+            stored["conditions"][1]["lastTransitionTime"]
+        );
+        assert!(observed_condition(&stored["conditions"], "Ready").is_none());
+        assert!(observed_list(&json!({ "addresses": [] }), "addresses").is_none());
+    }
+
+    fn class(generation: i64) -> GatewayClass {
+        let mut class: GatewayClass = serde_json::from_value(json!({
+            "metadata": {"name": "portail", "uid": "class-uid"},
+            "spec": {"controllerName": "epheo.eu/portail"},
+        }))
+        .unwrap();
+        class.metadata.generation = Some(generation);
+        class
+    }
+
+    /// `desired` as the store holds it once written.
+    fn stored_class_status(desired: &Value) -> Value {
+        let mut written = desired.clone();
+        stamp_status(&mut written, &json!({}), &now());
+        let typed: gateway_api::gatewayclasses::GatewayClassStatus =
+            serde_json::from_value(written).unwrap();
+        serde_json::to_value(typed).unwrap()
+    }
+
+    /// Accepted with the class generation, every supported feature once,
+    /// sorted by name; the echo of the write is current.
+    #[test]
+    fn class_status_is_accepted_with_sorted_features() {
+        let accepted = GatewayCondition::ok("Accepted", "ok");
+        let desired = desired_class_status(&class(3), &accepted);
+        assert_eq!(desired["conditions"][0]["observedGeneration"], 3);
+        assert_eq!(desired["conditions"][0]["status"], "True");
+        let names = feature_names(&desired);
+        let mut expected: Vec<&str> = SUPPORTED_FEATURES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        let listed: Vec<&str> = desired["supportedFeatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, expected, "written sorted");
+
+        let stored = stored_class_status(&desired);
+        assert!(class_status_current(&stored, &desired));
+        assert!(!class_status_current(&json!({}), &desired));
+        let bumped = desired_class_status(&class(4), &accepted);
+        assert!(!class_status_current(&stored, &bumped));
+        let invalid = desired_class_status(
+            &class(3),
+            &GatewayCondition {
+                ok: false,
+                reason: "InvalidParameters".into(),
+                message: "missing".into(),
+            },
+        );
+        assert!(!class_status_current(&stored, &invalid));
+
+        let mut frozen = stored.clone();
+        frozen["supportedFeatures"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "GatewayStaticAddresses"}));
+        assert!(
+            !class_status_current(&frozen, &desired),
+            "a stale feature list"
+        );
+    }
+
+    /// The departed entries go, every other entry stays verbatim.
+    #[test]
+    fn departed_entries_leave_the_rest() {
+        let existing = vec![
+            parent_entry("portail", "gone", None, None, "departed"),
+            parent_entry("other", "gone", None, None, "foreign"),
+            parent_entry("portail", "gw", None, None, "live"),
+        ];
+        let departed =
+            |e: &Value| e["controllerName"] == "portail" && e["parentRef"]["name"] == "gone";
+        let kept = merge_owned(&existing, departed, vec![]);
+        let reasons: Vec<&str> = kept
+            .iter()
+            .map(|e| e["conditions"][0]["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["foreign", "live"]);
     }
 }
