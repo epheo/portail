@@ -223,19 +223,24 @@ The pod gets:
 
 - `--transport apiserver-proxy`;
 - a second projected volume at `/var/run/secrets/portail.epheo.eu/apiserver`: a token of the API audience, one hour, rotated by kubelet, and `kube-root-ca.crt`;
-- still `automountServiceAccountToken: false`: the API token is opt-in per Gateway, and its RBAC allows the one proxy call.
+- still `automountServiceAccountToken: false`: the API token is opt-in per Gateway.
+
+The API token is good for whatever the ServiceAccount may do, not only the proxy call: its groups' bindings come with it, `system:serviceaccounts`, `system:serviceaccounts:<namespace>` and `system:authenticated`, and on OpenShift what those are bound to, such as `basic-user` and `system:image-puller`.
 
 An Unmanaged data plane does the same by hand: `--transport apiserver-proxy`, and the two files at the `--apiserver-token-file` and `--apiserver-ca-file` paths ([configuration](configuration.md#portail-dataplane)).
 
 Trust:
 
 - The data plane's TLS ends at the apiserver, verified against `kube-root-ca.crt` as `kubernetes.default.svc`; the apiserver dials the controller without verifying it.
-- So the data plane takes a snapshot, or a "Gateway gone", only when the controller signed it (see [Security](#security)): whoever may edit the controller Service or its endpoints cannot forge a configuration. They could replay an older snapshot the controller signed for the same Gateway.
+- So the data plane takes an answer only when the controller signed it for that poll (see [Security](#security)): whoever may edit the controller Service or its endpoints can neither forge a configuration nor replay an older one.
 - The controller authenticates the data plane as on Direct: a TokenReview of its controller token, carried in `X-Portail-Token` since the apiserver takes `Authorization` for its own hop.
-- The controller's per-peer limits do not apply to the apiserver's endpoints, read from the EndpointSlices of `default/kubernetes` every 10 minutes: every proxied data plane arrives from them, authenticated and authorized by the apiserver. Its global limits still apply.
+- Trust boundary: whoever can modify the controller Service or its EndpointSlices, and run a pod in the controller namespace, receives the proxied data planes' controller tokens, which the apiserver forwards to the endpoint it picks. That access is admin of the controller namespace, which reads the CA Secret anyway.
+- Follow-up: end-to-end TLS through an HTTP Upgrade tunnel across the apiserver would close that.
 
 Scale:
 
+- On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod. The controller caps open connections per address with `--sync-peer-connections` (default 32; a data plane holds one or two): set it to at least twice the Primary UDN data planes per apiserver node.
+- Reviews of new tokens from one address are paced, two at once and five a second, not refused: after a controller restart such a fleet reconnects over a few seconds.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
 - Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
@@ -282,8 +287,9 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
-- It signs every snapshot and every "Gateway gone" answer with its serving key, never the CA's. A data plane takes an answer only when the signing certificate chains to the controller CA, names the controller Service and is valid now, and the signature covers the body; a "gone" answer must also name its Gateway and be issued within a minute of the data plane's clock.
-- An answer that fails changes nothing served: the data plane backs off, and its reports carry why as an apply error until the controller answers again.
+- The sync endpoint and the data planes speak TLS 1.3 only.
+- The controller signs every snapshot, "unchanged" and "Gateway gone" answer with its serving key, never the CA's, over a nonce the data plane draws for each poll. A data plane takes an answer only when the signing certificate chains to the controller CA, is a serving certificate for the controller Service, valid now, and the signature covers this poll's nonce and the body ("unchanged": the version it confirms); a "gone" answer must also name its Gateway.
+- An answer that fails, or a body over 64 MiB, changes nothing served: the data plane counts the controller as disconnected, backs off, and its reports carry why as an apply error until the controller answers again.
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 
