@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +20,10 @@ use hyper::body::Body;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kube::runtime::reflector::ObjectRef;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant};
@@ -41,7 +46,9 @@ const SYNC_PREFIX: &str = "/v1/sync/";
 /// Gateway is two orders below.
 const MAX_BODY: usize = 1024 * 1024;
 /// Bodies read at once, as many as TokenReviews in flight: 16 MiB at most,
-/// and a report reads in milliseconds.
+/// and a report reads in milliseconds. One pod reads one at a time: a data
+/// plane sends one request at a time, and a tenant stalling bodies on its
+/// own valid token then holds one read, not all.
 const MAX_BODY_READS: usize = 16;
 /// The longest request head, and hyper's read buffer: a token is at most
 /// 16 KiB (the pre-check refuses more), the rest of a head a few hundred
@@ -52,9 +59,15 @@ const MAX_HEAD: usize = 32 * 1024;
 /// connection at most its read buffer and a TLS record or two, about
 /// 64 MiB in all.
 const MAX_CONNECTIONS: usize = 1024;
-/// The TLS handshake, the request head and the body each: in-cluster they
-/// take milliseconds; 5s absorbs a loaded node and frees a stalled peer's
-/// connection in a sixth of the hold.
+/// Open connections per peer IP. A data plane holds one or two and pods
+/// have their own IPs, but data planes behind the apiserver proxy all
+/// arrive from the apiserver's: room for 16 of those, and no single pod
+/// holds the whole cap.
+const MAX_CONNECTIONS_PER_PEER: usize = 32;
+/// The TLS handshake, the request head and the body each, and a response
+/// write that makes no progress: in-cluster they take milliseconds; 5s
+/// absorbs a loaded node and frees a stalled peer's connection in a sixth
+/// of the hold.
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every 503's: the data plane's first backoff step.
 const RETRY_AFTER_SECS: u64 = 1;
@@ -69,7 +82,12 @@ pub(crate) struct SyncServer {
     holds: Holds,
     lapses: Arc<Lapses>,
     connections: Arc<Semaphore>,
+    /// Open connections by peer IP, and the most one may hold.
+    peer_connections: Mutex<HashMap<IpAddr, usize>>,
+    per_peer: usize,
     body_reads: Semaphore,
+    /// The pods whose body is being read.
+    body_readers: Mutex<std::collections::HashSet<InstanceId>>,
     shutdown: CancellationToken,
 }
 
@@ -80,7 +98,14 @@ impl SyncServer {
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        Self::with_connections(ctx, auth, lapses, shutdown, MAX_CONNECTIONS)
+        Self::with_connections(
+            ctx,
+            auth,
+            lapses,
+            shutdown,
+            MAX_CONNECTIONS,
+            MAX_CONNECTIONS_PER_PEER,
+        )
     }
 
     fn with_connections(
@@ -89,6 +114,7 @@ impl SyncServer {
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
         connections: usize,
+        per_peer: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
@@ -96,13 +122,16 @@ impl SyncServer {
             holds: Holds::default(),
             lapses,
             connections: Arc::new(Semaphore::new(connections)),
+            peer_connections: Mutex::default(),
+            per_peer,
             body_reads: Semaphore::new(MAX_BODY_READS),
+            body_readers: Mutex::default(),
             shutdown,
         })
     }
 
-    /// One request, answered.
-    pub(crate) async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    /// One request from `peer`, answered.
+    pub(crate) async fn handle<B>(&self, request: Request<B>, peer: IpAddr) -> Response<Full<Bytes>>
     where
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -131,7 +160,18 @@ impl SyncServer {
             Ok(claimed) => claimed,
             Err(refusal) => return refused(refusal),
         };
-        let instance = match self.auth.authenticate(&claimed, &token, &key).await {
+        if !self.serves(&key) {
+            // No review for a Gateway we do not serve: its account cannot
+            // fill the verdict cache. Only a token already reviewed as its
+            // data plane learns that it is gone; anyone else gets the
+            // pre-check's 401, no oracle of Gateway names.
+            return if self.auth.reviewed_for(&token, &key) {
+                not_served()
+            } else {
+                refused(self.auth.refuse_unreviewed())
+            };
+        }
+        let instance = match self.auth.authenticate(&claimed, &token, &key, peer).await {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
@@ -143,16 +183,22 @@ impl SyncServer {
         if declared.is_some_and(|len| len > MAX_BODY as u64) {
             return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB");
         }
-        let Ok(_reading) = self.body_reads.try_acquire() else {
-            return unavailable("too many bodies being read");
-        };
-        let body = Limited::new(request.into_body(), MAX_BODY);
-        let bytes = match tokio::time::timeout(PEER_TIMEOUT, body.collect()).await {
-            Ok(Ok(collected)) => collected.to_bytes(),
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB")
+        // Both slots are held for the read only, never through the hold.
+        let bytes = {
+            let Some(_reader) = BodyReader::start(&self.body_readers, &instance) else {
+                return unavailable("a body of this pod is being read");
+            };
+            let Ok(_reading) = self.body_reads.try_acquire() else {
+                return unavailable("too many bodies being read");
+            };
+            let body = Limited::new(request.into_body(), MAX_BODY);
+            match tokio::time::timeout(PEER_TIMEOUT, body.collect()).await {
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                    return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB")
+                }
+                Ok(Err(_)) | Err(_) => return text(StatusCode::BAD_REQUEST, "body not read"),
             }
-            Ok(Err(_)) | Err(_) => return text(StatusCode::BAD_REQUEST, "body not read"),
         };
         let sync: SyncRequest = match serde_json::from_slice(&bytes) {
             Ok(sync) => sync,
@@ -258,13 +304,18 @@ fn token(headers: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
+/// Every answer but a snapshot or a 204, each closing its connection: only
+/// an answered poll keeps one, so a peer that never authenticates cannot
+/// hold a slot with one junk request per head timeout.
 fn text(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(format!("{body}\n"))));
     *response.status_mut() = status;
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         header::CONTENT_TYPE,
         "text/plain; charset=utf-8".parse().unwrap(),
     );
+    headers.insert(header::CONNECTION, "close".parse().unwrap());
     response
 }
 
@@ -418,6 +469,162 @@ impl Lapses {
     }
 }
 
+/// A pod's body read, until dropped.
+struct BodyReader<'a> {
+    readers: &'a Mutex<std::collections::HashSet<InstanceId>>,
+    instance: InstanceId,
+}
+
+impl<'a> BodyReader<'a> {
+    /// `None` while `instance` has a body being read.
+    fn start(
+        readers: &'a Mutex<std::collections::HashSet<InstanceId>>,
+        instance: &InstanceId,
+    ) -> Option<Self> {
+        let started = readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(instance.clone());
+        started.then(|| Self {
+            readers,
+            instance: instance.clone(),
+        })
+    }
+}
+
+impl Drop for BodyReader<'_> {
+    fn drop(&mut self) {
+        self.readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.instance);
+    }
+}
+
+/// A connection counted against its peer IP until dropped.
+struct PeerConnection {
+    server: Arc<SyncServer>,
+    peer: IpAddr,
+}
+
+impl PeerConnection {
+    /// `None` when `peer` holds its share already.
+    fn open(server: &Arc<SyncServer>, peer: IpAddr) -> Option<Self> {
+        let mut peers = server
+            .peer_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let open = peers.entry(peer).or_insert(0);
+        if *open >= server.per_peer {
+            return None;
+        }
+        *open += 1;
+        Some(Self {
+            server: server.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        let mut peers = self
+            .server
+            .peer_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(open) = peers.get_mut(&self.peer) {
+            *open -= 1;
+            if *open == 0 {
+                peers.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Fails a write that makes no progress for [`PEER_TIMEOUT`]: hyper waits
+/// on a flush to a peer that stopped reading, a pipelining one included,
+/// with no timer of its own.
+struct StallGuard<T> {
+    io: T,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> StallGuard<T> {
+    fn new(io: T) -> Self {
+        Self { io, stalled: None }
+    }
+
+    fn progress<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<std::io::Result<R>>,
+    ) -> Poll<std::io::Result<R>> {
+        if poll.is_ready() {
+            self.stalled = None;
+            return poll;
+        }
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(PEER_TIMEOUT)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the peer stopped reading",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for StallGuard<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.io).poll_write(cx, buf);
+        this.progress(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.progress(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.io).poll_flush(cx);
+        this.progress(cx, poll)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.io).poll_shutdown(cx);
+        this.progress(cx, poll)
+    }
+}
+
 /// Serve sync requests on `listener` until the server's shutdown; held
 /// polls then answer 503 and connections close.
 pub(crate) async fn serve(
@@ -445,9 +652,19 @@ pub(crate) async fn serve(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 backoff.reset();
-                tokio::spawn(connection(server.clone(), acceptor.clone(), stream, slot));
+                // Over its share the connection closes as it is dropped.
+                let Some(counted) = PeerConnection::open(&server, peer.ip()) else {
+                    continue;
+                };
+                tokio::spawn(connection(
+                    server.clone(),
+                    acceptor.clone(),
+                    stream,
+                    peer.ip(),
+                    (slot, counted),
+                ));
             }
             Err(e) => {
                 if let Some(pause) = backoff.after(&e) {
@@ -463,7 +680,8 @@ async fn connection(
     server: Arc<SyncServer>,
     acceptor: TlsAcceptor,
     stream: TcpStream,
-    _slot: OwnedSemaphorePermit,
+    peer: IpAddr,
+    _slots: (OwnedSemaphorePermit, PeerConnection),
 ) {
     // A peer that cannot complete a handshake is no data plane; the data
     // plane logs its own side.
@@ -474,7 +692,7 @@ async fn connection(
         let server = server.clone();
         move |request| {
             let server = server.clone();
-            async move { Ok::<_, Infallible>(server.handle(request).await) }
+            async move { Ok::<_, Infallible>(server.handle(request, peer).await) }
         }
     });
     let conn = http1::Builder::new()
@@ -482,7 +700,7 @@ async fn connection(
         .header_read_timeout(PEER_TIMEOUT)
         .max_buf_size(MAX_HEAD)
         .max_header_size(MAX_HEAD)
-        .serve_connection(TokioIo::new(tls), service);
+        .serve_connection(TokioIo::new(StallGuard::new(tls)), service);
     let mut conn = std::pin::pin!(conn);
     tokio::select! {
         // A reset or a timed-out head: the peer polls again.
@@ -496,7 +714,9 @@ async fn connection(
 
 #[cfg(test)]
 mod tests {
-    use super::super::auth::testing::{authenticator, gateway_token, review, token_of, REVIEWS};
+    use super::super::auth::testing::{
+        authenticator, gateway_token, peer, review, token_of, PEER, REVIEWS,
+    };
     use super::super::auth::METRICS_SERIAL;
     use super::super::testkit::{self, apply, gateway_class, MockApi, TestCluster, CONTROLLER};
     use super::*;
@@ -581,7 +801,7 @@ mod tests {
         }
 
         async fn sync(&self, request: Request<Full<Bytes>>) -> Response<Full<Bytes>> {
-            self.server.handle(request).await
+            self.server.handle(request, PEER).await
         }
     }
 
@@ -708,31 +928,23 @@ mod tests {
 
     /// The store says first: a poll for a Gateway that is not there, or
     /// whose class names another controller, gets 404 and leaves no slot.
-    #[tokio::test]
-    async fn a_gateway_not_ours_is_404_and_gets_no_slot() {
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_not_ours_gets_no_slot() {
+        let _serial = METRICS_SERIAL.lock().await;
         let mut f = fixture();
         let ghost = GatewayKey::new("default", "ghost");
-        f.api.reply_to(
-            REVIEWS,
-            201,
-            review(
-                true,
-                "system:serviceaccount:default:portail-ghost",
-                Some("pod-2"),
-            ),
-        );
         let response = f
             .sync(post(
                 Some(&gateway_token("default", "ghost", 0)),
                 &body(&ghost, "", Some(json!({"applied": "x"}))),
             ))
             .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!f.ctx.hub.remove(&ghost), "no slot was created");
         assert!(f.ctx.reports.live(&ghost).is_empty(), "no report recorded");
 
-        f.api
-            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
+        assert_eq!(f.sync(poll("")).await.status(), StatusCode::NO_CONTENT);
+        assert!(f.ctx.hub.remove(&key()));
         let mut other = testkit::gateway("gw", 1);
         other.spec.gateway_class_name = "theirs".into();
         apply(
@@ -742,6 +954,48 @@ mod tests {
         apply(&mut f.cluster.gateways, other);
         assert_eq!(f.sync(poll("")).await.status(), StatusCode::NOT_FOUND);
         assert!(!f.ctx.hub.remove(&key()));
+    }
+
+    /// A Gateway the store lacks, or of another class, costs no review:
+    /// its account cannot fill the verdict cache, and a stranger gets the
+    /// pre-check's 401, no oracle of Gateway names. A data plane already
+    /// reviewed for it learns it is gone.
+    #[tokio::test]
+    async fn a_gateway_not_served_costs_no_review() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let mut f = fixture();
+        let ghost = GatewayKey::new("default", "ghost");
+        let (status, text) = text_of(
+            f.sync(post(
+                Some(&gateway_token("default", "ghost", 0)),
+                &body(&ghost, "", None),
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(
+            (status, text.as_str()),
+            (StatusCode::UNAUTHORIZED, "unauthenticated\n")
+        );
+        assert_eq!(f.reviews(), 0);
+
+        let v1 = f.publish(1);
+        assert_eq!(version_of(f.sync(poll("")).await).await, v1);
+        assert_eq!(f.reviews(), 1);
+        let mut theirs = testkit::gateway("gw", 1);
+        theirs.spec.gateway_class_name = "theirs".into();
+        apply(
+            &mut f.cluster.gateway_classes,
+            gateway_class("theirs", "example.com/other"),
+        );
+        apply(&mut f.cluster.gateways, theirs);
+        assert_eq!(f.sync(poll("")).await.status(), StatusCode::NOT_FOUND);
+        let stranger = post(
+            Some(&gateway_token("default", "gw", 1)),
+            &body(&key(), "", None),
+        );
+        assert_eq!(f.sync(stranger).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(f.reviews(), 1, "neither cost a review");
     }
 
     #[tokio::test]
@@ -771,6 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_token_comes_from_authorization_or_x_portail_token() {
+        let _serial = METRICS_SERIAL.lock().await;
         let f = fixture();
         let v1 = f.publish(1);
         let token = gateway_token("default", "gw", 0);
@@ -873,6 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_junk_token_is_refused_before_its_body_is_read() {
+        let _serial = METRICS_SERIAL.lock().await;
         let f = fixture();
         let read = Arc::new(AtomicBool::new(false));
         let request = Request::post(path_of(&key()))
@@ -883,7 +1139,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            f.server.handle(request).await.status(),
+            f.server.handle(request, PEER).await.status(),
             StatusCode::UNAUTHORIZED
         );
         assert!(!read.load(Ordering::SeqCst));
@@ -904,7 +1160,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            f.server.handle(request).await.status(),
+            f.server.handle(request, PEER).await.status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
@@ -940,6 +1196,11 @@ mod tests {
 
         let ns = super::super::auth::testing::NS;
         let controller = GatewayKey::new(ns, "controller");
+        for name in ["ctl", "controller"] {
+            let mut reserved = testkit::gateway(name, 1);
+            reserved.metadata.namespace = Some(ns.into());
+            apply(&mut f.cluster.gateways, reserved);
+        }
         let wrong_protocol = {
             let mut b = body(&key(), "", None);
             b["protocol"] = json!(PROTOCOL + 1);
@@ -971,7 +1232,7 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             (
-                "an unknown Gateway",
+                "its own account",
                 gateway_token("default", "gw", 5),
                 body(&GatewayKey::new("default", "gw"), "", None),
                 StatusCode::OK,
@@ -990,20 +1251,17 @@ mod tests {
         }
         assert_eq!(metrics::sync_auth_rejected(SyncAuthStage::Authz), authz + 2);
 
-        f.api.reply_to(
-            REVIEWS,
-            201,
-            review(
-                true,
-                "system:serviceaccount:default:portail-web",
-                Some("pod-3"),
-            ),
-        );
+        let reviews = f.reviews();
         let unknown = body(&GatewayKey::new("default", "web"), "", None);
         let response = f
             .sync(post(Some(&gateway_token("default", "web", 7)), &unknown))
             .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unknown Gateway"
+        );
+        assert_eq!(f.reviews(), reviews);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1018,7 +1276,7 @@ mod tests {
         );
         let poll = tokio::spawn({
             let server = f.server.clone();
-            async move { server.handle(request).await }
+            async move { server.handle(request, PEER).await }
         });
         tokio::time::sleep(Duration::from_millis(1)).await;
         let live = f.ctx.reports.live(&key());
@@ -1183,7 +1441,7 @@ mod tests {
                     Some(&gateway_token("default", "gw", 100 + n)),
                     &body(&key(), "", None),
                 );
-                tokio::spawn(async move { server.handle(request).await })
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
             })
             .collect();
         let mut waited = 0;
@@ -1296,14 +1554,14 @@ mod tests {
         };
         let read = Arc::new(AtomicBool::new(false));
         let other = token_of("default", "portail-other", 0);
-        let response = f.server.handle(watched(&other, &read)).await;
+        let response = f.server.handle(watched(&other, &read), PEER).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!read.load(Ordering::SeqCst));
         assert_eq!(f.reviews(), 0);
 
         f.api.reply_to(REVIEWS, 201, review(false, "", None));
         let rejected = gateway_token("default", "gw", 1);
-        let response = f.server.handle(watched(&rejected, &read)).await;
+        let response = f.server.handle(watched(&rejected, &read), PEER).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!read.load(Ordering::SeqCst));
         assert_eq!(f.reviews(), 1);
@@ -1370,22 +1628,34 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn body_reads_are_capped_and_a_stalled_body_ends_in_5s() {
         let f = Arc::new(fixture());
-        let token = gateway_token("default", "gw", 0);
+        f.publish(1);
+        // One reviewed token per pod: one pod reads one body at a time.
+        let tokens: Vec<String> = (0..=MAX_BODY_READS as u32)
+            .map(|n| gateway_token("default", "gw", n))
+            .collect();
+        for (n, token) in tokens.iter().enumerate() {
+            f.api
+                .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
+            let reviewed = post(Some(token), &body(&key(), "", None));
+            assert_eq!(f.sync(reviewed).await.status(), StatusCode::OK);
+        }
         let started = Instant::now();
-        let stalled: Vec<_> = (0..MAX_BODY_READS)
-            .map(|_| {
+        let stalled: Vec<_> = tokens[..MAX_BODY_READS]
+            .iter()
+            .map(|token| {
                 let request = Request::post(path_of(&key()))
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Stalled)
                     .unwrap();
                 let server = f.server.clone();
-                tokio::spawn(async move { server.handle(request).await })
+                tokio::spawn(async move { server.handle(request, PEER).await })
             })
             .collect();
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
-        let over = f.sync(poll("")).await;
+        let last = post(Some(&tokens[MAX_BODY_READS]), &body(&key(), "", None));
+        let over = f.sync(last).await;
         assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(over.headers()[header::RETRY_AFTER], "1");
 
@@ -1393,8 +1663,8 @@ mod tests {
             assert_eq!(request.await.unwrap().status(), StatusCode::BAD_REQUEST);
         }
         assert_eq!(started.elapsed(), PEER_TIMEOUT);
-        let v1 = f.publish(1);
-        assert_eq!(version_of(f.sync(poll("")).await).await, v1, "freed");
+        let v2 = f.publish(2);
+        assert_eq!(version_of(f.sync(poll("")).await).await, v2, "freed");
     }
 
     #[tokio::test]
@@ -1407,6 +1677,7 @@ mod tests {
             Lapses::new().0,
             f.shutdown.clone(),
             1,
+            MAX_CONNECTIONS_PER_PEER,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1470,5 +1741,227 @@ mod tests {
         assert!(!matches!(silent.read(&mut buf).await, Ok(n) if n > 0));
         assert_eq!(started.elapsed(), PEER_TIMEOUT);
         f.shutdown.cancel();
+    }
+
+    /// Nothing but an answered poll keeps a connection: a refusal closes it,
+    /// so a peer cannot pin a slot with one junk request per head timeout.
+    #[tokio::test]
+    async fn refusals_close_the_connection() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let f = fixture();
+        f.publish(1);
+        let closes = |response: &Response<Full<Bytes>>| {
+            response
+                .headers()
+                .get(header::CONNECTION)
+                .is_some_and(|v| v == "close")
+        };
+        let served = f.sync(poll("")).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert!(!closes(&served));
+        let refusals = [
+            post(Some("junk"), &body(&key(), "", None)),
+            post(
+                Some(&gateway_token("default", "gw", 0)),
+                &body(&GatewayKey::new("default", "ghost"), "", None),
+            ),
+            Request::get(path_of(&key())).body(Full::default()).unwrap(),
+        ];
+        for request in refusals {
+            let response = f.sync(request).await;
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert!(closes(&response), "{}", response.status());
+        }
+    }
+
+    #[tokio::test]
+    async fn one_peer_holds_its_share_of_connections() {
+        let (ca, connector, name) = tls_client();
+        let f = fixture();
+        let server = SyncServer::with_connections(
+            f.ctx.clone(),
+            authenticator(f.api.client()),
+            Lapses::new().0,
+            f.shutdown.clone(),
+            MAX_CONNECTIONS,
+            1,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(server, ca.server_config(), listener));
+
+        let holder = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let over = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                connector.connect(name.clone(), over)
+            )
+            .await
+            .expect("closed at once, not left waiting")
+            .is_err(),
+            "a second connection from the same peer"
+        );
+        drop(holder);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let next = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), connector.connect(name, next))
+            .await
+            .unwrap()
+            .expect("its share is free again");
+        f.shutdown.cancel();
+    }
+
+    /// A write that makes no progress fails after the peer timeout; one that
+    /// does resets it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_fails_in_5s() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut guarded = StallGuard::new(near);
+        guarded.write_all(&[0; 64]).await.unwrap();
+        tokio::time::sleep(PEER_TIMEOUT - Duration::from_secs(1)).await;
+        let mut drained = [0; 64];
+        far.read_exact(&mut drained).await.unwrap();
+        guarded.write_all(&[0; 64]).await.unwrap();
+
+        let started = Instant::now();
+        let stalled = guarded.write_all(&[0; 64]).await.unwrap_err();
+        assert_eq!(stalled.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), PEER_TIMEOUT);
+    }
+
+    /// A data plane that asks for a snapshot and never reads it loses its
+    /// connection, and the slot, once the write stalls.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_frees_its_slot() {
+        let (ca, connector, name) = tls_client();
+        let f = fixture();
+        let mut snapshot = Snapshot::from_config(
+            crate::sync::GatewayRef {
+                namespace: "default".into(),
+                name: "gw".into(),
+                uid: "gw-uid".into(),
+                generation: 1,
+            },
+            PortailConfig::default(),
+            vec![],
+        );
+        // Past what loopback socket buffers absorb.
+        snapshot.certificates.push(crate::sync::CertificatePem {
+            namespace: "default".into(),
+            name: "big".into(),
+            cert_pem: "a".repeat(64 * 1024 * 1024),
+            key_pem: String::new(),
+        });
+        snapshot.version = "big".into();
+        assert!(f.ctx.hub.publish(snapshot));
+        let server = SyncServer::with_connections(
+            f.ctx.clone(),
+            authenticator(f.api.client()),
+            Lapses::new().0,
+            f.shutdown.clone(),
+            1,
+            MAX_CONNECTIONS_PER_PEER,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(server, ca.server_config(), listener));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector.connect(name.clone(), tcp).await.unwrap();
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{}",
+            path_of(&key()),
+            gateway_token("default", "gw", 0),
+            serde_json::to_vec(&body(&key(), "", None)).unwrap().len(),
+            body(&key(), "", None),
+        );
+        use tokio::io::AsyncWriteExt;
+        tls.write_all(request.as_bytes()).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let next = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), connector.connect(name, next))
+            .await
+            .expect("the stalled connection gave its slot back")
+            .unwrap();
+        assert!(started.elapsed() >= PEER_TIMEOUT - Duration::from_millis(100));
+        drop(tls);
+        f.shutdown.cancel();
+    }
+
+    /// One pod reads one body at a time: a tenant with a valid token
+    /// stalling bodies holds one read, not every other data plane's.
+    #[tokio::test(start_paused = true)]
+    async fn one_pod_reads_one_body_at_a_time() {
+        let f = Arc::new(fixture());
+        let v1 = f.publish(1);
+        assert_eq!(
+            version_of(f.sync(poll("")).await).await,
+            v1,
+            "pod-1 reviewed"
+        );
+        let token = gateway_token("default", "gw", 0);
+        let stalled: Vec<_> = (0..MAX_BODY_READS as u32)
+            .map(|n| {
+                let request = Request::post(path_of(&key()))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Stalled)
+                    .unwrap();
+                let server = f.server.clone();
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let refused = stalled.iter().filter(|s| s.is_finished()).count();
+        assert_eq!(refused, MAX_BODY_READS - 1, "all but one answered at once");
+
+        f.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-2")));
+        let other = post(
+            Some(&gateway_token("default", "gw", 1)),
+            &body(&key(), "", None),
+        );
+        assert_eq!(version_of(f.sync(other).await).await, v1, "pod-2 syncs");
+        stalled.iter().for_each(|s| s.abort());
+    }
+
+    /// More data planes hold polls than bodies may be read at once.
+    #[tokio::test(start_paused = true)]
+    async fn held_polls_hold_no_body_read() {
+        let f = Arc::new(fixture());
+        let v1 = f.publish(1);
+        let pods = 0..=MAX_BODY_READS as u32;
+        for n in pods.clone() {
+            f.api
+                .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
+            let reviewed = post(
+                Some(&gateway_token("default", "gw", n)),
+                &body(&key(), "", None),
+            );
+            assert_eq!(version_of(f.sync(reviewed).await).await, v1);
+        }
+        let held: Vec<_> = pods
+            .map(|n| {
+                let request = post(
+                    Some(&gateway_token("default", "gw", n)),
+                    &body(&key(), &v1, None),
+                );
+                let server = f.server.clone();
+                tokio::spawn(async move { server.handle(request, peer(n)).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(held.iter().all(|h| !h.is_finished()), "every poll holds");
+        let v2 = f.publish(2);
+        for poll in held {
+            assert_eq!(version_of(poll.await.unwrap()).await, v2);
+        }
     }
 }
