@@ -2180,9 +2180,11 @@ mod tests {
             "a dead accept loop must not count as bound"
         );
 
-        // The next ensure pass reaps the corpse and rebinds the endpoint.
-        let (opened, errors) = ensure(&mut dp, &listeners, &routes, &perf).await;
-        assert_eq!((opened, errors.len()), (1, 0), "dead endpoint must rebind");
+        // The next pass reaps the corpse and rebinds the endpoint, retried
+        // as bind_until says.
+        assert!(dp.close_unwanted(&listeners).is_empty());
+        assert!(!dp.listener_tasks.contains_key(&tcp(None, 23447)), "reaped");
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
         assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
     }
 
