@@ -17,6 +17,10 @@ pub(crate) const PRIVILEGED_PORT_MAX: u16 = 1023;
 /// resources.go `targetPortPoolBase`).
 const TARGET_PORT_POOL_BASE: u16 = 8000;
 
+/// The data plane's admin port: cli.rs AdminArgs's `--readiness-port`
+/// default, which the rendered args leave alone.
+pub(crate) const ADMIN_PORT: u16 = 19099;
+
 /// One Service port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DerivedPort {
@@ -75,18 +79,23 @@ pub(crate) fn protocol(transport: Transport) -> &'static str {
 /// keeps its `existing` target while that is unprivileged and free, else
 /// draws the lowest free port from 8000 up. Deterministic whatever the
 /// listener order, and collision-free.
+///
+/// The admin port is taken from the start: /livez, /readyz and /metrics
+/// hold it on the pod, so a listener published on it is remapped like a
+/// privileged one, and no target lands on it.
 pub(crate) fn allocate_target_ports(
     published: &[u16],
     existing: &BTreeMap<u16, u16>,
 ) -> BTreeMap<u16, u16> {
     let published: BTreeSet<u16> = published.iter().copied().collect();
+    let binds_itself = |p: u16| p > PRIVILEGED_PORT_MAX && p != ADMIN_PORT;
     let mut target = BTreeMap::new();
-    let mut used = BTreeSet::new();
-    for &p in published.iter().filter(|&&p| p > PRIVILEGED_PORT_MAX) {
+    let mut used = BTreeSet::from([ADMIN_PORT]);
+    for &p in published.iter().filter(|&&p| binds_itself(p)) {
         target.insert(p, p);
         used.insert(p);
     }
-    for &p in published.iter().filter(|&&p| p <= PRIVILEGED_PORT_MAX) {
+    for &p in published.iter().filter(|&&p| !binds_itself(p)) {
         if let Some(&t) = existing.get(&p) {
             if t > PRIVILEGED_PORT_MAX && used.insert(t) {
                 target.insert(p, t);
@@ -96,7 +105,7 @@ pub(crate) fn allocate_target_ports(
     // A Gateway has at most 64 listeners (Gateway API maxItems), so the
     // pool never runs past u16.
     let mut next = TARGET_PORT_POOL_BASE;
-    for &p in published.iter().filter(|&&p| p <= PRIVILEGED_PORT_MAX) {
+    for &p in published.iter().filter(|&&p| !binds_itself(p)) {
         if target.contains_key(&p) {
             continue;
         }
@@ -275,6 +284,16 @@ mod tests {
     #[test]
     fn allocation_ignores_listener_order() {
         assert_eq!(allocate(&[80, 443, 22], &[]), allocate(&[22, 443, 80], &[]));
+    }
+
+    /// The data plane's admin endpoint holds 19099 on the pod: a listener
+    /// published there gets another target, and none is drawn onto it.
+    #[test]
+    fn the_admin_port_is_never_a_target() {
+        let got = allocate(&[19099, 80], &[]);
+        assert_eq!((got[&80], got[&19099]), (8000, 8001));
+        let got = allocate(&[19099, 443], &[(19099, 19099), (443, 19099)]);
+        assert!(!got.values().any(|t| *t == ADMIN_PORT), "{got:?}");
     }
 
     /// Each transport allocates on its own.

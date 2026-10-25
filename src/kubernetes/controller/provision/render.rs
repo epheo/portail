@@ -19,7 +19,9 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use serde::Serialize;
 
-use super::ports::{bound_ports, derive_ports, protocol, DerivedPort, PRIVILEGED_PORT_MAX};
+use super::ports::{
+    bound_ports, derive_ports, protocol, DerivedPort, ADMIN_PORT, PRIVILEGED_PORT_MAX,
+};
 use crate::cli::{ControllerArgs, CONTROLLER_CA_ENV};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::controller::params::Params;
@@ -112,10 +114,6 @@ pub(crate) fn install_label(controller_name: &str) -> String {
         format!("{cut}-{hash}")
     }
 }
-
-/// The data plane's admin port: cli.rs AdminArgs's `--readiness-port`
-/// default, which the rendered args leave alone.
-const ADMIN_PORT: i32 = 19099;
 
 /// The data plane's `--token-file` default (cli.rs), where the projected
 /// token is mounted.
@@ -424,7 +422,7 @@ fn probe(path: &str, period: i32, failures: i32) -> Probe {
     Probe {
         http_get: Some(HTTPGetAction {
             path: Some(path.into()),
-            port: IntOrString::Int(ADMIN_PORT),
+            port: IntOrString::Int(ADMIN_PORT.into()),
             ..Default::default()
         }),
         period_seconds: Some(period),
