@@ -6,9 +6,9 @@
 //! the body: an unauthenticated peer never makes the controller read or
 //! hold more than a capped request head.
 //!
-//! Every snapshot and gone answer is signed with the serving leaf's key
-//! (`crate::sync::signed`): through the apiserver's service proxy the data
-//! plane's TLS ends at the apiserver.
+//! Every 200, 204 and gone 404 is signed with the serving leaf's key over
+//! the poll's nonce (`crate::sync::signed`): through the apiserver's
+//! service proxy the data plane's TLS ends at the apiserver.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
