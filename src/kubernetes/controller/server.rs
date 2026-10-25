@@ -1362,10 +1362,13 @@ mod tests {
         let snapshot = p.ctx.hub.current(&key()).unwrap();
         let report = serde_json::to_value(p.applier.apply(&snapshot).await).unwrap();
         let response = server
-            .handle(post(
-                Some(&gateway_token("default", "gw", 0)),
-                &body(&key(), "", Some(report)),
-            ))
+            .handle(
+                post(
+                    Some(&gateway_token("default", "gw", 0)),
+                    &body(&key(), "", Some(report)),
+                ),
+                PEER,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         p.api.clear();
