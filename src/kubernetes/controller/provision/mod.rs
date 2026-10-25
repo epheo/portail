@@ -951,6 +951,7 @@ mod tests {
             worker_threads: None,
             service_type,
             networks: vec![],
+            controller_transport: crate::kubernetes::crds::ControllerTransport::Direct,
         }
     }
 

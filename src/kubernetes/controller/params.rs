@@ -12,8 +12,8 @@ use kube::ResourceExt;
 use super::ControllerCtx;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
-    GatewayParameters, GatewayParametersSpec, NetworkSelection, Provisioning, ServiceParameters,
-    ServiceType,
+    ControllerTransport, GatewayParameters, GatewayParametersSpec, NetworkSelection, Provisioning,
+    ServiceParameters, ServiceType,
 };
 
 const GROUP: &str = "portail.epheo.eu";
@@ -34,6 +34,7 @@ pub(crate) struct Params {
     pub worker_threads: Option<u32>,
     pub service_type: ServiceType,
     pub networks: Vec<NetworkSelection>,
+    pub controller_transport: ControllerTransport,
 }
 
 /// `Err` says why the parameters cannot be used: the Gateway is
@@ -212,6 +213,7 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         }),
         service: None,
         networks: None,
+        controller_transport: Some(ControllerTransport::Direct),
     }
 }
 
@@ -229,8 +231,10 @@ fn merge(
             resources,
             service,
             networks,
+            controller_transport,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
+        base.controller_transport = controller_transport.or(base.controller_transport);
         base.replicas = replicas.or(base.replicas);
         base.image = image.or(base.image);
         base.resources = resources.or(base.resources);
@@ -283,6 +287,9 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         worker_threads,
         service_type,
         networks,
+        controller_transport: spec
+            .controller_transport
+            .unwrap_or(ControllerTransport::Direct),
     })
 }
 
@@ -421,8 +428,39 @@ mod tests {
                 worker_threads: Some(2),
                 service_type: ServiceType::LoadBalancer,
                 networks: vec![],
+                controller_transport: ControllerTransport::Direct,
             }
         );
+    }
+
+    /// The transport is a field like any other: the class's, else the
+    /// Gateway's over it.
+    #[tokio::test]
+    async fn the_controller_transport_merges_field_by_field() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "controllerTransport: APIServerProxy",
+            ),
+        );
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", "replicas: 2"),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(
+            params.controller_transport,
+            ControllerTransport::ApiServerProxy
+        );
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", "controllerTransport: Direct"),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.controller_transport, ControllerTransport::Direct);
     }
 
     /// Set fields win field by field, the Gateway's over the class's;
