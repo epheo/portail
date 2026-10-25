@@ -105,15 +105,6 @@ pub enum Command {
     Dataplane(DataplaneArgs),
 }
 
-impl Command {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Command::Controller(_) => "controller",
-            Command::Dataplane(_) => "dataplane",
-        }
-    }
-}
-
 /// The admin endpoint of both Kubernetes modes: /livez, /readyz, /metrics.
 #[derive(clap::Args, Debug, Clone)]
 pub struct AdminArgs {

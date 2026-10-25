@@ -565,6 +565,74 @@ fn render_listeners(out: &mut String) {
     }
 }
 
+// --- Controller sync (data plane) ------------------------------------------
+
+/// A data plane's sync with its controller. Rendered once [`Self::start`]
+/// ran: a standalone process has no controller.
+pub struct ControllerSync {
+    started: OnceLock<std::time::Instant>,
+    connected: std::sync::atomic::AtomicBool,
+    /// Milliseconds after `started` of the last answer that confirmed the
+    /// served config current.
+    confirmed_ms: AtomicU64,
+}
+
+pub static CONTROLLER_SYNC: ControllerSync = ControllerSync::new();
+
+impl ControllerSync {
+    pub(crate) const fn new() -> Self {
+        Self {
+            started: OnceLock::new(),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            confirmed_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// The config is as old as the process until the controller confirms
+    /// one.
+    pub fn start(&self) {
+        let _ = self.started.set(std::time::Instant::now());
+    }
+
+    /// Whether the last poll was answered by the controller.
+    pub fn set_connected(&self, connected: bool) {
+        self.connected.store(connected, Relaxed);
+    }
+
+    /// The controller said the config served is its current one: a
+    /// snapshot applied, an unchanged version, or none for this Gateway.
+    pub fn confirmed(&self) {
+        if let Some(started) = self.started.get() {
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.confirmed_ms.store(ms, Relaxed);
+        }
+    }
+
+    /// Since the last confirmation; `None` before [`Self::start`].
+    pub(crate) fn age(&self) -> Option<std::time::Duration> {
+        let confirmed = std::time::Duration::from_millis(self.confirmed_ms.load(Relaxed));
+        Some(self.started.get()?.elapsed().saturating_sub(confirmed))
+    }
+
+    fn render(&self, out: &mut String) {
+        use std::fmt::Write;
+        let Some(age) = self.age() else {
+            return;
+        };
+        let _ = write!(
+            out,
+            "# HELP portail_controller_connected Whether the last sync poll was answered by the controller\n\
+             # TYPE portail_controller_connected gauge\n\
+             portail_controller_connected {}\n\
+             # HELP portail_config_age_seconds Seconds since the controller last confirmed the served configuration current\n\
+             # TYPE portail_config_age_seconds gauge\n\
+             portail_config_age_seconds {:.3}\n",
+            self.connected.load(Relaxed) as u8,
+            age.as_secs_f64(),
+        );
+    }
+}
+
 /// Render everything in Prometheus text exposition format. `ready` is served
 /// as a gauge so dashboards can overlay readiness flaps on traffic.
 pub fn render(ready: bool) -> String {
@@ -625,6 +693,7 @@ pub fn render(ready: bool) -> String {
         METRICS.active_connections.get(),
         ready as u8,
     );
+    CONTROLLER_SYNC.render(&mut out);
     out
 }
 
@@ -692,6 +761,41 @@ mod tests {
             let v: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
             assert!(v >= prev, "non-monotonic bucket line: {line}");
             prev = v;
+        }
+    }
+
+    /// Standalone renders no controller series; a data plane's age grows
+    /// from its start until the controller confirms, then from there.
+    #[test]
+    fn controller_sync_renders_once_started() {
+        let sync = ControllerSync::new();
+        let render = |sync: &ControllerSync| {
+            let mut out = String::new();
+            sync.render(&mut out);
+            out
+        };
+        assert_eq!(render(&sync), "");
+
+        sync.start();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let value = |out: &str, name: &str| -> f64 {
+            out.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let out = render(&sync);
+        assert_eq!(value(&out, "portail_controller_connected "), 0.0);
+        assert!(value(&out, "portail_config_age_seconds ") >= 0.02, "{out}");
+
+        sync.set_connected(true);
+        sync.confirmed();
+        let out = render(&sync);
+        assert_eq!(value(&out, "portail_controller_connected "), 1.0);
+        assert!(value(&out, "portail_config_age_seconds ") < 0.02, "{out}");
+        for line in out.lines().filter(|l| !l.starts_with('#')) {
+            assert_eq!(line.split_whitespace().count(), 2, "bad line: {line}");
         }
     }
 

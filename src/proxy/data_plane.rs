@@ -1,4 +1,4 @@
-//! Tokio-based data plane — one TcpListener (or UdpSocket) per (address, port),
+//! Tokio-based data plane — one TcpListener (or UdpSocket) per [`Endpoint`],
 //! one accept loop per listener. Accept work is distributed across the Tokio
 //! runtime's worker threads, not via per-core SO_REUSEPORT fan-out (which adds
 //! task count without throughput on a single shared runtime).
@@ -23,6 +23,57 @@ use crate::proxy::tls::{self, TlsKind, TlsPlan};
 use crate::proxy::udp_worker;
 use crate::proxy::worker;
 use crate::routing::{BackendSelector, RouteTable};
+use crate::sync::Transport;
+
+/// A socket the data plane binds, one accept loop each. TCP and UDP on
+/// one port are two sockets: keyed without the transport, the second
+/// listener counted as bound and never bound.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Endpoint {
+    /// `None`: every interface.
+    pub address: Option<String>,
+    /// The port bound: the listener's targetPort when it has one.
+    pub port: u16,
+    pub transport: Transport,
+}
+
+impl Endpoint {
+    /// Where `listener` binds, its `address` as the caller expanded it.
+    pub fn of(listener: &ListenerConfig) -> Self {
+        Self {
+            address: listener.address.clone(),
+            port: listener.target_port.unwrap_or(listener.port),
+            transport: Transport::of(&listener.protocol),
+        }
+    }
+
+    /// The same port and transport on every interface.
+    fn wildcard(&self) -> Self {
+        Self {
+            address: None,
+            ..self.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let transport = match self.transport {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        };
+        let address = self.address.as_deref().unwrap_or("*");
+        write!(f, "{}:{}/{}", address, self.port, transport)
+    }
+}
+
+/// An endpoint a pass wanted and left unbound, and why. A port whose TLS
+/// config failed to build fails each of its TCP endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindError {
+    pub endpoint: Endpoint,
+    pub error: String,
+}
 
 /// What a TCP port serves, read by its accept loops per connection:
 /// `None` for plain bytes (HTTP, TCP), a plan for TLS (HTTPS, TLS
@@ -67,7 +118,7 @@ struct UdpListenerEntry {
     socket: UdpSocket,
 }
 
-/// State of one bound (address, port) endpoint.
+/// State of one bound endpoint.
 enum ListenerSlot {
     /// Socket bound at construction, accept loop not yet spawned — the
     /// standalone-mode window between `new()` and `start()`. Counts as
@@ -93,17 +144,20 @@ impl ListenerSlot {
 pub struct DataPlane {
     tcp_listeners: Vec<TcpListenerEntry>,
     udp_listeners: Vec<UdpListenerEntry>,
-    /// One accept-loop slot per bound (address, bound-port) endpoint.
+    /// One accept-loop slot per bound endpoint.
     /// Readiness reads LIVE task state from this map — a finished task no
     /// longer counts as bound, which keeps /readyz and Programmed truthful
     /// when an accept loop dies. (Its add-only predecessor had no way back:
     /// a dead listener stayed "bound" until pod restart, refusing every
     /// connection while readiness stayed green.)
-    listener_tasks: std::collections::HashMap<(Option<String>, u16), ListenerSlot>,
+    listener_tasks: std::collections::HashMap<Endpoint, ListenerSlot>,
     /// Pod readiness flag shared with the admin endpoint (`/readyz`), flipped
     /// false the moment an accept loop exits outside shutdown — no waiting
     /// for the next reconcile pass to notice. `None` in standalone mode.
     ready_flag: Option<Arc<AtomicBool>>,
+    /// Bumped with that flip: the data plane re-applies to rebind, and
+    /// reports the loss meanwhile.
+    listener_exits: tokio::sync::watch::Sender<u64>,
     worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
     /// Cloned into every UDP worker, the controller's too: a rebuilt one
@@ -116,6 +170,11 @@ pub struct DataPlane {
     /// Per port with HTTPS listeners, the config terminating for them.
     /// Dropped with the last of them: no cert outlives its listener.
     terminate_configs: HashMap<u16, BuiltConfig>,
+    /// Loops a pass closed because their port's plan serves nothing; the
+    /// next [`Self::close_unwanted`] hands them over to be awaited.
+    closing: Vec<JoinHandle<()>>,
+    /// Per port, why the last pass built it no terminating config.
+    tls_failures: HashMap<u16, String>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
     /// Process-wide backend pool when `performance.backendPoolScope: process`;
@@ -179,7 +238,7 @@ const DEFAULT_MAX_IDLE_PER_BACKEND: usize = 64;
 /// `example.org` via a catch-all listener gets dropped when a sibling
 /// `https-with-hostname` listener is processed last, hanging its TLS handshake
 /// until the client times out. An HTTPS listener without certs still names
-/// its port: the build then fails for it, and says so.
+/// its port, which terminates nothing for it.
 pub(crate) fn merge_cert_refs_by_port(
     listener_configs: &[ListenerConfig],
 ) -> HashMap<u16, Vec<CertificateRef>> {
@@ -234,6 +293,13 @@ fn plan_ports(
     built.retain(|port, _| merged.contains_key(port));
     let mut errors = Vec::new();
     for (port, refs) in merged {
+        // On purpose, not a failure: the controller keeps sending an HTTPS
+        // listener whose refs all went (grant revoked, Secret deleted), so
+        // its SNI is refused instead of taken by a sibling's cert.
+        if refs.is_empty() {
+            built.remove(&port);
+            continue;
+        }
         let fingerprint = compute_cert_fingerprint(&refs);
         if built
             .get(&port)
@@ -331,7 +397,7 @@ fn compute_cert_fingerprint(refs: &[CertificateRef]) -> u64 {
 }
 
 impl DataPlane {
-    /// Create one TcpListener / UdpSocket per (address, port) listener config.
+    /// Create one TcpListener / UdpSocket per endpoint the listener configs bind.
     /// The Tokio runtime multiplexes accepts across its worker threads; no
     /// per-core SO_REUSEPORT fan-out is needed for a single-process data plane.
     pub fn new(
@@ -366,8 +432,7 @@ impl DataPlane {
         // One socket per endpoint: siblings on a shared port ride the same
         // socket (routing is port-keyed), and a second bind would fail
         // EADDRINUSE against our own listener.
-        let mut bound_endpoints: std::collections::HashSet<(Option<String>, u16)> =
-            std::collections::HashSet::new();
+        let mut bound_endpoints: HashSet<Endpoint> = HashSet::new();
 
         for listener_cfg in listeners.iter() {
             // `port` is the published identity (routing/TLS key); `bound_port` is
@@ -382,7 +447,7 @@ impl DataPlane {
                     None => continue,
                 },
             };
-            if !bound_endpoints.insert((listener_cfg.address.clone(), bound_port)) {
+            if !bound_endpoints.insert(Endpoint::of(listener_cfg)) {
                 continue;
             }
             match plan {
@@ -431,6 +496,7 @@ impl DataPlane {
             udp_listeners,
             listener_tasks,
             ready_flag: None,
+            listener_exits: tokio::sync::watch::Sender::new(0),
             worker_config: worker::WorkerConfig::from_perf(
                 performance_config,
                 DEFAULT_MAX_IDLE_PER_BACKEND,
@@ -441,6 +507,8 @@ impl DataPlane {
             active_connections: Arc::new(AtomicUsize::new(0)),
             plans,
             terminate_configs,
+            closing: Vec::new(),
+            tls_failures: HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
             shared_pool: match performance_config.backend_pool_scope {
                 crate::config::PoolScope::Process => Some(Arc::new(
@@ -461,7 +529,12 @@ impl DataPlane {
         self.ready_flag = Some(flag);
     }
 
-    fn endpoint_alive(&self, endpoint: &(Option<String>, u16)) -> bool {
+    /// Changes each time an accept loop exits outside shutdown.
+    pub fn listener_exits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.listener_exits.subscribe()
+    }
+
+    fn endpoint_alive(&self, endpoint: &Endpoint) -> bool {
         self.listener_tasks
             .get(endpoint)
             .is_some_and(ListenerSlot::alive)
@@ -480,18 +553,15 @@ impl DataPlane {
     /// body: under `panic = "abort"` the whole process dies with it — its
     /// own honest signal — and `JoinHandle::is_finished` covers the unwind
     /// case.)
-    fn spawn_listener_task<F, Fut>(
-        &mut self,
-        endpoint: (Option<String>, u16),
-        port: u16,
-        make_task: F,
-    ) where
+    fn spawn_listener_task<F, Fut>(&mut self, endpoint: Endpoint, port: u16, make_task: F)
+    where
         F: FnOnce(CancellationToken) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let cancel = self.shutdown.child_token();
         let ready_flag = self.ready_flag.clone();
-        let desc = format!("{}:{}", endpoint.0.as_deref().unwrap_or("*"), endpoint.1);
+        let exits = self.listener_exits.clone();
+        let desc = endpoint.to_string();
         let task = make_task(cancel.clone());
         let watch_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
@@ -501,33 +571,32 @@ impl DataPlane {
                 if let Some(flag) = ready_flag {
                     flag.store(false, Ordering::Release);
                 }
+                exits.send_modify(|n| *n += 1);
             }
         });
         self.listener_tasks
             .insert(endpoint, ListenerSlot::Running(handle, cancel, port));
     }
 
-    /// The (address, bound port) endpoints `listener_configs` bind, each
-    /// with the published port it serves, the first listener's as the bind
-    /// loop takes it: each listener on its own address, or every interface.
-    /// A wildcard endpoint stands for the specific ones on its port: it
-    /// already takes their traffic, routing is port-keyed, and Linux refuses
-    /// a specific bind beside a listening wildcard.
-    fn desired_endpoints(
-        listener_configs: &[ListenerConfig],
-    ) -> HashMap<(Option<String>, u16), u16> {
-        let mut desired: HashMap<(Option<String>, u16), u16> = HashMap::new();
+    /// The endpoints `listener_configs` bind, each with the published port
+    /// it serves, the first listener's as the bind loop takes it: each
+    /// listener on its own address, or every interface. A wildcard endpoint
+    /// stands for the specific ones on its port and transport: it already
+    /// takes their traffic, routing is port-keyed, and Linux refuses a
+    /// specific bind beside a listening wildcard.
+    fn desired_endpoints(listener_configs: &[ListenerConfig]) -> HashMap<Endpoint, u16> {
+        let mut desired: HashMap<Endpoint, u16> = HashMap::new();
         for lc in listener_configs {
-            desired
-                .entry((lc.address.clone(), lc.target_port.unwrap_or(lc.port)))
-                .or_insert(lc.port);
+            desired.entry(Endpoint::of(lc)).or_insert(lc.port);
         }
-        let wildcard_ports: HashSet<u16> = desired
+        let wildcards: HashSet<Endpoint> = desired
             .keys()
-            .filter(|(addr, _)| addr.is_none())
-            .map(|(_, port)| *port)
+            .filter(|endpoint| endpoint.address.is_none())
+            .cloned()
             .collect();
-        desired.retain(|(addr, port), _| addr.is_none() || !wildcard_ports.contains(port));
+        desired.retain(|endpoint, _| {
+            endpoint.address.is_none() || !wildcards.contains(&endpoint.wildcard())
+        });
         desired
     }
 
@@ -535,46 +604,55 @@ impl DataPlane {
     /// no longer want: a listener removed from the spec, a wildcard whose
     /// port moved to specific addresses (or the reverse), or an endpoint
     /// now serving another published port on the same bound one. Returns
-    /// the closed loops. Each releases its socket as it exits, and until
-    /// then a bind overlapping it fails: await them, then
-    /// [`Self::add_tcp_listeners`] the same listeners.
+    /// the closed loops, with those the last pass closed. Each releases its
+    /// socket as it exits, and until then a bind overlapping it fails:
+    /// await them, then [`Self::add_tcp_listeners`] the same listeners.
     pub fn close_unwanted(&mut self, listener_configs: &[ListenerConfig]) -> Vec<JoinHandle<()>> {
         // A finished task means its socket is gone (the listener lives
         // inside the task), so the endpoint must stop counting as bound;
         // the bind loop then re-opens it this same pass.
-        self.listener_tasks.retain(|(addr, bound_port), slot| {
+        self.listener_tasks.retain(|endpoint, slot| {
             if slot.alive() {
                 true
             } else {
                 warn!(
-                    "Listener {}:{} accept loop is dead; rebinding this pass",
-                    addr.as_deref().unwrap_or("*"),
-                    bound_port
+                    "Listener {} accept loop is dead; rebinding this pass",
+                    endpoint
                 );
                 false
             }
         });
 
         let desired = Self::desired_endpoints(listener_configs);
+        let mut closed = std::mem::take(&mut self.closing);
+        closed.extend(self.close_where(|endpoint, port| {
+            let unwanted = desired.get(endpoint) != Some(&port);
+            if unwanted {
+                info!("Listener {} no longer in spec; closing", endpoint);
+            }
+            unwanted
+        }));
+        closed
+    }
+
+    /// Cancel the running loops `close` picks, by endpoint and the
+    /// published port each serves; returns them. Pre-start sockets
+    /// (standalone mode) are never managed here.
+    fn close_where(
+        &mut self,
+        mut close: impl FnMut(&Endpoint, u16) -> bool,
+    ) -> Vec<JoinHandle<()>> {
         self.listener_tasks
-            // Pre-start sockets (standalone mode) are never managed here.
             .extract_if(|endpoint, slot| match slot {
                 ListenerSlot::Pending => false,
-                ListenerSlot::Running(.., port) => desired.get(endpoint) != Some(port),
+                ListenerSlot::Running(.., port) => close(endpoint, *port),
             })
-            .filter_map(|(endpoint, slot)| {
-                info!(
-                    "Listener {}:{} no longer in spec; closing",
-                    endpoint.0.as_deref().unwrap_or("*"),
-                    endpoint.1
-                );
-                match slot {
-                    ListenerSlot::Running(handle, cancel, _) => {
-                        cancel.cancel();
-                        Some(handle)
-                    }
-                    ListenerSlot::Pending => None,
+            .filter_map(|(_, slot)| match slot {
+                ListenerSlot::Running(handle, cancel, _) => {
+                    cancel.cancel();
+                    Some(handle)
                 }
+                ListenerSlot::Pending => None,
             })
             .collect()
     }
@@ -582,7 +660,7 @@ impl DataPlane {
     /// Bind the endpoints `listener_configs` want that have no live accept
     /// loop: each listener on its own `address` (one listener per bind
     /// address, expanded by the caller), or every interface. One listener
-    /// per (address, port); accept work is distributed by the Tokio runtime.
+    /// per endpoint; accept work is distributed by the Tokio runtime.
     /// Publishes every TCP port's plan first ([`plan_ports`]): a socket
     /// already bound serves its next connection by it, so a port changes
     /// protocol, gains or sheds a listener or a cert, without a rebind.
@@ -596,7 +674,7 @@ impl DataPlane {
         listener_configs: &[ListenerConfig],
         routes: Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
-    ) -> (usize, Vec<(u16, String)>) {
+    ) -> (usize, Vec<BindError>) {
         let mut opened = 0usize;
         let desired = Self::desired_endpoints(listener_configs);
 
@@ -604,12 +682,27 @@ impl DataPlane {
         // only when a port's merged cert bytes changed, and once per port.
         // The bind loop below always runs, so a newly appeared bind address
         // still gets bound when the certs are unchanged.
-        let (plans, mut errors) = plan_ports(
+        let (plans, plan_errors) = plan_ports(
             listener_configs,
             std::path::Path::new("/unused"),
             performance_config.http2,
             &mut self.terminate_configs,
         );
+        self.tls_failures = plan_errors.iter().cloned().collect();
+        let mut errors: Vec<BindError> = plan_errors
+            .iter()
+            .flat_map(|(port, error)| {
+                desired
+                    .iter()
+                    .filter(move |(endpoint, published)| {
+                        **published == *port && endpoint.transport == Transport::Tcp
+                    })
+                    .map(|(endpoint, _)| BindError {
+                        endpoint: endpoint.clone(),
+                        error: error.clone(),
+                    })
+            })
+            .collect();
         self.plans.retain(|port, _| plans.contains_key(port));
         for (port, plan) in plans {
             match self.plans.get(&port) {
@@ -620,12 +713,29 @@ impl DataPlane {
                 }
             }
         }
+        // A port that could serve no connection (every HTTPS listener on
+        // it without a cert, nothing passed through) is closed, as a fresh
+        // data plane never binds it below.
+        let dead_ports: HashSet<u16> = self
+            .plans
+            .iter()
+            .filter(|(_, plan)| !serves(plan.load().as_deref()))
+            .map(|(port, _)| *port)
+            .collect();
+        let closing = self.close_where(|endpoint, port| {
+            let dead = endpoint.transport == Transport::Tcp && dead_ports.contains(&port);
+            if dead {
+                info!("Listener {} serves no certificate; closing", endpoint);
+            }
+            dead
+        });
+        self.closing.extend(closing);
 
         for listener_cfg in listener_configs {
-            // `port` is the published identity (routing/TLS key); `bound_port` is
-            // the socket we actually bind — the Service's targetPort when set.
+            // `port` is the published identity (routing/TLS key); the
+            // endpoint's is the socket we actually bind — the Service's
+            // targetPort when set.
             let port = listener_cfg.port;
-            let bound_port = listener_cfg.target_port.unwrap_or(port);
 
             let plan = match listener_cfg.protocol {
                 Protocol::UDP => None,
@@ -638,8 +748,7 @@ impl DataPlane {
                 },
             };
 
-            let address = listener_cfg.address.as_deref();
-            let endpoint = (listener_cfg.address.clone(), bound_port);
+            let endpoint = Endpoint::of(listener_cfg);
             // Already bound, a specific address the port's wildcard stands
             // for, or an endpoint another published port takes: the one
             // `close_unwanted` keeps it for.
@@ -647,35 +756,43 @@ impl DataPlane {
                 continue;
             }
 
-            if let Some(plan) = plan {
-                match self.bind_tcp(listener_cfg, endpoint, plan, &routes, performance_config) {
-                    Ok(()) => opened += 1,
-                    Err(e) => errors.push((port, e)),
+            let bound = match plan {
+                Some(plan) => {
+                    self.bind_tcp(listener_cfg, &endpoint, plan, &routes, performance_config)
                 }
-            } else {
-                match create_udp_socket(bound_port, address, listener_cfg.interface.as_deref()) {
-                    Ok(std_socket) => match UdpSocket::from_std(std_socket) {
-                        Ok(tokio_socket) => {
-                            let routes = routes.clone();
-                            let health = self.health.clone();
-                            let limits = self.udp_sessions.clone();
-                            let socket = Arc::new(tokio_socket);
-
-                            self.spawn_listener_task(endpoint, port, |cancel| async move {
-                                udp_worker::run_udp_worker(
-                                    socket, port, routes, limits, cancel, health,
-                                )
-                                .await;
-                            });
-                            opened += 1;
-                        }
-                        Err(e) => errors.push((port, format!("UDP from_std: {}", e))),
-                    },
-                    Err(e) => errors.push((port, format!("UDP bind: {}", e))),
-                }
+                None => self.bind_udp(listener_cfg, &endpoint, &routes),
+            };
+            match bound {
+                Ok(()) => opened += 1,
+                Err(error) => errors.push(BindError { endpoint, error }),
             }
         }
         (opened, errors)
+    }
+
+    /// Bind `listener_cfg`'s UDP `endpoint` and spawn its worker.
+    fn bind_udp(
+        &mut self,
+        listener_cfg: &ListenerConfig,
+        endpoint: &Endpoint,
+        routes: &Arc<ArcSwap<RouteTable>>,
+    ) -> Result<(), String> {
+        let std_socket = create_udp_socket(
+            endpoint.port,
+            endpoint.address.as_deref(),
+            listener_cfg.interface.as_deref(),
+        )
+        .map_err(|e| format!("UDP bind: {}", e))?;
+        let socket =
+            Arc::new(UdpSocket::from_std(std_socket).map_err(|e| format!("UDP from_std: {}", e))?);
+        let routes = routes.clone();
+        let health = self.health.clone();
+        let limits = self.udp_sessions.clone();
+        let port = listener_cfg.port;
+        self.spawn_listener_task(endpoint.clone(), port, |cancel| async move {
+            udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
+        });
+        Ok(())
     }
 
     /// Bind `listener_cfg`'s `endpoint` and spawn its accept loop, which
@@ -683,14 +800,14 @@ impl DataPlane {
     fn bind_tcp(
         &mut self,
         listener_cfg: &ListenerConfig,
-        endpoint: (Option<String>, u16),
+        endpoint: &Endpoint,
         plan: PortPlan,
         routes: &Arc<ArcSwap<RouteTable>>,
         performance_config: &crate::config::PerformanceConfig,
     ) -> Result<(), String> {
         let std_listener = create_tcp_listener(
-            endpoint.1,
-            endpoint.0.as_deref(),
+            endpoint.port,
+            endpoint.address.as_deref(),
             listener_cfg.interface.as_deref(),
             &worker::tcp_keepalive(performance_config.tcp_keepalive_time),
         )
@@ -713,7 +830,7 @@ impl DataPlane {
             active_connections: self.active_connections.clone(),
             shared_pool: self.shared_pool.clone(),
         };
-        self.spawn_listener_task(endpoint, listener_cfg.port, |cancel| async move {
+        self.spawn_listener_task(endpoint.clone(), listener_cfg.port, |cancel| async move {
             worker::run_worker(tokio_listener, ctx, cancel).await;
         });
         Ok(())
@@ -744,7 +861,12 @@ impl DataPlane {
                 active_connections: self.active_connections.clone(),
                 shared_pool: self.shared_pool.clone(),
             };
-            self.spawn_listener_task((address, bound_port), port, |cancel| async move {
+            let endpoint = Endpoint {
+                address,
+                port: bound_port,
+                transport: Transport::Tcp,
+            };
+            self.spawn_listener_task(endpoint, port, |cancel| async move {
                 worker::run_worker(listener, ctx, cancel).await;
             });
         }
@@ -757,7 +879,11 @@ impl DataPlane {
             let limits = self.udp_sessions.clone();
             let port = entry.port;
 
-            let endpoint = (entry.address, entry.bound_port);
+            let endpoint = Endpoint {
+                address: entry.address,
+                port: entry.bound_port,
+                transport: Transport::Udp,
+            };
             self.spawn_listener_task(endpoint, port, |cancel| async move {
                 udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
             });
@@ -779,12 +905,12 @@ impl DataPlane {
         }
     }
 
-    /// Check if all the specified (address, port) endpoints are bound with a
+    /// Check if all the specified endpoints are bound with a
     /// LIVE accept loop (or a construction-time socket awaiting `start()`).
     /// A dead accept loop does NOT count: readiness and Programmed must go
     /// false the moment a listener can no longer accept, so the reconcile
     /// safety net rebinds instead of trusting stale bookkeeping.
-    pub fn is_ready_for_endpoints(&self, required: &[(Option<String>, u16)]) -> bool {
+    pub fn is_ready_for_endpoints(&self, required: &[Endpoint]) -> bool {
         required.iter().all(|ep| {
             self.endpoint_alive(ep)
                 // A wildcard socket on the port already accepts traffic for
@@ -792,7 +918,7 @@ impl DataPlane {
                 // still open only while the spec wants it (close_unwanted).
                 // The reverse does NOT hold: a required wildcard bind is not
                 // satisfied by an address-specific one.
-                || (ep.0.is_some() && self.endpoint_alive(&(None, ep.1)))
+                || (ep.address.is_some() && self.endpoint_alive(&ep.wildcard()))
         })
     }
 
@@ -800,7 +926,38 @@ impl DataPlane {
     pub fn health(&self) -> &Arc<HealthRegistry> {
         &self.health
     }
+
+    /// Why HTTPS `listener` terminates nothing as of the last pass, its
+    /// SNI refused ([`TlsKind::NoCert`]); `None` when it terminates, or is
+    /// not HTTPS. Its socket may still be bound for a sibling.
+    pub fn refusal(&self, listener: &ListenerConfig) -> Option<String> {
+        if listener.protocol != Protocol::HTTPS
+            || self
+                .terminate_configs
+                .get(&listener.port)
+                .is_some_and(|built| built.has_cert_of(listener))
+        {
+            return None;
+        }
+        let revoked = listener
+            .tls
+            .as_ref()
+            .is_none_or(|tls| tls.certificate_refs.is_empty());
+        Some(if revoked {
+            NO_CERTIFICATE.to_string()
+        } else {
+            self.tls_failures
+                .get(&listener.port)
+                .cloned()
+                .unwrap_or_else(|| "none of its certificates loaded".to_string())
+        })
+    }
 }
+
+/// Why an HTTPS listener with no certificateRef left terminates nothing:
+/// the controller keeps sending it so that its SNI is refused.
+pub const NO_CERTIFICATE: &str =
+    "no certificateRef left (grant revoked or Secret gone): its TLS handshakes are refused";
 
 pub(crate) fn create_tcp_listener(
     port: u16,
@@ -1071,8 +1228,8 @@ mod tests {
         let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
 
         // Readiness keys on the bound (target) port, not the published port.
-        assert!(dp.is_ready_for_endpoints(&[(None, 31080)]));
-        assert!(!dp.is_ready_for_endpoints(&[(None, 21080)]));
+        assert!(dp.is_ready_for_endpoints(&[tcp(None, 31080)]));
+        assert!(!dp.is_ready_for_endpoints(&[tcp(None, 21080)]));
 
         // The socket really landed on the target port (held by the data plane)...
         assert!(
@@ -1391,7 +1548,7 @@ mod tests {
                 ensure(&mut dp, std::slice::from_ref(&rotated_bad), &routes, &perf).await;
             assert_eq!(opened, 0);
             assert_eq!(errors.len(), 1, "{errors:?}");
-            assert!(errors[0].1.contains("last good"), "{errors:?}");
+            assert!(errors[0].error.contains("last good"), "{errors:?}");
             assert_eq!(presented(port, sni).await, Ok(der(&good.0)));
         }
 
@@ -1405,7 +1562,7 @@ mod tests {
         renamed_bad.tls.as_mut().unwrap().certificate_refs[0].hostname =
             renamed_bad.hostname.clone();
         let (_, errors) = ensure(&mut dp, &[renamed_bad], &routes, &perf).await;
-        assert!(!errors[0].1.contains("last good"), "{errors:?}");
+        assert!(!errors[0].error.contains("last good"), "{errors:?}");
         for sni in [sni, Some("new.example.org")] {
             assert!(presented(port, sni).await.is_err(), "{sni:?}");
         }
@@ -1441,6 +1598,94 @@ mod tests {
             Ok(der(&wildcard.0))
         );
         assert_eq!(presented(port, Some("y.org")).await, Ok(der(&catch_all.0)));
+    }
+
+    /// An HTTPS listener as the controller sends it once its grant is
+    /// revoked or its Secret deleted: no certificateRef left.
+    fn revoked(listener: ListenerConfig) -> ListenerConfig {
+        let mut listener = listener;
+        listener.tls.as_mut().unwrap().certificate_refs.clear();
+        listener
+    }
+
+    /// A revoked hostname listener beside a catch-all HTTPS sibling on its
+    /// port: its SNI is refused, never answered with the sibling's cert,
+    /// and nothing failed.
+    #[tokio::test]
+    async fn a_revoked_hostname_listener_refuses_its_sni() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("catch-all") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let listeners = [
+            https_with_cert(port, None, &cert),
+            revoked(https_listener("gone", port, Some("gone.example.org"), "x")),
+        ];
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+        assert_eq!(
+            ensure(&mut dp, &listeners, &routes, &perf).await,
+            (0, vec![])
+        );
+
+        assert!(presented(port, Some("gone.example.org")).await.is_err());
+        assert_eq!(presented(port, Some("other.org")).await, Ok(der(&cert.0)));
+    }
+
+    /// A port whose only listener is revoked serves nothing: a fresh data
+    /// plane does not bind it, and a running one closes it, both without
+    /// an error. The running one kept the port open, refusing every
+    /// handshake, while a fresh pod never bound it.
+    #[tokio::test]
+    async fn a_port_with_only_revoked_listeners_is_closed_as_never_bound() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let serving = https_with_cert(port, None, &cert);
+        let gone = [revoked(serving.clone())];
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+
+        let mut fresh = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        assert_eq!(ensure(&mut fresh, &gone, &routes, &perf).await, (0, vec![]));
+        assert!(!fresh.endpoint_alive(&tcp(None, port)));
+        drop(fresh);
+
+        let mut running = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        bind_until(
+            &mut running,
+            std::slice::from_ref(&serving),
+            &routes,
+            &perf,
+            1,
+        )
+        .await;
+        assert_eq!(
+            ensure(&mut running, &gone, &routes, &perf).await,
+            (0, vec![])
+        );
+        assert!(!running.endpoint_alive(&tcp(None, port)));
+        for accept_loop in running.close_unwanted(&gone) {
+            accept_loop.await.unwrap();
+        }
+        // A child another test forks holds this process's sockets until
+        // its exec.
+        for _ in 0..200 {
+            if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the revoked port is not released");
     }
 
     /// A listener whose published port changes while its targetPort stays
@@ -1796,6 +2041,14 @@ mod tests {
         test_ports::wildcard()
     }
 
+    fn tcp(address: Option<&str>, port: u16) -> Endpoint {
+        Endpoint {
+            address: address.map(str::to_string),
+            port,
+            transport: Transport::Tcp,
+        }
+    }
+
     fn accepts(addr: &str, port: u16) -> bool {
         std::net::TcpStream::connect((addr, port)).is_ok()
     }
@@ -1807,7 +2060,7 @@ mod tests {
         listeners: &[ListenerConfig],
         routes: &Arc<ArcSwap<RouteTable>>,
         perf: &crate::config::PerformanceConfig,
-    ) -> (usize, Vec<(u16, String)>) {
+    ) -> (usize, Vec<BindError>) {
         for accept_loop in dp.close_unwanted(listeners) {
             accept_loop.await.unwrap();
         }
@@ -1825,8 +2078,7 @@ mod tests {
     ) {
         let listeners = std::slice::from_ref(listener);
         ensure(dp, listeners, routes, perf).await;
-        let bound_port = listener.target_port.unwrap_or(listener.port);
-        if !dp.endpoint_alive(&(listener.address.clone(), bound_port)) {
+        if !dp.endpoint_alive(&Endpoint::of(listener)) {
             bind_until(dp, listeners, routes, perf, 1).await;
         }
     }
@@ -1842,7 +2094,7 @@ mod tests {
         let port = free_port();
         let on_every_interface = http_listener(port, None);
         let on_one_address = http_listener(port, Some("127.0.0.1"));
-        let (wildcard, specific) = ((None, port), (Some("127.0.0.1".to_string()), port));
+        let (wildcard, specific) = (tcp(None, port), tcp(Some("127.0.0.1"), port));
         let perf = test_perf();
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
@@ -1881,7 +2133,7 @@ mod tests {
         bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
         let (opened, errors) = ensure(&mut dp, &listeners, &routes, &perf).await;
         assert_eq!((opened, errors), (0, vec![]), "nothing left to bind");
-        assert!(dp.is_ready_for_endpoints(&[(None, port), (Some("127.0.0.1".to_string()), port)]));
+        assert!(dp.is_ready_for_endpoints(&[tcp(None, port), tcp(Some("127.0.0.1"), port)]));
         assert!(accepts("127.0.0.2", port));
     }
 
@@ -1908,30 +2160,32 @@ mod tests {
 
         let (opened, errors) = dp.add_tcp_listeners(&listeners, routes.clone(), &perf);
         assert_eq!((opened, errors.len()), (1, 0));
-        assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
+        assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
 
         // Kill the accept loop out-of-band — stands in for any task death.
-        if let Some(ListenerSlot::Running(handle, ..)) = dp.listener_tasks.get(&(None, 23447)) {
+        if let Some(ListenerSlot::Running(handle, ..)) = dp.listener_tasks.get(&tcp(None, 23447)) {
             handle.abort();
         } else {
             panic!("expected a running listener slot");
         }
         // Bounded wait for the abort to land (is_finished flips async).
         for _ in 0..200 {
-            if !dp.endpoint_alive(&(None, 23447)) {
+            if !dp.endpoint_alive(&tcp(None, 23447)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
-            !dp.is_ready_for_endpoints(&[(None, 23447)]),
+            !dp.is_ready_for_endpoints(&[tcp(None, 23447)]),
             "a dead accept loop must not count as bound"
         );
 
-        // The next ensure pass reaps the corpse and rebinds the endpoint.
-        let (opened, errors) = ensure(&mut dp, &listeners, &routes, &perf).await;
-        assert_eq!((opened, errors.len()), (1, 0), "dead endpoint must rebind");
-        assert!(dp.is_ready_for_endpoints(&[(None, 23447)]));
+        // The next pass reaps the corpse and rebinds the endpoint, retried
+        // as bind_until says.
+        assert!(dp.close_unwanted(&listeners).is_empty());
+        assert!(!dp.listener_tasks.contains_key(&tcp(None, 23447)), "reaped");
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+        assert!(dp.is_ready_for_endpoints(&[tcp(None, 23447)]));
     }
 
     /// Reconcile passes until `want` more listeners are bound, as the
@@ -1980,7 +2234,7 @@ mod tests {
             tls: None,
             rate_limit: None,
         };
-        let endpoint = |port| (Some(ADDR.to_string()), port);
+        let endpoint = |port| tcp(Some(ADDR), port);
         let both = vec![mk("a", a), mk("b", b)];
         let perf = test_perf();
         let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
@@ -2007,5 +2261,114 @@ mod tests {
         // Re-adding the listener rebinds it.
         bind_until(&mut dp, &both, &routes, &perf, 1).await;
         assert!(dp.is_ready_for_endpoints(&[endpoint(b)]));
+    }
+
+    fn udp_listener(port: u16) -> ListenerConfig {
+        ListenerConfig {
+            name: "udp".into(),
+            protocol: P::UDP,
+            ..http_listener(port, None)
+        }
+    }
+
+    /// A port whose TCP and UDP sockets are both free.
+    fn free_tcp_and_udp_port() -> u16 {
+        std::iter::repeat_with(free_port)
+            .find(|&port| std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok())
+            .unwrap()
+    }
+
+    /// TCP and UDP listeners on one port are two sockets, in both bind
+    /// paths: keyed without the transport, the second counted as bound.
+    #[tokio::test]
+    async fn tcp_and_udp_listeners_on_one_port_both_bind() {
+        let perf = test_perf();
+        // A probe socket of this test's can sit in a child another test
+        // forks until its exec: try another port then.
+        let (port, dp) = std::iter::repeat_with(|| {
+            let port = free_tcp_and_udp_port();
+            let listeners = [http_listener(port, None), udp_listener(port)];
+            DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"))
+                .ok()
+                .map(|dp| (port, dp))
+        })
+        .take(10)
+        .flatten()
+        .next()
+        .expect("a port both bind on");
+        let listeners = [http_listener(port, None), udp_listener(port)];
+        let (tcp_endpoint, udp_endpoint) =
+            (Endpoint::of(&listeners[0]), Endpoint::of(&listeners[1]));
+        assert_eq!(udp_endpoint.transport, Transport::Udp);
+        let held = || {
+            (
+                std::net::TcpListener::bind(("0.0.0.0", port)).is_err(),
+                std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
+            )
+        };
+
+        assert!(dp.is_ready_for_endpoints(&[tcp_endpoint.clone(), udp_endpoint.clone()]));
+        assert_eq!(held(), (true, true), "construction binds both");
+        drop(dp);
+
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+        bind_until(&mut dp, &listeners, &routes, &perf, 2).await;
+        assert!(dp.is_ready_for_endpoints(&[tcp_endpoint, udp_endpoint]));
+        assert_eq!(held(), (true, true), "a pass binds both");
+    }
+
+    /// A bind error names the endpoint that failed, not every endpoint of
+    /// its port: a listener on two addresses whose port one of them holds.
+    #[tokio::test]
+    async fn a_bind_error_names_its_endpoint() {
+        // Loopback addresses no other test here binds.
+        const HELD: &str = "127.0.0.4";
+        const FREE: &str = "127.0.0.5";
+        let holder = std::net::TcpListener::bind((HELD, 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let listeners = [
+            http_listener(port, Some(HELD)),
+            http_listener(port, Some(FREE)),
+        ];
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+
+        let (opened, errors) = dp.add_tcp_listeners(&listeners, routes, &perf);
+        assert_eq!(opened, 1);
+        assert_eq!(
+            errors.iter().map(|e| &e.endpoint).collect::<Vec<_>>(),
+            [&tcp(Some(HELD), port)]
+        );
+        assert!(errors[0].error.starts_with("TCP bind"), "{errors:?}");
+        assert!(dp.is_ready_for_endpoints(&[tcp(Some(FREE), port)]));
+    }
+
+    /// An accept loop that ends on its own unreadies the pod and says so
+    /// to whoever waits to rebind; one cancelled does neither.
+    #[tokio::test]
+    async fn an_accept_loop_exit_is_announced() {
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let ready = Arc::new(AtomicBool::new(true));
+        dp.set_ready_flag(ready.clone());
+        let mut exits = dp.listener_exits();
+
+        dp.spawn_listener_task(
+            tcp(None, 1),
+            1,
+            |cancel| async move { cancel.cancelled().await },
+        );
+        dp.close_unwanted(&[]).pop().unwrap().await.unwrap();
+        assert!(ready.load(Ordering::Acquire), "a cancelled loop is no loss");
+        assert!(!exits.has_changed().unwrap());
+
+        dp.spawn_listener_task(tcp(None, 2), 2, |_| async {});
+        tokio::time::timeout(Duration::from_secs(5), exits.changed())
+            .await
+            .expect("the exit is announced")
+            .unwrap();
+        assert!(!ready.load(Ordering::Acquire));
     }
 }

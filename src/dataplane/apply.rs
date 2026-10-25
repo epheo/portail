@@ -13,7 +13,7 @@ use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_net
 use super::dns_refresh::{spawn_dns_refresh, Published};
 use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
 use crate::logging::{error, info, warn};
-use crate::proxy::data_plane::DataPlane;
+use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;
 use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Snapshot, Transport};
 
@@ -47,8 +47,8 @@ struct Applied {
 struct DataPlaneState {
     rebuilt: bool,
     build_error: Option<String>,
-    /// From this apply's binds, keyed by published port.
-    bind_errors: Vec<(u16, String)>,
+    /// From this apply's binds.
+    bind_errors: Vec<BindError>,
 }
 
 fn lock(data_plane: &Mutex<DataPlane>) -> MutexGuard<'_, DataPlane> {
@@ -170,13 +170,17 @@ impl Applier {
     /// - changed: bind, rebuild the table, publish it.
     async fn bring_up(&mut self, served: &Served) -> DataPlaneState {
         let binds = served.binds();
-        let required = served.required();
         let fingerprint = data_plane_fingerprint(&served.config, &binds);
         let unchanged = self
             .last
             .clone()
             .filter(|applied| applied.fingerprint == fingerprint);
-        let is_ready = |dp: &Mutex<DataPlane>| lock(dp).is_ready_for_endpoints(&required);
+        // Which listeners terminate nothing is the pass's to say: asked
+        // after it.
+        let is_ready = |dp: &Mutex<DataPlane>| {
+            let dp = lock(dp);
+            dp.is_ready_for_endpoints(&served.required(&dp))
+        };
 
         if is_ready(&self.data_plane) {
             self.ready.store(true, Ordering::Release);
@@ -198,7 +202,7 @@ impl Applier {
         if ready && !was_ready {
             info!(
                 "Data plane ready: {} listener endpoint(s) live, {:.1}s after start",
-                required.len(),
+                served.required(&lock(&self.data_plane)).len(),
                 self.started.elapsed().as_secs_f32()
             );
         }
@@ -239,8 +243,8 @@ impl Applier {
     }
 
     /// Bind the data plane to `binds` (see [`Served::binds`]) and close what
-    /// they no longer hold. Returns the bind errors, keyed by published port.
-    async fn ensure_listeners(&self, binds: &[ListenerConfig]) -> Vec<(u16, String)> {
+    /// they no longer hold. Returns the bind errors.
+    async fn ensure_listeners(&self, binds: &[ListenerConfig]) -> Vec<BindError> {
         info!(
             "Ensuring data plane listeners for ports: {:?}",
             binds.iter().map(|l| l.port).collect::<Vec<_>>()
@@ -257,19 +261,15 @@ impl Applier {
         if opened > 0 {
             info!("Opened {} new port(s)", opened);
         }
-        for (port, err) in &errors {
-            warn!("Failed to bind port {}: {}", port, err);
+        for e in &errors {
+            warn!("Failed to bind {}: {}", e.endpoint, e.error);
         }
         errors
     }
 
-    /// Each listener's endpoints, bound or not, the bind error of its port
-    /// on the unbound ones.
-    fn listener_reports(
-        &self,
-        served: &Served,
-        bind_errors: &[(u16, String)],
-    ) -> Vec<ListenerReport> {
+    /// Each listener's endpoints, bound or not, the unbound ones with their
+    /// bind error.
+    fn listener_reports(&self, served: &Served, bind_errors: &[BindError]) -> Vec<ListenerReport> {
         let dp = lock(&self.data_plane);
         served
             .config
@@ -283,15 +283,22 @@ impl Applier {
                     Some(bind) => required_endpoints(std::slice::from_ref(l), bind)
                         .into_iter()
                         .map(|endpoint| {
-                            let bound = dp.is_ready_for_endpoints(std::slice::from_ref(&endpoint));
-                            EndpointReport {
-                                error: bind_errors
+                            // Its socket may be a sibling's: it serves none
+                            // of it.
+                            let refusal = dp.refusal(l);
+                            let bound = refusal.is_none()
+                                && dp.is_ready_for_endpoints(std::slice::from_ref(&endpoint));
+                            let error = refusal.or_else(|| {
+                                bind_errors
                                     .iter()
-                                    .find(|(port, _)| !bound && *port == l.port)
-                                    .map(|(_, e)| e.clone()),
-                                address: endpoint.0,
-                                port: endpoint.1,
-                                transport: Transport::of(&l.protocol),
+                                    .find(|e| !bound && e.endpoint == endpoint)
+                                    .map(|e| e.error.clone())
+                            });
+                            EndpointReport {
+                                error,
+                                address: endpoint.address,
+                                port: endpoint.port,
+                                transport: endpoint.transport,
                                 bound,
                             }
                         })
@@ -332,35 +339,37 @@ impl Served {
     }
 
     /// The endpoints its listeners must have live to be ready. Unbindable
-    /// listeners still count, so readiness stays down.
-    fn required(&self) -> Vec<(Option<String>, u16)> {
-        required_endpoints(
-            &self.config.gateway.listeners,
-            self.bind.as_deref().unwrap_or_default(),
-        )
+    /// listeners still count, so readiness stays down. An HTTPS listener
+    /// that terminates nothing does not (no certificateRef left, or its
+    /// certs failed to build): it can never serve, and counting it took
+    /// every other listener of the pod out with it.
+    fn required(&self, dp: &DataPlane) -> Vec<Endpoint> {
+        let bind = self.bind.as_deref().unwrap_or_default();
+        self.config
+            .gateway
+            .listeners
+            .iter()
+            .filter(|l| dp.refusal(l).is_none())
+            .flat_map(|l| required_endpoints(std::slice::from_ref(l), bind))
+            .collect()
     }
 }
 
-/// (address, bound-port) pairs the data plane must be bound to for these
-/// listeners to be ready. Keyed on each listener's bound port (`target_port`
-/// when the controller decoupled it from the published port).
-fn required_endpoints(
-    listeners: &[ListenerConfig],
-    bind_addresses: &[String],
-) -> Vec<(Option<String>, u16)> {
+/// The endpoints the data plane must be bound to for these listeners to
+/// be ready. Keyed on each listener's bound port (`target_port` when the
+/// controller decoupled it from the published port).
+fn required_endpoints(listeners: &[ListenerConfig], bind_addresses: &[String]) -> Vec<Endpoint> {
+    let on = |address: Option<&String>, l: &ListenerConfig| Endpoint {
+        address: address.cloned(),
+        port: l.target_port.unwrap_or(l.port),
+        transport: Transport::of(&l.protocol),
+    };
     if bind_addresses.is_empty() {
-        listeners
-            .iter()
-            .map(|l| (None, l.target_port.unwrap_or(l.port)))
-            .collect()
+        listeners.iter().map(|l| on(None, l)).collect()
     } else {
         bind_addresses
             .iter()
-            .flat_map(|addr| {
-                listeners
-                    .iter()
-                    .map(move |l| (Some(addr.clone()), l.target_port.unwrap_or(l.port)))
-            })
+            .flat_map(|addr| listeners.iter().map(move |l| on(Some(addr), l)))
             .collect()
     }
 }
@@ -438,6 +447,7 @@ fn data_plane_fingerprint(config: &PortailConfig, binds: &[ListenerConfig]) -> u
 mod tests {
     use super::*;
     use crate::config::Protocol;
+    use crate::proxy::data_plane::NO_CERTIFICATE;
     use crate::sync::GatewayRef;
 
     fn lc(port: u16, target_port: Option<u16>) -> ListenerConfig {
@@ -454,14 +464,22 @@ mod tests {
         }
     }
 
+    fn tcp(address: Option<&str>, port: u16) -> Endpoint {
+        Endpoint {
+            address: address.map(str::to_string),
+            port,
+            transport: Transport::Tcp,
+        }
+    }
+
     #[test]
     fn required_endpoints_keys_on_bound_port() {
         let listeners = [lc(80, Some(8000)), lc(8080, None)];
         let eps = required_endpoints(&listeners, &[]);
-        assert!(eps.contains(&(None, 8000)));
-        assert!(eps.contains(&(None, 8080)));
+        assert!(eps.contains(&tcp(None, 8000)));
+        assert!(eps.contains(&tcp(None, 8080)));
         assert!(
-            !eps.contains(&(None, 80)),
+            !eps.contains(&tcp(None, 80)),
             "published port must not be the readiness key"
         );
     }
@@ -474,8 +492,22 @@ mod tests {
             &["10.0.0.1".to_string(), "10.0.0.2".to_string()],
         );
         assert_eq!(eps.len(), 2);
-        assert!(eps.contains(&(Some("10.0.0.1".to_string()), 8001)));
-        assert!(eps.contains(&(Some("10.0.0.2".to_string()), 8001)));
+        assert!(eps.contains(&tcp(Some("10.0.0.1"), 8001)));
+        assert!(eps.contains(&tcp(Some("10.0.0.2"), 8001)));
+    }
+
+    /// A UDP listener needs a UDP socket: a TCP one on its port is not it.
+    #[test]
+    fn required_endpoints_carry_the_transport() {
+        let udp = ListenerConfig {
+            protocol: Protocol::UDP,
+            ..lc(53, None)
+        };
+        let eps = required_endpoints(&[lc(53, None), udp], &[]);
+        assert_eq!(
+            eps.iter().map(|e| e.transport).collect::<Vec<_>>(),
+            [Transport::Tcp, Transport::Udp]
+        );
     }
 
     /// The skip gate is only sound if the fingerprint is deterministic and
@@ -677,6 +709,200 @@ mod tests {
             "{tcp_endpoint:?}"
         );
         assert!(!ready.load(Ordering::Acquire));
+    }
+
+    /// A TCP and a UDP listener on one port both bind, and the report says
+    /// so per transport.
+    #[tokio::test]
+    async fn tcp_and_udp_on_one_port_both_report_bound() {
+        let (mut applier, ready) = applier();
+        let port = std::iter::repeat_with(crate::proxy::data_plane::test_ports::wildcard)
+            .find(|&port| std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok())
+            .unwrap();
+        let config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": [
+                {"name": "tcp", "protocol": "TCP", "port": port},
+                {"name": "udp", "protocol": "UDP", "port": port},
+            ]},
+        }))
+        .unwrap();
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation: 1,
+        };
+
+        let report = applier
+            .apply(&Snapshot::from_config(gateway, config, vec![]))
+            .await;
+        let endpoints: Vec<(&str, Transport, bool)> = report
+            .listeners
+            .iter()
+            .flat_map(|l| {
+                l.endpoints
+                    .iter()
+                    .map(move |e| (l.name.as_str(), e.transport, e.bound))
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            [("tcp", Transport::Tcp, true), ("udp", Transport::Udp, true)]
+        );
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// An HTTPS listener with `refs` (Secret name, cert PEM, key PEM) and
+    /// an HTTP one, on `(https, http)`.
+    fn https_and_http((https, http): (u16, u16), refs: &[(&str, &[u8], &[u8])]) -> Snapshot {
+        let names: Vec<_> = refs
+            .iter()
+            .map(|(name, ..)| serde_json::json!({"name": name}))
+            .collect();
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": [
+                {"name": "https", "protocol": "HTTPS", "port": https,
+                 "tls": {"mode": "Terminate", "certificateRefs": names}},
+                {"name": "http", "protocol": "HTTP", "port": http},
+            ]},
+        }))
+        .unwrap();
+        let tls = config.gateway.listeners[0].tls.as_mut().unwrap();
+        for (r, (_, cert, key)) in tls.certificate_refs.iter_mut().zip(refs) {
+            r.cert_pem = Some(cert.to_vec());
+            r.key_pem = Some(key.to_vec());
+        }
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation: 1,
+        };
+        Snapshot::from_config(gateway, config, vec![])
+    }
+
+    /// An HTTPS listener whose certs fail to build terminates nothing, as
+    /// a revoked one: out of readiness, reported unbound with the build
+    /// error, its port closed on a running data plane, and the pod's other
+    /// listeners serve on. It counted for readiness, and the whole pod went
+    /// NotReady.
+    #[tokio::test]
+    async fn a_listener_whose_certs_fail_keeps_the_pod_ready() {
+        let bad: (&str, &[u8], &[u8]) = ("bad", b"not a cert", b"not a key");
+        let (mut fresh, fresh_ready) = applier();
+        let report = apply_bound(
+            &mut fresh,
+            &fresh_ready,
+            &https_and_http(free_ports(), &[bad]),
+        )
+        .await;
+        let https = &report.listeners[0].endpoints[0];
+        assert!(!https.bound);
+        assert!(
+            https
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("TLS config build failed")),
+            "{https:?}"
+        );
+        assert!(report.listeners[1].endpoints[0].bound);
+
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.test") else {
+            return; // openssl unavailable
+        };
+        let (mut running, running_ready) = applier();
+        let ports = free_ports();
+        let good = https_and_http(ports, &[("good", &cert, &key)]);
+        apply_bound(&mut running, &running_ready, &good).await;
+        let report = running.apply(&https_and_http(ports, &[bad])).await;
+        assert!(running_ready.load(Ordering::Acquire), "{report:?}");
+        assert!(!report.listeners[0].endpoints[0].bound);
+        assert!(report.listeners[1].endpoints[0].bound);
+    }
+
+    /// A revoked listener (no certificateRef left) is out of readiness and
+    /// reported unbound with why, whether the data plane starts with it or
+    /// served its certs before: the binds and the report end the same.
+    #[tokio::test]
+    async fn a_revoked_listener_ends_the_same_fresh_or_running() {
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.test") else {
+            return; // openssl unavailable
+        };
+        let snapshot = |ports, with_cert: bool| match with_cert {
+            true => https_and_http(ports, &[("cert", &cert, &key)]),
+            false => https_and_http(ports, &[]),
+        };
+        // Ports differ between the two: neither binds one the other just
+        // closed.
+        let shape = |report: &InstanceReport| -> Vec<(String, bool, Option<String>)> {
+            report
+                .listeners
+                .iter()
+                .flat_map(|l| {
+                    l.endpoints
+                        .iter()
+                        .map(|e| (l.name.clone(), e.bound, e.error.clone()))
+                })
+                .collect()
+        };
+        let https_endpoint = |port| Endpoint {
+            address: None,
+            port,
+            transport: Transport::Tcp,
+        };
+
+        let (mut fresh, fresh_ready) = applier();
+        let ports = free_ports();
+        let fresh_report = apply_bound(&mut fresh, &fresh_ready, &snapshot(ports, false)).await;
+        let fresh_bound =
+            lock(&fresh.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]);
+        assert!(!fresh_bound);
+
+        let (mut running, running_ready) = applier();
+        let ports = free_ports();
+        apply_bound(&mut running, &running_ready, &snapshot(ports, true)).await;
+        assert!(lock(&running.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]));
+        let running_report = running.apply(&snapshot(ports, false)).await;
+        assert!(running_ready.load(Ordering::Acquire));
+        assert_eq!(shape(&running_report), shape(&fresh_report));
+        assert_eq!(
+            shape(&running_report),
+            [
+                ("https".to_string(), false, Some(NO_CERTIFICATE.to_string())),
+                ("http".to_string(), true, None),
+            ]
+        );
+        assert!(!lock(&running.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]));
+        let closing = lock(&running.data_plane).close_unwanted(&[]);
+        for accept_loop in closing {
+            accept_loop.await.unwrap();
+        }
+        // A child another test forks holds this process's sockets until
+        // its exec.
+        for _ in 0..200 {
+            if bindable(ports.0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the running data plane kept the revoked port");
+    }
+
+    /// Apply until every endpoint binds: a probe socket of this test's can
+    /// sit in a child another test forks until its exec.
+    async fn apply_bound(
+        applier: &mut Applier,
+        ready: &AtomicBool,
+        snapshot: &Snapshot,
+    ) -> InstanceReport {
+        for _ in 0..200 {
+            let report = applier.apply(snapshot).await;
+            if ready.load(Ordering::Acquire) {
+                return report;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{} never bound", snapshot.version);
     }
 
     /// Runs `test` in a process of its own, on a current-thread runtime:

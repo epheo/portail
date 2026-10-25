@@ -2008,30 +2008,6 @@ fn test_admin_endpoint_binds_its_address() {
     assert!(std::net::TcpStream::connect(other).is_err());
 }
 
-/// The data-plane mode parses its flags, then exits 2 until its runtime
-/// lands: never a half-built mode that looks like it serves. The
-/// controller runs: tests/test_controller.rs.
-#[test]
-fn test_kubernetes_modes_are_not_implemented_in_this_build() {
-    let mode = [
-        "dataplane",
-        "--gateway",
-        "default/gw",
-        "--controller-address",
-        "https://portail-controller.portail-system.svc:9443",
-    ];
-    let mut proxy = PortailProcess::start_kubernetes(&mode, None, 25086);
-    let status = proxy
-        .wait_exit(Duration::from_secs(10))
-        .unwrap_or_else(|| panic!("{mode:?} still running:\n{}", proxy.output()));
-    assert_eq!(status.code(), Some(2), "{mode:?}:\n{}", proxy.output());
-    assert!(
-        proxy.output().contains("not implemented in this build"),
-        "{mode:?}:\n{}",
-        proxy.output()
-    );
-}
-
 /// A copy of `portail::proxy::worker::LINGER_IDLE`, which is crate-private:
 /// keep the two equal.
 const LINGER_IDLE: Duration = Duration::from_secs(5);
