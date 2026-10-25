@@ -919,6 +919,17 @@ mod tests {
         ("cert".into(), ns.into())
     }
 
+    /// How many certificateRefs the HTTPS listener of `gw` reaches the data
+    /// plane with. The listener itself always does, with no ref left: left
+    /// out, its SNI would fall to a catch-all sibling's cert.
+    fn carried_refs(gw: &Gateway, resolved: &ResolvedCerts) -> usize {
+        let config = crate::kubernetes::converters::convert_gateway(gw, &resolved.valid).unwrap();
+        let [https] = config.listeners.as_slice() else {
+            panic!("the HTTPS listener is sent: {:?}", config.listeners);
+        };
+        https.tls.as_ref().unwrap().certificate_refs.len()
+    }
+
     /// A TLS Secret at `resource_version`, in `default`.
     fn secret_at(uid: &str, resource_version: &str, pair: &(Vec<u8>, Vec<u8>)) -> Secret {
         let mut secret = tls_secret("cert", "default", &pair.0, &pair.1);
@@ -974,10 +985,12 @@ mod tests {
 
         let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
         assert_eq!(resolved.valid.get(&key), Some(&good));
+        assert_eq!(carried_refs(&gw, &resolved), 1);
 
         let resolved = resolve_gateway_certs(&gw, "default", &[], &store, &last);
         assert!(resolved.valid.is_empty(), "revoked grant");
         assert_eq!(resolved.errors[&key].reason(), "RefNotPermitted");
+        assert_eq!(carried_refs(&gw, &resolved), 0, "revoked grant");
 
         let mut deleted = tls_secret("cert", "certs", &good.0, &good.1);
         deleted.metadata.uid = Some("uid-1".into());
@@ -985,6 +998,7 @@ mod tests {
         let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
         assert!(resolved.valid.is_empty(), "deleted Secret");
         assert_eq!(resolved.errors[&key].reason(), "InvalidCertificateRef");
+        assert_eq!(carried_refs(&gw, &resolved), 0, "deleted Secret");
 
         stored(&mut secrets, "uid-1", "certs", &garbage());
         let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
@@ -1086,9 +1100,9 @@ mod tests {
     /// Far past a loopback handshake: only a hung one reaches it.
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// The cert the data plane on `port` presents for [`SNI`], or why it
+    /// The cert the data plane on `port` presents for `sni`, or why it
     /// presents none.
-    async fn presented(port: u16) -> Result<Vec<u8>, String> {
+    async fn presented(port: u16, sni: &str) -> Result<Vec<u8>, String> {
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
@@ -1096,7 +1110,7 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .map_err(|e| e.to_string())?;
-        let name = rustls::pki_types::ServerName::try_from(SNI).unwrap();
+        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
         let handshake = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp);
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
             Ok(Ok(tls)) => Ok(tls.get_ref().1.peer_certificates().unwrap()[0].to_vec()),
@@ -1121,17 +1135,46 @@ mod tests {
         gw
     }
 
-    /// The ResolvedRefs condition of the first listener in the last
-    /// status write of the pipeline's Gateway.
-    fn resolved_refs(p: &Pipeline) -> serde_json::Value {
+    /// Condition `kind` of `listener` in the last status write of the
+    /// pipeline's Gateway.
+    fn condition(p: &Pipeline, listener: &str, kind: &str) -> serde_json::Value {
         let patch = p.api.status_patch("gateways", "gw").unwrap();
-        patch["status"]["listeners"][0]["conditions"]
+        let listener = patch["status"]["listeners"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|c| c["type"] == "ResolvedRefs")
+            .find(|l| l["name"] == listener)
+            .unwrap();
+        listener["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == kind)
             .unwrap()
             .clone()
+    }
+
+    /// Listener `name` of what the hub serves for `gw` keeps its TLS
+    /// config, with no certificateRef left.
+    fn served_without_refs(p: &Pipeline, gw: &Gateway, name: &str) {
+        let served = p.served(gw).unwrap();
+        let listener = served
+            .config
+            .gateway
+            .listeners
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("{name} is served"));
+        assert!(listener.tls.as_ref().unwrap().certificate_refs.is_empty());
+    }
+
+    /// Accepted True, ResolvedRefs False for `reason`: the listener stays,
+    /// its refs do not resolve.
+    fn unresolved(p: &Pipeline, listener: &str, reason: &str) {
+        assert_eq!(condition(p, listener, "Accepted")["status"], "True");
+        let resolved_refs = condition(p, listener, "ResolvedRefs");
+        assert_eq!(resolved_refs["status"], "False", "{resolved_refs}");
+        assert_eq!(resolved_refs["reason"], reason);
     }
 
     /// A revoked ReferenceGrant refuses the listener's SNI in the pass
@@ -1149,16 +1192,94 @@ mod tests {
         let gw = pipeline_gateway(port, "certs");
         apply(&mut p.cluster.gateways, gw.clone());
         p.pass(&gw).await.unwrap();
-        assert_eq!(presented(port).await, Ok(der(&good.0)));
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
 
         p.cluster
             .reference_grants
             .apply_watcher_event(&watcher::Event::Delete(secret_grant()));
         p.api.clear();
         p.pass(&gw).await.unwrap();
-        let after = presented(port).await;
+        let after = presented(port, SNI).await;
         assert!(after.is_err(), "served after the revoke: {after:?}");
-        assert_eq!(resolved_refs(&p)["reason"], "RefNotPermitted");
+        unresolved(&p, "https", "RefNotPermitted");
+        served_without_refs(&p, &gw, "https");
+    }
+
+    /// A deleted Secret refuses the listener's SNI in the pass that sees
+    /// it; the data plane kept the cert, as for a bad rotation.
+    #[tokio::test]
+    async fn a_deleted_secret_refuses_the_sni_at_once() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(good) = generate_test_cert(SNI) else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "default", &good);
+        let gw = pipeline_gateway(port, "default");
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+
+        let mut deleted = tls_secret("cert", "default", &good.0, &good.1);
+        deleted.metadata.uid = Some("uid-1".into());
+        p.cluster
+            .secrets
+            .apply_watcher_event(&watcher::Event::Delete(deleted));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let after = presented(port, SNI).await;
+        assert!(after.is_err(), "served after the delete: {after:?}");
+        unresolved(&p, "https", "InvalidCertificateRef");
+        served_without_refs(&p, &gw, "https");
+    }
+
+    /// A hostname listener whose grant is revoked refuses its SNI beside a
+    /// catch-all HTTPS sibling on its port: the SNI is its by listener
+    /// precedence, so the sibling's cert must not answer it. Left out of
+    /// the snapshot, the listener would hand its SNI to the sibling.
+    #[tokio::test]
+    async fn a_revoked_hostname_listener_never_falls_to_a_catch_all_sibling() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (Some(own), Some(sibling)) = (generate_test_cert(SNI), generate_test_cert("any"))
+        else {
+            return; // openssl unavailable
+        };
+        let port = crate::proxy::data_plane::test_ports::wildcard();
+        let mut p = Pipeline::new();
+        stored(&mut p.cluster.secrets, "uid-1", "certs", &own);
+        let mut fallback = tls_secret("fallback", "default", &sibling.0, &sibling.1);
+        fallback.metadata.uid = Some("uid-2".into());
+        apply(&mut p.cluster.secrets, fallback);
+        apply(&mut p.cluster.reference_grants, secret_grant());
+        let mut gw = pipeline_gateway(port, "certs");
+        gw.spec.listeners[0].hostname = Some(SNI.into());
+        let mut catch_all = https_gateway("fallback").spec.listeners.remove(0);
+        catch_all.name = "catch-all".into();
+        catch_all.port = port.into();
+        gw.spec.listeners.push(catch_all);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        assert_eq!(presented(port, SNI).await, Ok(der(&own.0)));
+        assert_eq!(
+            presented(port, "other.example.com").await,
+            Ok(der(&sibling.0))
+        );
+
+        p.cluster
+            .reference_grants
+            .apply_watcher_event(&watcher::Event::Delete(secret_grant()));
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let after = presented(port, SNI).await;
+        assert!(after.is_err(), "served after the revoke: {after:?}");
+        assert_eq!(
+            presented(port, "other.example.com").await,
+            Ok(der(&sibling.0)),
+            "the sibling still serves"
+        );
+        unresolved(&p, "https", "RefNotPermitted");
+        served_without_refs(&p, &gw, "https");
     }
 
     /// A bad rotation keeps the last good cert served, ResolvedRefs False,
@@ -1176,15 +1297,13 @@ mod tests {
         let gw = pipeline_gateway(port, "default");
         apply(&mut p.cluster.gateways, gw.clone());
         p.pass(&gw).await.unwrap();
-        assert_eq!(presented(port).await, Ok(der(&good.0)));
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
 
         stored(&mut p.cluster.secrets, "uid-1", "default", &garbage());
         p.api.clear();
         p.pass(&gw).await.unwrap();
-        assert_eq!(presented(port).await, Ok(der(&good.0)));
-        let condition = resolved_refs(&p);
-        assert_eq!(condition["status"], "False", "{condition}");
-        assert_eq!(condition["reason"], "InvalidCertificateRef");
+        assert_eq!(presented(port, SNI).await, Ok(der(&good.0)));
+        unresolved(&p, "https", "InvalidCertificateRef");
         let served = p.served(&gw).unwrap();
         let certs: Vec<&[u8]> = served
             .certificates
