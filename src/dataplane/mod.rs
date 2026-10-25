@@ -555,6 +555,15 @@ mod tests {
 
         let (mut sync, ready) = sync_loop();
         sync.serve(on(&["here"])).await;
+        // As the loop retries a bind: a probe socket of this test's can sit
+        // in a child another test forks until its exec.
+        for _ in 0..200 {
+            if ready.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            sync.reapply().await;
+        }
         assert!(ready.load(Ordering::Acquire));
         assert_eq!(sync.rebind_at, None);
 

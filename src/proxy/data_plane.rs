@@ -2245,7 +2245,20 @@ mod tests {
     /// paths: keyed without the transport, the second counted as bound.
     #[tokio::test]
     async fn tcp_and_udp_listeners_on_one_port_both_bind() {
-        let port = free_tcp_and_udp_port();
+        let perf = test_perf();
+        // A probe socket of this test's can sit in a child another test
+        // forks until its exec: try another port then.
+        let (port, dp) = std::iter::repeat_with(|| {
+            let port = free_tcp_and_udp_port();
+            let listeners = [http_listener(port, None), udp_listener(port)];
+            DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"))
+                .ok()
+                .map(|dp| (port, dp))
+        })
+        .take(10)
+        .flatten()
+        .next()
+        .expect("a port both bind on");
         let listeners = [http_listener(port, None), udp_listener(port)];
         let (tcp_endpoint, udp_endpoint) =
             (Endpoint::of(&listeners[0]), Endpoint::of(&listeners[1]));
@@ -2256,9 +2269,7 @@ mod tests {
                 std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
             )
         };
-        let perf = test_perf();
 
-        let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
         assert!(dp.is_ready_for_endpoints(&[tcp_endpoint.clone(), udp_endpoint.clone()]));
         assert_eq!(held(), (true, true), "construction binds both");
         drop(dp);
