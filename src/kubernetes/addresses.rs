@@ -1,6 +1,6 @@
 //! Gateway `spec.addresses` on the controller side: the
 //! `portail.epheo.eu/Network` address type, read as the CIDRs of its
-//! NetworkAttachmentDefinition, and what a data plane reported it holds.
+//! NetworkAttachmentDefinition.
 //! Matching CIDRs against interfaces is the data plane's
 //! ([`crate::dataplane::addresses`]).
 
@@ -13,55 +13,11 @@ use std::sync::{Arc, Mutex};
 use gateway_api::gateways::Gateway;
 
 use crate::logging::{info, warn};
-use crate::sync::{InstanceReport, NetworkCidrs};
+use crate::sync::NetworkCidrs;
 
 /// Custom address type for binding a Gateway to a named network interface.
 /// Used in `spec.addresses[].type` to auto-discover UDN/Multus IPs.
 pub(crate) const NETWORK_ADDRESS_TYPE: &str = "portail.epheo.eu/Network";
-
-/// The addresses a data-plane instance holds, as status reports them.
-#[derive(Debug, Default)]
-pub(crate) struct UsableAddresses {
-    /// IPs from local network interfaces (includes secondary/UDN interfaces).
-    pub interface_ips: Vec<String>,
-    /// IPs resolved from `portail.epheo.eu/Network` address type (network-name → IP).
-    pub network_ips: HashMap<String, String>,
-}
-
-impl UsableAddresses {
-    /// What `report`'s instance holds.
-    pub fn of(report: &InstanceReport) -> Self {
-        Self {
-            interface_ips: report.interface_ips.clone(),
-            network_ips: report
-                .networks
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        }
-    }
-
-    /// All known addresses as a set (for membership checks).
-    pub fn all(&self) -> HashSet<&str> {
-        self.interface_ips
-            .iter()
-            .chain(self.network_ips.values())
-            .map(|s| s.as_str())
-            .collect()
-    }
-
-    /// Best locally-bindable address — first interface IP, else `0.0.0.0`.
-    pub fn preferred_ip(&self) -> &str {
-        self.interface_ips
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("0.0.0.0")
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.interface_ips.is_empty() && self.network_ips.is_empty()
-    }
-}
 
 /// What a NetworkAttachmentDefinition says about its network.
 enum NetworkRead {

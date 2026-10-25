@@ -237,6 +237,7 @@ impl TestCluster {
                 self.pdbs.as_reader(),
                 super::provision::ControllerEndpoint::for_tests(),
             ),
+            departures: Default::default(),
         })
     }
 }

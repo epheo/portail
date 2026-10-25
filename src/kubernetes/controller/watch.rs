@@ -30,6 +30,9 @@ pub(super) struct Listings(Arc<ListingsInner>);
 struct ListingsInner {
     kinds: Mutex<BTreeMap<String, Listing>>,
     changed: tokio::sync::Notify,
+    /// Wakes every [`Listings::synced`] waiter on each change; `changed`
+    /// keeps its one waiter's permit.
+    any_change: tokio::sync::Notify,
 }
 
 struct Listing {
@@ -84,6 +87,20 @@ impl Listings {
         self.0.changed.notified().await
     }
 
+    /// Resolves once every tracked kind listed. Any number of waiters.
+    pub(super) async fn synced(&self) {
+        loop {
+            let changed = self.0.any_change.notified();
+            let mut changed = std::pin::pin!(changed);
+            // Registered before the check: a change in between still wakes.
+            changed.as_mut().enable();
+            if self.is_synced() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     fn update(&self, kind: &str, change: impl FnOnce(&mut Listing)) {
         if let Some(listing) = self.kinds().get_mut(kind) {
             change(listing);
@@ -91,6 +108,7 @@ impl Listings {
         // One waiter, the synced task: a permit kept for it is a wake it
         // would otherwise miss between its check and its wait.
         self.0.changed.notify_one();
+        self.0.any_change.notify_waiters();
     }
 }
 
@@ -811,6 +829,33 @@ mod tests {
             assert!(store.is_empty());
             driver.abort();
         }
+    }
+
+    /// Every waiter of `synced` wakes when the last kind lists, alongside
+    /// the one waiter of `changed`.
+    #[tokio::test]
+    async fn every_synced_waiter_wakes() {
+        use gateway_api::httproutes::HTTPRoute;
+        let listings = Listings::default();
+        let routes = listings.track("HTTPRoute", false);
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let listings = listings.clone();
+                tokio::spawn(async move { listings.synced().await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert!(waiters.iter().all(|w| !w.is_finished()));
+
+        routes.observe::<HTTPRoute>(&Ok(watcher::Event::InitDone));
+        listings.changed().await;
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("woken")
+                .unwrap();
+        }
+        listings.synced().await;
     }
 
     /// A core kind that cannot list holds the caches unsynced, and is
