@@ -22,13 +22,6 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Both Kubernetes modes parse in full so manifests can be written
-    // against them; their runtimes land with the packages that build them.
-    if let Some(command) = &args.command {
-        eprintln!("portail {}: not implemented in this build", command.name());
-        std::process::exit(2);
-    }
-
     // Print supported features and exit
     if args.supported_features {
         println!("{}", kubernetes::features::SUPPORTED_FEATURES.join(","));
@@ -95,13 +88,12 @@ fn main() -> Result<()> {
 
     // Size the Tokio runtime to the POD, not the NODE. The default multi-thread
     // runtime eagerly spawns one worker per `available_parallelism()` (the node's
-    // CPU count), but each operator-provisioned data plane serves a single
-    // Gateway. Packing many per-Gateway pods onto one node would otherwise spawn
+    // CPU count), but each provisioned data plane serves a single Gateway.
+    // Packing many per-Gateway pods onto one node would otherwise spawn
     // (pods × node_cpus) worker threads and exhaust the node's PID/thread budget
     // long before its CPU or memory — a hard ceiling on Gateway density. Cap to a
     // small default; high-traffic gateways or standalone use scale up via
-    // PORTAIL_WORKER_THREADS. (The operator should also set CPU/mem requests+limits
-    // and can stamp PORTAIL_WORKER_THREADS to match the pod's CPU allocation.)
+    // PORTAIL_WORKER_THREADS, which provisioning stamps from the pod's cpu limit.
     let worker_threads = std::env::var("PORTAIL_WORKER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -148,6 +140,13 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
     // Registered first: as PID 1, a SIGTERM that lands before the handler
     // exists is dropped, not acted on (see the wait for shutdown below).
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // Both Kubernetes modes parse in full so manifests can be written
+    // against them; their runtimes land with the packages that build them.
+    if let Some(command) = &args.command {
+        eprintln!("portail {}: not implemented in this build", command.name());
+        std::process::exit(2);
+    }
 
     // Before listeners: a request must never race the writer task's spawn.
     if let Some(target) = &args.access_log {
