@@ -102,12 +102,28 @@ async fn read_network(client: &Client, network_name: &str, namespace: &str) -> N
     }
 }
 
-/// The subnet a NAD's spec.config names, when it parses as a CIDR.
+/// The CIDRs a NAD's spec.config `subnets` names: a comma list, one per IP
+/// family on an OVN-Kubernetes dual-stack network. The data plane matches
+/// the IPv4 ones only.
 fn nad_cidrs(nad: &serde_json::Value) -> Option<Vec<String>> {
     let config: serde_json::Value = serde_json::from_str(nad["spec"]["config"].as_str()?).ok()?;
-    let subnets = config["subnets"].as_str()?;
-    crate::dataplane::addresses::parse_cidr(subnets)?;
-    Some(vec![subnets.to_string()])
+    let cidrs: Vec<String> = config["subnets"]
+        .as_str()?
+        .split(',')
+        .filter_map(|entry| subnet_cidr(entry.trim()))
+        .collect();
+    (!cidrs.is_empty()).then_some(cidrs)
+}
+
+/// One `subnets` entry as `address/prefix`, IPv4 or IPv6. An OVN-Kubernetes
+/// layer3 entry adds the per-node host subnet length ("10.128.0.0/14/23"):
+/// a pod's IP is in the network, so the network's CIDR is the one to match.
+fn subnet_cidr(entry: &str) -> Option<String> {
+    let mut parts = entry.splitn(3, '/');
+    let addr: std::net::IpAddr = parts.next()?.parse().ok()?;
+    let len: u8 = parts.next()?.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (len <= max).then(|| format!("{addr}/{len}"))
 }
 
 /// The last CIDRs each network was read with, by (namespace, network).
@@ -260,6 +276,42 @@ mod tests {
             None
         );
         assert_eq!(nad_cidrs(&nad(serde_json::json!({}))), None);
+    }
+
+    /// An OVN-Kubernetes dual-stack NAD names one subnet per family in one
+    /// value; the data plane finds its IPv4 address in the IPv4 one. The
+    /// value parsed as no CIDR, and the network bound nothing.
+    #[test]
+    fn a_dual_stack_nad_resolves_its_ipv4_network() {
+        let nad = |subnets: &str| {
+            let config = serde_json::json!({"topology": "layer2", "subnets": subnets});
+            serde_json::json!({"spec": {"config": config.to_string()}})
+        };
+        let cidrs = nad_cidrs(&nad("10.10.1.0/24, fd00:10:10:1::/64")).unwrap();
+        assert_eq!(cidrs, vec!["10.10.1.0/24", "fd00:10:10:1::/64"]);
+
+        let networks = [NetworkCidrs {
+            name: "udn-a".into(),
+            cidrs,
+        }];
+        let local = ["fd00:10:10:1::7".to_string(), "10.10.1.7".to_string()];
+        let resolved =
+            crate::dataplane::addresses::resolve_networks(&["udn-a".into()], &networks, &local);
+        assert_eq!(resolved.get("udn-a").map(String::as_str), Some("10.10.1.7"));
+
+        assert_eq!(
+            nad_cidrs(&nad("10.128.0.0/14/23,fd00:10:128::/48/64")),
+            Some(vec![
+                "10.128.0.0/14".to_string(),
+                "fd00:10:128::/48".to_string()
+            ]),
+            "layer3 entries carry a host subnet length"
+        );
+        assert_eq!(
+            nad_cidrs(&nad("junk,10.10.1.0/33,fd00::/129,10.10.2.0/24")),
+            Some(vec!["10.10.2.0/24".to_string()])
+        );
+        assert_eq!(nad_cidrs(&nad("junk, ")), None);
     }
 
     /// Only the networks some Gateway still names keep their last CIDRs.
