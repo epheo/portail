@@ -78,7 +78,7 @@ The controller does not adopt the operator's objects: delete the Gateways, then 
 3. Delete the Gateways: garbage collection removes their `portail-<gateway>` Deployments, Services and PDBs.
    A delete that hangs on a finalizer: `kubectl -n <namespace> patch gateway <name> --type=merge -p '{"metadata":{"finalizers":null}}'`.
 
-4. Delete what is left of the operator: the `portail-controller` ServiceAccounts it created in Gateway namespaces, its `portail-operator-*` ClusterRoles and ClusterRoleBindings, and its namespace.
+4. Delete what is left of the operator: the `portail-controller` ServiceAccounts it created in Gateway namespaces, its `portail-secrets` RoleBindings there (label `app.kubernetes.io/managed-by=portail-operator`), its `portail-operator-*` ClusterRoles and ClusterRoleBindings, and its namespace.
    Strip the finalizer it put on the GatewayClass; 0.2.0 manages none:
 
    ```bash

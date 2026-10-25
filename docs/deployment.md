@@ -197,6 +197,7 @@ Data plane stopping (SIGTERM):
 - It reports leaving at once, keeps serving and `/readyz` at 200 for `--shutdown-delay` (5s), then drains for up to 30s.
 - A terminating pod stays a serving endpoint: kube-proxy uses it while no ready one exists.
 - With `Recreate` (static IPs) the delay is 0: no other endpoint takes over.
+- On OVN-Kubernetes some established connections to a pod are reset as soon as it turns terminating, while it still serves: a rollout of a one-replica Gateway can cost a few requests (measured: 1 in 60 on OpenShift 4.22). Two replicas avoid it for scale changes but not for rollouts.
 
 Data plane gone without a goodbye: it counts as live for 60s after its last report (two holds of 30s); then, with no other live data plane at the current configuration, the Gateway turns `Programmed=False`, reason `Pending`.
 
