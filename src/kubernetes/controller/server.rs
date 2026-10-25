@@ -1145,7 +1145,7 @@ mod tests {
 
         let mut roots = rustls::RootCertStore::empty();
         let der =
-            rustls::pki_types::pem::PemObject::from_pem_slice(ca.cert_pem().as_bytes()).unwrap();
+            rustls::pki_types::pem::PemObject::from_pem_slice(ca.ca_pem().as_bytes()).unwrap();
         roots.add(der).unwrap();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
@@ -1194,7 +1194,7 @@ mod tests {
         let ca = super::super::ca::ControllerCa::generated(ns, "portail-controller");
         let mut roots = rustls::RootCertStore::empty();
         let der =
-            rustls::pki_types::pem::PemObject::from_pem_slice(ca.cert_pem().as_bytes()).unwrap();
+            rustls::pki_types::pem::PemObject::from_pem_slice(ca.ca_pem().as_bytes()).unwrap();
         roots.add(der).unwrap();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)

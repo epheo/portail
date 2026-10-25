@@ -88,14 +88,6 @@ pub(crate) struct ControllerCa {
     serving: Arc<ServingCert>,
 }
 
-impl ControllerCa {
-    /// The CA certificate's PEM, which Managed data planes get in their
-    /// pod template to verify the controller against.
-    pub(crate) fn ca_pem(&self) -> String {
-        String::new()
-    }
-}
-
 /// The current leaf for every handshake: a re-issue swaps it under live
 /// listeners.
 #[derive(Debug)]
@@ -294,9 +286,9 @@ impl ControllerCa {
         ControllerCa::new(cert, &key, namespace, service).unwrap()
     }
 
-    /// The CA certificate, PEM.
-    #[cfg(test)]
-    pub(crate) fn cert_pem(&self) -> &str {
+    /// The CA certificate, PEM: what data planes verify the controller
+    /// against.
+    pub(crate) fn ca_pem(&self) -> &str {
         &self.cert_pem
     }
 
@@ -560,9 +552,9 @@ mod tests {
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(fake.count("POST", "secrets"), 2, "both generated one");
-        assert_eq!(a.cert_pem(), b.cert_pem());
-        assert_eq!(fake.secret_cert(), a.cert_pem());
-        assert_eq!(fake.published_cert(), a.cert_pem());
+        assert_eq!(a.ca_pem(), b.ca_pem());
+        assert_eq!(fake.secret_cert(), a.ca_pem());
+        assert_eq!(fake.published_cert(), a.ca_pem());
         let secret = fake.object("secrets").unwrap();
         assert_eq!(secret["type"], "Opaque");
     }
@@ -581,7 +573,7 @@ mod tests {
         );
 
         let ca = load_or_create(&fake.client(), NS, SVC).await.unwrap();
-        assert_eq!(ca.cert_pem(), cert);
+        assert_eq!(ca.ca_pem(), cert);
         assert_eq!(fake.count("POST", "secrets"), 0);
         assert_eq!(fake.count("PATCH", "configmaps"), 1);
         assert_eq!(fake.published_cert(), cert);

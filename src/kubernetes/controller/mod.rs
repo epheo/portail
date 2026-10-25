@@ -252,7 +252,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         &client,
         store_gateways.clone(),
         &listings,
-        provision::ControllerEndpoint::new(&args, ca.ca_pem()),
+        provision::ControllerEndpoint::new(&args, &ca),
     );
 
     let ctx = Arc::new(ControllerCtx {

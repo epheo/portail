@@ -24,6 +24,7 @@ use super::ports::{
 };
 use crate::cli::{ControllerArgs, CONTROLLER_CA_ENV};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
+use crate::kubernetes::controller::ca::ControllerCa;
 use crate::kubernetes::controller::params::Params;
 use crate::kubernetes::crds::{NetworkSelection, ServiceType};
 use crate::kubernetes::naming::{
@@ -49,14 +50,14 @@ pub(crate) struct ControllerEndpoint {
 }
 
 impl ControllerEndpoint {
-    pub(crate) fn new(args: &ControllerArgs, ca_pem: String) -> Self {
+    pub(crate) fn new(args: &ControllerArgs, ca: &ControllerCa) -> Self {
         Self {
             address: format!(
                 "https://{}.{}.svc:{}",
                 args.service_name, args.namespace, args.sync_port
             ),
             audience: controller_audience(&args.service_name, &args.namespace),
-            ca_pem,
+            ca_pem: ca.ca_pem().to_owned(),
             install: install_label(&args.controller_name),
         }
     }
@@ -522,6 +523,15 @@ mod tests {
         class: Option<&str>,
         own: Option<&str>,
     ) -> Vec<serde_json::Value> {
+        objects_for(gw, class, own, &ControllerEndpoint::for_tests()).await
+    }
+
+    async fn objects_for(
+        gw: &Gateway,
+        class: Option<&str>,
+        own: Option<&str>,
+        controller: &ControllerEndpoint,
+    ) -> Vec<serde_json::Value> {
         let mut cluster = TestCluster::default();
         let mut gc = testkit::gateway_class("portail", CONTROLLER);
         let mut gw = gw.clone();
@@ -553,12 +563,7 @@ mod tests {
         apply(&mut cluster.gateway_classes, gc);
         let ctx = cluster.ctx(MockApi::default().client());
         let params = params::resolve(&ctx, &gw).unwrap();
-        let (objects, _) = desired(
-            &gw,
-            &params,
-            &BTreeMap::new(),
-            &ControllerEndpoint::for_tests(),
-        );
+        let (objects, _) = desired(&gw, &params, &BTreeMap::new(), controller);
         let mut out = vec![
             serde_json::to_value(&objects.service_account).unwrap(),
             serde_json::to_value(&objects.deployment).unwrap(),
@@ -806,8 +811,7 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
         assert_ne!(install_label("a/b"), install_label("a-b"));
     }
 
-    #[test]
-    fn the_endpoint_is_the_controller_service() {
+    fn controller_args() -> ControllerArgs {
         use clap::Parser;
         let args = crate::cli::Args::try_parse_from([
             "portail",
@@ -819,11 +823,38 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
         let Some(crate::cli::Command::Controller(args)) = args.command else {
             panic!("controller args");
         };
-        let endpoint = ControllerEndpoint::new(&args, "pem".into());
+        args
+    }
+
+    #[test]
+    fn the_endpoint_is_the_controller_service() {
+        let ca = ControllerCa::generated("portail-system", "portail-controller");
+        let endpoint = ControllerEndpoint::new(&controller_args(), &ca);
         assert_eq!(
             endpoint.address,
             "https://portail-controller.portail-system.svc:9443"
         );
         assert_eq!(endpoint.audience, "portail-controller.portail-system.svc");
+    }
+
+    /// A Managed data plane verifies the controller against this PEM: an
+    /// empty one fails every handshake.
+    #[tokio::test]
+    async fn a_managed_deployment_carries_the_controller_ca() {
+        let ca = ControllerCa::generated("portail-system", "portail-controller");
+        let endpoint = ControllerEndpoint::new(&controller_args(), &ca);
+        let gw = gateway("public", http_https(), serde_json::Value::Null);
+        let objects = objects_for(&gw, None, None, &endpoint).await;
+        let env = deployment_of(&objects)["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let pem = env
+            .iter()
+            .find(|e| e["name"] == CONTROLLER_CA_ENV)
+            .and_then(|e| e["value"].as_str())
+            .unwrap();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"), "{pem}");
+        assert_eq!(pem, ca.ca_pem());
     }
 }
