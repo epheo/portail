@@ -2,46 +2,86 @@
 
 ## CLI Reference
 
+One binary, three modes:
+
+- `portail controller`: the Kubernetes controller.
+- `portail dataplane`: one Gateway's data plane, fed by the controller.
+- `portail` without a subcommand: standalone, from `--config` or the built-in default config.
+
+### Standalone
+
 | Flag | Description |
 |------|-------------|
-| `--kubernetes` | Run as Kubernetes Gateway API controller |
-| `--controller-name <NAME>` | Controller name for GatewayClass matching (default: `portail.epheo.eu/gateway-controller`) |
-| `--gateway <NS/NAME>` | Restrict the controller to a single Gateway; set by portail-operator on per-Gateway data planes. Absent = watch all Gateways cluster-wide |
-| `--watch-shape <TOKENS>` | Operator-set watch narrowing (comma tokens: `tls`, `ns-labels`); absent watches all secondary resources |
-| `--manage-gateway-status <BOOL>` | Manage Gateway lifecycle status (Accepted/Programmed/addresses). Set `false` under portail-operator, which owns those; portail then reports only listener and route status (default: `true`) |
-| `--readiness-port <PORT>` | Port for the `/livez` + `/readyz` + `/metrics` admin endpoint in Kubernetes mode (default: `19099`) |
-| `--metrics-port <PORT>` | Serve the same admin endpoint in standalone mode (off by default) |
-| `--admin-address <IP>` | Bind address of the admin endpoint, both modes (default: `0.0.0.0`, every interface). Kubelet probes reach the pod IP, so loopback would fail readiness; the pod IP keeps `/metrics` off public VIP and Multus interfaces |
-| `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
-| `--http2` | Enable HTTP/2 on TLS-terminate listeners (off by default; see HTTP/2 section) |
-| `--config, -c <FILE>` | Load configuration from a JSON or YAML file (mutually exclusive with `--kubernetes`) |
+| `--config, -c <FILE>` | Load configuration from a JSON or YAML file |
 | `--validate-only` | Validate config file without starting the server (requires `--config`) |
 | `--check-config` | Parse and display config values, then exit (requires `--config`) |
 | `--example-config` | List the built-in example configurations and exit |
 | `--generate-config <TYPE>` | Generate example config: `minimal` or `development` |
 | `--output <FILE>` | Output file for generated configuration (requires `--generate-config`) |
 | `--cert-dir <DIR>` | Directory for TLS certificate files (default: `certs`, relative to the working directory) |
+| `--metrics-port <PORT>` | Serve the `/livez` + `/readyz` + `/metrics` admin endpoint (off by default) |
+| `--admin-address <IP>` | Bind address of the admin endpoint (default: `0.0.0.0`, every interface) |
+| `--access-log <PATH>` | Write one JSON line per completed HTTP response to PATH, `-` = stdout (off by default) |
+| `--http2` | Enable HTTP/2 on TLS-terminate listeners (off by default; see HTTP/2 section) |
 | `--supported-features` | Print supported Gateway API features and exit |
-| `--print-crd` | Print portail's CRD manifests (RateLimitPolicy) as YAML and exit |
-| `--verbose, -v` | Enable verbose logging (repeat for more: `-vv`, `-vvv`) |
+| `--print-crd` | Print portail's CRD manifests (GatewayParameters, RateLimitPolicy) as YAML and exit |
+| `--verbose, -v` | Enable verbose logging (repeat for more: `-vv`, `-vvv`); also accepted before a subcommand |
+
+These flags take no subcommand: `portail --http2 dataplane ...` is refused.
+
+### `portail controller`
+
+| Flag | Description |
+|------|-------------|
+| `--controller-name <NAME>` | Controller name for GatewayClass matching (default: `portail.epheo.eu/gateway-controller`) |
+| `--namespace <NS>` | Namespace of the leader election Lease, the CA Secret and ConfigMap, and the Service (default: env `POD_NAMESPACE`) |
+| `--service-name <NAME>` | The ClusterIP Service data planes dial; `<service>.<namespace>.svc` is also the audience of their tokens (default: `portail-controller`) |
+| `--sync-port <PORT>` | Port of the TLS sync endpoint (default: `9443`) |
+| `--leader-election-id <NAME>` | Name of the leader election Lease (default: `portail-controller`); the Role of `deploy/install` grants this name only |
+| `--dataplane-image <IMAGE>` | Data-plane image of Managed Gateways without a GatewayParameters `image` (default: the image this binary was published as) |
+| `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |
+| `--admin-address <IP>` | Bind address of the admin endpoint (default: `0.0.0.0`) |
+
+### `portail dataplane`
+
+| Flag | Description |
+|------|-------------|
+| `--gateway <NS/NAME>` | The Gateway this data plane serves (required) |
+| `--controller-address <URL>` | The controller's sync endpoint, e.g. `https://portail-controller.portail-system.svc:9443` (required) |
+| `--controller-ca-file <FILE>` | PEM of the CA the controller's serving certificate chains to (default: the PEM in env `PORTAIL_CONTROLLER_CA`) |
+| `--token-file <FILE>` | Projected ServiceAccount token presented to the controller, re-read per request (default: `/var/run/secrets/portail.epheo.eu/controller/token`) |
+| `--shutdown-delay <DURATION>` | On SIGTERM, keep serving this long before draining (default: `5s`) |
+| `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |
+| `--admin-address <IP>` | Bind address of the admin endpoint (default: `0.0.0.0`). Kubelet probes reach the pod IP, so loopback would fail readiness; the pod IP keeps `/metrics` off public VIP and Multus interfaces |
+| `--access-log <PATH>` | As in standalone mode |
+| `--http2` | As in standalone mode |
+
+Managed data planes run with `--gateway`, `--controller-address`, `--admin-address=$(POD_IP)`, and `--shutdown-delay=0s` under a `Recreate` rollout.
+`--access-log` and `--http2` are for Unmanaged data planes: GatewayParameters do not set them yet.
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PORTAIL_WORKER_THREADS` | Tokio worker threads. Default: `min(available CPUs, 4)` — sized to the pod, not the node, so many per-Gateway pods can pack onto one node without exhausting its thread budget. Raise for high-traffic or standalone use |
+| `PORTAIL_WORKER_THREADS` | Tokio worker threads. Default: `min(available CPUs, 4)`, sized to the pod, not the node, so many per-Gateway pods can pack onto one node without exhausting its thread budget. Managed data planes get `min(CPU limit, 4)`. Raise for high-traffic or standalone use |
 | `PORTAIL_MAX_BLOCKING_THREADS` | Tokio blocking-thread cap (default: `32`) |
+| `POD_NAMESPACE` | The controller's `--namespace` default |
+| `PORTAIL_CONTROLLER_CA` | The data plane's controller CA, as PEM, when `--controller-ca-file` is not given |
 
 ## Admin Endpoint
 
 One plain-HTTP management server, on `--readiness-port` (default `19099`) in
-Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
+`portail controller` and `portail dataplane`, or opt-in via `--metrics-port`
+in standalone mode:
 
-- `GET /livez` — always `200` once the process is up. Liveness only: "should
+- `GET /livez`: always `200` once the process is up. Liveness only: "should
   this process be restarted", never "is it ready".
-- `GET /readyz` (any non-metrics path) — `200` once the data plane has bound
-  its listener ports, `503` before. Gate traffic on this.
-- `GET /metrics` — Prometheus text format. Process-wide counters
+- `GET /readyz` (any non-metrics path): `200`, else `503`. A data plane: once
+  it applied a configuration and bound every listener of it; it stays `200`
+  through `--shutdown-delay` after SIGTERM. Standalone: once its listener
+  ports are bound. The controller: once its caches synced and its CA loaded,
+  standbys included.
+- `GET /metrics`: Prometheus text format. Process-wide counters
   (connections, backend pool, DNS refresh, health transitions, reconciles,
   and `portail_http_requests_rejected_total` for requests refused with
   `400` before any backend, their head or chunked body framing malformed or
@@ -56,6 +96,12 @@ Kubernetes mode or opt-in via `--metrics-port` in standalone mode:
   upgrade tunnels excluded) and `portail_upstream_ttfb_seconds` (route match
   to backend response headers: connect, request forward, backend
   processing). Buckets are fixed, 10us to 60s.
+- A data plane adds `portail_controller_connected` (`0` while it cannot reach
+  the controller) and `portail_config_age_seconds`: alert on the age, since
+  route and certificate changes wait for the controller.
+- The controller adds `portail_sync_auth_rejected_total{stage}`,
+  `portail_tokenreview_requests_total{result}` and
+  `portail_sync_throttled_total`.
 
 The endpoint listens on every interface unless `--admin-address` names one.
 On a pod carrying a Gateway VIP or a Multus interface, the pod IP keeps
@@ -73,7 +119,7 @@ env:
 ## Access Logs
 
 `--access-log <PATH>` (`-` = stdout) writes one JSON line per completed HTTP
-response, in both Kubernetes and standalone mode:
+response, in a data plane or standalone:
 
 ```json
 {"ts":1752822334.123,"client":"192.0.2.7","listener":443,"tls":true,"method":"GET","path":"/api","host":"api.example.com","status":200,"backend":"10.1.2.3:8080","duration_us":1234}
@@ -118,8 +164,8 @@ IPv4 address or IPv6 /64. A request finding the bucket empty is answered
 kept open when safe so a throttled client cannot force TLS re-handshakes.
 An unlimited listener costs the hot path one null check per request.
 
-Kubernetes mode — a `RateLimitPolicy` attached to a Gateway (install the CRD
-from `examples/kubernetes/crds/ratelimitpolicy.yaml`, printable via
+Kubernetes mode: a `RateLimitPolicy` attached to a Gateway (`deploy/install`
+installs the CRD, `deploy/crds/ratelimitpolicy.yaml`, also printed by
 `--print-crd`):
 
 ```yaml
@@ -146,7 +192,7 @@ A CRD installed later is watched without a restart, within ten minutes:
 API discovery is read every ten minutes while a CRD is missing.
 The same holds for TCPRoute, TLSRoute and UDPRoute.
 
-Standalone mode — the same parameters on a listener:
+Standalone mode: the same parameters on a listener:
 
 ```yaml
 gateway:
@@ -300,8 +346,8 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 
 ## HTTP/2
 
-Opt-in via `--http2` (Kubernetes mode) or `performance.http2: true`
-(standalone). When enabled, TLS-terminate listeners advertise `h2` ahead of
+Opt-in via `portail dataplane --http2`, or `--http2` or
+`performance.http2: true` standalone. When enabled, TLS-terminate listeners advertise `h2` ahead of
 `http/1.1` via ALPN; the client's negotiation picks the protocol, so h1 and
 h2 clients share the same port. Plain-HTTP and passthrough listeners are
 unaffected, and with the flag off the data path is byte-for-byte unchanged.
@@ -329,10 +375,10 @@ Limits to know about:
 To use a custom controller name (e.g., for running multiple Portail instances):
 
 ```bash
-portail --kubernetes --controller-name my-org.example.com/gateway-controller
+portail controller --controller-name my-org.example.com/gateway-controller
 ```
 
-Update the `GatewayClass` to match:
+Add the flag to the controller Deployment's args, and update the `GatewayClass` to match:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -342,6 +388,8 @@ metadata:
 spec:
   controllerName: my-org.example.com/gateway-controller
 ```
+
+A second install in one cluster also needs its own namespace, and its own names for the ClusterRole, the ClusterRoleBinding and the GatewayClass.
 
 ## Standalone Mode
 
@@ -365,9 +413,9 @@ portail --config config.yaml
 
 ### Kubernetes Mode
 
-Portail reads TLS certificates from Kubernetes Secrets referenced in your Gateway listener's `certificateRefs`. It works with cert-manager or any other Secret-based certificate management.
+The controller reads TLS certificates from the Kubernetes Secrets referenced in a Gateway listener's `certificateRefs`, and sends them to that Gateway's data planes only. It works with cert-manager or any other Secret-based certificate management.
 
-TLS certificates are hot-reloaded when the underlying Secret changes — no restart required. Multiple Gateways sharing a port have their certificates merged automatically for SNI-based selection.
+A changed Secret reaches the data planes in their next sync, without a restart.
 
 Example with cert-manager:
 
@@ -426,5 +474,6 @@ HTTPS and TLS passthrough listeners on one port share one socket:
 - Connections rotate over a TLS route's backends per route, whatever SNI each sent under it.
 - Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
 - A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
-- A port already serving whose certificates all fail on a later pass, with the same listeners and Secrets, keeps serving the last good ones: a bad rotation does not take HTTPS down. The failure is logged each pass until fixed. In Kubernetes mode a deleted Secret, or one a ReferenceGrant no longer permits, fails the same way; the listener reports `ResolvedRefs=False` meanwhile. A pass that also changes the port's listeners or Secrets keeps none.
+- A port already serving whose certificates all fail on a later pass, with the same listeners and Secrets, keeps serving the last good ones: a bad rotation does not take HTTPS down. The failure is logged each pass until fixed. A pass that also changes the port's listeners or Secrets keeps none.
+- In Kubernetes mode only an invalid rotation of the same Secret keeps the last good certificate, and the listener reports `ResolvedRefs=False` meanwhile. A deleted Secret, or one a ReferenceGrant no longer permits, stops serving its hostnames at once.
 - An HTTPS listener whose own certificates fail to load closes the connections its SNI selects, even while its siblings' load: no other listener's certificate answers for its hostname.

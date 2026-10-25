@@ -2,91 +2,211 @@
 
 ## Prerequisites
 
-- Kubernetes 1.28+ (tested on MicroShift, should work on any conformant cluster)
-- Gateway API CRDs installed (experimental channel recommended)
+- Kubernetes 1.28+, OpenShift and MicroShift included.
+- Gateway API CRDs v1.4.1 (experimental channel for TCPRoute, TLSRoute and UDPRoute):
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
 ```
 
-## DaemonSet with Host Networking
+## Install
 
-One pod per node with `hostNetwork: true`. Simplest setup, good for single-node and edge.
+From a release:
 
 ```bash
-kubectl apply -k examples/kubernetes/daemonset/
+kubectl apply --server-side -f https://github.com/epheo/portail/releases/download/vX.Y.Z/install.yaml
 ```
 
-The pod binds directly to the node's network interfaces. Ports defined in your Gateway listeners (e.g., 80, 443) are opened on the node. No Kubernetes Service is needed. Privileged ports (< 1024) are bound via `cap_net_bind_service`, carried as a **file capability** on the portail binary (`setcap …=+p` in the image) and added to the pod (`capabilities.add: [NET_BIND_SERVICE]`); portail raises it to effective at startup. The pod stays **non-root** with `allowPrivilegeEscalation: false` and **no sysctl** — fully restricted Pod Security.
-
-If your node has a firewall, open the ports your Gateway listeners use:
+Or from the repository, at a tag or commit:
 
 ```bash
-sudo firewall-cmd --add-port=80/tcp --add-port=443/tcp --permanent && sudo firewall-cmd --reload
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+kubectl -n portail-system rollout status deploy/portail-controller
 ```
 
-On OpenShift / MicroShift, apply the SecurityContextConstraints for `hostNetwork` and `NET_BIND_SERVICE`:
+`deploy/install` creates:
+
+- Namespace `portail-system`.
+- The GatewayParameters and RateLimitPolicy CRDs.
+- ServiceAccount `portail-controller`, its ClusterRole, its Role in `portail-system`, and their bindings.
+- Deployment `portail-controller`, one replica.
+- ClusterIP Service `portail-controller`, port 9443 (`sync`), which data planes dial.
+- GatewayClass `portail`.
+
+`deploy/ha` is the same with two controller replicas, a PodDisruptionBudget and a soft spread across nodes:
 
 ```bash
-kubectl apply -f examples/kubernetes/daemonset/scc.yaml
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/ha?ref=vX.Y.Z"
 ```
 
-See: `examples/kubernetes/daemonset/`
+Another image, such as a mirror, goes through a kustomization of your own:
 
-## Deployment with LoadBalancer Service
-
-One Deployment per Gateway, exposed via a LoadBalancer Service. Requires MetalLB or a cloud LB provider. Best for multi-node production.
-
-```bash
-kubectl apply -k examples/kubernetes/loadbalancer/
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z
+images:
+- name: ghcr.io/epheo/portail
+  newName: registry.example.com/portail
+  newTag: X.Y.Z
 ```
 
-Portail runs as a regular Deployment (no `hostNetwork`). A Kubernetes Service exposes it externally. Each Gateway gets its own Deployment and Service, isolating Gateways in separate network namespaces.
+Managed data planes still run the image the controller was built for: set GatewayParameters `image`, or the controller's `--dataplane-image`, to the mirror too.
 
-**Unprivileged binds (no `NET_BIND_SERVICE`).** A published listener port (e.g. 80/443) is a client-facing contract, not the port the process must bind. Under `portail-operator`, the Service maps each published port to an unprivileged `targetPort` (e.g. `80 → 8080`) and portail binds that target — so the pod drops *all* capabilities, runs `runAsNonRoot` with `allowPrivilegeEscalation: false` and no sysctl, fully compliant with restricted Pod Security on both vanilla Kubernetes and OpenShift `restricted-v2`. portail discovers its fronting Service by the label `portail.epheo.eu/gateway: <gateway-name>` in the Gateway's namespace and binds the numeric `targetPort` of each port matching a listener. If no such Service exists — multi-network mode, the host-networked DaemonSet, or before the operator has created it — portail binds the published port directly. Those modes add `capabilities.add: [NET_BIND_SERVICE]`, which pairs with the `cap_net_bind_service` **file capability** baked into the image (`setcap …=+p`): portail raises it to effective at startup and binds the privileged port while staying **non-root** with `allowPrivilegeEscalation: false` — no sysctl, no root, no custom SCC. (`+p`, not `+ep`, so the same image still execs in service-mode pods that drop the capability.)
+## Architecture
 
-Static addresses (`GatewayStaticAddresses`) are not supported yet: `spec.addresses` never assigns an IP.
-An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically.
-Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
-A listener that gains a local address leaves all interfaces for it in the same pass, and goes back when it loses it.
-A listener whose published port changes while its `targetPort` stays reopens that socket in the same pass, to route and terminate as the new port.
-A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
-portail sets `Programmed` from bound listener ports; an IP address missing from the pod does not make it `False`.
+One image, two Kubernetes modes:
 
-The same pattern works with **NodePort** or **ClusterIP**. Just change `spec.type` in `service.yaml`. See the loadbalancer example's README for details.
+- `portail controller`: watches Gateway API resources cluster-wide, translates each Gateway into its data plane's configuration, provisions data planes and writes every status. Leader-elected: standbys keep their caches warm and write nothing.
+- `portail dataplane --gateway <ns>/<name>`: serves one Gateway. It has no Kubernetes client, no RBAC and no API token: it long-polls the controller over TLS and reports which listeners it bound.
 
-See: `examples/kubernetes/loadbalancer/`
+One data plane serves exactly one Gateway: Gateways never share a route table or a socket.
+TLS keys travel only from the controller to the data plane of the Gateway that references them, and stay in its memory.
+Only the controller reads Secrets.
 
-## Multi-Network Routing
+A route edit reaches the data planes within about a second or two: the controller debounces watch events for a second, translates, and answers the held polls at once.
 
-A Portail pod attached to multiple User Defined Networks (UDN) via Multus, routing between isolated network segments at L4-L7.
+## Managed Gateways
 
-```bash
-kubectl apply -k examples/kubernetes/multi-network/http-single-namespace/
+By default the controller provisions each Gateway of class `portail`, in the Gateway's namespace, named `portail-<gateway>`:
+
+- a ServiceAccount, without an API token;
+- a Deployment running `portail dataplane`;
+- a Service, unless its type resolves to `None`;
+- a PodDisruptionBudget, with more than one replica.
+
+Each object carries a controller ownerReference to its Gateway: deleting the Gateway garbage-collects them.
+An object of a wanted name the Gateway does not own is never touched: the Gateway reports `Programmed=False`, reason `Invalid`, `name conflict: <Kind>/<name> is not owned by this Gateway`.
+A Gateway whose class changes to another controller's has its objects deleted.
+
+A name longer than a label allows is cut and suffixed with a hash of the full name, as is a Gateway name with dots.
+
+### Ports and privileges
+
+- With a Service, each published port below 1024 binds an unprivileged target port, from 8000 up; other ports bind themselves. The pods drop every capability: restricted Pod Security, OpenShift `restricted-v2`.
+- Without a Service, the data plane binds the published ports. A port below 1024 adds `NET_BIND_SERVICE` and nothing else.
+- The image carries `cap_net_bind_service` as a file capability (`+p`, not `+ep`): portail raises it when the pod allows it, and the same image still runs where the pod drops it.
+- Listener changes never roll the pods: the Deployment declares no listener ports.
+
+### Addresses
+
+- LoadBalancer Service: `status.addresses` is its ingress; an `IPAddress` in `spec.addresses` is not requested from the provider and reports `AddressNotAssigned` unless the provider assigns it anyway.
+- ClusterIP or NodePort Service: the cluster IP.
+- No Service: what the data planes report: the `IPAddress` values of `spec.addresses` found on a pod, resolved Network addresses, else each pod's first interface IP.
+- An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically. Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
+- A listener that gains a local address leaves all interfaces for it in the same apply, and goes back when it loses it.
+- A listener whose published port changes while its bound port stays reopens that socket in the same apply, to route and terminate as the new port.
+- A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
+
+## GatewayParameters
+
+Group `portail.epheo.eu`, version `v1alpha1`, namespaced:
+
+```yaml
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: public
+  namespace: portail-system
+spec:
+  provisioning: Managed      # Managed | Unmanaged
+  replicas: 1                # Managed; at least 1
+  image: ghcr.io/epheo/portail:X.Y.Z   # Managed; default: the controller's --dataplane-image
+  resources: {}              # Managed; a core/v1 ResourceRequirements
+  service:
+    type: LoadBalancer       # LoadBalancer | ClusterIP | NodePort | None
+  networks:                  # Managed; Multus NetworkSelectionElements
+  - name: br-ex-network
+    namespace: default
+    ips: ["172.16.87.21/24"]
+    gateway: ["172.16.87.1"]
 ```
 
-Each UDN gets its own Gateway with a `portail.epheo.eu/Network` address naming it. Traffic crossing between networks goes through Portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
-portail reads the network's NetworkAttachmentDefinition (the base ClusterRole allows it) and binds the pod's IP on that network.
-A NetworkAttachmentDefinition that cannot be read keeps the network's last IP, while the pod has it; only a network with no IP on the pod, or none at all, unbinds.
-That last IP is forgotten once no Gateway names the network: dropped from `spec.addresses`, or its Gateway deleted.
-Each Gateway's listeners bind its own addresses only: a network with no IP on the pod unbinds that Gateway alone.
-One portail serving several Gateways routes by port: Gateways sharing a port are not isolated from each other.
+Referenced from:
 
-NAT is implicit: the backend sees Portail's UDN IP as source, not the original client. No iptables or kernel NAT required.
+- a GatewayClass, `spec.parametersRef` with its `namespace`: defaults for the class;
+- a Gateway, `spec.infrastructure.parametersRef`, in the Gateway's namespace: overrides for that Gateway.
 
-For pure L3 connectivity between subnets (high throughput, ICMP, no L7 policy), use OVN or iptables. Portail complements L3 infrastructure as the L4-L7 policy layer.
+Built-in defaults, then the class's, then the Gateway's: a set field wins field by field; `networks` and `resources` replace whole.
 
-See: `examples/kubernetes/multi-network/`
+Defaults:
+
+- `provisioning: Managed`, `replicas: 1`.
+- `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
+- `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
+
+Rules:
+
+- `networks[].ips` requires `replicas: 1`: one static IP cannot sit on two pods.
+- A missing or invalid GatewayParameters makes the Gateway `Accepted=False`, reason `InvalidParameters`; on a class, the class and its Gateways.
+- Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
+
+Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Network address not already listed.
+
+### Replicas
+
+| | `replicas: 1` | `replicas: 2` |
+|---|---|---|
+| PodDisruptionBudget | none | `maxUnavailable: 1` |
+| Rollout | surge 1, unavailable 0; `Recreate` with static `ips` | surge 1, unavailable 0 |
+| Node drain | a gap: the replacement's start, less the shutdown delay | none |
+| Controller down, a pod restarts | dark until the controller returns | the other replica serves |
+
+Two replicas spread across nodes when there are several.
+
+## Unmanaged Gateways
+
+`provisioning: Unmanaged`: the controller creates and deletes nothing; it serves the configuration and writes status.
+The pods are yours: hostNetwork, a DaemonSet, init containers, an SCC.
+They must run as ServiceAccount `portail-<gateway>` in the Gateway's namespace, with a projected token of audience `portail-controller.<controller namespace>.svc` and the controller CA.
+They bind the published ports: the pods' owner adds `NET_BIND_SERVICE` or other privileges.
+Any number of pods may serve the Gateway; each reports, and `Programmed` needs one live pod at the current configuration.
+
+See `examples/kubernetes/unmanaged/`.
+
+## Failure behavior
+
+Controller down:
+
+- Running data planes keep serving their configuration from memory: listeners, routes, certificates, rate limits.
+- They keep re-resolving backends: pod churn is still followed.
+- Route and certificate changes wait for the controller; `portail_config_age_seconds` grows and `portail_controller_connected` is `0`.
+- A data-plane pod that starts meanwhile stays NotReady until the controller answers.
+
+Data plane stopping (SIGTERM):
+
+- It reports leaving at once, keeps serving and `/readyz` at 200 for `--shutdown-delay` (5s), then drains for up to 30s.
+- A terminating pod stays a serving endpoint: kube-proxy uses it while no ready one exists.
+- With `Recreate` (static IPs) the delay is 0: no other endpoint takes over.
+
+Gateway deleted, or its class naming another controller: its data planes close their listeners, turn NotReady and keep polling.
+A deleted GatewayClass changes nothing until it returns.
+
+Controller failover: data planes reconnect to the new leader within a retry; an unchanged configuration is not re-applied.
+
+## Security
+
+- Data planes authenticate with projected ServiceAccount tokens of the controller audience; the controller checks them with a TokenReview.
+- A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
+- The data-plane pods mount no API token, and the API server refuses the controller-audience one.
+- The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
+- CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
+- RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 
 ## Container Image
 
 ```
-ghcr.io/epheo/portail:latest
+ghcr.io/epheo/portail:X.Y.Z
 ```
 
 Tags:
+
 - `X.Y.Z` and `X.Y`: releases; `latest` is the last release.
 - `main` and `sha-<commit>`: every commit on main, between releases.
+
+A controller renders Managed data planes with the image it was published as: `:X.Y.Z` for a release, `:sha-<commit>` for main.
+A local build renders `ghcr.io/epheo/portail:<its version>`; build with `--build-arg PORTAIL_IMAGE=<reference>` to name another.
 
 A release is a `vX.Y.Z` tag on main, made after `scripts/release.sh X.Y.Z` set the versions in a merged commit.
 
@@ -105,41 +225,63 @@ podman build --build-arg PREBUILT=1 -t ghcr.io/epheo/portail:latest -f Container
 
 ## Probes and Metrics
 
-In Kubernetes mode portail serves a plain-HTTP admin endpoint on
-`--readiness-port` (default `19099`): `/livez` answers "should this process
-be restarted" and is `200` once the process is up; `/readyz` turns `200`
-only when the data plane has bound its listener ports; `/metrics` is
-Prometheus text format. Point `readinessProbe` at `/readyz` and
-`livenessProbe` at `/livez`, always via the pod IP — probing through a
-Gateway VIP has no delivery guarantee to this pod and turns a neighbor's
-outage into your restart loop. The endpoint listens on every interface;
-`--admin-address=$(POD_IP)` binds the pod IP alone, so a Gateway VIP or
-Multus interface no longer exposes `/metrics` (see
-[configuration](configuration.md#admin-endpoint)).
+Both modes serve a plain-HTTP admin endpoint on `--readiness-port` (default `19099`):
+
+- `/livez`: `200` once the process is up. Liveness only: should this process be restarted.
+- `/readyz`: the controller once its caches synced and its CA loaded; a data plane once it applied a configuration and every listener of it is bound.
+- `/metrics`: Prometheus text format.
+
+Probe the pod IP, never a Gateway VIP: a VIP has no delivery guarantee to this pod and turns a neighbor's outage into your restart loop.
+Managed data planes run with `--admin-address=$(POD_IP)`, so a Gateway VIP or Multus interface does not expose `/metrics` (see [configuration](configuration.md#admin-endpoint)).
+
+## Multi-Network Routing
+
+A Gateway with a `portail.epheo.eu/Network` address puts its data plane on that network through Multus and binds the pod's IP there.
+GatewayParameters `networks` attach more networks, for the backend side.
+Traffic crossing between networks goes through portail, which applies Gateway API routing rules (HTTPRoute, TCPRoute, UDPRoute).
+
+- The controller reads the network's NetworkAttachmentDefinition; the data plane binds its interface IP within that subnet.
+- A NetworkAttachmentDefinition that cannot be read keeps its last subnet; one never read keeps the Gateway's previous configuration.
+
+For pure L3 connectivity between subnets (high throughput, ICMP, no L7 policy), use OVN or iptables.
+portail complements L3 infrastructure as the L4-L7 policy layer.
+
+See `examples/kubernetes/multi-network/`.
+
+## OpenShift
+
+- `restricted-v2` admits the controller and Managed data planes, including the `NET_BIND_SERVICE` add and the projected token.
+- hostNetwork, `NET_ADMIN` init containers and other privileges are for Unmanaged pods, with an SCC the cluster admin grants to their ServiceAccount.
 
 ## Verifying
 
-portail-operator writes GatewayClass status; portail never does.
-Without the operator it stays empty, and portail still serves Gateways whose class names its controller.
-
 ```bash
-# GatewayClass accepted? (portail-operator only)
-kubectl get gatewayclass portail -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
+# GatewayClass accepted, with the features portail supports
+kubectl get gatewayclass portail -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status} {.status.supportedFeatures[*].name}{"\n"}'
 
-# Gateway status
+# Gateway status: Accepted and Programmed True
 kubectl get gateway my-gateway -o yaml
-# Look for Accepted: True and Programmed: True
+
+# Its data plane
+kubectl get deploy,svc,pdb,sa -l portail.epheo.eu/gateway=my-gateway
 ```
 
-portail writes only the status that differs from what the API server holds, so a wiped or outdated status is rewritten on the next pass.
-A route or RateLimitPolicy that stops naming a Gateway loses portail's status entry for that Gateway.
-A listener whose port is not bound reports `Programmed=False` with reason `Pending`.
-Listeners sharing a port and protocol conflict unless their hostnames differ; TCP and UDP listeners need a port each.
-Without portail-operator, a Gateway with some listeners rejected stays `Accepted=True` with reason `ListenersNotValid`.
-`attachedRoutes` counts every route attached to the listener, accepted or not.
+- The controller leader writes every status, as field manager `portail-controller`.
+- It writes only the status that differs from what the API server holds, so a wiped or outdated status is rewritten on the next pass.
+- A route or RateLimitPolicy that stops naming a Gateway loses portail's status entry for that Gateway.
+- A listener a data plane cannot bind reports `Programmed=False`, reason `Invalid`, with the error; `Pending` until a data plane applied the Gateway's current configuration.
+- Listeners sharing a port and protocol conflict unless their hostnames differ; TCP and UDP listeners need a port each.
+- A Gateway with some listeners rejected stays `Accepted=True` with reason `ListenersNotValid`.
+- `attachedRoutes` counts every route attached to the listener, accepted or not.
 
 ## Uninstall
 
+Delete the Gateways of class `portail` first: their data planes go with them, and the controller removes its route status entries.
+
 ```bash
-kubectl delete -k examples/kubernetes/<pattern>/
+kubectl get gateways -A -o jsonpath='{range .items[?(@.spec.gatewayClassName=="portail")]}{.metadata.namespace} {.metadata.name}{"\n"}{end}' |
+    while read -r ns name; do kubectl -n "$ns" delete gateway "$name"; done
+kubectl delete -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
 ```
+
+Deleting the CRDs deletes every GatewayParameters and RateLimitPolicy.

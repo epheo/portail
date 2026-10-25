@@ -2,7 +2,10 @@
 
 **portail** is a Kubernetes API Gateway using Tokio runtime and kube-rs.
 
-Both control and data plane are implemented as a single Rust binary.
+Both control and data plane are implemented as a single Rust binary:
+`portail controller` watches the cluster and provisions one data plane per
+Gateway, `portail dataplane` serves it without any Kubernetes access, and
+plain `portail --config FILE` runs standalone.
 
 It is a single person project, obviously **not production ready** in any way and
 many parts have been written or refactored by an LLM.
@@ -18,8 +21,20 @@ But in front of the complexity, I took a step back and removed both the io_uring
 and eBPF implementations that were getting out of hands in favor of Tokio runtime.
 
 Portail targets **Gateway API v1.4.1** and does not support the mesh (GAMMA) profile.
-HTTP/2 is opt-in on HTTPS listeners via `--http2`.
+HTTP/2 is opt-in on HTTPS listeners via `--http2`, standalone or in an Unmanaged data plane.
 I plan on adding gRPC support in a future release.
+
+## Install
+
+With the Gateway API CRDs installed:
+
+```bash
+kubectl apply --server-side -k "https://github.com/epheo/portail//deploy/install?ref=vX.Y.Z"
+```
+
+Then create Gateways of class `portail`. See [deployment](docs/deployment.md),
+[configuration](docs/configuration.md), [upgrading from 0.1.x](docs/upgrading.md)
+and [examples](examples/kubernetes/).
 
 ## License
 
