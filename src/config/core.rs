@@ -727,6 +727,30 @@ mod tests {
         ports
     }
 
+    /// The controller's snapshot carries a config through JSON: a lost
+    /// `invalid` would forward to a refused backend, a lost namespace would
+    /// leave the ref without its PEMs.
+    #[test]
+    fn invalid_backends_and_cert_namespaces_survive_json() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [{
+                "name": "h", "protocol": "HTTPS", "port": 443,
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "c", "namespace": "certs"}]}
+            }]},
+            "httpRoutes": [{"hostnames": ["a.example"], "rules": [{"backendRefs": [
+                {"name": "127.0.0.1", "port": 8001, "invalid": true},
+                {"name": "127.0.0.1", "port": 8002}
+            ]}]}]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        let again: PortailConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        let refs = &again.http_routes[0].rules[0].backend_refs;
+        assert!(refs[0].invalid && !refs[1].invalid);
+        let tls = again.gateway.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(tls.certificate_refs[0].namespace.as_deref(), Some("certs"));
+    }
+
     #[test]
     fn headless_backend_connects_on_target_port() {
         // IP-literal backend name keeps this hermetic (no DNS). A headless service
