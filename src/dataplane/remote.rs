@@ -119,14 +119,16 @@ pub(super) struct Hop {
 
 impl Hop {
     /// A hop to `target`, whose certificate must chain to `roots` for
-    /// `server_name`.
-    pub fn new(target: Target, server_name: ServerName<'static>, roots: RootCertStore) -> Self {
-        // TLS 1.3 only: the controller serves nothing older, and every
-        // apiserver speaks it.
-        let mut tls =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+    /// `server_name`, in one of TLS `versions`.
+    pub fn new(
+        target: Target,
+        server_name: ServerName<'static>,
+        roots: RootCertStore,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Self {
+        let mut tls = rustls::ClientConfig::builder_with_protocol_versions(versions)
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Self {
             host: target.host,
@@ -232,7 +234,8 @@ impl Client {
             .with_context(|| format!("--controller-address {:?}: host", address))?;
         let answers = AnswerVerifier::new(roots.clone(), &target.host)?;
         Ok(Self::with(
-            Hop::new(target, server_name, roots),
+            // Both ends are ours: TLS 1.3 only.
+            Hop::new(target, server_name, roots, &[&rustls::version::TLS13]),
             Via::Direct { token_file },
             gateway.clone(),
             answers,

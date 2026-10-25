@@ -1845,9 +1845,10 @@ mod tests {
         g.shutdown.cancel();
     }
 
-    /// The sync endpoint speaks TLS 1.3 only.
+    /// The sync endpoint speaks TLS 1.2 too: an apiserver on an older Go
+    /// FIPS stack dials proxied polls with nothing newer.
     #[tokio::test]
-    async fn a_tls_1_2_client_is_refused() {
+    async fn a_tls_1_2_client_is_served() {
         let (ca, _, name) = tls_client();
         let f = fixture().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1862,7 +1863,7 @@ mod tests {
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(old));
         let tcp = TcpStream::connect(addr).await.unwrap();
-        assert!(connector.connect(name, tcp).await.is_err());
+        connector.connect(name, tcp).await.unwrap();
         f.shutdown.cancel();
     }
 

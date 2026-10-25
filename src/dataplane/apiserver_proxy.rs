@@ -87,7 +87,9 @@ pub fn client_with(
     // the address said after it.
     let answers = AnswerVerifier::new(ca_roots(ca_pem, "controller CA")?, &controller.name())?;
     Ok(Client::with(
-        Hop::new(target, server_name, roots),
+        // rustls' defaults, 1.2 too: some apiservers, on an older Go FIPS
+        // stack, speak nothing newer.
+        Hop::new(target, server_name, roots, rustls::DEFAULT_VERSIONS),
         Via::ApiserverProxy {
             api_token_file: apiserver.token_file.clone(),
             token_file,
@@ -328,8 +330,18 @@ mod tests {
             &self,
             answer: impl Fn(usize, Seen) -> stub::Reply + Send + Sync + 'static,
         ) -> (Client, Arc<std::sync::Mutex<Vec<Seen>>>) {
+            self.apiserver_speaking(rustls::DEFAULT_VERSIONS, answer)
+                .await
+        }
+
+        /// [`Self::apiserver`], speaking only TLS `versions`.
+        async fn apiserver_speaking(
+            &self,
+            versions: &[&'static rustls::SupportedProtocolVersion],
+            answer: impl Fn(usize, Seen) -> stub::Reply + Send + Sync + 'static,
+        ) -> (Client, Arc<std::sync::Mutex<Vec<Seen>>>) {
             let leaf = self.apiserver_ca.leaf(&[APISERVER_NAME]);
-            let (addr, seen) = stub::serve(leaf, true, answer).await;
+            let (addr, seen) = stub::serve_tls(leaf, true, versions, answer).await;
             let apiserver = Apiserver {
                 address: format!("https://{addr}"),
                 ca_pem: self.apiserver_ca.pem().into_bytes(),
@@ -433,6 +445,22 @@ mod tests {
             Answer::Retry { error, .. } => assert!(error.contains("no answer within"), "{error}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An apiserver on an older Go FIPS stack speaks TLS 1.2 only: the
+    /// hop to it takes that, the answer's signature still decides.
+    #[tokio::test]
+    async fn an_apiserver_speaking_tls_1_2_is_reached() {
+        let fixture = Arc::new(Fixture::new());
+        let answers = fixture.clone();
+        let (mut client, _) = fixture
+            .apiserver_speaking(&[&rustls::version::TLS12], move |_, seen| {
+                let answer = answers.snapshot(&seen);
+                Box::pin(async move { Some(answer) })
+            })
+            .await;
+        let answer = client.poll(&request()).await;
+        assert!(matches!(answer, Answer::Snapshot(_)), "{answer:?}");
     }
 
     /// Through the apiserver, a snapshot signed by anyone but the
