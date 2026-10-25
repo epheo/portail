@@ -8,7 +8,6 @@
 //! conditions); `leader`, `server`, `auth`, `ca`, `params`, `provision`,
 //! `programmed`, `gatewayclass` hold the runtime the split adds.
 
-mod apiserver_peers;
 mod auth;
 mod ca;
 mod gatewayclass;
@@ -342,13 +341,6 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let signer = ca.serving_key();
     tokio::spawn(ca.keep_renewed(shutdown.clone()));
     let (lapses, lapse_wakes) = server::Lapses::new();
-    let apiserver = Arc::new(apiserver_peers::ApiserverPeers::default());
-    tokio::spawn(apiserver.clone().keep_listed(
-        client.clone(),
-        Duration::from_secs(RESYNC_SECS),
-        Duration::from_secs(ERROR_REQUEUE_SECS),
-        shutdown.clone(),
-    ));
     let sync_server = server::SyncServer::new(
         ctx.clone(),
         auth::Authenticator::new(
@@ -356,11 +348,11 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             &args.namespace,
             &args.service_name,
             auth::own_service_account(),
-        )
-        .exempting(apiserver),
+        ),
         signer,
         lapses,
         shutdown.clone(),
+        args.sync_peer_connections,
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
