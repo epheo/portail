@@ -338,7 +338,7 @@ fn refused(refusal: Refusal) -> Response<Full<Bytes>> {
         // One body for every 401: no oracle of which check failed.
         Refusal::Unauthenticated => text(StatusCode::UNAUTHORIZED, "unauthenticated"),
         Refusal::Forbidden => text(StatusCode::FORBIDDEN, "forbidden"),
-        Refusal::Throttled => unavailable("too many token reviews in flight"),
+        Refusal::Throttled => unavailable("too many token reviews"),
         Refusal::Unavailable => unavailable("token review failed"),
     }
 }
@@ -1748,7 +1748,11 @@ mod tests {
             f.api
                 .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
             let reviewed = post(Some(token), &body(&key(), "", None));
-            assert_eq!(f.sync(reviewed).await.status(), StatusCode::OK);
+            let pod = peer(n as u32);
+            assert_eq!(
+                f.server.handle(reviewed, pod).await.status(),
+                StatusCode::OK
+            );
         }
         let started = Instant::now();
         let stalled: Vec<_> = tokens[..MAX_BODY_READS]
@@ -2053,7 +2057,10 @@ mod tests {
                 Some(&gateway_token("default", "gw", n)),
                 &body(&key(), "", None),
             );
-            assert_eq!(version_of(f.sync(reviewed).await).await, v1);
+            assert_eq!(
+                version_of(f.server.handle(reviewed, peer(n)).await).await,
+                v1
+            );
         }
         let held: Vec<_> = pods
             .map(|n| {

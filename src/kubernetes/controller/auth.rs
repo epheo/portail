@@ -44,6 +44,17 @@ const MAX_REVIEWS_IN_FLIGHT: usize = 16;
 /// needs one at a time. Renewals count, but are not refused: known tokens
 /// are a bounded set.
 const MAX_REVIEWS_PER_PEER: usize = 2;
+/// Reviews of unknown tokens per peer IP, a token bucket: 5 a second, 10
+/// at once. A data plane needs one per token (its first poll, each kubelet
+/// rotation, each restart), so none waits; a pod minting forgeries made
+/// thousands a second, as fast as the in-flight cap freed. Renewals of
+/// known tokens are not charged.
+const REVIEW_RATE_PER_PEER: f64 = 5.0;
+const REVIEW_BURST_PER_PEER: f64 = 10.0;
+/// Peer IPs whose bucket is kept at most. A full bucket is dropped first:
+/// it would refill anyway, within the burst over the rate (2s) of the
+/// peer's last review. A few dozen bytes each.
+const MAX_RATED_PEERS: usize = 4096;
 /// Renewals of known tokens in flight, apart from the unknown pool. Each
 /// live instance renews once per TTL, spread over it: at milliseconds per
 /// review, 4 renew hundreds of instances a second, and 16 + 4 stays at 10%
@@ -86,7 +97,8 @@ pub(crate) enum Refusal {
     Unauthenticated,
     /// 403: an identity that may not sync this Gateway.
     Forbidden,
-    /// 503: TokenReviews in flight are at their cap.
+    /// 503: TokenReviews in flight are at their cap, or the peer is over
+    /// its rate of reviews.
     Throttled,
     /// 503: the TokenReview got no answer.
     Unavailable,
@@ -197,6 +209,19 @@ enum Unreviewed {
     Rejected,
 }
 
+/// A peer IP's allowance of unknown-token reviews.
+struct ReviewBucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl ReviewBucket {
+    fn tokens_at(&self, now: Instant) -> f64 {
+        let refill = now.duration_since(self.at).as_secs_f64() * REVIEW_RATE_PER_PEER;
+        (self.tokens + refill).min(REVIEW_BURST_PER_PEER)
+    }
+}
+
 /// A review in flight for a peer IP, counted until dropped.
 struct PeerReview<'a> {
     peers: &'a Mutex<HashMap<IpAddr, usize>>,
@@ -226,6 +251,8 @@ pub(crate) struct Authenticator {
     renewals: Semaphore,
     /// Reviews in flight by peer IP.
     peers: Mutex<HashMap<IpAddr, usize>>,
+    /// Unknown-token reviews allowed by peer IP.
+    review_rates: Mutex<HashMap<IpAddr, ReviewBucket>>,
     verdicts: Mutex<Verdicts>,
 }
 
@@ -249,6 +276,7 @@ impl Authenticator {
             unknown: Semaphore::new(MAX_REVIEWS_IN_FLIGHT),
             renewals: Semaphore::new(MAX_RENEWALS_IN_FLIGHT),
             peers: Mutex::default(),
+            review_rates: Mutex::default(),
             verdicts: Mutex::default(),
         }
     }
@@ -315,6 +343,10 @@ impl Authenticator {
                     METRICS.sync_throttled_total.inc();
                     return Err(Refusal::Throttled);
                 };
+                if !self.charge_review(peer) {
+                    METRICS.sync_throttled_total.inc();
+                    return Err(Refusal::Throttled);
+                }
                 match self.review(hash, token).await {
                     Ok(reviewed) => reviewed,
                     Err(Unreviewed::Failed) => return Err(Refusal::Unavailable),
@@ -326,6 +358,30 @@ impl Authenticator {
             return Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden));
         }
         Ok(InstanceId(reviewed.pod_uid))
+    }
+
+    /// Take one unknown-token review from `peer`'s bucket, if it has one.
+    fn charge_review(&self, peer: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.review_rates.lock().unwrap_or_else(|p| p.into_inner());
+        if buckets.len() >= MAX_RATED_PEERS && !buckets.contains_key(&peer) {
+            buckets.retain(|_, b| b.tokens_at(now) < REVIEW_BURST_PER_PEER);
+            if buckets.len() >= MAX_RATED_PEERS {
+                return false;
+            }
+        }
+        let bucket = buckets.entry(peer).or_insert(ReviewBucket {
+            tokens: REVIEW_BURST_PER_PEER,
+            at: now,
+        });
+        let tokens = bucket.tokens_at(now);
+        bucket.at = now;
+        if tokens < 1.0 {
+            bucket.tokens = tokens;
+            return false;
+        }
+        bucket.tokens = tokens - 1.0;
+        true
     }
 
     /// Count a review for `peer`, unless it has `cap` in flight already.
@@ -1201,6 +1257,52 @@ mod tests {
             Ok(InstanceId("pod-0".into()))
         );
         flood.iter().for_each(|f| f.abort());
+    }
+
+    /// A peer gets 10 reviews of unknown tokens at once, then 5 a second;
+    /// past that a 503 with no review, another peer untouched, and a known
+    /// token's renewal never charged. One pod of unique forgeries made
+    /// 1,704 reviews a second.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_reviews_unknown_tokens_at_a_bounded_rate() {
+        let serial = METRICS_SERIAL.lock().await;
+        let api = MockApi::default();
+        let auth = authenticator(api.client(), &serial);
+        let gw = GatewayKey::new("apps", "web");
+        // A pod per token: a pod keeps two verdicts.
+        let sync = |n: u32, from: IpAddr| {
+            let pod = format!("pod-{n}");
+            api.reply_to(
+                REVIEWS,
+                201,
+                review(true, "system:serviceaccount:apps:portail-web", Some(&pod)),
+            );
+            let token = gateway_token("apps", "web", n);
+            let claimed = auth.precheck(&token).unwrap();
+            let gw = gw.clone();
+            let auth = &auth;
+            async move { auth.authenticate(&claimed, &token, &gw, from).await }
+        };
+        assert!(sync(0, PEER).await.is_ok());
+        tokio::time::advance(CACHE_TTL + Duration::from_millis(1)).await;
+
+        let throttled = metrics::METRICS.sync_throttled_total.get();
+        for n in 1..=REVIEW_BURST_PER_PEER as u32 {
+            assert!(sync(n, PEER).await.is_ok(), "within the burst: {n}");
+        }
+        let reviewed = reviews(&api);
+        assert_eq!(sync(100, PEER).await, Err(Refusal::Throttled));
+        assert_eq!(reviews(&api), reviewed, "a throttled token is not reviewed");
+        assert_eq!(metrics::METRICS.sync_throttled_total.get(), throttled + 1);
+        assert!(sync(101, peer(2)).await.is_ok(), "another peer");
+        assert!(sync(0, PEER).await.is_ok(), "a renewal is not charged");
+        assert_eq!(reviews(&api), reviewed + 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for n in 0..REVIEW_RATE_PER_PEER as u32 {
+            assert!(sync(200 + n, PEER).await.is_ok(), "refilled: {n}");
+        }
+        assert_eq!(sync(300, PEER).await, Err(Refusal::Throttled));
     }
 
     fn hash(n: u32) -> TokenHash {

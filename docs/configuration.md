@@ -101,7 +101,8 @@ in standalone mode:
   route and certificate changes wait for the controller.
 - The controller adds `portail_sync_auth_rejected_total{stage}`,
   `portail_tokenreview_requests_total{result}`,
-  `portail_sync_throttled_total` and
+  `portail_sync_throttled_total` (503s: TokenReviews in flight at their
+  cap, or a source IP past 5 reviews a second of tokens not seen yet) and
   `portail_sync_auth_stale_verdicts_total` (polls served on an expired
   TokenReview verdict while the API server did not answer its renewal).
 

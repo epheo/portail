@@ -93,7 +93,7 @@ metrics! {
     backends_recovered_total: "Backend health recoveries (probe or passive)",
     reconcile_runs_total: "Gateway reconcile passes that published a new snapshot or wrote status",
     reconcile_skips_total: "Gateway reconcile passes that published and wrote nothing",
-    sync_throttled_total: "Sync requests answered 503 because TokenReviews in flight were at their cap",
+    sync_throttled_total: "Sync requests answered 503 because TokenReviews in flight were at their cap or the source IP was over its review rate",
     sync_auth_stale_verdicts_total: "Sync requests served on an expired TokenReview verdict because it could not be renewed",
 }
 
