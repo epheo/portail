@@ -11,3 +11,4 @@ pub mod privileges;
 pub mod proxy;
 pub mod rate_limit;
 pub mod routing;
+pub mod sync;
