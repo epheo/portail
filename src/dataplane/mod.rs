@@ -6,6 +6,7 @@
 //! client, permission or token.
 
 pub mod addresses;
+pub mod apiserver_proxy;
 pub mod apply;
 pub mod dns_refresh;
 pub mod remote;
@@ -22,7 +23,7 @@ use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::DataplaneArgs;
+use crate::cli::{DataplaneArgs, SyncTransport};
 use crate::config::PerformanceConfig;
 use crate::logging::{error, info, warn};
 use crate::metrics::{ControllerSync, CONTROLLER_SYNC};
@@ -39,12 +40,15 @@ pub async fn run(args: DataplaneArgs, stop: CancellationToken) -> anyhow::Result
         args.controller_ca_file.as_deref(),
         std::env::var(crate::cli::CONTROLLER_CA_ENV).ok(),
     )?;
-    let mut client = Client::new(
-        &args.controller_address,
-        &args.gateway,
-        &ca,
-        args.token_file.clone(),
-    )?;
+    let mut client = match args.transport {
+        SyncTransport::Direct => Client::new(
+            &args.controller_address,
+            &args.gateway,
+            &ca,
+            args.token_file.clone(),
+        )?,
+        SyncTransport::ApiserverProxy => apiserver_proxy::client(&args, &ca)?,
+    };
 
     // Before listeners: a request must never race the writer task's spawn.
     if let Some(target) = &args.access_log {
@@ -78,9 +82,13 @@ pub async fn run(args: DataplaneArgs, stop: CancellationToken) -> anyhow::Result
     );
     let refresh_stop = CancellationToken::new();
     applier.spawn_dns_refresh(refresh_stop.clone());
+    let via = match args.transport {
+        SyncTransport::Direct => "",
+        SyncTransport::ApiserverProxy => " through the apiserver's service proxy",
+    };
     info!(
-        "Data plane for Gateway {} syncing from {}",
-        args.gateway, args.controller_address
+        "Data plane for Gateway {} syncing from {}{}",
+        args.gateway, args.controller_address, via
     );
 
     let mut sync = SyncLoop::new(args.gateway, applier, ready.clone(), listener_exits);
@@ -124,6 +132,9 @@ struct SyncLoop {
     /// The version refused and why, until a snapshot is applied: every
     /// report says so, as the controller would not send it again.
     refused: Option<(String, String)>,
+    /// Why the last answer was not taken as the controller's, until it
+    /// answers again: every report says so.
+    unverified: Option<String>,
     metrics: &'static ControllerSync,
 }
 
@@ -158,17 +169,25 @@ impl SyncLoop {
             rebind_at: None,
             last_error: None,
             refused: None,
+            unverified: None,
             metrics: &CONTROLLER_SYNC,
         }
     }
 
     fn request(&self) -> SyncRequest {
+        let report = self.report.clone().map(|report| match &self.unverified {
+            Some(error) => InstanceReport {
+                apply_error: Some(error.clone()),
+                ..report
+            },
+            None => report,
+        });
         SyncRequest {
             protocol: PROTOCOL,
             gateway: self.gateway.clone(),
             have: self.have.clone(),
             data_plane_version: env!("CARGO_PKG_VERSION").to_string(),
-            report: self.report.clone(),
+            report,
         }
     }
 
@@ -238,6 +257,7 @@ impl SyncLoop {
                 return now + self.failures.wait();
             }
             Answer::Standby(error) => return self.standby(error),
+            Answer::Unverified(error) => return self.unverified(error),
             Answer::Retry { after, error } => return self.failed(after, error),
         };
         match snapshot {
@@ -331,6 +351,7 @@ impl SyncLoop {
 
     /// The controller answered; `current`: what it said is served now.
     fn answered(&mut self, current: bool) {
+        self.unverified = None;
         self.metrics.set_connected(true);
         if current {
             self.metrics.confirmed();
@@ -350,6 +371,15 @@ impl SyncLoop {
         }
         self.last_error = Some(error);
         Instant::now() + delay
+    }
+
+    /// An answer not taken as the controller's: whoever sent it, the table
+    /// stays, the reports say why and the poll backs off. Through the
+    /// apiserver's proxy, a rogue endpoint of the controller Service could
+    /// send one; so could a controller whose CA the pod does not trust.
+    fn unverified(&mut self, error: String) -> Instant {
+        self.unverified = Some(error.clone());
+        self.failed(None, error)
     }
 
     fn failed(&mut self, after: Option<Duration>, error: String) -> Instant {
@@ -645,6 +675,39 @@ mod tests {
 
     fn body(snapshot: &Snapshot) -> bytes::Bytes {
         serde_json::to_vec(snapshot).unwrap().into()
+    }
+
+    /// An answer not signed by the controller changes nothing served: the
+    /// table stays, the reports carry why under the version served, and
+    /// the poll backs off; the controller's next answer clears it.
+    #[tokio::test]
+    async fn an_unverified_answer_keeps_the_table_and_is_reported() {
+        let (mut sync, ready) = sync_loop();
+        let served = snapshot();
+        sync.handle(Answer::Snapshot(body(&served))).await;
+        let clean = sync.request().report.unwrap();
+        assert_eq!(clean.apply_error, None);
+
+        let why = "snapshot refused: unsigned: no x-portail-signature header";
+        sync.handle(Answer::Unverified(why.into())).await;
+        assert_eq!(sync.current.as_ref().unwrap().version, served.version);
+        assert!(ready.load(Ordering::Acquire), "still serving");
+        assert_eq!(
+            sync.failures.next_ceiling(),
+            2 * Backoff::default().next_ceiling(),
+            "backed off"
+        );
+        let reported = sync.request().report.unwrap();
+        assert_eq!(
+            reported,
+            InstanceReport {
+                apply_error: Some(why.into()),
+                ..clean.clone()
+            }
+        );
+
+        sync.handle(Answer::Unchanged).await;
+        assert_eq!(sync.request().report.unwrap(), clean);
     }
 
     /// A refused version stays in every report until a snapshot applies,

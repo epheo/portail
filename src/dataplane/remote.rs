@@ -1,27 +1,31 @@
 //! The data plane's end of `POST /v1/sync`: one keep-alive HTTPS
-//! connection to the controller, trusted through the controller CA alone,
-//! and the backoff between polls that failed.
+//! connection, to the controller or through the apiserver's service proxy
+//! (`super::apiserver_proxy`), answers taken only when signed by the
+//! controller, and the backoff between polls that failed.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use bytes::Bytes;
-use http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, RETRY_AFTER};
+use http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE, HOST, RETRY_AFTER};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
+use rustls::RootCertStore;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
 use crate::cli::CONTROLLER_CA_ENV;
-use crate::sync::{GatewayKey, SyncRequest, HOLD, STANDBY_HEADER};
+use crate::sync::{
+    ca_roots, AnswerVerifier, GatewayKey, Gone, Signed, SyncRequest, HOLD, STANDBY_HEADER,
+    TOKEN_HEADER,
+};
 
 /// Bounds a connect, TCP and TLS together: in-cluster connects take
 /// milliseconds, so this only cuts short a dead endpoint during failover.
@@ -55,15 +59,19 @@ const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 /// How a poll ended.
 #[derive(Debug)]
 pub enum Answer {
-    /// 200: a snapshot, as sent.
+    /// 200: a snapshot, as sent, signed by the controller.
     Snapshot(Bytes),
     /// 204: the version served is current.
     Unchanged,
-    /// 404: the controller serves this Gateway nothing.
+    /// 404, signed by the controller, recent and for this Gateway: it
+    /// serves this Gateway nothing.
     Gone,
     /// 503 from a replica that serves nothing: a standby, one still
     /// syncing, or one stopping. Another replica may, on a new connection.
     Standby(String),
+    /// A 200 or 404 not signed by the controller, or a gone answer stale
+    /// or for another Gateway: whoever sent it, nothing it says is served.
+    Unverified(String),
     /// Anything else, a failed connect or request included: try again
     /// later, after `after` when the controller said so.
     Retry {
@@ -74,18 +82,91 @@ pub enum Answer {
 
 /// The controller's sync endpoint, as a data plane polls it.
 pub struct Client {
-    /// Dialed by name each connect: a Service whose address moved is
-    /// followed.
-    host: String,
-    port: u16,
-    /// The `Host` header.
-    authority: String,
-    path: String,
-    server_name: ServerName<'static>,
-    tls: TlsConnector,
-    token_file: PathBuf,
+    hop: Hop,
+    via: Via,
+    gateway: GatewayKey,
+    answers: AnswerVerifier,
     /// Idle between polls; taken by the poll that uses it.
     conn: Option<Conn>,
+}
+
+/// Where a poll is sent, and the TLS peer it must reach.
+pub(super) struct Hop {
+    /// Dialed by name each connect: a Service whose address moved is
+    /// followed.
+    pub host: String,
+    pub port: u16,
+    /// The `Host` header.
+    pub authority: String,
+    pub path: String,
+    pub server_name: ServerName<'static>,
+    pub tls: TlsConnector,
+}
+
+impl Hop {
+    /// A hop to `target`, whose certificate must chain to `roots` for
+    /// `server_name`.
+    pub fn new(target: Target, server_name: ServerName<'static>, roots: RootCertStore) -> Self {
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Self {
+            host: target.host,
+            port: target.port,
+            authority: target.authority,
+            path: target.path,
+            server_name,
+            tls: TlsConnector::from(Arc::new(tls)),
+        }
+    }
+}
+
+/// How a poll authenticates. Token files are read per request: kubelet
+/// rotates them.
+pub(super) enum Via {
+    /// To the controller: its token as the bearer.
+    Direct { token_file: PathBuf },
+    /// Through the apiserver: the API-audience token as the bearer, which
+    /// the apiserver checks and drops, and the controller's in
+    /// X-Portail-Token, which it passes on.
+    ApiserverProxy {
+        api_token_file: PathBuf,
+        token_file: PathBuf,
+    },
+}
+
+impl Via {
+    async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+        match self {
+            Via::Direct { token_file } => Ok(vec![(AUTHORIZATION, bearer(token_file).await?)]),
+            Via::ApiserverProxy {
+                api_token_file,
+                token_file,
+            } => Ok(vec![
+                (AUTHORIZATION, bearer(api_token_file).await?),
+                (
+                    HeaderName::from_static(TOKEN_HEADER),
+                    header_value(&read_token(token_file).await?, token_file)?,
+                ),
+            ]),
+        }
+    }
+
+    /// Whether a standby's answer drops the connection, so that the next
+    /// one may reach another replica. The apiserver picks an endpoint per
+    /// request: its connection is kept.
+    fn redials_on_standby(&self) -> bool {
+        matches!(self, Via::Direct { .. })
+    }
+
+    /// What the apiserver itself answered, not the controller.
+    fn apiserver_refusal(&self, status: StatusCode, body: &[u8]) -> Option<String> {
+        match self {
+            Via::Direct { .. } => None,
+            Via::ApiserverProxy { .. } => super::apiserver_proxy::refusal(status, body),
+        }
+    }
 }
 
 /// One connection to the controller. Dropping it closes it, a request in
@@ -120,7 +201,7 @@ pub fn controller_ca(file: Option<&Path>, env: Option<String>) -> anyhow::Result
 impl Client {
     /// A client of `gateway`'s sync endpoint under `address` (an https
     /// URL), which must present a certificate for its host chaining to
-    /// `ca_pem`.
+    /// `ca_pem`, and sign its answers with it.
     pub fn new(
         address: &str,
         gateway: &GatewayKey,
@@ -129,32 +210,26 @@ impl Client {
     ) -> anyhow::Result<Self> {
         let target = Target::parse(address, gateway)
             .with_context(|| format!("--controller-address {:?}", address))?;
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_slice_iter(ca_pem) {
-            roots
-                .add(cert.context("controller CA")?)
-                .context("controller CA")?;
-        }
-        anyhow::ensure!(
-            !roots.is_empty(),
-            "controller CA: no certificate in the PEM"
-        );
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let roots = ca_roots(ca_pem, "controller CA")?;
         let server_name = ServerName::try_from(target.host.clone())
             .with_context(|| format!("--controller-address {:?}: host", address))?;
-        Ok(Self {
-            host: target.host,
-            port: target.port,
-            authority: target.authority,
-            path: target.path,
-            server_name,
-            tls: TlsConnector::from(Arc::new(tls)),
-            token_file,
+        let answers = AnswerVerifier::new(roots.clone(), &target.host)?;
+        Ok(Self::with(
+            Hop::new(target, server_name, roots),
+            Via::Direct { token_file },
+            gateway.clone(),
+            answers,
+        ))
+    }
+
+    pub(super) fn with(hop: Hop, via: Via, gateway: GatewayKey, answers: AnswerVerifier) -> Self {
+        Self {
+            hop,
+            via,
+            gateway,
+            answers,
             conn: None,
-        })
+        }
     }
 
     /// One poll, bounded by twice the hold. Its token is read from the
@@ -171,9 +246,9 @@ impl Client {
     }
 
     async fn exchange(&mut self, request: &SyncRequest) -> Result<Answer, String> {
-        let bearer = bearer(&self.token_file).await?;
+        let credentials = self.via.headers().await?;
         let body = Bytes::from(serde_json::to_vec(request).map_err(|e| e.to_string())?);
-        let request = self.post(&bearer, body);
+        let request = self.post(credentials, body);
         let response = match self.conn.take() {
             Some(mut conn) if !conn.sender.is_closed() => match send(&mut conn, request).await {
                 Ok(response) => (conn, response),
@@ -186,41 +261,69 @@ impl Client {
                     ..
                 }) => self.send_new(*request).await?,
                 Err(Failed { error, .. }) => {
-                    return Err(format!("request to {}: {}", self.authority, error))
+                    return Err(format!("request to {}: {}", self.hop.authority, error))
                 }
             },
             _ => self.send_new(request).await?,
         };
         let (conn, response) = response;
-        let status = response.status();
-        let after = retry_after(response.headers());
-        let standby = response.headers().contains_key(STANDBY_HEADER);
-        let body = response
-            .into_body()
+        let (head, body) = response.into_parts();
+        let status = head.status;
+        let standby = head.headers.contains_key(STANDBY_HEADER);
+        let body = body
             .collect()
             .await
             .map_err(|e| format!("reading the answer: {}", e))?
             .to_bytes();
         let answer = match status {
-            StatusCode::OK => Answer::Snapshot(body),
+            StatusCode::OK => {
+                match self
+                    .answers
+                    .verify(Signed::Snapshot, &head.headers, &body, SystemTime::now())
+                {
+                    Ok(()) => Answer::Snapshot(body),
+                    Err(e) => return Ok(Answer::Unverified(format!("snapshot refused: {}", e))),
+                }
+            }
             StatusCode::NO_CONTENT => Answer::Unchanged,
-            StatusCode::NOT_FOUND => Answer::Gone,
-            // Dropping the connection lets the Service pick a replica again.
             StatusCode::SERVICE_UNAVAILABLE if standby => {
+                if !self.via.redials_on_standby() {
+                    self.conn = Some(conn);
+                }
                 return Ok(Answer::Standby(format!(
                     "controller replica not serving: {}",
                     excerpt(&body)
-                )))
+                )));
             }
             status => {
-                return Ok(Answer::Retry {
-                    after,
-                    error: format!("controller answered {}: {}", status, excerpt(&body)),
-                })
+                if let Some(error) = self.via.apiserver_refusal(status, &body) {
+                    self.conn = Some(conn);
+                    return Ok(Answer::Retry {
+                        after: retry_after(&head.headers),
+                        error,
+                    });
+                }
+                if status != StatusCode::NOT_FOUND {
+                    return Ok(Answer::Retry {
+                        after: retry_after(&head.headers),
+                        error: format!("controller answered {}: {}", status, excerpt(&body)),
+                    });
+                }
+                match self.gone(&head.headers, &body) {
+                    Ok(()) => Answer::Gone,
+                    Err(e) => return Ok(Answer::Unverified(format!("404 refused: {}", e))),
+                }
             }
         };
         self.conn = Some(conn);
         Ok(answer)
+    }
+
+    /// Whether a 404 is the controller's word that this Gateway is gone.
+    fn gone(&self, headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
+        let now = SystemTime::now();
+        self.answers.verify(Signed::Gone, headers, body, now)?;
+        Gone::check(body, &self.gateway, now)
     }
 
     async fn send_new(
@@ -230,33 +333,41 @@ impl Client {
         let mut conn = self.connect().await?;
         let response = send(&mut conn, request)
             .await
-            .map_err(|failed| format!("request to {}: {}", self.authority, failed.error))?;
+            .map_err(|failed| format!("request to {}: {}", self.hop.authority, failed.error))?;
         Ok((conn, response))
     }
 
-    fn post(&self, bearer: &HeaderValue, body: Bytes) -> Request<Full<Bytes>> {
-        Request::post(self.path.as_str())
-            .header(HOST, self.authority.as_str())
-            .header(AUTHORIZATION, bearer.clone())
-            .header(CONTENT_TYPE, "application/json")
+    fn post(
+        &self,
+        credentials: Vec<(HeaderName, HeaderValue)>,
+        body: Bytes,
+    ) -> Request<Full<Bytes>> {
+        let mut request = Request::post(self.hop.path.as_str())
+            .header(HOST, self.hop.authority.as_str())
+            .header(CONTENT_TYPE, "application/json");
+        for (name, value) in credentials {
+            request = request.header(name, value);
+        }
+        request
             .body(Full::new(body))
-            .expect("the path and authority parsed from a URI, the token as a header value")
+            .expect("the path and authority parsed from a URI, the tokens as header values")
     }
 
     async fn connect(&self) -> Result<Conn, String> {
+        let hop = &self.hop;
         let connecting = async {
-            let tcp = TcpStream::connect((self.host.as_str(), self.port))
+            let tcp = TcpStream::connect((hop.host.as_str(), hop.port))
                 .await
-                .map_err(|e| format!("connect to {}: {}", self.authority, e))?;
+                .map_err(|e| format!("connect to {}: {}", hop.authority, e))?;
             let _ = tcp.set_nodelay(true);
-            let tls = self
+            let tls = hop
                 .tls
-                .connect(self.server_name.clone(), tcp)
+                .connect(hop.server_name.clone(), tcp)
                 .await
-                .map_err(|e| format!("TLS with {}: {}", self.authority, e))?;
+                .map_err(|e| format!("TLS with {}: {}", hop.authority, e))?;
             let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
                 .await
-                .map_err(|e| format!("HTTP with {}: {}", self.authority, e))?;
+                .map_err(|e| format!("HTTP with {}: {}", hop.authority, e))?;
             let task = tokio::spawn(async move {
                 let _ = connection.await;
             });
@@ -267,7 +378,7 @@ impl Client {
             .unwrap_or_else(|_| {
                 Err(format!(
                     "connect to {}: no connection within {:?}",
-                    self.authority, CONNECT_TIMEOUT
+                    hop.authority, CONNECT_TIMEOUT
                 ))
             })
     }
@@ -298,17 +409,17 @@ async fn send(
         })
 }
 
-/// Where `--controller-address` points.
+/// Where an https URL points, its path followed by the Gateway's sync path.
 #[derive(Debug, PartialEq)]
-struct Target {
-    host: String,
-    port: u16,
-    authority: String,
-    path: String,
+pub(super) struct Target {
+    pub host: String,
+    pub port: u16,
+    pub authority: String,
+    pub path: String,
 }
 
 impl Target {
-    fn parse(address: &str, gateway: &GatewayKey) -> anyhow::Result<Self> {
+    pub fn parse(address: &str, gateway: &GatewayKey) -> anyhow::Result<Self> {
         let uri: Uri = address.parse()?;
         anyhow::ensure!(uri.scheme_str() == Some("https"), "not an https URL");
         anyhow::ensure!(uri.query().is_none(), "takes no query");
@@ -341,8 +452,8 @@ impl Target {
     }
 }
 
-/// The `Authorization` value for the token in `path`, read now.
-async fn bearer(path: &Path) -> Result<HeaderValue, String> {
+/// The token in `path`, read now.
+async fn read_token(path: &Path) -> Result<String, String> {
     let token = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| format!("token {}: {}", path.display(), e))?;
@@ -350,10 +461,20 @@ async fn bearer(path: &Path) -> Result<HeaderValue, String> {
     if token.is_empty() {
         return Err(format!("token {}: empty", path.display()));
     }
-    let mut value = HeaderValue::from_str(&format!("Bearer {}", token))
+    Ok(token.to_string())
+}
+
+/// `value`, read from `path`, as a header value kept out of Debug.
+fn header_value(value: &str, path: &Path) -> Result<HeaderValue, String> {
+    let mut value = HeaderValue::from_str(value)
         .map_err(|_| format!("token {}: not a header value", path.display()))?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+/// The `Authorization` value for the token in `path`, read now.
+async fn bearer(path: &Path) -> Result<HeaderValue, String> {
+    header_value(&format!("Bearer {}", read_token(path).await?), path)
 }
 
 /// `Retry-After` in seconds; its date form is not sent by the controller.
@@ -368,7 +489,7 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-fn excerpt(body: &[u8]) -> String {
+pub(super) fn excerpt(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(&body[..body.len().min(ERROR_BODY_LOG_BYTES)]);
     text.trim().to_string()
 }
@@ -417,9 +538,120 @@ impl Backoff {
     }
 }
 
+/// A TLS server for tests, answering as the controller or the apiserver
+/// would.
+#[cfg(test)]
+pub(super) mod stub {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use http::{HeaderMap, Request, Response};
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+
+    /// A request as the stub saw it.
+    #[derive(Clone, Debug)]
+    pub struct Seen {
+        /// Which connection, from 1.
+        pub connection: usize,
+        pub path: String,
+        pub headers: HeaderMap,
+        pub body: Bytes,
+    }
+
+    /// An answer, when it comes; `None` hangs up without one.
+    pub type Reply = futures::future::BoxFuture<'static, Option<Response<Full<Bytes>>>>;
+
+    #[derive(Debug)]
+    struct Fixed(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for Fixed {
+        fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A server on 127.0.0.1 presenting `leaf`, answering each request by
+    /// `answer` (its number, from 1). Returns its address and the requests
+    /// seen.
+    pub async fn serve(
+        leaf: CertifiedKey,
+        keep_alive: bool,
+        answer: impl Fn(usize, Seen) -> Reply + Send + Sync + 'static,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Fixed(Arc::new(leaf))));
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let answer = Arc::new(answer);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (acceptor, answer, log) = (acceptor.clone(), answer.clone(), log.clone());
+                let connection = connections.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                        let (answer, log) = (answer.clone(), log.clone());
+                        async move {
+                            let (head, body) = request.into_parts();
+                            // Read whole, as a held poll is: a hang-up
+                            // before that may land while the client still
+                            // writes, a poll it may then take as unsent.
+                            let body = body.collect().await.map(|b| b.to_bytes());
+                            let seen = Seen {
+                                connection,
+                                path: head.uri.path().to_string(),
+                                headers: head.headers,
+                                body: body.unwrap_or_default(),
+                            };
+                            let n = {
+                                let mut log = log.lock().unwrap();
+                                log.push(seen.clone());
+                                log.len()
+                            };
+                            match answer(n, seen).await {
+                                Some(response) => Ok(response),
+                                None => Err(std::io::Error::other("hang up")),
+                            }
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(keep_alive)
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Connections the requests in `seen` came on.
+    pub fn connections(seen: &Mutex<Vec<Seen>>) -> usize {
+        let seen = seen.lock().unwrap();
+        let mut ids: Vec<usize> = seen.iter().map(|s| s.connection).collect();
+        ids.dedup();
+        ids.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::signed_testing::{signed, TestCa};
 
     #[test]
     fn backoff_starts_at_one_second_and_caps_at_the_hold() {
@@ -449,17 +681,15 @@ mod tests {
         assert!(Backoff::default().wait_at_least(Some(3 * HOLD)) <= HOLD);
     }
 
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<stub::Seen>>>;
+
     /// A one-off TLS server for 127.0.0.1 that answers each request by
     /// `answer` (its number, from 1): `None` hangs up without an answer.
     /// Returns its address, the CA PEM and the requests seen.
     async fn server(
         keep_alive: bool,
         answer: fn(usize) -> Option<StatusCode>,
-    ) -> (
-        std::net::SocketAddr,
-        String,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    ) -> (std::net::SocketAddr, String, Seen) {
         server_with(keep_alive, answer, false).await
     }
 
@@ -468,67 +698,19 @@ mod tests {
         keep_alive: bool,
         answer: fn(usize) -> Option<StatusCode>,
         standby: bool,
-    ) -> (
-        std::net::SocketAddr,
-        String,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
-        let key = KeyPair::generate().unwrap();
-        let leaf = CertificateParams::new(vec!["127.0.0.1".to_string()])
-            .unwrap()
-            .signed_by(&key, &ca)
-            .unwrap();
-        let tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![leaf.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-            )
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(AtomicUsize::new(0));
-        let counter = seen.clone();
-        tokio::spawn(async move {
-            while let Ok((tcp, _)) = listener.accept().await {
-                let (acceptor, counter) = (acceptor.clone(), counter.clone());
-                tokio::spawn(async move {
-                    let Ok(tls) = acceptor.accept(tcp).await else {
-                        return;
-                    };
-                    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        async move {
-                            // Read whole, as a held poll is: a hang-up
-                            // before that may land while the client still
-                            // writes, a poll it may then take as unsent.
-                            let _ = request.into_body().collect().await;
-                            match answer(n) {
-                                Some(status) => {
-                                    let mut response = Response::builder().status(status);
-                                    if standby && status == StatusCode::SERVICE_UNAVAILABLE {
-                                        response = response.header(STANDBY_HEADER, "true");
-                                    }
-                                    Ok(response.body(Full::new(Bytes::new())).unwrap())
-                                }
-                                None => Err(std::io::Error::other("hang up")),
-                            }
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .keep_alive(keep_alive)
-                        .serve_connection(TokioIo::new(tls), service)
-                        .await;
-                });
-            }
-        });
+    ) -> (std::net::SocketAddr, String, Seen) {
+        let ca = TestCa::new();
+        let (addr, seen) = stub::serve(ca.leaf(&["127.0.0.1"]), keep_alive, move |n, _| {
+            let response = answer(n).map(|status| {
+                let mut response = Response::builder().status(status);
+                if standby && status == StatusCode::SERVICE_UNAVAILABLE {
+                    response = response.header(STANDBY_HEADER, "true");
+                }
+                response.body(Full::new(Bytes::new())).unwrap()
+            });
+            Box::pin(async move { response })
+        })
+        .await;
         (addr, ca.pem(), seen)
     }
 
@@ -581,7 +763,7 @@ mod tests {
             matches!(lost, Answer::Retry { after: None, .. }),
             "{lost:?}"
         );
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// A keep-alive the controller closed costs no failure: the poll goes
@@ -595,7 +777,132 @@ mod tests {
             let answer = client.poll(&poll()).await;
             assert!(matches!(answer, Answer::Unchanged), "{answer:?}");
         }
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    /// An answer of `status` with `body`, signed by `key` as `kind` when
+    /// given.
+    fn answer(
+        status: StatusCode,
+        body: &[u8],
+        signed_as: Option<(&rustls::sign::CertifiedKey, Signed)>,
+    ) -> Response<Full<Bytes>> {
+        let mut response = Response::builder()
+            .status(status)
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .unwrap();
+        if let Some((key, kind)) = signed_as {
+            *response.headers_mut() = signed(key, kind, body);
+        }
+        response
+    }
+
+    fn gone_body(gateway: GatewayKey, ago: Duration) -> Vec<u8> {
+        let issued = SystemTime::now() - ago;
+        serde_json::to_vec(&Gone {
+            gateway,
+            issued_at: issued
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })
+        .unwrap()
+    }
+
+    /// Only what the controller signed is taken: a snapshot, and a recent
+    /// gone answer for this Gateway. Unsigned, tampered, another CA's
+    /// leaf, stale, another Gateway's, or a snapshot's signature on a gone
+    /// answer: each refused, and nothing served changes.
+    #[tokio::test]
+    async fn only_answers_the_controller_signed_are_taken() {
+        use crate::sync::GONE_MAX_AGE;
+        let ca = TestCa::new();
+        let leaf = ca.leaf(&["127.0.0.1"]);
+        let rogue = TestCa::new().leaf(&["127.0.0.1"]);
+        let snapshot = br#"{"version":"v1"}"#;
+        let own = || GatewayKey::new("ns", "gw");
+        let mut tampered = answer(StatusCode::OK, br#"{"version":"v2"}"#, None);
+        *tampered.headers_mut() = signed(&leaf, Signed::Snapshot, snapshot);
+        let unverified = |a: &Answer| matches!(a, Answer::Unverified(_));
+        let cases: Vec<(&str, Response<Full<Bytes>>, &dyn Fn(&Answer) -> bool)> = vec![
+            (
+                "signed snapshot",
+                answer(StatusCode::OK, snapshot, Some((&leaf, Signed::Snapshot))),
+                &|a| matches!(a, Answer::Snapshot(_)),
+            ),
+            (
+                "unsigned snapshot",
+                answer(StatusCode::OK, snapshot, None),
+                &unverified,
+            ),
+            ("tampered snapshot", tampered, &unverified),
+            (
+                "another CA's snapshot",
+                answer(StatusCode::OK, snapshot, Some((&rogue, Signed::Snapshot))),
+                &unverified,
+            ),
+            (
+                "signed gone",
+                answer(
+                    StatusCode::NOT_FOUND,
+                    &gone_body(own(), Duration::ZERO),
+                    Some((&leaf, Signed::Gone)),
+                ),
+                &|a| matches!(a, Answer::Gone),
+            ),
+            (
+                "stale gone",
+                answer(
+                    StatusCode::NOT_FOUND,
+                    &gone_body(own(), GONE_MAX_AGE + Duration::from_secs(5)),
+                    Some((&leaf, Signed::Gone)),
+                ),
+                &unverified,
+            ),
+            (
+                "another Gateway's gone",
+                answer(
+                    StatusCode::NOT_FOUND,
+                    &gone_body(GatewayKey::new("ns", "other"), Duration::ZERO),
+                    Some((&leaf, Signed::Gone)),
+                ),
+                &unverified,
+            ),
+            (
+                "a gone signed as a snapshot",
+                answer(
+                    StatusCode::NOT_FOUND,
+                    &gone_body(own(), Duration::ZERO),
+                    Some((&leaf, Signed::Snapshot)),
+                ),
+                &unverified,
+            ),
+            (
+                "unsigned 404",
+                answer(StatusCode::NOT_FOUND, b"gateway not served\n", None),
+                &unverified,
+            ),
+        ];
+        let (names, replies): (Vec<_>, Vec<_>) = cases
+            .into_iter()
+            .map(|(name, reply, expect)| (name, (std::sync::Mutex::new(Some(reply)), expect)))
+            .unzip();
+        let (responses, expected): (Vec<_>, Vec<_>) = replies.into_iter().unzip();
+        let responses = std::sync::Arc::new(responses);
+        let (addr, _) = stub::serve(ca.leaf(&["127.0.0.1"]), true, {
+            let responses = responses.clone();
+            move |n, _| {
+                let reply = responses[n - 1].lock().unwrap().take();
+                Box::pin(async move { reply })
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(addr, &ca.pem(), &dir);
+        for (name, expect) in names.into_iter().zip(expected) {
+            let got = client.poll(&poll()).await;
+            assert!(expect(&got), "{name}: {got:?}");
+        }
     }
 
     #[test]
