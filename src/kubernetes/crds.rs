@@ -145,6 +145,7 @@ pub struct GatewayParametersSpec {
     /// Data-plane image (Managed). Default: the controller's
     /// `--dataplane-image`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub image: Option<String>,
 
     /// Data-plane container resources (Managed), a core/v1
@@ -202,9 +203,11 @@ pub struct NetworkSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub mac: Option<String>,
     /// The interface name in the pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub interface: Option<String>,
 }
 
@@ -325,7 +328,25 @@ mod tests {
         assert_eq!(kinds, ["GatewayParameters", "RateLimitPolicy"]);
     }
 
-    /// Design 4.2's example, resources and all.
+    /// An empty string never stands for "unset": the apiserver refuses it
+    /// where a field takes a value.
+    #[test]
+    fn empty_strings_are_refused_by_the_schema() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(GatewayParameters::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"];
+        let network = &spec["networks"]["items"]["properties"];
+        for (field, schema) in [
+            ("image", &spec["image"]),
+            ("mac", &network["mac"]),
+            ("interface", &network["interface"]),
+        ] {
+            assert_eq!(schema["minLength"], 1, "{field}: {schema}");
+        }
+    }
+
+    /// The example of a GatewayParameters, resources and all.
     #[test]
     fn gateway_parameters_parse() {
         let spec: GatewayParametersSpec = serde_yaml::from_str(

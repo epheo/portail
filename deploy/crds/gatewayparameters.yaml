@@ -38,6 +38,7 @@ spec:
                 description: |-
                   Data-plane image (Managed). Default: the controller's
                   `--dataplane-image`.
+                minLength: 1
                 nullable: true
                 type: string
               networks:
@@ -54,6 +55,7 @@ spec:
                       type: array
                     interface:
                       description: The interface name in the pod.
+                      minLength: 1
                       nullable: true
                       type: string
                     ips:
@@ -63,6 +65,7 @@ spec:
                       nullable: true
                       type: array
                     mac:
+                      minLength: 1
                       nullable: true
                       type: string
                     name:
