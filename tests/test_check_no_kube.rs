@@ -46,7 +46,8 @@ fn run(src: &Path) -> std::process::Output {
 fn a_clean_tree_passes() {
     let out = check(&[(
         "dataplane/strings.rs",
-        "const TYPE: &str = \"kubernetes.io/tls\";\nconst FLAG: &str = \"--kubernetes\";\n",
+        "const TYPE: &str = \"kubernetes.io/tls\";\nconst FLAG: &str = \"--kubernetes\";\n\
+         fn f(path: &str) { let path = \"/\"; }\n",
     )]);
     assert!(
         out.status.success(),
@@ -86,6 +87,22 @@ fn every_way_in_fails() {
             "dataplane/a.rs",
             "fn f() { super::super::kubernetes::naming::NAME; }\n",
         ),
+        (
+            "dataplane/a.rs",
+            "#[ path = \"../elsewhere.rs\"]\nmod elsewhere;\n",
+        ),
+        (
+            "dataplane/a.rs",
+            "#[cfg_attr(test, path = \"../elsewhere.rs\")]\nmod elsewhere;\n",
+        ),
+        (
+            "dataplane/a.rs",
+            "#[cfg_attr(\n    test,\n    path = \"../elsewhere.rs\"\n)]\nmod elsewhere;\n",
+        ),
+        // Anywhere in the library, a module file brought in by its name.
+        ("config.rs", "#[path = \"kubernetes/mod.rs\"]\nmod k;\n"),
+        ("config.rs", "include!(\"kubernetes/naming.rs\");\n"),
+        ("config.rs", "include!(\"../elsewhere.rs\");\n"),
         // A module the data plane imports, re-exporting.
         ("config.rs", "pub use crate::{routing, kubernetes};\n"),
         ("config.rs", "pub use crate::kubernetes::naming;\n"),
