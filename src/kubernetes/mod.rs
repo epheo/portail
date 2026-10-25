@@ -5,6 +5,7 @@ pub mod crds;
 pub mod dns_refresh;
 pub mod features;
 pub mod hostname;
+pub mod naming;
 pub mod parent_ref;
 pub mod reconciler;
 pub mod reference_grants;
