@@ -179,6 +179,8 @@ impl SyncServer {
         if let Some(report) = sync.report {
             let leaving = report.leaving;
             self.ctx.reports.record(&key, instance.clone(), report);
+            // After the record: a wake earlier than the report's own
+            // last-seen plus LIVENESS would find it still live.
             self.lapses.seen(&key, &instance);
             // A stopping data plane waits on this answer before it drains:
             // there is nothing left to hold it for.
@@ -1055,6 +1057,79 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(started.elapsed(), Duration::ZERO);
         assert!(f.ctx.reports.live(&key()).is_empty(), "no longer live");
+    }
+
+    /// A data plane gone silent turns its Gateway Pending on the lapse
+    /// wake, not at the resync: the pass the wake runs no longer counts it.
+    #[tokio::test]
+    async fn a_silent_instance_turns_its_gateway_pending_on_the_lapse() {
+        use super::super::reconcile::{finish, publish, Step};
+        let mut p = testkit::Pipeline::new();
+        p.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        let (lapses, mut wakes) = Lapses::new();
+        let server = SyncServer::new(
+            p.ctx.clone(),
+            authenticator(p.api.client()),
+            lapses,
+            CancellationToken::new(),
+        );
+        let pass = |p: &testkit::Pipeline, gw: Gateway| {
+            let ctx = p.ctx.clone();
+            async move {
+                match publish(&gw, &ctx).await {
+                    Step::Done(_) => {}
+                    Step::Continue(pass) => {
+                        finish(&gw, &ctx, *pass).await.unwrap();
+                    }
+                }
+            }
+        };
+        let programmed = |p: &testkit::Pipeline| {
+            let written = p.api.status_patch("gateways", "gw").unwrap();
+            written["status"]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "Programmed")
+                .unwrap()
+                .clone()
+        };
+
+        pass(&p, gw.clone()).await;
+        let gw = testkit::with_gateway_status(gw, &p.api.status_patch("gateways", "gw").unwrap());
+        apply(&mut p.cluster.gateways, gw.clone());
+        let snapshot = p.ctx.hub.current(&key()).unwrap();
+        let report = serde_json::to_value(p.applier.apply(&snapshot).await).unwrap();
+        let response = server
+            .handle(post(
+                Some(&gateway_token("default", "gw", 0)),
+                &body(&key(), "", Some(report)),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        p.api.clear();
+        pass(&p, gw.clone()).await;
+        assert_eq!(programmed(&p)["status"], "True");
+        let gw = testkit::with_gateway_status(gw, &p.api.status_patch("gateways", "gw").unwrap());
+        apply(&mut p.cluster.gateways, gw.clone());
+
+        tokio::time::pause();
+        let silent = Instant::now();
+        use futures::StreamExt;
+        assert_eq!(wakes.next().await.unwrap(), key());
+        assert!(p.ctx.reports.live(&key()).is_empty(), "woken while live");
+        // tokio's timer wheel rounds a deadline up to the millisecond.
+        assert!(
+            silent.elapsed() <= LIVENESS + Duration::from_millis(1),
+            "{:?}",
+            silent.elapsed()
+        );
+        p.api.clear();
+        pass(&p, gw).await;
+        assert_eq!(programmed(&p)["reason"], "Pending");
     }
 
     #[tokio::test(start_paused = true)]
