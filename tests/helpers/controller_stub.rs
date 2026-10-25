@@ -1,6 +1,7 @@
 //! A controller for data-plane tests: `POST /v1/sync` over TLS from a
 //! throwaway CA, answered from a script the test changes, every request
-//! and answer recorded. It can go down and come back on its address.
+//! and answer recorded. It can go down and come back on its address. It
+//! signs its snapshots and gone answers as the controller does.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -14,8 +15,9 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use portail::config::PortailConfig;
-use portail::sync::{GatewayRef, Snapshot, SyncRequest};
+use portail::sync::{sign, GatewayRef, Gone, Signed, Snapshot, SyncRequest};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +38,9 @@ pub enum Mode {
     Gone,
     /// 503, with `Retry-After` when given.
     Unavailable(Option<u64>),
+    /// As `Serve`, the snapshot signed by a leaf of another CA: what an
+    /// endpoint impersonating the controller could send.
+    Forged(Snapshot),
 }
 
 /// A request as it arrived.
@@ -59,6 +64,10 @@ pub struct Answered {
 
 struct State {
     mode: watch::Sender<Mode>,
+    /// The serving leaf, which signs answers.
+    signer: CertifiedKey,
+    /// Another CA's leaf for the same address.
+    forger: CertifiedKey,
     hold: Duration,
     requests: Mutex<Vec<Recorded>>,
     answers: Mutex<Vec<Answered>>,
@@ -90,13 +99,16 @@ impl ControllerStub {
             .unwrap()
             .local_addr()
             .unwrap();
-        let (ca_pem, tls) = test_pki(addr.ip());
+        let (ca_pem, tls, signer) = test_pki(addr.ip());
+        let (_, _, forger) = test_pki(addr.ip());
         Self {
             addr,
             ca_pem,
             tls: Arc::new(tls),
             state: Arc::new(State {
                 mode: watch::Sender::new(mode),
+                signer,
+                forger,
                 hold,
                 requests: Mutex::default(),
                 answers: Mutex::default(),
@@ -232,10 +244,24 @@ async fn answer(
         .map(str::to_string);
     let body = match request.into_body().collect().await {
         Ok(body) => body.to_bytes(),
-        Err(_) => return Ok(reply(&state, connection, StatusCode::BAD_REQUEST, None, "")),
+        Err(_) => {
+            return Ok(reply(
+                &state,
+                connection,
+                StatusCode::BAD_REQUEST,
+                None,
+                b"",
+            ))
+        }
     };
     let Ok(sync) = serde_json::from_slice::<SyncRequest>(&body) else {
-        return Ok(reply(&state, connection, StatusCode::BAD_REQUEST, None, ""));
+        return Ok(reply(
+            &state,
+            connection,
+            StatusCode::BAD_REQUEST,
+            None,
+            b"",
+        ));
     };
     // The controller's contract: the path names the body's Gateway.
     let own = format!("/v1/sync/{}/{}", sync.gateway.namespace, sync.gateway.name);
@@ -245,10 +271,11 @@ async fn answer(
             connection,
             StatusCode::BAD_REQUEST,
             None,
-            "path",
+            b"path",
         ));
     }
     let have = sync.have.clone();
+    let gateway = sync.gateway.clone();
     let leaving = sync.report.as_ref().is_some_and(|report| report.leaving);
     state.requests.lock().unwrap().push(Recorded {
         at: Instant::now(),
@@ -259,28 +286,38 @@ async fn answer(
     });
 
     if leaving {
-        return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, ""));
+        return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, b""));
     }
     let mut mode = state.mode.subscribe();
     let deadline = tokio::time::Instant::now() + state.hold;
     loop {
         let current = mode.borrow_and_update().clone();
         match current {
-            Mode::Gone => return Ok(reply(&state, connection, StatusCode::NOT_FOUND, None, "")),
+            Mode::Gone => {
+                let gone = serde_json::to_vec(&Gone::now(gateway)).unwrap();
+                let response = reply(&state, connection, StatusCode::NOT_FOUND, None, &gone);
+                return Ok(signed(response, &state.signer, Signed::Gone, &gone));
+            }
             Mode::Unavailable(after) => {
                 let status = StatusCode::SERVICE_UNAVAILABLE;
-                return Ok(reply(&state, connection, status, after, "standby"));
+                return Ok(reply(&state, connection, status, after, b"standby"));
             }
             Mode::Serve(Some(snapshot)) if snapshot.version != have => {
-                let json = serde_json::to_string(&snapshot).unwrap();
-                return Ok(reply(&state, connection, StatusCode::OK, None, &json));
+                let json = serde_json::to_vec(&snapshot).unwrap();
+                let response = reply(&state, connection, StatusCode::OK, None, &json);
+                return Ok(signed(response, &state.signer, Signed::Snapshot, &json));
             }
-            Mode::Serve(_) => {}
+            Mode::Forged(snapshot) if snapshot.version != have => {
+                let json = serde_json::to_vec(&snapshot).unwrap();
+                let response = reply(&state, connection, StatusCode::OK, None, &json);
+                return Ok(signed(response, &state.forger, Signed::Snapshot, &json));
+            }
+            Mode::Serve(_) | Mode::Forged(_) => {}
         }
         tokio::select! {
             _ = mode.changed() => {}
             _ = tokio::time::sleep_until(deadline) => {
-                return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, ""));
+                return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, b""));
             }
         }
     }
@@ -291,7 +328,7 @@ fn reply(
     connection: u64,
     status: StatusCode,
     retry_after: Option<u64>,
-    body: &str,
+    body: &[u8],
 ) -> Response<Full<Bytes>> {
     state.answers.lock().unwrap().push(Answered {
         at: Instant::now(),
@@ -303,12 +340,26 @@ fn reply(
         response = response.header(hyper::header::RETRY_AFTER, seconds);
     }
     response
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(Full::new(Bytes::copy_from_slice(body)))
         .unwrap()
 }
 
-/// A CA's PEM and a server config whose certificate it signed for `ip`.
-fn test_pki(ip: std::net::IpAddr) -> (String, rustls::ServerConfig) {
+/// `response` with the signature of `body` by `key`.
+fn signed(
+    mut response: Response<Full<Bytes>>,
+    key: &CertifiedKey,
+    kind: Signed,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    for (name, value) in sign(key, kind, body).unwrap() {
+        response.headers_mut().insert(name, value);
+    }
+    response
+}
+
+/// A CA's PEM, and a server config whose certificate it signed for `ip`
+/// with that certificate's key.
+fn test_pki(ip: std::net::IpAddr) -> (String, rustls::ServerConfig, CertifiedKey) {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -320,12 +371,14 @@ fn test_pki(ip: std::net::IpAddr) -> (String, rustls::ServerConfig) {
         .unwrap();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
     let chain: Vec<CertificateDer<'static>> = vec![leaf.der().clone()];
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let signer = CertifiedKey::from_der(chain.clone(), key.clone_key(), &provider).unwrap();
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .unwrap();
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    (ca.pem(), tls)
+    (ca.pem(), tls, signer)
 }
 
 /// The snapshot of `config` (a `PortailConfig` in JSON) for [`GATEWAY`].
