@@ -1209,6 +1209,16 @@ mod tests {
     /// load says the backendRefs go unused.
     #[test]
     fn a_redirect_beside_backend_refs_loads_with_a_warning() {
+        // Alone: a thread-local subscriber misses a callsite another test's
+        // thread registered first. While it is the only live subscriber,
+        // tracing-core caches that callsite's interest from the registering
+        // thread's default (none: never), and the warning is never sent.
+        if !crate::proxy::test_util::in_own_process(
+            module_path!(),
+            "a_redirect_beside_backend_refs_loads_with_a_warning",
+        ) {
+            return;
+        }
         use crate::proxy::request_processor::{analyze_request, LocalReply, RoutingResult};
         let redirect = HttpRouteFilter::RequestRedirect {
             config: RequestRedirectConfig {
