@@ -165,6 +165,17 @@ pub struct ControllerArgs {
 /// `--controller-ca-file` is not given: managed pods get it in their template.
 pub const CONTROLLER_CA_ENV: &str = "PORTAIL_CONTROLLER_CA";
 
+/// How a data plane reaches the controller.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncTransport {
+    /// To --controller-address
+    #[default]
+    Direct,
+    /// Through the apiserver's service proxy, to the Service
+    /// --controller-address names
+    ApiserverProxy,
+}
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct DataplaneArgs {
     /// The Gateway this data plane serves
@@ -188,6 +199,33 @@ pub struct DataplaneArgs {
         default_value = "/var/run/secrets/portail.epheo.eu/controller/token"
     )]
     pub token_file: PathBuf,
+
+    /// How to reach the controller: direct, or apiserver-proxy for pods
+    /// that reach only the apiserver (OVN-Kubernetes Primary UDN)
+    #[arg(long, value_enum, default_value_t = SyncTransport::Direct)]
+    pub transport: SyncTransport,
+
+    /// apiserver-proxy: the apiserver's URL; default
+    /// https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT
+    #[arg(long, value_name = "URL")]
+    pub apiserver_address: Option<String>,
+
+    /// apiserver-proxy: projected ServiceAccount token of the API audience,
+    /// re-read per request
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/var/run/secrets/portail.epheo.eu/apiserver/token"
+    )]
+    pub apiserver_token_file: PathBuf,
+
+    /// apiserver-proxy: PEM of the CA the apiserver's certificate chains to
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/var/run/secrets/portail.epheo.eu/apiserver/ca.crt"
+    )]
+    pub apiserver_ca_file: PathBuf,
 
     /// On SIGTERM, keep serving this long before draining
     ///
@@ -414,6 +452,15 @@ mod tests {
             PathBuf::from("/var/run/secrets/portail.epheo.eu/controller/token")
         );
         assert!(d.controller_ca_file.is_none() && !d.http2 && d.access_log.is_none());
+        assert_eq!(d.transport, SyncTransport::Direct);
+        assert!(d.apiserver_address.is_none());
+        assert_eq!(
+            (d.apiserver_token_file, d.apiserver_ca_file),
+            (
+                PathBuf::from("/var/run/secrets/portail.epheo.eu/apiserver/token"),
+                PathBuf::from("/var/run/secrets/portail.epheo.eu/apiserver/ca.crt")
+            )
+        );
 
         let Some(Command::Dataplane(d)) = parse(&[
             "portail",
@@ -427,6 +474,10 @@ mod tests {
             "--admin-address=10.0.0.5",
             "--access-log=-",
             "--http2",
+            "--transport=apiserver-proxy",
+            "--apiserver-address=https://10.96.0.1:443",
+            "--apiserver-token-file=/api-token",
+            "--apiserver-ca-file=/api-ca.crt",
         ])
         .command
         else {
@@ -434,6 +485,13 @@ mod tests {
         };
         assert_eq!(d.shutdown_delay, Duration::ZERO);
         assert!(d.http2 && d.access_log.as_deref() == Some("-"));
+        assert_eq!(d.transport, SyncTransport::ApiserverProxy);
+        assert_eq!(
+            d.apiserver_address.as_deref(),
+            Some("https://10.96.0.1:443")
+        );
+        assert_eq!(d.apiserver_token_file, PathBuf::from("/api-token"));
+        assert_eq!(d.apiserver_ca_file, PathBuf::from("/api-ca.crt"));
     }
 
     #[test]
@@ -482,7 +540,7 @@ mod tests {
                 "dataplane",
                 "--gateway=ns/gw",
                 "--controller-address=x",
-                "--transport=direct",
+                "--transport=apiserver",
             ],
         ] {
             assert!(Args::try_parse_args(argv).is_err(), "{argv:?}");
