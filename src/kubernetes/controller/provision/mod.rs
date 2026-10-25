@@ -5,6 +5,8 @@
 //! Stub: nothing is provisioned, so every Gateway binds its published
 //! ports, as an Unmanaged one does.
 
+mod ports;
+
 use std::collections::BTreeMap;
 
 use futures::stream::BoxStream;
