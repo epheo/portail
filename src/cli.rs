@@ -147,6 +147,15 @@ pub struct ControllerArgs {
     #[arg(long, default_value_t = 9443)]
     pub sync_port: u16,
 
+    /// Open sync connections one peer IP may hold
+    ///
+    /// A data plane holds one or two. Proxied data planes all arrive from
+    /// the apiserver, and on OVN-Kubernetes from each apiserver node's
+    /// management address: give 2 per Primary UDN data plane per apiserver
+    /// node.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_SYNC_PEER_CONNECTIONS)]
+    pub sync_peer_connections: usize,
+
     /// Name of the leader election Lease
     #[arg(long, default_value = "portail-controller")]
     pub leader_election_id: String,
@@ -160,6 +169,11 @@ pub struct ControllerArgs {
     #[command(flatten)]
     pub admin: AdminArgs,
 }
+
+/// `--sync-peer-connections`' default: room for 16 data planes sharing an
+/// IP (hostNetwork pods of one node, pods behind a SNAT, or polls through
+/// the apiserver), and no single pod holds the whole cap of 1024.
+pub const DEFAULT_SYNC_PEER_CONNECTIONS: usize = 32;
 
 /// Where a data plane reads the controller CA's PEM when
 /// `--controller-ca-file` is not given: managed pods get it in their template.
@@ -401,6 +415,7 @@ mod tests {
         assert_eq!(c.service_name, "portail-controller");
         assert_eq!(c.sync_port, 9443);
         assert_eq!(c.leader_election_id, "portail-controller");
+        assert_eq!(c.sync_peer_connections, 32);
         assert_eq!(c.dataplane_image, default_dataplane_image());
         assert_eq!(c.admin.readiness_port, 19099);
 
@@ -411,6 +426,7 @@ mod tests {
             "--controller-name=example.com/gw",
             "--service-name=ctl",
             "--sync-port=8443",
+            "--sync-peer-connections=200",
             "--leader-election-id=lease",
             "--dataplane-image=registry.local/portail:dev",
             "--readiness-port=9000",
@@ -429,6 +445,7 @@ mod tests {
             ),
             (8443, 9000, "registry.local/portail:dev")
         );
+        assert_eq!(c.sync_peer_connections, 200);
     }
 
     #[test]

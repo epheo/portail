@@ -67,12 +67,6 @@ const MAX_HEAD: usize = 32 * 1024;
 /// connection at most its read buffer and a TLS record or two, about
 /// 64 MiB in all.
 const MAX_CONNECTIONS: usize = 1024;
-/// Open connections per peer IP. A data plane holds one or two; data
-/// planes sharing an IP (hostNetwork pods of one node, or behind SNAT, as
-/// an apiserver hop may arrive) get room for 16, and no single pod holds
-/// the whole cap. The apiserver's own endpoints are exempt
-/// (`apiserver_peers`).
-const MAX_CONNECTIONS_PER_PEER: usize = 32;
 /// The TLS handshake, the request head and the body each, and a response
 /// write that makes no progress: in-cluster they take milliseconds; 5s
 /// absorbs a loaded node and frees a stalled peer's connection in a sixth
@@ -80,8 +74,6 @@ const MAX_CONNECTIONS_PER_PEER: usize = 32;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every 503's: the data plane's first backoff step.
 const RETRY_AFTER_SECS: u64 = 1;
-/// Set by the apiserver's service proxy, as by most proxies.
-const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// The sync endpoint's state.
 pub(crate) struct SyncServer {
@@ -97,18 +89,19 @@ pub(crate) struct SyncServer {
     body_reads: Semaphore,
     /// The pods whose body is being read.
     body_readers: Mutex<std::collections::HashSet<InstanceId>>,
-    /// Peers proxied polls were seen from, each logged once.
-    proxies: Mutex<std::collections::HashSet<IpAddr>>,
     shutdown: CancellationToken,
 }
 
 impl SyncServer {
+    /// `per_peer`: the open connections one peer IP may hold
+    /// (`--sync-peer-connections`).
     pub(crate) fn new(
         ctx: Arc<ControllerCtx>,
         auth: Authenticator,
         signer: ServingKey,
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
+        per_peer: usize,
     ) -> Arc<Self> {
         Self::with_connections(
             ctx,
@@ -117,7 +110,7 @@ impl SyncServer {
             lapses,
             shutdown,
             MAX_CONNECTIONS,
-            MAX_CONNECTIONS_PER_PEER,
+            per_peer,
         )
     }
 
@@ -141,7 +134,6 @@ impl SyncServer {
             per_peer,
             body_reads: Semaphore::new(MAX_BODY_READS),
             body_readers: Mutex::default(),
-            proxies: Mutex::default(),
             shutdown,
         })
     }
@@ -182,9 +174,6 @@ impl SyncServer {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
-        if request.headers().contains_key(FORWARDED_FOR) {
-            self.proxied_from(peer);
-        }
         // Its own data plane only learns that it is gone, and must: a
         // restarted controller holds no verdict for its token, and a
         // refusal would leave it serving the deleted Gateway.
@@ -251,33 +240,6 @@ impl SyncServer {
             }
         }
         self.poll(&key, &sync.have, &instance).await
-    }
-
-    /// Says once per peer whether polls proxied from it, through the
-    /// apiserver, escape the per-peer limits. The header is the caller's
-    /// to set: it decides nothing, it only shows a hop that arrives from
-    /// an address the apiserver does not list, as through a SNAT.
-    fn proxied_from(&self, peer: IpAddr) {
-        let first = self
-            .proxies
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(peer);
-        if !first {
-            return;
-        }
-        if self.auth.exempts(peer) {
-            info!(
-                "Proxied sync polls arrive from {}, an apiserver endpoint: no per-peer limit",
-                peer
-            );
-        } else {
-            warn!(
-                "Proxied sync polls arrive from {}, not an apiserver endpoint: the per-peer limits \
-                 apply, so its data planes share one pod's",
-                peer
-            );
-        }
     }
 
     /// Whether `key` is a Gateway of ours. A missing class keeps it served:
@@ -733,12 +695,8 @@ pub(crate) async fn serve(
             Ok((stream, peer)) => {
                 backoff.reset();
                 // Over its share the connection closes as it is dropped.
-                let counted = match server.auth.exempts(peer.ip()) {
-                    true => None,
-                    false => match PeerConnection::open(&server, peer.ip()) {
-                        Some(counted) => Some(counted),
-                        None => continue,
-                    },
+                let Some(counted) = PeerConnection::open(&server, peer.ip()) else {
+                    continue;
                 };
                 tokio::spawn(connection(
                     server.clone(),
@@ -763,7 +721,7 @@ async fn connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     peer: IpAddr,
-    _slots: (OwnedSemaphorePermit, Option<PeerConnection>),
+    _slots: (OwnedSemaphorePermit, PeerConnection),
 ) {
     // A peer that cannot complete a handshake is no data plane; the data
     // plane logs its own side.
@@ -802,6 +760,7 @@ mod tests {
     use super::super::auth::METRICS_SERIAL;
     use super::super::testkit::{self, apply, gateway_class, MockApi, TestCluster, CONTROLLER};
     use super::*;
+    use crate::cli::DEFAULT_SYNC_PEER_CONNECTIONS;
     use crate::config::PortailConfig;
     use crate::metrics::{self, SyncAuthStage};
     use crate::sync::GatewayRef;
@@ -852,6 +811,7 @@ mod tests {
             ca.serving_key(),
             lapses,
             shutdown.clone(),
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         Fixture {
             api,
@@ -1154,6 +1114,7 @@ mod tests {
             ca.serving_key(),
             Lapses::new().0,
             CancellationToken::new(),
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1580,6 +1541,7 @@ mod tests {
             signer(),
             lapses,
             CancellationToken::new(),
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         let pass = |p: &testkit::Pipeline, gw: Gateway| {
             let ctx = p.ctx.clone();
@@ -1682,6 +1644,7 @@ mod tests {
             signer(),
             Lapses::new().0,
             CancellationToken::new(),
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         let throttled = METRICS.sync_throttled_total.get();
         let polls: Vec<_> = (0..17)
@@ -1937,7 +1900,7 @@ mod tests {
             Lapses::new().0,
             f.shutdown.clone(),
             1,
-            MAX_CONNECTIONS_PER_PEER,
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2073,66 +2036,6 @@ mod tests {
         f.shutdown.cancel();
     }
 
-    /// X-Forwarded-For decides nothing: a proxied poll is answered as any,
-    /// and its peer is noted once, for the log that says whether the
-    /// apiserver's hop escapes the per-peer limits.
-    #[tokio::test]
-    async fn a_forwarded_poll_is_answered_as_any_and_its_peer_noted_once() {
-        let f = fixture().await;
-        let v1 = f.publish(1);
-        for _ in 0..2 {
-            let mut request = poll("");
-            request
-                .headers_mut()
-                .insert(FORWARDED_FOR, HeaderValue::from_static("10.128.0.9"));
-            assert_eq!(version_of(f.sync(request).await).await, v1);
-        }
-        let noted = f.server.proxies.lock().unwrap().clone();
-        assert_eq!(noted, [PEER].into_iter().collect());
-    }
-
-    /// The apiserver's endpoints hold no share: every proxied data plane
-    /// comes from them. The global cap still holds.
-    #[tokio::test]
-    async fn the_apiserver_holds_no_share_of_connections() {
-        use super::super::apiserver_peers::ApiserverPeers;
-        let (ca, connector, name) = tls_client();
-        let f = fixture().await;
-        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        let server = SyncServer::with_connections(
-            f.ctx.clone(),
-            authenticator(f.api.client(), &f.serial)
-                .exempting(Arc::new(ApiserverPeers::of([loopback]))),
-            signer(),
-            Lapses::new().0,
-            f.shutdown.clone(),
-            2,
-            1,
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(server, ca.server_config(), listener));
-
-        let mut held = Vec::new();
-        for _ in 0..2 {
-            let tcp = TcpStream::connect(addr).await.unwrap();
-            let tls =
-                tokio::time::timeout(Duration::from_secs(2), connector.connect(name.clone(), tcp))
-                    .await
-                    .expect("accepted past the per-peer share")
-                    .unwrap();
-            held.push(tls);
-        }
-        let over = TcpStream::connect(addr).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), connector.connect(name, over))
-                .await
-                .is_err(),
-            "accepted over the global cap"
-        );
-        f.shutdown.cancel();
-    }
-
     /// A write that makes no progress fails after the peer timeout; one that
     /// does resets it.
     #[tokio::test(start_paused = true)]
@@ -2184,7 +2087,7 @@ mod tests {
             Lapses::new().0,
             f.shutdown.clone(),
             1,
-            MAX_CONNECTIONS_PER_PEER,
+            DEFAULT_SYNC_PEER_CONNECTIONS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
