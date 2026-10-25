@@ -58,6 +58,8 @@ pub struct Recorded {
     /// Which TLS connection it came on, numbered from 1 in accept order.
     pub connection: u64,
     pub authorization: Option<String>,
+    /// X-Portail-Token, which a poll through the apiserver carries.
+    pub token: Option<String>,
     pub request: SyncRequest,
 }
 
@@ -252,6 +254,7 @@ async fn answer(
             .map(str::to_string)
     };
     let authorization = header(hyper::header::AUTHORIZATION.as_str());
+    let token = header(portail::sync::TOKEN_HEADER);
     let body = match request.into_body().collect().await {
         Ok(body) => body.to_bytes(),
         Err(_) => {
@@ -293,6 +296,7 @@ async fn answer(
         path,
         connection,
         authorization,
+        token,
         request: sync,
     });
     // The controller signs every 200, 204 and 404 over the poll's nonce.
