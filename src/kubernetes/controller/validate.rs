@@ -72,6 +72,34 @@ impl LastGoodCerts {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Make `pair`, validated from `secret`, the last good one of `key`,
+    /// when `secret` is still the object `store` holds. Passes of Gateways
+    /// sharing a Secret run concurrently: one that read an older version
+    /// must not overwrite a newer pair, which a bad rotation would lose.
+    fn record(
+        &self,
+        key: &(String, String),
+        secret: &Secret,
+        pair: &(Vec<u8>, Vec<u8>),
+        store: &Store<Secret>,
+    ) {
+        let Some(uid) = secret.metadata.uid.clone() else {
+            return;
+        };
+        // Check and insert under one lock: a newer pass that recorded
+        // first found the store at its version, so this read sees that one
+        // or a later one.
+        let mut last_good = self.lock();
+        let current = store.get(&ObjectRef::new(&key.0).within(&key.1));
+        if current.is_some_and(|c| {
+            c.metadata.uid == secret.metadata.uid
+                && c.metadata.resource_version == secret.metadata.resource_version
+        }) {
+            let pair = pair.clone();
+            last_good.insert(key.clone(), LastGood { uid, pair });
+        }
+    }
+
     /// Keep only the Secrets some Gateway of `gateways` references. A pair
     /// whose Secret no listener names any more would otherwise outlive
     /// every Gateway that served it.
@@ -184,9 +212,8 @@ pub(super) fn resolve_gateway_certs(
                 &cert_ref.name,
             ) {
                 Ok(pair) => {
-                    if let Some(uid) = uid {
-                        let pair = pair.clone();
-                        last_good.lock().insert(key.clone(), LastGood { uid, pair });
+                    if let Some(secret) = &secret {
+                        last_good.record(&key, secret, &pair, store_secrets);
                     }
                     resolved.valid.insert(key, pair);
                 }
@@ -890,6 +917,43 @@ mod tests {
 
     fn cert_key(ns: &str) -> (String, String) {
         ("cert".into(), ns.into())
+    }
+
+    /// A TLS Secret at `resource_version`, in `default`.
+    fn secret_at(uid: &str, resource_version: &str, pair: &(Vec<u8>, Vec<u8>)) -> Secret {
+        let mut secret = tls_secret("cert", "default", &pair.0, &pair.1);
+        secret.metadata.uid = Some(uid.into());
+        secret.metadata.resource_version = Some(resource_version.into());
+        secret
+    }
+
+    /// Passes of two Gateways sharing a Secret run concurrently: the one
+    /// that read an older version, recording last, keeps the newer pair.
+    /// It overwrote it, and a bad rotation then served the older cert.
+    #[test]
+    fn an_older_read_never_overwrites_the_last_good_pair() {
+        let (Some(old), Some(new)) = (
+            generate_test_cert("app.example.com"),
+            generate_test_cert("app.example.com"),
+        ) else {
+            return; // openssl unavailable
+        };
+        let (older, newer) = (
+            secret_at("uid-1", "10", &old),
+            secret_at("uid-1", "11", &new),
+        );
+        let mut secrets = Writer::<Secret>::default();
+        secrets.apply_watcher_event(&watcher::Event::Apply(newer.clone()));
+        let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
+        let key = cert_key("default");
+
+        last.record(&key, &newer, &new, &store);
+        last.record(&key, &older, &old, &store);
+
+        let rotated = secret_at("uid-1", "12", &garbage());
+        secrets.apply_watcher_event(&watcher::Event::Apply(rotated));
+        let resolved = resolve_gateway_certs(&https_gateway("cert"), "default", &[], &store, &last);
+        assert_eq!(resolved.valid.get(&key), Some(&new));
     }
 
     /// A revoked ReferenceGrant or a deleted Secret resolves no pair at
