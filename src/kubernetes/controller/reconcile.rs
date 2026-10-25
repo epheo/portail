@@ -1222,23 +1222,25 @@ mod tests {
     /// Deleting a Gateway closes its listener and empties the table: its
     /// snapshot leaves the hub and its data plane, answered 404, clears.
     /// Deletion ran no reconcile, so they served on.
-    #[tokio::test]
-    async fn deleted_gateway_stops_serving() {
-        let port = free_port();
-        let mut p = Pipeline::new();
-        let mut gw = testkit::gateway("gw", 1);
-        gw.spec.listeners[0].port = port.into();
-        apply(&mut p.cluster.gateways, gw.clone());
-        p.pass(&gw).await.unwrap();
-        assert!(std::net::TcpListener::bind(("0.0.0.0", port)).is_err());
+    #[test]
+    fn deleted_gateway_stops_serving() {
+        alone("deleted_gateway_stops_serving", async {
+            let port = free_port();
+            let mut p = Pipeline::new();
+            let mut gw = testkit::gateway("gw", 1);
+            gw.spec.listeners[0].port = port.into();
+            apply(&mut p.cluster.gateways, gw.clone());
+            p.pass(&gw).await.unwrap();
+            assert!(std::net::TcpListener::bind(("0.0.0.0", port)).is_err());
 
-        p.delete(&gw).await;
-        assert!(p.served(&gw).is_none());
-        assert!(p.ctx.reports.live(&testkit::key(&gw)).is_empty());
-        assert!(
-            std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
-            "the deleted Gateway's port is released"
-        );
+            p.delete(&gw).await;
+            assert!(p.served(&gw).is_none());
+            assert!(p.ctx.reports.live(&testkit::key(&gw)).is_empty());
+            assert!(
+                std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
+                "the deleted Gateway's port is released"
+            );
+        });
     }
 
     /// Before every reflector listed, a pass publishes and writes nothing:
