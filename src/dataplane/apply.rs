@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_networks};
 use super::dns_refresh::{spawn_dns_refresh, Published};
-use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig, Protocol};
+use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
 use crate::logging::{error, info, warn};
 use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;
@@ -170,13 +170,17 @@ impl Applier {
     /// - changed: bind, rebuild the table, publish it.
     async fn bring_up(&mut self, served: &Served) -> DataPlaneState {
         let binds = served.binds();
-        let required = served.required();
         let fingerprint = data_plane_fingerprint(&served.config, &binds);
         let unchanged = self
             .last
             .clone()
             .filter(|applied| applied.fingerprint == fingerprint);
-        let is_ready = |dp: &Mutex<DataPlane>| lock(dp).is_ready_for_endpoints(&required);
+        // Which listeners terminate nothing is the pass's to say: asked
+        // after it.
+        let is_ready = |dp: &Mutex<DataPlane>| {
+            let dp = lock(dp);
+            dp.is_ready_for_endpoints(&served.required(&dp))
+        };
 
         if is_ready(&self.data_plane) {
             self.ready.store(true, Ordering::Release);
@@ -198,7 +202,7 @@ impl Applier {
         if ready && !was_ready {
             info!(
                 "Data plane ready: {} listener endpoint(s) live, {:.1}s after start",
-                required.len(),
+                served.required(&lock(&self.data_plane)).len(),
                 self.started.elapsed().as_secs_f32()
             );
         }
@@ -281,15 +285,15 @@ impl Applier {
                         .map(|endpoint| {
                             // Its socket may be a sibling's: it serves none
                             // of it.
-                            let bound = !revoked(l)
+                            let refusal = dp.refusal(l);
+                            let bound = refusal.is_none()
                                 && dp.is_ready_for_endpoints(std::slice::from_ref(&endpoint));
-                            let error = match revoked(l) {
-                                true => Some(NO_CERTIFICATE.to_string()),
-                                false => bind_errors
+                            let error = refusal.or_else(|| {
+                                bind_errors
                                     .iter()
                                     .find(|e| !bound && e.endpoint == endpoint)
-                                    .map(|e| e.error.clone()),
-                            };
+                                    .map(|e| e.error.clone())
+                            });
                             EndpointReport {
                                 error,
                                 address: endpoint.address,
@@ -335,32 +339,20 @@ impl Served {
     }
 
     /// The endpoints its listeners must have live to be ready. Unbindable
-    /// listeners still count, so readiness stays down; revoked ones serve
-    /// nothing by design and do not.
-    fn required(&self) -> Vec<Endpoint> {
+    /// listeners still count, so readiness stays down. An HTTPS listener
+    /// that terminates nothing does not (no certificateRef left, or its
+    /// certs failed to build): it can never serve, and counting it took
+    /// every other listener of the pod out with it.
+    fn required(&self, dp: &DataPlane) -> Vec<Endpoint> {
         let bind = self.bind.as_deref().unwrap_or_default();
         self.config
             .gateway
             .listeners
             .iter()
-            .filter(|l| !revoked(l))
+            .filter(|l| dp.refusal(l).is_none())
             .flat_map(|l| required_endpoints(std::slice::from_ref(l), bind))
             .collect()
     }
-}
-
-/// Why a revoked listener reports its endpoints unbound.
-const NO_CERTIFICATE: &str =
-    "no certificateRef left (grant revoked or Secret gone): its TLS handshakes are refused";
-
-/// An HTTPS listener the controller sends with no certificateRef left, so
-/// that its SNI is refused rather than served a sibling's cert.
-fn revoked(listener: &ListenerConfig) -> bool {
-    listener.protocol == Protocol::HTTPS
-        && listener
-            .tls
-            .as_ref()
-            .is_none_or(|tls| tls.certificate_refs.is_empty())
 }
 
 /// The endpoints the data plane must be bound to for these listeners to
@@ -455,6 +447,7 @@ fn data_plane_fingerprint(config: &PortailConfig, binds: &[ListenerConfig]) -> u
 mod tests {
     use super::*;
     use crate::config::Protocol;
+    use crate::proxy::data_plane::NO_CERTIFICATE;
     use crate::sync::GatewayRef;
 
     fn lc(port: u16, target_port: Option<u16>) -> ListenerConfig {
@@ -759,6 +752,74 @@ mod tests {
         assert!(ready.load(Ordering::Acquire));
     }
 
+    /// An HTTPS listener with `refs` (Secret name, cert PEM, key PEM) and
+    /// an HTTP one, on `(https, http)`.
+    fn https_and_http((https, http): (u16, u16), refs: &[(&str, &[u8], &[u8])]) -> Snapshot {
+        let names: Vec<_> = refs
+            .iter()
+            .map(|(name, ..)| serde_json::json!({"name": name}))
+            .collect();
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": [
+                {"name": "https", "protocol": "HTTPS", "port": https,
+                 "tls": {"mode": "Terminate", "certificateRefs": names}},
+                {"name": "http", "protocol": "HTTP", "port": http},
+            ]},
+        }))
+        .unwrap();
+        let tls = config.gateway.listeners[0].tls.as_mut().unwrap();
+        for (r, (_, cert, key)) in tls.certificate_refs.iter_mut().zip(refs) {
+            r.cert_pem = Some(cert.to_vec());
+            r.key_pem = Some(key.to_vec());
+        }
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation: 1,
+        };
+        Snapshot::from_config(gateway, config, vec![])
+    }
+
+    /// An HTTPS listener whose certs fail to build terminates nothing, as
+    /// a revoked one: out of readiness, reported unbound with the build
+    /// error, its port closed on a running data plane, and the pod's other
+    /// listeners serve on. It counted for readiness, and the whole pod went
+    /// NotReady.
+    #[tokio::test]
+    async fn a_listener_whose_certs_fail_keeps_the_pod_ready() {
+        let bad: (&str, &[u8], &[u8]) = ("bad", b"not a cert", b"not a key");
+        let (mut fresh, fresh_ready) = applier();
+        let report = apply_bound(
+            &mut fresh,
+            &fresh_ready,
+            &https_and_http(free_ports(), &[bad]),
+        )
+        .await;
+        let https = &report.listeners[0].endpoints[0];
+        assert!(!https.bound);
+        assert!(
+            https
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("TLS config build failed")),
+            "{https:?}"
+        );
+        assert!(report.listeners[1].endpoints[0].bound);
+
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.test") else {
+            return; // openssl unavailable
+        };
+        let (mut running, running_ready) = applier();
+        let ports = free_ports();
+        let good = https_and_http(ports, &[("good", &cert, &key)]);
+        apply_bound(&mut running, &running_ready, &good).await;
+        let report = running.apply(&https_and_http(ports, &[bad])).await;
+        assert!(running_ready.load(Ordering::Acquire), "{report:?}");
+        assert!(!report.listeners[0].endpoints[0].bound);
+        assert!(report.listeners[1].endpoints[0].bound);
+    }
+
     /// A revoked listener (no certificateRef left) is out of readiness and
     /// reported unbound with why, whether the data plane starts with it or
     /// served its certs before: the binds and the report end the same.
@@ -767,31 +828,9 @@ mod tests {
         let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.test") else {
             return; // openssl unavailable
         };
-        let snapshot = |(https, http): (u16, u16), with_cert: bool| {
-            let refs = match with_cert {
-                true => serde_json::json!([{"name": "cert"}]),
-                false => serde_json::json!([]),
-            };
-            let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
-                "gateway": {"name": "gw", "listeners": [
-                    {"name": "https", "protocol": "HTTPS", "port": https,
-                     "tls": {"mode": "Terminate", "certificateRefs": refs}},
-                    {"name": "http", "protocol": "HTTP", "port": http},
-                ]},
-            }))
-            .unwrap();
-            let tls = config.gateway.listeners[0].tls.as_mut().unwrap();
-            for r in &mut tls.certificate_refs {
-                r.cert_pem = Some(cert.clone());
-                r.key_pem = Some(key.clone());
-            }
-            let gateway = GatewayRef {
-                namespace: "default".into(),
-                name: "gw".into(),
-                uid: "gw-uid".into(),
-                generation: 1,
-            };
-            Snapshot::from_config(gateway, config, vec![])
+        let snapshot = |ports, with_cert: bool| match with_cert {
+            true => https_and_http(ports, &[("cert", &cert, &key)]),
+            false => https_and_http(ports, &[]),
         };
         // Ports differ between the two: neither binds one the other just
         // closed.

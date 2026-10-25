@@ -173,6 +173,8 @@ pub struct DataPlane {
     /// Loops a pass closed because their port's plan serves nothing; the
     /// next [`Self::close_unwanted`] hands them over to be awaited.
     closing: Vec<JoinHandle<()>>,
+    /// Per port, why the last pass built it no terminating config.
+    tls_failures: HashMap<u16, String>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
     /// Process-wide backend pool when `performance.backendPoolScope: process`;
@@ -506,6 +508,7 @@ impl DataPlane {
             plans,
             terminate_configs,
             closing: Vec::new(),
+            tls_failures: HashMap::new(),
             selector: Arc::new(BackendSelector::new()),
             shared_pool: match performance_config.backend_pool_scope {
                 crate::config::PoolScope::Process => Some(Arc::new(
@@ -685,6 +688,7 @@ impl DataPlane {
             performance_config.http2,
             &mut self.terminate_configs,
         );
+        self.tls_failures = plan_errors.iter().cloned().collect();
         let mut errors: Vec<BindError> = plan_errors
             .iter()
             .flat_map(|(port, error)| {
@@ -922,7 +926,38 @@ impl DataPlane {
     pub fn health(&self) -> &Arc<HealthRegistry> {
         &self.health
     }
+
+    /// Why HTTPS `listener` terminates nothing as of the last pass, its
+    /// SNI refused ([`TlsKind::NoCert`]); `None` when it terminates, or is
+    /// not HTTPS. Its socket may still be bound for a sibling.
+    pub fn refusal(&self, listener: &ListenerConfig) -> Option<String> {
+        if listener.protocol != Protocol::HTTPS
+            || self
+                .terminate_configs
+                .get(&listener.port)
+                .is_some_and(|built| built.has_cert_of(listener))
+        {
+            return None;
+        }
+        let revoked = listener
+            .tls
+            .as_ref()
+            .is_none_or(|tls| tls.certificate_refs.is_empty());
+        Some(if revoked {
+            NO_CERTIFICATE.to_string()
+        } else {
+            self.tls_failures
+                .get(&listener.port)
+                .cloned()
+                .unwrap_or_else(|| "none of its certificates loaded".to_string())
+        })
+    }
 }
+
+/// Why an HTTPS listener with no certificateRef left terminates nothing:
+/// the controller keeps sending it so that its SNI is refused.
+pub const NO_CERTIFICATE: &str =
+    "no certificateRef left (grant revoked or Secret gone): its TLS handshakes are refused";
 
 pub(crate) fn create_tcp_listener(
     port: u16,
