@@ -573,39 +573,41 @@ mod tests {
 
     /// The report names every listener's endpoints as bound, at the
     /// snapshot's version; /readyz follows.
-    #[tokio::test]
-    async fn an_apply_binds_and_reports() {
-        let (mut applier, ready) = applier();
-        let (http, tcp) = free_ports();
-        let snapshot = snapshot(http, tcp, 1);
+    #[test]
+    fn an_apply_binds_and_reports() {
+        alone("an_apply_binds_and_reports", async {
+            let (mut applier, ready) = applier();
+            let (http, tcp) = free_ports();
+            let snapshot = snapshot(http, tcp, 1);
 
-        let report = applier.apply(&snapshot).await;
-        assert_eq!(report.applied, snapshot.version);
-        assert_eq!(report.apply_error, None);
-        let endpoints: Vec<(&str, Option<&str>, u16, Transport, bool)> = report
-            .listeners
-            .iter()
-            .flat_map(|l| {
-                l.endpoints.iter().map(move |e| {
-                    (
-                        l.name.as_str(),
-                        e.address.as_deref(),
-                        e.port,
-                        e.transport,
-                        e.bound,
-                    )
+            let report = applier.apply(&snapshot).await;
+            assert_eq!(report.applied, snapshot.version);
+            assert_eq!(report.apply_error, None);
+            let endpoints: Vec<(&str, Option<&str>, u16, Transport, bool)> = report
+                .listeners
+                .iter()
+                .flat_map(|l| {
+                    l.endpoints.iter().map(move |e| {
+                        (
+                            l.name.as_str(),
+                            e.address.as_deref(),
+                            e.port,
+                            e.transport,
+                            e.bound,
+                        )
+                    })
                 })
-            })
-            .collect();
-        assert_eq!(
-            endpoints,
-            [
-                ("http", None, http, Transport::Tcp, true),
-                ("tcp", None, tcp, Transport::Tcp, true),
-            ]
-        );
-        assert!(ready.load(Ordering::Acquire));
-        assert!(!bindable(http) && !bindable(tcp));
+                .collect();
+            assert_eq!(
+                endpoints,
+                [
+                    ("http", None, http, Transport::Tcp, true),
+                    ("tcp", None, tcp, Transport::Tcp, true),
+                ]
+            );
+            assert!(ready.load(Ordering::Acquire));
+            assert!(!bindable(http) && !bindable(tcp));
+        });
     }
 
     /// A generation bump with the same config rebuilds nothing.
@@ -626,10 +628,11 @@ mod tests {
     #[tokio::test]
     async fn a_held_port_is_reported_unbound() {
         let (mut applier, ready) = applier();
-        let (http, tcp) = free_ports();
-        let _held = std::net::TcpListener::bind(("0.0.0.0", tcp)).unwrap();
+        // Both from the kernel: no other test can pick either.
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let tcp = held.local_addr().unwrap().port();
 
-        let report = applier.apply(&snapshot(http, tcp, 1)).await;
+        let report = applier.apply(&snapshot(0, tcp, 1)).await;
         let tcp_endpoint = &report.listeners[1].endpoints[0];
         assert!(!tcp_endpoint.bound);
         assert!(
