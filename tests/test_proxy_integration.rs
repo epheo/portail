@@ -2008,34 +2008,21 @@ fn test_admin_endpoint_binds_its_address() {
     assert!(std::net::TcpStream::connect(other).is_err());
 }
 
-/// Both Kubernetes modes parse their flags, then exit 2 until their
-/// runtimes land: never a half-built mode that looks like it serves.
+/// The controller parses its flags, then exits 2 until its runtime
+/// lands: never a half-built mode that looks like it serves.
 #[test]
 fn test_kubernetes_modes_are_not_implemented_in_this_build() {
-    for (mode, port) in [
-        (&["controller", "--namespace", "portail-system"][..], 25085),
-        (
-            &[
-                "dataplane",
-                "--gateway",
-                "default/gw",
-                "--controller-address",
-                "https://portail-controller.portail-system.svc:9443",
-            ],
-            25086,
-        ),
-    ] {
-        let mut proxy = PortailProcess::start_kubernetes(mode, None, port);
-        let status = proxy
-            .wait_exit(Duration::from_secs(10))
-            .unwrap_or_else(|| panic!("{mode:?} still running:\n{}", proxy.output()));
-        assert_eq!(status.code(), Some(2), "{mode:?}:\n{}", proxy.output());
-        assert!(
-            proxy.output().contains("not implemented in this build"),
-            "{mode:?}:\n{}",
-            proxy.output()
-        );
-    }
+    let mode = ["controller", "--namespace", "portail-system"];
+    let mut proxy = PortailProcess::start_kubernetes(&mode, None, 25085);
+    let status = proxy
+        .wait_exit(Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("{mode:?} still running:\n{}", proxy.output()));
+    assert_eq!(status.code(), Some(2), "{mode:?}:\n{}", proxy.output());
+    assert!(
+        proxy.output().contains("not implemented in this build"),
+        "{mode:?}:\n{}",
+        proxy.output()
+    );
 }
 
 /// A copy of `portail::proxy::worker::LINGER_IDLE`, which is crate-private:
