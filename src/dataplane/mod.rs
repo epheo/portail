@@ -252,6 +252,11 @@ impl SyncLoop {
                 self.succeeded(self.refused.is_none());
                 return now;
             }
+            // Answered, held as a 204 is, confirming nothing.
+            Answer::Pending | Answer::Left => {
+                self.succeeded(false);
+                return now;
+            }
             // Answered at once, not held: paced like a failure.
             Answer::Gone => {
                 self.answered(true);
@@ -473,8 +478,13 @@ impl SyncLoop {
             ..self.request()
         };
         match tokio::time::timeout(CONNECT_TIMEOUT, client.poll(&request)).await {
-            Ok(Answer::Retry { error, .. }) => warn!("Leave not reported: {}", error),
-            Ok(_) => info!("Leave reported to the controller"),
+            Ok(Answer::Left) => info!("Leave reported to the controller"),
+            Ok(
+                Answer::Retry { error, .. } | Answer::Unverified(error) | Answer::Standby(error),
+            ) => {
+                warn!("Leave not reported: {}", error)
+            }
+            Ok(_) => warn!("Leave not acknowledged by the controller"),
             Err(_) => warn!("Leave not reported within {:?}", CONNECT_TIMEOUT),
         }
     }
@@ -696,6 +706,26 @@ mod tests {
         sync.handle(Answer::Unverified("204 refused: unsigned".into()))
             .await;
         assert!(!metrics.is_connected());
+        assert!(metrics.age().unwrap() >= pause, "confirmed");
+    }
+
+    /// "Pending" says the controller answered, and confirms nothing: the
+    /// config age grows on, and the next poll goes at once.
+    #[tokio::test]
+    async fn a_pending_answer_is_connected_not_confirmed() {
+        let (mut sync, _) = sync_loop();
+        let metrics: &'static ControllerSync = Box::leak(Box::new(ControllerSync::new()));
+        sync.metrics = metrics;
+        metrics.start();
+        let pause = Duration::from_millis(50);
+        tokio::time::sleep(pause).await;
+        let before = Instant::now();
+        let next = sync.handle(Answer::Pending).await;
+        assert!(
+            next <= before + Duration::from_millis(10),
+            "polled again at once"
+        );
+        assert!(metrics.is_connected());
         assert!(metrics.age().unwrap() >= pause, "confirmed");
     }
 

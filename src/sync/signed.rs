@@ -64,8 +64,15 @@ pub enum Signed {
     Snapshot,
     /// A 404's body, a [`Gone`].
     Gone,
-    /// A 204, over the version it confirms, the poll's `have`.
+    /// A 204 over the version it confirms current: the one served, equal
+    /// to the poll's `have`.
     Unchanged,
+    /// A 204 while the Gateway has no snapshot yet: the controller
+    /// answered, and confirms nothing.
+    Pending,
+    /// A 204 to a leaving poll. Never a confirmation: a token holder could
+    /// send a leaving poll with any `have`.
+    Leave,
 }
 
 impl Signed {
@@ -74,6 +81,8 @@ impl Signed {
             Signed::Snapshot => b"portail sync v1 snapshot\n",
             Signed::Gone => b"portail sync v1 gone\n",
             Signed::Unchanged => b"portail sync v1 unchanged\n",
+            Signed::Pending => b"portail sync v1 pending\n",
+            Signed::Leave => b"portail sync v1 leave\n",
         };
         [context, nonce.as_bytes(), b"\n", body].concat()
     }
@@ -341,18 +350,29 @@ mod tests {
         assert!(refused.contains("bad signature"), "{refused}");
     }
 
-    /// The context in the message: a snapshot's signature is no gone or
-    /// unchanged answer's, though the bytes are the same.
+    /// The context in the message: one kind's signature is no other's,
+    /// though the bytes are the same.
     #[test]
     fn a_signature_vouches_for_one_kind() {
         let ca = TestCa::new();
-        let body = b"{}";
-        let headers = signed(&ca.leaf(&[NAME]), Signed::Snapshot, NONCE, body);
-        for kind in [Signed::Gone, Signed::Unchanged] {
-            let refused = verifier(&ca)
-                .verify(kind, NONCE, &headers, body, SystemTime::now())
-                .unwrap_err();
-            assert!(refused.contains("bad signature"), "{kind:?}: {refused}");
+        let key = ca.leaf(&[NAME]);
+        let kinds = [
+            Signed::Snapshot,
+            Signed::Gone,
+            Signed::Unchanged,
+            Signed::Pending,
+            Signed::Leave,
+        ];
+        for signed_as in kinds {
+            let headers = signed(&key, signed_as, NONCE, b"");
+            for kind in kinds {
+                let verified = verifier(&ca).verify(kind, NONCE, &headers, b"", SystemTime::now());
+                assert_eq!(
+                    verified.is_ok(),
+                    kind == signed_as,
+                    "{signed_as:?} as {kind:?}"
+                );
+            }
         }
     }
 

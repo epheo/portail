@@ -302,19 +302,21 @@ async fn answer(
     // The controller signs every 200, 204 and 404 over the poll's nonce.
     let sign_as =
         |response, key: &CertifiedKey, kind, body: &[u8]| signed(response, key, kind, &nonce, body);
-    let unchanged = || {
+    // As the controller: "unchanged" over the version served, "pending"
+    // with none, "leave" to a leaving poll.
+    let no_content = |kind, over: &[u8]| {
         let response = reply(&state, connection, StatusCode::NO_CONTENT, None, b"");
-        sign_as(response, &state.signer, Signed::Unchanged, have.as_bytes())
+        sign_as(response, &state.signer, kind, over)
     };
 
     if leaving {
-        return Ok(unchanged());
+        return Ok(no_content(Signed::Leave, b""));
     }
     let mut mode = state.mode.subscribe();
     let deadline = tokio::time::Instant::now() + state.hold;
     loop {
         let current = mode.borrow_and_update().clone();
-        match current {
+        match &current {
             Mode::Gone => {
                 let gone = serde_json::to_vec(&Gone { gateway }).unwrap();
                 let response = reply(&state, connection, StatusCode::NOT_FOUND, None, &gone);
@@ -322,7 +324,7 @@ async fn answer(
             }
             Mode::Unavailable(after) => {
                 let status = StatusCode::SERVICE_UNAVAILABLE;
-                return Ok(reply(&state, connection, status, after, b"standby"));
+                return Ok(reply(&state, connection, status, *after, b"standby"));
             }
             Mode::Serve(Some(snapshot)) if snapshot.version != have => {
                 let json = serde_json::to_vec(&snapshot).unwrap();
@@ -349,7 +351,12 @@ async fn answer(
         }
         tokio::select! {
             _ = mode.changed() => {}
-            _ = tokio::time::sleep_until(deadline) => return Ok(unchanged()),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Ok(match current {
+                    Mode::Serve(None) => no_content(Signed::Pending, b""),
+                    _ => no_content(Signed::Unchanged, have.as_bytes()),
+                });
+            }
         }
     }
 }

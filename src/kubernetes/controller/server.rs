@@ -237,7 +237,7 @@ impl SyncServer {
             // A stopping data plane waits on this answer before it drains:
             // there is nothing left to hold it for.
             if leaving {
-                return self.unchanged(&sync.nonce, &sync.have);
+                return self.no_content(Signed::Leave, &sync.nonce, b"");
             }
         }
         self.poll(&key, &sync.have, &sync.nonce, &instance).await
@@ -288,9 +288,13 @@ impl SyncServer {
                 changed = current.changed() => if changed.is_err() {
                     return self.gone(key, nonce);
                 },
-                _ = tokio::time::sleep_until(deadline) => return self.unchanged(nonce, have),
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.held(current.borrow().clone().as_deref(), nonce, have)
+                }
                 // The instance asked again: this answer has no reader.
-                _ = hold.superseded.cancelled() => return self.unchanged(nonce, have),
+                _ = hold.superseded.cancelled() => {
+                    return self.held(current.borrow().clone().as_deref(), nonce, have)
+                }
                 _ = self.shutdown.cancelled() => return standby("shutting down"),
             }
         }
@@ -320,15 +324,24 @@ impl SyncServer {
         response
     }
 
-    /// The 204 that confirms `have` is current, signed over it: an
-    /// unsigned one would let any endpoint freeze a data plane's config.
-    fn unchanged(&self, nonce: &str, have: &str) -> Response<Full<Bytes>> {
-        let signature = match sign(
-            &self.signer.current(),
-            Signed::Unchanged,
-            nonce,
-            have.as_bytes(),
-        ) {
+    /// The answer to a poll nothing newer came for: "unchanged" over the
+    /// version served, which is `have`; "pending" while there is none. It
+    /// never vouches for a version the caller named: a token holder could
+    /// have a stale one confirmed, and freeze a data plane on it.
+    fn held(&self, served: Option<&Snapshot>, nonce: &str, have: &str) -> Response<Full<Bytes>> {
+        match served {
+            Some(snapshot) if snapshot.version == have => {
+                self.no_content(Signed::Unchanged, nonce, snapshot.version.as_bytes())
+            }
+            Some(snapshot) => self.served(snapshot, nonce),
+            None => self.no_content(Signed::Pending, nonce, b""),
+        }
+    }
+
+    /// A 204 of `kind`, signed over `nonce` and `over`: an unsigned one
+    /// would let any endpoint freeze a data plane's config.
+    fn no_content(&self, kind: Signed, nonce: &str, over: &[u8]) -> Response<Full<Bytes>> {
+        let signature = match sign(&self.signer.current(), kind, nonce, over) {
             Ok(signature) => signature,
             Err(e) => return not_signed(&e),
         };
@@ -1245,6 +1258,52 @@ mod tests {
             .unwrap();
         Gone::check(gone.as_bytes(), &ghost).unwrap();
         assert!(Gone::check(gone.as_bytes(), &key()).is_err());
+    }
+
+    /// A leaving poll's 204 is a leave acknowledgement, never "unchanged"
+    /// over the `have` it names: a token holder sent one with a stale
+    /// version and got a confirmation that froze the data plane. A poll
+    /// with no snapshot yet is answered "pending", confirming nothing.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_version_served_is_confirmed() {
+        use crate::sync::{ca_roots, new_nonce, AnswerVerifier};
+        use std::time::SystemTime;
+        let f = fixture().await;
+        let roots = ca_roots(f.ca.ca_pem().as_bytes(), "controller CA").unwrap();
+        let verifier = AnswerVerifier::new(roots, "portail-controller.portail-system.svc").unwrap();
+        let token = gateway_token("default", "gw", 0);
+        let now = SystemTime::now();
+
+        let nonce = new_nonce();
+        let mut pending = body(&key(), "stale", None);
+        pending["nonce"] = json!(nonce);
+        let response = f.sync(post(Some(&token), &pending)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let headers = response.headers();
+        assert!(verifier
+            .verify(Signed::Pending, &nonce, headers, b"", now)
+            .is_ok());
+        assert!(verifier
+            .verify(Signed::Unchanged, &nonce, headers, b"stale", now)
+            .is_err());
+
+        f.publish(1);
+        let nonce = new_nonce();
+        let mut leaving = body(
+            &key(),
+            "stale",
+            Some(json!({"applied": "stale", "leaving": true})),
+        );
+        leaving["nonce"] = json!(nonce);
+        let response = f.sync(post(Some(&token), &leaving)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let headers = response.headers();
+        assert!(verifier
+            .verify(Signed::Leave, &nonce, headers, b"", now)
+            .is_ok());
+        assert!(verifier
+            .verify(Signed::Unchanged, &nonce, headers, b"stale", now)
+            .is_err());
     }
 
     #[tokio::test]
