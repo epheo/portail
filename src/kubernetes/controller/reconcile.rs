@@ -293,7 +293,16 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     let mut plan = translate(ctx, gateway).await;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
-            let provisioned = provision::reconcile(ctx, gateway, params, plan).await;
+            let provisioned = match provision::reconcile(ctx, gateway, params).await {
+                Ok(provisioned) => provisioned,
+                Err(e) => {
+                    warn!(
+                        "Gateway {}: provisioning its data plane failed: {:#}",
+                        key, e
+                    );
+                    return Step::Done(Action::requeue(Duration::from_secs(ERROR_REQUEUE_SECS)));
+                }
+            };
             provisioned.stamp(&mut plan.config);
             let snapshot = Snapshot::from_config(
                 GatewayRef {

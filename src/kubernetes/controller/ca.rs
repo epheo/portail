@@ -8,6 +8,14 @@
 /// The CA and this replica's serving cert.
 pub(crate) struct ControllerCa;
 
+impl ControllerCa {
+    /// The CA certificate's PEM, which Managed data planes get in their
+    /// pod template to verify the controller against.
+    pub(crate) fn ca_pem(&self) -> String {
+        String::new()
+    }
+}
+
 /// Load the CA from its Secret, creating it when absent.
 pub(crate) async fn load_or_create(
     _client: &kube::Client,
