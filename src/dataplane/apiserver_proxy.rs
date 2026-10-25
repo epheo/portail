@@ -296,7 +296,10 @@ mod tests {
         }
         assert_eq!(refusal(StatusCode::FORBIDDEN, b"forbidden\n"), None);
         assert_eq!(
-            refusal(StatusCode::NOT_FOUND, br#"{"gateway":{},"issuedAt":1}"#),
+            refusal(
+                StatusCode::NOT_FOUND,
+                br#"{"gateway":{"namespace":"ns","name":"gw"}}"#
+            ),
             None
         );
     }
