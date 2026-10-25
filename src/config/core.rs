@@ -698,6 +698,29 @@ mod tests {
 
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("-5s").is_err());
+        assert!(parse_duration("1m-5s").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("5x").is_err());
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+    }
+
+    /// A snapshot carries durations as text: 90s went out as "1m30s",
+    /// which did not parse back, and 1.5s as "1s".
+    #[test]
+    fn durations_survive_their_text_form() {
+        use super::super::parsing::format_duration;
+        for d in [
+            Duration::ZERO,
+            Duration::from_nanos(7),
+            Duration::from_micros(250),
+            Duration::from_millis(1500),
+            Duration::from_secs(90),
+            Duration::from_secs(3661),
+            Duration::new(3661, 1_002_003),
+        ] {
+            assert_eq!(parse_duration(&format_duration(&d)).unwrap(), d, "{d:?}");
+        }
     }
 
     #[test]
