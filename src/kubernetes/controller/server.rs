@@ -67,10 +67,11 @@ const MAX_HEAD: usize = 32 * 1024;
 /// connection at most its read buffer and a TLS record or two, about
 /// 64 MiB in all.
 const MAX_CONNECTIONS: usize = 1024;
-/// Open connections per peer IP. A data plane holds one or two and pods
-/// have their own IPs, but data planes behind the apiserver proxy all
-/// arrive from the apiserver's: room for 16 of those, and no single pod
-/// holds the whole cap.
+/// Open connections per peer IP. A data plane holds one or two; data
+/// planes sharing an IP (hostNetwork pods of one node, or behind SNAT, as
+/// an apiserver hop may arrive) get room for 16, and no single pod holds
+/// the whole cap. The apiserver's own endpoints are exempt
+/// (`apiserver_peers`).
 const MAX_CONNECTIONS_PER_PEER: usize = 32;
 /// The TLS handshake, the request head and the body each, and a response
 /// write that makes no progress: in-cluster they take milliseconds; 5s
@@ -697,8 +698,12 @@ pub(crate) async fn serve(
             Ok((stream, peer)) => {
                 backoff.reset();
                 // Over its share the connection closes as it is dropped.
-                let Some(counted) = PeerConnection::open(&server, peer.ip()) else {
-                    continue;
+                let counted = match server.auth.exempts(peer.ip()) {
+                    true => None,
+                    false => match PeerConnection::open(&server, peer.ip()) {
+                        Some(counted) => Some(counted),
+                        None => continue,
+                    },
                 };
                 tokio::spawn(connection(
                     server.clone(),
@@ -723,7 +728,7 @@ async fn connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     peer: IpAddr,
-    _slots: (OwnedSemaphorePermit, PeerConnection),
+    _slots: (OwnedSemaphorePermit, Option<PeerConnection>),
 ) {
     // A peer that cannot complete a handshake is no data plane; the data
     // plane logs its own side.
@@ -2030,6 +2035,48 @@ mod tests {
             .await
             .unwrap()
             .expect("its share is free again");
+        f.shutdown.cancel();
+    }
+
+    /// The apiserver's endpoints hold no share: every proxied data plane
+    /// comes from them. The global cap still holds.
+    #[tokio::test]
+    async fn the_apiserver_holds_no_share_of_connections() {
+        use super::super::apiserver_peers::ApiserverPeers;
+        let (ca, connector, name) = tls_client();
+        let f = fixture().await;
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let server = SyncServer::with_connections(
+            f.ctx.clone(),
+            authenticator(f.api.client(), &f.serial)
+                .exempting(Arc::new(ApiserverPeers::of([loopback]))),
+            signer(),
+            Lapses::new().0,
+            f.shutdown.clone(),
+            2,
+            1,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(server, ca.server_config(), listener));
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let tls =
+                tokio::time::timeout(Duration::from_secs(2), connector.connect(name.clone(), tcp))
+                    .await
+                    .expect("accepted past the per-peer share")
+                    .unwrap();
+            held.push(tls);
+        }
+        let over = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), connector.connect(name, over))
+                .await
+                .is_err(),
+            "accepted over the global cap"
+        );
         f.shutdown.cancel();
     }
 
