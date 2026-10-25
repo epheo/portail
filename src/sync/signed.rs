@@ -56,8 +56,10 @@ pub fn valid_nonce(nonce: &str) -> bool {
 
 /// What a signature vouches for. Its context goes first in the message
 /// signed, then the poll's nonce: a snapshot's signature never passes for
-/// another kind's, an answer to another poll never for this one's, nor a
-/// TLS handshake's, made with the same key, for any.
+/// another kind's, an answer to another poll never for this one's. Nor
+/// does a TLS handshake signature, made with the same key, for any: TLS
+/// 1.2's ServerKeyExchange signs the two hello randoms first, 1.3's
+/// CertificateVerify 64 spaces, and neither starts with a context line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signed {
     /// A 200's body.
