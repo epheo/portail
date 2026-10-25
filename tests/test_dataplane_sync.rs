@@ -73,6 +73,17 @@ impl DataPlane {
             .and_then(|response| extract_status(&response))
     }
 
+    /// The value of an unlabeled series on /metrics.
+    fn metric(&self, name: &str) -> Option<f64> {
+        let request = b"GET /metrics HTTP/1.1\r\nHost: admin\r\n\r\n";
+        let response = http_request(self.admin, request).ok()?;
+        let body = String::from_utf8_lossy(extract_body(&response)).into_owned();
+        let line = body
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(name))?;
+        line.split_whitespace().nth(1)?.parse().ok()
+    }
+
     /// Wait until /readyz answers `status`.
     fn wait_readyz(&self, status: u16, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -459,6 +470,7 @@ fn serves_through_an_outage(outage: Duration) {
     let stub = ControllerStub::start(HOLD, Mode::Serve(Some(http_snapshot(port, backend.addr))));
     let dp = start_dataplane(&stub, &[]);
     wait_serving(&dp, port, "ok");
+    assert_eq!(dp.metric("portail_controller_connected"), Some(1.0));
 
     stub.go_down();
     let load = std::thread::spawn(move || load::run(port, outage));
@@ -483,6 +495,12 @@ fn serves_through_an_outage(outage: Duration) {
         .process
         .output()
         .contains("Sync of Gateway default/gw failed"));
+    assert_eq!(dp.metric("portail_controller_connected"), Some(0.0));
+    let age = dp.metric("portail_config_age_seconds").unwrap();
+    assert!(
+        age >= outage.as_secs_f64(),
+        "config age {age}s after the outage"
+    );
 
     let from = stub.requests().len();
     stub.up();
