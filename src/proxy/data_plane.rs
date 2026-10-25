@@ -155,6 +155,9 @@ pub struct DataPlane {
     /// false the moment an accept loop exits outside shutdown — no waiting
     /// for the next reconcile pass to notice. `None` in standalone mode.
     ready_flag: Option<Arc<AtomicBool>>,
+    /// Bumped with that flip: the data plane re-applies to rebind, and
+    /// reports the loss meanwhile.
+    listener_exits: tokio::sync::watch::Sender<u64>,
     worker_config: worker::WorkerConfig,
     health: Arc<HealthRegistry>,
     /// Cloned into every UDP worker, the controller's too: a rebuilt one
@@ -481,6 +484,7 @@ impl DataPlane {
             udp_listeners,
             listener_tasks,
             ready_flag: None,
+            listener_exits: tokio::sync::watch::Sender::new(0),
             worker_config: worker::WorkerConfig::from_perf(
                 performance_config,
                 DEFAULT_MAX_IDLE_PER_BACKEND,
@@ -511,6 +515,11 @@ impl DataPlane {
         self.ready_flag = Some(flag);
     }
 
+    /// Changes each time an accept loop exits outside shutdown.
+    pub fn listener_exits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.listener_exits.subscribe()
+    }
+
     fn endpoint_alive(&self, endpoint: &Endpoint) -> bool {
         self.listener_tasks
             .get(endpoint)
@@ -537,6 +546,7 @@ impl DataPlane {
     {
         let cancel = self.shutdown.child_token();
         let ready_flag = self.ready_flag.clone();
+        let exits = self.listener_exits.clone();
         let desc = endpoint.to_string();
         let task = make_task(cancel.clone());
         let watch_cancel = cancel.clone();
@@ -547,6 +557,7 @@ impl DataPlane {
                 if let Some(flag) = ready_flag {
                     flag.store(false, Ordering::Release);
                 }
+                exits.send_modify(|n| *n += 1);
             }
         });
         self.listener_tasks
@@ -2154,5 +2165,32 @@ mod tests {
         );
         assert!(errors[0].error.starts_with("TCP bind"), "{errors:?}");
         assert!(dp.is_ready_for_endpoints(&[tcp(Some(FREE), port)]));
+    }
+
+    /// An accept loop that ends on its own unreadies the pod and says so
+    /// to whoever waits to rebind; one cancelled does neither.
+    #[tokio::test]
+    async fn an_accept_loop_exit_is_announced() {
+        let perf = test_perf();
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        let ready = Arc::new(AtomicBool::new(true));
+        dp.set_ready_flag(ready.clone());
+        let mut exits = dp.listener_exits();
+
+        dp.spawn_listener_task(
+            tcp(None, 1),
+            1,
+            |cancel| async move { cancel.cancelled().await },
+        );
+        dp.close_unwanted(&[]).pop().unwrap().await.unwrap();
+        assert!(ready.load(Ordering::Acquire), "a cancelled loop is no loss");
+        assert!(!exits.has_changed().unwrap());
+
+        dp.spawn_listener_task(tcp(None, 2), 2, |_| async {});
+        tokio::time::timeout(Duration::from_secs(5), exits.changed())
+            .await
+            .expect("the exit is announced")
+            .unwrap();
+        assert!(!ready.load(Ordering::Acquire));
     }
 }
