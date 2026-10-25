@@ -119,7 +119,8 @@ struct ControllerCtx {
 pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
-    let leader = leader::start(&client, &args, &shutdown);
+    let elector = leader::start(&client, &args);
+    let leader = elector.leader();
     let ca = ca::load_or_create(&client, &args).await?;
 
     // --- Primary resource: Gateway ---
