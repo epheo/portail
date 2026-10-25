@@ -80,6 +80,8 @@ const MAX_CONNECTIONS_PER_PEER: usize = 32;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every 503's: the data plane's first backoff step.
 const RETRY_AFTER_SECS: u64 = 1;
+/// Set by the apiserver's service proxy, as by most proxies.
+const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// The sync endpoint's state.
 pub(crate) struct SyncServer {
@@ -95,6 +97,8 @@ pub(crate) struct SyncServer {
     body_reads: Semaphore,
     /// The pods whose body is being read.
     body_readers: Mutex<std::collections::HashSet<InstanceId>>,
+    /// Peers proxied polls were seen from, each logged once.
+    proxies: Mutex<std::collections::HashSet<IpAddr>>,
     shutdown: CancellationToken,
 }
 
@@ -137,6 +141,7 @@ impl SyncServer {
             per_peer,
             body_reads: Semaphore::new(MAX_BODY_READS),
             body_readers: Mutex::default(),
+            proxies: Mutex::default(),
             shutdown,
         })
     }
@@ -177,6 +182,9 @@ impl SyncServer {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
+        if request.headers().contains_key(FORWARDED_FOR) {
+            self.proxied_from(peer);
+        }
         // Its own data plane only learns that it is gone, and must: a
         // restarted controller holds no verdict for its token, and a
         // refusal would leave it serving the deleted Gateway.
@@ -243,6 +251,33 @@ impl SyncServer {
             }
         }
         self.poll(&key, &sync.have, &instance).await
+    }
+
+    /// Says once per peer whether polls proxied from it, through the
+    /// apiserver, escape the per-peer limits. The header is the caller's
+    /// to set: it decides nothing, it only shows a hop that arrives from
+    /// an address the apiserver does not list, as through a SNAT.
+    fn proxied_from(&self, peer: IpAddr) {
+        let first = self
+            .proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(peer);
+        if !first {
+            return;
+        }
+        if self.auth.exempts(peer) {
+            info!(
+                "Proxied sync polls arrive from {}, an apiserver endpoint: no per-peer limit",
+                peer
+            );
+        } else {
+            warn!(
+                "Proxied sync polls arrive from {}, not an apiserver endpoint: the per-peer limits \
+                 apply, so its data planes share one pod's",
+                peer
+            );
+        }
     }
 
     /// Whether `key` is a Gateway of ours. A missing class keeps it served:
@@ -2036,6 +2071,24 @@ mod tests {
             .unwrap()
             .expect("its share is free again");
         f.shutdown.cancel();
+    }
+
+    /// X-Forwarded-For decides nothing: a proxied poll is answered as any,
+    /// and its peer is noted once, for the log that says whether the
+    /// apiserver's hop escapes the per-peer limits.
+    #[tokio::test]
+    async fn a_forwarded_poll_is_answered_as_any_and_its_peer_noted_once() {
+        let f = fixture().await;
+        let v1 = f.publish(1);
+        for _ in 0..2 {
+            let mut request = poll("");
+            request
+                .headers_mut()
+                .insert(FORWARDED_FOR, HeaderValue::from_static("10.128.0.9"));
+            assert_eq!(version_of(f.sync(request).await).await, v1);
+        }
+        let noted = f.server.proxies.lock().unwrap().clone();
+        assert_eq!(noted, [PEER].into_iter().collect());
     }
 
     /// The apiserver's endpoints hold no share: every proxied data plane

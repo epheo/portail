@@ -397,6 +397,27 @@ mod tests {
         assert_eq!(sent, request());
     }
 
+    /// Past twice the hold the poll is given up: the controller answers
+    /// within one, so a longer wait is a hop that lost it.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_held_past_twice_the_hold_is_given_up() {
+        let fixture = Arc::new(Fixture::new());
+        let answers = fixture.clone();
+        let (mut client, _) = fixture
+            .apiserver(move |_, _| {
+                let answer = answers.snapshot();
+                Box::pin(async move {
+                    tokio::time::sleep(2 * HOLD + Duration::from_secs(1)).await;
+                    Some(answer)
+                })
+            })
+            .await;
+        match client.poll(&request()).await {
+            Answer::Retry { error, .. } => assert!(error.contains("no answer within"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Through the apiserver, a snapshot signed by anyone but the
     /// controller is refused: the hop's TLS proves only the apiserver.
     #[tokio::test]
