@@ -23,6 +23,7 @@ Then apply an example with `kubectl apply -k <dir>`:
 
 - [loadbalancer/](loadbalancer/): a Managed Gateway with two replicas behind a LoadBalancer Service.
 - [multi-network/](multi-network/): Gateways on User Defined Networks, by `portail.epheo.eu/Network` address.
+- [primary-udn/](primary-udn/): a Gateway in an OVN-Kubernetes Primary UDN namespace, its data plane polling the controller through the apiserver.
 - [unmanaged/](unmanaged/): an Unmanaged Gateway served by a hand-written Deployment.
 - [ratelimitpolicy.yaml](ratelimitpolicy.yaml): a per-client rate limit on the unmanaged example's Gateway.
 

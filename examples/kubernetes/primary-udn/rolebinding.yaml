@@ -1,0 +1,16 @@
+# Each Gateway whose data plane polls through the apiserver gets its
+# ServiceAccount here, portail-<gateway> in the Gateway's namespace: the
+# apiserver forwards only polls it authorizes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portail-controller-proxy
+  namespace: portail-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portail-controller-proxy
+subjects:
+- kind: ServiceAccount
+  name: portail-svc-gw
+  namespace: demo-primary
