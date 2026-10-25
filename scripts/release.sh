@@ -20,5 +20,6 @@ fi
 sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 sed -i "/^name = \"portail\"$/{n;s/^version = \".*\"/version = \"${version}\"/}" Cargo.lock
 sed -i "s/\(portailVersion *= *\)\"v[^\"]*\"/\1\"v${version}\"/" conformance/conformance_test.go
+sed -i "s/^\( *newTag: *\)\"[^\"]*\"$/\1\"${version}\"/" deploy/install/kustomization.yaml
 
 git diff --stat
