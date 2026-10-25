@@ -669,7 +669,7 @@ async fn provision(
 
     for (w, state) in wanted.iter().zip(live) {
         let hash = sha256_hex(w.body.to_string().as_bytes());
-        let force = match state {
+        let taken = match state {
             Live::Ours {
                 uid: object_uid,
                 version,
@@ -682,13 +682,13 @@ async fn provision(
                 if owned.applied(&uid, w.kind).as_ref() == Some(&current) {
                     continue;
                 }
-                true
+                Some(current.uid)
             }
             // A foreign object created since the preflight conflicts
             // instead of being taken over.
-            _ => false,
+            _ => None,
         };
-        let meta = match apply(&ctx.client, w, &namespace, &name, force).await {
+        let meta = match apply(&ctx.client, w, &namespace, &name, taken).await {
             Ok(meta) => meta,
             Err(e) => {
                 owned.record(&uid, w.kind, None);
@@ -799,20 +799,26 @@ async fn get_metadata(
     }
 }
 
+/// Server-side apply `wanted`, forced over the object of uid `taken` when
+/// it is ours.
 async fn apply(
     client: &Client,
     wanted: &Wanted,
     namespace: &str,
     name: &str,
-    force: bool,
+    taken: Option<String>,
 ) -> Result<ObjectMeta, kube::Error> {
     let api: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), namespace, &wanted.kind.resource());
     let mut params = PatchParams::apply(FIELD_MANAGER);
-    params.force = force;
-    let applied = api
-        .patch(name, &params, &Patch::Apply(&wanted.body))
-        .await?;
+    params.force = taken.is_some();
+    let mut body = wanted.body.clone();
+    if let Some(uid) = taken {
+        // The uid precondition of an apply: a force never takes the object
+        // another created under the name since the cache saw ours.
+        body["metadata"]["uid"] = serde_json::Value::String(uid);
+    }
+    let applied = api.patch(name, &params, &Patch::Apply(&body)).await?;
     Ok(applied.metadata)
 }
 
@@ -1037,7 +1043,51 @@ mod tests {
                 r.path
             );
             assert!(!r.path.contains("force=true"), "{}", r.path);
+            assert!(r.body["metadata"]["uid"].is_null(), "{}", r.body);
         }
+    }
+
+    /// A forced apply names the object it takes over by uid: one deleted
+    /// and recreated under the name since the cache saw ours is refused by
+    /// the apiserver, not taken.
+    #[tokio::test]
+    async fn a_forced_apply_carries_the_uid_it_takes() {
+        let api = MockApi::default();
+        let mut cluster = TestCluster::default();
+        own_all(&mut cluster);
+        let ctx = cluster.ctx(api.client());
+        for (kind, uid) in [
+            (Kind::ServiceAccount, "sa-uid"),
+            (Kind::Deployment, "deployment-uid"),
+            (Kind::Service, "service-uid"),
+            (Kind::PodDisruptionBudget, "pdb-uid"),
+        ] {
+            answer(&api, kind, uid, "1", None);
+        }
+        reconcile(&ctx, &gateway(), &params(1, ServiceType::LoadBalancer)).await;
+        let uids: Vec<(String, String)> = api
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH")
+            .map(|r| {
+                assert!(r.path.contains("force=true"), "{}", r.path);
+                (
+                    r.path.split('?').next().unwrap().to_string(),
+                    r.body["metadata"]["uid"]
+                        .as_str()
+                        .unwrap_or("none")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            uids,
+            [
+                (path(Kind::ServiceAccount, NAME), "sa-uid".to_string()),
+                (path(Kind::Deployment, NAME), "deployment-uid".to_string()),
+                (path(Kind::Service, NAME), "service-uid".to_string()),
+            ]
+        );
     }
 
     /// An object as it was applied is not applied again; one changed since
