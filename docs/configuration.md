@@ -36,7 +36,7 @@ These flags take no subcommand: `portail --http2 dataplane ...` is refused.
 | `--controller-name <NAME>` | Controller name for GatewayClass matching (default: `portail.epheo.eu/gateway-controller`) |
 | `--namespace <NS>` | Namespace of the leader election Lease, the CA Secret and ConfigMap, and the Service (default: env `POD_NAMESPACE`) |
 | `--service-name <NAME>` | The ClusterIP Service data planes dial; `<service>.<namespace>.svc` is also the audience of their tokens (default: `portail-controller`) |
-| `--sync-port <PORT>` | Port of the TLS sync endpoint (default: `9443`) |
+| `--sync-port <PORT>` | Port of the TLS sync endpoint, `POST /v1/sync/<namespace>/<name>` (default: `9443`) |
 | `--leader-election-id <NAME>` | Name of the leader election Lease (default: `portail-controller`); the Role of `deploy/install` grants this name only |
 | `--dataplane-image <IMAGE>` | Data-plane image of Managed Gateways without a GatewayParameters `image` (default: the image this binary was published as) |
 | `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |
@@ -100,8 +100,10 @@ in standalone mode:
   the controller) and `portail_config_age_seconds`: alert on the age, since
   route and certificate changes wait for the controller.
 - The controller adds `portail_sync_auth_rejected_total{stage}`,
-  `portail_tokenreview_requests_total{result}` and
-  `portail_sync_throttled_total`.
+  `portail_tokenreview_requests_total{result}`,
+  `portail_sync_throttled_total` and
+  `portail_sync_auth_stale_verdicts_total` (polls served on an expired
+  TokenReview verdict while the API server did not answer its renewal).
 
 The endpoint listens on every interface unless `--admin-address` names one.
 On a pod carrying a Gateway VIP or a Multus interface, the pod IP keeps
@@ -475,5 +477,7 @@ HTTPS and TLS passthrough listeners on one port share one socket:
 - Each Gateway change re-plans the port, and the next connection follows it, without a rebind: a protocol change, a listener added or removed, a certificate rotated or deleted.
 - A port whose HTTPS certificates fail to load closes the connections its HTTPS listeners select, and is not bound when no passthrough listener shares it.
 - A port already serving whose certificates all fail on a later pass, with the same listeners and Secrets, keeps serving the last good ones: a bad rotation does not take HTTPS down. The failure is logged each pass until fixed. A pass that also changes the port's listeners or Secrets keeps none.
-- In Kubernetes mode only an invalid rotation of the same Secret keeps the last good certificate, and the listener reports `ResolvedRefs=False` meanwhile. A deleted Secret, or one a ReferenceGrant no longer permits, stops serving its hostnames at once.
+- In Kubernetes mode only an invalid rotation of the same Secret keeps the last good certificate, and the listener reports `ResolvedRefs=False` meanwhile.
+- That last good certificate lives in the controller's memory: a controller restarted during a bad rotation refuses the listener's hostnames until the Secret is fixed.
+- A deleted Secret, or one a ReferenceGrant no longer permits, refuses its hostnames from the controller's next pass.
 - An HTTPS listener whose own certificates fail to load closes the connections its SNI selects, even while its siblings' load: no other listener's certificate answers for its hostname.

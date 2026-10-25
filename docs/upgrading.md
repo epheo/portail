@@ -113,5 +113,6 @@ Keep the 0.1.x manifests and image.
 1. Scale the controller to zero: `kubectl -n portail-system scale deploy/portail-controller --replicas=0`.
 2. Re-apply the 0.1.x objects; `kubectl replace` restores saved ones exactly.
 3. Delete the data planes the controller created: `kubectl delete deploy,svc,pdb,sa -A -l app.kubernetes.io/managed-by=portail-controller`.
+   With several portail installs, add their `portail.epheo.eu/controller-name` value to the selector: `kubectl get deploy -A -L portail.epheo.eu/controller-name` shows it.
 
 GatewayParameters and the GatewayClass `parametersRef` are ignored by 0.1.x.

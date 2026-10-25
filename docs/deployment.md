@@ -76,7 +76,7 @@ Managed data planes still run the image the controller was built for: set Gatewa
 One image, two Kubernetes modes:
 
 - `portail controller`: watches Gateway API resources cluster-wide, translates each Gateway into its data plane's configuration, provisions data planes and writes every status. Leader-elected: standbys keep their caches warm and write nothing.
-- `portail dataplane --gateway <ns>/<name>`: serves one Gateway. It has no Kubernetes client, no RBAC and no API token: it long-polls the controller over TLS and reports which listeners it bound.
+- `portail dataplane --gateway <ns>/<name>`: serves one Gateway. It has no Kubernetes client, no RBAC and no API token: it long-polls the controller over TLS, `POST /v1/sync/<ns>/<name>` on port 9443, and reports which listeners it bound.
 
 One data plane serves exactly one Gateway: Gateways never share a route table or a socket.
 TLS keys travel only from the controller to the data plane of the Gateway that references them, and stay in its memory.
@@ -94,6 +94,7 @@ By default the controller provisions each Gateway of class `portail`, in the Gat
 - a PodDisruptionBudget, with more than one replica.
 
 Each object carries a controller ownerReference to its Gateway: deleting the Gateway garbage-collects them.
+Each also carries label `portail.epheo.eu/controller-name`, the install's `--controller-name` as a label value: another portail install, with another controller name, never updates or deletes it.
 An object of a wanted name the Gateway does not own is never touched: the Gateway reports `Programmed=False`, reason `Invalid`, `name conflict: <Kind>/<name> is not owned by this Gateway`.
 A Gateway whose class changes to another controller's has its objects deleted.
 
@@ -197,6 +198,8 @@ Data plane stopping (SIGTERM):
 - A terminating pod stays a serving endpoint: kube-proxy uses it while no ready one exists.
 - With `Recreate` (static IPs) the delay is 0: no other endpoint takes over.
 
+Data plane gone without a goodbye: it counts as live for 60s after its last report (two holds of 30s); then, with no other live data plane at the current configuration, the Gateway turns `Programmed=False`, reason `Pending`.
+
 Gateway deleted, or its class naming another controller: its data planes close their listeners, turn NotReady and keep polling.
 A deleted GatewayClass changes nothing until it returns.
 
@@ -248,6 +251,8 @@ Both modes serve a plain-HTTP admin endpoint on `--readiness-port` (default `190
 - `/readyz`: the controller once its caches synced and its CA loaded; a data plane once it applied a configuration and every listener of it is bound.
 - `/metrics`: Prometheus text format.
 
+Managed data planes start and stay live on `/livez` (startupProbe and livenessProbe) and take traffic on `/readyz`: a pod started while the controller is down stays NotReady until it answers, instead of being restarted in a loop.
+
 Probe the pod IP, never a Gateway VIP: a VIP has no delivery guarantee to this pod and turns a neighbor's outage into your restart loop.
 Managed data planes run with `--admin-address=$(POD_IP)`, so a Gateway VIP or Multus interface does not expose `/metrics` (see [configuration](configuration.md#admin-endpoint)).
 
@@ -286,8 +291,9 @@ kubectl get deploy,svc,pdb,sa -l portail.epheo.eu/gateway=my-gateway
 - The controller leader writes every status, as field manager `portail-controller`.
 - It writes only the status that differs from what the API server holds, so a wiped or outdated status is rewritten on the next pass.
 - A route or RateLimitPolicy that stops naming a Gateway loses portail's status entry for that Gateway.
-- A listener a data plane cannot bind reports `Programmed=False`, reason `Invalid`, with the error; `Pending` until a data plane applied the Gateway's current configuration.
-- Listeners sharing a port and protocol conflict unless their hostnames differ; TCP and UDP listeners need a port each.
+- A listener a data plane cannot bind reports `Programmed=False`, reason `Pending`, with the error, and the Gateway `Programmed=False`, reason `Invalid`; `Pending` too until a data plane applied the Gateway's current configuration.
+- Listeners sharing a port and protocol conflict unless their hostnames differ.
+- A UDP listener shares its port with a TCP, HTTP, HTTPS or TLS one; two UDP listeners on one port conflict.
 - A Gateway with some listeners rejected stays `Accepted=True` with reason `ListenersNotValid`.
 - `attachedRoutes` counts every route attached to the listener, accepted or not.
 
