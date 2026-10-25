@@ -378,6 +378,40 @@ fn syncs_through_the_apiservers_service_proxy() {
     assert_eq!(reported.token.as_deref(), Some("token-1"));
 }
 
+/// Through the apiserver, an older snapshot the controller signed for an
+/// earlier poll, replayed, is not served: its signature names that poll's
+/// nonce.
+#[test]
+fn a_replayed_snapshot_through_the_apiserver_is_not_served() {
+    let (a, b) = (TestBackend::spawn("a"), TestBackend::spawn("b"));
+    let port = free_port();
+    let first = http_snapshot(port, a.addr);
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(first.clone())));
+    let apiserver = ApiserverStub::start(PROXY_PREFIX, "api-token", stub.addr);
+    let (dp, _api) = start_proxied_dataplane(&stub, &apiserver, "api-token");
+    wait_serving(&dp, port, "a");
+
+    let second = http_snapshot(port, b.addr);
+    stub.set(Mode::Serve(Some(second.clone())));
+    wait_serving(&dp, port, "b");
+    assert!(stub.wait_for(0, SETTLE, applied(&second.version)).is_some());
+
+    let from = stub.requests().len();
+    stub.set(Mode::Replay);
+    let refused = stub
+        .wait_for(from, SETTLE, |r| {
+            r.request.report.as_ref().is_some_and(|report| {
+                report
+                    .apply_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("snapshot refused"))
+            })
+        })
+        .unwrap_or_else(|| panic!("no refusal reported:\n{}", dp.process.output()));
+    assert_eq!(refused.request.have, second.version);
+    assert_eq!(get(port, "/").unwrap().1, b"b");
+}
+
 /// An apiserver that refuses the hop, as without the RoleBinding: a
 /// configuration error, said so, and the data plane polls on.
 #[test]

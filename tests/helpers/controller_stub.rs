@@ -48,6 +48,9 @@ pub enum Mode {
     /// As `Serve` with `sent`, under the controller's signature of
     /// `signed`: a body changed on its way.
     Tampered { signed: Snapshot, sent: Snapshot },
+    /// The first snapshot answer sent, again, as recorded: a replay to a
+    /// later poll.
+    Replay,
 }
 
 /// A request as it arrived.
@@ -77,6 +80,8 @@ struct State {
     signer: CertifiedKey,
     /// Another CA's leaf for the same address.
     forger: CertifiedKey,
+    /// The first 200 sent: its headers and body.
+    first_snapshot: Mutex<Option<(hyper::HeaderMap, Vec<u8>)>>,
     hold: Duration,
     requests: Mutex<Vec<Recorded>>,
     answers: Mutex<Vec<Answered>>,
@@ -118,6 +123,7 @@ impl ControllerStub {
                 mode: watch::Sender::new(mode),
                 signer,
                 forger,
+                first_snapshot: Mutex::default(),
                 hold,
                 requests: Mutex::default(),
                 answers: Mutex::default(),
@@ -329,7 +335,20 @@ async fn answer(
             Mode::Serve(Some(snapshot)) if snapshot.version != have => {
                 let json = serde_json::to_vec(&snapshot).unwrap();
                 let response = reply(&state, connection, StatusCode::OK, None, &json);
-                return Ok(sign_as(response, &state.signer, Signed::Snapshot, &json));
+                let response = sign_as(response, &state.signer, Signed::Snapshot, &json);
+                let mut first = state.first_snapshot.lock().unwrap();
+                if first.is_none() {
+                    *first = Some((response.headers().clone(), json));
+                }
+                return Ok(response);
+            }
+            Mode::Replay => {
+                let recorded = state.first_snapshot.lock().unwrap().clone();
+                if let Some((headers, json)) = recorded {
+                    let mut response = reply(&state, connection, StatusCode::OK, None, &json);
+                    *response.headers_mut() = headers;
+                    return Ok(response);
+                }
             }
             Mode::Forged(snapshot) if snapshot.version != have => {
                 let json = serde_json::to_vec(&snapshot).unwrap();
