@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_networks};
 use super::dns_refresh::{spawn_dns_refresh, Published};
-use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
+use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig, Protocol};
 use crate::logging::{error, info, warn};
 use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;
@@ -279,12 +279,19 @@ impl Applier {
                     Some(bind) => required_endpoints(std::slice::from_ref(l), bind)
                         .into_iter()
                         .map(|endpoint| {
-                            let bound = dp.is_ready_for_endpoints(std::slice::from_ref(&endpoint));
-                            EndpointReport {
-                                error: bind_errors
+                            // Its socket may be a sibling's: it serves none
+                            // of it.
+                            let bound = !revoked(l)
+                                && dp.is_ready_for_endpoints(std::slice::from_ref(&endpoint));
+                            let error = match revoked(l) {
+                                true => Some(NO_CERTIFICATE.to_string()),
+                                false => bind_errors
                                     .iter()
                                     .find(|e| !bound && e.endpoint == endpoint)
                                     .map(|e| e.error.clone()),
+                            };
+                            EndpointReport {
+                                error,
                                 address: endpoint.address,
                                 port: endpoint.port,
                                 transport: endpoint.transport,
@@ -328,13 +335,32 @@ impl Served {
     }
 
     /// The endpoints its listeners must have live to be ready. Unbindable
-    /// listeners still count, so readiness stays down.
+    /// listeners still count, so readiness stays down; revoked ones serve
+    /// nothing by design and do not.
     fn required(&self) -> Vec<Endpoint> {
-        required_endpoints(
-            &self.config.gateway.listeners,
-            self.bind.as_deref().unwrap_or_default(),
-        )
+        let bind = self.bind.as_deref().unwrap_or_default();
+        self.config
+            .gateway
+            .listeners
+            .iter()
+            .filter(|l| !revoked(l))
+            .flat_map(|l| required_endpoints(std::slice::from_ref(l), bind))
+            .collect()
     }
+}
+
+/// Why a revoked listener reports its endpoints unbound.
+const NO_CERTIFICATE: &str =
+    "no certificateRef left (grant revoked or Secret gone): its TLS handshakes are refused";
+
+/// An HTTPS listener the controller sends with no certificateRef left, so
+/// that its SNI is refused rather than served a sibling's cert.
+fn revoked(listener: &ListenerConfig) -> bool {
+    listener.protocol == Protocol::HTTPS
+        && listener
+            .tls
+            .as_ref()
+            .is_none_or(|tls| tls.certificate_refs.is_empty())
 }
 
 /// The endpoints the data plane must be bound to for these listeners to
@@ -731,6 +757,113 @@ mod tests {
             [("tcp", Transport::Tcp, true), ("udp", Transport::Udp, true)]
         );
         assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// A revoked listener (no certificateRef left) is out of readiness and
+    /// reported unbound with why, whether the data plane starts with it or
+    /// served its certs before: the binds and the report end the same.
+    #[tokio::test]
+    async fn a_revoked_listener_ends_the_same_fresh_or_running() {
+        let Some((cert, key)) = crate::proxy::tls::test_util::generate_test_cert("app.test") else {
+            return; // openssl unavailable
+        };
+        let snapshot = |(https, http): (u16, u16), with_cert: bool| {
+            let refs = match with_cert {
+                true => serde_json::json!([{"name": "cert"}]),
+                false => serde_json::json!([]),
+            };
+            let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+                "gateway": {"name": "gw", "listeners": [
+                    {"name": "https", "protocol": "HTTPS", "port": https,
+                     "tls": {"mode": "Terminate", "certificateRefs": refs}},
+                    {"name": "http", "protocol": "HTTP", "port": http},
+                ]},
+            }))
+            .unwrap();
+            let tls = config.gateway.listeners[0].tls.as_mut().unwrap();
+            for r in &mut tls.certificate_refs {
+                r.cert_pem = Some(cert.clone());
+                r.key_pem = Some(key.clone());
+            }
+            let gateway = GatewayRef {
+                namespace: "default".into(),
+                name: "gw".into(),
+                uid: "gw-uid".into(),
+                generation: 1,
+            };
+            Snapshot::from_config(gateway, config, vec![])
+        };
+        // Ports differ between the two: neither binds one the other just
+        // closed.
+        let shape = |report: &InstanceReport| -> Vec<(String, bool, Option<String>)> {
+            report
+                .listeners
+                .iter()
+                .flat_map(|l| {
+                    l.endpoints
+                        .iter()
+                        .map(|e| (l.name.clone(), e.bound, e.error.clone()))
+                })
+                .collect()
+        };
+        let https_endpoint = |port| Endpoint {
+            address: None,
+            port,
+            transport: Transport::Tcp,
+        };
+
+        let (mut fresh, fresh_ready) = applier();
+        let ports = free_ports();
+        let fresh_report = apply_bound(&mut fresh, &fresh_ready, &snapshot(ports, false)).await;
+        let fresh_bound =
+            lock(&fresh.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]);
+        assert!(!fresh_bound);
+
+        let (mut running, running_ready) = applier();
+        let ports = free_ports();
+        apply_bound(&mut running, &running_ready, &snapshot(ports, true)).await;
+        assert!(lock(&running.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]));
+        let running_report = running.apply(&snapshot(ports, false)).await;
+        assert!(running_ready.load(Ordering::Acquire));
+        assert_eq!(shape(&running_report), shape(&fresh_report));
+        assert_eq!(
+            shape(&running_report),
+            [
+                ("https".to_string(), false, Some(NO_CERTIFICATE.to_string())),
+                ("http".to_string(), true, None),
+            ]
+        );
+        assert!(!lock(&running.data_plane).is_ready_for_endpoints(&[https_endpoint(ports.0)]));
+        let closing = lock(&running.data_plane).close_unwanted(&[]);
+        for accept_loop in closing {
+            accept_loop.await.unwrap();
+        }
+        // A child another test forks holds this process's sockets until
+        // its exec.
+        for _ in 0..200 {
+            if bindable(ports.0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the running data plane kept the revoked port");
+    }
+
+    /// Apply until every endpoint binds: a probe socket of this test's can
+    /// sit in a child another test forks until its exec.
+    async fn apply_bound(
+        applier: &mut Applier,
+        ready: &AtomicBool,
+        snapshot: &Snapshot,
+    ) -> InstanceReport {
+        for _ in 0..200 {
+            let report = applier.apply(snapshot).await;
+            if ready.load(Ordering::Acquire) {
+                return report;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{} never bound", snapshot.version);
     }
 
     /// Runs `test` in a process of its own, on a current-thread runtime:

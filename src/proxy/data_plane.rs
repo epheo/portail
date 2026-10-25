@@ -170,6 +170,9 @@ pub struct DataPlane {
     /// Per port with HTTPS listeners, the config terminating for them.
     /// Dropped with the last of them: no cert outlives its listener.
     terminate_configs: HashMap<u16, BuiltConfig>,
+    /// Loops a pass closed because their port's plan serves nothing; the
+    /// next [`Self::close_unwanted`] hands them over to be awaited.
+    closing: Vec<JoinHandle<()>>,
     /// Shared backend selector across all listeners for correct weighted distribution.
     selector: Arc<BackendSelector>,
     /// Process-wide backend pool when `performance.backendPoolScope: process`;
@@ -233,7 +236,7 @@ const DEFAULT_MAX_IDLE_PER_BACKEND: usize = 64;
 /// `example.org` via a catch-all listener gets dropped when a sibling
 /// `https-with-hostname` listener is processed last, hanging its TLS handshake
 /// until the client times out. An HTTPS listener without certs still names
-/// its port: the build then fails for it, and says so.
+/// its port, which terminates nothing for it.
 pub(crate) fn merge_cert_refs_by_port(
     listener_configs: &[ListenerConfig],
 ) -> HashMap<u16, Vec<CertificateRef>> {
@@ -288,6 +291,13 @@ fn plan_ports(
     built.retain(|port, _| merged.contains_key(port));
     let mut errors = Vec::new();
     for (port, refs) in merged {
+        // On purpose, not a failure: the controller keeps sending an HTTPS
+        // listener whose refs all went (grant revoked, Secret deleted), so
+        // its SNI is refused instead of taken by a sibling's cert.
+        if refs.is_empty() {
+            built.remove(&port);
+            continue;
+        }
         let fingerprint = compute_cert_fingerprint(&refs);
         if built
             .get(&port)
@@ -495,6 +505,7 @@ impl DataPlane {
             active_connections: Arc::new(AtomicUsize::new(0)),
             plans,
             terminate_configs,
+            closing: Vec::new(),
             selector: Arc::new(BackendSelector::new()),
             shared_pool: match performance_config.backend_pool_scope {
                 crate::config::PoolScope::Process => Some(Arc::new(
@@ -590,9 +601,9 @@ impl DataPlane {
     /// no longer want: a listener removed from the spec, a wildcard whose
     /// port moved to specific addresses (or the reverse), or an endpoint
     /// now serving another published port on the same bound one. Returns
-    /// the closed loops. Each releases its socket as it exits, and until
-    /// then a bind overlapping it fails: await them, then
-    /// [`Self::add_tcp_listeners`] the same listeners.
+    /// the closed loops, with those the last pass closed. Each releases its
+    /// socket as it exits, and until then a bind overlapping it fails:
+    /// await them, then [`Self::add_tcp_listeners`] the same listeners.
     pub fn close_unwanted(&mut self, listener_configs: &[ListenerConfig]) -> Vec<JoinHandle<()>> {
         // A finished task means its socket is gone (the listener lives
         // inside the task), so the endpoint must stop counting as bound;
@@ -610,21 +621,35 @@ impl DataPlane {
         });
 
         let desired = Self::desired_endpoints(listener_configs);
+        let mut closed = std::mem::take(&mut self.closing);
+        closed.extend(self.close_where(|endpoint, port| {
+            let unwanted = desired.get(endpoint) != Some(&port);
+            if unwanted {
+                info!("Listener {} no longer in spec; closing", endpoint);
+            }
+            unwanted
+        }));
+        closed
+    }
+
+    /// Cancel the running loops `close` picks, by endpoint and the
+    /// published port each serves; returns them. Pre-start sockets
+    /// (standalone mode) are never managed here.
+    fn close_where(
+        &mut self,
+        mut close: impl FnMut(&Endpoint, u16) -> bool,
+    ) -> Vec<JoinHandle<()>> {
         self.listener_tasks
-            // Pre-start sockets (standalone mode) are never managed here.
             .extract_if(|endpoint, slot| match slot {
                 ListenerSlot::Pending => false,
-                ListenerSlot::Running(.., port) => desired.get(endpoint) != Some(port),
+                ListenerSlot::Running(.., port) => close(endpoint, *port),
             })
-            .filter_map(|(endpoint, slot)| {
-                info!("Listener {} no longer in spec; closing", endpoint);
-                match slot {
-                    ListenerSlot::Running(handle, cancel, _) => {
-                        cancel.cancel();
-                        Some(handle)
-                    }
-                    ListenerSlot::Pending => None,
+            .filter_map(|(_, slot)| match slot {
+                ListenerSlot::Running(handle, cancel, _) => {
+                    cancel.cancel();
+                    Some(handle)
                 }
+                ListenerSlot::Pending => None,
             })
             .collect()
     }
@@ -684,6 +709,23 @@ impl DataPlane {
                 }
             }
         }
+        // A port that could serve no connection (every HTTPS listener on
+        // it without a cert, nothing passed through) is closed, as a fresh
+        // data plane never binds it below.
+        let dead_ports: HashSet<u16> = self
+            .plans
+            .iter()
+            .filter(|(_, plan)| !serves(plan.load().as_deref()))
+            .map(|(port, _)| *port)
+            .collect();
+        let closing = self.close_where(|endpoint, port| {
+            let dead = endpoint.transport == Transport::Tcp && dead_ports.contains(&port);
+            if dead {
+                info!("Listener {} serves no certificate; closing", endpoint);
+            }
+            dead
+        });
+        self.closing.extend(closing);
 
         for listener_cfg in listener_configs {
             // `port` is the published identity (routing/TLS key); the
@@ -1521,6 +1563,94 @@ mod tests {
             Ok(der(&wildcard.0))
         );
         assert_eq!(presented(port, Some("y.org")).await, Ok(der(&catch_all.0)));
+    }
+
+    /// An HTTPS listener as the controller sends it once its grant is
+    /// revoked or its Secret deleted: no certificateRef left.
+    fn revoked(listener: ListenerConfig) -> ListenerConfig {
+        let mut listener = listener;
+        listener.tls.as_mut().unwrap().certificate_refs.clear();
+        listener
+    }
+
+    /// A revoked hostname listener beside a catch-all HTTPS sibling on its
+    /// port: its SNI is refused, never answered with the sibling's cert,
+    /// and nothing failed.
+    #[tokio::test]
+    async fn a_revoked_hostname_listener_refuses_its_sni() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("catch-all") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let listeners = [
+            https_with_cert(port, None, &cert),
+            revoked(https_listener("gone", port, Some("gone.example.org"), "x")),
+        ];
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+        let mut dp = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        bind_until(&mut dp, &listeners, &routes, &perf, 1).await;
+        assert_eq!(
+            ensure(&mut dp, &listeners, &routes, &perf).await,
+            (0, vec![])
+        );
+
+        assert!(presented(port, Some("gone.example.org")).await.is_err());
+        assert_eq!(presented(port, Some("other.org")).await, Ok(der(&cert.0)));
+    }
+
+    /// A port whose only listener is revoked serves nothing: a fresh data
+    /// plane does not bind it, and a running one closes it, both without
+    /// an error. The running one kept the port open, refusing every
+    /// handshake, while a fresh pod never bound it.
+    #[tokio::test]
+    async fn a_port_with_only_revoked_listeners_is_closed_as_never_bound() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let Some(cert) = crate::proxy::tls::test_util::generate_test_cert("app.example.org") else {
+            return; // openssl unavailable
+        };
+        let port = free_port();
+        let serving = https_with_cert(port, None, &cert);
+        let gone = [revoked(serving.clone())];
+        let (perf, routes) = (
+            test_perf(),
+            Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+        );
+
+        let mut fresh = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        assert_eq!(ensure(&mut fresh, &gone, &routes, &perf).await, (0, vec![]));
+        assert!(!fresh.endpoint_alive(&tcp(None, port)));
+        drop(fresh);
+
+        let mut running = DataPlane::new(&[], &perf, std::path::Path::new("/unused")).unwrap();
+        bind_until(
+            &mut running,
+            std::slice::from_ref(&serving),
+            &routes,
+            &perf,
+            1,
+        )
+        .await;
+        assert_eq!(
+            ensure(&mut running, &gone, &routes, &perf).await,
+            (0, vec![])
+        );
+        assert!(!running.endpoint_alive(&tcp(None, port)));
+        for accept_loop in running.close_unwanted(&gone) {
+            accept_loop.await.unwrap();
+        }
+        // A child another test forks holds this process's sockets until
+        // its exec.
+        for _ in 0..200 {
+            if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the revoked port is not released");
     }
 
     /// A listener whose published port changes while its targetPort stays
