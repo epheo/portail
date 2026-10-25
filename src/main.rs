@@ -142,9 +142,25 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
 
     // Both Kubernetes modes parse in full so manifests can be written
     // against them; their runtimes land with the packages that build them.
-    if let Some(command) = &args.command {
-        eprintln!("portail {}: not implemented in this build", command.name());
-        std::process::exit(2);
+    match args.command {
+        Some(cli::Command::Dataplane(dataplane)) => {
+            let stop = CancellationToken::new();
+            let on_signal = stop.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                info!("Received shutdown signal");
+                on_signal.cancel();
+            });
+            return dataplane::run(dataplane, stop).await;
+        }
+        Some(command) => {
+            eprintln!("portail {}: not implemented in this build", command.name());
+            std::process::exit(2);
+        }
+        None => {}
     }
 
     // Before listeners: a request must never race the writer task's spawn.
