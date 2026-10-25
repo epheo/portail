@@ -5,6 +5,10 @@
 //! Gateway in the path, on the head alone, then TokenReview, and only then
 //! the body: an unauthenticated peer never makes the controller read or
 //! hold more than a capped request head.
+//!
+//! Every snapshot and gone answer is signed with the serving leaf's key
+//! (`crate::sync::signed`): through the apiserver's service proxy the data
+//! plane's TLS ends at the apiserver.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -33,12 +37,16 @@ use tokio_util::sync::CancellationToken;
 use gateway_api::gateways::Gateway;
 
 use super::auth::{Authenticator, Refusal};
+use super::ca::ServingKey;
 use super::reconcile::{class_owner, ClassOwner};
 use super::reports::{InstanceId, LIVENESS};
 use super::ControllerCtx;
 use crate::logging::{info, warn};
 use crate::proxy::worker::AcceptBackoff;
-use crate::sync::{GatewayKey, Snapshot, SyncRequest, HOLD, PROTOCOL, STANDBY_HEADER};
+use crate::sync::{
+    sign, GatewayKey, Gone, Signed, Snapshot, SyncRequest, HOLD, PROTOCOL, STANDBY_HEADER,
+    TOKEN_HEADER,
+};
 
 /// Followed by `{namespace}/{name}` of the Gateway.
 const SYNC_PREFIX: &str = "/v1/sync/";
@@ -71,14 +79,12 @@ const MAX_CONNECTIONS_PER_PEER: usize = 32;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every 503's: the data plane's first backoff step.
 const RETRY_AFTER_SECS: u64 = 1;
-/// The token's other header: the apiserver service proxy drops
-/// Authorization on its hop.
-const TOKEN_HEADER: &str = "x-portail-token";
 
 /// The sync endpoint's state.
 pub(crate) struct SyncServer {
     ctx: Arc<ControllerCtx>,
     auth: Authenticator,
+    signer: ServingKey,
     holds: Holds,
     lapses: Arc<Lapses>,
     connections: Arc<Semaphore>,
@@ -95,12 +101,14 @@ impl SyncServer {
     pub(crate) fn new(
         ctx: Arc<ControllerCtx>,
         auth: Authenticator,
+        signer: ServingKey,
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         Self::with_connections(
             ctx,
             auth,
+            signer,
             lapses,
             shutdown,
             MAX_CONNECTIONS,
@@ -111,6 +119,7 @@ impl SyncServer {
     fn with_connections(
         ctx: Arc<ControllerCtx>,
         auth: Authenticator,
+        signer: ServingKey,
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
         connections: usize,
@@ -119,6 +128,7 @@ impl SyncServer {
         Arc::new(Self {
             ctx,
             auth,
+            signer,
             holds: Holds::default(),
             lapses,
             connections: Arc::new(Semaphore::new(connections)),
@@ -170,7 +180,7 @@ impl SyncServer {
         // restarted controller holds no verdict for its token, and a
         // refusal would leave it serving the deleted Gateway.
         if !self.serves(&key) {
-            return not_served();
+            return self.gone(&key);
         }
         let declared = request
             .headers()
@@ -217,7 +227,7 @@ impl SyncServer {
             );
         }
         if !self.serves(&key) {
-            return not_served();
+            return self.gone(&key);
         }
         if let Some(report) = sync.report {
             let leaving = report.leaving;
@@ -266,17 +276,17 @@ impl SyncServer {
         let mut current = self.ctx.hub.subscribe(key);
         if !self.serves(key) {
             self.ctx.hub.remove(key);
-            return not_served();
+            return self.gone(key);
         }
         let deadline = Instant::now() + HOLD;
         loop {
             let snapshot = current.borrow_and_update().clone();
             if let Some(snapshot) = snapshot.filter(|s| s.version != have) {
-                return served(&snapshot);
+                return self.served(&snapshot);
             }
             tokio::select! {
                 changed = current.changed() => if changed.is_err() {
-                    return not_served();
+                    return self.gone(key);
                 },
                 _ = tokio::time::sleep_until(deadline) => return no_content(),
                 // The instance asked again: this answer has no reader.
@@ -284,6 +294,52 @@ impl SyncServer {
                 _ = self.shutdown.cancelled() => return standby("shutting down"),
             }
         }
+    }
+
+    fn served(&self, snapshot: &Snapshot) -> Response<Full<Bytes>> {
+        match serde_json::to_vec(snapshot) {
+            Ok(json) => self.signed(Signed::Snapshot, json),
+            Err(e) => text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("snapshot not serialized: {e}"),
+            ),
+        }
+    }
+
+    /// The 404 that tells `key`'s own data plane its Gateway is gone. It
+    /// closes the connection, as every refusal does.
+    fn gone(&self, key: &GatewayKey) -> Response<Full<Bytes>> {
+        let body = serde_json::to_vec(&Gone::now(key.clone()))
+            .expect("a Gateway key and a number serialize");
+        let mut response = self.signed(Signed::Gone, body);
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        response
+    }
+
+    /// `body`, a JSON answer of `kind`, with its signature.
+    fn signed(&self, kind: Signed, body: Vec<u8>) -> Response<Full<Bytes>> {
+        let signature = match sign(&self.signer.current(), kind, &body) {
+            Ok(signature) => signature,
+            Err(e) => {
+                return text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("answer not signed: {e}"),
+                )
+            }
+        };
+        let mut response = Response::new(Full::new(Bytes::from(body)));
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        for (name, value) in signature {
+            headers.insert(name, value);
+        }
+        response
     }
 }
 
@@ -343,30 +399,10 @@ fn refused(refusal: Refusal) -> Response<Full<Bytes>> {
     }
 }
 
-fn not_served() -> Response<Full<Bytes>> {
-    text(StatusCode::NOT_FOUND, "gateway not served")
-}
-
 fn no_content() -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::default());
     *response.status_mut() = StatusCode::NO_CONTENT;
     response
-}
-
-fn served(snapshot: &Snapshot) -> Response<Full<Bytes>> {
-    match serde_json::to_vec(snapshot) {
-        Ok(json) => {
-            let mut response = Response::new(Full::new(Bytes::from(json)));
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-            response
-        }
-        Err(e) => text(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("snapshot not serialized: {e}"),
-        ),
-    }
 }
 
 /// One held poll per instance: a data plane asks again when its report
@@ -740,6 +776,8 @@ mod tests {
         api: MockApi,
         cluster: TestCluster,
         ctx: Arc<ControllerCtx>,
+        /// Signs the server's answers.
+        ca: super::super::ca::ControllerCa,
         server: Arc<SyncServer>,
         wakes: mpsc::UnboundedReceiver<GatewayKey>,
         shutdown: CancellationToken,
@@ -766,9 +804,12 @@ mod tests {
         edit(Arc::get_mut(&mut ctx).unwrap());
         let (lapses, wakes) = Lapses::new();
         let shutdown = CancellationToken::new();
+        let ns = super::super::auth::testing::NS;
+        let ca = super::super::ca::ControllerCa::generated(ns, "portail-controller");
         let server = SyncServer::new(
             ctx.clone(),
             authenticator(api.client(), &serial),
+            ca.serving_key(),
             lapses,
             shutdown.clone(),
         );
@@ -776,6 +817,7 @@ mod tests {
             api,
             cluster,
             ctx,
+            ca,
             server,
             wakes,
             shutdown,
@@ -816,6 +858,12 @@ mod tests {
 
     fn key() -> GatewayKey {
         GatewayKey::new("default", "gw")
+    }
+
+    /// The serving key of a CA of the default controller Service.
+    fn signer() -> ServingKey {
+        let ns = super::super::auth::testing::NS;
+        super::super::ca::ControllerCa::generated(ns, "portail-controller").serving_key()
     }
 
     fn body(gateway: &GatewayKey, have: &str, report: Option<Value>) -> Value {
@@ -1059,13 +1107,14 @@ mod tests {
         super::super::reconcile::forget_deleted_gateways(&p.ctx);
         p.api
             .reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
+        let ca = super::super::ca::ControllerCa::generated_for_localhost();
         let restarted = SyncServer::new(
             p.ctx.clone(),
             authenticator(p.api.client(), &serial),
+            ca.serving_key(),
             Lapses::new().0,
             CancellationToken::new(),
         );
-        let ca = super::super::ca::ControllerCa::generated_for_localhost();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(serve(restarted, ca.server_config(), listener));
@@ -1091,6 +1140,59 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!p.ready.load(Ordering::Acquire), "its listeners closed");
+    }
+
+    /// Snapshots and gone answers carry the serving leaf's signature, which
+    /// a data plane trusting the CA takes for the Service's name; a gone
+    /// answer names its Gateway. Through the apiserver's proxy that is all
+    /// that tells the controller from any endpoint of its Service.
+    #[tokio::test]
+    async fn snapshots_and_gone_answers_are_signed_by_the_serving_leaf() {
+        use crate::sync::{ca_roots, AnswerVerifier};
+        use std::time::SystemTime;
+        let f = fixture().await;
+        let roots = ca_roots(f.ca.ca_pem().as_bytes(), "controller CA").unwrap();
+        let verifier = AnswerVerifier::new(roots, "portail-controller.portail-system.svc").unwrap();
+        let v1 = f.publish(1);
+        let response = f.sync(poll("")).await;
+        let headers = response.headers().clone();
+        let (status, json) = text_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        verifier
+            .verify(
+                Signed::Snapshot,
+                &headers,
+                json.as_bytes(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert!(json.contains(&v1));
+
+        let ghost = GatewayKey::new("default", "ghost");
+        f.api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:default:portail-ghost",
+                Some("pod-9"),
+            ),
+        );
+        let response = f
+            .sync(post(
+                Some(&gateway_token("default", "ghost", 0)),
+                &body(&ghost, "", None),
+            ))
+            .await;
+        let headers = response.headers().clone();
+        let (status, gone) = text_of(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let now = SystemTime::now();
+        verifier
+            .verify(Signed::Gone, &headers, gone.as_bytes(), now)
+            .unwrap();
+        Gone::check(gone.as_bytes(), &ghost, now).unwrap();
+        assert!(Gone::check(gone.as_bytes(), &key(), now).is_err());
     }
 
     #[tokio::test]
@@ -1435,6 +1537,7 @@ mod tests {
         let server = SyncServer::new(
             p.ctx.clone(),
             authenticator(p.api.client(), &serial),
+            signer(),
             lapses,
             CancellationToken::new(),
         );
@@ -1536,6 +1639,7 @@ mod tests {
         let server = SyncServer::new(
             f.ctx.clone(),
             authenticator(stalled_client(in_flight.clone()), &f.serial),
+            signer(),
             Lapses::new().0,
             CancellationToken::new(),
         );
@@ -1789,6 +1893,7 @@ mod tests {
         let server = SyncServer::with_connections(
             f.ctx.clone(),
             authenticator(f.api.client(), &f.serial),
+            signer(),
             Lapses::new().0,
             f.shutdown.clone(),
             1,
@@ -1895,6 +2000,7 @@ mod tests {
         let server = SyncServer::with_connections(
             f.ctx.clone(),
             authenticator(f.api.client(), &f.serial),
+            signer(),
             Lapses::new().0,
             f.shutdown.clone(),
             MAX_CONNECTIONS,
@@ -1974,6 +2080,7 @@ mod tests {
         let server = SyncServer::with_connections(
             f.ctx.clone(),
             authenticator(f.api.client(), &f.serial),
+            signer(),
             Lapses::new().0,
             f.shutdown.clone(),
             1,
