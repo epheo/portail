@@ -603,7 +603,9 @@ impl PortailConfig {
 }
 
 /// Rule filters in the table's form. A mirror DNS cannot resolve is left
-/// out when the policy is lenient: primary traffic never depends on it.
+/// out when the policy is lenient: primary traffic never depends on it. A
+/// mirror to a refused backend (`invalid`) is left out always, its share of
+/// copies lost as a refused backend's share of requests fails.
 fn rule_filters(
     filters: &[CompiledFilter],
     resolver: &mut Resolver,
@@ -612,6 +614,7 @@ fn rule_filters(
     for f in filters {
         match f {
             CompiledFilter::Ready(filter) => out.push(filter.clone()),
+            CompiledFilter::Mirror { backend, .. } if backend.invalid => {}
             CompiledFilter::Mirror { backend, fraction } => {
                 // Copies go to one endpoint (HTTPRequestMirrorFilter.backendRef).
                 // The smallest address, not the resolver's first: records
@@ -1404,6 +1407,32 @@ mod tests {
         } else {
             panic!("expected RequestMirror filter");
         }
+    }
+
+    /// A refused mirror backend is never resolved: no copy goes to it. A
+    /// file's `invalid: true` was ignored on a mirror and the copies went.
+    #[test]
+    fn an_invalid_mirror_backend_gets_no_copies() {
+        let json = r#"{
+            "gateway": {"name": "g", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "http"}],
+                "hostnames": ["example.com"],
+                "rules": [{
+                    "filters": [{"type": "RequestMirror", "requestMirror": {
+                        "backendRef": {"name": "127.0.0.1", "port": 9999, "invalid": true}}}],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }"#;
+        let config: PortailConfig = serde_json::from_str(json).unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("example.com", "GET", "/", &[], "", 8080)
+            .unwrap();
+        assert!(rule.filters.is_empty(), "{:?}", rule.filters.len());
+        assert_eq!(rule.backends.len(), 1, "the route still serves");
     }
 
     #[test]
