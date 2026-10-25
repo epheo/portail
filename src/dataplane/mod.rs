@@ -39,7 +39,12 @@ pub async fn run(args: DataplaneArgs, stop: CancellationToken) -> anyhow::Result
         args.controller_ca_file.as_deref(),
         std::env::var(crate::cli::CONTROLLER_CA_ENV).ok(),
     )?;
-    let mut client = Client::new(&args.controller_address, &ca, args.token_file.clone())?;
+    let mut client = Client::new(
+        &args.controller_address,
+        &args.gateway,
+        &ca,
+        args.token_file.clone(),
+    )?;
 
     // Before listeners: a request must never race the writer task's spawn.
     if let Some(target) = &args.access_log {
@@ -391,16 +396,13 @@ impl SyncLoop {
     }
 
     /// Report leaving, so the controller stops counting this instance as
-    /// live. Bounded by the connect timeout: shutdown does not wait on an
-    /// unreachable controller.
+    /// live; it answers such a poll at once. Bounded by the connect
+    /// timeout: shutdown does not wait on an unreachable controller.
     async fn leave(&self, client: &mut Client) {
         let Some(report) = &self.report else {
             return;
         };
         let request = SyncRequest {
-            // Answered at once rather than held: a reachable controller
-            // confirms within one round trip.
-            have: String::new(),
             report: Some(InstanceReport {
                 leaving: true,
                 ..report.clone()

@@ -152,6 +152,7 @@ fn serves_a_snapshot_and_reports_its_binds() {
     wait_serving(&dp, port, "from-backend");
 
     let first = &stub.requests()[0];
+    assert_eq!(first.path, "/v1/sync/default/gw");
     assert!(first.request.have.is_empty() && first.request.report.is_none());
     let reported = stub
         .wait_for(0, SETTLE, applied(&served.version))

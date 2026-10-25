@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 /// The Gateway every stub snapshot is for.
 pub const GATEWAY: &str = "default/gw";
 
-/// What the stub answers a poll.
+/// What the stub answers a poll; a leaving one gets 204 at once, as from
+/// the controller.
 // Set a few times per test: the snapshot's size inline costs nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
@@ -41,6 +42,7 @@ pub enum Mode {
 #[derive(Clone, Debug)]
 pub struct Recorded {
     pub at: Instant,
+    pub path: String,
     /// Which TLS connection it came on, numbered from 1 in accept order.
     pub connection: u64,
     pub authorization: Option<String>,
@@ -222,6 +224,7 @@ async fn answer(
     connection: u64,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path = request.uri().path().to_string();
     let authorization = request
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -234,14 +237,30 @@ async fn answer(
     let Ok(sync) = serde_json::from_slice::<SyncRequest>(&body) else {
         return Ok(reply(&state, connection, StatusCode::BAD_REQUEST, None, ""));
     };
+    // The controller's contract: the path names the body's Gateway.
+    let own = format!("/v1/sync/{}/{}", sync.gateway.namespace, sync.gateway.name);
+    if path != own {
+        return Ok(reply(
+            &state,
+            connection,
+            StatusCode::BAD_REQUEST,
+            None,
+            "path",
+        ));
+    }
     let have = sync.have.clone();
+    let leaving = sync.report.as_ref().is_some_and(|report| report.leaving);
     state.requests.lock().unwrap().push(Recorded {
         at: Instant::now(),
+        path,
         connection,
         authorization,
         request: sync,
     });
 
+    if leaving {
+        return Ok(reply(&state, connection, StatusCode::NO_CONTENT, None, ""));
+    }
     let mut mode = state.mode.subscribe();
     let deadline = tokio::time::Instant::now() + state.hold;
     loop {

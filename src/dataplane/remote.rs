@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
 use crate::cli::CONTROLLER_CA_ENV;
-use crate::sync::{SyncRequest, HOLD};
+use crate::sync::{GatewayKey, SyncRequest, HOLD};
 
 /// Bounds a connect, TCP and TLS together: in-cluster connects take
 /// milliseconds, so this only cuts short a dead endpoint during failover.
@@ -32,7 +32,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// went to a peer that is gone.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * HOLD.as_secs());
 
-/// Appended to the controller address's own path.
+/// Appended to the controller address's own path, then the Gateway's
+/// namespace and name: the controller checks the token against the path
+/// before it reads the body.
 const SYNC_PATH: &str = "/v1/sync";
 
 /// The share of an error answer's body a log line keeps: a reason, not a
@@ -106,10 +108,16 @@ pub fn controller_ca(file: Option<&Path>, env: Option<String>) -> anyhow::Result
 }
 
 impl Client {
-    /// A client of the sync endpoint under `address` (an https URL), which
-    /// must present a certificate for its host chaining to `ca_pem`.
-    pub fn new(address: &str, ca_pem: &[u8], token_file: PathBuf) -> anyhow::Result<Self> {
-        let target = Target::parse(address)
+    /// A client of `gateway`'s sync endpoint under `address` (an https
+    /// URL), which must present a certificate for its host chaining to
+    /// `ca_pem`.
+    pub fn new(
+        address: &str,
+        gateway: &GatewayKey,
+        ca_pem: &[u8],
+        token_file: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let target = Target::parse(address, gateway)
             .with_context(|| format!("--controller-address {:?}", address))?;
         let mut roots = rustls::RootCertStore::empty();
         for cert in CertificateDer::pem_slice_iter(ca_pem) {
@@ -261,7 +269,7 @@ struct Target {
 }
 
 impl Target {
-    fn parse(address: &str) -> anyhow::Result<Self> {
+    fn parse(address: &str, gateway: &GatewayKey) -> anyhow::Result<Self> {
         let uri: Uri = address.parse()?;
         anyhow::ensure!(uri.scheme_str() == Some("https"), "not an https URL");
         anyhow::ensure!(uri.query().is_none(), "takes no query");
@@ -271,6 +279,17 @@ impl Target {
             "takes no user information"
         );
         let host = authority.host();
+        let path = format!(
+            "{}{}/{}/{}",
+            uri.path().trim_end_matches('/'),
+            SYNC_PATH,
+            gateway.namespace,
+            gateway.name
+        );
+        // As sent, whole: no query, no fragment cut off, no byte refused.
+        let whole = http::uri::PathAndQuery::try_from(path.as_str())
+            .is_ok_and(|parsed| parsed.path() == path);
+        anyhow::ensure!(whole, "Gateway {} makes no URL path", gateway);
         Ok(Self {
             host: host
                 .trim_start_matches('[')
@@ -278,7 +297,7 @@ impl Target {
                 .to_string(),
             port: authority.port_u16().unwrap_or(443),
             authority: authority.as_str().to_string(),
-            path: format!("{}{}", uri.path().trim_end_matches('/'), SYNC_PATH),
+            path,
         })
     }
 }
@@ -369,19 +388,21 @@ mod tests {
 
     #[test]
     fn the_address_names_host_port_and_path() {
-        let target = Target::parse("https://portail-controller.portail-system.svc:9443").unwrap();
+        let gateway = GatewayKey::new("portail-system", "public");
+        let parse = |address: &str| Target::parse(address, &gateway);
+        let target = parse("https://portail-controller.portail-system.svc:9443").unwrap();
         assert_eq!(
             target,
             Target {
                 host: "portail-controller.portail-system.svc".into(),
                 port: 9443,
                 authority: "portail-controller.portail-system.svc:9443".into(),
-                path: "/v1/sync".into(),
+                path: "/v1/sync/portail-system/public".into(),
             }
         );
 
         // Under a path, as through the apiserver's service proxy.
-        let target = Target::parse(
+        let target = parse(
             "https://apiserver.example/api/v1/namespaces/ps/services/https:portail-controller:9443/proxy/",
         )
         .unwrap();
@@ -391,10 +412,10 @@ mod tests {
         );
         assert_eq!(
             target.path,
-            "/api/v1/namespaces/ps/services/https:portail-controller:9443/proxy/v1/sync"
+            "/api/v1/namespaces/ps/services/https:portail-controller:9443/proxy/v1/sync/portail-system/public"
         );
 
-        let target = Target::parse("https://[fd00::1]:9443").unwrap();
+        let target = parse("https://[fd00::1]:9443").unwrap();
         assert_eq!(
             (target.host.as_str(), target.authority.as_str()),
             ("fd00::1", "[fd00::1]:9443")
@@ -407,7 +428,23 @@ mod tests {
             "https://user@portail-controller:9443",
             "https://",
         ] {
-            assert!(Target::parse(bad).is_err(), "{bad}");
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A dotted Gateway name is a path segment as it is; a key no path can
+    /// carry is refused at start, not at the first poll.
+    #[test]
+    fn the_path_names_the_gateway() {
+        let address = "https://ctl:9443";
+        let dotted = GatewayKey::new("ns", "gw.example");
+        assert_eq!(
+            Target::parse(address, &dotted).unwrap().path,
+            "/v1/sync/ns/gw.example"
+        );
+        for name in ["a?b", "a#b", "a b"] {
+            let key = GatewayKey::new("ns", name);
+            assert!(Target::parse(address, &key).is_err(), "{name:?}");
         }
     }
 
@@ -455,7 +492,8 @@ mod tests {
 
     #[test]
     fn a_ca_without_a_certificate_is_refused() {
-        let error = Client::new("https://ctl:9443", b"no pem here", PathBuf::from("/t"))
+        let gateway = GatewayKey::new("ns", "gw");
+        let error = Client::new("https://ctl:9443", &gateway, b"no pem", PathBuf::from("/t"))
             .err()
             .unwrap();
         assert!(error.to_string().contains("no certificate"), "{error:#}");
