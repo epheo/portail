@@ -87,12 +87,12 @@ metrics! {
     pool_stale_retries_total: "Requests replayed on a fresh connection after a pooled one died before answering",
     udp_session_overflow_drops_total: "UDP datagrams dropped because their listener was at its session cap",
     dns_refresh_swaps_total: "DNS refresh passes that installed a changed backend set",
-    dns_refresh_superseded_total: "DNS refresh passes dropped because a reconcile swapped concurrently",
+    dns_refresh_superseded_total: "DNS refresh passes dropped because an apply swapped concurrently",
     dns_refresh_unchanged_total: "DNS refresh passes with an unchanged backend set",
     backends_marked_unhealthy_total: "Backend health transitions into UNHEALTHY",
     backends_recovered_total: "Backend health recoveries (probe or passive)",
-    reconcile_runs_total: "Gateway reconcile passes that ran the apply path",
-    reconcile_skips_total: "Gateway reconcile passes short-circuited by the fingerprint gate",
+    reconcile_runs_total: "Gateway reconcile passes that published a new snapshot or wrote status",
+    reconcile_skips_total: "Gateway reconcile passes that published and wrote nothing",
 }
 
 // --- Latency histograms ----------------------------------------------------

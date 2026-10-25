@@ -5,6 +5,7 @@ pub mod admin;
 pub mod cli;
 pub mod config;
 pub mod config_watcher;
+pub mod dataplane;
 pub mod kubernetes;
 pub mod logging;
 pub mod metrics;

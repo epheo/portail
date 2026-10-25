@@ -91,7 +91,7 @@ impl Transport {
 mod tests {
     use super::*;
 
-    /// The request of design 3.4, with a field a newer data plane adds.
+    /// A full request, with fields a newer data plane adds.
     #[test]
     fn a_request_parses_and_tolerates_new_fields() {
         let request: SyncRequest = serde_json::from_value(serde_json::json!({

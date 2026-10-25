@@ -14,7 +14,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 use crate::config::compile::compile_http_route;
 use crate::config::*;
-use crate::logging::warn;
 
 use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
@@ -346,15 +345,6 @@ pub(crate) fn reconcile_to_config(
         .cloned()
         .collect();
 
-    // Bind the fronting Service's targetPort: the operator maps the published
-    // (possibly privileged) port -> an unprivileged target the pod binds, so no
-    // NET_BIND_SERVICE is needed. Empty in multi-network mode (no Service), where
-    // listeners fall back to binding their published port directly.
-    let target_ports = resolve_listener_target_ports(&snapshot.services, gateway_ns, gateway_name);
-    for l in &mut gateway_config.listeners {
-        l.target_port = target_ports.get(&l.port).copied();
-    }
-
     let policy_status = apply_rate_limit_policies(
         &mut gateway_config.listeners,
         &snapshot.rate_limit_policies,
@@ -408,8 +398,7 @@ pub(crate) fn reconcile_to_config(
 /// attachment). A `sectionName`-scoped policy beats a Gateway-wide one for
 /// its listener; among equal specificity the OLDEST policy wins
 /// (creationTimestamp, then name — the GEP-713 conflict rule) and later
-/// ones report Conflicted. Runs before the unscoped-mode merge prefixes
-/// listener names, so sectionName matches the Gateway's own listener names.
+/// ones report Conflicted.
 pub(crate) fn apply_rate_limit_policies(
     listeners: &mut [ListenerConfig],
     policies: &[Arc<RateLimitPolicy>],
@@ -635,65 +624,6 @@ pub(crate) fn listener_is_served(l: &GatewayListeners) -> bool {
             .is_some_and(|tls| tls.mode == Some(GatewayListenersTlsMode::Passthrough)),
         _ => false,
     }
-}
-
-/// published listener port -> Service `targetPort` for the Service fronting this
-/// Gateway, identified by the label `portail.epheo.eu/gateway == gw_name` in
-/// `gw_ns`. The operator emits exactly one such LoadBalancer Service with numeric
-/// targetPorts; in multi-network mode there is no Service and the result is empty
-/// (listeners then bind their published port directly).
-fn resolve_listener_target_ports(
-    services: &[Arc<Service>],
-    gw_ns: &str,
-    gw_name: &str,
-) -> HashMap<u16, u16> {
-    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-
-    let mut matching = services.iter().filter(|svc| {
-        svc.metadata.namespace.as_deref() == Some(gw_ns)
-            && svc
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get("portail.epheo.eu/gateway"))
-                .is_some_and(|v| v == gw_name)
-    });
-
-    let Some(svc) = matching.next() else {
-        return HashMap::new();
-    };
-    if matching.next().is_some() {
-        warn!(
-            "Multiple Services labelled portail.epheo.eu/gateway={} in {}; using {:?}",
-            gw_name,
-            gw_ns,
-            svc.metadata.name.as_deref().unwrap_or("?")
-        );
-    }
-
-    let mut map = HashMap::new();
-    let Some(spec) = svc.spec.as_ref() else {
-        return map;
-    };
-    for p in spec.ports.iter().flatten() {
-        let Ok(published) = u16::try_from(p.port) else {
-            continue;
-        };
-        match &p.target_port {
-            Some(IntOrString::Int(t)) => {
-                if let Ok(target) = u16::try_from(*t) {
-                    map.insert(published, target);
-                }
-            }
-            Some(IntOrString::String(name)) => warn!(
-                "Service for gateway {} uses named targetPort {:?} on port {}; binding the \
-                 published port (operator should emit numeric targetPorts)",
-                gw_name, name, published
-            ),
-            None => {} // omitted targetPort defaults to `port` -> no decoupling
-        }
-    }
-    map
 }
 
 /// Per-Gateway inputs shared by every `collect_routes` call of one pass.

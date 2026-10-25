@@ -1,7 +1,5 @@
-//! Reflector/watch plumbing: store+stream construction (plain, optional-CRD,
-//! and shape-gated variants), the secondary-resource → Gateway mappers, and
-//! the operator-provided `WatchShape` that decides which gate-able watches a
-//! scoped data plane opens at all.
+//! Reflector/watch plumbing: store+stream construction (plain and
+//! optional-CRD) and the secondary-resource → Gateway mappers.
 
 use std::time::Duration;
 
@@ -25,10 +23,9 @@ use crate::logging::{info, warn};
 /// of mapped Gateway(s) when resources change.
 ///
 /// Streams the initial list via the WatchList API instead of a single blocking
-/// LIST. Each per-Gateway pod cold-starts by listing ~6 cluster-wide resource
-/// types; with N pods watching + route/Service churn, concurrent blocking LISTs
-/// saturate the apiserver and a fresh pod's reflector sync stalls (measured 1s
-/// isolated → 20s+/never under load), which is the cold-start convergence flake.
+/// LIST: cluster-wide lists of every Service, route and Secret are the
+/// controller's cold start, and concurrent blocking LISTs under churn stall
+/// on a loaded apiserver (measured 1s isolated, 20s+ or never under load).
 /// Streaming lists are far lighter on the apiserver under that load. Requires
 /// server WatchList support (k8s >= 1.27; default-on >= 1.30).
 pub(super) fn create_reflector<K>(api: Api<K>) -> (Store<K>, BoxedReflectorStream<K>)
@@ -42,17 +39,7 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
-    create_reflector_gated_with_config(true, api, watcher::Config::default().streaming_lists())
-}
-
-/// An empty store and a stream that never yields; no LIST/WATCH is opened.
-fn empty_reflector<K>() -> (Store<K>, BoxedReflectorStream<K>)
-where
-    K: kube::Resource + Clone + Send + 'static,
-    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
-{
-    let writer = reflector::store::Writer::default();
-    (writer.as_reader(), Box::pin(futures::stream::pending()))
+    create_reflector_with_config(api, watcher::Config::default().streaming_lists())
 }
 
 /// Like `create_reflector`, for a CRD that may not be installed. When API
@@ -250,8 +237,7 @@ impl StatusReports for RateLimitPolicy {
     }
 }
 
-/// The served Gateways among `candidates`. The store check is what makes
-/// scoped pods ignore objects for Gateways they do not serve.
+/// The Gateways among `candidates` that are in the store.
 fn served<'a>(
     candidates: impl Iterator<Item = (&'a str, &'a str)>,
     store: &Store<Gateway>,
@@ -352,69 +338,14 @@ pub(super) fn all_gateway_refs(store: &Store<Gateway>) -> Vec<ObjectRef<Gateway>
         .collect()
 }
 
-/// Which *gate-able* secondary resources a single-Gateway data plane needs to
-/// watch. Derived by portail-operator from the Gateway's listeners and passed
-/// via `--watch-shape`, so a scoped pod skips cluster-wide watches it will never
-/// consume. The default (`--watch-shape` absent → `WatchShape::all()`) keeps the
-/// legacy broad behavior, so an older operator that does not set the flag still
-/// works unchanged.
-///
-/// IMPORTANT: only resources that never `parentRef` a Gateway may be gated.
-/// Route watches (HTTP/TCP/TLS/UDP) are deliberately NOT here: a route in any
-/// namespace, of any kind, may `parentRef` this Gateway and must receive a
-/// status — attached, or rejected with `NotAllowedByListeners` /
-/// `NoMatchingParent` — which requires the data plane to observe it. Secrets and
-/// Namespace labels do not `parentRef` Gateways, so they are safe to drop.
-#[derive(Clone, Copy, Debug)]
-pub struct WatchShape {
-    pub tls_secrets: bool,
-    pub namespaces: bool,
-}
-
-impl WatchShape {
-    /// Watch every gate-able secondary resource (legacy / unscoped mode).
-    pub fn all() -> Self {
-        Self {
-            tls_secrets: true,
-            namespaces: true,
-        }
-    }
-
-    /// Parse the operator's `--watch-shape` token set. `None` → `all()` (broad,
-    /// legacy). `Some(spec)` → enable only the listed gate-able watches: `tls`
-    /// (a TLS-terminate listener) and `ns-labels` (an `allowedRoutes: Selector`
-    /// listener).
-    pub fn parse(spec: Option<&str>) -> Self {
-        let Some(spec) = spec else {
-            return Self::all();
-        };
-        let mut s = Self {
-            tls_secrets: false,
-            namespaces: false,
-        };
-        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-            match token {
-                "tls" => s.tls_secrets = true,
-                "ns-labels" => s.namespaces = true,
-                other => warn!("ignoring unknown --watch-shape token: {other}"),
-            }
-        }
-        s
-    }
-}
-
-/// A boxed reflector stream — the uniform type used by gated watches so the
-/// `Controller` wiring stays identical whether or not the watch is active.
+/// A boxed reflector stream: plain and optional-CRD watches share the type,
+/// so the `Controller` wiring treats them alike.
 pub(super) type BoxedReflectorStream<K> =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static>>;
 
-/// Like `create_reflector` but gated, with a caller-supplied watcher config:
-/// when `enabled` is false, returns an empty store and a stream that never yields
-/// — the controller opens no LIST/WATCH for it — while keeping the `Controller`
-/// wiring uniform. `config` lets callers add a field selector etc. (e.g. the TLS
-/// Secret watch's `type=kubernetes.io/tls`).
-pub(super) fn create_reflector_gated_with_config<K>(
-    enabled: bool,
+/// Like `create_reflector`, with a caller-supplied watcher config: a field
+/// selector etc. (e.g. the TLS Secret watch's `type=kubernetes.io/tls`).
+pub(super) fn create_reflector_with_config<K>(
     api: Api<K>,
     config: watcher::Config,
 ) -> (Store<K>, BoxedReflectorStream<K>)
@@ -428,9 +359,6 @@ where
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
-    if !enabled {
-        return empty_reflector();
-    }
     let writer = reflector::store::Writer::default();
     let reader = writer.as_reader();
     (reader, reflector_stream(writer, api, config))
@@ -464,7 +392,7 @@ where
 const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
 /// Drop metadata no reconcile reads before the reflector caches the object.
-/// Every pod caches every Service and TLS Secret in the cluster, and
+/// The controller caches every Service and TLS Secret in the cluster, and
 /// managedFields often outweighs the spec. On a Secret, the last-applied
 /// annotation repeats the certificate and key.
 pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
@@ -473,25 +401,6 @@ pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
     if let Some(annotations) = meta.annotations.as_mut() {
         annotations.remove(LAST_APPLIED_ANNOTATION);
     }
-}
-
-/// The gated counterpart of `create_reflector`: same default streaming-list
-/// config, but opens no LIST/WATCH when `enabled` is false.
-pub(super) fn create_reflector_gated<K>(
-    enabled: bool,
-    api: Api<K>,
-) -> (Store<K>, BoxedReflectorStream<K>)
-where
-    K: kube::Resource
-        + Clone
-        + std::fmt::Debug
-        + serde::de::DeserializeOwned
-        + Send
-        + Sync
-        + 'static,
-    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
-{
-    create_reflector_gated_with_config(enabled, api, watcher::Config::default().streaming_lists())
 }
 
 #[cfg(test)]
@@ -677,26 +586,5 @@ mod tests {
         let annotations = secret.metadata.annotations.unwrap();
         assert!(!annotations.contains_key(LAST_APPLIED_ANNOTATION));
         assert_eq!(annotations["keep"], "me");
-    }
-
-    #[test]
-    fn watch_shape_parse() {
-        // Absent → broad (legacy): every gate-able watch on.
-        let all = WatchShape::parse(None);
-        assert!(all.tls_secrets && all.namespaces);
-
-        // Present-but-empty → minimal: no gate-able extras (routes stay
-        // cluster-wide regardless — they are never gated).
-        let min = WatchShape::parse(Some(""));
-        assert!(!min.tls_secrets && !min.namespaces);
-
-        // TLS-terminate listener only.
-        let tls = WatchShape::parse(Some("tls"));
-        assert!(tls.tls_secrets && !tls.namespaces);
-
-        // Unknown / retired tokens (e.g. the old route-scoping tokens) are
-        // ignored; recognized ones still apply.
-        let u = WatchShape::parse(Some("routes-same, udp-routes, bogus , ns-labels"));
-        assert!(u.namespaces && !u.tls_secrets);
     }
 }

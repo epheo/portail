@@ -9,19 +9,20 @@
 //! resolved address set actually changes**.
 //!
 //! It deliberately reuses the existing `Arc<ArcSwap<RouteTable>>` swap that
-//! already backs config reload — a DNS change triggers the same atomic swap a
-//! reconcile would, with no apiserver call and no hot-path change (every
+//! already backs config reload — a DNS change triggers the same atomic swap an
+//! apply would, with no apiserver call and no hot-path change (every
 //! resolved address is an ordinary fixed-`socket_addr` backend). Health state is
 //! keyed by `socket_addr` and lives outside the table: a swap prunes the pods
 //! that left it, so surviving pods keep their passive-health status and new or
-//! recycled pod IPs start optimistically healthy, matching the reconcile-driven
+//! recycled pod IPs start optimistically healthy, matching the apply-driven
 //! swap.
 //!
 //! The swap is a **compare-and-swap** against the table this task snapshotted at
-//! the start of the tick: the reconciler is a second, authoritative writer of the
-//! same cell, so if it stores a fresher table during this task's (blocking)
-//! re-resolve, the CAS leaves that table in place and this tick is dropped. That
-//! keeps the task stateless and unable to clobber a just-applied config change.
+//! the start of the tick: the [`Applier`](super::Applier) is a second,
+//! authoritative writer of the same cell, so if it stores a fresher table
+//! during this task's (blocking) re-resolve, the CAS leaves that table in
+//! place and this tick is dropped. That keeps the task stateless and unable
+//! to clobber a just-applied config change.
 //!
 //! The config and the table built from it are read as one [`Published`] pair.
 //! From two cells, a tick could pair an older config with a newer table and
@@ -39,7 +40,7 @@ use crate::metrics::METRICS;
 use crate::proxy::health::HealthRegistry;
 use crate::routing::RouteTable;
 
-/// A config and the route table the reconciler built from it.
+/// A config and the route table the Applier built from it.
 pub struct Published {
     pub config: Arc<PortailConfig>,
     pub table: Arc<RouteTable>,
@@ -47,11 +48,11 @@ pub struct Published {
 
 /// Spawn the background DNS-refresh task.
 ///
-/// `published` is the shared cell the Kubernetes reconciler publishes its
-/// last-built config and table into. This task is spawned only in Kubernetes
-/// mode (the standalone config-file path re-resolves on reload via
-/// `config_watcher`, not here), and it no-ops on each tick until the first
-/// reconcile populates the cell. A zero `interval` disables the task entirely.
+/// `published` is the shared cell the Applier publishes its last-built
+/// config and table into. This task is spawned only in data-plane mode (the
+/// standalone config-file path re-resolves on reload via `config_watcher`,
+/// not here), and it no-ops on each tick until the first apply populates
+/// the cell. A zero `interval` disables the task entirely.
 ///
 /// `on_swap` runs after each swap: the backends' pods changed.
 pub fn spawn_dns_refresh(
@@ -86,7 +87,7 @@ pub fn spawn_dns_refresh(
             }
 
             // The pair's table is the one to replace: the CAS in
-            // `apply_refresh` tells whether a reconcile swapped a fresher
+            // `apply_refresh` tells whether an apply swapped a fresher
             // table in while we were resolving.
             let Some(pair) = published.load_full() else {
                 continue;
@@ -124,9 +125,7 @@ pub fn spawn_dns_refresh(
                 }
                 SwapOutcome::Superseded => {
                     METRICS.dns_refresh_superseded_total.inc();
-                    debug!(
-                        "DNS refresh: reconcile swapped concurrently; dropping re-resolved table"
-                    )
+                    debug!("DNS refresh: an apply swapped concurrently; dropping re-resolved table")
                 }
                 SwapOutcome::Unchanged => METRICS.dns_refresh_unchanged_total.inc(),
             }
@@ -141,7 +140,7 @@ enum SwapOutcome {
     Unchanged,
     /// Re-resolved table installed.
     Swapped,
-    /// A concurrent writer (the reconciler) swapped first — re-resolve dropped.
+    /// A concurrent writer (the Applier) swapped first — re-resolve dropped.
     Superseded,
 }
 
@@ -150,7 +149,7 @@ enum SwapOutcome {
 /// writer swapped in the meantime.
 ///
 /// The compare-and-swap against `pair.table` is what stops a slow re-resolve
-/// from clobbering a fresh reconcile: if the reconciler stored a newer table
+/// from clobbering a fresh apply: if the Applier stored a newer table
 /// while we were resolving, the CAS leaves it in place and we drop our
 /// (now-stale) rebuild. The pair is an immutable snapshot, so its
 /// `dns_signature` is stable; comparing against it detects DNS drift relative
@@ -170,7 +169,7 @@ fn apply_refresh(
     if !Arc::ptr_eq(&pair.table, &prev) {
         return SwapOutcome::Superseded;
     }
-    // The next tick must compare against the table now live. A reconcile
+    // The next tick must compare against the table now live. An apply
     // that published since keeps its newer pair.
     published.compare_and_swap(
         &Some(pair.clone()),
@@ -195,7 +194,7 @@ mod tests {
         t
     }
 
-    /// The cells as a reconcile leaves them: `table` live and published with
+    /// The cells as an apply leaves them: `table` live and published with
     /// the config it was built from.
     fn reconciled(
         ip: &str,
@@ -247,7 +246,7 @@ mod tests {
         assert!(Arc::ptr_eq(&now.config, &pair.config));
     }
 
-    /// A swap tells the controller: the backends' pods changed.
+    /// A swap is reported: the backends' pods changed.
     #[tokio::test]
     async fn swap_runs_on_swap() {
         let config: PortailConfig = serde_json::from_str(
