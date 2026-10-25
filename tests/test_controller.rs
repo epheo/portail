@@ -243,7 +243,7 @@ fn token() -> String {
     )
 }
 
-/// POST /v1/sync over TLS, trusting only `ca_pem` for the controller
+/// POST /v1/sync/default/gw over TLS, trusting only `ca_pem` for the controller
 /// Service's name; the status code.
 fn sync(ca_pem: &str, token: &str) -> u16 {
     let mut roots = rustls::RootCertStore::empty();
@@ -268,7 +268,7 @@ fn sync(ca_pem: &str, token: &str) -> u16 {
     let body =
         json!({"protocol": 1, "gateway": {"namespace": "default", "name": "gw"}}).to_string();
     let request = format!(
-        "POST /v1/sync HTTP/1.1\r\nHost: {AUDIENCE}\r\nAuthorization: Bearer {token}\r\n\
+        "POST /v1/sync/default/gw HTTP/1.1\r\nHost: {AUDIENCE}\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );

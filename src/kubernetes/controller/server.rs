@@ -1,10 +1,10 @@
-//! `POST /v1/sync` over TLS: authenticate, record the report, answer the
-//! current snapshot or hold the poll until a newer one.
+//! `POST /v1/sync/{namespace}/{name}` over TLS: authenticate, record the
+//! report, answer the current snapshot or hold the poll until a newer one.
 //!
-//! Order per request: leadership and caches, then the token on the headers
-//! alone, then the body, then TokenReview. A junk token never has its body
-//! read; a well-formed one has it read, capped, because the Gateway its
-//! subject must match is in the body.
+//! Order per request: leadership and caches, then the token against the
+//! Gateway in the path, on the head alone, then TokenReview, and only then
+//! the body: an unauthenticated peer never makes the controller read or
+//! hold more than a capped request head.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -20,6 +20,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kube::runtime::reflector::ObjectRef;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -34,13 +35,27 @@ use crate::logging::{info, warn};
 use crate::proxy::worker::AcceptBackoff;
 use crate::sync::{GatewayKey, Snapshot, SyncRequest, HOLD, PROTOCOL};
 
-const SYNC_PATH: &str = "/v1/sync";
+/// Followed by `{namespace}/{name}` of the Gateway.
+const SYNC_PREFIX: &str = "/v1/sync/";
 /// A report grows with listeners and endpoints; konstruct's 13-listener
 /// Gateway is two orders below.
 const MAX_BODY: usize = 1024 * 1024;
-/// The TLS handshake and the request body each get as long as hyper gives
-/// the request head (its default header_read_timeout).
-const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bodies read at once, as many as TokenReviews in flight: 16 MiB at most,
+/// and a report reads in milliseconds.
+const MAX_BODY_READS: usize = 16;
+/// The longest request head, and hyper's read buffer: a token is at most
+/// 16 KiB (the pre-check refuses more), the rest of a head a few hundred
+/// bytes.
+const MAX_HEAD: usize = 32 * 1024;
+/// Open connections. A data plane holds one, two while a report change
+/// replaces its poll: room for 512 data-plane pods per controller, each
+/// connection at most its read buffer and a TLS record or two, about
+/// 64 MiB in all.
+const MAX_CONNECTIONS: usize = 1024;
+/// The TLS handshake, the request head and the body each: in-cluster they
+/// take milliseconds; 5s absorbs a loaded node and frees a stalled peer's
+/// connection in a sixth of the hold.
+const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every 503's: the data plane's first backoff step.
 const RETRY_AFTER_SECS: u64 = 1;
 /// The token's other header: the apiserver service proxy drops
@@ -53,6 +68,8 @@ pub(crate) struct SyncServer {
     auth: Authenticator,
     holds: Holds,
     lapses: Arc<Lapses>,
+    connections: Arc<Semaphore>,
+    body_reads: Semaphore,
     shutdown: CancellationToken,
 }
 
@@ -63,11 +80,23 @@ impl SyncServer {
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
+        Self::with_connections(ctx, auth, lapses, shutdown, MAX_CONNECTIONS)
+    }
+
+    fn with_connections(
+        ctx: Arc<ControllerCtx>,
+        auth: Authenticator,
+        lapses: Arc<Lapses>,
+        shutdown: CancellationToken,
+        connections: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
             auth,
             holds: Holds::default(),
             lapses,
+            connections: Arc::new(Semaphore::new(connections)),
+            body_reads: Semaphore::new(MAX_BODY_READS),
             shutdown,
         })
     }
@@ -78,9 +107,14 @@ impl SyncServer {
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        if request.uri().path() != SYNC_PATH {
+        let Some(key) = request
+            .uri()
+            .path()
+            .strip_prefix(SYNC_PREFIX)
+            .and_then(|gateway| gateway.parse::<GatewayKey>().ok())
+        else {
             return text(StatusCode::NOT_FOUND, "not found");
-        }
+        };
         if request.method() != Method::POST {
             return text(StatusCode::METHOD_NOT_ALLOWED, "POST only");
         }
@@ -97,6 +131,10 @@ impl SyncServer {
             Ok(claimed) => claimed,
             Err(refusal) => return refused(refusal),
         };
+        let instance = match self.auth.authenticate(&claimed, &token, &key).await {
+            Ok(instance) => instance,
+            Err(refusal) => return refused(refusal),
+        };
         let declared = request
             .headers()
             .get(header::CONTENT_LENGTH)
@@ -105,6 +143,9 @@ impl SyncServer {
         if declared.is_some_and(|len| len > MAX_BODY as u64) {
             return text(StatusCode::PAYLOAD_TOO_LARGE, "body over 1 MiB");
         }
+        let Ok(_reading) = self.body_reads.try_acquire() else {
+            return unavailable("too many bodies being read");
+        };
         let body = Limited::new(request.into_body(), MAX_BODY);
         let bytes = match tokio::time::timeout(PEER_TIMEOUT, body.collect()).await {
             Ok(Ok(collected)) => collected.to_bytes(),
@@ -117,14 +158,12 @@ impl SyncServer {
             Ok(sync) => sync,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("not a sync request: {e}")),
         };
-        let instance = match self
-            .auth
-            .authenticate(&claimed, &token, &sync.gateway)
-            .await
-        {
-            Ok(instance) => instance,
-            Err(refusal) => return refused(refusal),
-        };
+        if sync.gateway != key {
+            return text(
+                StatusCode::BAD_REQUEST,
+                "the body names another Gateway than the path",
+            );
+        }
         if sync.protocol != PROTOCOL {
             return text(
                 StatusCode::CONFLICT,
@@ -134,7 +173,6 @@ impl SyncServer {
                 ),
             );
         }
-        let key = sync.gateway;
         if !self.serves(&key) {
             return not_served();
         }
@@ -381,12 +419,19 @@ pub(crate) async fn serve(
 ) -> anyhow::Result<()> {
     let acceptor = TlsAcceptor::from(tls);
     info!(
-        "Sync endpoint listening on {} ({})",
+        "Sync endpoint listening on {} ({}{{namespace}}/{{name}})",
         listener.local_addr()?,
-        SYNC_PATH
+        SYNC_PREFIX
     );
     let mut backoff = AcceptBackoff::default();
     loop {
+        // At the cap, connections wait in the listen backlog.
+        let slot = tokio::select! {
+            _ = server.shutdown.cancelled() => return Ok(()),
+            slot = server.connections.clone().acquire_owned() => {
+                slot.expect("the connection semaphore is never closed")
+            }
+        };
         let accepted = tokio::select! {
             _ = server.shutdown.cancelled() => return Ok(()),
             accepted = listener.accept() => accepted,
@@ -394,7 +439,7 @@ pub(crate) async fn serve(
         match accepted {
             Ok((stream, _)) => {
                 backoff.reset();
-                tokio::spawn(connection(server.clone(), acceptor.clone(), stream));
+                tokio::spawn(connection(server.clone(), acceptor.clone(), stream, slot));
             }
             Err(e) => {
                 if let Some(pause) = backoff.after(&e) {
@@ -406,7 +451,12 @@ pub(crate) async fn serve(
     }
 }
 
-async fn connection(server: Arc<SyncServer>, acceptor: TlsAcceptor, stream: TcpStream) {
+async fn connection(
+    server: Arc<SyncServer>,
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    _slot: OwnedSemaphorePermit,
+) {
     // A peer that cannot complete a handshake is no data plane; the data
     // plane logs its own side.
     let Ok(Ok(tls)) = tokio::time::timeout(PEER_TIMEOUT, acceptor.accept(stream)).await else {
@@ -422,6 +472,8 @@ async fn connection(server: Arc<SyncServer>, acceptor: TlsAcceptor, stream: TcpS
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(PEER_TIMEOUT)
+        .max_buf_size(MAX_HEAD)
+        .max_header_size(MAX_HEAD)
         .serve_connection(TokioIo::new(tls), service);
     let mut conn = std::pin::pin!(conn);
     tokio::select! {
@@ -542,8 +594,14 @@ mod tests {
         body
     }
 
+    fn path_of(gateway: &GatewayKey) -> String {
+        format!("{SYNC_PREFIX}{}/{}", gateway.namespace, gateway.name)
+    }
+
+    /// A sync request to the path of the Gateway its body names.
     fn post(token: Option<&str>, body: &Value) -> Request<Full<Bytes>> {
-        let mut builder = Request::post(SYNC_PATH);
+        let gateway: GatewayKey = serde_json::from_value(body["gateway"].clone()).unwrap();
+        let mut builder = Request::post(path_of(&gateway));
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
@@ -709,7 +767,7 @@ mod tests {
         let v1 = f.publish(1);
         let token = gateway_token("default", "gw", 0);
         let request = |header_name: &str, value: String| {
-            Request::post(SYNC_PATH)
+            Request::post(path_of(&key()))
                 .header(header_name, value)
                 .body(Full::new(Bytes::from(
                     serde_json::to_vec(&body(&key(), "", None)).unwrap(),
@@ -809,7 +867,7 @@ mod tests {
     async fn a_junk_token_is_refused_before_its_body_is_read() {
         let f = fixture();
         let read = Arc::new(AtomicBool::new(false));
-        let request = Request::post(SYNC_PATH)
+        let request = Request::post(path_of(&key()))
             .header(header::AUTHORIZATION, "Bearer junk")
             .body(Watched {
                 read: read.clone(),
@@ -824,10 +882,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_over_1_mib_is_refused_without_a_review() {
+    async fn a_body_over_1_mib_is_refused() {
         let f = fixture();
         let read = Arc::new(AtomicBool::new(false));
-        let request = Request::post(SYNC_PATH)
+        let request = Request::post(path_of(&key()))
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", gateway_token("default", "gw", 0)),
@@ -841,9 +899,8 @@ mod tests {
             f.server.handle(request).await.status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
-        assert_eq!(f.reviews(), 0);
 
-        let declared = Request::post(SYNC_PATH)
+        let declared = Request::post(path_of(&key()))
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", gateway_token("default", "gw", 0)),
@@ -1100,5 +1157,219 @@ mod tests {
         let tcp = TcpStream::connect(addr).await.unwrap();
         assert!(connector.connect(wrong, tcp).await.is_err());
         g.shutdown.cancel();
+    }
+
+    /// The CA and a TLS client trusting only it, for the Service's name.
+    fn tls_client() -> (
+        super::super::ca::ControllerCa,
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ns = super::super::auth::testing::NS;
+        let ca = super::super::ca::ControllerCa::generated(ns, "portail-controller");
+        let mut roots = rustls::RootCertStore::empty();
+        let der =
+            rustls::pki_types::pem::PemObject::from_pem_slice(ca.cert_pem().as_bytes()).unwrap();
+        roots.add(der).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(format!("portail-controller.{ns}.svc"))
+            .unwrap();
+        (ca, tokio_rustls::TlsConnector::from(Arc::new(config)), name)
+    }
+
+    /// Another Gateway's account is refused from the path, before any
+    /// review; a token TokenReview rejects never has its body read either.
+    #[tokio::test]
+    async fn the_body_is_read_only_once_the_token_is_reviewed() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let f = fixture();
+        let watched = |token: &str, read: &Arc<AtomicBool>| {
+            Request::post(path_of(&key()))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Watched {
+                    read: read.clone(),
+                    left: 1024,
+                })
+                .unwrap()
+        };
+        let read = Arc::new(AtomicBool::new(false));
+        let other = token_of("default", "portail-other", 0);
+        let response = f.server.handle(watched(&other, &read)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!read.load(Ordering::SeqCst));
+        assert_eq!(f.reviews(), 0);
+
+        f.api.reply_to(REVIEWS, 201, review(false, "", None));
+        let rejected = gateway_token("default", "gw", 1);
+        let response = f.server.handle(watched(&rejected, &read)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!read.load(Ordering::SeqCst));
+        assert_eq!(f.reviews(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_body_must_name_the_gateway_of_the_path() {
+        let f = fixture();
+        let request = Request::post(path_of(&key()))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", gateway_token("default", "gw", 0)),
+            )
+            .body(Full::new(Bytes::from(
+                serde_json::to_vec(&body(&GatewayKey::new("default", "other"), "", None)).unwrap(),
+            )))
+            .unwrap();
+        assert_eq!(f.sync(request).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_path_without_one_gateway_is_404() {
+        let f = fixture();
+        let token = gateway_token("default", "gw", 0);
+        for path in [
+            "/v1/sync",
+            "/v1/sync/",
+            "/v1/sync/default",
+            "/v1/sync/default/",
+            "/v1/sync//gw",
+            "/v1/sync/default/gw/x",
+            "/v2/sync/default/gw",
+        ] {
+            let request = Request::post(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Full::new(Bytes::from(
+                    serde_json::to_vec(&body(&key(), "", None)).unwrap(),
+                )))
+                .unwrap();
+            assert_eq!(
+                f.sync(request).await.status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        assert_eq!(f.reviews(), 0);
+    }
+
+    /// A body that never ends.
+    struct Stalled;
+
+    impl Body for Stalled {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_reads_are_capped_and_a_stalled_body_ends_in_5s() {
+        let f = Arc::new(fixture());
+        let token = gateway_token("default", "gw", 0);
+        let started = Instant::now();
+        let stalled: Vec<_> = (0..MAX_BODY_READS)
+            .map(|_| {
+                let request = Request::post(path_of(&key()))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Stalled)
+                    .unwrap();
+                let server = f.server.clone();
+                tokio::spawn(async move { server.handle(request).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let over = f.sync(poll("")).await;
+        assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(over.headers()[header::RETRY_AFTER], "1");
+
+        for request in stalled {
+            assert_eq!(request.await.unwrap().status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(started.elapsed(), PEER_TIMEOUT);
+        let v1 = f.publish(1);
+        assert_eq!(version_of(f.sync(poll("")).await).await, v1, "freed");
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_cap_wait_to_be_accepted() {
+        let (ca, connector, name) = tls_client();
+        let f = fixture();
+        let server = SyncServer::with_connections(
+            f.ctx.clone(),
+            authenticator(f.api.client()),
+            Lapses::new().0,
+            f.shutdown.clone(),
+            1,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(server, ca.server_config(), listener));
+
+        let holder = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiting = TcpStream::connect(addr).await.unwrap();
+        let handshake = connector.connect(name.clone(), waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), handshake)
+                .await
+                .is_err(),
+            "accepted over the cap"
+        );
+
+        drop(holder);
+        let next = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), connector.connect(name, next))
+            .await
+            .expect("accepted once a slot freed")
+            .unwrap();
+        f.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_request_head_over_32_kib_is_refused() {
+        let (ca, connector, name) = tls_client();
+        let f = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(f.server.clone(), ca.server_config(), listener));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls = connector.connect(name, tcp).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut request = poll("");
+        request
+            .headers_mut()
+            .insert("x-pad", "a".repeat(MAX_HEAD).parse().unwrap());
+        let answer = sender.send_request(request).await.unwrap();
+        assert_eq!(answer.status(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+        assert_eq!(f.reviews(), 0);
+        f.shutdown.cancel();
+    }
+
+    /// A peer that connects and says nothing holds its connection 5s.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_is_dropped_in_5s() {
+        let (ca, _, _) = tls_client();
+        let f = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(f.server.clone(), ca.server_config(), listener));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        assert!(!matches!(silent.read(&mut buf).await, Ok(n) if n > 0));
+        assert_eq!(started.elapsed(), PEER_TIMEOUT);
+        f.shutdown.cancel();
     }
 }
