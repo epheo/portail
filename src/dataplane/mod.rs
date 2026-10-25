@@ -321,10 +321,7 @@ impl SyncLoop {
 
     fn failed(&mut self, after: Option<Duration>, error: String) -> Instant {
         CONTROLLER_SYNC.set_connected(false);
-        let backoff = self.failures.wait();
-        // Capped at the hold, the backoff's own ceiling: a Retry-After of
-        // hours would strand the data plane.
-        let delay = after.map_or(backoff, |after| after.min(HOLD));
+        let delay = self.failures.wait_at_least(after);
         warn!(
             "Sync of Gateway {} failed: {}; polling again in {:.1}s",
             self.gateway,
@@ -570,5 +567,21 @@ mod tests {
         sync.serve(on(&["here", "not-yet"])).await;
         assert!(ready.load(Ordering::Acquire));
         assert!(sync.rebind_at.is_some(), "no retry for the late network");
+    }
+
+    /// Repeated 503s with Retry-After 1s slow down past it, as any failure
+    /// backs off. They came back every second, the whole fleet in step.
+    #[tokio::test]
+    async fn repeated_503s_back_off_past_their_retry_after() {
+        fastrand::seed(11);
+        let (mut sync, _) = sync_loop();
+        let after = Duration::from_secs(1);
+        let waits: Vec<Duration> = (0..8)
+            .map(|_| sync.failed(Some(after), "503".into()) - Instant::now())
+            .collect();
+        // Within a scheduling tick of the floor.
+        let floor = after - Duration::from_millis(50);
+        assert!(waits.iter().all(|w| *w >= floor), "{waits:?}");
+        assert!(waits.iter().any(|w| *w > 2 * after), "{waits:?}");
     }
 }

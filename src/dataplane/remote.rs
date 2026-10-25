@@ -163,16 +163,23 @@ impl Client {
     async fn exchange(&mut self, request: &SyncRequest) -> Result<Answer, String> {
         let bearer = bearer(&self.token_file).await?;
         let body = Bytes::from(serde_json::to_vec(request).map_err(|e| e.to_string())?);
+        let request = self.post(&bearer, body);
         let response = match self.conn.take() {
-            Some(mut conn) if !conn.sender.is_closed() => {
-                match self.send(&mut conn, &bearer, body.clone()).await {
-                    Ok(response) => (conn, response),
-                    // The controller may close an idle connection as the
-                    // request leaves; a poll is safe to send twice.
-                    Err(_) => self.send_new(&bearer, body).await?,
+            Some(mut conn) if !conn.sender.is_closed() => match send(&mut conn, request).await {
+                Ok(response) => (conn, response),
+                // The controller closed the idle connection before the poll
+                // was written: once more on a new one. A poll written and
+                // lost (a controller that crashed or rolled) goes through
+                // the backoff instead, or a fleet would reconnect in step.
+                Err(Failed {
+                    unsent: Some(request),
+                    ..
+                }) => self.send_new(*request).await?,
+                Err(Failed { error, .. }) => {
+                    return Err(format!("request to {}: {}", self.authority, error))
                 }
-            }
-            _ => self.send_new(&bearer, body).await?,
+            },
+            _ => self.send_new(request).await?,
         };
         let (conn, response) = response;
         let status = response.status();
@@ -202,31 +209,22 @@ impl Client {
 
     async fn send_new(
         &self,
-        bearer: &HeaderValue,
-        body: Bytes,
+        request: Request<Full<Bytes>>,
     ) -> Result<(Conn, Response<Incoming>), String> {
         let mut conn = self.connect().await?;
-        let response = self
-            .send(&mut conn, bearer, body)
+        let response = send(&mut conn, request)
             .await
-            .map_err(|e| format!("request to {}: {}", self.authority, e))?;
+            .map_err(|failed| format!("request to {}: {}", self.authority, failed.error))?;
         Ok((conn, response))
     }
 
-    async fn send(
-        &self,
-        conn: &mut Conn,
-        bearer: &HeaderValue,
-        body: Bytes,
-    ) -> Result<Response<Incoming>, hyper::Error> {
-        let request = Request::post(self.path.as_str())
+    fn post(&self, bearer: &HeaderValue, body: Bytes) -> Request<Full<Bytes>> {
+        Request::post(self.path.as_str())
             .header(HOST, self.authority.as_str())
             .header(AUTHORIZATION, bearer.clone())
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(body))
-            .expect("the path and authority parsed from a URI, the token as a header value");
-        conn.sender.ready().await?;
-        conn.sender.send_request(request).await
+            .expect("the path and authority parsed from a URI, the token as a header value")
     }
 
     async fn connect(&self) -> Result<Conn, String> {
@@ -257,6 +255,31 @@ impl Client {
                 ))
             })
     }
+}
+
+/// A request that got no answer; `unsent` when it was never written.
+struct Failed {
+    unsent: Option<Box<Request<Full<Bytes>>>>,
+    error: hyper::Error,
+}
+
+async fn send(
+    conn: &mut Conn,
+    request: Request<Full<Bytes>>,
+) -> Result<Response<Incoming>, Failed> {
+    if let Err(error) = conn.sender.ready().await {
+        return Err(Failed {
+            unsent: Some(Box::new(request)),
+            error,
+        });
+    }
+    conn.sender
+        .try_send_request(request)
+        .await
+        .map_err(|mut failed| Failed {
+            unsent: failed.take_message().map(Box::new),
+            error: failed.into_error(),
+        })
 }
 
 /// Where `--controller-address` points.
@@ -356,6 +379,16 @@ impl Backoff {
         self.next_ceiling().mul_f64(fastrand::f64())
     }
 
+    /// The next wait, never shorter than `floor` (a Retry-After) capped at
+    /// the hold. A Retry-After alone would bring a fleet back in step
+    /// after a controller rollout, and a controller stuck answering 503
+    /// would be polled at its pace forever: the backoff spreads and slows
+    /// them as with any failure.
+    pub fn wait_at_least(&mut self, floor: Option<Duration>) -> Duration {
+        let jittered = self.wait();
+        floor.map_or(jittered, |floor| floor.min(HOLD).max(jittered))
+    }
+
     /// The next ceiling itself, for retries that need no jitter.
     pub fn next_ceiling(&mut self) -> Duration {
         let ceiling = self.ceiling;
@@ -384,6 +417,135 @@ mod tests {
         for ceiling in [1, 2, 4, 8, 16, 30, 30] {
             assert!(backoff.wait() <= Duration::from_secs(ceiling));
         }
+    }
+
+    /// A Retry-After is a floor, not the wait: past it the jittered
+    /// backoff spreads a fleet and slows its polls as the ceiling grows.
+    /// It was the wait itself, every time.
+    #[test]
+    fn a_retry_after_floors_the_jittered_backoff() {
+        fastrand::seed(7);
+        let floor = Duration::from_secs(1);
+        let mut backoff = Backoff::default();
+        let waits: Vec<Duration> = (0..8).map(|_| backoff.wait_at_least(Some(floor))).collect();
+        assert!(waits.iter().all(|w| *w >= floor && *w <= HOLD), "{waits:?}");
+        assert!(waits[3..].iter().any(|w| *w > 2 * floor), "{waits:?}");
+        assert!(Backoff::default().wait_at_least(Some(3 * HOLD)) <= HOLD);
+    }
+
+    /// A one-off TLS server for 127.0.0.1 that answers each request by
+    /// `answer` (its number, from 1): `None` hangs up without an answer.
+    /// Returns its address, the CA PEM and the requests seen.
+    async fn server(
+        keep_alive: bool,
+        answer: fn(usize) -> Option<StatusCode>,
+    ) -> (
+        std::net::SocketAddr,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (acceptor, counter) = (acceptor.clone(), counter.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        async move {
+                            // Read whole, as a held poll is: a hang-up
+                            // before that may land while the client still
+                            // writes, a poll it may then take as unsent.
+                            let _ = request.into_body().collect().await;
+                            match answer(n) {
+                                Some(status) => Ok(Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap()),
+                                None => Err(std::io::Error::other("hang up")),
+                            }
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(keep_alive)
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        (addr, ca.pem(), seen)
+    }
+
+    fn client(addr: std::net::SocketAddr, ca: &str, dir: &tempfile::TempDir) -> Client {
+        let token = dir.path().join("token");
+        std::fs::write(&token, "t").unwrap();
+        let gateway = GatewayKey::new("ns", "gw");
+        Client::new(&format!("https://{addr}"), &gateway, ca.as_bytes(), token).unwrap()
+    }
+
+    fn poll() -> SyncRequest {
+        SyncRequest {
+            protocol: crate::sync::PROTOCOL,
+            gateway: GatewayKey::new("ns", "gw"),
+            have: String::new(),
+            data_plane_version: String::new(),
+            report: None,
+        }
+    }
+
+    /// A poll written and lost (the controller crashed or rolled while
+    /// holding it) fails to the backoff: no second request at once. Every
+    /// data plane reconnected in step.
+    #[tokio::test]
+    async fn a_poll_lost_after_it_was_written_is_not_sent_again_at_once() {
+        let (addr, ca, seen) = server(true, |n| (n == 1).then_some(StatusCode::NO_CONTENT)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(addr, &ca, &dir);
+        assert!(matches!(client.poll(&poll()).await, Answer::Unchanged));
+        let lost = client.poll(&poll()).await;
+        assert!(
+            matches!(lost, Answer::Retry { after: None, .. }),
+            "{lost:?}"
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A keep-alive the controller closed costs no failure: the poll goes
+    /// on a new connection.
+    #[tokio::test]
+    async fn a_closed_keep_alive_is_replaced_without_a_failure() {
+        let (addr, ca, seen) = server(false, |_| Some(StatusCode::NO_CONTENT)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(addr, &ca, &dir);
+        for _ in 0..3 {
+            let answer = client.poll(&poll()).await;
+            assert!(matches!(answer, Answer::Unchanged), "{answer:?}");
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]
