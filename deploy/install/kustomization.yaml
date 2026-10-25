@@ -11,4 +11,4 @@ resources:
 images:
 - name: ghcr.io/epheo/portail
   # scripts/release.sh sets it; publish.yml refuses a tag it does not match.
-  newTag: "0.1.29"
+  newTag: "0.2.0"
