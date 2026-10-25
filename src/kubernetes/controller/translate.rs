@@ -52,8 +52,8 @@ pub(crate) struct Statuses {
     pub observed_policies: Vec<Observed>,
 }
 
-/// Translation failed before a config existed: nothing to serve, the
-/// Gateway's listener statuses, and why.
+/// Translation failed: nothing new to serve, the snapshot served stays.
+/// The Gateway's listener statuses, and why.
 pub(crate) struct Rejected {
     pub statuses: Statuses,
     pub error: String,
@@ -298,7 +298,23 @@ pub(crate) async fn translate(
     // once it is named again must not bind on an answer for a spec the
     // Gateway no longer had.
     ctx.networks.retain_named(&ctx.cache.gateways.state());
-    let networks = resolve_network_cidrs(&ctx.client, gateway, &gw_ns, &ctx.networks).await;
+    let networks = match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, &ctx.networks).await {
+        Ok(networks) => networks,
+        Err(e) => {
+            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
+            return Err(Box::new(Rejected {
+                statuses: Statuses {
+                    accepted,
+                    listeners,
+                    routes: Vec::new(),
+                    policies: Vec::new(),
+                    observed_routes: Vec::new(),
+                    observed_policies: Vec::new(),
+                },
+                error: e,
+            }));
+        }
+    };
     let statuses = Statuses {
         accepted,
         listeners,

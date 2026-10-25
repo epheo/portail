@@ -869,6 +869,33 @@ mod tests {
         });
     }
 
+    /// A NetworkAttachmentDefinition never read publishes nothing, as no
+    /// read said the network is gone: a first pass published the Gateway
+    /// bound nowhere, a later one replaced the snapshot served.
+    #[tokio::test]
+    async fn an_unread_network_publishes_nothing() {
+        let mut p = Pipeline::new();
+        nad_unreadable(&p);
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let gw = with_addresses(testkit::gateway("gw", 1), 1, &network);
+        apply(&mut p.cluster.gateways, gw.clone());
+        assert!(p.pass(&gw).await.is_err());
+        assert!(p.served(&gw).is_none());
+        assert_eq!(gateway_programmed(&p, "gw")["status"], "False");
+
+        let gw = with_addresses(testkit::gateway("gw", 1), 2, &[]);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        let served = p.served(&gw).unwrap();
+        let gw = with_addresses(gw, 3, &network);
+        apply(&mut p.cluster.gateways, gw.clone());
+        assert!(p.pass(&gw).await.is_err());
+        assert!(
+            Arc::ptr_eq(&served, &p.served(&gw).unwrap()),
+            "the served snapshot stays"
+        );
+    }
+
     /// The Programmed condition of Gateway `name`'s last status write.
     fn gateway_programmed(p: &Pipeline, name: &str) -> serde_json::Value {
         let patch = p.api.status_patch("gateways", name).unwrap();
@@ -882,7 +909,8 @@ mod tests {
 
     /// A network dropped from spec.addresses forgets its CIDRs. They were
     /// kept, and a failed read of the network once re-added bound on an
-    /// answer from a spec the Gateway no longer had.
+    /// answer from a spec the Gateway no longer had; now that read
+    /// publishes nothing.
     #[test]
     fn a_dropped_network_forgets_its_ip() {
         alone("a_dropped_network_forgets_its_ip", async {
@@ -906,9 +934,12 @@ mod tests {
             assert_eq!(programmed["status"], "True", "{programmed}");
 
             nad_unreadable(&p);
-            pass_with(&mut p, &gw, 3, &network).await;
-            assert_eq!(gateway_programmed(&p, "gw")["reason"], "AddressNotUsable");
-            assert!(!accepts(&ip), "bound on a forgotten answer");
+            let gw = with_addresses(gw, 3, &network);
+            apply(&mut p.cluster.gateways, gw.clone());
+            assert!(p.pass(&gw).await.is_err());
+            let served = p.served(&gw).unwrap();
+            assert_eq!(served.gateway.generation, 2);
+            assert!(served.networks.is_empty(), "published a forgotten answer");
         });
     }
 
@@ -939,8 +970,8 @@ mod tests {
             nad_unreadable(&p);
             apply(&mut p.cluster.gateways, gw.clone());
             p.api.clear();
-            p.pass(&gw).await.unwrap();
-            assert_eq!(gateway_programmed(&p, "gw")["reason"], "AddressNotUsable");
+            assert!(p.pass(&gw).await.is_err());
+            assert!(p.served(&gw).is_none());
             assert!(!accepts(&ip), "bound on a deleted Gateway's answer");
         });
     }

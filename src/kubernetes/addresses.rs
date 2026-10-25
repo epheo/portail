@@ -143,15 +143,16 @@ impl NetworkCidrCache {
 ///
 /// A NAD that cannot be read keeps the network's last CIDRs: unbinding on
 /// an apiserver blip was an outage. Only an answer that the network is gone
-/// drops them.
+/// drops them. With no last CIDRs, `Err`: no read says the network is
+/// gone, so the snapshot served stays as it is.
 pub(crate) async fn resolve_network_cidrs(
     client: &Client,
     gateway: &Gateway,
     gw_ns: &str,
     last: &NetworkCidrCache,
-) -> Vec<NetworkCidrs> {
+) -> Result<Vec<NetworkCidrs>, String> {
     let Some(spec_addrs) = &gateway.spec.addresses else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let gw_name = gateway.name_any();
     let mut networks = Vec::new();
@@ -188,11 +189,10 @@ pub(crate) async fn resolve_network_cidrs(
                     cidrs.clone()
                 }
                 None => {
-                    warn!(
-                        "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
-                         not read ({e}); network unresolved"
-                    );
-                    continue;
+                    return Err(format!(
+                        "NetworkAttachmentDefinition {gw_ns}/{network_name} not read ({e}), \
+                         and never read before"
+                    ));
                 }
             },
         };
@@ -201,7 +201,7 @@ pub(crate) async fn resolve_network_cidrs(
             cidrs,
         });
     }
-    networks
+    Ok(networks)
 }
 
 #[cfg(test)]
