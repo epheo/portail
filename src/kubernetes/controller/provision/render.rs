@@ -324,9 +324,13 @@ fn render(
         args: Some(args),
         env: Some(env),
         resources: Some(params.resources.clone()),
-        // Operator parity; liveness at the kubelet defaults.
+        // Periods and thresholds: operator parity, liveness at the kubelet
+        // defaults. Startup waits on /livez, not /readyz: with no
+        // last-known-good, a pod started while the controller is down is
+        // NotReady until it returns, and a startup failure would kill it
+        // in a crash loop whose backoff outlasts the outage.
         readiness_probe: Some(probe("/readyz", 5, 6)),
-        startup_probe: Some(probe("/readyz", 1, 30)),
+        startup_probe: Some(probe("/livez", 1, 30)),
         liveness_probe: Some(probe("/livez", 10, 3)),
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
@@ -709,6 +713,20 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
         );
         let none = objects_of(&high, None, Some("service: {type: None}")).await;
         assert!(added_capabilities(&none).is_null());
+    }
+
+    /// A pod started while the controller is down stays NotReady instead
+    /// of being killed in a loop: startup waits on liveness, readiness on
+    /// the snapshot.
+    #[tokio::test]
+    async fn startup_waits_on_liveness_not_readiness() {
+        let gw = gateway("gw", http_https(), serde_json::Value::Null);
+        let objects = objects_of(&gw, None, None).await;
+        let container = &deployment_of(&objects)["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(container["startupProbe"]["httpGet"]["path"], "/livez");
+        assert_eq!(container["startupProbe"]["periodSeconds"], 1);
+        assert_eq!(container["startupProbe"]["failureThreshold"], 30);
+        assert_eq!(container["readinessProbe"]["httpGet"]["path"], "/readyz");
     }
 
     /// The live Service's targets stay with their listeners.

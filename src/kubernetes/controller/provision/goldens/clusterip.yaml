@@ -106,7 +106,7 @@ spec:
         startupProbe:
           failureThreshold: 30
           httpGet:
-            path: /readyz
+            path: /livez
             port: 19099
           periodSeconds: 1
         volumeMounts:
