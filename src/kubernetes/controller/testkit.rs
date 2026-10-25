@@ -93,12 +93,24 @@ impl MockApi {
     }
 
     fn reply(&self, req: &Recorded) -> (u16, Value) {
+        // The group list is one exact path, under the prefix of every
+        // API group: a "/apis" prefix would answer them all.
+        if req.method == "GET" && req.path.split('?').next() == Some("/apis") {
+            let replies = self.replies.lock().unwrap();
+            if let Some((_, code, body)) = replies.iter().find(|(p, _, _)| p == "/apis") {
+                return (*code, body.clone());
+            }
+            return (
+                200,
+                json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": []}),
+            );
+        }
         if let Some((_, code, body)) = self
             .replies
             .lock()
             .unwrap()
             .iter()
-            .find(|(prefix, _, _)| req.path.starts_with(prefix.as_str()))
+            .find(|(prefix, _, _)| prefix != "/apis" && req.path.starts_with(prefix.as_str()))
         {
             return (*code, body.clone());
         }

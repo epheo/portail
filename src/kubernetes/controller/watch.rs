@@ -297,6 +297,19 @@ const RETRY_CAP_SECS: u64 = 30;
 /// Whether API discovery serves `plural` in `api_version`; `Err` when
 /// discovery itself failed, which says neither.
 async fn crd_served(client: &Client, api_version: &str, plural: &str) -> Result<bool, kube::Error> {
+    // An unserved group's resource list answers a plain-text 404, which
+    // kube-client logs as a warning before returning it: one per missing
+    // kind on every recheck. The group list says the same without a 404.
+    if let Some((group, version)) = api_version.split_once('/') {
+        let groups = client.list_api_groups().await?;
+        let served = groups
+            .groups
+            .iter()
+            .any(|g| g.name == group && g.versions.iter().any(|v| v.version == version));
+        if !served {
+            return Ok(false);
+        }
+    }
     match client.list_api_group_resources(api_version).await {
         Ok(list) => Ok(list.resources.iter().any(|r| r.name == plural)),
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(false),
@@ -660,6 +673,25 @@ mod tests {
     const TCPROUTE_GROUP: &str = "/apis/gateway.networking.k8s.io/v1alpha2";
 
     fn discovery_serves_tcproutes(api: &MockApi, served: bool) {
+        let versions = if served {
+            serde_json::json!([{"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"},
+                               {"groupVersion": "gateway.networking.k8s.io/v1alpha2", "version": "v1alpha2"}])
+        } else {
+            serde_json::json!([{"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"}])
+        };
+        api.reply_to(
+            "/apis",
+            200,
+            serde_json::json!({
+                "kind": "APIGroupList",
+                "apiVersion": "v1",
+                "groups": [{
+                    "name": "gateway.networking.k8s.io",
+                    "versions": versions,
+                    "preferredVersion": {"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"},
+                }],
+            }),
+        );
         if served {
             api.reply_to(
                 TCPROUTE_GROUP,
@@ -689,10 +721,11 @@ mod tests {
         }
     }
 
+    /// Discovery rounds: each starts with the group list.
     fn discovery_reads(api: &MockApi) -> usize {
         api.requests()
             .iter()
-            .filter(|r| r.path.split('?').next() == Some(TCPROUTE_GROUP))
+            .filter(|r| r.path.split('?').next() == Some("/apis"))
             .count()
     }
 
@@ -786,7 +819,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_discovery_retries_then_starts_the_watch() {
         let api = MockApi::default();
-        api.reply_to(TCPROUTE_GROUP, 504, status(504, "Timeout"));
+        api.reply_to("/apis", 504, status(504, "Timeout"));
         let listings = Listings::default();
         let (_store, driver) = tcproutes(&api, &Arc::default(), &listings);
         settle().await;
@@ -881,6 +914,26 @@ mod tests {
             unlisted[0].1.contains("403") || unlisted[0].1.contains("Forbidden"),
             "{unlisted:?}"
         );
+        driver.abort();
+    }
+
+    /// A group the cluster does not serve is known missing from the group
+    /// list alone: asking for its resources drew a plain-text 404 that
+    /// kube-client logs as a warning, one per missing kind per recheck.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_group_is_not_asked_for_its_resources() {
+        let api = MockApi::default();
+        discovery_serves_tcproutes(&api, false);
+        let listings = Listings::default();
+        let (_store, driver) = tcproutes(&api, &Arc::default(), &listings);
+        settle().await;
+        assert!(listings.is_synced(), "{:?}", listings.unlisted());
+        let asked = api
+            .requests()
+            .iter()
+            .filter(|r| r.path.split('?').next() == Some(TCPROUTE_GROUP))
+            .count();
+        assert_eq!(asked, 0);
         driver.abort();
     }
 
