@@ -121,7 +121,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     info!("Kubernetes client connected, starting Gateway API controller");
     let elector = leader::start(&client, &args);
     let leader = elector.leader();
-    let ca = ca::load_or_create(&client, &args).await?;
+    let ca = ca::load_or_create(&client, &args.namespace, &args.service_name).await?;
 
     // --- Primary resource: Gateway ---
     // No `predicate_filter(predicates::generation)` here: it caches generation
