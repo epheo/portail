@@ -31,9 +31,45 @@ use crate::kubernetes::status::{self, GatewayCondition, Write};
 use crate::logging::info;
 use crate::sync::GatewayKey;
 
+/// Feeds the class pass: each item of a stream passed through [`Self::on`]
+/// wakes it.
+pub(crate) struct ClassEvents(futures::channel::mpsc::UnboundedSender<()>);
+
+/// The class pass's events and the stream `run` reads them from.
+pub(crate) fn class_events() -> (ClassEvents, futures::channel::mpsc::UnboundedReceiver<()>) {
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    (ClassEvents(sender), receiver)
+}
+
+impl ClassEvents {
+    /// `stream`, each item of which wakes the class pass.
+    pub(crate) fn on<S>(&self, stream: S) -> impl Stream<Item = S::Item> + Send + 'static
+    where
+        S: Stream + Send + 'static,
+    {
+        let sender = self.0.clone();
+        stream.inspect(move |_| {
+            let _ = sender.unbounded_send(());
+        })
+    }
+}
+
+/// Asks the class pass to run: a Gateway left this controller, and the
+/// pass removes its entries (retrying a failed removal as its own).
+#[derive(Default)]
+pub(crate) struct Departures(tokio::sync::Notify);
+
+impl Departures {
+    pub(crate) fn wake(&self) {
+        // A permit is kept while a pass runs: the next one sees the change.
+        self.0.notify_one();
+    }
+}
+
 /// Write class status and drop departed Gateways' entries on each item of
-/// `changes` (a class was added, changed or deleted), once caches synced,
-/// on each leadership gained and every [`RESYNC_SECS`], until `shutdown`.
+/// `changes` (a class or GatewayParameters event), on each departure, once
+/// caches synced, on each leadership gained and every [`RESYNC_SECS`],
+/// until `shutdown`.
 pub(crate) async fn run(
     ctx: Arc<ControllerCtx>,
     changes: impl Stream<Item = ()> + Send,
@@ -44,9 +80,7 @@ pub(crate) async fn run(
     let listings = ctx.synced.clone();
     let mut synced = std::pin::pin!(async move { listings.synced().await });
     let mut was_synced = false;
-    // The Gateways' safety net, for removals too: a route event maps to
-    // served Gateways only, so none retries a removal refused on a stale
-    // read.
+    // The Gateways' safety net.
     let every = Duration::from_secs(RESYNC_SECS);
     let mut resync = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -56,6 +90,7 @@ pub(crate) async fn run(
             _ = shutdown.cancelled() => return,
             change = changes.next() => if change.is_none() { return },
             Some(()) = gained.next() => {}
+            () = ctx.departures.0.notified() => {}
             () = &mut synced, if !was_synced => was_synced = true,
             _ = resync.tick() => {}
             _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)),
@@ -93,12 +128,9 @@ async fn pass(ctx: &ControllerCtx) -> bool {
         let desired = status::desired_class_status(&class, &accepted);
         ok &= status::write_class_status(&ctx.client, &class, desired).await != Write::Failed;
     }
-    ok &= remove_departed(
-        ctx.client.clone(),
-        ctx.controller_name.clone(),
-        departed(ctx),
-    )
-    .await;
+    // A route event maps to served Gateways only: no other pass retries a
+    // removal refused on a stale read.
+    ok &= remove_departed(&ctx.client, &ctx.controller_name, departed(ctx)).await;
     ok
 }
 
@@ -138,7 +170,7 @@ fn accepted(class: &GatewayClass, parameters: &Store<GatewayParameters>) -> Gate
 }
 
 /// An object whose status holds our entries for departed Gateways.
-pub(super) struct Departed {
+struct Departed {
     observed: Observed,
     gateways: Vec<GatewayKey>,
 }
@@ -148,7 +180,7 @@ pub(super) struct Departed {
 /// such a Gateway removes them: deletion runs none, and a pass of another
 /// controller's Gateway writes nothing. A missing class keeps them, as it
 /// keeps the Gateway served.
-pub(super) fn departed(ctx: &ControllerCtx) -> Vec<Departed> {
+fn departed(ctx: &ControllerCtx) -> Vec<Departed> {
     let classes = ctx.cache.gateway_classes.state();
     let gone = |ns: &str, name: &str| match ctx.cache.gateways.get(&ObjectRef::new(name).within(ns))
     {
@@ -211,11 +243,7 @@ fn departed_of(
 }
 
 /// Remove `departed`'s entries. Returns false when a write failed.
-pub(super) async fn remove_departed(
-    client: Client,
-    controller: String,
-    departed: Vec<Departed>,
-) -> bool {
+async fn remove_departed(client: &Client, controller: &str, departed: Vec<Departed>) -> bool {
     let mut ok = true;
     for d in departed {
         let o = &d.observed;
@@ -225,7 +253,7 @@ pub(super) async fn remove_departed(
             "parentRef"
         };
         let names_departed = |e: &Value| {
-            e["controllerName"].as_str() == Some(controller.as_str())
+            e["controllerName"].as_str() == Some(controller)
                 && d.gateways.iter().any(|k| {
                     let gateway = &e[ref_field];
                     gateway["name"].as_str() == Some(k.name.as_str())
@@ -235,7 +263,7 @@ pub(super) async fn remove_departed(
         macro_rules! remove {
             ($ty:ty, $list:literal) => {
                 status::remove_entries::<$ty>(
-                    &client,
+                    client,
                     &o.namespace,
                     &o.name,
                     $list,
@@ -281,6 +309,7 @@ mod tests {
     use serde_json::json;
 
     const CLASSES: &str = "/apis/gateway.networking.k8s.io/v1/gatewayclasses";
+    const ROUTE_R: &str = "/apis/gateway.networking.k8s.io/v1/namespaces/default/httproutes/r";
 
     /// A Pipeline whose class `portail` has a uid, and whose apiserver
     /// answers class writes at resourceVersion 8.
@@ -307,7 +336,7 @@ mod tests {
         class
     }
 
-    fn class_writes(p: &Pipeline) -> Vec<testkit::Recorded> {
+    fn class_writes(p: &Pipeline) -> Vec<Recorded> {
         p.api
             .requests()
             .into_iter()
@@ -328,6 +357,28 @@ mod tests {
             .iter()
             .map(|f| f["name"].as_str().unwrap())
             .collect()
+    }
+
+    /// The class loop over `p`, until the token is cancelled, past its
+    /// first pass (the caches are synced): the class written.
+    async fn start(p: &Pipeline) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(
+            p.ctx.clone(),
+            futures::stream::pending(),
+            shutdown.clone(),
+        ));
+        for _ in 0..1000 {
+            if class_writes(p).len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(class_writes(p).len(), 2, "the first pass");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        (shutdown, task)
     }
 
     /// Our class only: Accepted at its generation applied by our field
@@ -491,10 +542,11 @@ mod tests {
     async fn the_caches_syncing_wakes_the_class_pass() {
         let p = pipeline();
         let routes = p.ctx.synced.track("HTTPRoute", false);
-        let (changed, changes) = futures::channel::mpsc::unbounded();
+        let (events, changes) = class_events();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(run(p.ctx.clone(), changes, shutdown.clone()));
-        changed.unbounded_send(()).unwrap();
+        let mut classes = events.on(futures::stream::iter([()]));
+        assert!(classes.next().await.is_some());
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
@@ -506,6 +558,48 @@ mod tests {
         routes.observe::<HTTPRoute>(&Ok(watcher::Event::InitDone));
         let written = eventually(&p, "gatewayclasses", "portail").await;
         assert_eq!(written["status"]["conditions"][0]["status"], "True");
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// A class seen before its GatewayParameters is judged again when they
+    /// come. Only class events woke the pass: the class stayed
+    /// InvalidParameters until the resync.
+    #[tokio::test]
+    async fn a_parameters_event_judges_the_class_again() {
+        let mut p = pipeline();
+        apply(
+            &mut p.cluster.gateway_classes,
+            with_ref(
+                "portail.epheo.eu",
+                "GatewayParameters",
+                Some("portail-system"),
+            ),
+        );
+        let (events, changes) = class_events();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(p.ctx.clone(), changes, shutdown.clone()));
+        let mut classes = events.on(futures::stream::iter([()]));
+        classes.next().await;
+        let first = eventually(&p, "gatewayclasses", "portail").await;
+        assert_eq!(
+            first["status"]["conditions"][0]["reason"],
+            "InvalidParameters"
+        );
+
+        let mut stored = with_ref(
+            "portail.epheo.eu",
+            "GatewayParameters",
+            Some("portail-system"),
+        );
+        stored.status = Some(serde_json::from_value(first["status"].clone()).unwrap());
+        apply(&mut p.cluster.gateway_classes, stored);
+        apply(&mut p.cluster.parameters, parameters("public"));
+        p.api.clear();
+        let mut params = events.on(futures::stream::iter([parameters("public")]));
+        params.next().await;
+        let judged = eventually(&p, "gatewayclasses", "portail").await;
+        assert_eq!(judged["status"]["conditions"][0]["reason"], "Accepted");
         shutdown.cancel();
         task.await.unwrap();
     }
@@ -541,42 +635,6 @@ mod tests {
             .collect()
     }
 
-    /// Deleting a Gateway removes our route parent and policy ancestor
-    /// entries naming it; another controller's entries and ours for a live
-    /// Gateway stay. They stayed forever: deletion runs no pass.
-    #[tokio::test]
-    async fn a_deleted_gateway_loses_our_entries() {
-        let mut p = pipeline();
-        let gw = testkit::gateway("gw", 1);
-        apply(&mut p.cluster.gateways, gw.clone());
-        apply(&mut p.cluster.gateways, testkit::gateway("gw2", 1));
-        apply(
-            &mut p.cluster.http_routes,
-            route_reporting("gw2", &["gw", "gw2"]),
-        );
-        let mut policy = testkit::rate_limit_policy("p", "other-gw");
-        policy.status = Some(
-            serde_json::from_value(json!({ "ancestors": [
-                testkit::status_entry(CONTROLLER, "gw", "ancestorRef"),
-            ]}))
-            .unwrap(),
-        );
-        apply(&mut p.cluster.policies, policy);
-
-        p.delete(&gw).await;
-        let route = eventually(&p, "httproutes", "r").await;
-        assert_eq!(
-            parent_names(&route),
-            [
-                (CONTROLLER.to_string(), "gw2".to_string()),
-                ("example.com/other".to_string(), "gw".to_string()),
-            ]
-        );
-        assert_eq!(route["metadata"]["resourceVersion"], "1");
-        let policy = eventually(&p, "ratelimitpolicies", "p").await;
-        assert_eq!(policy["status"]["ancestors"], json!([]));
-    }
-
     /// Our class turning to another controller makes its Gateways
     /// someone else's: our entries for them go.
     #[tokio::test]
@@ -598,8 +656,105 @@ mod tests {
         assert!(class_writes(&p).is_empty(), "not our class any more");
     }
 
+    /// Deleting a Gateway removes our route parent and policy ancestor
+    /// entries naming it; another controller's entries and ours for a live
+    /// Gateway stay. They stayed forever: deletion runs no pass.
+    #[tokio::test]
+    async fn a_deleted_gateway_loses_our_entries() {
+        let mut p = pipeline();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.gateways, testkit::gateway("gw2", 1));
+        apply(
+            &mut p.cluster.http_routes,
+            route_reporting("gw2", &["gw", "gw2"]),
+        );
+        let mut policy = testkit::rate_limit_policy("p", "other-gw");
+        policy.status = Some(
+            serde_json::from_value(json!({ "ancestors": [
+                testkit::status_entry(CONTROLLER, "gw", "ancestorRef"),
+            ]}))
+            .unwrap(),
+        );
+        apply(&mut p.cluster.policies, policy);
+        let (shutdown, task) = start(&p).await;
+
+        p.delete(&gw).await;
+        let route = eventually(&p, "httproutes", "r").await;
+        assert_eq!(
+            parent_names(&route),
+            [
+                (CONTROLLER.to_string(), "gw2".to_string()),
+                ("example.com/other".to_string(), "gw".to_string()),
+            ]
+        );
+        assert_eq!(route["metadata"]["resourceVersion"], "1");
+        let policy = eventually(&p, "ratelimitpolicies", "p").await;
+        assert_eq!(policy["status"]["ancestors"], json!([]));
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// A removal refused on a stale read (409) is retried within the
+    /// class pass's retry, not at the next resync ten minutes on.
+    #[tokio::test]
+    async fn a_refused_removal_is_retried_soon() {
+        let mut p = pipeline();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.http_routes, route_reporting("gw", &["gw"]));
+        p.api.reply_to(
+            ROUTE_R,
+            409,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Conflict", "code": 409, "message": "object was modified",
+            }),
+        );
+        tokio::time::pause();
+        let (shutdown, task) = start(&p).await;
+        // The store's delete and the controller's forget, without the
+        // data plane's clear: the paused clock would run on while it waits.
+        p.cluster
+            .gateways
+            .apply_watcher_event(&watcher::Event::Delete(gw));
+        super::super::reconcile::forget_deleted_gateways(&p.ctx);
+        let attempts = |p: &Pipeline| p.api.status_patches("httproutes", "r").len();
+        for _ in 0..1000 {
+            if attempts(&p) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts(&p), 1, "refused");
+        // The pass ends and sets its retry from the clock as it is now.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        p.api.reply_to(
+            ROUTE_R,
+            200,
+            json!({
+                "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                "metadata": {"name": "r", "namespace": "default"}, "spec": {},
+            }),
+        );
+        // Past the retry: timers round up to the millisecond.
+        tokio::time::advance(Duration::from_secs(ERROR_REQUEUE_SECS + 1)).await;
+        for _ in 0..1000 {
+            if attempts(&p) > 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts(&p), 2, "retried");
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
     /// A Gateway moving to another controller's class drops our entries
-    /// in the pass that stops serving it.
+    /// once the pass that stops serving it wakes the class pass.
     #[tokio::test]
     async fn a_gateway_moved_to_a_foreign_class_drops_our_entries() {
         let mut p = pipeline();
@@ -614,15 +769,18 @@ mod tests {
         let mut moved = gw;
         moved.spec.gateway_class_name = "other".into();
         apply(&mut p.cluster.gateways, moved.clone());
+        let (shutdown, task) = start(&p).await;
 
         p.api.clear();
         p.pass(&moved).await.unwrap();
         assert!(p.served(&moved).is_none());
-        let route = p.api.status_patch("httproutes", "r").unwrap();
+        let route = eventually(&p, "httproutes", "r").await;
         assert_eq!(
             parent_names(&route),
             [("example.com/other".to_string(), "gw".to_string())]
         );
+        shutdown.cancel();
+        task.await.unwrap();
     }
 
     /// A missing class takes nothing away, our entries included; unsynced
@@ -642,11 +800,7 @@ mod tests {
         p.cluster
             .gateways
             .apply_watcher_event(&watcher::Event::Delete(testkit::gateway("gw", 1)));
-        super::super::reconcile::forget_deleted_gateways(&p.ctx);
         assert!(pass(&p.ctx).await);
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
         assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
     }
 }

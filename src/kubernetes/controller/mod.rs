@@ -112,6 +112,8 @@ struct ControllerCtx {
     synced: Listings,
     #[allow(dead_code)] // Read by provision::reconcile once it provisions.
     owned: provision::Owned,
+    /// Wakes the class pass, which removes departed Gateways' entries.
+    departures: gatewayclass::Departures,
 }
 
 /// `portail controller`: run until `shutdown`, the lease is lost or the
@@ -222,10 +224,10 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     // which are ours.
     let (store_gateway_classes, gateway_class_stream) =
         create_reflector(Api::<GatewayClass>::all(client.clone()), &listings);
-    let (class_changed, class_changes) = futures::channel::mpsc::unbounded::<()>();
-    let gateway_class_stream = gateway_class_stream.inspect(move |_| {
-        let _ = class_changed.unbounded_send(());
-    });
+    let (class_events, class_changes) = gatewayclass::class_events();
+    let gateway_class_stream = class_events.on(gateway_class_stream);
+    // A class seen before its parameters is judged again when they come.
+    let params_stream = class_events.on(params_stream);
     // TLS secrets, field-filtered to type=kubernetes.io/tls.
     let (store_secrets, secret_stream) = create_reflector_with_config(
         Api::<Secret>::all(client.clone()),
@@ -264,6 +266,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         leader: leader.clone(),
         synced: listings.clone(),
         owned,
+        departures: Default::default(),
     });
 
     // Every Gateway is reconciled once the caches are synced: passes before

@@ -223,6 +223,7 @@ impl TestCluster {
             leader: super::leader::Leader::always(),
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned,
+            departures: Default::default(),
         })
     }
 }
