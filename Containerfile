@@ -9,7 +9,14 @@
 
 ARG PREBUILT=0
 
-FROM docker.io/library/rust:1-slim AS builder
+# Link against the runtime's glibc (2.39): a newer build glibc can emit symbol
+# versions UBI 10 lacks. The toolchain comes from the official image; Rust's
+# dist binaries only need glibc 2.17.
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
+RUN dnf install -y gcc && dnf clean all
+COPY --from=docker.io/library/rust:1-slim /usr/local/rustup /usr/local/rustup
+COPY --from=docker.io/library/rust:1-slim /usr/local/cargo /usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -28,9 +35,11 @@ FROM scratch AS binary-1
 COPY target/release/portail /src/target/release/portail
 FROM binary-${PREBUILT} AS binary
 
-FROM registry.fedoraproject.org/fedora-minimal:43 AS runtime
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest AS runtime
 RUN microdnf install -y libgcc libcap && microdnf clean all
 COPY --from=binary /src/target/release/portail /usr/local/bin/portail
+# A PREBUILT host binary can need a newer glibc: fail the build, not the pod.
+RUN /usr/local/bin/portail --version >/dev/null
 # Carry CAP_NET_BIND_SERVICE as a *file* capability so the data plane can bind
 # privileged ports (80/443) directly in multi-network/UDN and host-network modes
 # while staying non-root under restricted Pod Security (no allowPrivilegeEscalation,
