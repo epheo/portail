@@ -253,7 +253,7 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 		"-e", "KUBECONFIG=/kubeconfig",
 		"-e", "USABLE_ADDRESSES="+vip,
 		"-e", "UNUSABLE_ADDRESSES=198.51.100.1",
-		"registry.fedoraproject.org/fedora-minimal:43",
+		"registry.access.redhat.com/ubi10/ubi-minimal:latest",
 		"/conformance.test",
 		"-test.v",
 		"-test.timeout", "25m",
