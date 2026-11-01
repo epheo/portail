@@ -169,6 +169,34 @@ fn status_code(e: &watcher::Error) -> Option<u16> {
     }
 }
 
+/// The controller's API client: metadata requests also accept plain JSON,
+/// as client-go's do. An error cannot take the PartialObjectMetadata form,
+/// so without that fallback the apiserver writes it indented (WriteRawJSON).
+/// kube-rs reads a watch line by line: an indented 403 becomes one serde
+/// error per line and loses its status code.
+pub(super) async fn client() -> anyhow::Result<Client> {
+    let config = kube::Config::infer().await?;
+    Ok(kube::client::ClientBuilder::try_from(config)?
+        .with_layer(&tower::util::MapRequestLayer::new(accept_plain_json))
+        .build())
+}
+
+fn accept_plain_json(
+    mut req: http::Request<kube::client::Body>,
+) -> http::Request<kube::client::Body> {
+    let accept = http::header::ACCEPT;
+    let fallback = req
+        .headers()
+        .get(&accept)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.contains(";as=PartialObjectMetadata"))
+        .and_then(|v| http::HeaderValue::from_str(&format!("{v},application/json")).ok());
+    if let Some(value) = fallback {
+        req.headers_mut().insert(accept, value);
+    }
+    req
+}
+
 /// Create a reflector for a resource type, returning the store and a stream.
 /// The stream is consumed by `Controller::watches_stream()` which both drives
 /// the reflector (keeping the store up to date) and triggers reconciliation
@@ -981,5 +1009,78 @@ mod tests {
         let annotations = secret.metadata.annotations.unwrap();
         assert!(!annotations.contains_key(LAST_APPLIED_ANNOTATION));
         assert_eq!(annotations["keep"], "me");
+    }
+
+    /// Lists nothing, then refuses the watch as the apiserver does: the
+    /// 403 is indented unless the request also accepts plain JSON.
+    fn refusing_apiserver(
+        req: http::Request<kube::client::Body>,
+    ) -> std::future::Ready<Result<http::Response<kube::client::Body>, std::convert::Infallible>>
+    {
+        let watch = req.uri().query().unwrap_or("").contains("watch=true");
+        let plain = req
+            .headers()
+            .get(http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|c| c.trim() == "application/json"));
+        let (code, body) = if watch {
+            let status = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {},
+                "status": "Failure", "reason": "Forbidden", "code": 403,
+                "message": "deployments.apps is forbidden: cannot watch",
+                "details": {"group": "apps", "kind": "deployments"},
+            });
+            let body = if plain {
+                serde_json::to_vec(&status)
+            } else {
+                serde_json::to_vec_pretty(&status)
+            };
+            (403, body.unwrap())
+        } else {
+            let list = serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadataList",
+                "metadata": {"resourceVersion": "1"}, "items": [],
+            });
+            (200, serde_json::to_vec(&list).unwrap())
+        };
+        std::future::ready(Ok(http::Response::builder()
+            .status(code)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(kube::client::Body::from(body))
+            .unwrap()))
+    }
+
+    async fn first_watch_error(client: Client) -> watcher::Error {
+        use k8s_openapi::api::apps::v1::Deployment;
+        let errors = kube::runtime::metadata_watcher(
+            Api::<Deployment>::all(client),
+            watcher::Config::default(),
+        )
+        .filter_map(|event| std::future::ready(event.err()));
+        let mut errors = std::pin::pin!(errors);
+        tokio::time::timeout(Duration::from_secs(5), errors.next())
+            .await
+            .expect("the watch fails")
+            .expect("the stream yields an error")
+    }
+
+    #[tokio::test]
+    async fn a_refused_metadata_watch_reports_its_status_code() {
+        let bare = Client::new(tower::service_fn(refusing_apiserver), "default");
+        let e = first_watch_error(bare).await;
+        assert_eq!(
+            status_code(&e),
+            None,
+            "the stub should reproduce the bug: {e}"
+        );
+
+        let fixed = Client::new(
+            tower::ServiceBuilder::new()
+                .map_request(accept_plain_json)
+                .service_fn(refusing_apiserver),
+            "default",
+        );
+        let e = first_watch_error(fixed).await;
+        assert_eq!(status_code(&e), Some(403), "{e}");
     }
 }

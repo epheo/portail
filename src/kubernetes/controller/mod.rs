@@ -120,7 +120,7 @@ struct ControllerCtx {
 /// `portail controller`: run until `shutdown`, the lease is lost or the
 /// Gateway watch ends.
 pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
-    let client = Client::try_default().await?;
+    let client = watch::client().await?;
     info!("Kubernetes client connected, starting Gateway API controller");
     // /livez from here on; /readyz once the CA is loaded and the caches
     // synced. A standby is ready: it answers 503 and the client dials again.

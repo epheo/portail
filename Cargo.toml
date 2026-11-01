@@ -66,6 +66,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 # Verifies a signed controller answer against the public key of the leaf it
 # carries; already in the tree through rustls, with these features.
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
+# A request layer on the controller's kube client; already in the tree
+# through kube-client, with this feature.
+tower = { version = "0.5", features = ["util"] }
 
 
 
@@ -79,8 +82,6 @@ hyper_014 = { package = "hyper", version = "0.14" }
 libc = "0.2"
 rewrk-core = "0.1.3"
 tempfile = "3"
-# service_fn for a mock kube Client in controller tests; kube already builds tower.
-tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "routing_bench"
