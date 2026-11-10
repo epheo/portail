@@ -110,15 +110,19 @@ pub enum SyncAuthStage {
     Precheck,
     /// A TokenReview rejected the same token within the cache TTL.
     NegativeCache,
+    /// Not signed by the cluster's issuer for this controller, or not a
+    /// live pod-bound token: refused before any review.
+    Signature,
     TokenReview,
     /// Authenticated, but not as an identity that may sync this Gateway.
     Authz,
 }
 
 impl SyncAuthStage {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Precheck,
         Self::NegativeCache,
+        Self::Signature,
         Self::TokenReview,
         Self::Authz,
     ];
@@ -127,6 +131,7 @@ impl SyncAuthStage {
         match self {
             Self::Precheck => "precheck",
             Self::NegativeCache => "negative_cache",
+            Self::Signature => "signature",
             Self::TokenReview => "tokenreview",
             Self::Authz => "authz",
         }
@@ -831,7 +836,13 @@ mod tests {
     fn sync_auth_series_render_from_zero() {
         let _serial = SYNC_AUTH_SERIAL.blocking_lock();
         let text = render(false);
-        for stage in ["precheck", "negative_cache", "tokenreview", "authz"] {
+        for stage in [
+            "precheck",
+            "negative_cache",
+            "signature",
+            "tokenreview",
+            "authz",
+        ] {
             let series = format!("portail_sync_auth_rejected_total{{stage=\"{stage}\"}} ");
             assert!(text.contains(&series), "{series}");
         }
