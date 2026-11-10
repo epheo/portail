@@ -407,18 +407,32 @@ pub(crate) async fn write_gateway_status(
 /// The GatewayClass status this controller owns, without timestamps:
 /// Accepted and the supported features, sorted by name as the field
 /// requires.
+/// Says the controller holds each Gateway to its share of polls, held polls
+/// uncounted against their address: a console may then let tenants' data
+/// planes poll through the apiserver, where they share one.
+pub(crate) const POLLS_CAPPED: &str = "portail.epheo.eu/PollsCappedPerGateway";
+
 pub(crate) fn desired_class_status(class: &GatewayClass, accepted: &GatewayCondition) -> Value {
     let mut features: Vec<&str> = SUPPORTED_FEATURES.to_vec();
     features.sort_unstable();
     features.dedup();
     json!({
-        "conditions": [condition(
-            "Accepted",
-            accepted.ok,
-            &accepted.reason,
-            &accepted.message,
-            class.metadata.generation,
-        )],
+        "conditions": [
+            condition(
+                "Accepted",
+                accepted.ok,
+                &accepted.reason,
+                &accepted.message,
+                class.metadata.generation,
+            ),
+            condition(
+                POLLS_CAPPED,
+                true,
+                "Capped",
+                "Each Gateway's data planes hold at most --sync-gateway-polls polls at once",
+                class.metadata.generation,
+            ),
+        ],
         "supportedFeatures": features
             .iter()
             .map(|name| json!({ "name": name }))

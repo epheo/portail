@@ -37,7 +37,8 @@ These flags take no subcommand: `portail --http2 dataplane ...` is refused.
 | `--namespace <NS>` | Namespace of the leader election Lease, the CA Secret and ConfigMap, and the Service (default: env `POD_NAMESPACE`) |
 | `--service-name <NAME>` | The ClusterIP Service data planes dial; `<service>.<namespace>.svc` is also the audience of their tokens (default: `portail-controller`) |
 | `--sync-port <PORT>` | Port of the TLS sync endpoint, `POST /v1/sync/<namespace>/<name>` (default: `9443`) |
-| `--sync-peer-connections <N>` | Open sync connections one peer IP may hold (default: `32`; a data plane holds one or two). Polls through the apiserver's proxy arrive from the apiserver, on OVN-Kubernetes from each apiserver node's management address: at least twice the Primary UDN data planes per apiserver node |
+| `--sync-peer-connections <N>` | Open sync connections one peer IP may hold, held polls aside (default: `32`). A held poll counts against its Gateway, not its address, so data planes polling through the apiserver's proxy, which all share one, do not crowd each other out |
+| `--sync-gateway-polls <N>` | Polls one Gateway's data planes may hold at once (default: `8`; each pod holds one). Over it a poll is answered 503 at once: pods that a namespace's admin starts on its Gateway's ServiceAccount never take other Gateways' connections |
 | `--leader-election-id <NAME>` | Name of the leader election Lease (default: `portail-controller`); the Role of `deploy/install` grants this name only |
 | `--dataplane-image <IMAGE>` | Data-plane image of Managed Gateways without a GatewayParameters `image` (default: the image this binary was published as) |
 | `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |

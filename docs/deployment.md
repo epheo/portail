@@ -241,8 +241,10 @@ Trust:
 
 Scale:
 
-- On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod. The controller caps open connections per address with `--sync-peer-connections` (default 32; a data plane holds one or two): set it to at least twice the Primary UDN data planes per apiserver node.
-- Reviews of new tokens are shared per address too, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
+- On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod.
+- A held poll counts against its Gateway (`--sync-gateway-polls`, default 8), not that address: one namespace's data planes cannot crowd out another's.
+- Each GatewayClass of the controller says so with condition `portail.epheo.eu/PollsCappedPerGateway=True`.
+- Reviews of new tokens stay shared per address, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
 - Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
@@ -295,6 +297,7 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 - ExternalName backends are refused unless the Gateway's GatewayParameters set `externalNameBackends: Allowed`: whoever writes the Service picks the name the Gateway dials, another namespace's Service or the API server included, from wherever the Gateway's pods sit (CVE-2021-25740). The Gateway API asks implementations not to support them.
+- A Gateway's ServiceAccount can be used by any pod its namespace's admin starts, each with a valid token. Its data planes hold at most `--sync-gateway-polls` polls at once, uncounted against their address, so such pods never take other Gateways' connections.
 
 ## Container Image
 
