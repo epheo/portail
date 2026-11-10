@@ -42,6 +42,7 @@ use super::reconcile::{class_owner, ClassOwner};
 use super::reports::{InstanceId, LIVENESS};
 use super::ControllerCtx;
 use crate::logging::{info, warn};
+use crate::metrics::METRICS;
 use crate::proxy::worker::AcceptBackoff;
 use crate::sync::{
     sign, valid_nonce, GatewayKey, Gone, Signed, Snapshot, SyncRequest, HOLD, PROTOCOL,
@@ -86,6 +87,8 @@ pub(crate) struct SyncServer {
     /// Open connections by peer IP, and the most one may hold.
     peer_connections: Mutex<HashMap<IpAddr, usize>>,
     per_peer: usize,
+    /// The polls one Gateway's data planes may hold at once.
+    per_gateway: usize,
     body_reads: Semaphore,
     /// The pods whose body is being read.
     body_readers: Mutex<std::collections::HashSet<InstanceId>>,
@@ -94,7 +97,8 @@ pub(crate) struct SyncServer {
 
 impl SyncServer {
     /// `per_peer`: the open connections one peer IP may hold
-    /// (`--sync-peer-connections`).
+    /// (`--sync-peer-connections`); `per_gateway`: the polls one Gateway's
+    /// data planes may hold at once (`--sync-gateway-polls`).
     pub(crate) fn new(
         ctx: Arc<ControllerCtx>,
         auth: Authenticator,
@@ -102,6 +106,7 @@ impl SyncServer {
         lapses: Arc<Lapses>,
         shutdown: CancellationToken,
         per_peer: usize,
+        per_gateway: usize,
     ) -> Arc<Self> {
         Self::with_connections(
             ctx,
@@ -111,9 +116,11 @@ impl SyncServer {
             shutdown,
             MAX_CONNECTIONS,
             per_peer,
+            per_gateway,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_connections(
         ctx: Arc<ControllerCtx>,
         auth: Authenticator,
@@ -122,6 +129,7 @@ impl SyncServer {
         shutdown: CancellationToken,
         connections: usize,
         per_peer: usize,
+        per_gateway: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
@@ -132,6 +140,7 @@ impl SyncServer {
             connections: Arc::new(Semaphore::new(connections)),
             peer_connections: Mutex::default(),
             per_peer,
+            per_gateway,
             body_reads: Semaphore::new(MAX_BODY_READS),
             body_readers: Mutex::default(),
             shutdown,
@@ -240,7 +249,8 @@ impl SyncServer {
                 return self.no_content(Signed::Leave, &sync.nonce, b"");
             }
         }
-        self.poll(&key, &sync.have, &sync.nonce, &instance).await
+        self.poll(&key, &sync.have, &sync.nonce, &instance, peer)
+            .await
     }
 
     /// Whether `key` is a Gateway of ours. A missing class keeps it served:
@@ -269,8 +279,16 @@ impl SyncServer {
         have: &str,
         nonce: &str,
         instance: &InstanceId,
+        peer: IpAddr,
     ) -> Response<Full<Bytes>> {
-        let hold = self.holds.begin(instance);
+        let Some(hold) = self.holds.begin(key, instance, self.per_gateway) else {
+            METRICS.sync_throttled_total.inc();
+            return unavailable("this Gateway holds its share of polls");
+        };
+        // Held polls count against their Gateway, not their address: those
+        // through the apiserver all share one, and one namespace's pods
+        // would crowd out every other Gateway polling there.
+        let _lease = PeerLease::new(self, peer);
         // Subscribing creates the slot: checked before, and again after in
         // case the Gateway went in between, as a publish re-checks.
         let mut current = self.ctx.hub.subscribe(key);
@@ -443,53 +461,120 @@ fn not_signed(error: &str) -> Response<Full<Bytes>> {
 }
 
 /// One held poll per instance: a data plane asks again when its report
-/// changes, and the poll it gave up on would otherwise hold to expiry.
+/// changes, and the poll it gave up on would otherwise hold to expiry. A
+/// Gateway's instances hold at most `per_gateway` at once: pods minted on its
+/// ServiceAccount, by whoever administers its namespace, would otherwise
+/// take every connection the controller has.
 #[derive(Default)]
 struct Holds {
-    by_instance: Mutex<HashMap<InstanceId, (u64, CancellationToken)>>,
+    state: Mutex<HoldState>,
     next: AtomicU64,
+}
+
+#[derive(Default)]
+struct HoldState {
+    by_instance: HashMap<InstanceId, (u64, CancellationToken)>,
+    by_gateway: HashMap<GatewayKey, usize>,
 }
 
 struct Hold<'a> {
     holds: &'a Holds,
+    gateway: GatewayKey,
     instance: InstanceId,
     id: u64,
     superseded: CancellationToken,
 }
 
 impl Holds {
-    fn begin(&self, instance: &InstanceId) -> Hold<'_> {
+    /// `None` when `gateway` holds `per_gateway` polls of other instances.
+    fn begin(
+        &self,
+        gateway: &GatewayKey,
+        instance: &InstanceId,
+        per_gateway: usize,
+    ) -> Option<Hold<'_>> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let superseded = CancellationToken::new();
-        let previous = self
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.by_instance.contains_key(instance) {
+            let held = state.by_gateway.entry(gateway.clone()).or_insert(0);
+            if *held >= per_gateway {
+                return None;
+            }
+            *held += 1;
+        }
+        let previous = state
             .by_instance
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
             .insert(instance.clone(), (id, superseded.clone()));
         if let Some((_, previous)) = previous {
             previous.cancel();
         }
-        Hold {
+        Some(Hold {
             holds: self,
+            gateway: gateway.clone(),
             instance: instance.clone(),
             id,
             superseded,
-        }
+        })
     }
 }
 
 impl Drop for Hold<'_> {
     fn drop(&mut self) {
-        let mut holds = self
-            .holds
+        let mut state = self.holds.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state
             .by_instance
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if holds
             .get(&self.instance)
             .is_some_and(|(id, _)| *id == self.id)
         {
-            holds.remove(&self.instance);
+            state.by_instance.remove(&self.instance);
+            if let Some(held) = state.by_gateway.get_mut(&self.gateway) {
+                *held -= 1;
+                if *held == 0 {
+                    state.by_gateway.remove(&self.gateway);
+                }
+            }
+        }
+    }
+}
+
+/// A held poll's connection, uncounted against its peer while it holds.
+struct PeerLease<'a> {
+    server: &'a SyncServer,
+    peer: IpAddr,
+    lent: bool,
+}
+
+impl<'a> PeerLease<'a> {
+    fn new(server: &'a SyncServer, peer: IpAddr) -> Self {
+        let mut peers = server
+            .peer_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let lent = match peers.get_mut(&peer) {
+            Some(open) => {
+                *open -= 1;
+                if *open == 0 {
+                    peers.remove(&peer);
+                }
+                true
+            }
+            None => false,
+        };
+        Self { server, peer, lent }
+    }
+}
+
+impl Drop for PeerLease<'_> {
+    fn drop(&mut self) {
+        if self.lent {
+            *self
+                .server
+                .peer_connections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(self.peer)
+                .or_insert(0) += 1;
         }
     }
 }
@@ -799,7 +884,7 @@ mod tests {
     use super::super::auth::METRICS_SERIAL;
     use super::super::testkit::{self, apply, gateway_class, MockApi, TestCluster, CONTROLLER};
     use super::*;
-    use crate::cli::DEFAULT_SYNC_PEER_CONNECTIONS;
+    use crate::cli::{DEFAULT_SYNC_GATEWAY_POLLS, DEFAULT_SYNC_PEER_CONNECTIONS};
     use crate::config::PortailConfig;
     use crate::metrics::{self, SyncAuthStage};
     use crate::sync::GatewayRef;
@@ -829,6 +914,12 @@ mod tests {
     }
 
     async fn fixture_with(edit: impl FnOnce(&mut ControllerCtx)) -> Fixture {
+        fixture_holding(edit, DEFAULT_SYNC_GATEWAY_POLLS).await
+    }
+
+    /// `fixture_with`, its Gateway's data planes holding `per_gateway`
+    /// polls at most.
+    async fn fixture_holding(edit: impl FnOnce(&mut ControllerCtx), per_gateway: usize) -> Fixture {
         let serial = METRICS_SERIAL.lock().await;
         let api = MockApi::default();
         api.reply_to(REVIEWS, 201, review(true, SA, Some("pod-1")));
@@ -851,6 +942,7 @@ mod tests {
             lapses,
             shutdown.clone(),
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            per_gateway,
         );
         Fixture {
             api,
@@ -1158,6 +1250,7 @@ mod tests {
             Lapses::new().0,
             CancellationToken::new(),
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1652,6 +1745,7 @@ mod tests {
             lapses,
             CancellationToken::new(),
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let pass = |p: &testkit::Pipeline, gw: Gateway| {
             let ctx = p.ctx.clone();
@@ -1755,6 +1849,7 @@ mod tests {
             Lapses::new().0,
             CancellationToken::new(),
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let throttled = METRICS.sync_throttled_total.get();
         let polls: Vec<_> = (0..17)
@@ -2057,6 +2152,7 @@ mod tests {
             f.shutdown.clone(),
             1,
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2164,6 +2260,7 @@ mod tests {
             f.shutdown.clone(),
             MAX_CONNECTIONS,
             1,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2244,6 +2341,7 @@ mod tests {
             f.shutdown.clone(),
             1,
             DEFAULT_SYNC_PEER_CONNECTIONS,
+            DEFAULT_SYNC_GATEWAY_POLLS,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2313,7 +2411,7 @@ mod tests {
     /// More data planes hold polls than bodies may be read at once.
     #[tokio::test(start_paused = true)]
     async fn held_polls_hold_no_body_read() {
-        let f = Arc::new(fixture().await);
+        let f = Arc::new(fixture_holding(|_| {}, MAX_BODY_READS + 1).await);
         let v1 = f.publish(1);
         let pods = 0..=MAX_BODY_READS as u32;
         for n in pods.clone() {
@@ -2346,5 +2444,92 @@ mod tests {
         for poll in held {
             assert_eq!(version_of(poll.await.unwrap()).await, v2);
         }
+    }
+
+    /// Pod `n` of Gateway `default/gw`, reviewed and served `v1` once.
+    async fn polled(f: &Fixture, n: u32, v1: &str) {
+        f.api
+            .reply_to(REVIEWS, 201, review(true, SA, Some(&format!("pod-{n}"))));
+        let first = post(
+            Some(&gateway_token("default", "gw", n)),
+            &body(&key(), "", None),
+        );
+        assert_eq!(version_of(f.server.handle(first, peer(n)).await).await, v1);
+    }
+
+    fn hold(
+        f: &Arc<Fixture>,
+        n: u32,
+        have: &str,
+    ) -> tokio::task::JoinHandle<Response<Full<Bytes>>> {
+        let request = post(
+            Some(&gateway_token("default", "gw", n)),
+            &body(&key(), have, None),
+        );
+        let server = f.server.clone();
+        tokio::spawn(async move { server.handle(request, peer(n)).await })
+    }
+
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A Gateway's data planes hold its share of polls at most: another
+    /// pod's poll is refused at once, a pod holding already may ask again,
+    /// and a poll answered frees its place.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_holds_its_share_of_polls() {
+        let f = Arc::new(fixture_holding(|_| {}, 2).await);
+        let v1 = f.publish(1);
+        for n in 1..=3 {
+            polled(&f, n, &v1).await;
+        }
+        let first = hold(&f, 1, &v1);
+        let second = hold(&f, 2, &v1);
+        settle().await;
+        assert!(!first.is_finished() && !second.is_finished(), "both hold");
+        let over = hold(&f, 3, &v1).await.unwrap();
+        assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let again = hold(&f, 1, &v1);
+        settle().await;
+        assert!(first.is_finished(), "superseded by its own pod");
+        assert!(!again.is_finished(), "a pod holding already asks again");
+
+        let v2 = f.publish(2);
+        assert_eq!(version_of(again.await.unwrap()).await, v2);
+        assert_eq!(version_of(second.await.unwrap()).await, v2);
+        let third = hold(&f, 3, &v2);
+        settle().await;
+        assert!(!third.is_finished(), "the places are free again");
+        f.publish(3);
+        third.await.unwrap();
+    }
+
+    /// A held poll does not count against its address: data planes polling
+    /// through the apiserver all arrive from one.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_poll_frees_its_address() {
+        let f = Arc::new(fixture().await);
+        let v1 = f.publish(1);
+        polled(&f, 1, &v1).await;
+        let count = |f: &Fixture| {
+            f.server
+                .peer_connections
+                .lock()
+                .unwrap()
+                .get(&peer(1))
+                .copied()
+        };
+        f.server.peer_connections.lock().unwrap().insert(peer(1), 1);
+        let held = hold(&f, 1, &v1);
+        settle().await;
+        assert!(!held.is_finished());
+        assert_eq!(count(&f), None, "uncounted while it holds");
+        let v2 = f.publish(2);
+        assert_eq!(version_of(held.await.unwrap()).await, v2);
+        assert_eq!(count(&f), Some(1), "counted again once answered");
     }
 }

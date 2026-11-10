@@ -423,6 +423,23 @@ mod tests {
         assert_eq!(bumped["status"]["conditions"][0]["observedGeneration"], 2);
     }
 
+    /// A class says each Gateway's polls are capped: a console gates
+    /// tenant data planes polling through the apiserver on it.
+    #[test]
+    fn a_class_says_polls_are_capped_per_gateway() {
+        let desired = status::desired_class_status(
+            &class("portail", CONTROLLER),
+            &GatewayCondition::ok("Accepted", "GatewayClass accepted by portail controller"),
+        );
+        let capped = desired["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == status::POLLS_CAPPED)
+            .expect("the condition");
+        assert_eq!(capped["status"], "True");
+    }
+
     /// A list an older writer froze keeps a feature dropped since; an
     /// apply would leave that entry, its owner's, and be sent again on
     /// every pass. The list is replaced whole, the conditions left alone.
@@ -434,7 +451,9 @@ mod tests {
             &GatewayCondition::ok("Accepted", "GatewayClass accepted by portail controller"),
         );
         let mut frozen = desired.clone();
-        frozen["conditions"][0]["lastTransitionTime"] = json!("2026-03-01T00:00:00Z");
+        for condition in frozen["conditions"].as_array_mut().unwrap() {
+            condition["lastTransitionTime"] = json!("2026-03-01T00:00:00Z");
+        }
         frozen["supportedFeatures"]
             .as_array_mut()
             .unwrap()

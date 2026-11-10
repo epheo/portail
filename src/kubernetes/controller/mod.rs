@@ -353,6 +353,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         lapses,
         shutdown.clone(),
         args.sync_peer_connections,
+        args.sync_gateway_polls,
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
