@@ -243,7 +243,7 @@ Scale:
 
 - On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod.
 - A held poll counts against its Gateway (`--sync-gateway-polls`, default 8), not that address: one namespace's data planes cannot crowd out another's.
-- Each GatewayClass of the controller says so with condition `portail.epheo.eu/PollsCappedPerGateway=True`.
+- Held polls still take the controller's 1024 connections: 128 Gateways at their cap fill it. Whoever creates Gateways bounds that.
 - Reviews of new tokens stay shared per address, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.

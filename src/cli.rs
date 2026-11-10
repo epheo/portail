@@ -166,6 +166,8 @@ pub struct ControllerArgs {
     /// Each data-plane pod holds one. Over this a poll is answered 503 at
     /// once: pods anyone with that namespace's admin can start on the
     /// Gateway's ServiceAccount never take other Gateways' connections.
+    /// Held polls still take the controller's 1024: 128 Gateways at their
+    /// cap fill it, so whoever creates Gateways bounds them.
     #[arg(
         long,
         value_name = "N",
