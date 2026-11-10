@@ -1,5 +1,11 @@
 # Upgrading
 
+## From 0.2.1
+
+- Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.
+- To keep them, set `externalNameBackends: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
+- Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.
+
 ## 0.1.x to 0.2.0
 
 0.2.0 splits portail into a controller and one data plane per Gateway.

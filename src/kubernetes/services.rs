@@ -23,6 +23,8 @@ use crate::logging::{debug, info, warn};
 /// Resolved service metadata needed for route table construction.
 pub(crate) struct ServiceState {
     pub known_services: HashSet<(String, String)>,
+    /// (name, namespace) of the ExternalName Services.
+    pub external_names: HashSet<(String, String)>,
     pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
     pub app_protocol_overrides: HashMap<(String, u16), String>,
     /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
@@ -188,6 +190,7 @@ pub(crate) fn resolve_services(
     // Service spec — no EndpointSlices). Headless pod IPs come from DNS; only their
     // targetPort mapping (above) is taken from the Service spec.
     let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
+    let mut external_names: HashSet<(String, String)> = HashSet::new();
 
     // ExternalName services: resolve externalName DNS targets
     for svc in all_services {
@@ -208,6 +211,7 @@ pub(crate) fn resolve_services(
         };
         let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
         let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
+        external_names.insert((svc_name.to_string(), svc_ns.to_string()));
 
         if let Some(ports) = spec.ports.as_ref() {
             for sp in ports {
@@ -258,6 +262,7 @@ pub(crate) fn resolve_services(
     (
         ServiceState {
             known_services,
+            external_names,
             endpoint_overrides,
             app_protocol_overrides,
             headless_target_ports,
@@ -536,6 +541,35 @@ mod tests {
             .collect();
         kept.sort_unstable();
         assert_eq!(kept, ["shadow.prod.svc", "web.prod.svc"]);
+    }
+
+    #[test]
+    fn resolve_services_lists_external_names() {
+        use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+        let external = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("ext".to_string()),
+                namespace: Some("tenant".to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                type_: Some("ExternalName".to_string()),
+                external_name: Some("kubernetes.default.svc.cluster.local".to_string()),
+                ports: Some(vec![ServicePort {
+                    port: 443,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain = headless("db", "tenant", None, 5432, IntOrString::Int(5432));
+        let (state, _) =
+            resolve_services(&[std::sync::Arc::new(external), std::sync::Arc::new(plain)]);
+        assert_eq!(
+            state.external_names,
+            HashSet::from([("ext".to_string(), "tenant".to_string())])
+        );
     }
 
     #[test]

@@ -47,6 +47,20 @@ spec:
                 - null
                 nullable: true
                 type: string
+              externalNameBackends:
+                description: |-
+                  Routes to Services of type ExternalName, Managed or not. Refused: the
+                  backendRef is ResolvedRefs=False InvalidKind and its share answers
+                  500, so a route's author cannot make the Gateway dial any name it
+                  likes (Gateway API: implementations SHOULD NOT support them,
+                  CVE-2021-25740). Allowed: the data plane dials the name. Default
+                  Refused.
+                enum:
+                - Refused
+                - Allowed
+                - null
+                nullable: true
+                type: string
               image:
                 description: |-
                   Data-plane image (Managed). Default: the controller's

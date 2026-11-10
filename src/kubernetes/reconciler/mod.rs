@@ -19,7 +19,7 @@ use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
     parse_backend_dns_name, route_namespace, CertData,
 };
-use super::crds::RateLimitPolicy;
+use super::crds::{ExternalNameBackends, RateLimitPolicy};
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
 use super::reference_grants::{is_reference_allowed, listeners_for_parent_ref};
 use super::services::ServiceState;
@@ -325,6 +325,7 @@ pub(crate) fn reconcile_to_config(
     cert_data: &CertData,
     services: &ServiceState,
     verdicts: &RouteVerdicts,
+    external_name_backends: ExternalNameBackends,
 ) -> Result<ReconcileResult> {
     let mut gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
@@ -354,6 +355,7 @@ pub(crate) fn reconcile_to_config(
 
     let mut route_status = Vec::new();
 
+    let none_refused = HashSet::new();
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
@@ -361,6 +363,10 @@ pub(crate) fn reconcile_to_config(
         namespace_labels: &snapshot.namespace_labels,
         reference_grants: &snapshot.reference_grants,
         known_services: &services.known_services,
+        refused_external_names: match external_name_backends {
+            ExternalNameBackends::Refused => &services.external_names,
+            ExternalNameBackends::Allowed => &none_refused,
+        },
     };
     let gateway_key = (gateway_ns.to_string(), gateway_name.to_string());
     let mut checks = Checks {
@@ -640,6 +646,7 @@ struct RouteCollectCtx<'a> {
     namespace_labels: &'a HashMap<String, BTreeMap<String, String>>,
     reference_grants: &'a [ReferenceGrant],
     known_services: &'a HashSet<(String, String)>,
+    refused_external_names: &'a HashSet<(String, String)>,
 }
 
 /// Gateway API precedence between routes whose matches tie: the oldest
@@ -798,7 +805,8 @@ fn collect_routes<R: GatewayRoute>(
         let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
         // Group/kind (core Service only), cross-namespace ReferenceGrant,
-        // and service existence: one checker for forward and mirror refs.
+        // service existence and ExternalName refusal: one checker for
+        // forward and mirror refs.
         let check_ref =
             |backend_name: &str, group: &str, ref_kind: &str| -> Option<(&'static str, String)> {
                 if (!group.is_empty() && group != "core")
@@ -839,6 +847,20 @@ fn collect_routes<R: GatewayRoute>(
                     return Some((
                         "BackendNotFound",
                         format!("Backend service {}.{} not found", svc_name, svc_ns),
+                    ));
+                }
+                if cx
+                    .refused_external_names
+                    .contains(&(svc_name.clone(), svc_ns.clone()))
+                {
+                    return Some((
+                        "InvalidKind",
+                        format!(
+                            "Backend service {}.{} is of type ExternalName, which this Gateway \
+                             refuses unless its GatewayParameters set externalNameBackends: \
+                             Allowed",
+                            svc_name, svc_ns
+                        ),
                     ));
                 }
                 None
