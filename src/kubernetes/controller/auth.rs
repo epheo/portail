@@ -1,21 +1,27 @@
 //! Sync request authentication and authorization. A local pre-check of the
 //! token's unverified claims refuses junk without an apiserver call; then
-//! TokenReview with the controller audience, the authority, its verdict
-//! cached by token hash; then the ServiceAccount must be
-//! `naming::resource_name` of the requested Gateway, in its namespace.
+//! the token's signature against the cluster's issuer keys, when they can be
+//! read ([`IssuerKeys`]); then TokenReview with the controller audience, the
+//! authority on whether its pod still runs, its verdict cached by token
+//! hash; then the ServiceAccount must be `naming::resource_name` of the
+//! requested Gateway, in its namespace.
 //!
 //! Unbounded, each unknown token would cost a TokenReview, and any pod
 //! reaching the Service could make the controller amplify junk onto the
-//! apiserver. Rejections are cached too and reviews in flight are capped; a
-//! forged but well-formed token passes the pre-check, and the cap is what
-//! bounds it. A known token whose verdict expired is reviewed again from a
-//! pool of its own, so forgeries holding the unknown pool never stop a
-//! running data plane; when that pool is busy or the apiserver fails, the
-//! expired verdict serves one more TTL.
+//! apiserver. A verified token is reviewed from its ServiceAccount's own
+//! budget, and its signature stands for it while that budget or the shared
+//! pool is busy: no other namespace's flood delays its Gateway, even through
+//! the apiserver, where every data plane shares one address. A forged one is
+//! refused before any review. Without the keys, reviews are budgeted by
+//! peer address, rejections cached, and the cap is what bounds forgeries. A
+//! known token whose verdict expired is reviewed again from a pool of its
+//! own, so forgeries holding the unknown pool never stop a running data
+//! plane; when that pool is busy or the apiserver fails, the expired verdict
+//! serves one more TTL.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -27,6 +33,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 
+use super::issuer::{IssuerKeys, Verification, Verified};
 use super::reports::InstanceId;
 use crate::kubernetes::naming;
 use crate::logging::{debug, warn};
@@ -105,7 +112,7 @@ pub(crate) enum Refusal {
 }
 
 /// A ServiceAccount, as `system:serviceaccount:<namespace>:<name>` names it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ServiceAccount {
     pub namespace: String,
     pub name: String,
@@ -183,6 +190,23 @@ struct Reviewed {
     pod_uid: String,
 }
 
+impl From<Verified> for Reviewed {
+    fn from(v: Verified) -> Self {
+        Self {
+            account: v.account,
+            pod_uid: v.pod_uid,
+        }
+    }
+}
+
+/// Whose allowance a review of an unknown token is charged to: the
+/// ServiceAccount a verified token proves, else the peer address.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Budget {
+    Peer(IpAddr),
+    Account(ServiceAccount),
+}
+
 type TokenHash = [u8; 32];
 
 #[derive(Default)]
@@ -209,7 +233,7 @@ enum Unreviewed {
     Rejected,
 }
 
-/// A peer IP's allowance of unknown-token reviews.
+/// A budget's allowance of unknown-token reviews.
 struct ReviewBucket {
     tokens: f64,
     at: Instant,
@@ -222,22 +246,28 @@ impl ReviewBucket {
     }
 }
 
-/// A review in flight for a peer IP, counted until dropped.
-struct PeerReview<'a> {
-    peers: &'a Mutex<HashMap<IpAddr, usize>>,
-    peer: IpAddr,
+/// A review in flight for a budget, counted until dropped.
+struct BudgetReview<'a> {
+    in_flight: &'a Mutex<HashMap<Budget, usize>>,
+    budget: Budget,
 }
 
-impl Drop for PeerReview<'_> {
+impl Drop for BudgetReview<'_> {
     fn drop(&mut self) {
-        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(n) = peers.get_mut(&self.peer) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = in_flight.get_mut(&self.budget) {
             *n -= 1;
             if *n == 0 {
-                peers.remove(&self.peer);
+                in_flight.remove(&self.budget);
             }
         }
     }
+}
+
+/// A budget's review and a permit of the unknown pool, held for one review.
+struct Reserved<'a> {
+    _review: BudgetReview<'a>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
 pub(crate) struct Authenticator {
@@ -249,21 +279,23 @@ pub(crate) struct Authenticator {
     refused: Vec<ServiceAccount>,
     unknown: Semaphore,
     renewals: Semaphore,
-    /// Reviews in flight by peer IP.
-    peers: Mutex<HashMap<IpAddr, usize>>,
-    /// Unknown-token reviews allowed by peer IP.
-    review_rates: Mutex<HashMap<IpAddr, ReviewBucket>>,
+    /// Reviews in flight by budget.
+    in_flight: Mutex<HashMap<Budget, usize>>,
+    /// Unknown-token reviews allowed by budget.
+    review_rates: Mutex<HashMap<Budget, ReviewBucket>>,
     verdicts: Mutex<Verdicts>,
+    issuer: Arc<IssuerKeys>,
 }
 
 impl Authenticator {
     /// For the controller of Service `service` in `namespace`, running as
-    /// `own` when known.
+    /// `own` when known, verifying tokens with `issuer`'s keys.
     pub(crate) fn new(
         client: Client,
         namespace: &str,
         service: &str,
         own: Option<ServiceAccount>,
+        issuer: Arc<IssuerKeys>,
     ) -> Self {
         let reserved = ServiceAccount {
             namespace: namespace.to_string(),
@@ -275,9 +307,10 @@ impl Authenticator {
             refused: std::iter::once(reserved).chain(own).collect(),
             unknown: Semaphore::new(MAX_REVIEWS_IN_FLIGHT),
             renewals: Semaphore::new(MAX_RENEWALS_IN_FLIGHT),
-            peers: Mutex::default(),
+            in_flight: Mutex::default(),
             review_rates: Mutex::default(),
             verdicts: Mutex::default(),
+            issuer,
         }
     }
 
@@ -322,7 +355,7 @@ impl Authenticator {
                 let renewal = tokio::time::timeout(REVIEW_TIMEOUT, self.renewals.acquire()).await;
                 let reviewed = match renewal {
                     Ok(Ok(_permit)) => {
-                        let _peer = self.peer_review(peer, usize::MAX);
+                        let _peer = self.budget_review(Budget::Peer(peer), usize::MAX);
                         self.review(hash, token).await
                     }
                     Ok(Err(_)) | Err(_) => Err(Unreviewed::Failed),
@@ -336,23 +369,37 @@ impl Authenticator {
                     Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
                 }
             }
-            Cached::Unknown => {
-                let peer_review = self.peer_review(peer, MAX_REVIEWS_PER_PEER);
-                let permit = self.unknown.try_acquire();
-                let (Some(_peer), Ok(_permit)) = (peer_review, permit) else {
-                    METRICS.sync_throttled_total.inc();
-                    return Err(Refusal::Throttled);
-                };
-                if !self.charge_review(peer) {
-                    METRICS.sync_throttled_total.inc();
-                    return Err(Refusal::Throttled);
+            Cached::Unknown => match self.issuer.verify(token, &self.audience).await {
+                Verification::Refused => {
+                    return Err(rejected(SyncAuthStage::Signature, Refusal::Unauthenticated))
                 }
-                match self.review(hash, token).await {
-                    Ok(reviewed) => reviewed,
-                    Err(Unreviewed::Failed) => return Err(Refusal::Unavailable),
-                    Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
+                // Not cached unreviewed: its next poll asks for a review
+                // again, which a deleted pod's token then fails.
+                Verification::Verified(verified) => {
+                    if verified.account != expected {
+                        return Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden));
+                    }
+                    match self.reserve(Budget::Account(verified.account.clone())) {
+                        Some(_reserved) => match self.review(hash, token).await {
+                            Ok(reviewed) => reviewed,
+                            Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
+                            Err(Unreviewed::Failed) => verified.into(),
+                        },
+                        None => verified.into(),
+                    }
                 }
-            }
+                Verification::Off => {
+                    let Some(_reserved) = self.reserve(Budget::Peer(peer)) else {
+                        METRICS.sync_throttled_total.inc();
+                        return Err(Refusal::Throttled);
+                    };
+                    match self.review(hash, token).await {
+                        Ok(reviewed) => reviewed,
+                        Err(Unreviewed::Failed) => return Err(Refusal::Unavailable),
+                        Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
+                    }
+                }
+            },
         };
         if reviewed.account != expected {
             return Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden));
@@ -360,8 +407,19 @@ impl Authenticator {
         Ok(InstanceId(reviewed.pod_uid))
     }
 
-    /// Take one unknown-token review from `peer`'s bucket, if it has one.
-    fn charge_review(&self, peer: IpAddr) -> bool {
+    /// One review of an unknown token for `budget`: under its in-flight cap,
+    /// with a permit of the unknown pool, charged to its rate.
+    fn reserve(&self, budget: Budget) -> Option<Reserved<'_>> {
+        let review = self.budget_review(budget.clone(), MAX_REVIEWS_PER_PEER)?;
+        let permit = self.unknown.try_acquire().ok()?;
+        self.charge_review(budget).then_some(Reserved {
+            _review: review,
+            _permit: permit,
+        })
+    }
+
+    /// Take one unknown-token review from `budget`'s bucket, if it has one.
+    fn charge_review(&self, peer: Budget) -> bool {
         let now = Instant::now();
         let mut buckets = self.review_rates.lock().unwrap_or_else(|p| p.into_inner());
         if buckets.len() >= MAX_RATED_PEERS && !buckets.contains_key(&peer) {
@@ -370,7 +428,7 @@ impl Authenticator {
                 return false;
             }
         }
-        let bucket = buckets.entry(peer).or_insert(ReviewBucket {
+        let bucket = buckets.entry(peer.clone()).or_insert(ReviewBucket {
             tokens: REVIEW_BURST_PER_PEER,
             at: now,
         });
@@ -384,17 +442,17 @@ impl Authenticator {
         true
     }
 
-    /// Count a review for `peer`, unless it has `cap` in flight already.
-    fn peer_review(&self, peer: IpAddr, cap: usize) -> Option<PeerReview<'_>> {
-        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-        let n = peers.entry(peer).or_insert(0);
+    /// Count a review for `budget`, unless it has `cap` in flight already.
+    fn budget_review(&self, budget: Budget, cap: usize) -> Option<BudgetReview<'_>> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        let n = in_flight.entry(budget.clone()).or_insert(0);
         if *n >= cap {
             return None;
         }
         *n += 1;
-        Some(PeerReview {
-            peers: &self.peers,
-            peer,
+        Some(BudgetReview {
+            in_flight: &self.in_flight,
+            budget,
         })
     }
 
@@ -631,18 +689,18 @@ pub(super) mod testing {
             namespace: NS.into(),
             name: "portail-ctl".into(),
         };
-        Authenticator::new(client, NS, SERVICE, Some(own))
+        Authenticator::new(client, NS, SERVICE, Some(own), Arc::new(IssuerKeys::off()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::issuer::testing::{self as keys, pod_claims, Signer};
     use super::super::testkit::MockApi;
     use super::testing::*;
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     fn reviews(api: &MockApi) -> usize {
         api.requests()
@@ -1403,5 +1461,222 @@ mod tests {
         ] {
             assert_eq!(ServiceAccount::from_username(bad), None, "{bad}");
         }
+    }
+
+    const SA_WEB: &str = "system:serviceaccount:apps:portail-web";
+
+    /// The token of pod `pod` of Gateway `ns/gateway`, signed by `signer`.
+    fn signed(signer: &Signer, ns: &str, gateway: &str, pod: &str, n: u32) -> String {
+        signer.sign(&pod_claims(
+            ns,
+            &naming::resource_name(gateway),
+            pod,
+            AUDIENCE,
+            n,
+        ))
+    }
+
+    /// A kube client whose TokenReviews answer each token `answers` names,
+    /// and leave every other one hanging, counting them; `asked` keeps
+    /// every token reviewed.
+    fn answering_client(
+        answers: Vec<(String, Value)>,
+        hanging: Arc<AtomicUsize>,
+        asked: Arc<Mutex<Vec<String>>>,
+    ) -> Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let (answers, hanging, asked) = (answers.clone(), hanging.clone(), asked.clone());
+            async move {
+                let bytes = req.into_body().collect_bytes().await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let token = body["spec"]["token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                asked.lock().unwrap().push(token.clone());
+                let Some((_, answer)) = answers.iter().find(|(t, _)| *t == token) else {
+                    hanging.fetch_add(1, Ordering::SeqCst);
+                    return futures::future::pending().await;
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(201)
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(answer).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    /// Keys `signer` signs with, as the cluster serves them.
+    async fn keys_of(signer: &Signer) -> Arc<IssuerKeys> {
+        let api = MockApi::default();
+        keys::serve(&api, signer);
+        keys::read_from(&api).await
+    }
+
+    #[tokio::test]
+    async fn a_forged_token_is_refused_without_a_review() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let signer = Signer::new("k");
+        let api = MockApi::default();
+        api.reply_to(REVIEWS, 201, review(true, SA_WEB, Some("pod-1")));
+        let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
+        let forged = signed(&Signer::new("k"), "apps", "web", "pod-1", 0);
+        let refused = counter(SyncAuthStage::Signature);
+        let claimed = auth.precheck(&forged).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &forged, &GatewayKey::new("apps", "web"), PEER)
+                .await,
+            Err(Refusal::Unauthenticated)
+        );
+        assert_eq!(reviews(&api), 0, "no review spent on it");
+        assert_eq!(counter(SyncAuthStage::Signature), refused + 1);
+    }
+
+    /// A verified token is still reviewed: a deleted pod's token stops.
+    #[tokio::test]
+    async fn a_verified_token_is_reviewed_for_its_pod() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let signer = Signer::new("k");
+        let api = MockApi::default();
+        let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
+        let gw = GatewayKey::new("apps", "web");
+        api.reply_to(REVIEWS, 201, review(true, SA_WEB, Some("pod-1")));
+        let live = signed(&signer, "apps", "web", "pod-1", 0);
+        let claimed = auth.precheck(&live).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &live, &gw, PEER).await,
+            Ok(InstanceId("pod-1".into()))
+        );
+        assert_eq!(reviews(&api), 1);
+
+        api.reply_to(REVIEWS, 201, review(false, "", None));
+        let gone = signed(&signer, "apps", "web", "pod-2", 1);
+        let claimed = auth.precheck(&gone).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &gone, &gw, PEER).await,
+            Err(Refusal::Unauthenticated),
+            "its pod was deleted"
+        );
+    }
+
+    /// One namespace flooding through the apiserver, where every data plane
+    /// shares one address, never delays another Gateway's first poll: each
+    /// account's reviews come from its own budget.
+    #[tokio::test(start_paused = true)]
+    async fn one_namespace_never_delays_another_through_one_address() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let signer = Signer::new("k");
+        let first = signed(&signer, "shop", "front", "pod-b", 0);
+        let (hanging, asked) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let answer = review(
+            true,
+            "system:serviceaccount:shop:portail-front",
+            Some("pod-b"),
+        );
+        let client = answering_client(
+            vec![(first.clone(), answer)],
+            hanging.clone(),
+            asked.clone(),
+        );
+        let auth = Arc::new(Authenticator::new(
+            client,
+            NS,
+            SERVICE,
+            None,
+            keys_of(&signer).await,
+        ));
+
+        let flood: Vec<_> = (0..40u32)
+            .map(|n| {
+                let (auth, token) = (
+                    auth.clone(),
+                    signed(&signer, "apps", "web", &format!("pod-{n}"), n),
+                );
+                tokio::spawn(async move {
+                    let claimed = auth.precheck(&token).unwrap();
+                    auth.authenticate(&claimed, &token, &GatewayKey::new("apps", "web"), PEER)
+                        .await
+                })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(
+            hanging.load(Ordering::SeqCst),
+            MAX_REVIEWS_PER_PEER,
+            "its own budget"
+        );
+
+        let claimed = auth.precheck(&first).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &first, &GatewayKey::new("shop", "front"), PEER)
+                .await,
+            Ok(InstanceId("pod-b".into()))
+        );
+        assert!(
+            asked.lock().unwrap().contains(&first),
+            "reviewed from its own budget"
+        );
+        flood.iter().for_each(|f| f.abort());
+    }
+
+    /// Floods of many accounts can fill the shared pool of reviews: a
+    /// verified token is then served on its signature, never refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_verified_token_is_served_while_the_shared_pool_is_busy() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let signer = Signer::new("k");
+        let (hanging, asked) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client = answering_client(Vec::new(), hanging.clone(), asked.clone());
+        let auth = Arc::new(Authenticator::new(
+            client,
+            NS,
+            SERVICE,
+            None,
+            keys_of(&signer).await,
+        ));
+        let flood: Vec<_> = (0..MAX_REVIEWS_IN_FLIGHT as u32)
+            .map(|n| {
+                let gw = format!("gw-{}", n / MAX_REVIEWS_PER_PEER as u32);
+                let (auth, token) = (
+                    auth.clone(),
+                    signed(&signer, "apps", &gw, &format!("pod-{n}"), n),
+                );
+                tokio::spawn(async move {
+                    let claimed = auth.precheck(&token).unwrap();
+                    auth.authenticate(&claimed, &token, &GatewayKey::new("apps", &gw), PEER)
+                        .await
+                })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(
+            hanging.load(Ordering::SeqCst),
+            MAX_REVIEWS_IN_FLIGHT,
+            "the pool is full"
+        );
+
+        let first = signed(&signer, "shop", "front", "pod-b", 0);
+        let claimed = auth.precheck(&first).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &first, &GatewayKey::new("shop", "front"), PEER)
+                .await,
+            Ok(InstanceId("pod-b".into()))
+        );
+        assert!(
+            !asked.lock().unwrap().contains(&first),
+            "served on its signature"
+        );
+        flood.iter().for_each(|f| f.abort());
     }
 }

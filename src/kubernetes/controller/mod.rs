@@ -12,6 +12,7 @@ mod auth;
 mod ca;
 mod gatewayclass;
 mod hub;
+mod issuer;
 mod leader;
 mod params;
 mod programmed;
@@ -115,6 +116,9 @@ struct ControllerCtx {
     owned: provision::Owned,
     /// Wakes the class pass, which removes departed Gateways' entries.
     departures: gatewayclass::Departures,
+    /// Whether sync tokens are verified locally, which the class status
+    /// says as portail.epheo.eu/GatewaysIsolated.
+    isolated: tokio::sync::watch::Receiver<bool>,
 }
 
 /// `portail controller`: run until `shutdown`, the lease is lost or the
@@ -237,6 +241,14 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let (store_gateway_classes, gateway_class_stream) =
         create_reflector(Api::<GatewayClass>::all(client.clone()), &listings);
     let (class_events, class_changes) = gatewayclass::class_events();
+    let issuer = Arc::new(issuer::IssuerKeys::new(client.clone()));
+    tokio::spawn(issuer.clone().run(shutdown.clone()));
+    let isolated = issuer.watch();
+    tokio::spawn(
+        class_events
+            .clone()
+            .on_change(issuer.watch(), shutdown.clone()),
+    );
     let gateway_class_stream = class_events.on(gateway_class_stream);
     // A class seen before its parameters is judged again when they come.
     let params_stream = class_events.on(params_stream);
@@ -285,6 +297,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         synced: listings.clone(),
         owned,
         departures: Default::default(),
+        isolated,
     });
 
     // Every Gateway is reconciled once the caches are synced: passes before
@@ -348,6 +361,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             &args.namespace,
             &args.service_name,
             auth::own_service_account(),
+            issuer,
         ),
         signer,
         lapses,

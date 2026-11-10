@@ -250,6 +250,7 @@ impl TestCluster {
                 super::provision::ControllerEndpoint::for_tests(),
             ),
             departures: Default::default(),
+            isolated: tokio::sync::watch::channel(false).1,
         })
     }
 }

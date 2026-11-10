@@ -407,18 +407,45 @@ pub(crate) async fn write_gateway_status(
 /// The GatewayClass status this controller owns, without timestamps:
 /// Accepted and the supported features, sorted by name as the field
 /// requires.
-pub(crate) fn desired_class_status(class: &GatewayClass, accepted: &GatewayCondition) -> Value {
+/// Says one namespace's data planes never delay another Gateway's
+/// configuration: held polls capped per Gateway, and sync tokens verified
+/// against the cluster's issuer keys before any review, reviews budgeted by
+/// the ServiceAccount they prove. A console may then let tenants' data
+/// planes poll through the apiserver, where they share one address.
+pub(crate) const GATEWAYS_ISOLATED: &str = "portail.epheo.eu/GatewaysIsolated";
+
+/// `isolated`: sync tokens are verified locally (the per-Gateway poll cap
+/// always holds).
+pub(crate) fn desired_class_status(
+    class: &GatewayClass,
+    accepted: &GatewayCondition,
+    isolated: bool,
+) -> Value {
     let mut features: Vec<&str> = SUPPORTED_FEATURES.to_vec();
     features.sort_unstable();
     features.dedup();
+    let (reason, message) = if isolated {
+        (
+            "Isolated",
+            "One namespace's data planes never delay another Gateway's configuration",
+        )
+    } else {
+        (
+            "TokensNotVerified",
+            "The controller cannot read the cluster's ServiceAccount issuer keys: forged tokens sent through one address can delay other Gateways' first poll",
+        )
+    };
     json!({
-        "conditions": [condition(
-            "Accepted",
-            accepted.ok,
-            &accepted.reason,
-            &accepted.message,
-            class.metadata.generation,
-        )],
+        "conditions": [
+            condition(
+                "Accepted",
+                accepted.ok,
+                &accepted.reason,
+                &accepted.message,
+                class.metadata.generation,
+            ),
+            condition(GATEWAYS_ISOLATED, isolated, reason, message, class.metadata.generation),
+        ],
         "supportedFeatures": features
             .iter()
             .map(|name| json!({ "name": name }))
@@ -1198,7 +1225,7 @@ mod tests {
     #[test]
     fn class_status_is_accepted_with_sorted_features() {
         let accepted = GatewayCondition::ok("Accepted", "ok");
-        let desired = desired_class_status(&class(3), &accepted);
+        let desired = desired_class_status(&class(3), &accepted, false);
         assert_eq!(desired["conditions"][0]["observedGeneration"], 3);
         assert_eq!(desired["conditions"][0]["status"], "True");
         let names = feature_names(&desired);
@@ -1216,7 +1243,7 @@ mod tests {
         let stored = stored_class_status(&desired);
         assert!(class_status_current(&stored, &desired));
         assert!(!class_status_current(&json!({}), &desired));
-        let bumped = desired_class_status(&class(4), &accepted);
+        let bumped = desired_class_status(&class(4), &accepted, false);
         assert!(!class_status_current(&stored, &bumped));
         let invalid = desired_class_status(
             &class(3),
@@ -1225,6 +1252,7 @@ mod tests {
                 reason: "InvalidParameters".into(),
                 message: "missing".into(),
             },
+            false,
         );
         assert!(!class_status_current(&stored, &invalid));
 

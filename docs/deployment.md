@@ -244,7 +244,8 @@ Scale:
 - On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod.
 - A held poll counts against its Gateway (`--sync-gateway-polls`, default 8), not that address: one namespace's data planes cannot crowd out another's.
 - Held polls still take the controller's 1024 connections: 128 Gateways at their cap fill it. Whoever creates Gateways bounds that.
-- Reviews of new tokens stay shared per address, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
+- A token is checked against the cluster's issuer keys before any review, and reviewed from its ServiceAccount's budget, not that address's: a forged one costs no review, and one namespace's flood never delays another Gateway's first poll.
+- Without the keys, reviews of new tokens are shared per address, two at once and five a second: a poll over that share gets a 503 and retries.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
 - Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
@@ -287,7 +288,12 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 
 ## Security
 
-- Data planes authenticate with projected ServiceAccount tokens of the controller audience; the controller checks them with a TokenReview.
+- Data planes authenticate with projected ServiceAccount tokens of the controller audience.
+- The controller verifies each token against the cluster's ServiceAccount issuer keys (`/.well-known/openid-configuration`, `/openid/v1/jwks`): signature, issuer, audience, expiry and pod binding. A forged one is refused before any TokenReview.
+- A TokenReview then says whether the token's pod still runs. It is budgeted per ServiceAccount, one per Gateway; while that budget or the shared pool is busy, the signature serves the token until its next poll, so no namespace delays another's configuration.
+- An unknown key id reads the keys again at most every 30s: a rotation is seen, a forged id costs one read per period.
+- Without the keys (discovery off, or no RBAC on its URLs) tokens go to TokenReview unverified, budgeted per address, and each GatewayClass says so.
+- Each GatewayClass carries `portail.epheo.eu/GatewaysIsolated`: `True` while one namespace's data planes cannot delay another Gateway's configuration (held polls capped per Gateway, tokens verified locally), `False` with why otherwise.
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
