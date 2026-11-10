@@ -1,5 +1,11 @@
 # Upgrading
 
+## Downgrading
+
+- A controller drops the conditions of its own domain (`portail.epheo.eu/...`) it no longer writes on its first pass.
+- One released before that, such as 0.2.1, leaves them as they were. After downgrading to it, a GatewayClass keeps a stale `portail.epheo.eu/GatewaysIsolated=True` that a console may trust.
+- Remove it by hand, `kubectl patch gatewayclass <name> --subresource=status --type=json -p '[{"op":"remove","path":"/status/conditions/<index>"}]'`, or edit the class so the older controller rewrites its conditions.
+
 ## From 0.2.1
 
 - Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.
