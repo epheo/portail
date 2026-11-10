@@ -17,6 +17,7 @@ fn reconcile_to_config(
         cert_data,
         services,
         &RouteVerdicts::default(),
+        ExternalNameBackends::Refused,
     )
 }
 
@@ -76,6 +77,7 @@ fn test_snapshot(
 fn empty_services() -> ServiceState {
     ServiceState {
         known_services: test_known_services(),
+        external_names: HashSet::new(),
         endpoint_overrides: HashMap::new(),
         app_protocol_overrides: HashMap::new(),
         headless_target_ports: HashMap::new(),
@@ -1707,6 +1709,65 @@ fn test_mirror_to_unknown_service_dropped() {
     assert_eq!(ra.refs_reason, "BackendNotFound");
 }
 
+/// `test_http_route`'s backend, `api-svc`, as an ExternalName Service.
+fn api_svc_external_name() -> (ClusterSnapshot, ServiceState) {
+    let snapshot = test_snapshot(
+        vec![test_http_route()],
+        vec![],
+        vec![],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let mut services = empty_services();
+    services
+        .external_names
+        .insert(("api-svc".to_string(), "default".to_string()));
+    (snapshot, services)
+}
+
+/// Gateway API BackendObjectReference: implementations SHOULD NOT support
+/// ExternalName Services. The Service's own namespace picks the name the
+/// Gateway would dial.
+#[test]
+fn external_name_backend_is_refused_by_default() {
+    let (snapshot, services) = api_svc_external_name();
+    let result =
+        reconcile_to_config(&test_gateway(), &snapshot, &HashMap::new(), &services).unwrap();
+
+    let ra = &result.route_status[0];
+    assert!(ra.accepted);
+    assert!(!ra.refs_resolved);
+    assert_eq!(ra.refs_reason, "InvalidKind");
+    assert!(
+        ra.refs_message.contains("ExternalName"),
+        "{}",
+        ra.refs_message
+    );
+    assert!(result.config.http_routes[0].rules[0].backend_refs[0].invalid);
+    assert!(
+        crate::kubernetes::services::referenced_backends(&result.config).is_empty(),
+        "the name it holds never reaches the data plane"
+    );
+}
+
+#[test]
+fn external_name_backend_is_followed_when_allowed() {
+    let (snapshot, services) = api_svc_external_name();
+    let result = super::reconcile_to_config(
+        &test_gateway(),
+        &snapshot,
+        &HashMap::new(),
+        &services,
+        &RouteVerdicts::default(),
+        ExternalNameBackends::Allowed,
+    )
+    .unwrap();
+
+    assert!(result.route_status[0].refs_resolved);
+    assert!(!result.config.http_routes[0].rules[0].backend_refs[0].invalid);
+}
+
 // ---- Filter values spliced into HTTP/1 bytes ----
 
 fn route_with_filters(
@@ -2054,6 +2115,7 @@ fn a_route_verdict_stands_until_its_generation_moves() {
             &HashMap::new(),
             &empty_services(),
             &verdicts,
+            ExternalNameBackends::Refused,
         )
         .unwrap()
     };

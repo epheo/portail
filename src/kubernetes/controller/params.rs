@@ -12,8 +12,8 @@ use kube::ResourceExt;
 use super::ControllerCtx;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
-    ControllerTransport, GatewayParameters, GatewayParametersSpec, NetworkSelection, Provisioning,
-    ServiceParameters, ServiceType,
+    ControllerTransport, ExternalNameBackends, GatewayParameters, GatewayParametersSpec,
+    NetworkSelection, Provisioning, ServiceParameters, ServiceType,
 };
 
 const GROUP: &str = "portail.epheo.eu";
@@ -35,6 +35,7 @@ pub(crate) struct Params {
     pub service_type: ServiceType,
     pub networks: Vec<NetworkSelection>,
     pub controller_transport: ControllerTransport,
+    pub external_name_backends: ExternalNameBackends,
 }
 
 /// `Err` says why the parameters cannot be used: the Gateway is
@@ -214,6 +215,7 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         service: None,
         networks: None,
         controller_transport: Some(ControllerTransport::Direct),
+        external_name_backends: Some(ExternalNameBackends::Refused),
     }
 }
 
@@ -232,9 +234,11 @@ fn merge(
             service,
             networks,
             controller_transport,
+            external_name_backends,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
         base.controller_transport = controller_transport.or(base.controller_transport);
+        base.external_name_backends = external_name_backends.or(base.external_name_backends);
         base.replicas = replicas.or(base.replicas);
         base.image = image.or(base.image);
         base.resources = resources.or(base.resources);
@@ -290,6 +294,9 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         controller_transport: spec
             .controller_transport
             .unwrap_or(ControllerTransport::Direct),
+        external_name_backends: spec
+            .external_name_backends
+            .unwrap_or(ExternalNameBackends::Refused),
     })
 }
 
@@ -429,6 +436,7 @@ mod tests {
                 service_type: ServiceType::LoadBalancer,
                 networks: vec![],
                 controller_transport: ControllerTransport::Direct,
+                external_name_backends: ExternalNameBackends::Refused,
             }
         );
     }
@@ -522,6 +530,28 @@ networks: [{name: c}]
         );
         let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
         assert_eq!(params.provisioning, Provisioning::Unmanaged);
+    }
+
+    #[tokio::test]
+    async fn external_name_backends_from_the_class_unless_the_gateway_says() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "externalNameBackends: Allowed",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(params.external_name_backends, ExternalNameBackends::Allowed);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", "externalNameBackends: Refused"),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.external_name_backends, ExternalNameBackends::Refused);
     }
 
     /// A missing referent, a wrong group or kind, or a class reference

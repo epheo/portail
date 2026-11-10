@@ -170,6 +170,21 @@ pub struct GatewayParametersSpec {
     /// deploy/components/apiserver-proxy. Default Direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_transport: Option<ControllerTransport>,
+
+    /// Routes to Services of type ExternalName, Managed or not. Refused: the
+    /// backendRef is ResolvedRefs=False InvalidKind and its share answers
+    /// 500, so a route's author cannot make the Gateway dial any name it
+    /// likes (Gateway API: implementations SHOULD NOT support them,
+    /// CVE-2021-25740). Allowed: the data plane dials the name. Default
+    /// Refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_name_backends: Option<ExternalNameBackends>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ExternalNameBackends {
+    Refused,
+    Allowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

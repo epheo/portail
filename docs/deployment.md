@@ -140,6 +140,7 @@ spec:
     ips: ["172.16.87.21/24"]
     gateway: ["172.16.87.1"]
   controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
+  externalNameBackends: Refused  # Refused | Allowed
 ```
 
 Referenced from:
@@ -155,6 +156,7 @@ Defaults:
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
 - `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
 - `controllerTransport: Direct`.
+- `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
 
 Rules:
 
@@ -292,6 +294,7 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - An answer that fails, or a body over 64 MiB, changes nothing served: the data plane counts the controller as disconnected, backs off, and its reports carry why as an apply error until the controller answers again.
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
+- ExternalName backends are refused unless the Gateway's GatewayParameters set `externalNameBackends: Allowed`: whoever writes the Service picks the name the Gateway dials, another namespace's Service or the API server included, from wherever the Gateway's pods sit (CVE-2021-25740). The Gateway API asks implementations not to support them.
 
 ## Container Image
 

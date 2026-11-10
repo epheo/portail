@@ -15,7 +15,7 @@ use super::watch::StatusReports;
 use super::{ControllerCtx, ResourceCache};
 use crate::config::PortailConfig;
 use crate::kubernetes::addresses::resolve_network_cidrs;
-use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
     reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
@@ -216,6 +216,7 @@ fn observed_policies(
 pub(crate) async fn translate(
     ctx: &ControllerCtx,
     gateway: &Gateway,
+    external_name_backends: ExternalNameBackends,
 ) -> Result<Plan, Box<Rejected>> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -261,6 +262,7 @@ pub(crate) async fn translate(
         &resolved_certs.valid,
         &services,
         &ctx.route_verdicts,
+        external_name_backends,
     ) {
         Ok(r) => r,
         Err(e) => {

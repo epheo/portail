@@ -24,7 +24,7 @@ use super::{
     params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
     ReconcileError, ERROR_REQUEUE_SECS,
 };
-use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::{PolicyAcceptance, RouteAcceptance};
 use crate::kubernetes::status;
@@ -293,7 +293,11 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     }
 
     let params = params::resolve(ctx, gateway);
-    let mut plan = translate(ctx, gateway).await;
+    // Invalid parameters publish nothing; the status they leave refuses.
+    let external_name_backends = params
+        .as_ref()
+        .map_or(ExternalNameBackends::Refused, |p| p.external_name_backends);
+    let mut plan = translate(ctx, gateway, external_name_backends).await;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
             let provisioned = provision::reconcile(ctx, gateway, params).await;
@@ -1330,7 +1334,7 @@ mod tests {
         p.api.clear();
         let pass = Pass {
             key: testkit::key(&gw),
-            plan: translate(&p.ctx, &gw).await,
+            plan: translate(&p.ctx, &gw, ExternalNameBackends::Refused).await,
             provisioned: Provisioned::unmanaged(),
             invalid_parameters: Some("GatewayParameters default/missing not found".into()),
             published: false,
