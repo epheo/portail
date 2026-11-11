@@ -131,7 +131,8 @@ impl NetworkCidrCache {
 
 /// The CIDRs of the networks `gateway`'s Network addresses name, and of
 /// the `egress` networks (namespace, name) its parameters attach with
-/// listeners false, for its data planes to find their own IPs in.
+/// listeners false, for its data planes to find their own IPs in. A dial-out
+/// network whose NAD is gone, or names no subnet, stays, with no CIDRs.
 ///
 /// A NAD that cannot be read keeps the network's last CIDRs: unbinding on
 /// an apiserver blip was an outage. Only an answer that the network is gone
@@ -173,7 +174,12 @@ pub(crate) async fn resolve_network_cidrs(
             }
             NetworkRead::Absent => {
                 known.remove(&key);
-                continue;
+                // Its pods may keep the interface: the data plane must
+                // still know a network it cannot tell apart is there.
+                if listeners {
+                    continue;
+                }
+                Vec::new()
             }
             NetworkRead::Unknown(e) => match known.get(&key) {
                 Some(cidrs) => {

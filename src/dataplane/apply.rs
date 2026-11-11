@@ -9,7 +9,7 @@ use std::time::Instant;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio_util::sync::CancellationToken;
 
-use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_networks};
+use super::addresses::{bind_addresses_resolved, local_interfaces, resolve_networks, DialOut};
 use super::dns_refresh::{spawn_dns_refresh, Published};
 use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
 use crate::logging::{error, info, warn};
@@ -81,15 +81,12 @@ impl Applier {
     /// under the snapshot's version as sent.
     pub async fn apply(&mut self, snapshot: &Snapshot) -> InstanceReport {
         let config = snapshot.to_config();
-        let local = local_interface_ips();
+        let interfaces = local_interfaces();
+        let local: Vec<String> = interfaces.iter().map(|(_, ip)| ip.clone()).collect();
         let networks = resolve_networks(&config.gateway.addresses, &snapshot.networks, &local);
+        let dial_out = DialOut::of(&interfaces, &snapshot.networks);
         let served = Served {
-            bind: bind_addresses_resolved(
-                &config.gateway.addresses,
-                &networks,
-                &local,
-                &snapshot.networks,
-            ),
+            bind: bind_addresses_resolved(&config.gateway.addresses, &networks, &local, &dial_out),
             config: Arc::new(config),
         };
         let state = self.bring_up(&served).await;
@@ -116,6 +113,7 @@ impl Applier {
             apply_error: state.build_error,
             interface_ips: local,
             networks,
+            dial_out_ips: dial_out.ips,
             dns_epoch: self.dns_epoch(),
             leaving: false,
         }

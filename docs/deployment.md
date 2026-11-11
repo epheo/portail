@@ -159,7 +159,7 @@ Defaults:
 
 - `provisioning: Managed`, `replicas: 1`.
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
-- `service.type`: `None` when the Gateway has a Network address or a network in `networks` it listens on, else `LoadBalancer`.
+- `service.type`: `None` when the Gateway has a Network address or `networks` is set, a network it only dials out on included, else `LoadBalancer`.
 - `controllerTransport: Direct`.
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
 - `proxyProtocol`: no trusted source; no connection is read for a header.
@@ -168,6 +168,7 @@ Rules:
 
 - `networks[].ips` requires `replicas: 1`: one static IP cannot sit on two pods.
 - A Network address naming a network `networks` attaches with `listeners: false` is invalid: a Network address binds listeners.
+- An `IPAddress` inside such a network is invalid once its CIDRs are read: it would never bind.
 - A missing or invalid GatewayParameters makes the Gateway `Accepted=False`, reason `InvalidParameters`; on a class, the class and its Gateways.
 - Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
 
@@ -188,10 +189,13 @@ Two replicas spread across nodes when there are several.
 
 `networks[].listeners: false` attaches a network the data plane only dials out on, Managed or not (Unmanaged pods attach it themselves):
 
-- No listener binds on it, whatever the Gateway's addresses: an IPAddress inside it binds nowhere.
+- No listener binds on its interface: the one holding an IP inside its CIDRs. Every address on that interface is left out, any family, inside the CIDRs or not.
 - Its data planes still report their IP there: Gateway backends are reached on it, and Gateways trusting this one trust that IP.
-- Where such a Gateway would bind every interface (no local address, or only a LoadBalancer VIP), it binds each local IP outside these networks instead.
+- Where such a Gateway would bind every interface (no local address, or only a LoadBalancer VIP), it binds each local IP off these interfaces instead.
 - That list is read at each apply: an address the pod gains later binds at the next apply. Every other Gateway keeps every interface, which follows addresses as they come.
+- Loopback is never in that list: such a Gateway no longer answers on 127.0.0.1.
+- Its NetworkAttachmentDefinition gone, or naming no subnet: its interface cannot be told apart, so the Gateway binds only the addresses it names, as for a Network address not resolved; with none, nothing binds and `Programmed` is `False`, reason `AddressNotUsable`.
+- It does not change the Service default: a Gateway with `networks` gets `None`. An edge behind a LoadBalancer sets `service.type: LoadBalancer`.
 - Only platform namespaces attach such a network to Gateways; the edge is the case it is for ([Edge mode](#edge-mode)).
 
 ### PROXY protocol
@@ -250,6 +254,7 @@ apiVersion: portail.epheo.eu/v1alpha1
 kind: GatewayParameters
 metadata: {name: edge, namespace: portail-edge}
 spec:
+  service: {type: LoadBalancer}   # networks default it to None
   networks:
   - {name: transit, listeners: false}
 ---
@@ -318,7 +323,7 @@ spec:
 
 - HTTPS passes through the edge by SNI and terminates at the project Gateway, with its own certificate; HTTP goes by Host.
 - The project Gateway sees each client, from the header the edge sends, in `X-Forwarded-For`, access logs and rate limits.
-- The edge's public side: a LoadBalancer Service, the default when its only network is one it dials out on; or an `IPAddress` local to the pod (such as on a localnet network) with `service.type: None`.
+- The edge's public side: a LoadBalancer Service, set explicitly; or an `IPAddress` local to the pod (such as on a localnet network) with `service.type: None`.
 - Its listeners bind every local IP but its transit one: nothing listens on transit.
 - Project Gateways keep transit as a Network address: they listen there.
 - Behind a LoadBalancer, keeping the client's address up to the edge needs `externalTrafficPolicy: Local` on its Service, which GatewayParameters cannot set yet.

@@ -370,6 +370,15 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         &egress,
     )
     .await;
+    // A dial-out network's CIDRs are read at translation: only then does an
+    // IPAddress inside one show it would never bind.
+    let params = match (params, &plan) {
+        (Ok(p), Ok(plan)) => match params::dial_out_address(gateway, &plan.networks) {
+            Some(why) => Err(why),
+            None => Ok(p),
+        },
+        (params, _) => params,
+    };
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
             let provisioned = provision::reconcile(ctx, gateway, params).await;
@@ -1410,6 +1419,72 @@ mod tests {
                 .map(|c| c.trusted_sources),
             Some(vec!["10.250.0.9/32".to_string()]),
             "the edge's udn-a address, though nothing binds there"
+        );
+
+        // The NAD gone while the edge's pods keep their interface: udn-a
+        // stays in its snapshot with no CIDRs, so nothing binds where it
+        // might be.
+        p.api.reply_to(
+            NAD_UDN_A,
+            404,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        );
+        p.pass(&edge).await.unwrap();
+        assert_eq!(
+            p.served(&edge).unwrap().networks,
+            [crate::sync::NetworkCidrs {
+                name: "udn-a".into(),
+                cidrs: vec![],
+                listeners: false,
+            }]
+        );
+    }
+
+    /// An IPAddress inside a network the Gateway only dials out on is
+    /// InvalidParameters once that network's CIDRs are read.
+    #[tokio::test]
+    async fn an_address_inside_a_dialed_network_is_invalid_parameters() {
+        use crate::kubernetes::crds::{GatewayParameters, GatewayParametersSpec, NetworkSelection};
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let mut params = GatewayParameters::new(
+            "edge",
+            GatewayParametersSpec {
+                networks: Some(vec![NetworkSelection {
+                    name: "udn-a".into(),
+                    listeners: Some(false),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut p.cluster.parameters, params);
+        let mut edge = with_addresses(
+            testkit::gateway("edge", 1),
+            1,
+            &[("IPAddress", "10.250.0.5")],
+        );
+        edge.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "edge".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut p.cluster.gateways, edge.clone());
+        let _ = p.pass(&edge).await;
+        assert!(p.served(&edge).is_none(), "nothing published");
+        let patch = p.api.status_patch("gateways", "edge").unwrap();
+        let accepted = &patch["status"]["conditions"][0];
+        assert_eq!(accepted["reason"], "InvalidParameters", "{patch}");
+        assert!(
+            accepted["message"].as_str().unwrap().contains("10.250.0.5"),
+            "{accepted}"
         );
     }
 

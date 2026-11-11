@@ -253,8 +253,8 @@ pub enum Provisioning {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceParameters {
     /// The Service fronting the data plane; None creates none. Unset:
-    /// None when the Gateway has a Network address or `networks` it
-    /// listens on, else LoadBalancer.
+    /// None when the Gateway has a Network address or `networks`, else
+    /// LoadBalancer.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<ServiceType>,
 }
@@ -290,9 +290,9 @@ pub struct NetworkSelection {
     pub interface: Option<String>,
     /// Whether listeners bind on this network. false: the data planes
     /// only dial out on it, reaching Gateway backends and being trusted
-    /// there by the Gateways that name this one; a Gateway with such a
-    /// network binds its unaddressed listeners on every local IP outside
-    /// it. Default true.
+    /// there by the Gateways that name this one. No listener binds on its
+    /// interface, and a Gateway with such a network binds its unaddressed
+    /// listeners on every local IP off it. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listeners: Option<bool>,
 }
