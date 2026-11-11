@@ -18,6 +18,15 @@
 //! own, so forgeries holding the unknown pool never stop a running data
 //! plane; when that pool is busy or the apiserver fails, the expired verdict
 //! serves one more TTL.
+//!
+//! A token is only ever its ServiceAccount's by uid, not by name: a Gateway
+//! deleted and recreated under its name gets a new one, and its snapshot,
+//! TLS keys included, must never reach the old one's pods. A Managed
+//! Gateway's uid comes from the cache of what this controller provisioned,
+//! and is compared on every path, a cached verdict's included. An
+//! Unmanaged one's ServiceAccount is its owner's and unwatched: only a
+//! TokenReview, which refuses a deleted ServiceAccount's token, accepts it,
+//! and neither a busy budget nor a failed review stands in for one.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -111,6 +120,20 @@ pub(crate) enum Refusal {
     Unavailable,
 }
 
+/// What this controller knows of the ServiceAccount a Gateway's data
+/// planes run as now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Account {
+    /// Managed: the uid of the one this controller provisioned for it.
+    Provisioned(String),
+    /// Managed, and the cache holds none of its: deleted, not made yet, or
+    /// still the one a deleted Gateway of that name owned.
+    Missing,
+    /// Unmanaged, or not a Gateway this controller runs: only a TokenReview
+    /// tells whether a token is still its ServiceAccount's.
+    Unwatched,
+}
+
 /// A ServiceAccount, as `system:serviceaccount:<namespace>:<name>` names it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ServiceAccount {
@@ -173,6 +196,15 @@ fn precheck(token: &str, audience: &str, now: SystemTime) -> Option<ServiceAccou
         return None;
     }
     ServiceAccount::from_username(claims["sub"].as_str()?)
+}
+
+/// The uid of the ServiceAccount `token` claims to be, unverified: compared
+/// before any acceptance, so it can only refuse.
+fn claimed_uid(token: &str) -> Option<String> {
+    claims(token)?["kubernetes.io"]["serviceaccount"]["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .map(String::from)
 }
 
 /// This process's ServiceAccount, from its own API token's claims; `None`
@@ -322,13 +354,15 @@ impl Authenticator {
     }
 
     /// The instance `token` belongs to, if it may sync `gateway`, asked from
-    /// `peer`. `claimed` is what [`Self::precheck`] read from it.
+    /// `peer`. `claimed` is what [`Self::precheck`] read from it; `account`
+    /// what the cache says of the Gateway's ServiceAccount.
     pub(crate) async fn authenticate(
         &self,
         claimed: &ServiceAccount,
         token: &str,
         gateway: &GatewayKey,
         peer: IpAddr,
+        account: &Account,
     ) -> Result<InstanceId, Refusal> {
         let expected = ServiceAccount::of(gateway);
         // Computed from the request: the store is not read for a stranger,
@@ -339,6 +373,18 @@ impl Authenticator {
         if self.refused.contains(&expected) {
             return Err(rejected(SyncAuthStage::Authz, Refusal::Forbidden));
         }
+        // Before the cache: a verdict taken under the previous one must not
+        // serve the recreated ServiceAccount.
+        let reviewed_only = match account {
+            Account::Provisioned(uid) if claimed_uid(token).as_ref() == Some(uid) => false,
+            Account::Provisioned(_) | Account::Missing => {
+                return Err(rejected(
+                    SyncAuthStage::ServiceAccount,
+                    Refusal::Unauthenticated,
+                ))
+            }
+            Account::Unwatched => true,
+        };
         let hash = token_hash(token);
         let reviewed = match self.cached(&hash) {
             Cached::Fresh(reviewed) => reviewed,
@@ -362,6 +408,7 @@ impl Authenticator {
                 };
                 match reviewed {
                     Ok(reviewed) => reviewed,
+                    Err(Unreviewed::Failed) if reviewed_only => return Err(Refusal::Unavailable),
                     Err(Unreviewed::Failed) => {
                         METRICS.sync_auth_stale_verdicts_total.inc();
                         stale
@@ -383,8 +430,15 @@ impl Authenticator {
                         Some(_reserved) => match self.review(hash, token).await {
                             Ok(reviewed) => reviewed,
                             Err(Unreviewed::Rejected) => return Err(Refusal::Unauthenticated),
+                            Err(Unreviewed::Failed) if reviewed_only => {
+                                return Err(Refusal::Unavailable)
+                            }
                             Err(Unreviewed::Failed) => verified.into(),
                         },
+                        None if reviewed_only => {
+                            METRICS.sync_throttled_total.inc();
+                            return Err(Refusal::Throttled);
+                        }
                         None => verified.into(),
                     }
                 }
@@ -645,6 +699,15 @@ pub(super) mod testing {
     /// second boundary, so they hit the verdict cache.
     const EXP: i64 = 4_102_444_800;
 
+    /// The uid every test token's ServiceAccount has, as the issuer's
+    /// test claims give it.
+    pub const SA_UID: &str = "sa-uid";
+
+    /// A Managed Gateway whose ServiceAccount is the one test tokens name.
+    pub fn managed() -> Account {
+        Account::Provisioned(SA_UID.into())
+    }
+
     /// A projected token's claims for ServiceAccount `ns:sa`, `n` telling
     /// tokens of one account apart.
     pub fn token_of(ns: &str, sa: &str, n: u32) -> String {
@@ -653,6 +716,7 @@ pub(super) mod testing {
             "sub": format!("system:serviceaccount:{ns}:{sa}"),
             "exp": EXP,
             "jti": n,
+            "kubernetes.io": {"serviceaccount": {"name": sa, "uid": SA_UID}},
         }))
     }
 
@@ -804,7 +868,7 @@ mod tests {
 
         for _ in 0..3 {
             let instance = auth
-                .authenticate(&claimed, &token, &gw, PEER)
+                .authenticate(&claimed, &token, &gw, PEER, &managed())
                 .await
                 .unwrap();
             assert_eq!(instance, InstanceId("pod-1".into()));
@@ -816,7 +880,7 @@ mod tests {
         );
 
         tokio::time::advance(HOLD).await;
-        auth.authenticate(&claimed, &token, &gw, PEER)
+        auth.authenticate(&claimed, &token, &gw, PEER, &managed())
             .await
             .unwrap();
         assert_eq!(reviews(&api), 2, "the verdict expired with the hold");
@@ -839,7 +903,8 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw, PEER).await,
+                auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                    .await,
                 Err(Refusal::Unauthenticated)
             );
         }
@@ -853,7 +918,8 @@ mod tests {
 
         tokio::time::advance(HOLD).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw, PEER).await,
+            auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                .await,
             Err(Refusal::Unauthenticated)
         );
         assert_eq!(reviews(&api), 2);
@@ -877,7 +943,8 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw, PEER).await,
+                auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                    .await,
                 Err(Refusal::Unavailable)
             );
         }
@@ -896,7 +963,10 @@ mod tests {
                 Some("pod-1"),
             ),
         );
-        assert!(auth.authenticate(&claimed, &token, &gw, PEER).await.is_ok());
+        assert!(auth
+            .authenticate(&claimed, &token, &gw, PEER, &managed())
+            .await
+            .is_ok());
     }
 
     /// Who may sync which Gateway: only its own ServiceAccount, in its own
@@ -949,7 +1019,10 @@ mod tests {
             }
             let token = token_of(ns, name, n as u32);
             let claimed = auth.precheck(&token).unwrap();
-            let got = auth.authenticate(&claimed, &token, gw, PEER).await.err();
+            let got = auth
+                .authenticate(&claimed, &token, gw, PEER, &managed())
+                .await
+                .err();
             assert_eq!(got, answer, "{why}");
         }
 
@@ -965,7 +1038,8 @@ mod tests {
             let token = gateway_token(&gw.namespace, &gw.name, n);
             let claimed = auth.precheck(&token).unwrap();
             assert_eq!(
-                auth.authenticate(&claimed, &token, &gw, PEER).await,
+                auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                    .await,
                 Err(Refusal::Forbidden),
                 "{gw}"
             );
@@ -983,7 +1057,8 @@ mod tests {
         let token = gateway_token("apps", "web", 20);
         let claimed = auth.precheck(&token).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &token, &web, PEER).await,
+            auth.authenticate(&claimed, &token, &web, PEER, &managed())
+                .await,
             Err(Refusal::Unauthenticated)
         );
         assert!(matches!(auth.cached(&token_hash(&token)), Cached::Rejected));
@@ -1000,8 +1075,14 @@ mod tests {
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &token, &GatewayKey::new("apps", "web"), PEER)
-                .await,
+            auth.authenticate(
+                &claimed,
+                &token,
+                &GatewayKey::new("apps", "web"),
+                PEER,
+                &managed()
+            )
+            .await,
             Err(Refusal::Unauthenticated)
         );
     }
@@ -1065,7 +1146,7 @@ mod tests {
         ));
         let gw = GatewayKey::new("apps", "web");
         let claimed = auth.precheck(&known).unwrap();
-        auth.authenticate(&claimed, &known, &gw, PEER)
+        auth.authenticate(&claimed, &known, &gw, PEER, &managed())
             .await
             .unwrap();
 
@@ -1078,7 +1159,8 @@ mod tests {
                         let forged = gateway_token("apps", "web", 1000 + n);
                         let claimed = auth.precheck(&forged).unwrap();
                         let gw = GatewayKey::new("apps", "web");
-                        auth.authenticate(&claimed, &forged, &gw, peer(n)).await
+                        auth.authenticate(&claimed, &forged, &gw, peer(n), &managed())
+                            .await
                     })
                 })
                 .collect();
@@ -1087,13 +1169,14 @@ mod tests {
             let extra = gateway_token("apps", "web", 999);
             let extra_claim = auth.precheck(&extra).unwrap();
             assert_eq!(
-                auth.authenticate(&extra_claim, &extra, &gw, peer(999))
+                auth.authenticate(&extra_claim, &extra, &gw, peer(999), &managed())
                     .await,
                 Err(Refusal::Throttled),
                 "the unknown pool is saturated"
             );
             assert_eq!(
-                auth.authenticate(&claimed, &known, &gw, PEER).await,
+                auth.authenticate(&claimed, &known, &gw, PEER, &managed())
+                    .await,
                 Ok(InstanceId("pod-0".into())),
                 "the known instance syncs on"
             );
@@ -1118,7 +1201,7 @@ mod tests {
         let gw = GatewayKey::new("apps", "web");
         let token = gateway_token("apps", "web", 0);
         let claimed = auth.precheck(&token).unwrap();
-        auth.authenticate(&claimed, &token, &gw, PEER)
+        auth.authenticate(&claimed, &token, &gw, PEER, &managed())
             .await
             .unwrap();
 
@@ -1131,7 +1214,8 @@ mod tests {
         let stale = METRICS.sync_auth_stale_verdicts_total.get();
         tokio::time::advance(CACHE_TTL).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw, PEER).await,
+            auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                .await,
             Ok(InstanceId("pod-1".into()))
         );
         assert_eq!(reviews(&api), 2, "a renewal was tried");
@@ -1139,7 +1223,8 @@ mod tests {
 
         tokio::time::advance(STALE_TTL).await;
         assert_eq!(
-            auth.authenticate(&claimed, &token, &gw, PEER).await,
+            auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                .await,
             Err(Refusal::Unavailable),
             "two TTLs: unknown again"
         );
@@ -1193,7 +1278,9 @@ mod tests {
             .collect();
         for token in &tokens {
             let claimed = auth.precheck(token).unwrap();
-            auth.authenticate(&claimed, token, &gw, PEER).await.unwrap();
+            auth.authenticate(&claimed, token, &gw, PEER, &managed())
+                .await
+                .unwrap();
         }
 
         answer.store(false, Ordering::SeqCst);
@@ -1209,7 +1296,7 @@ mod tests {
                     let claimed = auth.precheck(&token).unwrap();
                     let gw = GatewayKey::new("apps", "web");
                     let got = auth
-                        .authenticate(&claimed, &token, &gw, peer(n as u32))
+                        .authenticate(&claimed, &token, &gw, peer(n as u32), &managed())
                         .await;
                     (got, started.elapsed())
                 })
@@ -1240,7 +1327,7 @@ mod tests {
         let gw = GatewayKey::new("apps", "web");
         for (n, token) in tokens.iter().enumerate() {
             let claimed = auth.precheck(token).unwrap();
-            auth.authenticate(&claimed, token, &gw, peer(n as u32))
+            auth.authenticate(&claimed, token, &gw, peer(n as u32), &managed())
                 .await
                 .unwrap();
         }
@@ -1256,7 +1343,7 @@ mod tests {
                 tokio::spawn(async move {
                     let claimed = auth.precheck(&token).unwrap();
                     let gw = GatewayKey::new("apps", "web");
-                    auth.authenticate(&claimed, &token, &gw, peer(n as u32))
+                    auth.authenticate(&claimed, &token, &gw, peer(n as u32), &managed())
                         .await
                 })
             })
@@ -1268,7 +1355,8 @@ mod tests {
         let stale = METRICS.sync_auth_stale_verdicts_total.get();
         let n = MAX_RENEWALS_IN_FLIGHT as u32;
         assert_eq!(
-            auth.authenticate(&claimed, last, &gw, peer(n)).await,
+            auth.authenticate(&claimed, last, &gw, peer(n), &managed())
+                .await,
             Ok(InstanceId(format!("pod-{n}")))
         );
         assert!(
@@ -1300,7 +1388,8 @@ mod tests {
                     let forged = gateway_token("apps", "web", 1000 + n);
                     let claimed = auth.precheck(&forged).unwrap();
                     let gw = GatewayKey::new("apps", "web");
-                    auth.authenticate(&claimed, &forged, &gw, PEER).await
+                    auth.authenticate(&claimed, &forged, &gw, PEER, &managed())
+                        .await
                 })
             })
             .collect();
@@ -1311,7 +1400,8 @@ mod tests {
 
         let claimed = auth.precheck(&newcomer).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &newcomer, &gw, peer(1)).await,
+            auth.authenticate(&claimed, &newcomer, &gw, peer(1), &managed())
+                .await,
             Ok(InstanceId("pod-0".into()))
         );
         flood.iter().for_each(|f| f.abort());
@@ -1339,7 +1429,10 @@ mod tests {
             let claimed = auth.precheck(&token).unwrap();
             let gw = gw.clone();
             let auth = &auth;
-            async move { auth.authenticate(&claimed, &token, &gw, from).await }
+            async move {
+                auth.authenticate(&claimed, &token, &gw, from, &managed())
+                    .await
+            }
         };
         assert!(sync(0, PEER).await.is_ok());
         tokio::time::advance(CACHE_TTL + Duration::from_millis(1)).await;
@@ -1529,8 +1622,14 @@ mod tests {
         let refused = counter(SyncAuthStage::Signature);
         let claimed = auth.precheck(&forged).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &forged, &GatewayKey::new("apps", "web"), PEER)
-                .await,
+            auth.authenticate(
+                &claimed,
+                &forged,
+                &GatewayKey::new("apps", "web"),
+                PEER,
+                &managed()
+            )
+            .await,
             Err(Refusal::Unauthenticated)
         );
         assert_eq!(reviews(&api), 0, "no review spent on it");
@@ -1549,7 +1648,8 @@ mod tests {
         let live = signed(&signer, "apps", "web", "pod-1", 0);
         let claimed = auth.precheck(&live).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &live, &gw, PEER).await,
+            auth.authenticate(&claimed, &live, &gw, PEER, &managed())
+                .await,
             Ok(InstanceId("pod-1".into()))
         );
         assert_eq!(reviews(&api), 1);
@@ -1558,7 +1658,8 @@ mod tests {
         let gone = signed(&signer, "apps", "web", "pod-2", 1);
         let claimed = auth.precheck(&gone).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &gone, &gw, PEER).await,
+            auth.authenticate(&claimed, &gone, &gw, PEER, &managed())
+                .await,
             Err(Refusal::Unauthenticated),
             "its pod was deleted"
         );
@@ -1602,8 +1703,14 @@ mod tests {
                 );
                 tokio::spawn(async move {
                     let claimed = auth.precheck(&token).unwrap();
-                    auth.authenticate(&claimed, &token, &GatewayKey::new("apps", "web"), PEER)
-                        .await
+                    auth.authenticate(
+                        &claimed,
+                        &token,
+                        &GatewayKey::new("apps", "web"),
+                        PEER,
+                        &managed(),
+                    )
+                    .await
                 })
             })
             .collect();
@@ -1616,8 +1723,14 @@ mod tests {
 
         let claimed = auth.precheck(&first).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &first, &GatewayKey::new("shop", "front"), PEER)
-                .await,
+            auth.authenticate(
+                &claimed,
+                &first,
+                &GatewayKey::new("shop", "front"),
+                PEER,
+                &managed()
+            )
+            .await,
             Ok(InstanceId("pod-b".into()))
         );
         assert!(
@@ -1625,6 +1738,194 @@ mod tests {
             "reviewed from its own budget"
         );
         flood.iter().for_each(|f| f.abort());
+    }
+
+    /// A full shared pool of reviews, held by hanging reviews of other
+    /// accounts, over `signer`'s keys.
+    async fn busy_pool(signer: &Signer) -> (Arc<Authenticator>, Vec<tokio::task::JoinHandle<()>>) {
+        let (hanging, asked) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client = answering_client(Vec::new(), hanging.clone(), asked);
+        let auth = Arc::new(Authenticator::new(
+            client,
+            NS,
+            SERVICE,
+            None,
+            keys_of(signer).await,
+        ));
+        let flood = (0..MAX_REVIEWS_IN_FLIGHT as u32)
+            .map(|n| {
+                let gw = format!("gw-{}", n / MAX_REVIEWS_PER_PEER as u32);
+                let (auth, token) = (
+                    auth.clone(),
+                    signed(signer, "apps", &gw, &format!("pod-{n}"), n),
+                );
+                tokio::spawn(async move {
+                    let claimed = auth.precheck(&token).unwrap();
+                    let _ = auth
+                        .authenticate(
+                            &claimed,
+                            &token,
+                            &GatewayKey::new("apps", &gw),
+                            PEER,
+                            &managed(),
+                        )
+                        .await;
+                })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(hanging.load(Ordering::SeqCst), MAX_REVIEWS_IN_FLIGHT);
+        (auth, flood)
+    }
+
+    /// The ServiceAccount recreated under its name: the old one's token is
+    /// refused on every path that could accept it, before any review.
+    #[tokio::test(start_paused = true)]
+    async fn a_recreated_service_account_refuses_the_old_token_on_every_path() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let recreated = Account::Provisioned("recreated-uid".into());
+        let gw = GatewayKey::new("shop", "front");
+        let signer = Signer::new("k");
+        let token = signed(&signer, "shop", "front", "pod-b", 0);
+        let refused = counter(SyncAuthStage::ServiceAccount);
+
+        // Signature alone, the review pool busy.
+        let (auth, flood) = busy_pool(&signer).await;
+        let claimed = auth.precheck(&token).unwrap();
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                .await,
+            Ok(InstanceId("pod-b".into())),
+            "its own ServiceAccount is served on the signature"
+        );
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &recreated)
+                .await,
+            Err(Refusal::Unauthenticated)
+        );
+        flood.iter().for_each(|f| f.abort());
+
+        // Signature alone, the review failing.
+        let api = MockApi::default();
+        api.reply_to(
+            REVIEWS,
+            500,
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                   "reason": "InternalError", "message": "down", "code": 500}),
+        );
+        let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &recreated)
+                .await,
+            Err(Refusal::Unauthenticated)
+        );
+        assert_eq!(reviews(&api), 0, "refused before a review");
+
+        // A verdict cached while it was the live one.
+        let api = MockApi::default();
+        api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:shop:portail-front",
+                Some("pod-b"),
+            ),
+        );
+        let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
+        assert!(auth
+            .authenticate(&claimed, &token, &gw, PEER, &managed())
+            .await
+            .is_ok());
+        assert_eq!(reviews(&api), 1);
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &recreated)
+                .await,
+            Err(Refusal::Unauthenticated)
+        );
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Missing)
+                .await,
+            Err(Refusal::Unauthenticated),
+            "none in the cache"
+        );
+        assert_eq!(reviews(&api), 1, "the cached verdict never served it");
+        assert_eq!(counter(SyncAuthStage::ServiceAccount), refused + 4);
+    }
+
+    /// An unwatched ServiceAccount is only ever accepted on a review: a
+    /// busy pool, a failed review or a failed renewal refuses where a
+    /// Managed Gateway's token would be served on its signature or its
+    /// stale verdict.
+    #[tokio::test(start_paused = true)]
+    async fn an_unwatched_service_account_is_served_on_a_review_only() {
+        let _serial = METRICS_SERIAL.lock().await;
+        let gw = GatewayKey::new("shop", "front");
+        let signer = Signer::new("k");
+        let token = signed(&signer, "shop", "front", "pod-b", 0);
+
+        let (auth, flood) = busy_pool(&signer).await;
+        let claimed = auth.precheck(&token).unwrap();
+        let throttled = METRICS.sync_throttled_total.get();
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Unwatched)
+                .await,
+            Err(Refusal::Throttled),
+            "the pool busy"
+        );
+        assert_eq!(METRICS.sync_throttled_total.get(), throttled + 1);
+        flood.iter().for_each(|f| f.abort());
+
+        let api = MockApi::default();
+        let down = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                          "reason": "InternalError", "message": "down", "code": 500});
+        api.reply_to(REVIEWS, 500, down.clone());
+        let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Unwatched)
+                .await,
+            Err(Refusal::Unavailable),
+            "the review failed"
+        );
+
+        api.reply_to(
+            REVIEWS,
+            201,
+            review(
+                true,
+                "system:serviceaccount:shop:portail-front",
+                Some("pod-b"),
+            ),
+        );
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Unwatched)
+                .await,
+            Ok(InstanceId("pod-b".into()))
+        );
+        tokio::time::advance(CACHE_TTL / 2).await;
+        assert!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Unwatched)
+                .await
+                .is_ok(),
+            "a verdict fresh within its TTL"
+        );
+        api.reply_to(REVIEWS, 500, down);
+        tokio::time::advance(CACHE_TTL).await;
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &Account::Unwatched)
+                .await,
+            Err(Refusal::Unavailable),
+            "no stale verdict when the renewal fails"
+        );
+        assert_eq!(
+            auth.authenticate(&claimed, &token, &gw, PEER, &managed())
+                .await,
+            Ok(InstanceId("pod-b".into())),
+            "where a Managed Gateway's stale verdict serves"
+        );
     }
 
     /// Floods of many accounts can fill the shared pool of reviews: a
@@ -1654,8 +1955,14 @@ mod tests {
                 );
                 tokio::spawn(async move {
                     let claimed = auth.precheck(&token).unwrap();
-                    auth.authenticate(&claimed, &token, &GatewayKey::new("apps", &gw), PEER)
-                        .await
+                    auth.authenticate(
+                        &claimed,
+                        &token,
+                        &GatewayKey::new("apps", &gw),
+                        PEER,
+                        &managed(),
+                    )
+                    .await
                 })
             })
             .collect();
@@ -1669,8 +1976,14 @@ mod tests {
         let first = signed(&signer, "shop", "front", "pod-b", 0);
         let claimed = auth.precheck(&first).unwrap();
         assert_eq!(
-            auth.authenticate(&claimed, &first, &GatewayKey::new("shop", "front"), PEER)
-                .await,
+            auth.authenticate(
+                &claimed,
+                &first,
+                &GatewayKey::new("shop", "front"),
+                PEER,
+                &managed()
+            )
+            .await,
             Ok(InstanceId("pod-b".into()))
         );
         assert!(

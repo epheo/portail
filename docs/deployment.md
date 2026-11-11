@@ -471,11 +471,15 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 
 - Data planes authenticate with projected ServiceAccount tokens of the controller audience.
 - The controller verifies each token against the cluster's ServiceAccount issuer keys (`/.well-known/openid-configuration`, `/openid/v1/jwks`): signature, issuer, audience, expiry and pod binding. A forged one is refused before any TokenReview.
-- A TokenReview then says whether the token's pod still runs. It is budgeted per ServiceAccount, one per Gateway; while that budget or the shared pool is busy, the signature serves the token until its next poll, so no namespace delays another's configuration.
+- A TokenReview then says whether the token's pod still runs. It is budgeted per ServiceAccount, one per Gateway; while that budget or the shared pool is busy, the signature serves a Managed Gateway's token until its next poll, so no namespace delays another's configuration.
 - An unknown key id reads the keys again at most every 30s: a rotation is seen, a forged id costs one read per period.
 - Without the keys (discovery off, or no RBAC on its URLs) tokens go to TokenReview unverified, budgeted per address, and each GatewayClass says so.
 - Each GatewayClass carries `portail.epheo.eu/GatewaysIsolated`: `True` while one namespace's data planes cannot delay another Gateway's configuration (held polls capped per Gateway, tokens verified locally), `False` with why otherwise.
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
+- Its own by uid, not only by name: a Gateway deleted and recreated under its name gets a new ServiceAccount, and the old one's pods never receive the new one's configuration, TLS keys included.
+- Managed: the ServiceAccount's uid is the one the controller provisioned and caches, compared on every request, before any review and over a cached verdict. None cached, or one still controlled by the deleted Gateway: refused, `portail_sync_auth_rejected_total{stage="serviceaccount"}`.
+- Unmanaged: the ServiceAccount is its owner's, which the controller does not watch. Its tokens are served on a TokenReview only: a busy pool answers 503 and a failed review 503, where a Managed one is served on its signature or a stale verdict. A deleted ServiceAccount's token can still serve on a verdict taken before, for one hold at most.
+- Backends and trust resolve only from instances serving the current Gateway's configuration: a Gateway recreated under its name forgets what the previous one's instances reported.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
 - A data plane dialing the controller speaks TLS 1.3 only; the sync endpoint takes TLS 1.2 too, which an apiserver on an older Go FIPS stack proxies polls with.

@@ -118,15 +118,19 @@ pub enum SyncAuthStage {
     TokenReview,
     /// Authenticated, but not as an identity that may sync this Gateway.
     Authz,
+    /// Not the ServiceAccount the Gateway's data planes run as now: its
+    /// uid differs, or there is none.
+    ServiceAccount,
 }
 
 impl SyncAuthStage {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Precheck,
         Self::NegativeCache,
         Self::Signature,
         Self::TokenReview,
         Self::Authz,
+        Self::ServiceAccount,
     ];
 
     fn label(self) -> &'static str {
@@ -136,6 +140,7 @@ impl SyncAuthStage {
             Self::Signature => "signature",
             Self::TokenReview => "tokenreview",
             Self::Authz => "authz",
+            Self::ServiceAccount => "serviceaccount",
         }
     }
 }

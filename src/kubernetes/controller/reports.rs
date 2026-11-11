@@ -99,12 +99,14 @@ impl ReportStore {
         live
     }
 
-    /// `visit` each live report of `gateway` in place, by instance id: a
-    /// report as large as its sender made it is never copied, and a cap
-    /// applied while visiting keeps the same instances from pass to pass.
+    /// `visit` each live report of `gateway` serving the snapshot of the
+    /// Gateway of `uid`, in place, by instance id: a report as large as its
+    /// sender made it is never copied, and a cap applied while visiting
+    /// keeps the same instances from pass to pass.
     pub(crate) fn for_each_live(
         &self,
         gateway: &GatewayKey,
+        uid: &str,
         mut visit: impl FnMut(&InstanceReport),
     ) {
         let gateways = self.gateways();
@@ -113,6 +115,7 @@ impl ReportStore {
             .into_iter()
             .flatten()
             .filter(|(_, e)| e.seen.elapsed() < LIVENESS && !e.report.leaving)
+            .filter(|(_, e)| !uid.is_empty() && e.report.gateway_uid == uid)
             .collect();
         live.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
         for (_, entry) in live {
@@ -159,6 +162,12 @@ impl ReportStore {
             .filter(|e| e.report.leaving)
             .map(|e| e.seen)
             .max()
+    }
+
+    /// Forget what every instance of `gateway` reported: another Gateway
+    /// took its name.
+    pub(crate) fn forget(&self, gateway: &GatewayKey) {
+        self.gateways().remove(gateway);
     }
 
     /// Forget every Gateway `live` rejects.

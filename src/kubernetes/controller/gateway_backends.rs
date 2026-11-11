@@ -180,7 +180,7 @@ pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) ->
             )
         })
         .collect();
-    reports.for_each_live(target, |report| {
+    reports.for_each_live(target, &served.gateway.uid, |report| {
         for (network, cidrs) in &networks {
             let Some(ip) = report.networks.get(&network.name) else {
                 continue;
@@ -270,7 +270,7 @@ pub(crate) fn trusted_addresses(
         return Vec::new();
     }
     let mut found: BTreeMap<&str, BTreeSet<IpAddr>> = BTreeMap::new();
-    reports.for_each_live(named, |report| {
+    reports.for_each_live(named, &served.gateway.uid, |report| {
         for (name, mine, theirs) in &shared {
             let Some(ip) = report.networks.get(*name) else {
                 continue;
@@ -454,11 +454,11 @@ pub(crate) fn resolve(
 /// snapshot of it, or no instance of it is live. After a start or a
 /// takeover both stores begin empty; what spec says is never read here.
 pub(crate) fn unheard(hub: &Hub, reports: &ReportStore, named: &GatewayKey) -> bool {
-    if hub.current(named).is_none() {
+    let Some(served) = hub.current(named) else {
         return true;
-    }
+    };
     let mut live = false;
-    reports.for_each_live(named, |_| live = true);
+    reports.for_each_live(named, &served.gateway.uid, |_| live = true);
     !live
 }
 
@@ -601,6 +601,7 @@ mod tests {
             networks: network
                 .map(|ip| [("transit".to_string(), ip.to_string())].into())
                 .unwrap_or_default(),
+            gateway_uid: "u".into(),
             ..Default::default()
         }
     }
@@ -874,6 +875,30 @@ mod tests {
     /// The IP each instance reports on the shared Network, at its bound
     /// port: an all-interfaces bind gives that IP alone, never an
     /// interface on another network inside the same CIDR.
+    /// Instances serving another Gateway's snapshot under this name, or
+    /// an older data plane's that names none, resolve nothing: no
+    /// endpoint, no trust, and the target is still unheard.
+    #[test]
+    fn only_the_served_gateways_instances_resolve() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        let at = |uid: &str| InstanceReport {
+            gateway_uid: uid.into(),
+            ..report(Some("10.250.0.7"), Some("10.250.0.7"), &["10.250.0.7"])
+        };
+        reports.record(&target(), InstanceId("previous".into()), at("deleted-uid"));
+        reports.record(&target(), InstanceId("older".into()), at(""));
+        assert!(resolved(&hub, &reports, 80, &transit()).is_empty());
+        assert!(trusted_addresses(&hub, &reports, &target(), &transit()).is_empty());
+        assert!(unheard(&hub, &reports, &target()));
+
+        reports.record(&target(), InstanceId("current".into()), at("u"));
+        assert_eq!(
+            resolved(&hub, &reports, 80, &transit()),
+            [("10.250.0.7".to_string(), 8000)]
+        );
+        assert!(!unheard(&hub, &reports, &target()));
+    }
+
     #[test]
     fn endpoints_are_each_instance_on_the_shared_network() {
         let (hub, reports) = (hub(), ReportStore::default());

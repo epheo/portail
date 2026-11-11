@@ -106,7 +106,8 @@ in standalone mode:
 - A data plane adds `portail_controller_connected` (`0` while it cannot reach
   the controller) and `portail_config_age_seconds`: alert on the age, since
   route and certificate changes wait for the controller.
-- The controller adds `portail_sync_auth_rejected_total{stage}`,
+- The controller adds `portail_sync_auth_rejected_total{stage}` (`precheck`,
+  `negative_cache`, `signature`, `tokenreview`, `authz`, `serviceaccount`),
   `portail_tokenreview_requests_total{result}`,
   `portail_sync_throttled_total` (503s: TokenReviews in flight at their
   cap, or a source IP past 5 reviews a second of tokens not seen yet) and

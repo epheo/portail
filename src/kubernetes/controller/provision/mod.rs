@@ -278,6 +278,21 @@ impl Owned {
         });
     }
 
+    /// The uid of ServiceAccount `namespace/name` while the cache holds it
+    /// as this install's, controlled by the Gateway of `gateway_uid`.
+    pub(crate) fn service_account_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        gateway_uid: &str,
+    ) -> Option<String> {
+        let meta = meta_of(&self.service_accounts, namespace, name)?;
+        if !is_ours(&meta, gateway_uid, &self.controller.install) {
+            return None;
+        }
+        meta.uid.filter(|uid| !uid.is_empty())
+    }
+
     #[cfg(test)]
     fn retry_pending(&self, gateway: &ObjectRef<Gateway>) -> bool {
         self.retries.pending.lock().unwrap().contains(gateway)
@@ -467,6 +482,40 @@ fn controller_owner(meta: &ObjectMeta) -> Option<&OwnerReference> {
             && o.kind == "Gateway"
             && o.api_version.starts_with("gateway.networking.k8s.io/")
     })
+}
+
+/// `gateway`'s ServiceAccount, of `uid`, as the test install provisions
+/// it: labeled, and controlled by the Gateway.
+#[cfg(test)]
+pub(crate) fn provisioned_service_account(
+    gateway: &Gateway,
+    uid: &str,
+) -> PartialObjectMeta<ServiceAccount> {
+    PartialObjectMeta {
+        types: None,
+        metadata: ObjectMeta {
+            name: Some(resource_name(&gateway.name_any())),
+            namespace: gateway.namespace(),
+            uid: Some(uid.into()),
+            labels: Some(
+                [(
+                    render::LABEL_CONTROLLER.to_string(),
+                    render::install_label(super::testkit::CONTROLLER),
+                )]
+                .into(),
+            ),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "gateway.networking.k8s.io/v1".into(),
+                kind: "Gateway".into(),
+                name: gateway.name_any(),
+                uid: gateway.uid().unwrap_or_default(),
+                controller: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        _phantom: std::marker::PhantomData,
+    }
 }
 
 /// The Gateway an owned object's controller ownerReference names.

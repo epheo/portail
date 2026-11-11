@@ -16,6 +16,8 @@
 - GatewayParameters `trustedSources` may name a Gateway: apply this release's CRD (`deploy/crds`) before writing one, as the older one requires `cidr`.
 - GatewayParameters `networks[].listeners`: apply this release's CRD before writing it. The older one prunes the field unknown to it, and the network then takes listeners.
 - `listeners: false` needs data planes of this release: an older one binds every interface, that network included, and reports no IP there, so Gateways trusting it trust nothing.
+- An older data plane's reports name no Gateway uid: no backend or trust resolves from them until it runs this release.
+- An Unmanaged Gateway's data planes are served on a TokenReview only: while reviews are busy or failing they get 503 and keep serving their last configuration.
 
 ## 0.1.x to 0.2.0
 

@@ -36,11 +36,12 @@ use tokio_util::sync::CancellationToken;
 
 use gateway_api::gateways::Gateway;
 
-use super::auth::{Authenticator, Refusal};
+use super::auth::{Account, Authenticator, Refusal};
 use super::ca::ServingKey;
 use super::reconcile::{class_owner, ClassOwner};
 use super::reports::{InstanceId, LIVENESS};
 use super::ControllerCtx;
+use crate::kubernetes::crds::Provisioning;
 use crate::logging::{info, warn};
 use crate::metrics::METRICS;
 use crate::proxy::worker::AcceptBackoff;
@@ -179,7 +180,12 @@ impl SyncServer {
         };
         // Served or not, a Gateway's name is authenticated alike: a refusal
         // never tells the two apart.
-        let instance = match self.auth.authenticate(&claimed, &token, &key, peer).await {
+        let account = self.account(&key);
+        let instance = match self
+            .auth
+            .authenticate(&claimed, &token, &key, peer, &account)
+            .await
+        {
             Ok(instance) => instance,
             Err(refusal) => return refused(refusal),
         };
@@ -269,6 +275,38 @@ impl SyncServer {
             &gateway.spec.gateway_class_name,
             &self.ctx.controller_name,
         ) != ClassOwner::Other
+    }
+
+    /// What the cache says of the ServiceAccount `key`'s data planes run
+    /// as. A Gateway this controller does not run is Unwatched: its pods
+    /// still learn it is gone, once a TokenReview says they are its.
+    fn account(&self, key: &GatewayKey) -> Account {
+        let Some(gateway) = self
+            .ctx
+            .cache
+            .gateways
+            .get(&ObjectRef::<Gateway>::new(&key.name).within(&key.namespace))
+        else {
+            return Account::Unwatched;
+        };
+        if !self.serves(key) {
+            return Account::Unwatched;
+        }
+        match super::params::resolve(&self.ctx, &gateway) {
+            Ok(params) if params.provisioning == Provisioning::Managed => {
+                let uid = gateway.metadata.uid.as_deref().unwrap_or_default();
+                let name = crate::kubernetes::naming::resource_name(&key.name);
+                match self
+                    .ctx
+                    .owned
+                    .service_account_uid(&key.namespace, &name, uid)
+                {
+                    Some(uid) => Account::Provisioned(uid),
+                    None => Account::Missing,
+                }
+            }
+            Ok(_) | Err(_) => Account::Unwatched,
+        }
     }
 
     /// The snapshot when its version is not `have`, at once or when one is
@@ -879,7 +917,7 @@ async fn connection(
 #[cfg(test)]
 mod tests {
     use super::super::auth::testing::{
-        authenticator, gateway_token, peer, review, token_of, PEER, REVIEWS,
+        authenticator, gateway_token, peer, review, token_of, PEER, REVIEWS, SA_UID,
     };
     use super::super::auth::METRICS_SERIAL;
     use super::super::testkit::{self, apply, gateway_class, MockApi, TestCluster, CONTROLLER};
@@ -928,7 +966,12 @@ mod tests {
             &mut cluster.gateway_classes,
             gateway_class("portail", CONTROLLER),
         );
-        apply(&mut cluster.gateways, testkit::gateway("gw", 1));
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut cluster.gateways, gw.clone());
+        apply(
+            &mut cluster.service_accounts,
+            super::super::provision::provisioned_service_account(&gw, SA_UID),
+        );
         let mut ctx = cluster.ctx(api.client());
         edit(Arc::get_mut(&mut ctx).unwrap());
         let (lapses, wakes) = Lapses::new();
@@ -1451,6 +1494,86 @@ mod tests {
         assert_eq!(f.sync(none).await.status(), StatusCode::UNAUTHORIZED);
         let basic = request("authorization", format!("Basic {token}"));
         assert_eq!(f.sync(basic).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A Gateway recreated under its name gets a new ServiceAccount: the
+    /// old one's pods are refused before any review, never sent the new
+    /// one's snapshot. So are pods of a Managed Gateway whose
+    /// ServiceAccount the cache does not hold as its own.
+    #[tokio::test]
+    async fn only_the_provisioned_service_account_syncs_a_managed_gateway() {
+        let mut f = fixture().await;
+        f.publish(1);
+        let token = gateway_token("default", "gw", 0);
+        let gw = testkit::gateway("gw", 1);
+        let refused = metrics::sync_auth_rejected(SyncAuthStage::ServiceAccount);
+
+        apply(
+            &mut f.cluster.service_accounts,
+            super::super::provision::provisioned_service_account(&gw, "recreated-uid"),
+        );
+        let old = f.sync(post(Some(&token), &body(&key(), "", None))).await;
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED, "another uid");
+
+        let mut deleted_gateways = testkit::gateway("gw", 1);
+        deleted_gateways.metadata.uid = Some("deleted-gw-uid".into());
+        apply(
+            &mut f.cluster.service_accounts,
+            super::super::provision::provisioned_service_account(&deleted_gateways, SA_UID),
+        );
+        let stale = f.sync(post(Some(&token), &body(&key(), "", None))).await;
+        assert_eq!(
+            stale.status(),
+            StatusCode::UNAUTHORIZED,
+            "the deleted Gateway's, not yet collected"
+        );
+
+        f.cluster
+            .service_accounts
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(
+                super::super::provision::provisioned_service_account(&gw, SA_UID),
+            ));
+        let missing = f.sync(post(Some(&token), &body(&key(), "", None))).await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED, "none cached");
+
+        assert_eq!(f.reviews(), 0, "refused before any review");
+        assert_eq!(
+            metrics::sync_auth_rejected(SyncAuthStage::ServiceAccount),
+            refused + 3
+        );
+    }
+
+    /// An Unmanaged Gateway's ServiceAccount is its owner's, unwatched:
+    /// its tokens are served on a review only.
+    #[tokio::test]
+    async fn an_unmanaged_gateways_token_is_served_on_a_review() {
+        let mut f = fixture().await;
+        let mut params = crate::kubernetes::crds::GatewayParameters::new(
+            "hand-written",
+            crate::kubernetes::crds::GatewayParametersSpec {
+                provisioning: Some(Provisioning::Unmanaged),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut f.cluster.parameters, params);
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "hand-written".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut f.cluster.gateways, gw);
+        let v1 = f.publish(1);
+        let token = gateway_token("default", "gw", 0);
+        assert_eq!(
+            version_of(f.sync(post(Some(&token), &body(&key(), "", None))).await).await,
+            v1
+        );
+        assert_eq!(f.reviews(), 1);
     }
 
     #[tokio::test]
