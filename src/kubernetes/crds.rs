@@ -180,6 +180,16 @@ pub struct GatewayParametersSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_name_backends: Option<ExternalNameBackends>,
 
+    /// Service backends whose addresses fall inside a network the Gateway
+    /// attaches (its Network addresses and the networks it dials out on),
+    /// Managed or not. Refused: such an address is never dialed, and a ref
+    /// left with none answers 500, so whoever writes a Service's Endpoints
+    /// cannot point the Gateway at the platform's networks. Allowed: they
+    /// are dialed, for a platform serving hosts on a network it attaches.
+    /// Gateway backends are never refused. Default Refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_endpoints_on_attached_networks: Option<AttachedNetworkEndpoints>,
+
     /// PROXY protocol v2 on the data plane's TCP listeners, Managed or not.
     /// Replaces whole: a Gateway's own list is never added to its class's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +242,12 @@ pub struct TrustedGateway {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ExternalNameBackends {
+    Refused,
+    Allowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AttachedNetworkEndpoints {
     Refused,
     Allowed,
 }

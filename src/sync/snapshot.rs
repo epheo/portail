@@ -7,7 +7,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{sha256_hex, GatewayRef, PROTOCOL};
-use crate::config::PortailConfig;
+use crate::config::{DialRules, PortailConfig};
+use crate::proxy::proxy_protocol::Cidr;
 
 /// One Gateway's data-plane config. `version` is a hash of the snapshot as
 /// sent: equal versions serve equal tables, so an unchanged translation is
@@ -51,6 +52,11 @@ pub struct Snapshot {
     /// that does not know this field keeps nothing, which fails closed.
     #[serde(default, skip_serializing_if = "Pending::is_empty")]
     pub pending: Pending,
+    /// The Gateway's parameters let Service backends resolve into its
+    /// attached networks. Absent: refused, so a data plane newer than its
+    /// controller refuses too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_endpoints_on_attached_networks: bool,
 }
 
 /// The host CIDRs trusted for one named Gateway.
@@ -276,6 +282,7 @@ impl Snapshot {
             trusted_from: Vec::new(),
             backends_from: Vec::new(),
             pending: Pending::default(),
+            service_endpoints_on_attached_networks: false,
         }
         .seal()
     }
@@ -336,7 +343,36 @@ impl Snapshot {
             .iter()
             .map(|a| ((a.host.clone(), a.port), a.app_protocol.clone()))
             .collect();
+        config.dial_rules = Some(self.dial_rules());
         config
+    }
+
+    /// What a Service backend may resolve to on this Gateway. The pod's own
+    /// addresses are refused always; its attached networks unless the
+    /// parameters allow them.
+    fn dial_rules(&self) -> DialRules {
+        if self.service_endpoints_on_attached_networks {
+            return DialRules::default();
+        }
+        let cidrs: Vec<Option<Cidr>> = self
+            .networks
+            .iter()
+            .flat_map(|n| &n.cidrs)
+            .map(|c| Cidr::covering(c))
+            .collect();
+        let named_unread = self
+            .config
+            .gateway
+            .addresses
+            .iter()
+            .filter(|a| a.parse::<std::net::IpAddr>().is_err())
+            .any(|name| !self.networks.iter().any(|n| &n.name == name));
+        DialRules {
+            unresolved: named_unread
+                || self.networks.iter().any(|n| n.cidrs.is_empty())
+                || cidrs.iter().any(Option::is_none),
+            refused: cidrs.into_iter().flatten().collect(),
+        }
     }
 }
 
@@ -517,7 +553,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 16] = [
+        let changes: [(&str, fn(&mut Snapshot)); 17] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -567,6 +603,9 @@ mod tests {
                     uid: "u".into(),
                 })
             }),
+            ("serviceEndpointsOnAttachedNetworks", |s| {
+                s.service_endpoints_on_attached_networks = true
+            }),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -603,5 +642,61 @@ mod tests {
         assert!(serde_json::from_value::<Snapshot>(json.clone()).is_ok());
         json["config"]["gateway"]["shards"] = serde_json::json!(2);
         assert!(serde_json::from_value::<Snapshot>(json).is_err());
+    }
+
+    /// Every network a snapshot names refuses Service addresses, a subnet
+    /// written with its gateway address included. One with no CIDRs, a
+    /// Network address with no entry, or an unreadable CIDR leaves direct
+    /// addresses unknown. Allowed refuses only the pod's own addresses.
+    #[test]
+    fn a_snapshot_refuses_service_addresses_on_its_networks() {
+        let net = |name: &str, cidrs: &[&str], listeners: bool| NetworkCidrs {
+            name: name.into(),
+            cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+            listeners,
+        };
+        let mut config = translated();
+        config.gateway.addresses = vec!["transit".into(), "203.0.113.7".into()];
+        let snapshot = Snapshot::from_config(
+            gateway(),
+            config.clone(),
+            vec![
+                net("transit", &["10.250.0.1/16"], true),
+                net("egress", &["fd00::/64"], false),
+            ],
+        );
+        let rules = snapshot.to_config().dial_rules.unwrap();
+        assert!(!rules.unresolved);
+        assert!(rules
+            .refuses("10.250.9.9".parse().unwrap(), false)
+            .is_some());
+        assert!(rules.refuses("fd00::9".parse().unwrap(), false).is_some());
+        assert_eq!(rules.refuses("10.128.0.5".parse().unwrap(), true), None);
+
+        let unresolved = |networks: Vec<NetworkCidrs>| {
+            Snapshot::from_config(gateway(), config.clone(), networks)
+                .to_config()
+                .dial_rules
+                .unwrap()
+                .unresolved
+        };
+        assert!(unresolved(vec![]), "a Network address with no entry");
+        assert!(unresolved(vec![
+            net("transit", &["10.250.0.0/16"], true),
+            net("egress", &[], false)
+        ]));
+        assert!(unresolved(vec![net("transit", &["not-a-cidr"], true)]));
+
+        let mut allowed = snapshot.clone();
+        allowed.service_endpoints_on_attached_networks = true;
+        let rules = allowed.to_config().dial_rules.unwrap();
+        assert_eq!(rules, crate::config::DialRules::default());
+        assert!(rules.refuses("127.0.0.1".parse().unwrap(), true).is_some());
+
+        let file: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": []},
+        }))
+        .unwrap();
+        assert_eq!(file.dial_rules, None, "a standalone file sets none");
     }
 }

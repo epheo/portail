@@ -470,6 +470,9 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
             snapshot.trusted_from = trusted_from;
             snapshot.backends_from = backends_from;
             snapshot.pending = pending;
+            snapshot.service_endpoints_on_attached_networks = params
+                .service_endpoints_on_attached_networks
+                == crate::kubernetes::crds::AttachedNetworkEndpoints::Allowed;
             // Instances of a Gateway this name named before report for
             // that one: their binds and addresses are not this one's.
             if ctx

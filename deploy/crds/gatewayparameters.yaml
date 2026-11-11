@@ -227,6 +227,21 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              serviceEndpointsOnAttachedNetworks:
+                description: |-
+                  Service backends whose addresses fall inside a network the Gateway
+                  attaches (its Network addresses and the networks it dials out on),
+                  Managed or not. Refused: such an address is never dialed, and a ref
+                  left with none answers 500, so whoever writes a Service's Endpoints
+                  cannot point the Gateway at the platform's networks. Allowed: they
+                  are dialed, for a platform serving hosts on a network it attaches.
+                  Gateway backends are never refused. Default Refused.
+                enum:
+                - Refused
+                - Allowed
+                - null
+                nullable: true
+                type: string
             type: object
         required:
         - spec

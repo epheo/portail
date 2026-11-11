@@ -13,8 +13,8 @@ use super::ControllerCtx;
 use crate::dataplane::addresses::in_cidr;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
-    ControllerTransport, ExternalNameBackends, GatewayParameters, GatewayParametersSpec,
-    NetworkSelection, Provisioning, ServiceParameters, ServiceType,
+    AttachedNetworkEndpoints, ControllerTransport, ExternalNameBackends, GatewayParameters,
+    GatewayParametersSpec, NetworkSelection, Provisioning, ServiceParameters, ServiceType,
 };
 use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::GatewayKey;
@@ -40,6 +40,7 @@ pub(crate) struct Params {
     pub networks: Vec<NetworkSelection>,
     pub controller_transport: ControllerTransport,
     pub external_name_backends: ExternalNameBackends,
+    pub service_endpoints_on_attached_networks: AttachedNetworkEndpoints,
     /// CIDRs whose connections open with a PROXY v2 header.
     pub proxy_sources: Vec<String>,
     /// Gateways whose data planes' addresses join `proxy_sources` once
@@ -280,6 +281,7 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         networks: None,
         controller_transport: Some(ControllerTransport::Direct),
         external_name_backends: Some(ExternalNameBackends::Refused),
+        service_endpoints_on_attached_networks: Some(AttachedNetworkEndpoints::Refused),
         proxy_protocol: None,
     }
 }
@@ -300,11 +302,14 @@ fn merge(
             networks,
             controller_transport,
             external_name_backends,
+            service_endpoints_on_attached_networks,
             proxy_protocol,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
         base.controller_transport = controller_transport.or(base.controller_transport);
         base.external_name_backends = external_name_backends.or(base.external_name_backends);
+        base.service_endpoints_on_attached_networks =
+            service_endpoints_on_attached_networks.or(base.service_endpoints_on_attached_networks);
         base.replicas = replicas.or(base.replicas);
         base.image = image.or(base.image);
         base.resources = resources.or(base.resources);
@@ -392,6 +397,9 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         external_name_backends: spec
             .external_name_backends
             .unwrap_or(ExternalNameBackends::Refused),
+        service_endpoints_on_attached_networks: spec
+            .service_endpoints_on_attached_networks
+            .unwrap_or(AttachedNetworkEndpoints::Refused),
         proxy_sources,
         trusted_gateways,
     })
@@ -534,6 +542,7 @@ mod tests {
                 networks: vec![],
                 controller_transport: ControllerTransport::Direct,
                 external_name_backends: ExternalNameBackends::Refused,
+                service_endpoints_on_attached_networks: AttachedNetworkEndpoints::Refused,
                 proxy_sources: vec![],
                 trusted_gateways: vec![],
             }
@@ -629,6 +638,42 @@ networks: [{name: c}]
         );
         let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
         assert_eq!(params.provisioning, Provisioning::Unmanaged);
+    }
+
+    #[tokio::test]
+    async fn attached_network_endpoints_refused_unless_a_layer_allows_them() {
+        let params = resolve_in(&cluster(None), &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Refused
+        );
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "serviceEndpointsOnAttachedNetworks: Allowed",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Allowed
+        );
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "serviceEndpointsOnAttachedNetworks: Refused",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Refused
+        );
     }
 
     #[tokio::test]
