@@ -24,6 +24,7 @@ use super::{
     params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
     ReconcileError, ERROR_REQUEUE_SECS,
 };
+use crate::config::ProxyProtocolConfig;
 use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::{PolicyAcceptance, RouteAcceptance};
@@ -302,6 +303,10 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         (Ok(params), Ok(plan)) => {
             let provisioned = provision::reconcile(ctx, gateway, params).await;
             provisioned.stamp(&mut plan.config);
+            plan.config.gateway.proxy_protocol =
+                (!params.proxy_sources.is_empty()).then(|| ProxyProtocolConfig {
+                    trusted_sources: params.proxy_sources.clone(),
+                });
             let snapshot = Snapshot::from_config(
                 GatewayRef {
                     namespace: key.namespace.clone(),
@@ -462,6 +467,42 @@ mod tests {
             }
             _ => vec![],
         }
+    }
+
+    /// The parameters' trusted sources ride the config the data plane
+    /// applies; none set, none sent.
+    #[tokio::test]
+    async fn trusted_proxy_sources_reach_the_data_plane() {
+        use crate::kubernetes::crds::{GatewayParameters, ProxyProtocolParameters, TrustedSource};
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        let served = p.served(&gw).unwrap();
+        assert_eq!(served.config.gateway.proxy_protocol, None);
+
+        let mut params = GatewayParameters::new(
+            "unmanaged",
+            crate::kubernetes::crds::GatewayParametersSpec {
+                provisioning: Some(crate::kubernetes::crds::Provisioning::Unmanaged),
+                proxy_protocol: Some(ProxyProtocolParameters {
+                    trusted_sources: Some(vec![TrustedSource {
+                        cidr: "10.250.0.0/16".into(),
+                    }]),
+                }),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut p.cluster.parameters, params);
+        p.pass(&gw).await.unwrap();
+        let served = p.served(&gw).unwrap();
+        assert_eq!(
+            served.config.gateway.proxy_protocol,
+            Some(ProxyProtocolConfig {
+                trusted_sources: vec!["10.250.0.0/16".into()],
+            })
+        );
     }
 
     /// A spec change that leaves the config alone still moves

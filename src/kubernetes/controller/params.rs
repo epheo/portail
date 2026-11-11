@@ -15,6 +15,7 @@ use crate::kubernetes::crds::{
     ControllerTransport, ExternalNameBackends, GatewayParameters, GatewayParametersSpec,
     NetworkSelection, Provisioning, ServiceParameters, ServiceType,
 };
+use crate::proxy::proxy_protocol::Cidr;
 
 const GROUP: &str = "portail.epheo.eu";
 const KIND: &str = "GatewayParameters";
@@ -36,6 +37,8 @@ pub(crate) struct Params {
     pub networks: Vec<NetworkSelection>,
     pub controller_transport: ControllerTransport,
     pub external_name_backends: ExternalNameBackends,
+    /// CIDRs whose connections open with a PROXY v2 header.
+    pub proxy_sources: Vec<String>,
 }
 
 /// `Err` says why the parameters cannot be used: the Gateway is
@@ -216,11 +219,12 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         networks: None,
         controller_transport: Some(ControllerTransport::Direct),
         external_name_backends: Some(ExternalNameBackends::Refused),
+        proxy_protocol: None,
     }
 }
 
-/// `base` with each layer's set fields over it, in order; `networks` and
-/// `resources` replace whole.
+/// `base` with each layer's set fields over it, in order; `networks`,
+/// `resources` and `proxyProtocol` replace whole.
 fn merge(
     mut base: GatewayParametersSpec,
     layers: &[GatewayParametersSpec],
@@ -235,6 +239,7 @@ fn merge(
             networks,
             controller_transport,
             external_name_backends,
+            proxy_protocol,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
         base.controller_transport = controller_transport.or(base.controller_transport);
@@ -243,6 +248,7 @@ fn merge(
         base.image = image.or(base.image);
         base.resources = resources.or(base.resources);
         base.networks = networks.or(base.networks);
+        base.proxy_protocol = proxy_protocol.or(base.proxy_protocol);
         if let Some(type_) = service.and_then(|s| s.type_) {
             base.service = Some(ServiceParameters { type_: Some(type_) });
         }
@@ -269,6 +275,18 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
              be on two pods"
         ));
     }
+    let proxy_sources = spec
+        .proxy_protocol
+        .and_then(|p| p.trusted_sources)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, source)| {
+            Cidr::parse(&source.cidr)
+                .map(|c| c.to_string())
+                .map_err(|e| format!("proxyProtocol.trustedSources[{i}].cidr: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let resources = spec.resources.unwrap_or_default();
     let worker_threads = cpu_limit(Some(&resources))
         .and_then(|cpu| cpu_cores(&cpu.0))
@@ -297,6 +315,7 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         external_name_backends: spec
             .external_name_backends
             .unwrap_or(ExternalNameBackends::Refused),
+        proxy_sources,
     })
 }
 
@@ -437,6 +456,7 @@ mod tests {
                 networks: vec![],
                 controller_transport: ControllerTransport::Direct,
                 external_name_backends: ExternalNameBackends::Refused,
+                proxy_sources: vec![],
             }
         );
     }
@@ -552,6 +572,43 @@ networks: [{name: c}]
         );
         let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
         assert_eq!(params.external_name_backends, ExternalNameBackends::Refused);
+    }
+
+    #[tokio::test]
+    async fn proxy_sources_from_the_class_replaced_whole_by_the_gateway() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        let sources = |cidrs: &[&str]| {
+            let items: Vec<String> = cidrs.iter().map(|c| format!("{{cidr: \"{c}\"}}")).collect();
+            format!("proxyProtocol: {{trustedSources: [{}]}}", items.join(", "))
+        };
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                &sources(&["10.0.0.0/8", "2001:db8::/32"]),
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(params.proxy_sources, ["10.0.0.0/8", "2001:db8::/32"]);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", &sources(&["192.0.2.0/24"])),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.proxy_sources, ["192.0.2.0/24"]);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", &sources(&["192.0.2.7/24"])),
+        );
+        let err = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap_err();
+        assert!(
+            err.starts_with("proxyProtocol.trustedSources[0].cidr: "),
+            "{err}"
+        );
+        assert!(err.contains("host bits"), "{err}");
     }
 
     /// A missing referent, a wrong group or kind, or a class reference

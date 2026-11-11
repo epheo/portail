@@ -34,6 +34,7 @@ use crate::proxy::http_parser::{
     parse_digits, trim_ows,
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
+use crate::proxy::proxy_protocol::{self, Header};
 use crate::proxy::request_processor::{
     analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
     RequestMeta, RoutingResult,
@@ -505,16 +506,22 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                         }
                         let routes = routes.clone();
                         let health = health.clone();
+                        let selector = selector.clone();
+                        let shared_pool = shared_pool.clone();
+                        let listener_stats = listener_stats.clone();
+                        let drain = shutdown.child_token();
                         let conn_guard =
                             ConnGuard::new(active_connections.clone(), listener_stats.clone());
-
-                        if let Some(tls) = plan.load_full() {
-                            let selector = selector.clone();
-                            let shared_pool = shared_pool.clone();
-                            let listener_stats = listener_stats.clone();
-                            let drain = shutdown.child_token();
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
+                        let tls = plan.load_full();
+                        tokio::spawn(async move {
+                            let _guard = conn_guard;
+                            let mut tcp_stream = tcp_stream;
+                            let timeout = cfg.client_header_timeout;
+                            let Some(peer) = client_of(&mut tcp_stream, peer, &routes, timeout).await
+                            else {
+                                return;
+                            };
+                            if let Some(tls) = tls {
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
@@ -529,26 +536,23 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                     drain,
                                 )
                                 .await;
-                            });
-                        } else {
+                                return;
+                            }
                             let state = ConnectionState::new(
                                 server_port,
                                 routes,
                                 make_pool(&shared_pool, &cfg),
-                                selector.clone(),
+                                selector,
                                 health,
                                 false,
                                 peer.ip(),
                                 &cfg,
-                                listener_stats.clone(),
-                                shutdown.child_token(),
+                                listener_stats,
+                                drain,
                             );
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
-                                let conn = Connection::Plain { inner: tcp_stream };
-                                let _ = handle_connection(conn, peer, state).await;
-                            });
-                        }
+                            let conn = Connection::Plain { inner: tcp_stream };
+                            let _ = handle_connection(conn, peer, state).await;
+                        });
                     }
                     Err(e) => {
                         if let Some(pause) = backoff.after(&e) {
@@ -564,6 +568,33 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                     }
                 }
             }
+        }
+    }
+}
+
+/// The client a connection speaks for: its peer, or, from a trusted
+/// source, the client its PROXY v2 header names. None closes it: a
+/// trusted source that sends no header, a malformed one, or none in time
+/// never falls back to its own address.
+async fn client_of(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    routes: &ArcSwap<RouteTable>,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    if !routes.load().proxy_sources.trusts(peer.ip()) {
+        return Some(peer);
+    }
+    match tokio::time::timeout(timeout, proxy_protocol::read_header(stream)).await {
+        Ok(Ok(Header::Proxy(client))) => Some(client),
+        Ok(Ok(Header::Local)) => Some(peer),
+        _outcome => {
+            METRICS.proxy_protocol_refused_total.inc();
+            debug!(
+                "PROXY protocol header from {} refused: {:?}",
+                peer, _outcome
+            );
+            None
         }
     }
 }
@@ -2965,6 +2996,7 @@ fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: boo
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+    use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
     use crate::routing::{Backend, HttpHeader, PathMatchType, URLRewritePath};
     use tokio::io::DuplexStream;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -3652,6 +3684,116 @@ mod connection_tests {
             });
             assert_eq!(accepted, want, "{addr}");
         }
+    }
+
+    /// An accept loop on loopback over `rt`, trusting `sources` for PROXY
+    /// v2 headers, with a short header budget.
+    async fn listening(mut rt: RouteTable, sources: &[&str]) -> SocketAddr {
+        rt.proxy_sources =
+            TrustedSources::new(sources.iter().map(|s| Cidr::parse(s).unwrap()).collect());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = conn_state(rt, false);
+        let ctx = ListenerCtx {
+            server_port: addr.port(),
+            routes: state.routes.clone(),
+            cfg: WorkerConfig {
+                client_header_timeout: Duration::from_millis(300),
+                ..WorkerConfig::from_perf(&Default::default(), 4)
+            },
+            plan: Default::default(),
+            health: state.health.clone(),
+            selector: state.selector.clone(),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+        addr
+    }
+
+    /// A v2 header: PROXY for `client` over TCP4, or LOCAL.
+    fn proxy_v2(client: Option<SocketAddr>) -> Vec<u8> {
+        let mut h = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        let Some(SocketAddr::V4(client)) = client else {
+            h.extend([0x20, 0x00, 0, 0]);
+            return h;
+        };
+        h.extend([0x21, 0x11, 0, 12]);
+        h.extend(client.ip().octets());
+        h.extend([127, 0, 0, 1]);
+        h.extend(client.port().to_be_bytes());
+        h.extend(80u16.to_be_bytes());
+        h
+    }
+
+    const CLOSING_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n";
+
+    /// Everything the proxy answers to `bytes` until it closes; a close
+    /// on unread bytes resets.
+    async fn answer(addr: SocketAddr, bytes: &[u8]) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(bytes).await.unwrap();
+        let mut out = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("the proxy never closed");
+        if let Err(e) = read {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}");
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The forwarded request a trusted source's `header` brings about.
+    async fn forwarded_with(header: Vec<u8>) -> String {
+        let (backend_addr, mut rx) = backend(REFUSED).await;
+        let addr = listening(routes(backend_addr), &["127.0.0.0/8"]).await;
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        delivered(&mut rx).await
+    }
+
+    #[tokio::test]
+    async fn a_trusted_source_names_the_client_it_forwards() {
+        let seen = forwarded_with(proxy_v2(Some("203.0.113.7:50000".parse().unwrap()))).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 203.0.113.7\r\n"),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_sources_local_header_keeps_its_own_address() {
+        let seen = forwarded_with(proxy_v2(None)).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 127.0.0.1\r\n"),
+            "{seen}"
+        );
+    }
+
+    /// No fallback to the transport address: the source vouches for
+    /// every connection, so one without a header is not its.
+    #[tokio::test]
+    async fn a_trusted_source_without_a_header_in_time_is_closed() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["127.0.0.1/32"]).await;
+        let before = METRICS.proxy_protocol_refused_total.get();
+        assert_eq!(answer(addr, CLOSING_GET).await, "");
+        let cut_short = &proxy_v2(Some("203.0.113.7:1".parse().unwrap()))[..20];
+        assert_eq!(answer(addr, cut_short).await, "");
+        assert_never_connected(&backend).await;
+        assert!(METRICS.proxy_protocol_refused_total.get() >= before + 2);
+    }
+
+    /// An untrusted client's header is bytes of its request, never read:
+    /// no request opens with them.
+    #[tokio::test]
+    async fn an_untrusted_sources_header_is_not_read() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["10.0.0.0/8"]).await;
+        let header = proxy_v2(Some("203.0.113.7:1".parse().unwrap()));
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(!out.contains(" 200 "), "{out}");
+        assert_never_connected(&backend).await;
     }
 
     /// A backend that vanishes without FIN or RST would otherwise pin an

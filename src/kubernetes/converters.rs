@@ -93,6 +93,7 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
         name,
         listeners,
         addresses,
+        proxy_protocol: None,
     })
 }
 

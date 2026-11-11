@@ -224,6 +224,28 @@ a throttled crawler stays throttled across a rate change. Observability:
 `portail_http_requests_total` and `portail_listener_http_requests_total`
 count requests dispatched to a backend.
 
+## PROXY Protocol
+
+The receiving half of PROXY protocol v2, for a Gateway behind a load balancer or edge proxy that sends it.
+
+Kubernetes mode: `proxyProtocol.trustedSources` in GatewayParameters ([deployment](deployment.md#proxy-protocol)).
+Standalone mode:
+
+```yaml
+gateway:
+  proxyProtocol:
+    trustedSources: ["10.250.0.0/16", "2001:db8:250::/48"]
+```
+
+- A connection from a trusted source must open with a v2 header, on every TCP listener, plain or TLS.
+- PROXY for a TCP4 or TCP6 client: that client stands for the connection: `X-Forwarded-For`, access logs, rate limits.
+- LOCAL, a health check: the connection's own address stands.
+- Anything else from a trusted source closes the connection, never falling back to its address: no header within `clientHeaderTimeout`, a malformed one, v1 text, a UDP or unix client.
+- Counted in `portail_proxy_protocol_refused_total`.
+- Other sources are never read for a header: one they send is bytes of their request.
+- TLVs are skipped. UDP listeners take no header.
+- CIDRs name networks: `10.250.0.7/16` is refused, write `10.250.0.0/16` or `10.250.0.7/32`.
+
 ## Route Attachment
 
 A route is served on exactly the listeners its status attaches it to.

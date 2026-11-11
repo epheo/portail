@@ -29,6 +29,23 @@ pub struct GatewayConfig {
     /// names. Kubernetes mode binds the ones local to the pod.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+
+    /// Sources whose connections open with a PROXY protocol v2 header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+}
+
+/// The receiving half of PROXY protocol v2, on every TCP listener. A
+/// connection from a trusted source must open with a header, and the
+/// client it names stands for the connection: X-Forwarded-For, access
+/// logs, rate limits. Other sources are never read for one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ProxyProtocolConfig {
+    /// CIDRs, network address only.
+    #[serde(default)]
+    pub trusted_sources: Vec<String>,
 }
 
 /// Listener configuration defining protocol and port bindings
@@ -147,6 +164,7 @@ impl Default for GatewayConfig {
                 rate_limit: None,
             }],
             addresses: vec![],
+            proxy_protocol: None,
         }
     }
 }

@@ -11,6 +11,7 @@
 - Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.
 - To keep them, set `externalNameBackends: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
 - Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.
+- GatewayParameters `proxyProtocol` needs data planes of this release: an older one refuses the configuration and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`.
 
 ## 0.1.x to 0.2.0
 

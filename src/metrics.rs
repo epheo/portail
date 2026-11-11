@@ -77,6 +77,7 @@ metrics! {
     connections_accepted_total: "Client connections accepted across all listeners",
     http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
+    proxy_protocol_refused_total: "Connections from a trusted PROXY protocol source closed because their header was missing, malformed or late",
     rate_limited_total: "Requests answered 429 by a per-client rate limit",
     http_requests_rejected_total: "Requests answered 400 because their head or chunked body framing was malformed or ambiguous",
     upstream_connects_total: "Backend connections established",

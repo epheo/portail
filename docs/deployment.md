@@ -141,6 +141,9 @@ spec:
     gateway: ["172.16.87.1"]
   controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
   externalNameBackends: Refused  # Refused | Allowed
+  proxyProtocol:             # see PROXY protocol
+    trustedSources:
+    - cidr: 10.250.0.0/16
 ```
 
 Referenced from:
@@ -148,7 +151,7 @@ Referenced from:
 - a GatewayClass, `spec.parametersRef` with its `namespace`: defaults for the class;
 - a Gateway, `spec.infrastructure.parametersRef`, in the Gateway's namespace: overrides for that Gateway.
 
-Built-in defaults, then the class's, then the Gateway's: a set field wins field by field; `networks` and `resources` replace whole.
+Built-in defaults, then the class's, then the Gateway's: a set field wins field by field; `networks`, `resources` and `proxyProtocol` replace whole.
 
 Defaults:
 
@@ -157,6 +160,7 @@ Defaults:
 - `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
 - `controllerTransport: Direct`.
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
+- `proxyProtocol`: no trusted source; no connection is read for a header.
 
 Rules:
 
@@ -176,6 +180,16 @@ Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Ne
 | Controller down, a pod restarts | dark until the controller returns | the other replica serves |
 
 Two replicas spread across nodes when there are several.
+
+### PROXY protocol
+
+`proxyProtocol.trustedSources`: up to 16 CIDRs whose connections open with a PROXY protocol v2 header, Managed and Unmanaged alike.
+
+- The client the header names stands for the connection: `X-Forwarded-For`, access logs, rate limits.
+- A trusted source that sends no header, a malformed one, or one for anything but a TCP client is closed; LOCAL keeps its own address.
+- Other sources are never read for one.
+- Trust only what sends a header on every connection, and nothing a tenant can run: whoever sends from a trusted address names any client it likes.
+- Details: [configuration](configuration.md#proxy-protocol).
 
 ## Primary UDN
 

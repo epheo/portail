@@ -32,7 +32,7 @@ spec:
             description: |-
               How a Gateway's data plane is run. Built-in defaults, then the
               GatewayClass's parameters, then the Gateway's: a set field wins field by
-              field; `networks` and `resources` replace whole.
+              field; `networks`, `resources` and `proxyProtocol` replace whole.
             properties:
               controllerTransport:
                 description: |-
@@ -119,6 +119,34 @@ spec:
                 - null
                 nullable: true
                 type: string
+              proxyProtocol:
+                description: |-
+                  PROXY protocol v2 on the data plane's TCP listeners, Managed or not.
+                  Replaces whole: a Gateway's own list is never added to its class's.
+                nullable: true
+                properties:
+                  trustedSources:
+                    description: |-
+                      Sources whose connections must open with a v2 header: the client
+                      it names stands for the connection (X-Forwarded-For, access logs,
+                      rate limits). One that sends no header, or a malformed one, is
+                      closed; LOCAL keeps the connection's own address. Other sources are
+                      never read for one. Empty: none. Matched per accepted connection.
+                    items:
+                      properties:
+                        cidr:
+                          description: |-
+                            An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
+                            10.250.0.7/16.
+                          minLength: 1
+                          type: string
+                      required:
+                      - cidr
+                      type: object
+                    maxItems: 16
+                    nullable: true
+                    type: array
+                type: object
               replicas:
                 description: |-
                   Data-plane pods (Managed). Default 1; static `networks[].ips`
