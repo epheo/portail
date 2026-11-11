@@ -1020,6 +1020,8 @@ mod tests {
             networks: vec![],
             controller_transport: crate::kubernetes::crds::ControllerTransport::Direct,
             external_name_backends: crate::kubernetes::crds::ExternalNameBackends::Refused,
+            service_endpoints_on_attached_networks:
+                crate::kubernetes::crds::AttachedNetworkEndpoints::Refused,
             proxy_sources: vec![],
             trusted_gateways: vec![],
         }

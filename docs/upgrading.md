@@ -8,6 +8,11 @@
 
 ## From 0.2.1
 
+- A Service backend whose addresses fall inside a network the Gateway attaches (its Network addresses, the networks it dials out on) is refused: the share of a backendRef left with none answers 500.
+- To keep them, set `serviceEndpointsOnAttachedNetworks: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
+- Find them first: headless Services (`clusterIP: None`) and ExternalName Services routed to by such Gateways, whose endpoints sit in those networks' CIDRs.
+- A headless or ExternalName answer that is loopback, link-local, unspecified, broadcast or multicast is refused whatever the parameters. A standalone file is unchanged.
+- An older controller sends no setting: a data plane of this release refuses, as by default.
 - A Gateway without a Service whose `spec.addresses` `IPAddress` values are on no data-plane pod now says so: `portail.epheo.eu/AddressesAssigned` `False` while another address is held, `Programmed` `False`, reason `AddressNotAssigned`, when none is. It binds as before.
 - An Unmanaged data plane on a dial-out network should set `POD_IP` (`status.podIP` through the downward API): while that network is unresolved, a named address binds only on its pod IP's interface or a listening Network's.
 - Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.

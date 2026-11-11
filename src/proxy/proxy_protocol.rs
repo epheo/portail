@@ -133,6 +133,22 @@ impl Cidr {
         Ok(Self { network, prefix })
     }
 
+    /// The network `s` lies in, host bits cleared: a
+    /// NetworkAttachmentDefinition's subnet may be written with its gateway
+    /// address.
+    pub fn covering(s: &str) -> Option<Self> {
+        let (ip, prefix) = s.split_once('/')?;
+        let ip: IpAddr = ip.parse().ok()?;
+        let bits = if ip.is_ipv4() { 32 } else { 128 };
+        let prefix: u8 = prefix.parse().ok().filter(|p| *p <= bits)?;
+        let masked = bits_of(ip) & mask(bits, prefix);
+        let network = match ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(masked as u32)),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(masked)),
+        };
+        Some(Self { network, prefix })
+    }
+
     /// An IPv4 client of a dual-stack socket arrives IPv4-mapped.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();

@@ -79,6 +79,7 @@ metrics! {
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
     proxy_protocol_refused_total: "Connections from a trusted PROXY protocol source closed because their header was missing, malformed or late",
     rate_limited_total: "Requests answered 429 by a per-client rate limit",
+    backend_addresses_refused_total: "Service backend addresses a configuration from the controller resolved to and the data plane refused to dial, counted at each route table build",
     http_requests_rejected_total: "Requests answered 400 because their head or chunked body framing was malformed or ambiguous",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",

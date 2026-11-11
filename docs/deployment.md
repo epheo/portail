@@ -145,6 +145,7 @@ spec:
     listeners: true          # false: dial out only, see Networks to dial out on
   controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
   externalNameBackends: Refused  # Refused | Allowed
+  serviceEndpointsOnAttachedNetworks: Refused  # Refused | Allowed
   proxyProtocol:             # see PROXY protocol
     trustedSources:
     - cidr: 10.250.0.0/16
@@ -165,6 +166,7 @@ Defaults:
 - `service.type`: `None` when the Gateway has a Network address or `networks` is set, a network it only dials out on included, else `LoadBalancer`.
 - `controllerTransport: Direct`.
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
+- `serviceEndpointsOnAttachedNetworks: Refused`, Managed and Unmanaged alike: see [Service backends on attached networks](#service-backends-on-attached-networks).
 - `proxyProtocol`: no trusted source; no connection is read for a header.
 
 Rules:
@@ -176,6 +178,25 @@ Rules:
 - Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
 
 Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Network address not already listed.
+
+### Service backends on attached networks
+
+Whoever can write a Service's Endpoints picks the addresses its headless name answers with, and the data plane dials them from its own pod.
+A route to such a Service could then reach a network the Gateway attaches for the platform, transit, and the other Gateways on it.
+
+With `serviceEndpointsOnAttachedNetworks: Refused`, the default:
+
+- An address a Service backend or a mirror resolves to inside an attached network is never dialed: the CIDRs of the Gateway's Network addresses and of the networks it dials out on.
+- A backendRef left with no address has its share answer 500, an L4 connection closed, as for an invalid ref.
+- An attached network with no CIDRs read (its NetworkAttachmentDefinition missing or naming no subnet, or a Network address with none): no address dialed directly can be told outside it, so every one is refused. A ClusterIP still serves: cluster DNS answers its VIP, which OVN cannot route onto a secondary network.
+- Gateway backends are never refused: they are dialed on the network both share.
+- A `networks[]` attachment the Gateway listens on without naming it as a Network address is not read, so not covered: name it as a Network address, or fence it.
+- `Allowed` dials them, for a platform serving hosts on a network it attaches.
+
+Whatever this field says, an address dialed directly (a headless answer, an ExternalName answer, an override) that is the pod's own is refused: loopback, link-local (169.254.169.254, a cloud metadata endpoint), unspecified, broadcast or multicast. 127.0.0.1 would reach the data plane's admin port. This holds for a configuration from the controller only: a standalone file's backends are its owner's, loopback included.
+
+Only the data plane sees the DNS answers, so route status says nothing of a refused address.
+Each refused address counts in `portail_backend_addresses_refused_total`, counted at each route table build (apply and DNS refresh), and a debug line names the Service.
 
 ### Replicas
 
@@ -342,6 +363,7 @@ Requirements:
 - Only platform namespaces attach it: the edge's and the project Gateways'. Nothing a tenant runs.
 - Tenants cannot create or replace NetworkAttachmentDefinitions. A shared network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
 - A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods. Denying transit ingress to the edge too is defense in depth: nothing listens there.
+- Beside it, `serviceEndpointsOnAttachedNetworks: Refused` keeps a tenant's Service from pointing a project Gateway at transit: defense in depth, as the MultiNetworkPolicy already fences the targets.
 - `trustedSources` names the edge Gateway, never the transit CIDR.
 
 The lapse window:
@@ -497,6 +519,7 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 - ExternalName backends are refused unless the Gateway's GatewayParameters set `externalNameBackends: Allowed`: whoever writes the Service picks the name the Gateway dials, another namespace's Service or the API server included, from wherever the Gateway's pods sit (CVE-2021-25740). The Gateway API asks implementations not to support them.
+- A Service backend's address inside a network the Gateway attaches is refused unless its GatewayParameters set `serviceEndpointsOnAttachedNetworks: Allowed`, and an address dialed directly that is the pod's own (loopback, link-local, unspecified, broadcast, multicast) is refused always: whoever writes Endpoints picks a headless Service's addresses ([Service backends on attached networks](#service-backends-on-attached-networks)).
 - A Gateway's ServiceAccount can be used by any pod its namespace's admin starts, each with a valid token. Its data planes hold at most `--sync-gateway-polls` polls at once, uncounted against their address, so such pods never take other Gateways' connections.
 
 ## Container Image

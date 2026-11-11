@@ -691,6 +691,9 @@ fn data_plane_fingerprint(config: &PortailConfig, binds: &[ListenerConfig]) -> u
             )
             .collect(),
     );
+    // What a Service backend may resolve to: a network read again, or the
+    // parameters allowing it, rebuilds the table though the routes did not move.
+    h.write(format!("{:?}", config.dial_rules).as_bytes());
     for b in binds {
         h.write(format!("{:?}:{}", b.address, b.port).as_bytes());
         h.write(&[0]);
@@ -1444,6 +1447,29 @@ mod tests {
                 .unwrap()
                 .block_on(test);
         }
+    }
+
+    /// The DNS refresh rebuilds from the published config: it carries the
+    /// snapshot's dial rules, so a name re-resolved there meets them too.
+    #[tokio::test]
+    async fn the_published_config_carries_the_snapshots_dial_rules() {
+        let (mut applier, _) = applier();
+        let mut snapshot = edge(&[], &[], false, 1);
+        snapshot.networks = vec![crate::sync::NetworkCidrs {
+            name: "transit".into(),
+            cidrs: vec!["10.250.0.0/16".into()],
+            listeners: false,
+        }];
+        let snapshot = snapshot.seal();
+        applier.apply(&snapshot).await;
+        let published = applier.published.load_full().expect("published");
+        let rules = published
+            .config
+            .dial_rules
+            .clone()
+            .expect("the snapshot's rules");
+        assert!(rules.refuses("10.250.0.9".parse().unwrap(), true).is_some());
+        assert_eq!(rules.refuses("10.128.0.5".parse().unwrap(), true), None);
     }
 
     /// A 404 closes every listener and turns NotReady; the next snapshot

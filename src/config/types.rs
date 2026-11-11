@@ -212,6 +212,10 @@ pub struct PortailConfig {
     /// DNS A-records carry no port. Map: (backend_fqdn, service_port) → target_port.
     #[serde(skip)]
     pub headless_target_ports: std::collections::HashMap<(String, u16), u16>,
+
+    /// Set from a controller's snapshot only, never from a file.
+    #[serde(skip)]
+    pub dial_rules: Option<super::DialRules>,
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
