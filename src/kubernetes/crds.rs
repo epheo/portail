@@ -215,7 +215,7 @@ pub struct TrustedSource {
     pub cidr: Option<String>,
     /// A Gateway of this controller: the address each of its live data
     /// planes reports on a Network both Gateways name, inside its CIDRs on
-    /// both sides, where it bound a listener. Nothing while none reports
+    /// both sides, bound there or not. Nothing while none reports
     /// or this Gateway has no Network address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<TrustedGateway>,
