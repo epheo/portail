@@ -36,10 +36,14 @@ pub struct Snapshot {
     /// interfaces against them. A name without an entry is unresolved.
     #[serde(default)]
     pub networks: Vec<NetworkCidrs>,
-    /// The trusted sources each named Gateway gave, by its key: what a
-    /// data plane keeps for it while it is pending.
+    /// The trusted sources each named Gateway gave, by its key and uid:
+    /// what a data plane keeps for it while it is pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_from: Vec<TrustedFrom>,
+    /// The uid of the Gateway each resolved Gateway backend's endpoints
+    /// came from: a data plane keeps them only for that same Gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends_from: Vec<BackendFrom>,
     /// What spec still allows but none of whose instances has reported
     /// since this controller took the lead. A data plane keeps what it last
     /// served for each, one hold at most. Only reports are waited for:
@@ -55,7 +59,19 @@ pub struct Snapshot {
 pub struct TrustedFrom {
     /// `namespace/name`.
     pub gateway: String,
+    /// A Gateway recreated under the same name is another: what was
+    /// trusted for the old one is never kept for the new.
+    pub uid: String,
     pub sources: Vec<String>,
+}
+
+/// The Gateway a Gateway backend's endpoints came from.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendFrom {
+    pub host: String,
+    pub port: u16,
+    pub uid: String,
 }
 
 /// Gateway backends and trusted Gateways waiting for a first report.
@@ -65,9 +81,17 @@ pub struct Pending {
     /// Gateway backends, by the name and port their endpoints ride.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<PendingBackend>,
-    /// Trusted Gateways, `namespace/name`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trusted: Vec<String>,
+    pub trusted: Vec<PendingTrusted>,
+}
+
+/// A trusted Gateway waiting for a first report.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingTrusted {
+    /// `namespace/name`.
+    pub gateway: String,
+    pub uid: String,
 }
 
 impl Pending {
@@ -81,6 +105,8 @@ impl Pending {
 pub struct PendingBackend {
     pub host: String,
     pub port: u16,
+    /// The target Gateway's.
+    pub uid: String,
 }
 
 /// A certificateRef's resolved Secret. PEM is ASCII; [`Snapshot::from_config`]
@@ -248,6 +274,7 @@ impl Snapshot {
             backends,
             networks,
             trusted_from: Vec::new(),
+            backends_from: Vec::new(),
             pending: Pending::default(),
         }
         .seal()
@@ -490,7 +517,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 15] = [
+        let changes: [(&str, fn(&mut Snapshot)); 16] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -523,10 +550,23 @@ mod tests {
             ("trustedFrom", |s| {
                 s.trusted_from.push(TrustedFrom {
                     gateway: "edge/public".into(),
+                    uid: "u".into(),
                     sources: vec!["10.250.0.9/32".into()],
                 })
             }),
-            ("pending", |s| s.pending.trusted.push("edge/public".into())),
+            ("backendsFrom", |s| {
+                s.backends_from.push(BackendFrom {
+                    host: "edge.public.gateway".into(),
+                    port: 80,
+                    uid: "u".into(),
+                })
+            }),
+            ("pending", |s| {
+                s.pending.trusted.push(PendingTrusted {
+                    gateway: "edge/public".into(),
+                    uid: "u".into(),
+                })
+            }),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();

@@ -31,7 +31,7 @@ use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::{PolicyAcceptance, RouteAcceptance};
 use crate::kubernetes::status;
 use crate::logging::{debug, info, warn};
-use crate::sync::{GatewayKey, GatewayRef, Pending, Snapshot, TrustedFrom, HOLD};
+use crate::sync::{GatewayKey, GatewayRef, Pending, PendingTrusted, Snapshot, TrustedFrom, HOLD};
 
 /// Per-listener attachedRoutes. The spec counts ROUTES attached to a
 /// listener, so a route whose several parentRefs land on the same listener
@@ -399,6 +399,12 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                 .map(|t| t + HOLD)
                 .filter(|end| *end > tokio::time::Instant::now());
             let mut pending = Pending::default();
+            let uid_of = |named: &GatewayKey| {
+                ctx.cache
+                    .gateways
+                    .get(&ObjectRef::new(&named.name).within(&named.namespace))
+                    .and_then(|g| g.metadata.uid.clone())
+            };
             for named in params
                 .trusted_gateways
                 .iter()
@@ -420,17 +426,28 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                     && !plan.networks.is_empty()
                     && gateway_backends::unheard(&ctx.hub, &ctx.reports, named)
                 {
-                    pending.trusted.push(named.to_string());
+                    if let Some(uid) = uid_of(named) {
+                        pending.trusted.push(PendingTrusted {
+                            gateway: named.to_string(),
+                            uid,
+                        });
+                    }
                 }
             }
             if window.is_some() {
-                pending.backends =
-                    gateway_backends::unheard_backends(&ctx.hub, &ctx.reports, &plan.config);
+                pending.backends = gateway_backends::unheard_backends(
+                    &ctx.hub,
+                    &ctx.reports,
+                    &plan.config,
+                    uid_of,
+                );
             }
+            let backends_from = gateway_backends::backends_from(&plan.config, uid_of);
             let trusted_from = trusted_for
                 .iter()
                 .map(|(named, sources)| TrustedFrom {
                     gateway: named.to_string(),
+                    uid: uid_of(named).unwrap_or_default(),
                     sources: sources.clone(),
                 })
                 .collect();
@@ -451,6 +468,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                 std::mem::take(&mut plan.networks),
             );
             snapshot.trusted_from = trusted_from;
+            snapshot.backends_from = backends_from;
             snapshot.pending = pending;
             let published = ctx.hub.publish(snapshot.seal());
             // Its listeners may have moved with its spec.
@@ -1234,12 +1252,21 @@ mod tests {
         apply(&mut p.cluster.gateways, edge.clone());
         let project = with_addresses(testkit::gateway("project", 1), 1, &network);
         apply(&mut p.cluster.gateways, project.clone());
-        let pending = |p: &Pipeline| p.served(&project).unwrap().pending.trusted.clone();
+        let pending = |p: &Pipeline| -> Vec<(String, String)> {
+            p.served(&project)
+                .unwrap()
+                .pending
+                .trusted
+                .iter()
+                .map(|t| (t.gateway.clone(), t.uid.clone()))
+                .collect()
+        };
+        let edge_as = |uid: &str| vec![("default/edge".to_string(), uid.to_string())];
 
         p.pass(&project).await.unwrap();
         assert_eq!(
             pending(&p),
-            ["default/edge"],
+            edge_as("edge-uid"),
             "edge neither served nor heard"
         );
         assert_eq!(
@@ -1250,7 +1277,11 @@ mod tests {
         // Published, its data plane not yet heard from.
         let _ = publish(&edge, &p.ctx).await;
         p.pass(&project).await.unwrap();
-        assert_eq!(pending(&p), ["default/edge"], "served, but not heard from");
+        assert_eq!(
+            pending(&p),
+            edge_as("edge-uid"),
+            "served, but not heard from"
+        );
 
         p.ctx.reports.record(
             &testkit::key(&edge),
@@ -1275,9 +1306,20 @@ mod tests {
             served.trusted_from,
             [TrustedFrom {
                 gateway: "default/edge".into(),
+                uid: "edge-uid".into(),
                 sources: vec!["10.250.0.9/32".into()],
             }]
         );
+
+        // Recreated under the same name: another Gateway, pending under its
+        // own uid, so nothing trusted for the old one is kept for it.
+        p.delete(&edge).await;
+        let mut edge = edge.clone();
+        edge.metadata.uid = Some("edge-uid-2".into());
+        apply(&mut p.cluster.gateways, edge.clone());
+        p.pass(&project).await.unwrap();
+        assert_eq!(pending(&p), edge_as("edge-uid-2"));
+        assert!(p.served(&project).unwrap().trusted_from.is_empty());
 
         apply(&mut p.cluster.parameters, parameters(false));
         p.pass(&project).await.unwrap();
@@ -1291,7 +1333,7 @@ mod tests {
         apply(&mut p.cluster.parameters, parameters(true));
         p.ctx.reports.retain(|k| *k != testkit::key(&edge));
         p.pass(&project).await.unwrap();
-        assert_eq!(pending(&p), ["default/edge"], "unheard again, window open");
+        assert_eq!(pending(&p), edge_as("edge-uid-2"), "unheard, window open");
 
         p.ctx.leader.led_for(HOLD + Duration::from_secs(1));
         p.pass(&project).await.unwrap();
@@ -1301,7 +1343,7 @@ mod tests {
         p.pass(&project).await.unwrap();
         assert_eq!(
             pending(&p),
-            ["default/edge"],
+            edge_as("edge-uid-2"),
             "a takeover opens a new window"
         );
     }
@@ -1356,10 +1398,14 @@ mod tests {
             route
         };
         let pending = |p: &Pipeline| p.served(&edge).unwrap().pending.backends.clone();
-        let unheard = [PendingBackend {
-            host: "target.projects.gateway".into(),
-            port: 80,
-        }];
+        let unheard_as = |uid: &str| {
+            vec![PendingBackend {
+                host: "target.projects.gateway".into(),
+                port: 80,
+                uid: uid.into(),
+            }]
+        };
+        let unheard = unheard_as("target-uid");
 
         apply(&mut p.cluster.http_routes, naming(true));
         p.pass(&edge).await.unwrap();
@@ -1396,6 +1442,15 @@ mod tests {
         });
         p.pass(&edge).await.unwrap();
         assert_eq!(pending(&p), unheard);
+
+        // Recreated under the same name: pending under its own uid.
+        p.delete(&target).await;
+        let mut target = target.clone();
+        target.metadata.uid = Some("target-uid-2".into());
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&edge).await.unwrap();
+        assert_eq!(pending(&p), unheard_as("target-uid-2"));
+
         p.delete(&target).await;
         p.pass(&edge).await.unwrap();
         assert!(pending(&p).is_empty(), "a deleted target drops at once");

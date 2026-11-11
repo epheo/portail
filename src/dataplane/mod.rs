@@ -249,6 +249,9 @@ impl SyncLoop {
             // The version confirmed may be one refused: the config served
             // is older, and its age grows on.
             Answer::Unchanged => {
+                if self.refused.is_none() {
+                    self.applier.confirmed();
+                }
                 self.succeeded(self.refused.is_none());
                 return now;
             }
@@ -735,6 +738,42 @@ mod tests {
         assert!(metrics.age().unwrap() >= pause, "confirmed");
     }
 
+    /// "Unchanged" is the controller vouching for what is served: a value
+    /// it confirms stays fresh enough to keep through a failover, one it
+    /// stopped confirming does not.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_answer_keeps_what_is_served_fresh() {
+        let mut resolved = snapshot();
+        resolved.trusted_from = vec![crate::sync::TrustedFrom {
+            gateway: "p/edge".into(),
+            uid: "u1".into(),
+            sources: vec!["10.250.0.9/32".into()],
+        }];
+        resolved.config.gateway.proxy_protocol = Some(crate::config::ProxyProtocolConfig {
+            trusted_sources: vec!["10.250.0.9/32".into()],
+        });
+        let resolved = resolved.seal();
+        let mut pending = snapshot();
+        pending.config.gateway.name = "gw-2".into();
+        pending.pending.trusted = vec![crate::sync::PendingTrusted {
+            gateway: "p/edge".into(),
+            uid: "u1".into(),
+        }];
+        let pending = pending.seal();
+
+        for confirmed in [true, false] {
+            let (mut sync, _) = sync_loop();
+            sync.handle(Answer::Snapshot(body(&resolved))).await;
+            tokio::time::advance(Duration::from_secs(50)).await;
+            if confirmed {
+                sync.handle(Answer::Unchanged).await;
+            }
+            tokio::time::advance(Duration::from_secs(20)).await;
+            sync.handle(Answer::Snapshot(body(&pending))).await;
+            assert_eq!(sync.applier.kept_until().is_some(), confirmed);
+        }
+    }
+
     /// A value kept for something pending is dropped on the data plane's
     /// own clock: its lapse schedules an apply, whatever the controller
     /// sends meanwhile.
@@ -744,6 +783,7 @@ mod tests {
         let mut served = snapshot();
         served.trusted_from = vec![crate::sync::TrustedFrom {
             gateway: "p/edge".into(),
+            uid: "u1".into(),
             sources: vec!["10.250.0.9/32".into()],
         }];
         served.config.gateway.proxy_protocol = Some(crate::config::ProxyProtocolConfig {
@@ -752,7 +792,10 @@ mod tests {
         sync.handle(Answer::Snapshot(body(&served.seal()))).await;
         let mut pending = snapshot();
         pending.config.gateway.name = "gw-2".into();
-        pending.pending.trusted = vec!["p/edge".into()];
+        pending.pending.trusted = vec![crate::sync::PendingTrusted {
+            gateway: "p/edge".into(),
+            uid: "u1".into(),
+        }];
         sync.handle(Answer::Snapshot(body(&pending.seal()))).await;
         let kept = sync.applier.kept_until().expect("trust kept");
         assert!(
