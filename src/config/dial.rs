@@ -1,9 +1,11 @@
 //! Which addresses a Service backend may resolve to when the controller
 //! sent the configuration. Whoever can write a Service's Endpoints picks
-//! the addresses a headless name answers with, and the data plane dials
-//! them from its own pod.
+//! the addresses a headless name answers with, whoever writes an
+//! ExternalName Service picks its target's, and the data plane dials them
+//! from its own pod.
 
-use std::net::IpAddr;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::proxy::proxy_protocol::Cidr;
 
@@ -17,17 +19,21 @@ pub struct DialRules {
     /// One of those networks has no CIDRs read: no address dialed directly
     /// can be told outside it.
     pub unresolved: bool,
+    /// Backend names the controller knows cluster DNS answers with a VIP.
+    /// Every other name, an unknown one included, is dialed directly.
+    pub cluster_ip: BTreeSet<String>,
 }
 
 impl DialRules {
-    /// Why `ip` is not dialed for a Service backend, if it is not. `direct`:
-    /// a headless or ExternalName answer, or an override, whose addresses
-    /// whoever writes the Service picks. Never a ClusterIP: cluster DNS
-    /// answers its VIP, which is none of the pod's own and which OVN cannot
-    /// route onto a secondary network.
+    /// Why `ip` is not dialed, if it is not. `direct`: an address whoever
+    /// writes the Service picks (a headless or ExternalName answer, an
+    /// override target), so anything but a name marked as a ClusterIP's.
+    /// Every address meets the pod's-own and the attached-network checks,
+    /// a marked VIP's too: a real one is never either, and a Service turned
+    /// ExternalName since it was marked is caught.
     pub fn refuses(&self, ip: IpAddr, direct: bool) -> Option<&'static str> {
-        let ip = ip.to_canonical();
-        if direct && dialed_by_the_pod_itself(ip) {
+        let ip = canonical(ip);
+        if dialed_by_the_pod_itself(ip) {
             Some("the Gateway pod's own: loopback, link-local, unspecified, broadcast or multicast")
         } else if self.refused.iter().any(|c| c.contains(ip)) {
             Some("inside a network the Gateway attaches")
@@ -37,10 +43,29 @@ impl DialRules {
             None
         }
     }
+
+    /// Whether backend `name`'s own DNS answers are dialed as is.
+    pub fn direct(&self, name: &str) -> bool {
+        !self.cluster_ip.contains(name)
+    }
 }
 
+/// The IPv4 address an IPv6 one stands for: IPv4-mapped, or under the NAT64
+/// well-known prefix 64:ff9b::/96, which a NAT64 gateway turns into it.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) if v6.segments()[..6] == NAT64[..6] => {
+            let [.., a, b, c, d] = v6.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+        }
+        other => other,
+    }
+}
+
+const NAT64: [u16; 8] = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0).segments();
+
 /// 127.0.0.1 reaches the data plane's admin port, 169.254.169.254 a cloud
-/// metadata endpoint: whatever the networks, never a backend.
+/// metadata endpoint: never a backend.
 fn dialed_by_the_pod_itself(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -66,12 +91,12 @@ mod tests {
     fn transit() -> DialRules {
         DialRules {
             refused: vec![Cidr::covering("10.250.0.0/16").unwrap()],
-            unresolved: false,
+            ..DialRules::default()
         }
     }
 
     #[test]
-    fn the_pods_own_addresses_are_refused_when_dialed_directly() {
+    fn the_pods_own_addresses_are_refused_direct_or_not() {
         for ip in [
             "127.0.0.1",
             "127.1.2.3",
@@ -85,39 +110,43 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
-            assert!(DialRules::default().refuses(ip, true).is_some(), "{ip}");
-            assert!(transit().refuses(ip, true).is_some(), "{ip}");
+            for direct in [true, false] {
+                assert!(DialRules::default().refuses(ip, direct).is_some(), "{ip}");
+                assert!(transit().refuses(ip, direct).is_some(), "{ip}");
+            }
         }
-        // A name cluster DNS answers with a VIP, as a ClusterIP's, is not one
-        // whoever writes the Service picks.
-        assert_eq!(
-            DialRules::default().refuses("127.0.0.1".parse().unwrap(), false),
-            None
-        );
     }
 
     #[test]
-    fn an_attached_network_is_refused_mapped_or_not() {
+    fn an_attached_network_is_refused_mapped_or_through_nat64() {
         let rules = transit();
-        for ip in ["10.250.3.4", "::ffff:10.250.3.4"] {
+        for ip in ["10.250.3.4", "::ffff:10.250.3.4", "64:ff9b::afa:304"] {
             assert!(rules.refuses(ip.parse().unwrap(), true).is_some(), "{ip}");
             assert!(rules.refuses(ip.parse().unwrap(), false).is_some(), "{ip}");
         }
         assert_eq!(rules.refuses("10.251.0.1".parse().unwrap(), true), None);
         assert_eq!(rules.refuses("172.30.0.10".parse().unwrap(), false), None);
+        assert_eq!(
+            rules.refuses("64:ff9c::afa:304".parse().unwrap(), true),
+            None
+        );
     }
 
     #[test]
     fn an_unresolved_network_refuses_direct_addresses_only() {
         let rules = DialRules {
-            refused: vec![],
             unresolved: true,
+            cluster_ip: ["vip.p.svc".to_string()].into(),
+            ..DialRules::default()
         };
         let ip: IpAddr = "10.128.2.7".parse().unwrap();
-        assert!(rules.refuses(ip, true).is_some());
-        assert_eq!(rules.refuses(ip, false), None);
+        assert!(rules.refuses(ip, rules.direct("head.p.svc")).is_some());
+        assert!(rules.refuses(ip, rules.direct("unknown.p.svc")).is_some());
+        assert_eq!(rules.refuses(ip, rules.direct("vip.p.svc")), None);
     }
 
     #[test]

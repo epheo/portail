@@ -31,6 +31,9 @@ pub(crate) struct ServiceState {
     /// data plane connects to DNS-resolved pod IPs on the targetPort, not the
     /// service port (headless has no VIP and DNS carries no port).
     pub headless_target_ports: HashMap<(String, u16), u16>,
+    /// Backend names of the Services cluster DNS answers with a VIP: a real
+    /// clusterIP, not None and not ExternalName.
+    pub cluster_ip_backends: HashSet<String>,
 }
 
 /// A headless Service whose `targetPort` is *named*. The numeric value lives in
@@ -144,11 +147,22 @@ pub(crate) fn resolve_services(
     // fallback here so an absent/failed lookup degrades to prior behavior.
     let mut headless_target_ports: HashMap<(String, u16), u16> = HashMap::new();
     let mut named_target_ports: Vec<NamedTargetPortReq> = Vec::new();
+    let mut cluster_ip_backends: HashSet<String> = HashSet::new();
     for svc in all_services {
         let spec = match svc.spec.as_ref() {
             Some(s) => s,
             None => continue,
         };
+        let vip = spec
+            .cluster_ip
+            .as_deref()
+            .is_some_and(|ip| !ip.is_empty() && ip != "None");
+        if vip && spec.type_.as_deref() != Some("ExternalName") {
+            if let Some(name) = svc.metadata.name.as_deref() {
+                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+                cluster_ip_backends.insert(backend_dns_name(name, None, ns));
+            }
+        }
         // Headless services are marked clusterIP: None (stored as the literal "None").
         // ClusterIP/LoadBalancer resolve to a VIP and keep the service port (kube-proxy
         // maps it); ExternalName has no clusterIP and is handled via endpoint_overrides.
@@ -266,6 +280,7 @@ pub(crate) fn resolve_services(
             endpoint_overrides,
             app_protocol_overrides,
             headless_target_ports,
+            cluster_ip_backends,
         },
         named_target_ports,
     )

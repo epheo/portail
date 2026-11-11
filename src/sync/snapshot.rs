@@ -57,6 +57,11 @@ pub struct Snapshot {
     /// controller refuses too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub service_endpoints_on_attached_networks: bool,
+    /// Backend names cluster DNS answers with a VIP, sorted. A data plane
+    /// dials every other name's answers as is; with this absent (an older
+    /// controller) every name counts so, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_ip_backends: Vec<String>,
 }
 
 /// The host CIDRs trusted for one named Gateway.
@@ -270,6 +275,9 @@ impl Snapshot {
         backends.external_names.sort_unstable();
         backends.app_protocols.sort_unstable();
         networks.sort_unstable();
+        let cluster_ip_backends = std::mem::take(&mut config.cluster_ip_backends)
+            .into_iter()
+            .collect();
 
         Snapshot {
             protocol: PROTOCOL,
@@ -283,6 +291,7 @@ impl Snapshot {
             backends_from: Vec::new(),
             pending: Pending::default(),
             service_endpoints_on_attached_networks: false,
+            cluster_ip_backends,
         }
         .seal()
     }
@@ -343,6 +352,7 @@ impl Snapshot {
             .iter()
             .map(|a| ((a.host.clone(), a.port), a.app_protocol.clone()))
             .collect();
+        config.cluster_ip_backends = self.cluster_ip_backends.iter().cloned().collect();
         config.dial_rules = Some(self.dial_rules());
         config
     }
@@ -351,8 +361,12 @@ impl Snapshot {
     /// addresses are refused always; its attached networks unless the
     /// parameters allow them.
     fn dial_rules(&self) -> DialRules {
+        let cluster_ip = self.cluster_ip_backends.iter().cloned().collect();
         if self.service_endpoints_on_attached_networks {
-            return DialRules::default();
+            return DialRules {
+                cluster_ip,
+                ..DialRules::default()
+            };
         }
         let cidrs: Vec<Option<Cidr>> = self
             .networks
@@ -372,6 +386,7 @@ impl Snapshot {
                 || self.networks.iter().any(|n| n.cidrs.is_empty())
                 || cidrs.iter().any(Option::is_none),
             refused: cidrs.into_iter().flatten().collect(),
+            cluster_ip,
         }
     }
 }
@@ -553,7 +568,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 17] = [
+        let changes: [(&str, fn(&mut Snapshot)); 18] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -605,6 +620,9 @@ mod tests {
             }),
             ("serviceEndpointsOnAttachedNetworks", |s| {
                 s.service_endpoints_on_attached_networks = true
+            }),
+            ("clusterIpBackends", |s| {
+                s.cluster_ip_backends.push("web.p.svc".into())
             }),
         ];
         for (field, change) in changes {
@@ -698,5 +716,24 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(file.dial_rules, None, "a standalone file sets none");
+    }
+
+    /// The names marked as a ClusterIP's ride the envelope. An older
+    /// controller's snapshot marks none: every name is dialed directly.
+    #[test]
+    fn cluster_ip_marks_ride_the_envelope_and_fail_closed_when_absent() {
+        let mut config = translated();
+        config.cluster_ip_backends = ["web.p.svc".to_string()].into();
+        let snapshot = Snapshot::from_config(gateway(), config, vec![]);
+        assert_eq!(snapshot.cluster_ip_backends, ["web.p.svc"]);
+        let received = over_the_wire(&snapshot);
+        let rules = received.to_config().dial_rules.unwrap();
+        assert!(!rules.direct("web.p.svc"));
+        assert!(rules.direct("head.p.svc"));
+
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json.as_object_mut().unwrap().remove("clusterIpBackends");
+        let older: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(older.to_config().dial_rules.unwrap().direct("web.p.svc"));
     }
 }

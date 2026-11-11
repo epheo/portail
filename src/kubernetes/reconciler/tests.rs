@@ -83,6 +83,7 @@ fn empty_services() -> ServiceState {
         endpoint_overrides: HashMap::new(),
         app_protocol_overrides: HashMap::new(),
         headless_target_ports: HashMap::new(),
+        cluster_ip_backends: HashSet::new(),
     }
 }
 
@@ -4172,4 +4173,53 @@ fn an_unreadable_gateway_backend_name_is_not_found() {
     assert_eq!(reason, "BackendNotFound");
     assert!(message.contains("names no Gateway"), "{message}");
     assert!(cx.watched.into_inner().is_empty());
+}
+
+/// A backend name that is an IP address would reach the data plane
+/// unchecked: the reconciler refuses one, however it arrived.
+#[test]
+fn a_literal_backend_name_is_invalid() {
+    for name in ["127.0.0.1", "::1", "10.250.0.7"] {
+        let (reason, why) = literal_backend_name(name).expect(name);
+        assert_eq!(reason, "InvalidKind");
+        assert!(why.contains(name), "{why}");
+    }
+    assert_eq!(literal_backend_name("web.p.svc"), None);
+    assert_eq!(literal_backend_name("127.0.0.1.default.svc"), None);
+    assert_eq!(literal_backend_name("edge.p.gateway"), None);
+}
+
+/// Only the names this Gateway routes to are marked as a ClusterIP's:
+/// the cluster's every Service would grow each snapshot.
+#[test]
+fn only_routed_cluster_ip_names_are_marked() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(Some("default"), None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let mut services = loopback_services();
+    services.cluster_ip_backends.extend([
+        "127.0.0.1.other-ns.svc".to_string(),
+        "unused.x.svc".to_string(),
+    ]);
+    let result = reconcile_to_config(
+        &gw,
+        &snapshot_of(vec![route], vec![], vec![]),
+        &HashMap::new(),
+        &services,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .config
+            .cluster_ip_backends
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["127.0.0.1.other-ns.svc"]
+    );
 }

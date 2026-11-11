@@ -150,7 +150,13 @@ impl Resolver<'_, '_> {
     ) -> Result<usize> {
         let key = (name.to_string(), port);
         let overrides = self.endpoint_overrides;
-        let rules = self.dial_rules;
+        // A backend named by an IP address goes unchecked: the controller
+        // never sends one (reconciler::literal_backend_name, tested by
+        // a_literal_backend_name_is_invalid), only tests and hand-made
+        // snapshots do. An override's targets are checked, IP literal or not.
+        let rules = self
+            .dial_rules
+            .filter(|_| name.parse::<std::net::IpAddr>().is_err());
         let mut refused = 0;
         let mut admit = |addr: SocketAddr, direct: bool| match rules
             .and_then(|r| r.refuses(addr.ip(), direct))
@@ -180,8 +186,9 @@ impl Resolver<'_, '_> {
             }
         } else {
             // A ClusterIP Service has no entry: kube-proxy maps its service
-            // port. Only a headless one answers with addresses dialed as is.
-            let direct = self.headless(name);
+            // port. Any name the controller did not mark as a ClusterIP's
+            // answers with addresses dialed as is.
+            let direct = rules.is_none_or(|r| r.direct(name));
             let connect_port = self
                 .headless_target_ports
                 .get(&key)
@@ -207,14 +214,6 @@ impl Resolver<'_, '_> {
             .backend_addresses_refused_total
             .add(refused as u64);
         Ok(refused)
-    }
-
-    /// Whether `name` is a headless Service: its every port has an entry,
-    /// so a port the route names that the Service lacks still counts.
-    fn headless(&self, name: &str) -> bool {
-        self.headless_target_ports
-            .keys()
-            .any(|(host, _)| host == name)
     }
 
     /// A Gateway backend's endpoints: only those the controller resolved,
@@ -2000,27 +1999,28 @@ mod tests {
         config
             .headless_target_ports
             .insert(("head.p.svc".into(), 80), 8080);
-        config.dial_rules = rules;
+        config.dial_rules = rules.map(|mut rules| {
+            rules.cluster_ip.insert("vip.p.svc".into());
+            rules
+        });
         config
     }
 
     fn transit() -> Option<super::super::DialRules> {
         Some(super::super::DialRules {
             refused: vec![crate::proxy::proxy_protocol::Cidr::covering("10.250.0.0/16").unwrap()],
-            unresolved: false,
+            ..Default::default()
         })
     }
 
-    /// Builds `config` with `head.p.svc` answering `head`, `vip.p.svc` its
-    /// ClusterIP 172.30.0.10, and an IP literal itself.
-    fn with_answers(config: &PortailConfig, head: &[&str]) -> crate::routing::RouteTable {
-        let head: Vec<std::net::IpAddr> = head.iter().map(|a| a.parse().unwrap()).collect();
+    /// Builds `config` with each name answering its addresses, an IP literal
+    /// itself, and any other name NXDOMAIN.
+    fn answering(config: &PortailConfig, names: &[(&str, &[&str])]) -> crate::routing::RouteTable {
         config
             .build_route_table(super::BuildPolicy::Lenient, &mut |name, port| {
-                let ips = match name {
-                    "head.p.svc" => head.clone(),
-                    "vip.p.svc" => vec!["172.30.0.10".parse().unwrap()],
-                    literal => vec![literal.parse()?],
+                let ips: Vec<std::net::IpAddr> = match names.iter().find(|(n, _)| *n == name) {
+                    Some((_, answers)) => answers.iter().map(|a| a.parse().unwrap()).collect(),
+                    None => vec![name.parse()?],
                 };
                 Ok(ips
                     .into_iter()
@@ -2028,6 +2028,15 @@ mod tests {
                     .collect())
             })
             .unwrap()
+    }
+
+    /// [`answering`], `head.p.svc` answering `head` and `vip.p.svc` its
+    /// ClusterIP 172.30.0.10.
+    fn with_answers(config: &PortailConfig, head: &[&str]) -> crate::routing::RouteTable {
+        answering(
+            config,
+            &[("head.p.svc", head), ("vip.p.svc", &["172.30.0.10"])],
+        )
     }
 
     fn tcp_addrs(table: &crate::routing::RouteTable, port: u16) -> Vec<String> {
@@ -2142,13 +2151,64 @@ mod tests {
     /// outside it, while a ClusterIP still serves.
     #[test]
     fn an_unresolved_attached_network_refuses_direct_addresses() {
-        let config = tenant_routes(Some(super::super::DialRules {
-            refused: vec![],
+        let mut config = tenant_routes(Some(super::super::DialRules {
             unresolved: true,
+            ..Default::default()
         }));
         let table = with_answers(&config, &["10.128.0.5"]);
         assert_eq!(tcp_addrs(&table, 5432), ["rejected"]);
         assert_eq!(tcp_addrs(&table, 5433), ["172.30.0.10:80"]);
+
+        // An older controller marks nothing: every name is dialed directly.
+        config.dial_rules.as_mut().unwrap().cluster_ip.clear();
+        let table = with_answers(&config, &["10.128.0.5"]);
+        assert_eq!(tcp_addrs(&table, 5433), ["rejected"]);
+    }
+
+    /// An ExternalName Service without ports gets no override: its name
+    /// answers what its target does, dialed as is. A name the controller
+    /// marked as a ClusterIP's that turns special since (a Service turned
+    /// ExternalName, re-resolved by the DNS refresh) is refused too.
+    #[test]
+    fn an_unmarked_or_flipped_name_answering_the_pods_own_address_is_refused() {
+        let config = tenant_routes(Some(super::super::DialRules::default()));
+        let table = answering(
+            &config,
+            &[
+                ("head.p.svc", &["10.128.0.5"]),
+                ("vip.p.svc", &["169.254.169.254"]),
+            ],
+        );
+        assert_eq!(tcp_addrs(&table, 5433), ["rejected"]);
+
+        let mut portless: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "t", "protocol": "TCP", "port": 5432}]},
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "t"}],
+                "rules": [{"backendRefs": [{"name": "ext.p.svc", "port": 80}]}]}],
+        }))
+        .unwrap();
+        portless.dial_rules = Some(super::super::DialRules::default());
+        let table = answering(&portless, &[("ext.p.svc", &["169.254.169.254"])]);
+        assert_eq!(tcp_addrs(&table, 5432), ["rejected"]);
+        let table = answering(&portless, &[("ext.p.svc", &["203.0.113.9"])]);
+        assert_eq!(tcp_addrs(&table, 5432), ["203.0.113.9:80"]);
+    }
+
+    /// A backend named by an IP address is a test's or a hand-made
+    /// snapshot's: it goes unchecked.
+    #[test]
+    fn a_literal_backend_name_is_served_from_a_snapshot() {
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "t", "protocol": "TCP", "port": 5432}]},
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "t"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 9}]}]}],
+        }))
+        .unwrap();
+        config.dial_rules = Some(super::super::DialRules {
+            unresolved: true,
+            ..transit().unwrap()
+        });
+        assert_eq!(tcp_addrs(&answering(&config, &[]), 5432), ["127.0.0.1:9"]);
     }
 
     /// From the controller, an answer the pod would dial itself is refused;
