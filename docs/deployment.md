@@ -139,6 +139,7 @@ spec:
     namespace: default
     ips: ["172.16.87.21/24"]
     gateway: ["172.16.87.1"]
+    listeners: true          # false: dial out only, see Networks to dial out on
   controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
   externalNameBackends: Refused  # Refused | Allowed
   proxyProtocol:             # see PROXY protocol
@@ -158,7 +159,7 @@ Defaults:
 
 - `provisioning: Managed`, `replicas: 1`.
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
-- `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
+- `service.type`: `None` when the Gateway has a Network address or a network in `networks` it listens on, else `LoadBalancer`.
 - `controllerTransport: Direct`.
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
 - `proxyProtocol`: no trusted source; no connection is read for a header.
@@ -166,6 +167,7 @@ Defaults:
 Rules:
 
 - `networks[].ips` requires `replicas: 1`: one static IP cannot sit on two pods.
+- A Network address naming a network `networks` attaches with `listeners: false` is invalid: a Network address binds listeners.
 - A missing or invalid GatewayParameters makes the Gateway `Accepted=False`, reason `InvalidParameters`; on a class, the class and its Gateways.
 - Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
 
@@ -182,13 +184,23 @@ Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Ne
 
 Two replicas spread across nodes when there are several.
 
+### Networks to dial out on
+
+`networks[].listeners: false` attaches a network the data plane only dials out on, Managed or not (Unmanaged pods attach it themselves):
+
+- No listener binds on it, whatever the Gateway's addresses: an IPAddress inside it binds nowhere.
+- Its data planes still report their IP there: Gateway backends are reached on it, and Gateways trusting this one trust that IP.
+- Where such a Gateway would bind every interface (no local address, or only a LoadBalancer VIP), it binds each local IP outside these networks instead.
+- That list is read at each apply: an address the pod gains later binds at the next apply. Every other Gateway keeps every interface, which follows addresses as they come.
+- Only platform namespaces attach such a network to Gateways; the edge is the case it is for ([Edge mode](#edge-mode)).
+
 ### PROXY protocol
 
 `proxyProtocol.trustedSources`: up to 16 sources whose connections open with a PROXY protocol v2 header, Managed and Unmanaged alike.
 Each is exactly one of:
 
 - `cidr`: a network address, as written.
-- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a `portail.epheo.eu/Network` both Gateways name, inside that Network's CIDRs on both sides, a listener bound there or not. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
+- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a network both Gateways name, inside that network's CIDRs on both sides, a listener bound there or not. This Gateway names it as a `portail.epheo.eu/Network` address; the named one, as a Network address or a network it dials out on. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
 - At most 64 trusted addresses per Network, one per instance, the first instances by id; the rest are counted in `portail_gateway_addresses_truncated_total`.
 - An address a live instance of another Gateway reports is never trusted.
 - This Gateway is reconciled when where the named one is reachable moves.
@@ -215,7 +227,7 @@ backendRefs:
 
 - HTTPRoute, TLSRoute and TCPRoute; a UDPRoute or a request mirror naming a Gateway is `ResolvedRefs=False`, reason `InvalidKind`.
 - Another namespace: a ReferenceGrant in the target's, `to: [{group: gateway.networking.k8s.io, kind: Gateway}]`.
-- Both Gateways need a `portail.epheo.eu/Network` address of the same name.
+- The target names the network as a `portail.epheo.eu/Network` address; the referencing Gateway, as a Network address or a network it dials out on ([Networks to dial out on](#networks-to-dial-out-on)), of the same name.
 - Its endpoints: each live instance of the target, at its IP on that Network, inside the Network's CIDRs, where it bound that listener. An interface on another network never counts, whatever its address.
 - At most 64 endpoints per Network and port, one per instance and listener, the first instances by id: a report listing more never crowds out the others. What a cap leaves out is counted in `portail_gateway_addresses_truncated_total`.
 - A pass that fails, such as on invalid parameters, keeps the configuration last served, but drops the endpoints of a Gateway deleted since, and the trust in an address a named Gateway holds no more: deleted, or its instance left or lapsed.
@@ -233,20 +245,26 @@ backendRefs:
 One public address in front of many Gateways: an edge Gateway takes every connection and hands each to the Gateway serving its hostname, over a transit network only platform pods join.
 
 ```yaml
-# The edge, in a platform namespace, on transit.
+# The edge, in a platform namespace: transit only to dial out on.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata: {name: edge, namespace: portail-edge}
+spec:
+  networks:
+  - {name: transit, listeners: false}
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: {name: edge, namespace: portail-edge}
 spec:
   gatewayClassName: portail
-  addresses:
-  - {type: portail.epheo.eu/Network, value: transit}
-  - {type: IPAddress, value: 203.0.113.10}      # its public address, local to the pod (localnet)
+  infrastructure:
+    parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: edge}
   listeners:
   - {name: tls, protocol: TLS, port: 443, tls: {mode: Passthrough}}
   - {name: http, protocol: HTTP, port: 80}
 ---
-# Each project Gateway, on transit, trusting the edge.
+# Each project Gateway, listening on transit, trusting the edge.
 apiVersion: portail.epheo.eu/v1alpha1
 kind: GatewayParameters
 metadata: {name: publish, namespace: p-publish}
@@ -300,20 +318,18 @@ spec:
 
 - HTTPS passes through the edge by SNI and terminates at the project Gateway, with its own certificate; HTTP goes by Host.
 - The project Gateway sees each client, from the header the edge sends, in `X-Forwarded-For`, access logs and rate limits.
+- The edge's public side: a LoadBalancer Service, the default when its only network is one it dials out on; or an `IPAddress` local to the pod (such as on a localnet network) with `service.type: None`.
+- Its listeners bind every local IP but its transit one: nothing listens on transit.
+- Project Gateways keep transit as a Network address: they listen there.
+- Behind a LoadBalancer, keeping the client's address up to the edge needs `externalTrafficPolicy: Local` on its Service, which GatewayParameters cannot set yet.
 
 Requirements:
 
 - The transit network has subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC.
 - Only platform namespaces attach it: the edge's and the project Gateways'. Nothing a tenant runs.
-- Tenants cannot create or replace NetworkAttachmentDefinitions. A shared Network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
-- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods, and denies transit ingress to the edge.
+- Tenants cannot create or replace NetworkAttachmentDefinitions. A shared network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
+- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods. Denying transit ingress to the edge too is defense in depth: nothing listens there.
 - `trustedSources` names the edge Gateway, never the transit CIDR.
-- The edge's public address is local to the pod, such as on a localnet network. A LoadBalancer-fronted edge is not supported yet.
-
-Why the edge needs both:
-
-- A Gateway binds every listener on every local address it names, its Network ones included. The edge's listeners also listen on its transit address, so every project data plane reaches them there, past any filtering on the public side. The MultiNetworkPolicy denying transit ingress to the edge closes that.
-- An edge whose public address is not local to the pod, such as a LoadBalancer VIP, binds only transit, so its public path is dead. Both stand until a network can carry egress only, bound by no listener.
 
 The lapse window:
 

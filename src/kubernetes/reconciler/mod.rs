@@ -332,6 +332,7 @@ pub(crate) fn reconcile_to_config(
     services: &ServiceState,
     verdicts: &RouteVerdicts,
     external_name_backends: ExternalNameBackends,
+    dials_out: bool,
 ) -> Result<ReconcileResult> {
     let mut gateway_config = convert_gateway(gateway, cert_data)?;
     let gateway_name = gateway.metadata.name.as_deref().unwrap_or("default");
@@ -365,9 +366,10 @@ pub(crate) fn reconcile_to_config(
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
-        on_network: gateway.spec.addresses.iter().flatten().any(|a| {
-            a.r#type.as_deref() == Some(crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE)
-        }),
+        on_network: dials_out
+            || gateway.spec.addresses.iter().flatten().any(|a| {
+                a.r#type.as_deref() == Some(crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE)
+            }),
         gateways: &snapshot.gateways,
         watched: Default::default(),
         listeners: &listeners,
@@ -654,8 +656,9 @@ pub(crate) fn listener_is_served(l: &GatewayListeners) -> bool {
 struct RouteCollectCtx<'a> {
     gateway_name: &'a str,
     gateway_ns: &'a str,
-    /// The Gateway has a portail.epheo.eu/Network address: the only way it
-    /// shares a network with a Gateway backend.
+    /// The Gateway has a portail.epheo.eu/Network address, or a network its
+    /// parameters attach to dial out on: the only ways it shares a network
+    /// with a Gateway backend.
     on_network: bool,
     gateways: &'a HashMap<(String, String), Vec<u16>>,
     /// The Gateways this one's refs name past their ReferenceGrant.
@@ -751,7 +754,8 @@ fn check_gateway(
             "BackendNotFound",
             format!(
                 "Backend Gateway {}/{} is reached on a network both share: this Gateway \
-                 needs a portail.epheo.eu/Network address",
+                 needs a portail.epheo.eu/Network address, or a network its parameters \
+                 attach with listeners: false",
                 gw_ns, gw
             ),
         ));
