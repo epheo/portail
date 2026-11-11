@@ -94,6 +94,8 @@ pub enum RoutingResult<'a> {
     LocalReply(LocalReply),
     TcpForward {
         backend_addr: SocketAddr,
+        /// The connection opens with a PROXY v2 header: a Gateway backend.
+        proxied: bool,
     },
     UdpForward {
         backend_addr: SocketAddr,
@@ -441,7 +443,9 @@ pub fn analyze_udp_request(
         "UDP",
         &UNROUTABLE,
         |port| routes.find_udp_backends(port),
-        |addr| RoutingResult::UdpForward { backend_addr: addr },
+        |b| RoutingResult::UdpForward {
+            backend_addr: b.socket_addr,
+        },
         health,
     )
 }
@@ -459,7 +463,10 @@ pub(crate) fn analyze_tcp_request(
         "TCP",
         &UNROUTABLE,
         |port| routes.find_tcp_backends(port),
-        |addr| RoutingResult::TcpForward { backend_addr: addr },
+        |b| RoutingResult::TcpForward {
+            backend_addr: b.socket_addr,
+            proxied: b.action == BackendAction::ForwardProxied,
+        },
         health,
     )
 }
@@ -488,7 +495,7 @@ fn analyze_l4_request<'a>(
     proto: &str,
     throttles: &L4Throttles,
     lookup: impl FnOnce(u16) -> Option<&'a Vec<Backend>>,
-    make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
+    make_decision: impl FnOnce(&Backend) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
     let unroutable = |throttle: &LogThrottle, condition: &str| {
@@ -530,7 +537,7 @@ fn analyze_l4_request<'a>(
         proto, server_port, selected_backend.socket_addr
     );
 
-    Ok(make_decision(selected_backend.socket_addr))
+    Ok(make_decision(selected_backend))
 }
 
 #[cfg(test)]

@@ -222,6 +222,7 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
         .collect();
     ctx.hub.retain(|key| live.contains(key));
     ctx.reports.retain(|key| live.contains(key));
+    ctx.dependents.retain(|key| live.contains(key));
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
     ctx.networks.retain_named(&gateways);
@@ -939,6 +940,80 @@ mod tests {
         assert!(
             Arc::ptr_eq(&served, &p.served(&gw).unwrap()),
             "the served snapshot stays"
+        );
+    }
+
+    /// An edge on udn-a naming Gateway `target` serves the addresses
+    /// `target`'s instances bound on udn-a, and a report of `target`
+    /// reconciles the edge.
+    #[tokio::test]
+    async fn an_edge_serves_where_its_gateway_backend_bound() {
+        use crate::sync::{EndpointReport, GatewayRef, InstanceReport, ListenerReport, Transport};
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let mut target = testkit::gateway("target", 1);
+        target.spec.listeners[0].port = 80;
+        apply(&mut p.cluster.gateways, target.clone());
+        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "target", "listeners": [
+                {"name": "http", "protocol": "HTTP", "port": 80, "target_port": 8000}
+            ]}
+        }))
+        .unwrap();
+        let target_ref = GatewayRef {
+            namespace: "default".into(),
+            name: "target".into(),
+            uid: "target-uid".into(),
+            generation: 1,
+        };
+        p.ctx
+            .hub
+            .publish(Snapshot::from_config(target_ref, config, vec![]));
+        p.ctx.reports.record(
+            &testkit::key(&target),
+            super::super::reports::InstanceId("pod-a".into()),
+            InstanceReport {
+                listeners: vec![ListenerReport {
+                    name: "http".into(),
+                    endpoints: vec![EndpointReport {
+                        address: Some("10.250.0.7".into()),
+                        port: 8000,
+                        transport: Transport::Tcp,
+                        bound: true,
+                        error: None,
+                    }],
+                }],
+                ..Default::default()
+            },
+        );
+
+        let edge = with_addresses(
+            testkit::gateway("edge", 1),
+            1,
+            &[(NETWORK_ADDRESS_TYPE, "udn-a")],
+        );
+        apply(&mut p.cluster.gateways, edge.clone());
+        let mut route = testkit::http_route("r", &["edge"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
+            "backendRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                             "name": "target", "port": 80}],
+        }))
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, route);
+        p.pass(&edge).await.unwrap();
+
+        let served = p.served(&edge).unwrap();
+        assert_eq!(
+            served.backends.external_names,
+            [crate::sync::ExternalName {
+                host: "target.default.gateway".into(),
+                port: 80,
+                targets: vec![("10.250.0.7".into(), 8000)],
+            }]
+        );
+        assert_eq!(
+            p.ctx.dependents.of(&testkit::key(&target)),
+            [testkit::key(&edge)]
         );
     }
 

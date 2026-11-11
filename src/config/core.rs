@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use super::compile::{CompiledFilter, CompiledRule};
 use super::types::*;
-use crate::routing::{Backend, RouteTable};
+use crate::routing::{Backend, BackendAction, RouteTable};
 
 impl PortailConfig {
     /// Load configuration from file with auto-format detection
@@ -178,6 +178,28 @@ impl Resolver<'_, '_> {
         Ok(())
     }
 
+    /// A Gateway backend's endpoints: only those the controller resolved,
+    /// never DNS, where its name could find a Service. None yet: its share
+    /// is rejected until an instance of it reports.
+    fn gateway_endpoints(&self, br: &BackendRef) -> Vec<Backend> {
+        let endpoints: Vec<Backend> = self
+            .endpoint_overrides
+            .get(&(br.name.clone(), br.port))
+            .into_iter()
+            .flatten()
+            .filter_map(|(ip, port)| Some(SocketAddr::new(ip.parse::<IpAddr>().ok()?, *port)))
+            .map(|addr| Backend {
+                action: BackendAction::ForwardProxied,
+                ..backend_at(addr, br.weight, &br.name)
+            })
+            .collect();
+        if endpoints.is_empty() {
+            vec![Backend::rejecting(br.weight)]
+        } else {
+            endpoints
+        }
+    }
+
     /// One backend per endpoint of each ref, at the ref's weight. An invalid
     /// ref is never looked up: it keeps its weight as a rejecting stand-in.
     fn backends(&mut self, refs: &[BackendRef], what: &str) -> Result<Vec<Backend>> {
@@ -185,6 +207,8 @@ impl Resolver<'_, '_> {
         for br in refs {
             if br.invalid {
                 backends.push(Backend::rejecting(br.weight));
+            } else if br.is_gateway() {
+                backends.extend(self.gateway_endpoints(br));
             } else {
                 self.endpoints(&br.name, br.port, what, |addr, name| {
                     backends.push(backend_at(addr, br.weight, name))
@@ -601,6 +625,13 @@ impl PortailConfig {
         {
             if backend_ref.invalid {
                 backends.push(Backend::rejecting(backend_ref.weight));
+                continue;
+            }
+            if backend_ref.is_gateway() {
+                for mut backend in resolver.gateway_endpoints(backend_ref) {
+                    backend.filters = backend_filters.clone();
+                    backends.push(backend);
+                }
                 continue;
             }
 
@@ -1030,7 +1061,7 @@ mod tests {
         );
         let resolve = |sni, port, listener| {
             rt.resolve_tls_passthrough(Some(sni), port, listener, &selector, &health)
-                .map(|addr| addr.port())
+                .map(|b| b.socket_addr.port())
         };
         assert_eq!(
             resolve("a.example.com", 8443, Some("*.example.com")),
@@ -1068,7 +1099,7 @@ mod tests {
         for (port, listener) in [(8443, Some("*.example.com")), (9443, None)] {
             let backend = rt
                 .resolve_tls_passthrough(Some("s.example.com"), port, listener, &selector, &health)
-                .map(|addr| addr.port());
+                .map(|b| b.socket_addr.port());
             assert_eq!(backend, Ok(7001), "{port}");
         }
         assert_eq!(rt.tls_scopes.values().flatten().count(), 1);
@@ -1837,6 +1868,55 @@ mod tests {
         let calls = std::cell::RefCell::new(vec![]);
         let built = config.build_route_table(policy, &mut |n, p| fake_dns(&calls, n, p));
         (built, calls.into_inner())
+    }
+
+    /// A Gateway backend dials only the endpoints the controller resolved,
+    /// behind a PROXY header, and never asks DNS, where its name could find
+    /// a Service. None resolved: a rejecting share, on every route kind.
+    #[test]
+    fn a_gateway_backend_takes_its_endpoints_from_the_controller_only() {
+        let gateway_ref = r#"{"name":"edge.p.gateway","port":80,
+            "group":"gateway.networking.k8s.io","kind":"Gateway"}"#;
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"a","protocol":"HTTP","port":8080}},
+                {{"name":"t","protocol":"TCP","port":5432}}]}},
+            "httpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"a"}}],
+                "rules":[{{"backendRefs":[{gateway_ref}]}}]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],
+                "rules":[{{"backendRefs":[{gateway_ref}]}}]}}]
+            }}"#
+        );
+        let mut config: PortailConfig = serde_json::from_str(&json).unwrap();
+        let (table, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let table = table.unwrap();
+        assert!(calls.is_empty(), "{calls:?}");
+        let tcp = table.find_tcp_backends(5432).unwrap();
+        assert_eq!(tcp.len(), 1);
+        assert_eq!(tcp[0].action, crate::routing::BackendAction::Reject);
+
+        config.endpoint_overrides.insert(
+            ("edge.p.gateway".into(), 80),
+            vec![("10.250.0.7".into(), 8000), ("10.250.0.8".into(), 8000)],
+        );
+        let (table, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let table = table.unwrap();
+        assert!(calls.is_empty(), "{calls:?}");
+        let tcp = table.find_tcp_backends(5432).unwrap();
+        let addrs: Vec<String> = tcp.iter().map(|b| b.socket_addr.to_string()).collect();
+        assert_eq!(addrs, ["10.250.0.7:8000", "10.250.0.8:8000"]);
+        assert!(tcp
+            .iter()
+            .all(|b| b.action == crate::routing::BackendAction::ForwardProxied && !b.use_tls));
+        let rule = table
+            .find_http_route("x", "GET", "/", b"", "", 8080)
+            .expect("the HTTP rule");
+        assert_eq!(rule.backends.len(), 2);
+        assert!(rule
+            .backends
+            .iter()
+            .all(|b| b.action == crate::routing::BackendAction::ForwardProxied));
     }
 
     /// Two listeners, two hostnames, two rules on one backend, plus TCP and

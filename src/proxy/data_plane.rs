@@ -1997,6 +1997,53 @@ mod tests {
         assert_eq!(got, hello);
     }
 
+    /// A Gateway backend behind passthrough hears who connected before
+    /// the hello: the client a trusted source named, so an edge behind a
+    /// load balancer passes the real client on.
+    #[tokio::test]
+    async fn a_gateway_backend_hears_the_client_before_the_hello() {
+        use crate::proxy::proxy_protocol::{header, Cidr, TrustedSources};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (backend, mut forward) = test_backend().await;
+        forward.action = crate::routing::BackendAction::ForwardProxied;
+        let port = free_port();
+        let listeners = [passthrough_listener(port, Some("*.example.com"))];
+        let mut table = RouteTable::new();
+        table.add_tls_route_for_listener(
+            port,
+            Some("*.example.com"),
+            "*.example.com",
+            vec![forward],
+        );
+        table.proxy_sources = TrustedSources::new(vec![Cidr::parse("127.0.0.0/8").unwrap()]);
+        let _dp = serve(&listeners, table).await;
+
+        let (config, name) = client_config(Some("b.example.com"));
+        let mut hello = Vec::new();
+        rustls::ClientConnection::new(config, name)
+            .unwrap()
+            .write_tls(&mut hello)
+            .unwrap();
+        let client_addr = "203.0.113.7:50000".parse().unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let local = "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap();
+        client
+            .write_all(&[header(client_addr, local), hello.clone()].concat())
+            .await
+            .unwrap();
+        let (mut forwarded, _) = tokio::time::timeout(Duration::from_secs(5), backend.accept())
+            .await
+            .expect("never forwarded")
+            .unwrap();
+        let want = [header(client_addr, ([127, 0, 0, 1], port).into()), hello].concat();
+        let mut got = vec![0u8; want.len()];
+        forwarded.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, want);
+    }
+
     /// Regression: with unchanged certs, a reconcile that brings a NEW bind
     /// address must still bind it. The old flow `continue`d out of the whole
     /// listener iteration on a fingerprint match, silently skipping the

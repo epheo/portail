@@ -40,7 +40,7 @@ use crate::proxy::request_processor::{
     RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
-use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
+use crate::routing::{BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Read what the client has sent into `buf`'s spare room, as one read with
 /// room up to `CLIENT_BUF` would: a read that fills the room grows the
@@ -261,8 +261,11 @@ pub(crate) struct ConnectionState {
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
-    /// Client address for X-Forwarded-For.
-    peer_ip: std::net::IpAddr,
+    /// The client: X-Forwarded-For, access logs, rate limits, and the
+    /// source of a PROXY v2 header to a Gateway backend.
+    peer: SocketAddr,
+    /// Where the client reached this data plane: the header's destination.
+    local: SocketAddr,
     /// Forwarding lines appended to every request this connection sends,
     /// formatted at the first: many connections forward none.
     forwarded: Option<ForwardedLines>,
@@ -323,7 +326,8 @@ impl ConnectionState {
         selector: Arc<BackendSelector>,
         health: Arc<HealthRegistry>,
         is_tls: bool,
-        peer_ip: std::net::IpAddr,
+        peer: SocketAddr,
+        local: SocketAddr,
         cfg: &WorkerConfig,
         listener_stats: Arc<ListenerStats>,
         drain: CancellationToken,
@@ -335,7 +339,8 @@ impl ConnectionState {
             selector,
             health,
             is_tls,
-            peer_ip,
+            peer,
+            local,
             forwarded: None,
             client_header_timeout: cfg.client_header_timeout,
             connect_timeout: cfg.connect_timeout,
@@ -352,6 +357,11 @@ impl ConnectionState {
             client_done: false,
             reset: false,
         }
+    }
+
+    /// The PROXY v2 header a Gateway backend's connection opens with.
+    fn proxy_header(&self, proxied: bool) -> Option<Vec<u8>> {
+        proxied.then(|| proxy_protocol::header(self.peer, self.local))
     }
 
     /// The connection closes after a reply: a client still sending, a
@@ -521,10 +531,14 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                             else {
                                 return;
                             };
+                            let Ok(local) = tcp_stream.local_addr() else {
+                                return;
+                            };
                             if let Some(tls) = tls {
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
+                                    local,
                                     tls,
                                     server_port,
                                     routes,
@@ -545,7 +559,8 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                 selector,
                                 health,
                                 false,
-                                peer.ip(),
+                                peer,
+                                local,
                                 &cfg,
                                 listener_stats,
                                 drain,
@@ -608,6 +623,7 @@ async fn client_of(
 async fn serve_tls_connection(
     tcp_stream: TcpStream,
     peer: SocketAddr,
+    local: SocketAddr,
     plan: Arc<TlsPlan>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -640,6 +656,7 @@ async fn serve_tls_connection(
         TlsKind::Passthrough => {
             let _ = handle_tls_passthrough(
                 tcp_stream,
+                (peer, local),
                 sni.as_deref(),
                 listener.hostname.as_deref(),
                 server_port,
@@ -700,6 +717,7 @@ async fn serve_tls_connection(
                 cfg,
                 listener_stats,
                 peer,
+                local,
                 drain,
             },
         )
@@ -716,7 +734,8 @@ async fn serve_tls_connection(
         selector,
         health,
         true,
-        peer.ip(),
+        peer,
+        local,
         &cfg,
         listener_stats,
         drain,
@@ -755,10 +774,15 @@ pub(crate) async fn handle_connection(
 
     let mut buf = Vec::new();
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
-    if let Ok(Handoff::Tcp { backend_addr }) = served {
+    if let Ok(Handoff::Tcp {
+        backend_addr,
+        proxied,
+    }) = served
+    {
         return handle_tcp_connection(
             client,
             backend_addr,
+            state.proxy_header(proxied),
             &buf,
             Arc::clone(&state.health),
             state.connect_timeout,
@@ -777,7 +801,10 @@ enum Handoff {
     /// The HTTP exchanges are over: the connection closes.
     Close,
     /// Not HTTP: the connection goes to a TCP route, `buf` first.
-    Tcp { backend_addr: SocketAddr },
+    Tcp {
+        backend_addr: SocketAddr,
+        proxied: bool,
+    },
 }
 
 /// Serve requests until the connection must close, or turns out to be
@@ -817,7 +844,7 @@ async fn serve_http(
         let access = crate::access_log::capture(
             buf,
             request_started,
-            state.peer_ip,
+            state.peer.ip(),
             state.server_port,
             state.is_tls,
         );
@@ -835,8 +862,14 @@ async fn serve_http(
         // over and replayed as the next iteration's input instead of being
         // sent to the backend or lost.
         let pending: Option<Vec<u8>> = match result {
-            RoutingResult::TcpForward { backend_addr } => {
-                return Ok(Handoff::Tcp { backend_addr });
+            RoutingResult::TcpForward {
+                backend_addr,
+                proxied,
+            } => {
+                return Ok(Handoff::Tcp {
+                    backend_addr,
+                    proxied,
+                });
             }
             RoutingResult::HttpForward {
                 backend,
@@ -846,7 +879,7 @@ async fn serve_http(
                 let limited = rule
                     .limiter
                     .as_ref()
-                    .is_some_and(|l| !l.check(state.peer_ip));
+                    .is_some_and(|l| !l.check(state.peer.ip()));
                 if limited {
                     crate::metrics::METRICS.rate_limited_total.inc();
                     state.listener_stats.rate_limited.inc();
@@ -1037,12 +1070,17 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
         state.server_port,
         &state.health,
     )?;
-    let RoutingResult::TcpForward { backend_addr } = routed else {
+    let RoutingResult::TcpForward {
+        backend_addr,
+        proxied,
+    } = routed
+    else {
         return Ok(()); // the router logged why
     };
     handle_tcp_connection(
         client,
         backend_addr,
+        state.proxy_header(proxied),
         &[],
         Arc::clone(&state.health),
         state.connect_timeout,
@@ -1588,7 +1626,9 @@ async fn proxy_http_request(
     // backend conn returns to the pool only when `backend_conn_poolable`
     // allows (notably never after HEAD or a refused upgrade) and never when
     // the backend announced Connection: close.
-    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade) && !framing.backend_close
+    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade)
+        && !framing.backend_close
+        && backend_ref.action != BackendAction::ForwardProxied
     {
         state.pool.release(
             backend_addr,
@@ -1598,7 +1638,7 @@ async fn proxy_http_request(
         );
     } else if framing_clean {
         debug!(
-            "Backend {} conn not pooled (HEAD, refused upgrade, or backend Connection: close)",
+            "Backend {} conn not pooled (HEAD, refused upgrade, backend Connection: close, or a Gateway backend)",
             backend_addr
         );
     }
@@ -1723,14 +1763,27 @@ async fn connect_to_backend(
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     let (use_tls, server_name) = (backend_ref.use_tls, backend_ref.server_name.as_str());
-    let acquired = match state.pool.take_idle(backend_addr, use_tls, server_name) {
-        Some(conn) => Some(Ok((conn, true))),
-        None => {
-            let keepalive = &state.backend_keepalive;
-            let connect = state
-                .pool
-                .acquire(backend_addr, use_tls, server_name, keepalive);
-            within(timer, deadline, connect).await
+    let acquired = if backend_ref.action == BackendAction::ForwardProxied {
+        // Never pooled: its header names this request's client, and a
+        // pooled conn would carry it to another client's request.
+        let header = proxy_protocol::header(state.peer, state.local);
+        let connect = connect_proxied(
+            backend_addr,
+            state.connect_timeout,
+            &state.backend_keepalive,
+            header,
+        );
+        within(timer, deadline, connect).await
+    } else {
+        match state.pool.take_idle(backend_addr, use_tls, server_name) {
+            Some(conn) => Some(Ok((conn, true))),
+            None => {
+                let keepalive = &state.backend_keepalive;
+                let connect = state
+                    .pool
+                    .acquire(backend_addr, use_tls, server_name, keepalive);
+                within(timer, deadline, connect).await
+            }
         }
     };
     match acquired {
@@ -1759,6 +1812,21 @@ async fn connect_to_backend(
     }
 }
 
+/// A fresh plain connection to a Gateway backend, its PROXY v2 header sent.
+async fn connect_proxied(
+    addr: SocketAddr,
+    connect_timeout: Duration,
+    keepalive: &socket2::TcpKeepalive,
+    header: Vec<u8>,
+) -> Result<(Connection, bool), ConnectError> {
+    let mut tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
+    METRICS.upstream_connects_total.inc();
+    tcp.write_all(&header).await.map_err(|e| {
+        ConnectError::Backend(anyhow::anyhow!("PROXY header to {} failed: {}", addr, e))
+    })?;
+    Ok((Connection::Plain { inner: tcp }, false))
+}
+
 /// Assemble the outgoing request header block into `state.scratch_buf`:
 /// hop-by-hop stripping + X-Forwarded-* (always, via parser-recorded spans),
 /// then filter header modifications (when configured).
@@ -1778,7 +1846,7 @@ fn build_outgoing_headers(
         Some(_) => Some(meta.path(raw).as_bytes()),
         None => meta.normalized_path.as_deref().map(str::as_bytes),
     };
-    let (peer_ip, is_tls) = (state.peer_ip, state.is_tls);
+    let (peer_ip, is_tls) = (state.peer.ip(), state.is_tls);
     let forwarded = state
         .forwarded
         .get_or_insert_with(|| ForwardedLines::new(peer_ip, is_tls));
@@ -2669,6 +2737,7 @@ async fn within<F: std::future::Future>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_tls_passthrough(
     client: TcpStream,
+    (peer, local): (SocketAddr, SocketAddr),
     sni: Option<&str>,
     listener: Option<&str>,
     server_port: u16,
@@ -2678,9 +2747,12 @@ async fn handle_tls_passthrough(
     cfg: &WorkerConfig,
 ) -> Result<()> {
     let route_table = routes.load();
-    let backend_addr = route_table
+    let backend = route_table
         .resolve_tls_passthrough(sni, server_port, listener, &selector, &health)
         .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
+    let backend_addr = backend.socket_addr;
+    let header = (backend.action == BackendAction::ForwardProxied)
+        .then(|| proxy_protocol::header(peer, local));
 
     // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
@@ -2688,6 +2760,7 @@ async fn handle_tls_passthrough(
     handle_tcp_connection(
         Connection::Plain { inner: client },
         backend_addr,
+        header,
         &[],
         health,
         cfg.connect_timeout,
@@ -2698,9 +2771,12 @@ async fn handle_tls_passthrough(
     .await
 }
 
+/// `header`, a PROXY v2 header for a Gateway backend, goes before any
+/// byte of the client's.
 async fn handle_tcp_connection(
     client: Connection,
     backend_addr: SocketAddr,
+    header: Option<Vec<u8>>,
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
@@ -2728,8 +2804,13 @@ async fn handle_tcp_connection(
         }
     };
     health.record_success(backend_addr);
-    if !initial_data.is_empty() {
-        backend.write_all(initial_data).await?;
+    match header {
+        Some(mut first) => {
+            first.extend_from_slice(initial_data);
+            backend.write_all(&first).await?;
+        }
+        None if !initial_data.is_empty() => backend.write_all(initial_data).await?,
+        None => {}
     }
     relay_l4(client, backend, idle).await;
     Ok(())
@@ -3118,7 +3199,8 @@ mod connection_tests {
             Arc::new(BackendSelector::new()),
             Arc::new(HealthRegistry::new()),
             is_tls,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:40000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
             &cfg,
             Arc::new(ListenerStats::default()),
             CancellationToken::new(),
@@ -3485,11 +3567,13 @@ mod connection_tests {
                 .await
                 .unwrap();
             client.write_all(&client_hello(sni)).await.unwrap();
-            let (server, _) = listener.accept().await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let local = server.local_addr().unwrap();
             let routes = Arc::clone(&routes);
             let (health, selector) = (Arc::default(), Arc::default());
             let err = handle_tls_passthrough(
                 server,
+                (peer, local),
                 Some(sni),
                 None,
                 8443,
@@ -3533,9 +3617,11 @@ mod connection_tests {
             client.write_all(&first_bytes).await.unwrap();
             let (server, peer) = listener.accept().await.unwrap();
             let stats = Arc::new(ListenerStats::default());
+            let local = server.local_addr().unwrap();
             serve_tls_connection(
                 server,
                 peer,
+                local,
                 Arc::clone(&plan),
                 8443,
                 Arc::clone(&routes),
@@ -3794,6 +3880,97 @@ mod connection_tests {
         let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
         assert!(!out.contains(" 200 "), "{out}");
         assert_never_connected(&backend).await;
+    }
+
+    fn gateway_backend(socket_addr: SocketAddr) -> Backend {
+        Backend {
+            socket_addr,
+            weight: 1,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: crate::routing::BackendAction::ForwardProxied,
+        }
+    }
+
+    /// What `conn_state`'s client sends a Gateway backend first.
+    fn conn_state_header() -> Vec<u8> {
+        proxy_protocol::header(
+            "127.0.0.1:40000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
+        )
+    }
+
+    async fn received(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("backend connection never closed")
+            .unwrap()
+    }
+
+    /// Raw TCP to a Gateway backend: the header goes before any byte of
+    /// the client's, on a TCP-only port and after a sniff alike.
+    #[tokio::test]
+    async fn a_gateway_backend_hears_who_connected_before_the_bytes() {
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task) = serve(rt);
+        client.write_all(b"hello").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), b"hello".to_vec()].concat()
+        );
+
+        let (http, _) = backend(REFUSED).await;
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = routes(http);
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task) = serve(rt);
+        client.write_all(OPAQUE).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), OPAQUE.to_vec()].concat()
+        );
+    }
+
+    /// A Gateway backend's connection carries one client's header, so it
+    /// serves one request: never from the pool, never back to it.
+    #[tokio::test]
+    async fn each_request_to_a_gateway_backend_opens_its_own_connection() {
+        let (addr, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "a.test",
+            HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![gateway_backend(addr)],
+            ),
+        );
+        let (mut client, _task) = serve(rt);
+        for _ in 0..2 {
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let reply = read_one_reply(&mut client).await;
+            assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        }
+        client.shutdown().await.unwrap();
+        for _ in 0..2 {
+            let seen = received(&mut rx).await;
+            let header = conn_state_header();
+            assert_eq!(seen[..header.len()], header[..]);
+            let request = String::from_utf8_lossy(&seen[header.len()..]).into_owned();
+            assert!(request.starts_with("GET / HTTP/1.1\r\n"), "{request}");
+            assert_eq!(request.matches("GET ").count(), 1, "{request}");
+        }
     }
 
     /// A backend that vanishes without FIN or RST would otherwise pin an

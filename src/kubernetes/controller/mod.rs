@@ -10,6 +10,7 @@
 
 mod auth;
 mod ca;
+mod gateway_backends;
 mod gatewayclass;
 mod hub;
 mod issuer;
@@ -109,6 +110,8 @@ struct ControllerCtx {
     certs: Arc<validate::LastGoodCerts>,
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
+    /// Who names whom as a backend of kind Gateway.
+    dependents: Arc<gateway_backends::Dependents>,
     leader: leader::Leader,
     /// Whether every reflector delivered its initial list, and which did
     /// not. The sync server answers 503 until then, /readyz names them.
@@ -293,6 +296,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         certs: Arc::default(),
         hub: Arc::default(),
         reports: Arc::default(),
+        dependents: Arc::default(),
         leader: leader.clone(),
         synced: listings.clone(),
         owned,
@@ -377,12 +381,17 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let sync = tokio::spawn(server::serve(sync_server, tls, listener));
 
     let named_ports = ctx.named_ports.clone();
+    let dependents = ctx.dependents.clone();
     let report_triggers = ctx
         .reports
         .triggers()
         .expect("a fresh report store has its triggers")
-        .map(move |trigger| report_trigger(&named_ports, trigger));
-    let lapse_triggers = lapse_wakes.map(|gateway| gateway_ref(&gateway));
+        .flat_map(move |trigger| {
+            futures::stream::iter(report_trigger(&named_ports, &dependents, trigger))
+        });
+    let dependents = ctx.dependents.clone();
+    let lapse_triggers = lapse_wakes
+        .flat_map(move |gateway| futures::stream::iter(with_dependents(&dependents, &gateway)));
 
     // --- Gateway controller ---
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
@@ -515,11 +524,26 @@ async fn load_ca(
 
 /// The reconcile a report change asks for. Moved DNS means backend pods
 /// came or went, and a named targetPort's number lives on the pods.
-fn report_trigger(named_ports: &NamedPortCache, trigger: reports::Trigger) -> ObjectRef<Gateway> {
+fn report_trigger(
+    named_ports: &NamedPortCache,
+    dependents: &gateway_backends::Dependents,
+    trigger: reports::Trigger,
+) -> Vec<ObjectRef<Gateway>> {
     if trigger.dns_moved {
         named_ports.dns_changed();
     }
-    gateway_ref(&trigger.gateway)
+    with_dependents(dependents, &trigger.gateway)
+}
+
+/// `gateway`, and the Gateways naming it as a backend: its endpoints are
+/// theirs.
+fn with_dependents(
+    dependents: &gateway_backends::Dependents,
+    gateway: &GatewayKey,
+) -> Vec<ObjectRef<Gateway>> {
+    std::iter::once(gateway_ref(gateway))
+        .chain(dependents.of(gateway).iter().map(gateway_ref))
+        .collect()
 }
 
 fn gateway_ref(gateway: &GatewayKey) -> ObjectRef<Gateway> {
@@ -577,17 +601,46 @@ mod tests {
     use super::testkit::{self, apply, Pipeline};
     use super::*;
 
+    /// A report reconciles its Gateway and those naming it as a backend:
+    /// their endpoints moved with it.
     #[test]
-    fn a_report_trigger_reconciles_its_gateway() {
+    fn a_report_trigger_reconciles_its_gateway_and_its_dependents() {
         let named_ports = NamedPortCache::new(Duration::from_secs(RESYNC_SECS));
-        let trigger = reports::Trigger {
+        let dependents = gateway_backends::Dependents::default();
+        let trigger = || reports::Trigger {
             gateway: GatewayKey::new("apps", "web"),
             dns_moved: false,
         };
+        let web = ObjectRef::<Gateway>::new("web").within("apps");
         assert_eq!(
-            report_trigger(&named_ports, trigger),
-            ObjectRef::<Gateway>::new("web").within("apps")
+            report_trigger(&named_ports, &dependents, trigger()),
+            std::slice::from_ref(&web)
         );
+
+        let edge = GatewayKey::new("edge", "public");
+        dependents.record(edge.clone(), [GatewayKey::new("apps", "web")].into());
+        dependents.record(
+            GatewayKey::new("edge", "other"),
+            [GatewayKey::new("x", "y")].into(),
+        );
+        assert_eq!(
+            report_trigger(&named_ports, &dependents, trigger()),
+            [web.clone(), gateway_ref(&edge)]
+        );
+        assert_eq!(
+            with_dependents(&dependents, &GatewayKey::new("apps", "web")),
+            [web.clone(), gateway_ref(&edge)],
+            "a lapse too"
+        );
+
+        dependents.record(edge.clone(), Default::default());
+        assert_eq!(
+            report_trigger(&named_ports, &dependents, trigger()),
+            std::slice::from_ref(&web)
+        );
+        dependents.record(edge.clone(), [GatewayKey::new("apps", "web")].into());
+        dependents.retain(|key| key != &edge);
+        assert_eq!(report_trigger(&named_ports, &dependents, trigger()), [web]);
     }
 
     /// A data plane's DNS refresh saw backend pods move: the next pass reads
@@ -629,12 +682,12 @@ mod tests {
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 1);
 
-        report_trigger(&p.ctx.named_ports, trigger(false));
+        report_trigger(&p.ctx.named_ports, &p.ctx.dependents, trigger(false));
         p.api.clear();
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 0, "same pods, read from the cache");
 
-        report_trigger(&p.ctx.named_ports, trigger(true));
+        report_trigger(&p.ctx.named_ports, &p.ctx.dependents, trigger(true));
         p.api.clear();
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 1, "the pods moved");

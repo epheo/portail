@@ -135,8 +135,8 @@ pub struct RouteTable {
     /// within its listener's. Port 0 holds the routes without parentRefs,
     /// which every passthrough listener searches after its own.
     pub tls_scopes: FnvHashMap<u16, Vec<TlsScope>>,
-    /// Read at accept, with the routes of the same config: a connection
-    /// never meets a trust list older or newer than its routes.
+    /// Read once per connection, at accept: a change applies to
+    /// connections accepted after it.
     pub proxy_sources: crate::proxy::proxy_protocol::TrustedSources,
 }
 
@@ -440,7 +440,7 @@ impl RouteTable {
         listener: Option<&str>,
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
-    ) -> Result<std::net::SocketAddr, PassthroughMiss> {
+    ) -> Result<&Backend, PassthroughMiss> {
         // Each route rotates on its own counter; a key collision only
         // shares one.
         let (backends, key) = if let Some(route) = self.tls_route(sni, server_port, listener) {
@@ -457,7 +457,7 @@ impl RouteTable {
         match selector.select_l4_backend(key, backends, health) {
             None => Err(PassthroughMiss::NoWeight),
             Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
-            Some(b) => Ok(b.socket_addr),
+            Some(b) => Ok(b),
         }
     }
 }
@@ -741,6 +741,9 @@ impl std::fmt::Display for PassthroughMiss {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendAction {
     Forward,
+    /// Forward behind a PROXY v2 header naming the client: a Gateway
+    /// backend, which trusts this data plane to say who connected.
+    ForwardProxied,
     /// Stands for an invalid backendRef (RefNotPermitted, BackendNotFound,
     /// InvalidKind) and keeps its weight: its share fails (HTTP 500, L4
     /// connection closed or datagram dropped) instead of moving to the

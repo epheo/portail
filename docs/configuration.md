@@ -245,6 +245,7 @@ gateway:
 - Other sources are never read for a header: one they send is bytes of their request.
 - TLVs are skipped. UDP listeners take no header.
 - CIDRs name networks: `10.250.0.7/16` is refused, write `10.250.0.0/16` or `10.250.0.7/32`.
+- The sending half goes only to backendRefs of kind Gateway, in Kubernetes mode ([deployment](deployment.md#gateway-backends)).
 
 ## Route Attachment
 

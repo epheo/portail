@@ -17,7 +17,7 @@ use crate::config::*;
 
 use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
-    parse_backend_dns_name, route_namespace, CertData,
+    parse_backend_dns_name, parse_gateway_backend_name, route_namespace, CertData,
 };
 use super::crds::{ExternalNameBackends, RateLimitPolicy};
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
@@ -44,6 +44,9 @@ pub(crate) struct ClusterSnapshot {
     pub services: Vec<Arc<Service>>,
     /// Pre-filtered to policies targeting this Gateway, like routes.
     pub rate_limit_policies: Vec<Arc<RateLimitPolicy>>,
+    /// This controller's Gateways by (namespace, name), with their
+    /// listener ports: what a backendRef of kind Gateway may name.
+    pub gateways: HashMap<(String, String), Vec<u16>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +362,10 @@ pub(crate) fn reconcile_to_config(
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
+        on_network: gateway.spec.addresses.iter().flatten().any(|a| {
+            a.r#type.as_deref() == Some(crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE)
+        }),
+        gateways: &snapshot.gateways,
         listeners: &listeners,
         namespace_labels: &snapshot.namespace_labels,
         reference_grants: &snapshot.reference_grants,
@@ -642,6 +649,10 @@ pub(crate) fn listener_is_served(l: &GatewayListeners) -> bool {
 struct RouteCollectCtx<'a> {
     gateway_name: &'a str,
     gateway_ns: &'a str,
+    /// The Gateway has a portail.epheo.eu/Network address: the only way it
+    /// shares a network with a Gateway backend.
+    on_network: bool,
+    gateways: &'a HashMap<(String, String), Vec<u16>>,
     listeners: &'a [GatewayListeners],
     namespace_labels: &'a HashMap<String, BTreeMap<String, String>>,
     reference_grants: &'a [ReferenceGrant],
@@ -804,6 +815,65 @@ fn collect_routes<R: GatewayRoute>(
         let mut refs_reason = "ResolvedRefs";
         let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
+        // Another Gateway of this controller, reached on a network both
+        // share.
+        let check_gateway = |backend_name: &str, port: u16| -> Option<(&'static str, String)> {
+            let (gw, gw_ns) = parse_gateway_backend_name(backend_name)?;
+            if !is_reference_allowed(
+                cx.reference_grants,
+                GATEWAY_GROUP,
+                kind,
+                route_ns,
+                GATEWAY_GROUP,
+                "Gateway",
+                &gw_ns,
+                &gw,
+            ) {
+                return Some((
+                    "RefNotPermitted",
+                    format!(
+                        "Cross-namespace reference to Gateway {}/{} not allowed by ReferenceGrant",
+                        gw_ns, gw
+                    ),
+                ));
+            }
+            if gw == cx.gateway_name && gw_ns == cx.gateway_ns {
+                return Some((
+                    "BackendNotFound",
+                    "A Gateway cannot be its own backend".into(),
+                ));
+            }
+            let Some(ports) = cx.gateways.get(&(gw_ns.clone(), gw.clone())) else {
+                return Some((
+                    "BackendNotFound",
+                    format!(
+                        "Backend Gateway {}/{} not found, or not served by this controller",
+                        gw_ns, gw
+                    ),
+                ));
+            };
+            if !ports.contains(&port) {
+                return Some((
+                    "BackendNotFound",
+                    format!(
+                        "Backend Gateway {}/{} has no listener on port {}",
+                        gw_ns, gw, port
+                    ),
+                ));
+            }
+            if !cx.on_network {
+                return Some((
+                    "BackendNotFound",
+                    format!(
+                        "Backend Gateway {}/{} is reached on a network both share: this Gateway \
+                         needs a portail.epheo.eu/Network address",
+                        gw_ns, gw
+                    ),
+                ));
+            }
+            None
+        };
+
         // Group/kind (core Service only), cross-namespace ReferenceGrant,
         // service existence and ExternalName refusal: one checker for
         // forward and mirror refs.
@@ -866,11 +936,34 @@ fn collect_routes<R: GatewayRoute>(
                 None
             };
 
+        // A Gateway only by a forward ref of a TCP-borne route: a UDPRoute
+        // or a mirror has no PROXY header to carry the client.
+        let check_any = |backend_name: &str,
+                         port: u16,
+                         group: &str,
+                         ref_kind: &str,
+                         forward: bool|
+         -> Option<(&'static str, String)> {
+            if group != GATEWAY_GROUP || ref_kind != "Gateway" {
+                return check_ref(backend_name, group, ref_kind);
+            }
+            if !forward || kind == "UDPRoute" {
+                let by = if forward { kind } else { "request mirror" };
+                return Some(("InvalidKind", format!("A {} cannot name a Gateway", by)));
+            }
+            check_gateway(backend_name, port)
+        };
+
         // An invalid ref keeps its weight so its share fails rather
         // than moving to the valid refs (HTTPRouteRule.backendRefs).
         for backend in R::backend_refs_mut(&mut config) {
-            if let Some((reason, message)) = check_ref(&backend.name, &backend.group, &backend.kind)
-            {
+            if let Some((reason, message)) = check_any(
+                &backend.name,
+                backend.port,
+                &backend.group,
+                &backend.kind,
+                true,
+            ) {
                 refs_resolved = false;
                 refs_reason = reason;
                 refs_messages.push(message);
@@ -878,7 +971,7 @@ fn collect_routes<R: GatewayRoute>(
             }
         }
         for (backend_name, port, group, ref_kind) in R::mirror_backend_refs(&config) {
-            if let Some((reason, message)) = check_ref(backend_name, group, ref_kind) {
+            if let Some((reason, message)) = check_any(backend_name, port, group, ref_kind, false) {
                 refs_resolved = false;
                 refs_reason = reason;
                 refs_messages.push(message);

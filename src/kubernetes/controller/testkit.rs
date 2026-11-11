@@ -241,6 +241,7 @@ impl TestCluster {
             )),
             hub: Arc::default(),
             reports: Arc::default(),
+            dependents: Arc::default(),
             leader: super::leader::Leader::always(),
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(
