@@ -353,7 +353,7 @@ Controller restarts and failovers:
 - For one hold after it takes the lead, a Gateway backend or trusted Gateway that spec still allows but that the controller has not heard from is marked pending, not left out.
 - A data plane keeps what it last served for a pending item, for one hold from when it first saw it pending, then drops it. Further pending snapshots, reconnects and leaders never extend that.
 - It keeps it only for the same Gateway: a Gateway deleted and recreated under the same name in the meantime has another uid, and gets nothing of the old one's.
-- It keeps it only while fresh: applied or confirmed unchanged by a controller within two holds. A data plane cut off longer keeps nothing.
+- It keeps it only while fresh: sent, or confirmed unchanged, by a controller within two holds. Applying it again on its own (a rebind) does not count. A data plane cut off longer keeps nothing.
 - What spec dropped is never pending: a removed `trustedSources` entry, a deleted backendRef or target Gateway, a revoked ReferenceGrant apply at once.
 - After the window nothing is pending: an unheard Gateway backend answers 503, an unheard Gateway is trusted nowhere.
 - A data plane that restarts keeps nothing: it fails closed until its Gateway's named Gateways report.
