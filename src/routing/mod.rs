@@ -135,6 +135,9 @@ pub struct RouteTable {
     /// within its listener's. Port 0 holds the routes without parentRefs,
     /// which every passthrough listener searches after its own.
     pub tls_scopes: FnvHashMap<u16, Vec<TlsScope>>,
+    /// Read at accept, with the routes of the same config: a connection
+    /// never meets a trust list older or newer than its routes.
+    pub proxy_sources: crate::proxy::proxy_protocol::TrustedSources,
 }
 
 /// One port's HTTP route scopes, one per listener hostname.

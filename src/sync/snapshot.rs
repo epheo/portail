@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 12] = [
+        let changes: [(&str, fn(&mut Snapshot)); 13] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -453,6 +453,11 @@ mod tests {
                 })
             }),
             ("performance", |s| s.config.performance.http2 = true),
+            ("proxyProtocol", |s| {
+                s.config.gateway.proxy_protocol = Some(crate::config::ProxyProtocolConfig {
+                    trusted_sources: vec!["10.0.0.0/8".into()],
+                })
+            }),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();

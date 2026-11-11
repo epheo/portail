@@ -113,7 +113,7 @@ pub struct PolicyCondition {
 
 /// How a Gateway's data plane is run. Built-in defaults, then the
 /// GatewayClass's parameters, then the Gateway's: a set field wins field by
-/// field; `networks` and `resources` replace whole.
+/// field; `networks`, `resources` and `proxyProtocol` replace whole.
 #[derive(CustomResource, Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portail.epheo.eu",
@@ -179,6 +179,33 @@ pub struct GatewayParametersSpec {
     /// Refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_name_backends: Option<ExternalNameBackends>,
+
+    /// PROXY protocol v2 on the data plane's TCP listeners, Managed or not.
+    /// Replaces whole: a Gateway's own list is never added to its class's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocolParameters>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProtocolParameters {
+    /// Sources whose connections must open with a v2 header: the client
+    /// it names stands for the connection (X-Forwarded-For, access logs,
+    /// rate limits). One that sends no header, or a malformed one, is
+    /// closed; LOCAL keeps the connection's own address. Other sources are
+    /// never read for one. Empty: none. Matched per accepted connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 16))]
+    pub trusted_sources: Option<Vec<TrustedSource>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedSource {
+    /// An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
+    /// 10.250.0.7/16.
+    #[schemars(length(min = 1))]
+    pub cidr: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

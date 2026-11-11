@@ -471,6 +471,25 @@ impl PortailConfig {
             }
         }
 
+        // Lenient leaves a bad entry out: trusting less closes connections,
+        // trusting more would let a client name itself.
+        let mut cidrs = Vec::new();
+        for source in self
+            .gateway
+            .proxy_protocol
+            .iter()
+            .flat_map(|p| &p.trusted_sources)
+        {
+            match crate::proxy::proxy_protocol::Cidr::parse(source) {
+                Ok(cidr) => cidrs.push(cidr),
+                Err(e) if policy == BuildPolicy::Strict => {
+                    return Err(anyhow!("proxyProtocol trustedSources: {}", e));
+                }
+                Err(e) => tracing::warn!("Skipping a PROXY protocol trusted source: {}", e),
+            }
+        }
+        route_table.proxy_sources = crate::proxy::proxy_protocol::TrustedSources::new(cidrs);
+
         tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
             route_table.http_scopes().count(), route_table.tcp_routes.len(), route_table.udp_routes.len());
 

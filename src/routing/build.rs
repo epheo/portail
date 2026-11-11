@@ -77,6 +77,7 @@ impl RouteTable {
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
+            proxy_sources: Default::default(),
         }
     }
 
