@@ -397,7 +397,14 @@ fn evaluate(
     let config = &served.config;
     let binds: Vec<Option<Vec<String>>> = at_version
         .iter()
-        .map(|r| bind_addresses_resolved(&config.gateway.addresses, &r.networks, &r.interface_ips))
+        .map(|r| {
+            bind_addresses_resolved(
+                &config.gateway.addresses,
+                &r.networks,
+                &r.interface_ips,
+                &served.networks,
+            )
+        })
         .collect();
     let unusable = binds.iter().all(Option::is_none);
     // Only listeners the translation could program count: one without a
@@ -498,7 +505,9 @@ fn instance_addresses(
             })
             .collect();
         if held.is_empty() {
-            all.extend(report.interface_ips.first().cloned());
+            // Where it bound, never a network it only dials out on.
+            let bound = bind.iter().flatten().next();
+            all.extend(bound.or(report.interface_ips.first()).cloned());
         } else {
             all.extend(held);
         }
@@ -650,6 +659,22 @@ mod tests {
             interface_ips: ips.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// A Gateway without a spec address of its own reports where it bound:
+    /// never its address on a network it only dials out on, listed first.
+    #[test]
+    fn a_dialing_gateway_reports_where_it_bound() {
+        let gw = crate::kubernetes::controller::testkit::gateway("edge", 1);
+        let r = report("v1", &["10.250.0.9", "10.244.1.5"], true);
+        let held = instance_addresses(&gw, &[&r], &[Some(vec!["10.244.1.5".into()])]);
+        assert_eq!(held, [(IP_ADDRESS, "10.244.1.5".to_string())]);
+        let every = instance_addresses(&gw, &[&r], &[Some(vec![])]);
+        assert_eq!(
+            every,
+            [(IP_ADDRESS, "10.250.0.9".to_string())],
+            "first interface"
+        );
     }
 
     fn live(reports: Vec<InstanceReport>) -> Vec<(InstanceId, InstanceReport)> {

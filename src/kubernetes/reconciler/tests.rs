@@ -18,6 +18,7 @@ fn reconcile_to_config(
         services,
         &RouteVerdicts::default(),
         ExternalNameBackends::Refused,
+        false,
     )
 }
 
@@ -1762,6 +1763,7 @@ fn external_name_backend_is_followed_when_allowed() {
         &services,
         &RouteVerdicts::default(),
         ExternalNameBackends::Allowed,
+        false,
     )
     .unwrap();
 
@@ -2117,6 +2119,7 @@ fn a_route_verdict_stands_until_its_generation_moves() {
             &empty_services(),
             &verdicts,
             ExternalNameBackends::Refused,
+            false,
         )
         .unwrap()
     };
@@ -3887,6 +3890,46 @@ fn edge_gateway(on_network: bool) -> Gateway {
         .unwrap();
     }
     gw
+}
+
+/// A network the edge's parameters attach to dial out on shares it as a
+/// Network address would: its Gateway backends resolve.
+#[test]
+fn a_gateway_dialing_out_on_a_network_reaches_gateway_backends() {
+    let route: HTTPRoute = edge_route(
+        "HTTPRoute",
+        "edge",
+        serde_json::json!({"backendRefs": [gateway_ref("publish", Some("p-publish"), 80)]}),
+    );
+    let snapshot = with_gateways(test_snapshot(
+        vec![route],
+        vec![],
+        vec![],
+        vec![],
+        &default_ns_labels(),
+        vec![gateway_grant()],
+    ));
+    let resolve = |dials_out| {
+        super::reconcile_to_config(
+            &edge_gateway(false),
+            &snapshot,
+            &HashMap::new(),
+            &empty_services(),
+            &RouteVerdicts::default(),
+            ExternalNameBackends::Refused,
+            dials_out,
+        )
+        .unwrap()
+    };
+    let off = resolve(false);
+    assert!(!off.route_status[0].refs_resolved);
+    let on = resolve(true);
+    assert!(
+        on.route_status[0].refs_resolved,
+        "{}",
+        on.route_status[0].refs_message
+    );
+    assert!(!on.config.http_routes[0].rules[0].backend_refs[0].invalid);
 }
 
 fn gateway_ref(name: &str, namespace: Option<&str>, port: u16) -> serde_json::Value {

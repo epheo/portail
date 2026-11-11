@@ -31,8 +31,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub backends: Backends,
     /// CIDRs of the NetworkAttachmentDefinitions the Gateway's Network
-    /// addresses name, read by the controller; the data plane matches its
-    /// own interfaces against them. A name without an entry is unresolved.
+    /// addresses name, and of those its parameters attach with listeners
+    /// false, read by the controller; the data plane matches its own
+    /// interfaces against them. A name without an entry is unresolved.
     #[serde(default)]
     pub networks: Vec<NetworkCidrs>,
 }
@@ -106,6 +107,18 @@ pub struct AppProtocol {
 pub struct NetworkCidrs {
     pub name: String,
     pub cidrs: Vec<String>,
+    /// false: a network the Gateway only dials out on. Its data planes
+    /// report their IP there, and never bind a listener on it.
+    #[serde(default = "listens", skip_serializing_if = "is_listening")]
+    pub listeners: bool,
+}
+
+fn listens() -> bool {
+    true
+}
+
+fn is_listening(listeners: &bool) -> bool {
+    *listeners
 }
 
 /// Hex digits of SHA-256 a version keeps: 64 bits make a collision between
@@ -403,6 +416,7 @@ mod tests {
                 .map(|n| NetworkCidrs {
                     name: n.to_string(),
                     cidrs: vec!["10.10.1.0/24".into()],
+                    listeners: true,
                 })
                 .collect()
         };
@@ -450,6 +464,7 @@ mod tests {
                 s.networks.push(NetworkCidrs {
                     name: "udn-a".into(),
                     cidrs: vec!["10.10.1.0/24".into()],
+                    listeners: true,
                 })
             }),
             ("performance", |s| s.config.performance.http2 = true),

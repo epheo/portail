@@ -636,6 +636,7 @@ mod tests {
                 let networks = vec![crate::sync::NetworkCidrs {
                     name: "here".into(),
                     cidrs: vec![format!("{ip}/32")],
+                    listeners: true,
                 }];
                 Snapshot::from_config(gateway, config, networks)
             };

@@ -84,7 +84,12 @@ impl Applier {
         let local = local_interface_ips();
         let networks = resolve_networks(&config.gateway.addresses, &snapshot.networks, &local);
         let served = Served {
-            bind: bind_addresses_resolved(&config.gateway.addresses, &networks, &local),
+            bind: bind_addresses_resolved(
+                &config.gateway.addresses,
+                &networks,
+                &local,
+                &snapshot.networks,
+            ),
             config: Arc::new(config),
         };
         let state = self.bring_up(&served).await;

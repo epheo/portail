@@ -243,6 +243,7 @@ pub(crate) async fn translate(
     gateway: &Gateway,
     external_name_backends: ExternalNameBackends,
     trusted: &[GatewayKey],
+    egress: &[(String, String)],
 ) -> Result<Plan, Box<Rejected>> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -290,6 +291,7 @@ pub(crate) async fn translate(
         &services,
         &ctx.route_verdicts,
         external_name_backends,
+        !egress.is_empty(),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -328,24 +330,28 @@ pub(crate) async fn translate(
     // A network dropped from spec.addresses forgets its CIDRs: a failed read
     // once it is named again must not bind on an answer for a spec the
     // Gateway no longer had.
-    ctx.networks.retain_named(&ctx.cache.gateways.state());
-    let networks = match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, &ctx.networks).await {
-        Ok(networks) => networks,
-        Err(e) => {
-            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
-            return Err(Box::new(Rejected {
-                statuses: Statuses {
-                    accepted,
-                    listeners,
-                    routes: Vec::new(),
-                    policies: Vec::new(),
-                    observed_routes: Vec::new(),
-                    observed_policies: Vec::new(),
-                },
-                error: e,
-            }));
-        }
-    };
+    ctx.networks.retain_named(
+        &ctx.cache.gateways.state(),
+        &ctx.cache.gateway_parameters.state(),
+    );
+    let networks =
+        match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, egress, &ctx.networks).await {
+            Ok(networks) => networks,
+            Err(e) => {
+                error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
+                return Err(Box::new(Rejected {
+                    statuses: Statuses {
+                        accepted,
+                        listeners,
+                        routes: Vec::new(),
+                        policies: Vec::new(),
+                        observed_routes: Vec::new(),
+                        observed_policies: Vec::new(),
+                    },
+                    error: e,
+                }));
+            }
+        };
     gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
     let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
     let targets = std::mem::take(&mut result.gateway_targets)

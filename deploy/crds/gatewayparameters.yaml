@@ -91,6 +91,15 @@ spec:
                         type: string
                       nullable: true
                       type: array
+                    listeners:
+                      description: |-
+                        Whether listeners bind on this network. false: the data planes
+                        only dial out on it, reaching Gateway backends and being trusted
+                        there by the Gateways that name this one; a Gateway with such a
+                        network binds its unaddressed listeners on every local IP outside
+                        it. Default true.
+                      nullable: true
+                      type: boolean
                     mac:
                       minLength: 1
                       nullable: true
@@ -207,8 +216,8 @@ spec:
                   type:
                     description: |-
                       The Service fronting the data plane; None creates none. Unset:
-                      None when the Gateway has a Network address or `networks`, else
-                      LoadBalancer.
+                      None when the Gateway has a Network address or `networks` it
+                      listens on, else LoadBalancer.
                     enum:
                     - LoadBalancer
                     - ClusterIP

@@ -45,6 +45,24 @@ pub(crate) struct Params {
     pub trusted_gateways: Vec<GatewayKey>,
 }
 
+impl Params {
+    /// The (namespace, NAD) of each network attached with listeners
+    /// false, a selection without a namespace in the Gateway's.
+    pub(crate) fn egress_networks(&self, gateway_ns: &str) -> Vec<(String, String)> {
+        self.networks
+            .iter()
+            .filter(|n| n.egress_only())
+            .map(|n| {
+                let ns = n
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| gateway_ns.to_string());
+                (ns, n.name.clone())
+            })
+            .collect()
+    }
+}
+
 /// `Err` says why the parameters cannot be used: the Gateway is
 /// Accepted=False InvalidParameters, and its last snapshot and objects
 /// stay as they are.
@@ -74,10 +92,27 @@ pub(crate) fn resolve(ctx: &ControllerCtx, gateway: &Gateway) -> Result<Params, 
         }
         network_address = true;
     }
-    concrete(
+    let params = concrete(
         merge(builtin(&ctx.dataplane_image), &layers),
         network_address,
-    )
+    )?;
+    let addressed = |name: &str| {
+        gateway.spec.addresses.iter().flatten().any(|a| {
+            a.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE) && a.value.as_deref() == Some(name)
+        })
+    };
+    if let Some(n) = params
+        .networks
+        .iter()
+        .find(|n| n.egress_only() && addressed(&n.name))
+    {
+        return Err(format!(
+            "spec.addresses: Network {:?} binds listeners, but this Gateway's parameters attach \
+             it with listeners: false",
+            n.name
+        ));
+    }
+    Ok(params)
 }
 
 /// Whether `class`'s parametersRef can be used, as its Accepted condition
@@ -309,16 +344,16 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
     let worker_threads = cpu_limit(Some(&resources))
         .and_then(|cpu| cpu_cores(&cpu.0))
         .map(|cores| (cores.ceil() as u32).clamp(1, MAX_WORKER_THREADS));
-    // Operator parity: a Gateway on Multus networks binds on them, and
-    // nothing fronts it.
-    let service_type =
-        spec.service
-            .and_then(|s| s.type_)
-            .unwrap_or(if network_address || !networks.is_empty() {
-                ServiceType::None
-            } else {
-                ServiceType::LoadBalancer
-            });
+    // Operator parity: a Gateway listening on Multus networks binds on
+    // them, and nothing fronts it. One that only dials out on them still
+    // listens behind its Service.
+    let service_type = spec.service.and_then(|s| s.type_).unwrap_or(
+        if network_address || networks.iter().any(|n| !n.egress_only()) {
+            ServiceType::None
+        } else {
+            ServiceType::LoadBalancer
+        },
+    );
     Ok(Params {
         provisioning,
         replicas,
@@ -846,6 +881,70 @@ networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
             let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
             assert_eq!(params.worker_threads, Some(threads), "{cpu}");
         }
+    }
+
+    /// A network listens unless its parameters say false; one it only
+    /// dials out on keeps the Service a Gateway without networks gets, and
+    /// counts among its egress networks, in its namespace unless named.
+    #[tokio::test]
+    async fn a_network_listens_unless_attached_for_dialing_out() {
+        let mut cluster = cluster(None);
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: br-ex}, {name: transit, listeners: false}, \
+                 {name: shared, namespace: infra, listeners: false}]",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        let listens: Vec<bool> = params.networks.iter().map(|n| !n.egress_only()).collect();
+        assert_eq!(listens, [true, false, false]);
+        assert_eq!(
+            params.egress_networks("edge"),
+            [
+                ("edge".to_string(), "transit".to_string()),
+                ("infra".to_string(), "shared".to_string())
+            ]
+        );
+        assert_eq!(params.service_type, ServiceType::None, "br-ex listens");
+
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: transit, listeners: false}]",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.service_type, ServiceType::LoadBalancer);
+    }
+
+    /// A Network address binds listeners: naming one the parameters attach
+    /// for dialing out only is a contradiction, refused.
+    #[tokio::test]
+    async fn a_network_address_cannot_name_a_dialed_network() {
+        let mut cluster = cluster(None);
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: transit, listeners: false}]",
+            ),
+        );
+        let mut gw = gateway_with_ref("mine");
+        gw.spec.addresses = Some(vec![serde_json::from_value(
+            serde_json::json!({"type": NETWORK_ADDRESS_TYPE, "value": "transit"}),
+        )
+        .unwrap()]);
+        let err = resolve_in(&cluster, &gw).unwrap_err();
+        assert!(
+            err.contains("\"transit\"") && err.contains("listeners: false"),
+            "{err}"
+        );
     }
 
     /// Unset, the Service is None when the Gateway binds on networks, else

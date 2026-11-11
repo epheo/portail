@@ -456,6 +456,7 @@ mod tests {
         vec![NetworkCidrs {
             name: "transit".into(),
             cidrs: vec!["10.250.0.0/16".into()],
+            listeners: true,
         }]
     }
 
@@ -547,6 +548,7 @@ mod tests {
         let elsewhere = vec![NetworkCidrs {
             name: "other".into(),
             cidrs: vec!["10.250.0.0/16".into()],
+            listeners: true,
         }];
         assert!(
             trusted(&elsewhere).is_empty(),
@@ -556,6 +558,7 @@ mod tests {
         let narrower = vec![NetworkCidrs {
             name: "transit".into(),
             cidrs: vec!["10.250.1.0/24".into()],
+            listeners: true,
         }];
         assert!(trusted(&narrower).is_empty(), "outside the truster's CIDRs");
 
@@ -786,6 +789,7 @@ mod tests {
         let elsewhere = vec![NetworkCidrs {
             name: "other".into(),
             cidrs: vec!["10.250.0.0/16".into()],
+            listeners: true,
         }];
         assert!(
             resolved(&hub, &reports, 80, &elsewhere).is_empty(),
