@@ -1,9 +1,11 @@
 //! Backends of kind Gateway: another Gateway of this controller, reached
-//! on a network both share, at the addresses its own data planes report.
+//! on a network both share, at the addresses its own data planes bound.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
+
+use futures::channel::mpsc;
 
 use super::hub::Hub;
 use super::reports::ReportStore;
@@ -12,81 +14,227 @@ use crate::kubernetes::converters::parse_gateway_backend_name;
 use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::{GatewayKey, NetworkCidrs, Transport};
 
-/// The Gateways each Gateway names as backends: a report or lapse of one
-/// reconciles those that name it, whose endpoints moved.
+/// Where a Gateway can be reached: per (Network name, listener port), the
+/// address and bound port of each live instance there.
+pub(crate) type Exposure = BTreeMap<(String, u16), BTreeSet<(String, u16)>>;
+
+/// Endpoints one Network and port take at most: a Gateway runs a few
+/// replicas, so more is a forged or runaway report.
+const MAX_ENDPOINTS: usize = 64;
+
+/// Who names whom, and what each named Gateway exposes. A Gateway naming
+/// another is reconciled when that one's exposure changes, never on its
+/// other report churn: a busy target would keep the debounce from ever
+/// letting its edge run.
+pub(crate) struct GatewayBackends {
+    state: Mutex<State>,
+    wakes: mpsc::UnboundedSender<GatewayKey>,
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<GatewayKey>>>,
+}
+
 #[derive(Default)]
-pub(crate) struct Dependents(Mutex<HashMap<GatewayKey, BTreeSet<GatewayKey>>>);
+struct State {
+    /// What each Gateway names, as of its last translation.
+    targets: HashMap<GatewayKey, BTreeSet<GatewayKey>>,
+    /// Each Gateway's exposure when last refreshed; none when empty.
+    exposed: HashMap<GatewayKey, Exposure>,
+}
 
-impl Dependents {
-    fn map(&self) -> MutexGuard<'_, HashMap<GatewayKey, BTreeSet<GatewayKey>>> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// What `referrer` names as of its last translation.
-    pub(crate) fn record(&self, referrer: GatewayKey, targets: BTreeSet<GatewayKey>) {
-        let mut map = self.map();
-        if targets.is_empty() {
-            map.remove(&referrer);
-        } else {
-            map.insert(referrer, targets);
-        }
-    }
-
-    /// The Gateways that name `target`.
-    pub(crate) fn of(&self, target: &GatewayKey) -> Vec<GatewayKey> {
-        self.map()
+impl State {
+    fn dependents(&self, target: &GatewayKey) -> Vec<GatewayKey> {
+        self.targets
             .iter()
             .filter(|(_, targets)| targets.contains(target))
             .map(|(referrer, _)| referrer.clone())
             .collect()
     }
+}
 
-    pub(crate) fn retain(&self, live: impl Fn(&GatewayKey) -> bool) {
-        self.map().retain(|referrer, _| live(referrer));
+impl Default for GatewayBackends {
+    fn default() -> Self {
+        let (wakes, receiver) = mpsc::unbounded();
+        Self {
+            state: Mutex::default(),
+            wakes,
+            receiver: Mutex::new(Some(receiver)),
+        }
     }
 }
 
-/// Fill `config`'s endpoint overrides for its valid Gateway backends and
-/// return every Gateway its refs name, valid or not: one that comes to
-/// exist, or to report, reconciles this one. An endpoint is where a live instance of
-/// the target bound the listener on the ref's port, inside a CIDR of the
-/// referencing Gateway's own networks: the address it can reach, and the
-/// only one it dials. None yet: the share is rejected until one reports.
+impl GatewayBackends {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What `referrer` names as of its last translation.
+    pub(crate) fn record(&self, referrer: GatewayKey, targets: BTreeSet<GatewayKey>) {
+        let mut state = self.state();
+        if targets.is_empty() {
+            state.targets.remove(&referrer);
+        } else {
+            state.targets.insert(referrer, targets);
+        }
+    }
+
+    /// Recompute `target`'s exposure; when it moved, wake the Gateways
+    /// naming it. Run on its reports, its lapses, the end of its
+    /// reconcile, and when it leaves the hub.
+    pub(crate) fn refresh(&self, target: &GatewayKey, hub: &Hub, reports: &ReportStore) {
+        let now = exposure(hub, reports, target);
+        let mut state = self.state();
+        let unchanged = match state.exposed.get(target) {
+            Some(before) => *before == now,
+            None => now.is_empty(),
+        };
+        if unchanged {
+            return;
+        }
+        if now.is_empty() {
+            state.exposed.remove(target);
+        } else {
+            state.exposed.insert(target.clone(), now);
+        }
+        for referrer in state.dependents(target) {
+            let _ = self.wakes.unbounded_send(referrer);
+        }
+    }
+
+    /// Forget every Gateway `live` rejects: what it named, and what it
+    /// exposed, which wakes those naming it.
+    pub(crate) fn retain(&self, live: impl Fn(&GatewayKey) -> bool) {
+        let mut state = self.state();
+        state.targets.retain(|referrer, _| live(referrer));
+        let gone: Vec<GatewayKey> = state.exposed.keys().filter(|k| !live(k)).cloned().collect();
+        for target in gone {
+            state.exposed.remove(&target);
+            for referrer in state.dependents(&target) {
+                let _ = self.wakes.unbounded_send(referrer);
+            }
+        }
+    }
+
+    /// Gateways to reconcile because a Gateway they name moved. Taken
+    /// once, by the controller.
+    pub(crate) fn wakes(&self) -> Option<mpsc::UnboundedReceiver<GatewayKey>> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dependents(&self, target: &GatewayKey) -> Vec<GatewayKey> {
+        self.state().dependents(target)
+    }
+}
+
+/// `target`'s exposure: for each Network its served snapshot names, the IP
+/// each live instance reports on it, inside that Network's CIDRs, at each
+/// port it bound there (on that IP or all interfaces). An interface on
+/// another network never counts, whatever its address.
+pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) -> Exposure {
+    let mut out = Exposure::new();
+    let Some(served) = hub.current(target) else {
+        return out;
+    };
+    let networks: Vec<(&NetworkCidrs, Vec<Cidr>)> = served
+        .networks
+        .iter()
+        .map(|n| {
+            (
+                n,
+                n.cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect(),
+            )
+        })
+        .collect();
+    reports.for_each_live(target, |report| {
+        for (network, cidrs) in &networks {
+            let Some(ip) = report.networks.get(&network.name) else {
+                continue;
+            };
+            let on_network = ip
+                .parse::<IpAddr>()
+                .is_ok_and(|addr| cidrs.iter().any(|c| c.contains(addr)));
+            if !on_network {
+                continue;
+            }
+            for listener in &served.config.gateway.listeners {
+                let ports = report
+                    .listeners
+                    .iter()
+                    .filter(|l| l.name == listener.name)
+                    .flat_map(|l| &l.endpoints)
+                    .filter(|e| e.bound && e.transport == Transport::Tcp)
+                    .filter(|e| e.address.as_ref().is_none_or(|a| a == ip))
+                    .map(|e| e.port);
+                let set = out
+                    .entry((network.name.clone(), listener.port))
+                    .or_default();
+                for port in ports {
+                    if set.len() >= MAX_ENDPOINTS {
+                        break;
+                    }
+                    set.insert((ip.clone(), port));
+                }
+            }
+        }
+    });
+    out.retain(|_, endpoints| !endpoints.is_empty());
+    out
+}
+
+/// Fill `config`'s endpoint overrides for its valid Gateway backends: the
+/// target's exposure on each of the referencing Gateway's own Networks,
+/// by name, inside that Network's CIDRs. None yet: no override, and the
+/// share is rejected until an instance of the target reports.
 pub(crate) fn resolve(
     hub: &Hub,
     reports: &ReportStore,
     config: &mut PortailConfig,
     networks: &[NetworkCidrs],
-) -> BTreeSet<GatewayKey> {
-    let refs: BTreeSet<(String, u16, bool)> = gateway_refs(config)
-        .filter(|br| br.is_gateway())
-        .map(|br| (br.name.clone(), br.port, br.invalid))
+) {
+    let refs: BTreeSet<(String, u16)> = gateway_refs(config)
+        .filter(|br| br.is_gateway() && !br.invalid)
+        .map(|br| (br.name.clone(), br.port))
         .collect();
-    if refs.is_empty() {
-        return BTreeSet::new();
-    }
-    let cidrs: Vec<Cidr> = networks
+    let networks: Vec<(&NetworkCidrs, Vec<Cidr>)> = networks
         .iter()
-        .flat_map(|n| &n.cidrs)
-        .filter_map(|c| Cidr::parse(c).ok())
+        .map(|n| {
+            (
+                n,
+                n.cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect(),
+            )
+        })
         .collect();
-    let mut targets = BTreeSet::new();
-    for (name, port, invalid) in refs {
+    let mut exposures: HashMap<GatewayKey, Exposure> = HashMap::new();
+    for (name, port) in refs {
         let Some((gateway, namespace)) = parse_gateway_backend_name(&name) else {
             continue;
         };
         let key = GatewayKey::new(namespace, gateway);
-        if invalid {
-            targets.insert(key);
-            continue;
-        }
-        let endpoints = endpoints(hub, reports, &key, port, &cidrs);
-        targets.insert(key);
+        let exposed = exposures
+            .entry(key.clone())
+            .or_insert_with(|| exposure(hub, reports, &key));
+        let endpoints: BTreeSet<(String, u16)> = networks
+            .iter()
+            .flat_map(|(network, cidrs)| {
+                exposed
+                    .get(&(network.name.clone(), port))
+                    .into_iter()
+                    .flatten()
+                    .filter(|(ip, _)| {
+                        ip.parse::<IpAddr>()
+                            .is_ok_and(|addr| cidrs.iter().any(|c| c.contains(addr)))
+                    })
+            })
+            .cloned()
+            .collect();
         if !endpoints.is_empty() {
-            config.endpoint_overrides.insert((name, port), endpoints);
+            config
+                .endpoint_overrides
+                .insert((name, port), endpoints.into_iter().collect());
         }
     }
-    targets
 }
 
 fn gateway_refs(config: &PortailConfig) -> impl Iterator<Item = &BackendRef> {
@@ -108,58 +256,6 @@ fn gateway_refs(config: &PortailConfig) -> impl Iterator<Item = &BackendRef> {
     http.chain(tcp).chain(tls)
 }
 
-/// Sorted: equal endpoints keep the snapshot's version.
-fn endpoints(
-    hub: &Hub,
-    reports: &ReportStore,
-    target: &GatewayKey,
-    port: u16,
-    cidrs: &[Cidr],
-) -> Vec<(String, u16)> {
-    let Some(served) = hub.current(target) else {
-        return Vec::new();
-    };
-    let Some(listener) = served
-        .config
-        .gateway
-        .listeners
-        .iter()
-        .find(|l| l.port == port)
-    else {
-        return Vec::new();
-    };
-    let reachable = |ip: &str| {
-        ip.parse::<IpAddr>()
-            .is_ok_and(|ip| cidrs.iter().any(|c| c.contains(ip)))
-    };
-    let mut out: Vec<(String, u16)> = reports
-        .live(target)
-        .iter()
-        .flat_map(|(_, report)| {
-            let bound = report
-                .listeners
-                .iter()
-                .filter(|l| l.name == listener.name)
-                .flat_map(|l| &l.endpoints)
-                .filter(|e| e.bound && e.transport == Transport::Tcp);
-            bound
-                .flat_map(|e| match &e.address {
-                    Some(address) => vec![(address.clone(), e.port)],
-                    None => report
-                        .interface_ips
-                        .iter()
-                        .map(|ip| (ip.clone(), e.port))
-                        .collect(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|(ip, _)| reachable(ip))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,12 +267,18 @@ mod tests {
         GatewayKey::new("p-publish", "publish")
     }
 
-    /// The target serves `http` on 80, bound at 8000.
-    fn hub() -> Hub {
-        let hub = Hub::default();
+    fn transit() -> Vec<NetworkCidrs> {
+        vec![NetworkCidrs {
+            name: "transit".into(),
+            cidrs: vec!["10.250.0.0/16".into()],
+        }]
+    }
+
+    /// The target serves `http` on `port`, bound at 8000, on transit.
+    fn publish(hub: &Hub, port: u16) {
         let config: PortailConfig = serde_json::from_value(serde_json::json!({
             "gateway": {"name": "publish", "listeners": [
-                {"name": "http", "protocol": "HTTP", "port": 80, "target_port": 8000}
+                {"name": "http", "protocol": "HTTP", "port": port, "target_port": 8000}
             ]}
         }))
         .unwrap();
@@ -184,13 +286,24 @@ mod tests {
             namespace: "p-publish".into(),
             name: "publish".into(),
             uid: "u".into(),
-            generation: 1,
+            generation: i64::from(port),
         };
-        hub.publish(Snapshot::from_config(gateway, config, vec![]));
+        hub.publish(Snapshot::from_config(gateway, config, transit()));
+    }
+
+    fn hub() -> Hub {
+        let hub = Hub::default();
+        publish(&hub, 80);
         hub
     }
 
-    fn report(address: Option<&str>, interface_ips: &[&str]) -> InstanceReport {
+    /// An instance at `network` on transit, `http` bound on `address`
+    /// (None: all interfaces) at 8000.
+    fn report(
+        network: Option<&str>,
+        address: Option<&str>,
+        interface_ips: &[&str],
+    ) -> InstanceReport {
         InstanceReport {
             listeners: vec![ListenerReport {
                 name: "http".into(),
@@ -203,83 +316,149 @@ mod tests {
                 }],
             }],
             interface_ips: interface_ips.iter().map(|s| s.to_string()).collect(),
+            networks: network
+                .map(|ip| [("transit".to_string(), ip.to_string())].into())
+                .unwrap_or_default(),
             ..Default::default()
         }
     }
 
-    fn edge_config(port: u16, invalid: bool) -> PortailConfig {
+    fn edge_config(port: u16) -> PortailConfig {
         serde_json::from_value(serde_json::json!({
             "httpRoutes": [{"rules": [{"backendRefs": [{
                 "name": "publish.p-publish.gateway", "port": port,
-                "group": "gateway.networking.k8s.io", "kind": "Gateway", "invalid": invalid
+                "group": "gateway.networking.k8s.io", "kind": "Gateway"
             }]}]}]
         }))
         .unwrap()
     }
 
-    fn transit() -> Vec<NetworkCidrs> {
-        vec![NetworkCidrs {
-            name: "transit".into(),
-            cidrs: vec!["10.250.0.0/16".into()],
-        }]
+    fn resolved(
+        hub: &Hub,
+        reports: &ReportStore,
+        port: u16,
+        networks: &[NetworkCidrs],
+    ) -> Vec<(String, u16)> {
+        let mut config = edge_config(port);
+        resolve(hub, reports, &mut config, networks);
+        config
+            .endpoint_overrides
+            .remove(&("publish.p-publish.gateway".to_string(), port))
+            .unwrap_or_default()
     }
 
-    /// Where a live instance bound the ref's listener, inside the edge's
-    /// own networks: an address on another network is never dialed.
+    /// The IP each instance reports on the shared Network, at its bound
+    /// port: an all-interfaces bind gives that IP alone, never an
+    /// interface on another network inside the same CIDR.
     #[test]
-    fn endpoints_are_bound_addresses_on_a_shared_network() {
+    fn endpoints_are_each_instance_on_the_shared_network() {
         let (hub, reports) = (hub(), ReportStore::default());
-        reports.record(
-            &target(),
-            InstanceId("a".into()),
-            report(Some("10.250.0.7"), &["10.128.0.9", "10.250.0.7"]),
+        let record = |id: &str, r| reports.record(&target(), InstanceId(id.into()), r);
+        record(
+            "a",
+            report(Some("10.250.0.7"), Some("10.250.0.7"), &["10.250.0.7"]),
         );
-        reports.record(
-            &target(),
-            InstanceId("b".into()),
-            report(None, &["10.128.0.10", "10.250.0.8"]),
+        record(
+            "b",
+            report(Some("10.250.0.8"), None, &["10.250.0.8", "10.250.9.9"]),
         );
-        reports.record(
-            &target(),
-            InstanceId("c".into()),
-            report(Some("10.128.0.11"), &["10.128.0.11"]),
-        );
-        let mut config = edge_config(80, false);
-        let targets = resolve(&hub, &reports, &mut config, &transit());
-        assert_eq!(targets, [target()].into());
+        record("c", report(Some("10.250.0.10"), Some("10.128.0.11"), &[]));
+        record("d", report(None, None, &["10.250.0.12"]));
+        record("e", report(Some("10.128.0.13"), None, &["10.128.0.13"]));
         assert_eq!(
-            config.endpoint_overrides[&("publish.p-publish.gateway".to_string(), 80)],
+            resolved(&hub, &reports, 80, &transit()),
             [
                 ("10.250.0.7".to_string(), 8000),
                 ("10.250.0.8".to_string(), 8000)
             ]
         );
+        assert!(
+            resolved(&hub, &reports, 443, &transit()).is_empty(),
+            "no listener"
+        );
+        assert!(
+            resolved(&hub, &reports, 80, &[]).is_empty(),
+            "the edge is on no network"
+        );
+        let elsewhere = vec![NetworkCidrs {
+            name: "other".into(),
+            cidrs: vec!["10.250.0.0/16".into()],
+        }];
+        assert!(
+            resolved(&hub, &reports, 80, &elsewhere).is_empty(),
+            "another Network, the same CIDR"
+        );
     }
 
-    /// No live instance on the network, or no listener on the port: no
-    /// override, so the share is rejected. The target is still named, so
-    /// its first report reconciles the edge; an invalid ref's too.
+    /// A report as large as its sender likes adds at most MAX_ENDPOINTS
+    /// per Network and port.
     #[test]
-    fn no_endpoint_leaves_no_override_but_names_the_target() {
+    fn a_runaway_report_is_capped() {
         let (hub, reports) = (hub(), ReportStore::default());
-        for (case, mut config, networks) in [
-            ("no report", edge_config(80, false), transit()),
-            ("no listener", edge_config(443, false), transit()),
-            ("off the network", edge_config(80, false), vec![]),
-            ("invalid", edge_config(80, true), transit()),
-        ] {
-            if case == "off the network" {
-                reports.record(
-                    &target(),
-                    InstanceId("a".into()),
-                    report(None, &["10.250.0.7"]),
-                );
+        let mut big = report(Some("10.250.0.7"), None, &[]);
+        big.listeners[0].endpoints = (0..10_000)
+            .map(|port| EndpointReport {
+                address: None,
+                port,
+                transport: Transport::Tcp,
+                bound: true,
+                error: None,
+            })
+            .collect();
+        reports.record(&target(), InstanceId("a".into()), big);
+        let exposed = exposure(&hub, &reports, &target());
+        assert_eq!(exposed[&("transit".into(), 80)].len(), MAX_ENDPOINTS);
+    }
+
+    /// Dependents wake when the target's exposure moves: an address, a
+    /// listener, the target gone. A new version applied or a DNS refresh
+    /// moves nothing.
+    #[test]
+    fn dependents_wake_only_when_the_exposure_moves() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        let backends = GatewayBackends::default();
+        let mut wakes = backends.wakes().unwrap();
+        let edge = GatewayKey::new("edge", "public");
+        backends.record(edge.clone(), [target()].into());
+        let mut woken = || {
+            let mut out = vec![];
+            while let Ok(key) = wakes.try_recv() {
+                out.push(key);
             }
-            let targets = resolve(&hub, &reports, &mut config, &networks);
-            assert_eq!(targets, [target()].into(), "{case}");
-            assert!(config.endpoint_overrides.is_empty(), "{case}");
-        }
-        let mut none: PortailConfig = Default::default();
-        assert!(resolve(&hub, &reports, &mut none, &transit()).is_empty());
+            out
+        };
+        let refresh = || backends.refresh(&target(), &hub, &reports);
+
+        let mut instance = report(Some("10.250.0.7"), None, &[]);
+        reports.record(&target(), InstanceId("a".into()), instance.clone());
+        refresh();
+        assert_eq!(woken(), std::slice::from_ref(&edge), "first exposure");
+
+        instance.applied = "v2".into();
+        instance.dns_epoch += 1;
+        reports.record(&target(), InstanceId("a".into()), instance.clone());
+        refresh();
+        assert!(woken().is_empty(), "applied and dns_epoch alone");
+
+        instance
+            .networks
+            .insert("transit".into(), "10.250.0.8".into());
+        reports.record(&target(), InstanceId("a".into()), instance);
+        refresh();
+        assert_eq!(woken(), std::slice::from_ref(&edge), "an address moved");
+
+        publish(&hub, 81);
+        refresh();
+        assert_eq!(woken(), std::slice::from_ref(&edge), "a listener moved");
+
+        backends.retain(|key| key != &target());
+        assert_eq!(woken(), std::slice::from_ref(&edge), "the target is gone");
+        backends.retain(|key| key != &target());
+        assert!(woken().is_empty(), "once");
+
+        backends.record(edge.clone(), Default::default());
+        refresh();
+        assert!(woken().is_empty(), "the edge names it no more");
+        assert!(backends.dependents(&target()).is_empty());
     }
 }

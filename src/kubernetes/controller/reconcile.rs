@@ -222,7 +222,7 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
         .collect();
     ctx.hub.retain(|key| live.contains(key));
     ctx.reports.retain(|key| live.contains(key));
-    ctx.dependents.retain(|key| live.contains(key));
+    ctx.backends.retain(|key| live.contains(key));
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
     ctx.networks.retain_named(&gateways);
@@ -270,6 +270,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         ClassOwner::Ours => {}
         ClassOwner::Other => {
             if ctx.hub.remove(&key) {
+                ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
                 info!(
                     "Gateway {} class '{}' names another controller; no longer served",
                     key, gateway.spec.gateway_class_name
@@ -318,7 +319,10 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                 std::mem::take(&mut plan.config),
                 std::mem::take(&mut plan.networks),
             );
-            (provisioned, ctx.hub.publish(snapshot))
+            let published = ctx.hub.publish(snapshot);
+            // Its listeners may have moved with its spec.
+            ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
+            (provisioned, published)
         }
         _ => (Provisioned::unmanaged(), false),
     };
@@ -333,6 +337,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         .is_none_or(|now| now.metadata.uid != gateway.metadata.uid);
     if stale {
         ctx.hub.remove(&key);
+        ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
         return Step::Done(Action::await_change());
     }
     Step::Continue(Box::new(Pass {
@@ -943,55 +948,65 @@ mod tests {
         );
     }
 
-    /// An edge on udn-a naming Gateway `target` serves the addresses
-    /// `target`'s instances bound on udn-a, and a report of `target`
-    /// reconciles the edge.
+    /// An edge on udn-a naming Gateway `target` serves where `target`'s
+    /// instances bound on udn-a. It wakes when that moves (an address, the
+    /// target's spec, the target gone), never on the target's other report
+    /// churn.
     #[tokio::test]
-    async fn an_edge_serves_where_its_gateway_backend_bound() {
-        use crate::sync::{EndpointReport, GatewayRef, InstanceReport, ListenerReport, Transport};
+    async fn an_edge_follows_where_its_gateway_backend_bound() {
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
         let mut p = Pipeline::new();
-        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
-        let mut target = testkit::gateway("target", 1);
-        target.spec.listeners[0].port = 80;
-        apply(&mut p.cluster.gateways, target.clone());
-        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
-            "gateway": {"name": "target", "listeners": [
-                {"name": "http", "protocol": "HTTP", "port": 80, "target_port": 8000}
-            ]}
-        }))
-        .unwrap();
-        let target_ref = GatewayRef {
-            namespace: "default".into(),
-            name: "target".into(),
-            uid: "target-uid".into(),
-            generation: 1,
+        let mut wakes = p.ctx.backends.wakes().unwrap();
+        let mut woken = move || {
+            let mut out = vec![];
+            while let Ok(key) = wakes.try_recv() {
+                out.push(key);
+            }
+            out
         };
-        p.ctx
-            .hub
-            .publish(Snapshot::from_config(target_ref, config, vec![]));
-        p.ctx.reports.record(
-            &testkit::key(&target),
-            super::super::reports::InstanceId("pod-a".into()),
-            InstanceReport {
-                listeners: vec![ListenerReport {
-                    name: "http".into(),
-                    endpoints: vec![EndpointReport {
-                        address: Some("10.250.0.7".into()),
-                        port: 8000,
-                        transport: Transport::Tcp,
-                        bound: true,
-                        error: None,
-                    }],
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let on_port = |port: i32, generation: i64| {
+            let mut target = with_addresses(testkit::gateway("target", 1), generation, &network);
+            target.spec.listeners[0].port = port;
+            target
+        };
+        let target = on_port(80, 1);
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&target).await.unwrap();
+        let report = |applied: &str, ip: &str| InstanceReport {
+            applied: applied.into(),
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: None,
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
                 }],
-                ..Default::default()
-            },
-        );
+            }],
+            interface_ips: vec![ip.into(), "10.250.9.9".into()],
+            networks: [("udn-a".to_string(), ip.to_string())].into(),
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, r: InstanceReport| {
+            p.ctx.reports.record(
+                &testkit::key(&target),
+                super::super::reports::InstanceId("pod-a".into()),
+                r,
+            );
+            super::super::report_trigger(
+                &p.ctx,
+                super::super::reports::Trigger {
+                    gateway: testkit::key(&target),
+                    dns_moved: false,
+                },
+            );
+        };
+        reported(&p, report("v1", "10.250.0.7"));
 
-        let edge = with_addresses(
-            testkit::gateway("edge", 1),
-            1,
-            &[(NETWORK_ADDRESS_TYPE, "udn-a")],
-        );
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
         apply(&mut p.cluster.gateways, edge.clone());
         let mut route = testkit::http_route("r", &["edge"], 1);
         route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
@@ -1001,7 +1016,6 @@ mod tests {
         .unwrap()]);
         apply(&mut p.cluster.http_routes, route);
         p.pass(&edge).await.unwrap();
-
         let served = p.served(&edge).unwrap();
         assert_eq!(
             served.backends.external_names,
@@ -1009,12 +1023,33 @@ mod tests {
                 host: "target.default.gateway".into(),
                 port: 80,
                 targets: vec![("10.250.0.7".into(), 8000)],
-            }]
+            }],
+            "its udn-a address alone, not 10.250.9.9"
         );
         assert_eq!(
-            p.ctx.dependents.of(&testkit::key(&target)),
+            p.ctx.backends.dependents(&testkit::key(&target)),
             [testkit::key(&edge)]
         );
+        let edge_key = testkit::key(&edge);
+        woken();
+
+        reported(&p, report("v2", "10.250.0.7"));
+        assert!(woken().is_empty(), "a new version alone");
+
+        reported(&p, report("v2", "10.250.0.8"));
+        assert_eq!(woken(), std::slice::from_ref(&edge_key), "an address moved");
+
+        let target = on_port(81, 2);
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&target).await.unwrap();
+        assert_eq!(
+            woken(),
+            std::slice::from_ref(&edge_key),
+            "its spec moved a listener"
+        );
+
+        p.delete(&target).await;
+        assert_eq!(woken(), [edge_key], "it is gone");
     }
 
     /// The Programmed condition of Gateway `name`'s last status write.

@@ -4022,6 +4022,9 @@ fn a_gateway_backend_resolves_only_when_it_may() {
         .unwrap();
         let ra = &result.route_status[0];
         let backend = &result.config.http_routes[0].rules[0].backend_refs[0];
+        // Past the grant and not itself: the target's own events wake it.
+        let watched = !matches!(case, "ungranted" | "itself");
+        assert_eq!(!result.gateway_targets.is_empty(), watched, "{case}");
         match want {
             None => {
                 assert!(ra.refs_resolved, "{case}: {}", ra.refs_message);
@@ -4103,4 +4106,27 @@ fn only_tcp_borne_forward_refs_name_a_gateway() {
     let rule = &result.config.http_routes[0].rules[0];
     assert!(rule.filters.is_empty(), "the mirror is left out");
     assert!(!rule.backend_refs[0].invalid, "the forward ref stands");
+}
+
+/// A Gateway backend's name the converter did not write names nothing:
+/// BackendNotFound, never a resolved ref, and nothing watched.
+#[test]
+fn an_unreadable_gateway_backend_name_is_not_found() {
+    let (gateways, labels, known) = (HashMap::new(), HashMap::new(), HashSet::new());
+    let cx = RouteCollectCtx {
+        gateway_name: "multi-gw",
+        gateway_ns: "default",
+        on_network: true,
+        gateways: &gateways,
+        watched: Default::default(),
+        listeners: &[],
+        namespace_labels: &labels,
+        reference_grants: &[],
+        known_services: &known,
+        refused_external_names: &known,
+    };
+    let (reason, message) = check_gateway(&cx, "HTTPRoute", "default", "nodots", 80).unwrap();
+    assert_eq!(reason, "BackendNotFound");
+    assert!(message.contains("names no Gateway"), "{message}");
+    assert!(cx.watched.into_inner().is_empty());
 }

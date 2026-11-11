@@ -206,7 +206,10 @@ backendRefs:
 
 - HTTPRoute, TLSRoute and TCPRoute; a UDPRoute or a request mirror naming a Gateway is `ResolvedRefs=False`, reason `InvalidKind`.
 - Another namespace: a ReferenceGrant in the target's, `to: [{group: gateway.networking.k8s.io, kind: Gateway}]`.
-- The referencing Gateway needs a `portail.epheo.eu/Network` address: its endpoints are where the target's live data planes bound that listener, inside that network's CIDRs.
+- Both Gateways need a `portail.epheo.eu/Network` address of the same name.
+- Its endpoints: each live instance of the target, at its IP on that Network, inside the Network's CIDRs, where it bound that listener. An interface on another network never counts, whatever its address.
+- At most 64 endpoints per Network and port: a Gateway runs a few replicas.
+- The referencing Gateway is reconciled when where the target is reachable moves (an address, its listeners, the target gone), never on its other changes.
 - No live instance there yet: its share fails (500, or the connection closes) until one reports.
 - Every connection to it opens with a PROXY protocol v2 header naming the client.
 - HTTP opens one connection per request to it: a header names one client, so none is pooled or reused.
