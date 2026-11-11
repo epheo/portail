@@ -36,6 +36,51 @@ pub struct Snapshot {
     /// interfaces against them. A name without an entry is unresolved.
     #[serde(default)]
     pub networks: Vec<NetworkCidrs>,
+    /// The trusted sources each named Gateway gave, by its key: what a
+    /// data plane keeps for it while it is pending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_from: Vec<TrustedFrom>,
+    /// What spec still allows but none of whose instances has reported
+    /// since this controller took the lead. A data plane keeps what it last
+    /// served for each, one hold at most. Only reports are waited for:
+    /// what spec dropped is absent here and drops at once. A data plane
+    /// that does not know this field keeps nothing, which fails closed.
+    #[serde(default, skip_serializing_if = "Pending::is_empty")]
+    pub pending: Pending,
+}
+
+/// The host CIDRs trusted for one named Gateway.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedFrom {
+    /// `namespace/name`.
+    pub gateway: String,
+    pub sources: Vec<String>,
+}
+
+/// Gateway backends and trusted Gateways waiting for a first report.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pending {
+    /// Gateway backends, by the name and port their endpoints ride.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<PendingBackend>,
+    /// Trusted Gateways, `namespace/name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted: Vec<String>,
+}
+
+impl Pending {
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty() && self.trusted.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBackend {
+    pub host: String,
+    pub port: u16,
 }
 
 /// A certificateRef's resolved Secret. PEM is ASCII; [`Snapshot::from_config`]
@@ -202,6 +247,8 @@ impl Snapshot {
             certificates,
             backends,
             networks,
+            trusted_from: Vec::new(),
+            pending: Pending::default(),
         }
         .seal()
     }
@@ -443,7 +490,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 13] = [
+        let changes: [(&str, fn(&mut Snapshot)); 15] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -473,6 +520,13 @@ mod tests {
                     trusted_sources: vec!["10.0.0.0/8".into()],
                 })
             }),
+            ("trustedFrom", |s| {
+                s.trusted_from.push(TrustedFrom {
+                    gateway: "edge/public".into(),
+                    sources: vec!["10.250.0.9/32".into()],
+                })
+            }),
+            ("pending", |s| s.pending.trusted.push("edge/public".into())),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
