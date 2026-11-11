@@ -412,7 +412,7 @@ impl SyncLoop {
             self.rebind_at = None;
             return false;
         };
-        let report = self.applier.apply(snapshot).await;
+        let report = self.applier.reapply(snapshot).await;
         let report = self.as_reported(report);
         let moved = self.report.as_ref() != Some(&report);
         self.report = Some(report);

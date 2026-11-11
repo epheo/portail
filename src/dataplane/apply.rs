@@ -57,12 +57,13 @@ enum Kept {
 const FRESH: std::time::Duration = std::time::Duration::from_secs(2 * HOLD.as_secs());
 
 /// One value served: its Gateway's uid, the value, when the controller
-/// last vouched for it, and whether this data plane kept it itself.
+/// last vouched for it (None: never), and whether this data plane kept it
+/// itself.
 #[derive(Clone)]
 struct Value<T> {
     uid: String,
     value: T,
-    fresh: tokio::time::Instant,
+    fresh: Option<tokio::time::Instant>,
     kept: bool,
 }
 
@@ -91,18 +92,38 @@ fn carried<'a, T>(
     now: tokio::time::Instant,
 ) -> Option<(&'a Value<T>, tokio::time::Instant)> {
     old.filter(|old| !uid.is_empty() && old.uid == uid)
-        .map(|old| (old, deadline.min(old.fresh + FRESH)))
+        .and_then(|old| Some((old, deadline.min(old.fresh? + FRESH))))
         .filter(|(_, until)| now < *until)
+}
+
+/// A resolved value's freshness: now when the controller vouched for it,
+/// else the stamp its last resolved value of the same Gateway had.
+fn stamp<T>(
+    old: Option<&Value<T>>,
+    uid: &str,
+    now: tokio::time::Instant,
+    vouched: bool,
+) -> Option<tokio::time::Instant> {
+    if vouched {
+        return Some(now);
+    }
+    old.filter(|v| !v.kept && v.uid == uid)
+        .and_then(|v| v.fresh)
 }
 
 impl Keep {
     /// Fill into `config` what `snapshot` marks pending and the last apply
     /// served, until it lapses. Returns when the first value carried lapses.
+    /// `vouched`: the controller just sent `snapshot`. Applied again on the
+    /// data plane's own account, it vouches for nothing: what it resolves
+    /// keeps the stamp it had, so a data plane cut off retrying binds never
+    /// makes a stale value fresh.
     fn carry(
         &mut self,
         snapshot: &Snapshot,
         config: &mut PortailConfig,
         now: tokio::time::Instant,
+        vouched: bool,
     ) -> Option<tokio::time::Instant> {
         let backend_uid = |host: &str, port: u16| {
             snapshot
@@ -117,13 +138,15 @@ impl Keep {
             .iter()
             .filter(|((host, _), _)| parse_gateway_backend_name(host).is_some())
             .map(|((host, port), targets)| {
+                let key = (host.clone(), *port);
+                let uid = backend_uid(host, *port);
                 let value = Value {
-                    uid: backend_uid(host, *port),
+                    fresh: stamp(self.backends.get(&key), &uid, now, vouched),
+                    uid,
                     value: targets.clone(),
-                    fresh: now,
                     kept: false,
                 };
-                ((host.clone(), *port), value)
+                (key, value)
             })
             .collect();
         let mut trusted: HashMap<String, Value<Vec<String>>> = snapshot
@@ -133,7 +156,7 @@ impl Keep {
                 let value = Value {
                     uid: t.uid.clone(),
                     value: t.sources.clone(),
-                    fresh: now,
+                    fresh: stamp(self.trusted.get(&t.gateway), &t.uid, now, vouched),
                     kept: false,
                 };
                 (t.gateway.clone(), value)
@@ -215,7 +238,7 @@ impl Keep {
         let trusted = self.trusted.values_mut().map(|v| (&mut v.fresh, v.kept));
         for (fresh, kept) in backends.chain(trusted) {
             if !kept {
-                *fresh = now;
+                *fresh = Some(now);
             }
         }
     }
@@ -277,10 +300,20 @@ impl Applier {
     /// Bring the data plane in line with `snapshot` and report the result,
     /// under the snapshot's version as sent.
     pub async fn apply(&mut self, snapshot: &Snapshot) -> InstanceReport {
+        self.apply_as(snapshot, true).await
+    }
+
+    /// [`Self::apply`] of the snapshot already served, on the data plane's
+    /// own account (a rebind, a lapse): the controller vouched for nothing.
+    pub async fn reapply(&mut self, snapshot: &Snapshot) -> InstanceReport {
+        self.apply_as(snapshot, false).await
+    }
+
+    async fn apply_as(&mut self, snapshot: &Snapshot, vouched: bool) -> InstanceReport {
         let mut config = snapshot.to_config();
-        self.kept_until = self
-            .keep
-            .carry(snapshot, &mut config, tokio::time::Instant::now());
+        self.kept_until =
+            self.keep
+                .carry(snapshot, &mut config, tokio::time::Instant::now(), vouched);
         let interfaces = local_interfaces();
         let local: Vec<String> = interfaces.iter().map(|(_, ip)| ip.clone()).collect();
         let networks = resolve_networks(&config.gateway.addresses, &snapshot.networks, &local);
@@ -865,16 +898,27 @@ mod tests {
         snapshot.seal()
     }
 
-    /// What `snapshot` serves through `keep` at `now`: the backend's
-    /// endpoint IPs, the trusted sources, and when the first kept value
-    /// lapses.
+    /// What `snapshot`, sent by the controller, serves through `keep` at
+    /// `now`: the backend's endpoint IPs, the trusted sources, and when the
+    /// first kept value lapses.
     fn served_through(
         keep: &mut Keep,
         snapshot: &Snapshot,
         now: tokio::time::Instant,
     ) -> (Vec<String>, Vec<String>, Option<tokio::time::Instant>) {
+        carried_through(keep, snapshot, now, true)
+    }
+
+    /// [`served_through`], the snapshot sent by the controller (`vouched`)
+    /// or applied again on the data plane's own account.
+    fn carried_through(
+        keep: &mut Keep,
+        snapshot: &Snapshot,
+        now: tokio::time::Instant,
+        vouched: bool,
+    ) -> (Vec<String>, Vec<String>, Option<tokio::time::Instant>) {
         let mut config = snapshot.to_config();
-        let until = keep.carry(snapshot, &mut config, now);
+        let until = keep.carry(snapshot, &mut config, now, vouched);
         let endpoints = config
             .endpoint_overrides
             .get(&("target.p.gateway".to_string(), 80))
@@ -994,6 +1038,26 @@ mod tests {
             Some(pending + HOLD),
             "the earlier of the hold and freshness"
         );
+    }
+
+    /// A data plane cut off from the controller applies its snapshot again
+    /// on its own (rebinds, listener exits): that vouches for nothing. Past
+    /// two holds of it, reconnecting to a leader marking the item pending
+    /// keeps nothing.
+    #[test]
+    fn applying_again_on_its_own_never_makes_a_value_fresh() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let resolved = edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1);
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        for at in [s(20), s(50), s(80), s(110)] {
+            let (endpoints, trusted, _) = carried_through(&mut keep, &resolved, t0 + at, false);
+            assert_eq!((endpoints.len(), trusted.len()), (1, 1), "still served");
+        }
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), t0 + s(120));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
     }
 
     /// What a snapshot no longer carries, pending or not, is gone at once:
