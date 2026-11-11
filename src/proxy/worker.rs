@@ -3537,12 +3537,40 @@ mod connection_tests {
         hello
     }
 
+    /// An invalid ref's share answers 500; a Gateway backend's before any
+    /// of its instances reported answers 503: one is wrong, the other not
+    /// up yet.
+    #[tokio::test]
+    async fn an_unreported_gateway_backend_answers_503_an_invalid_ref_500() {
+        for (backend, status) in [
+            (Backend::rejecting(1), "500"),
+            (Backend::unavailable(1), "503"),
+        ] {
+            let mut rt = RouteTable::new();
+            rt.add_http_route(
+                "a.test",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![backend],
+                ),
+            );
+            let (mut client, _task) = serve(rt);
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert!(out.starts_with(&format!("HTTP/1.1 {status} ")), "{out}");
+        }
+    }
+
     /// A passthrough connection that drew an invalid backendRef's share
     /// was said to find no route or no healthy backend.
     #[tokio::test]
     async fn tls_passthrough_says_why_it_has_no_backend() {
         let mut rt = RouteTable::new();
         rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
+        rt.add_tls_route(0, "unreported.test", vec![Backend::unavailable(1)]);
         let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
         weightless.weight = 0;
         rt.add_tls_route(0, "weightless.test", vec![weightless]);
@@ -3558,6 +3586,7 @@ mod connection_tests {
         };
         for (sni, why) in [
             ("rejected.test", "drew an invalid backendRef's share"),
+            ("unreported.test", "before any instance reported"),
             ("weightless.test", "no backend with positive weight"),
             ("empty.test", "no backends available"),
             ("unrouted.test", "no route"),

@@ -954,6 +954,7 @@ mod tests {
             controller_transport: crate::kubernetes::crds::ControllerTransport::Direct,
             external_name_backends: crate::kubernetes::crds::ExternalNameBackends::Refused,
             proxy_sources: vec![],
+            trusted_gateways: vec![],
         }
     }
 

@@ -199,13 +199,35 @@ pub struct ProxyProtocolParameters {
     pub trusted_sources: Option<Vec<TrustedSource>>,
 }
 
+/// Exactly one of `cidr` or `gateway`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "has(self.cidr) != has(self.gateway)",
+    "message": "exactly one of cidr or gateway"
+}]))]
 pub struct TrustedSource {
     /// An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
-    /// 10.250.0.7/16.
+    /// 10.250.0.7/16. Never a network other workloads share: any of them
+    /// could name any client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub cidr: String,
+    pub cidr: Option<String>,
+    /// A Gateway of this controller: the address each of its live data
+    /// planes reports on a Network both Gateways name, inside its CIDRs on
+    /// both sides, where it bound a listener. Nothing while none reports
+    /// or this Gateway has no Network address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<TrustedGateway>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedGateway {
+    #[schemars(length(min = 1))]
+    pub namespace: String,
+    #[schemars(length(min = 1))]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

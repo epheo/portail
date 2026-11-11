@@ -133,16 +133,38 @@ spec:
                       closed; LOCAL keeps the connection's own address. Other sources are
                       never read for one. Empty: none. Matched per accepted connection.
                     items:
+                      description: Exactly one of `cidr` or `gateway`.
                       properties:
                         cidr:
                           description: |-
                             An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
-                            10.250.0.7/16.
+                            10.250.0.7/16. Never a network other workloads share: any of them
+                            could name any client.
                           minLength: 1
+                          nullable: true
                           type: string
-                      required:
-                      - cidr
+                        gateway:
+                          description: |-
+                            A Gateway of this controller: the address each of its live data
+                            planes reports on a Network both Gateways name, inside its CIDRs on
+                            both sides, where it bound a listener. Nothing while none reports
+                            or this Gateway has no Network address.
+                          nullable: true
+                          properties:
+                            name:
+                              minLength: 1
+                              type: string
+                            namespace:
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          - namespace
+                          type: object
                       type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of cidr or gateway
+                        rule: has(self.cidr) != has(self.gateway)
                     maxItems: 16
                     nullable: true
                     type: array

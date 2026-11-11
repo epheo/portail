@@ -372,6 +372,15 @@ impl Backend {
         })
     }
 
+    /// The stand-in for a valid Gateway backend with no instance reported
+    /// yet: see [`BackendAction::Unavailable`]. Never dialed.
+    pub fn unavailable(weight: u32) -> Self {
+        Self {
+            action: BackendAction::Unavailable,
+            ..Self::rejecting(weight)
+        }
+    }
+
     /// The stand-in for an invalid backendRef: see [`BackendAction::Reject`].
     /// The address is unspecified and never dialed.
     pub fn rejecting(weight: u32) -> Self {

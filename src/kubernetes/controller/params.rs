@@ -16,6 +16,7 @@ use crate::kubernetes::crds::{
     NetworkSelection, Provisioning, ServiceParameters, ServiceType,
 };
 use crate::proxy::proxy_protocol::Cidr;
+use crate::sync::GatewayKey;
 
 const GROUP: &str = "portail.epheo.eu";
 const KIND: &str = "GatewayParameters";
@@ -39,6 +40,9 @@ pub(crate) struct Params {
     pub external_name_backends: ExternalNameBackends,
     /// CIDRs whose connections open with a PROXY v2 header.
     pub proxy_sources: Vec<String>,
+    /// Gateways whose data planes' addresses join `proxy_sources` once
+    /// resolved against this Gateway's own networks.
+    pub trusted_gateways: Vec<GatewayKey>,
 }
 
 /// `Err` says why the parameters cannot be used: the Gateway is
@@ -275,18 +279,32 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
              be on two pods"
         ));
     }
-    let proxy_sources = spec
-        .proxy_protocol
-        .and_then(|p| p.trusted_sources)
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .map(|(i, source)| {
-            Cidr::parse(&source.cidr)
-                .map(|c| c.to_string())
-                .map_err(|e| format!("proxyProtocol.trustedSources[{i}].cidr: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mut proxy_sources, mut trusted_gateways) = (Vec::new(), Vec::new());
+    let sources = spec.proxy_protocol.and_then(|p| p.trusted_sources);
+    for (i, source) in sources.unwrap_or_default().into_iter().enumerate() {
+        match (source.cidr, source.gateway) {
+            (Some(cidr), None) => proxy_sources.push(
+                Cidr::parse(&cidr)
+                    .map_err(|e| format!("proxyProtocol.trustedSources[{i}].cidr: {e}"))?
+                    .to_string(),
+            ),
+            (None, Some(gw)) if !gw.namespace.is_empty() && !gw.name.is_empty() => {
+                trusted_gateways.push(GatewayKey::new(gw.namespace, gw.name))
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "proxyProtocol.trustedSources[{i}].gateway: needs a namespace and a name"
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "proxyProtocol.trustedSources[{i}]: needs exactly one of cidr or gateway"
+                ))
+            }
+        }
+    }
+    trusted_gateways.sort();
+    trusted_gateways.dedup();
     let resources = spec.resources.unwrap_or_default();
     let worker_threads = cpu_limit(Some(&resources))
         .and_then(|cpu| cpu_cores(&cpu.0))
@@ -316,6 +334,7 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
             .external_name_backends
             .unwrap_or(ExternalNameBackends::Refused),
         proxy_sources,
+        trusted_gateways,
     })
 }
 
@@ -457,6 +476,7 @@ mod tests {
                 controller_transport: ControllerTransport::Direct,
                 external_name_backends: ExternalNameBackends::Refused,
                 proxy_sources: vec![],
+                trusted_gateways: vec![],
             }
         );
     }
@@ -609,6 +629,52 @@ networks: [{name: c}]
             "{err}"
         );
         assert!(err.contains("host bits"), "{err}");
+    }
+
+    /// A trusted source is a CIDR or a Gateway, never both or neither.
+    #[tokio::test]
+    async fn a_trusted_source_is_exactly_one_of_cidr_or_gateway() {
+        let mut cluster = cluster(None);
+        let resolve = |cluster: &mut TestCluster, sources: &str| {
+            apply(
+                &mut cluster.parameters,
+                parameters(
+                    "default",
+                    "mine",
+                    &format!("proxyProtocol: {{trustedSources: [{sources}]}}"),
+                ),
+            );
+            resolve_in(cluster, &gateway_with_ref("mine"))
+        };
+        let params = resolve(
+            &mut cluster,
+            "{cidr: 192.0.2.0/24}, {gateway: {namespace: edge, name: public}}, \
+             {gateway: {namespace: edge, name: public}}",
+        )
+        .unwrap();
+        assert_eq!(params.proxy_sources, ["192.0.2.0/24"]);
+        assert_eq!(params.trusted_gateways, [GatewayKey::new("edge", "public")]);
+
+        for (sources, why) in [
+            (
+                "{cidr: 192.0.2.0/24, gateway: {namespace: edge, name: public}}",
+                "proxyProtocol.trustedSources[0]: needs exactly one of cidr or gateway",
+            ),
+            (
+                "{}",
+                "proxyProtocol.trustedSources[0]: needs exactly one of cidr or gateway",
+            ),
+            (
+                "{gateway: {namespace: edge, name: ''}}",
+                "proxyProtocol.trustedSources[0].gateway: needs a namespace and a name",
+            ),
+        ] {
+            assert_eq!(
+                resolve(&mut cluster, sources).unwrap_err(),
+                why,
+                "{sources}"
+            );
+        }
     }
 
     /// A missing referent, a wrong group or kind, or a class reference

@@ -180,7 +180,7 @@ impl Resolver<'_, '_> {
 
     /// A Gateway backend's endpoints: only those the controller resolved,
     /// never DNS, where its name could find a Service. None yet: its share
-    /// is rejected until an instance of it reports.
+    /// answers 503 until an instance of it reports.
     fn gateway_endpoints(&self, br: &BackendRef) -> Vec<Backend> {
         let endpoints: Vec<Backend> = self
             .endpoint_overrides
@@ -194,7 +194,7 @@ impl Resolver<'_, '_> {
             })
             .collect();
         if endpoints.is_empty() {
-            vec![Backend::rejecting(br.weight)]
+            vec![Backend::unavailable(br.weight)]
         } else {
             endpoints
         }
@@ -1872,7 +1872,8 @@ mod tests {
 
     /// A Gateway backend dials only the endpoints the controller resolved,
     /// behind a PROXY header, and never asks DNS, where its name could find
-    /// a Service. None resolved: a rejecting share, on every route kind.
+    /// a Service. None resolved: an unavailable share (503), on every route
+    /// kind, told apart from an invalid ref's (500).
     #[test]
     fn a_gateway_backend_takes_its_endpoints_from_the_controller_only() {
         let gateway_ref = r#"{"name":"edge.p.gateway","port":80,
@@ -1894,6 +1895,12 @@ mod tests {
         assert!(calls.is_empty(), "{calls:?}");
         let tcp = table.find_tcp_backends(5432).unwrap();
         assert_eq!(tcp.len(), 1);
+        assert_eq!(tcp[0].action, crate::routing::BackendAction::Unavailable);
+
+        let mut invalid = config.clone();
+        invalid.tcp_routes[0].rules[0].backend_refs[0].invalid = true;
+        let (table, _) = build_with_fake_dns(&invalid, super::BuildPolicy::Strict);
+        let tcp = table.unwrap().find_tcp_backends(5432).unwrap().to_vec();
         assert_eq!(tcp[0].action, crate::routing::BackendAction::Reject);
 
         config.endpoint_overrides.insert(
