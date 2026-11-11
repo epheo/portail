@@ -57,6 +57,12 @@ pub struct InstanceReport {
     pub dns_epoch: u64,
     /// Sent on SIGTERM: the instance no longer counts as live.
     pub leaving: bool,
+    /// The uid of the Gateway whose snapshot this instance serves: a
+    /// Gateway recreated under the same name never resolves backends or
+    /// trust from another's instances. Empty from an older data plane,
+    /// whose addresses then resolve nothing.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub gateway_uid: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

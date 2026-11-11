@@ -470,6 +470,15 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
             snapshot.trusted_from = trusted_from;
             snapshot.backends_from = backends_from;
             snapshot.pending = pending;
+            // Instances of a Gateway this name named before report for
+            // that one: their binds and addresses are not this one's.
+            if ctx
+                .hub
+                .current(&key)
+                .is_some_and(|served| served.gateway.uid != snapshot.gateway.uid)
+            {
+                ctx.reports.forget(&key);
+            }
             let published = ctx.hub.publish(snapshot.seal());
             // Its listeners may have moved with its spec.
             ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
@@ -666,6 +675,34 @@ mod tests {
             Some(ProxyProtocolConfig {
                 trusted_sources: vec!["10.250.0.0/16".into()],
             })
+        );
+    }
+
+    /// A Gateway recreated under its name: what the previous one's
+    /// instances reported is forgotten as the new one publishes.
+    #[tokio::test]
+    async fn a_recreated_gateway_forgets_the_previous_ones_reports() {
+        use super::super::reports::InstanceId;
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("target", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        let mut previous = p.ctx.reports.live(&testkit::key(&gw))[0].1.clone();
+        assert_eq!(previous.gateway_uid, "target-uid");
+        previous.interface_ips = vec!["10.128.0.99".into()];
+        p.ctx
+            .reports
+            .record(&testkit::key(&gw), InstanceId("old-pod".into()), previous);
+
+        let mut again = testkit::gateway("target", 1);
+        again.metadata.uid = Some("target-uid-2".into());
+        apply(&mut p.cluster.gateways, again.clone());
+        p.pass(&again).await.unwrap();
+        let live = p.ctx.reports.live(&testkit::key(&again));
+        assert!(
+            live.iter()
+                .all(|(id, r)| id.0 != "old-pod" && r.gateway_uid == "target-uid-2"),
+            "{live:?}"
         );
     }
 
@@ -1152,7 +1189,10 @@ mod tests {
             p.ctx.reports.record(
                 &testkit::key(&target),
                 super::super::reports::InstanceId("pod-a".into()),
-                r,
+                InstanceReport {
+                    gateway_uid: target.uid().unwrap(),
+                    ..r
+                },
             );
             super::super::report_trigger(
                 &p.ctx,
@@ -1287,6 +1327,7 @@ mod tests {
             &testkit::key(&edge),
             InstanceId("edge-pod".into()),
             InstanceReport {
+                gateway_uid: edge.uid().unwrap(),
                 interface_ips: vec!["10.250.0.9".into()],
                 networks: [("udn-a".to_string(), "10.250.0.9".to_string())].into(),
                 ..Default::default()
@@ -1552,7 +1593,10 @@ mod tests {
             p.ctx.reports.record(
                 &testkit::key(gw),
                 InstanceId(format!("{}-pod", gw.name_any())),
-                r,
+                InstanceReport {
+                    gateway_uid: gw.uid().unwrap(),
+                    ..r
+                },
             );
             super::super::report_trigger(
                 &p.ctx,
@@ -1687,7 +1731,10 @@ mod tests {
             p.ctx.reports.record(
                 &testkit::key(gw),
                 InstanceId(format!("{}-pod", gw.name_any())),
-                r,
+                InstanceReport {
+                    gateway_uid: gw.uid().unwrap(),
+                    ..r
+                },
             );
             super::super::report_trigger(
                 &p.ctx,
@@ -1845,6 +1892,7 @@ mod tests {
             &testkit::key(&target),
             InstanceId("pod-a".into()),
             InstanceReport {
+                gateway_uid: target.uid().unwrap(),
                 listeners: vec![ListenerReport {
                     name: "http".into(),
                     endpoints: vec![EndpointReport {
@@ -1971,9 +2019,14 @@ mod tests {
             ..Default::default()
         };
         let reported = |p: &Pipeline, pod: &str, r: InstanceReport| {
-            p.ctx
-                .reports
-                .record(&testkit::key(&edge), InstanceId(pod.into()), r);
+            p.ctx.reports.record(
+                &testkit::key(&edge),
+                InstanceId(pod.into()),
+                InstanceReport {
+                    gateway_uid: edge.uid().unwrap(),
+                    ..r
+                },
+            );
             super::super::report_trigger(
                 &p.ctx,
                 Trigger {

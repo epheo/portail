@@ -351,6 +351,7 @@ impl Applier {
             dial_out_ips: dial_out.ips,
             dns_epoch: self.dns_epoch(),
             leaving: false,
+            gateway_uid: snapshot.gateway.uid.clone(),
         }
     }
 
