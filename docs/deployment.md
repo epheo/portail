@@ -188,7 +188,7 @@ Two replicas spread across nodes when there are several.
 Each is exactly one of:
 
 - `cidr`: a network address, as written.
-- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a `portail.epheo.eu/Network` both Gateways name, inside that Network's CIDRs on both sides, where it bound a listener. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
+- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a `portail.epheo.eu/Network` both Gateways name, inside that Network's CIDRs on both sides, a listener bound there or not. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
 - At most 64 trusted addresses per Network, one per instance, the first instances by id; the rest are counted in `portail_gateway_addresses_truncated_total`.
 - An address a live instance of another Gateway reports is never trusted.
 - This Gateway is reconciled when where the named one is reachable moves.
@@ -218,7 +218,8 @@ backendRefs:
 - Both Gateways need a `portail.epheo.eu/Network` address of the same name.
 - Its endpoints: each live instance of the target, at its IP on that Network, inside the Network's CIDRs, where it bound that listener. An interface on another network never counts, whatever its address.
 - At most 64 endpoints per Network and port, one per instance and listener, the first instances by id: a report listing more never crowds out the others. What a cap leaves out is counted in `portail_gateway_addresses_truncated_total`.
-- A pass that fails, such as on invalid parameters, keeps the configuration last served, but drops the endpoints of, and the trust in, a Gateway deleted since.
+- A pass that fails, such as on invalid parameters, keeps the configuration last served, but drops the endpoints of a Gateway deleted since, and the trust in an address a named Gateway holds no more: deleted, or its instance left or lapsed.
+- A Gateway whose parameters fail is still reconciled when a Gateway its last trust was for moves.
 - The referencing Gateway is reconciled when where the target is reachable moves (an address, its listeners, the target gone), never on its other changes.
 - No live instance there yet: its share answers 503, or the connection closes, until one reports. An invalid ref's share answers 500.
 - Every connection to it opens with a PROXY protocol v2 header naming the client.
@@ -240,7 +241,7 @@ spec:
   gatewayClassName: portail
   addresses:
   - {type: portail.epheo.eu/Network, value: transit}
-  - {type: IPAddress, value: 203.0.113.10}      # its public address, however it gets one
+  - {type: IPAddress, value: 203.0.113.10}      # its public address, local to the pod (localnet)
   listeners:
   - {name: tls, protocol: TLS, port: 443, tls: {mode: Passthrough}}
   - {name: http, protocol: HTTP, port: 80}
@@ -305,8 +306,14 @@ Requirements:
 - The transit network has subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC.
 - Only platform namespaces attach it: the edge's and the project Gateways'. Nothing a tenant runs.
 - Tenants cannot create or replace NetworkAttachmentDefinitions. A shared Network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
-- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods.
+- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods, and denies transit ingress to the edge.
 - `trustedSources` names the edge Gateway, never the transit CIDR.
+- The edge's public address is local to the pod, such as on a localnet network. A LoadBalancer-fronted edge is not supported yet.
+
+Why the edge needs both:
+
+- A Gateway binds every listener on every local address it names, its Network ones included. The edge's listeners also listen on its transit address, so every project data plane reaches them there, past any filtering on the public side. The MultiNetworkPolicy denying transit ingress to the edge closes that.
+- An edge whose public address is not local to the pod, such as a LoadBalancer VIP, binds only transit, so its public path is dead. Both stand until a network can carry egress only, bound by no listener.
 
 The lapse window:
 
@@ -316,7 +323,8 @@ The lapse window:
 - Within that window transit IPAM may hand its address to another transit pod. Only platform pods attach to transit, so that pod is a project Gateway's data plane, trusted as the edge for the window: it could name any client.
 - That is why transit stays platform-only.
 - OVN-Kubernetes hands an address on only once the pod holding it is gone, so the window needs a force delete (grace 0) or a leave report that never reached the controller.
-- Each time a truster is reconciled, an address another Gateway's live instance reports is left out, whatever the edge reported last. The new holder's own report does not reconcile the truster.
+- Each time a truster is reconciled, an address another Gateway's live instance reports is left out, whatever the edge reported last.
+- The new holder's own report does not reconcile the truster: it stays trusted until the truster's next pass. The MultiNetworkPolicy admitting only the edge's pods to a project Gateway holds meanwhile.
 
 ## Primary UDN
 
