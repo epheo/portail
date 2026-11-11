@@ -69,17 +69,27 @@ pub struct DialOut {
 }
 
 impl DialOut {
-    /// From this pod's `interfaces`, (name, IP).
-    pub fn of(interfaces: &[(String, String)], networks: &[NetworkCidrs]) -> Self {
+    /// From this pod's `interfaces`, (name, IP). `known` are IPs whose
+    /// interface listens: a listening Network's, the pod's own. While a
+    /// dial-out network has no CIDRs read, any other interface may be its,
+    /// so every address on it counts as dial-out: a named address there
+    /// would otherwise bind on a network the Gateway only dials out on.
+    pub fn of(
+        interfaces: &[(String, String)],
+        networks: &[NetworkCidrs],
+        known: &[String],
+    ) -> Self {
         let mut out = Self::declared(networks);
-        let theirs: Vec<&str> = interfaces
-            .iter()
-            .filter(|(_, ip)| dialed_cidrs(networks).any(|c| in_cidr(ip, c)))
-            .map(|(name, _)| name.as_str())
-            .collect();
+        let holds = |name: &str, test: &dyn Fn(&str) -> bool| {
+            interfaces.iter().any(|(n, ip)| n == name && test(ip))
+        };
+        let dialed = |ip: &str| dialed_cidrs(networks).any(|c| in_cidr(ip, c));
+        let listens = |ip: &str| known.iter().any(|k| same_ip(k, ip));
+        let theirs =
+            |name: &str| holds(name, &dialed) || (out.unresolved && !holds(name, &listens));
         out.ips = interfaces
             .iter()
-            .filter(|(name, _)| theirs.contains(&name.as_str()))
+            .filter(|(name, _)| theirs(name))
             .map(|(_, ip)| ip.clone())
             .collect();
         out
@@ -108,6 +118,14 @@ impl DialOut {
             .iter()
             .filter(|n| !n.listeners && n.cidrs.is_empty())
             .map(|n| n.name.as_str())
+    }
+}
+
+/// Equal as addresses, whatever their spelling.
+fn same_ip(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => a.to_canonical() == b.to_canonical(),
+        _ => false,
     }
 }
 
@@ -186,14 +204,33 @@ pub fn bind_addresses(
     addresses: &[String],
     networks: &[NetworkCidrs],
     interfaces: &[(String, String)],
+    pod_ip: Option<&str>,
 ) -> Option<Vec<String>> {
     let local: Vec<String> = interfaces.iter().map(|(_, ip)| ip.clone()).collect();
+    let resolved = resolve_networks(addresses, networks, &local);
+    let known = listening_ips(&resolved, networks, pod_ip);
     bind_addresses_resolved(
         addresses,
-        &resolve_networks(addresses, networks, &local),
+        &resolved,
         &local,
-        &DialOut::of(interfaces, networks),
+        &DialOut::of(interfaces, networks, &known),
     )
+}
+
+/// The IPs whose interfaces listen: each resolved listening Network's,
+/// and the pod's own.
+pub fn listening_ips(
+    resolved: &BTreeMap<String, String>,
+    networks: &[NetworkCidrs],
+    pod_ip: Option<&str>,
+) -> Vec<String> {
+    let listening = |name: &str| networks.iter().any(|n| n.name == name && n.listeners);
+    resolved
+        .iter()
+        .filter(|(name, _)| listening(name))
+        .map(|(_, ip)| ip.clone())
+        .chain(pod_ip.map(str::to_string))
+        .collect()
 }
 
 /// [`bind_addresses`] once the networks are resolved: what a report's
@@ -339,13 +376,16 @@ mod tests {
             "203.0.113.10", // LB VIP: external, not bindable here
         ]);
         assert_eq!(
-            bind_addresses(&spec, &networks, &own(&local)),
+            bind_addresses(&spec, &networks, &own(&local), None),
             Some(strings(&["10.244.1.5", "192.168.10.3"]))
         );
-        assert_eq!(bind_addresses(&[], &networks, &own(&local)), Some(vec![]));
+        assert_eq!(
+            bind_addresses(&[], &networks, &own(&local), None),
+            Some(vec![])
+        );
         // A VIP alone binds every interface; the Service carries it.
         assert_eq!(
-            bind_addresses(&strings(&["203.0.113.10"]), &networks, &own(&local)),
+            bind_addresses(&strings(&["203.0.113.10"]), &networks, &own(&local), None),
             Some(vec![])
         );
     }
@@ -363,9 +403,15 @@ mod tests {
     fn without_a_dialed_network_every_interface_binds() {
         let local = strings(&["10.244.1.5", "10.250.0.9"]);
         let networks = [network("udn-a", "192.168.10.0/24")];
-        assert_eq!(bind_addresses(&[], &networks, &own(&local)), Some(vec![]));
+        assert_eq!(
+            bind_addresses(&[], &networks, &own(&local), None),
+            Some(vec![])
+        );
         let vip = strings(&["203.0.113.10"]);
-        assert_eq!(bind_addresses(&vip, &networks, &own(&local)), Some(vec![]));
+        assert_eq!(
+            bind_addresses(&vip, &networks, &own(&local), None),
+            Some(vec![])
+        );
     }
 
     /// The edge on transit, fronted by a LoadBalancer: its listeners bind
@@ -380,11 +426,14 @@ mod tests {
         let networks = [dialed("transit", "10.250.0.0/16")];
         let vip = strings(&["203.0.113.10"]);
         let want = Some(strings(&["10.244.1.5", "fd00:10:244::5"]));
-        assert_eq!(bind_addresses(&vip, &networks, &interfaces), want);
-        assert_eq!(bind_addresses(&[], &networks, &interfaces), want);
+        assert_eq!(bind_addresses(&vip, &networks, &interfaces, None), want);
+        assert_eq!(bind_addresses(&[], &networks, &interfaces, None), want);
         // An IPAddress on transit binds nowhere, so the rest bind as above.
         let on_transit = strings(&["10.250.0.9"]);
-        assert_eq!(bind_addresses(&on_transit, &networks, &interfaces), want);
+        assert_eq!(
+            bind_addresses(&on_transit, &networks, &interfaces, None),
+            want
+        );
         // Its IP there is still resolved, for reports and trust.
         let local = strings(&["10.244.1.5", "fd00:10:244::5", "10.250.0.9"]);
         assert_eq!(
@@ -404,15 +453,15 @@ mod tests {
             ("net1", "fd00:250::9"),
         ]);
         let networks = [dialed("transit", "10.250.0.0/16")];
-        let dial_out = DialOut::of(&interfaces, &networks);
+        let dial_out = DialOut::of(&interfaces, &networks, &[]);
         assert_eq!(dial_out.ips, strings(&["10.250.0.9", "fd00:250::9"]));
         assert_eq!(
-            bind_addresses(&[], &networks, &interfaces),
+            bind_addresses(&[], &networks, &interfaces, None),
             Some(strings(&["10.244.1.5"]))
         );
         let named = strings(&["fd00:250::9"]);
         assert_eq!(
-            bind_addresses(&named, &networks, &interfaces),
+            bind_addresses(&named, &networks, &interfaces, None),
             Some(strings(&["10.244.1.5"])),
             "a named address on it binds nowhere"
         );
@@ -428,17 +477,68 @@ mod tests {
             cidrs: vec![],
             ..dialed("transit", "10.250.0.0/16")
         }];
-        assert_eq!(bind_addresses(&[], &networks, &interfaces), None);
+        assert_eq!(bind_addresses(&[], &networks, &interfaces, None), None);
         let vip = strings(&["203.0.113.10"]);
-        assert_eq!(bind_addresses(&vip, &networks, &interfaces), None);
+        assert_eq!(bind_addresses(&vip, &networks, &interfaces, None), None);
         let named = strings(&["10.244.1.5"]);
         assert_eq!(
-            bind_addresses(&named, &networks, &interfaces),
+            bind_addresses(&named, &networks, &interfaces, Some("10.244.1.5")),
             Some(named.clone())
         );
         assert_eq!(
             DialOut::unresolved_names(&networks).collect::<Vec<_>>(),
             ["transit"]
+        );
+    }
+
+    /// While a dialed network is unresolved, its interface cannot be told
+    /// apart: a named address binds only where the pod is known to listen,
+    /// its own IP's interface or a listening Network's.
+    #[test]
+    fn an_unresolved_dialed_network_binds_named_addresses_only_where_known() {
+        let interfaces = table(&[
+            ("eth0", "10.244.1.5"),
+            ("net1", "10.250.0.9"),
+            ("net2", "192.168.10.3"),
+        ]);
+        let networks = [
+            NetworkCidrs {
+                cidrs: vec![],
+                ..dialed("transit", "10.250.0.0/16")
+            },
+            network("udn-a", "192.168.10.0/24"),
+        ];
+        let pod = Some("10.244.1.5");
+        let on_transit = strings(&["10.250.0.9"]);
+        assert_eq!(
+            bind_addresses(&on_transit, &networks, &interfaces, pod),
+            None
+        );
+        let both = strings(&["10.250.0.9", "10.244.1.5"]);
+        assert_eq!(
+            bind_addresses(&both, &networks, &interfaces, pod),
+            Some(strings(&["10.244.1.5"]))
+        );
+        let with_network = strings(&["udn-a", "10.250.0.9"]);
+        assert_eq!(
+            bind_addresses(&with_network, &networks, &interfaces, pod),
+            Some(strings(&["192.168.10.3"]))
+        );
+        let known = listening_ips(
+            &resolve_networks(&with_network, &networks, &strings(&["192.168.10.3"])),
+            &networks,
+            pod,
+        );
+        let dial_out = DialOut::of(&interfaces, &networks, &known);
+        assert_eq!(
+            dial_out.ips,
+            strings(&["10.250.0.9"]),
+            "reported as dial-out"
+        );
+        assert_eq!(
+            bind_addresses(&strings(&["10.244.1.5"]), &networks, &interfaces, None),
+            None,
+            "without the pod's own IP nothing is known"
         );
     }
 
@@ -449,7 +549,7 @@ mod tests {
         let interfaces = table(&[("eth0", "10.244.1.5"), ("net1", "10.250.0.9")]);
         let networks = [dialed("transit", "10.250.0.0/16")];
         let spec = strings(&["udn-a"]);
-        assert_eq!(bind_addresses(&spec, &networks, &interfaces), None);
+        assert_eq!(bind_addresses(&spec, &networks, &interfaces, None), None);
     }
 
     /// Addresses it listens on bind as before; the dialed network adds none.
@@ -466,7 +566,7 @@ mod tests {
         ];
         let spec = strings(&["udn-a"]);
         assert_eq!(
-            bind_addresses(&spec, &networks, &interfaces),
+            bind_addresses(&spec, &networks, &interfaces, None),
             Some(strings(&["192.168.10.3"]))
         );
     }
@@ -480,7 +580,7 @@ mod tests {
             dialed("transit", "10.250.0.0/16"),
             dialed("transit6", "fd00:250::/64"),
         ];
-        assert_eq!(bind_addresses(&[], &networks, &interfaces), None);
+        assert_eq!(bind_addresses(&[], &networks, &interfaces, None), None);
     }
 
     /// A Network address binds this pod's IP on that network, not every
@@ -495,7 +595,7 @@ mod tests {
             BTreeMap::from([("udn-a".to_string(), "192.168.10.3".to_string())])
         );
         assert_eq!(
-            bind_addresses(&spec, &networks, &own(&local)),
+            bind_addresses(&spec, &networks, &own(&local), None),
             Some(strings(&["192.168.10.3"]))
         );
     }
@@ -507,9 +607,9 @@ mod tests {
         // TEST-NET-1: no pod has an address there.
         let networks = [network("udn-a", "192.0.2.0/24")];
         let mut spec = strings(&["udn-a"]);
-        assert_eq!(bind_addresses(&spec, &networks, &own(&local)), None);
+        assert_eq!(bind_addresses(&spec, &networks, &own(&local), None), None);
         assert_eq!(
-            bind_addresses(&spec, &[], &own(&local)),
+            bind_addresses(&spec, &[], &own(&local), None),
             None,
             "no CIDRs read"
         );
@@ -518,7 +618,7 @@ mod tests {
         // A local address still binds; the unresolved name adds nothing.
         spec.push("10.244.1.5".to_string());
         assert_eq!(
-            bind_addresses(&spec, &networks, &own(&local)),
+            bind_addresses(&spec, &networks, &own(&local), None),
             Some(strings(&["10.244.1.5"]))
         );
     }

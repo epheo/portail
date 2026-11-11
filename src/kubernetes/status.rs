@@ -221,7 +221,7 @@ pub(crate) fn address(address_type: &str, value: &str) -> Value {
 /// `[Accepted, Programmed]`, every listener entry, and the addresses.
 /// `addresses: None` leaves the field out: no placeholder is ever written.
 pub(crate) fn desired_gateway_status(
-    conditions: [Value; 2],
+    conditions: Vec<Value>,
     listeners: Vec<Value>,
     addresses: Option<Vec<Value>>,
 ) -> Value {
@@ -423,6 +423,11 @@ pub(crate) async fn write_gateway_status(
 /// the ServiceAccount they prove. A console may then let tenants' data
 /// planes poll through the apiserver, where they share one address.
 pub(crate) const GATEWAYS_ISOLATED: &str = "portail.epheo.eu/GatewaysIsolated";
+
+/// False, naming each spec address no data plane holds, while another is
+/// held: Gateway API's AddressNotAssigned on Programmed is for none held,
+/// and one missing rented IP must not take the other listeners down.
+pub(crate) const ADDRESSES_ASSIGNED: &str = "portail.epheo.eu/AddressesAssigned";
 
 /// `isolated`: sync tokens are verified locally (the per-Gateway poll cap
 /// always holds).
@@ -1113,7 +1118,7 @@ mod tests {
             ..Default::default()
         };
         desired_gateway_status(
-            [
+            vec![
                 condition("Accepted", true, "Accepted", "ok", generation),
                 condition("Programmed", true, "Programmed", "ok", generation),
             ],

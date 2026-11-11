@@ -8,6 +8,8 @@
 
 ## From 0.2.1
 
+- A Gateway without a Service whose `spec.addresses` `IPAddress` values are on no data-plane pod now says so: `portail.epheo.eu/AddressesAssigned` `False` while another address is held, `Programmed` `False`, reason `AddressNotAssigned`, when none is. It binds as before.
+- An Unmanaged data plane on a dial-out network should set `POD_IP` (`status.podIP` through the downward API): while that network is unresolved, a named address binds only on its pod IP's interface or a listening Network's.
 - Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.
 - To keep them, set `externalNameBackends: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
 - Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.

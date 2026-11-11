@@ -116,6 +116,9 @@ A name longer than a label allows is cut and suffixed with a hash of the full na
 - A listener that gains a local address leaves all interfaces for it in the same apply, and goes back when it loses it.
 - A listener whose published port changes while its bound port stays reopens that socket in the same apply, to route and terminate as the new port.
 - A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
+- No Service: an `IPAddress` in `spec.addresses` that no data plane holds is named in `portail.epheo.eu/AddressesAssigned`, `False`, reason `AddressNotAssigned`, with why for each address. `Programmed` stays `True` while another address of the Gateway is held, so a missing rented IP never takes the other listeners down.
+- None of the spec's addresses held: `Programmed` is `False`, reason `AddressNotAssigned`.
+- The condition goes once every address is held. With no data plane at the served version, what was written stays.
 
 ## GatewayParameters
 
@@ -195,6 +198,10 @@ Two replicas spread across nodes when there are several.
 - That list is read at each apply: an address the pod gains later binds at the next apply. Every other Gateway keeps every interface, which follows addresses as they come.
 - Loopback is never in that list: such a Gateway no longer answers on 127.0.0.1.
 - Its NetworkAttachmentDefinition gone, or naming no subnet: its interface cannot be told apart, so the Gateway binds only the addresses it names, as for a Network address not resolved; with none, nothing binds and `Programmed` is `False`, reason `AddressNotUsable`.
+- Meanwhile a named address binds only on an interface known to listen: the one holding a resolved listening Network's IP, or the pod's own IP. Every other interface may be the unresolved network's, and its addresses are reported among the dial-out ones.
+- The pod's own IP is `POD_IP`, which Managed pods get from `status.podIP` through the downward API: the kubelet's word, not the pod's. An Unmanaged pod without `POD_IP` knows only its listening Networks' interfaces.
+- A named address held back says why in `portail.epheo.eu/AddressesAssigned`, or in `Programmed` when nothing binds.
+- A dial-out interface not yet holding its IP is not recognized as dial-out: its other addresses bind until the next apply. CNI configures interfaces before the container starts, so a running data plane does not meet one.
 - It does not change the Service default: a Gateway with `networks` gets `None`. An edge behind a LoadBalancer sets `service.type: LoadBalancer`.
 - Only platform namespaces attach such a network to Gateways; the edge is the case it is for ([Edge mode](#edge-mode)).
 
