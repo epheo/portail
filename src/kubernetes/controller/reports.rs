@@ -98,6 +98,21 @@ impl ReportStore {
         live
     }
 
+    /// `visit` each live report of `gateway` in place: a report as large
+    /// as its sender made it is never copied.
+    pub(crate) fn for_each_live(
+        &self,
+        gateway: &GatewayKey,
+        mut visit: impl FnMut(&InstanceReport),
+    ) {
+        let gateways = self.gateways();
+        for entry in gateways.get(gateway).into_iter().flat_map(|i| i.values()) {
+            if entry.seen.elapsed() < LIVENESS && !entry.report.leaving {
+                visit(&entry.report);
+            }
+        }
+    }
+
     /// When an instance of `gateway` last said it was leaving: its
     /// replacement is due. Kept until that instance is pruned.
     pub(crate) fn last_leaving(&self, gateway: &GatewayKey) -> Option<Instant> {

@@ -343,8 +343,12 @@ pub(crate) async fn translate(
             }));
         }
     };
-    let targets = gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
-    ctx.dependents
+    gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
+    let targets = std::mem::take(&mut result.gateway_targets)
+        .into_iter()
+        .map(|(namespace, name)| GatewayKey::new(namespace, name))
+        .collect();
+    ctx.backends
         .record(GatewayKey::new(gw_ns.clone(), gw_name.clone()), targets);
     let statuses = Statuses {
         accepted,

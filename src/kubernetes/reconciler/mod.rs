@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use gateway_api::experimental::tcproutes::*;
@@ -234,6 +234,9 @@ pub struct ReconcileResult {
     pub config: PortailConfig,
     pub route_status: Vec<RouteAcceptance>,
     pub policy_status: Vec<PolicyAcceptance>,
+    /// (namespace, name) of each Gateway a backendRef names past its
+    /// ReferenceGrant, valid or not.
+    pub gateway_targets: BTreeSet<(String, String)>,
 }
 
 /// Computed Accepted condition for one RateLimitPolicy against this Gateway.
@@ -366,6 +369,7 @@ pub(crate) fn reconcile_to_config(
             a.r#type.as_deref() == Some(crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE)
         }),
         gateways: &snapshot.gateways,
+        watched: Default::default(),
         listeners: &listeners,
         namespace_labels: &snapshot.namespace_labels,
         reference_grants: &snapshot.reference_grants,
@@ -404,6 +408,7 @@ pub(crate) fn reconcile_to_config(
         },
         route_status,
         policy_status,
+        gateway_targets: cx.watched.into_inner(),
     })
 }
 
@@ -653,6 +658,8 @@ struct RouteCollectCtx<'a> {
     /// shares a network with a Gateway backend.
     on_network: bool,
     gateways: &'a HashMap<(String, String), Vec<u16>>,
+    /// The Gateways this one's refs name past their ReferenceGrant.
+    watched: std::cell::RefCell<BTreeSet<(String, String)>>,
     listeners: &'a [GatewayListeners],
     namespace_labels: &'a HashMap<String, BTreeMap<String, String>>,
     reference_grants: &'a [ReferenceGrant],
@@ -679,6 +686,79 @@ fn precedence<R: GatewayRoute>(a: &R, b: &R) -> std::cmp::Ordering {
 /// Generic route collection with namespace scoping and acceptance tracking.
 /// Configs come out in precedence order: the table keeps insertion order
 /// among equally specific rules.
+/// A backendRef naming another Gateway of this controller, reached on a
+/// network both share. One past the ReferenceGrant and not the Gateway
+/// itself is watched, valid or not: the target's own events then wake
+/// this Gateway. A ref a grant refused subscribes to nothing.
+fn check_gateway(
+    cx: &RouteCollectCtx,
+    kind: &str,
+    route_ns: &str,
+    backend_name: &str,
+    port: u16,
+) -> Option<(&'static str, String)> {
+    let Some((gw, gw_ns)) = parse_gateway_backend_name(backend_name) else {
+        return Some((
+            "BackendNotFound",
+            format!("Backend Gateway {:?} names no Gateway", backend_name),
+        ));
+    };
+    if !is_reference_allowed(
+        cx.reference_grants,
+        GATEWAY_GROUP,
+        kind,
+        route_ns,
+        GATEWAY_GROUP,
+        "Gateway",
+        &gw_ns,
+        &gw,
+    ) {
+        return Some((
+            "RefNotPermitted",
+            format!(
+                "Cross-namespace reference to Gateway {}/{} not allowed by ReferenceGrant",
+                gw_ns, gw
+            ),
+        ));
+    }
+    if gw == cx.gateway_name && gw_ns == cx.gateway_ns {
+        return Some((
+            "BackendNotFound",
+            "A Gateway cannot be its own backend".into(),
+        ));
+    }
+    cx.watched.borrow_mut().insert((gw_ns.clone(), gw.clone()));
+    let Some(ports) = cx.gateways.get(&(gw_ns.clone(), gw.clone())) else {
+        return Some((
+            "BackendNotFound",
+            format!(
+                "Backend Gateway {}/{} not found, or not served by this controller",
+                gw_ns, gw
+            ),
+        ));
+    };
+    if !ports.contains(&port) {
+        return Some((
+            "BackendNotFound",
+            format!(
+                "Backend Gateway {}/{} has no listener on port {}",
+                gw_ns, gw, port
+            ),
+        ));
+    }
+    if !cx.on_network {
+        return Some((
+            "BackendNotFound",
+            format!(
+                "Backend Gateway {}/{} is reached on a network both share: this Gateway \
+                 needs a portail.epheo.eu/Network address",
+                gw_ns, gw
+            ),
+        ));
+    }
+    None
+}
+
 fn collect_routes<R: GatewayRoute>(
     routes: &[Arc<R>],
     cx: &RouteCollectCtx,
@@ -815,65 +895,6 @@ fn collect_routes<R: GatewayRoute>(
         let mut refs_reason = "ResolvedRefs";
         let mut invalid_mirrors: HashSet<(String, u16)> = HashSet::new();
 
-        // Another Gateway of this controller, reached on a network both
-        // share.
-        let check_gateway = |backend_name: &str, port: u16| -> Option<(&'static str, String)> {
-            let (gw, gw_ns) = parse_gateway_backend_name(backend_name)?;
-            if !is_reference_allowed(
-                cx.reference_grants,
-                GATEWAY_GROUP,
-                kind,
-                route_ns,
-                GATEWAY_GROUP,
-                "Gateway",
-                &gw_ns,
-                &gw,
-            ) {
-                return Some((
-                    "RefNotPermitted",
-                    format!(
-                        "Cross-namespace reference to Gateway {}/{} not allowed by ReferenceGrant",
-                        gw_ns, gw
-                    ),
-                ));
-            }
-            if gw == cx.gateway_name && gw_ns == cx.gateway_ns {
-                return Some((
-                    "BackendNotFound",
-                    "A Gateway cannot be its own backend".into(),
-                ));
-            }
-            let Some(ports) = cx.gateways.get(&(gw_ns.clone(), gw.clone())) else {
-                return Some((
-                    "BackendNotFound",
-                    format!(
-                        "Backend Gateway {}/{} not found, or not served by this controller",
-                        gw_ns, gw
-                    ),
-                ));
-            };
-            if !ports.contains(&port) {
-                return Some((
-                    "BackendNotFound",
-                    format!(
-                        "Backend Gateway {}/{} has no listener on port {}",
-                        gw_ns, gw, port
-                    ),
-                ));
-            }
-            if !cx.on_network {
-                return Some((
-                    "BackendNotFound",
-                    format!(
-                        "Backend Gateway {}/{} is reached on a network both share: this Gateway \
-                         needs a portail.epheo.eu/Network address",
-                        gw_ns, gw
-                    ),
-                ));
-            }
-            None
-        };
-
         // Group/kind (core Service only), cross-namespace ReferenceGrant,
         // service existence and ExternalName refusal: one checker for
         // forward and mirror refs.
@@ -951,7 +972,7 @@ fn collect_routes<R: GatewayRoute>(
                 let by = if forward { kind } else { "request mirror" };
                 return Some(("InvalidKind", format!("A {} cannot name a Gateway", by)));
             }
-            check_gateway(backend_name, port)
+            check_gateway(cx, kind, route_ns, backend_name, port)
         };
 
         // An invalid ref keeps its weight so its share fails rather
