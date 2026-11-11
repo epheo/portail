@@ -73,6 +73,7 @@ Managed data planes run with `--gateway`, `--controller-address`, `--admin-addre
 | `PORTAIL_MAX_BLOCKING_THREADS` | Tokio blocking-thread cap (default: `32`) |
 | `POD_NAMESPACE` | The controller's `--namespace` default |
 | `PORTAIL_CONTROLLER_CA` | The data plane's controller CA, as PEM, when `--controller-ca-file` is not given |
+| `POD_IP` | The data plane's pod IP, `status.podIP` through the downward API (Managed pods get it): while a network it only dials out on is unresolved, a named address binds only on this IP's interface or a listening Network's |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | Set by kubelet: the data plane's `--apiserver-address` default with `--transport apiserver-proxy` |
 
 ## Admin Endpoint

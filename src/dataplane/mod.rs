@@ -79,7 +79,8 @@ pub async fn run(args: DataplaneArgs, stop: CancellationToken) -> anyhow::Result
         Arc::new(ArcSwap::from_pointee(RouteTable::new())),
         perf,
         ready.clone(),
-    );
+    )
+    .with_pod_ip(std::env::var("POD_IP").ok());
     let refresh_stop = CancellationToken::new();
     applier.spawn_dns_refresh(refresh_stop.clone());
     let via = match args.transport {

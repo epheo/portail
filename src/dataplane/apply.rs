@@ -10,7 +10,9 @@ use std::time::Instant;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio_util::sync::CancellationToken;
 
-use super::addresses::{bind_addresses_resolved, local_interfaces, resolve_networks, DialOut};
+use super::addresses::{
+    bind_addresses_resolved, listening_ips, local_interfaces, resolve_networks, DialOut,
+};
 use super::dns_refresh::{spawn_dns_refresh, Published};
 use crate::config::{
     parse_gateway_backend_name, ListenerConfig, PerformanceConfig, PortailConfig,
@@ -42,6 +44,10 @@ pub struct Applier {
     /// When the first value [`Keep`] carried lapses: the snapshot is applied
     /// again then, without it.
     kept_until: Option<tokio::time::Instant>,
+    /// status.podIP, from the downward API: the kubelet's, not the pod's
+    /// own word. Its interface is known to listen while a dial-out network
+    /// cannot be told apart.
+    pod_ip: Option<String>,
 }
 
 /// A Gateway backend or a trusted Gateway, as the controller marks it
@@ -286,7 +292,14 @@ impl Applier {
             started: Instant::now(),
             keep: Keep::default(),
             kept_until: None,
+            pod_ip: None,
         }
+    }
+
+    /// This pod's IP, as `POD_IP` carries it; `None` knows none.
+    pub fn with_pod_ip(mut self, pod_ip: Option<String>) -> Self {
+        self.pod_ip = pod_ip.filter(|ip| ip.parse::<std::net::IpAddr>().is_ok());
+        self
     }
 
     /// When a value kept for something pending lapses: apply again then.
@@ -319,7 +332,8 @@ impl Applier {
         let interfaces = local_interfaces();
         let local: Vec<String> = interfaces.iter().map(|(_, ip)| ip.clone()).collect();
         let networks = resolve_networks(&config.gateway.addresses, &snapshot.networks, &local);
-        let dial_out = DialOut::of(&interfaces, &snapshot.networks);
+        let known = listening_ips(&networks, &snapshot.networks, self.pod_ip.as_deref());
+        let dial_out = DialOut::of(&interfaces, &snapshot.networks, &known);
         let served = Served {
             bind: bind_addresses_resolved(&config.gateway.addresses, &networks, &local, &dial_out),
             config: Arc::new(config),
