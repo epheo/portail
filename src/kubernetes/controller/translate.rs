@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use gateway_api::gateways::Gateway;
 
+use super::gateway_backends;
+use super::reconcile::{class_owner, ClassOwner};
 use super::validate::{resolve_gateway_certs, validate_gateway};
 use super::watch::StatusReports;
 use super::{ControllerCtx, ResourceCache};
@@ -25,7 +27,7 @@ use crate::kubernetes::services::{
 };
 use crate::kubernetes::status;
 use crate::logging::error;
-use crate::sync::NetworkCidrs;
+use crate::sync::{GatewayKey, NetworkCidrs};
 
 /// One Gateway, translated.
 pub(crate) struct Plan {
@@ -212,6 +214,27 @@ fn observed_policies(
     out
 }
 
+/// This controller's Gateways with their listener ports: what a backendRef
+/// of kind Gateway may name.
+fn served_gateways(ctx: &ControllerCtx) -> HashMap<(String, String), Vec<u16>> {
+    let classes = ctx.cache.gateway_classes.state();
+    ctx.cache
+        .gateways
+        .state()
+        .iter()
+        .filter(|g| {
+            matches!(
+                class_owner(&classes, &g.spec.gateway_class_name, &ctx.controller_name),
+                ClassOwner::Ours
+            )
+        })
+        .filter_map(|g| {
+            let ports = g.spec.listeners.iter().map(|l| l.port as u16).collect();
+            Some(((g.namespace()?, g.metadata.name.clone()?), ports))
+        })
+        .collect()
+}
+
 /// Translate `gateway` from the reflector caches.
 pub(crate) async fn translate(
     ctx: &ControllerCtx,
@@ -243,6 +266,7 @@ pub(crate) async fn translate(
         reference_grants: cloned(&ctx.cache.reference_grants),
         services: ctx.cache.services.state(),
         rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
+        gateways: served_gateways(ctx),
     };
 
     ctx.certs.retain_referenced(&ctx.cache.gateways.state());
@@ -319,6 +343,9 @@ pub(crate) async fn translate(
             }));
         }
     };
+    let targets = gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
+    ctx.dependents
+        .record(GatewayKey::new(gw_ns.clone(), gw_name.clone()), targets);
     let statuses = Statuses {
         accepted,
         listeners,

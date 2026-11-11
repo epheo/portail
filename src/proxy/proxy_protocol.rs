@@ -74,6 +74,35 @@ pub(crate) async fn read_header<R: AsyncRead + Unpin>(stream: &mut R) -> io::Res
     })
 }
 
+/// The v2 header a connection to a Gateway backend opens with: PROXY for
+/// `client`, which reached this data plane at `local`. No TLVs.
+pub(crate) fn header(client: SocketAddr, local: SocketAddr) -> Vec<u8> {
+    let (src, dst) = (client.ip().to_canonical(), local.ip().to_canonical());
+    let mut h = Vec::with_capacity(52);
+    h.extend_from_slice(&SIGNATURE);
+    h.push(0x21);
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            h.extend_from_slice(&[0x11, 0, 12]);
+            h.extend_from_slice(&src.octets());
+            h.extend_from_slice(&dst.octets());
+        }
+        // One family per header: an IPv4 end goes IPv4-mapped.
+        _ => {
+            let v6 = |ip: IpAddr| match ip {
+                IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                IpAddr::V6(v6) => v6,
+            };
+            h.extend_from_slice(&[0x21, 0, 36]);
+            h.extend_from_slice(&v6(src).octets());
+            h.extend_from_slice(&v6(dst).octets());
+        }
+    }
+    h.extend_from_slice(&client.port().to_be_bytes());
+    h.extend_from_slice(&local.port().to_be_bytes());
+    h
+}
+
 /// An IPv4 or IPv6 network, host bits clear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
@@ -255,6 +284,41 @@ mod tests {
         cut.truncate(cut.len() - 1);
         assert!(read(&cut).await.0.is_err(), "TLVs cut short");
         assert!(read(&SIGNATURE).await.0.is_err(), "fixed part cut short");
+    }
+
+    #[tokio::test]
+    async fn a_written_header_reads_back_as_its_client() {
+        let cases = [
+            ("203.0.113.7:50000", "192.0.2.1:443", "203.0.113.7:50000"),
+            ("[2001:db8::7]:1", "[2001:db8::1]:80", "[2001:db8::7]:1"),
+            (
+                "203.0.113.7:2",
+                "[2001:db8::1]:80",
+                "[::ffff:203.0.113.7]:2",
+            ),
+            (
+                "[::ffff:203.0.113.7]:3",
+                "[::ffff:192.0.2.1]:443",
+                "203.0.113.7:3",
+            ),
+        ];
+        for (client, local, want) in cases {
+            let mut bytes = header(client.parse().unwrap(), local.parse().unwrap());
+            bytes.push(0x16);
+            let (read_back, rest) = read(&bytes).await;
+            assert_eq!(
+                read_back.unwrap(),
+                Header::Proxy(want.parse().unwrap()),
+                "{client}"
+            );
+            assert_eq!(rest, [0x16]);
+        }
+        let v4 = header(
+            "203.0.113.7:1".parse().unwrap(),
+            "192.0.2.1:2".parse().unwrap(),
+        );
+        assert_eq!(v4.len(), 28);
+        assert_eq!(&v4[12..16], &[0x21, 0x11, 0, 12]);
     }
 
     #[test]

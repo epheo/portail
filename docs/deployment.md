@@ -191,6 +191,30 @@ Two replicas spread across nodes when there are several.
 - Trust only what sends a header on every connection, and nothing a tenant can run: whoever sends from a trusted address names any client it likes.
 - Details: [configuration](configuration.md#proxy-protocol).
 
+### Gateway backends
+
+A route's backendRef may name another Gateway of this controller, reached on a network both share:
+
+```yaml
+backendRefs:
+- group: gateway.networking.k8s.io
+  kind: Gateway
+  name: publish
+  namespace: p-publish   # a ReferenceGrant there must allow it
+  port: 443              # one of its listener ports
+```
+
+- HTTPRoute, TLSRoute and TCPRoute; a UDPRoute or a request mirror naming a Gateway is `ResolvedRefs=False`, reason `InvalidKind`.
+- Another namespace: a ReferenceGrant in the target's, `to: [{group: gateway.networking.k8s.io, kind: Gateway}]`.
+- The referencing Gateway needs a `portail.epheo.eu/Network` address: its endpoints are where the target's live data planes bound that listener, inside that network's CIDRs.
+- No live instance there yet: its share fails (500, or the connection closes) until one reports.
+- Every connection to it opens with a PROXY protocol v2 header naming the client.
+- HTTP opens one connection per request to it: a header names one client, so none is pooled or reused.
+- The shared network must have subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC, so no pod sends from a Gateway's address.
+- Never put the shared network's CIDR in `trustedSources`: every Gateway on it could then name any client.
+- Edge mode, a Gateway behind another on a shared network, is not usable until `trustedSources` can name a Gateway.
+- Until then Gateway backends serve nothing safely: a target that does not trust the sender reads the header as request bytes and closes the connection.
+
 ## Primary UDN
 
 On OVN-Kubernetes, a pod in a namespace with a Primary User Defined Network reaches the apiserver and DNS on the default network, and nothing else: its data plane cannot dial the controller Service.

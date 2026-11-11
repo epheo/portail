@@ -509,6 +509,17 @@ pub struct BackendRef {
     pub invalid: bool,
 }
 
+/// The group of a backendRef that names another Gateway.
+pub const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
+
+impl BackendRef {
+    /// Another Gateway, reached on a network both share, behind a PROXY
+    /// v2 header naming the client.
+    pub fn is_gateway(&self) -> bool {
+        self.group == GATEWAY_GROUP && self.kind == "Gateway"
+    }
+}
+
 fn default_backend_kind() -> String {
     "Service".to_string()
 }

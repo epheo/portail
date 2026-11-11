@@ -481,10 +481,12 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
     let percent = rm.percent.map(|p| p.clamp(0, 100) as u32);
     RequestMirrorConfig {
         backend_ref: BackendRef {
-            name: backend_dns_name(
+            name: backend_ref_name(
                 &rm.backend_ref.name,
                 rm.backend_ref.namespace.as_deref(),
                 ns,
+                rm.backend_ref.group.as_deref(),
+                rm.backend_ref.kind.as_deref(),
             ),
             port: rm.backend_ref.port.unwrap_or(80) as u16,
             weight: 1,
@@ -528,7 +530,13 @@ fn convert_http_backend_ref(
         })
         .collect();
     let backend = BackendRef {
-        name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
+        name: backend_ref_name(
+            &br.name,
+            br.namespace.as_deref(),
+            ns,
+            br.group.as_deref(),
+            br.kind.as_deref(),
+        ),
         port: br.port.unwrap_or(80) as u16,
         weight: br.weight.unwrap_or(1) as u32,
         group: br.group.clone().unwrap_or_default(),
@@ -627,7 +635,13 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
         },
     };
     BackendRef {
-        name: backend_dns_name(br.br_name(), br.br_namespace(), ns),
+        name: backend_ref_name(
+            br.br_name(),
+            br.br_namespace(),
+            ns,
+            br.br_group(),
+            br.br_kind(),
+        ),
         port,
         weight: br.br_weight().unwrap_or(1) as u32,
         group: br.br_group().unwrap_or_default().to_string(),
@@ -719,6 +733,29 @@ pub(crate) fn backend_dns_name(
 ) -> String {
     let ns = namespace.unwrap_or(route_namespace);
     format!("{}.{}.svc", name, ns)
+}
+
+/// A backendRef's name: a Service's DNS name, or for another Gateway
+/// `{gateway}.{namespace}.gateway`, which no Service's overrides are keyed
+/// by.
+pub(crate) fn backend_ref_name(
+    name: &str,
+    namespace: Option<&str>,
+    route_namespace: &str,
+    group: Option<&str>,
+    kind: Option<&str>,
+) -> String {
+    if group == Some(crate::config::GATEWAY_GROUP) && kind == Some("Gateway") {
+        format!("{}.{}.gateway", name, namespace.unwrap_or(route_namespace))
+    } else {
+        backend_dns_name(name, namespace, route_namespace)
+    }
+}
+
+/// A Gateway backend's name back into (gateway, namespace).
+pub(crate) fn parse_gateway_backend_name(name: &str) -> Option<(String, String)> {
+    let (gateway, ns) = name.strip_suffix(".gateway")?.rsplit_once('.')?;
+    Some((gateway.to_string(), ns.to_string()))
 }
 
 /// Parse a DNS-style backend name back into (service_name, namespace).

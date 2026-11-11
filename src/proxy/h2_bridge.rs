@@ -86,6 +86,7 @@ pub(crate) struct H2Ctx {
     pub(crate) cfg: WorkerConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
+    pub(crate) local: SocketAddr,
     /// Cancelled when the data plane drains: the connection sends GOAWAY.
     pub(crate) drain: CancellationToken,
 }
@@ -350,7 +351,8 @@ async fn serve_stream(
         ctx.selector.clone(),
         ctx.health.clone(),
         true,
-        ctx.peer.ip(),
+        ctx.peer,
+        ctx.local,
         &ctx.cfg,
         ctx.listener_stats.clone(),
         // The connection drains by GOAWAY, which lets every accepted stream
@@ -1224,6 +1226,7 @@ mod tests {
             cfg,
             listener_stats: Arc::new(ListenerStats::default()),
             peer: "127.0.0.1:40000".parse().unwrap(),
+            local: "127.0.0.1:8080".parse().unwrap(),
             drain: CancellationToken::new(),
         }
     }
