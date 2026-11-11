@@ -10,6 +10,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use kube::ResourceExt;
 
 use super::ControllerCtx;
+use crate::dataplane::addresses::in_cidr;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
     ControllerTransport, ExternalNameBackends, GatewayParameters, GatewayParametersSpec,
@@ -17,6 +18,7 @@ use crate::kubernetes::crds::{
 };
 use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::GatewayKey;
+use crate::sync::NetworkCidrs;
 
 const GROUP: &str = "portail.epheo.eu";
 const KIND: &str = "GatewayParameters";
@@ -62,6 +64,26 @@ impl Params {
             .collect()
     }
 }
+
+/// Why an `IPAddress` of `gateway` cannot be used: it is inside a network
+/// its parameters attach to dial out on, where no listener binds.
+pub(crate) fn dial_out_address(gateway: &Gateway, networks: &[NetworkCidrs]) -> Option<String> {
+    let dialed = || networks.iter().filter(|n| !n.listeners);
+    gateway.spec.addresses.iter().flatten().find_map(|a| {
+        if a.r#type.as_deref().unwrap_or(IP_ADDRESS_TYPE) != IP_ADDRESS_TYPE {
+            return None;
+        }
+        let value = a.value.as_deref()?;
+        let network = dialed().find(|n| n.cidrs.iter().any(|c| in_cidr(value, c)))?;
+        Some(format!(
+            "spec.addresses: IPAddress {value} is inside network {:?}, which this Gateway's \
+             parameters attach with listeners: false: no listener binds there",
+            network.name
+        ))
+    })
+}
+
+const IP_ADDRESS_TYPE: &str = "IPAddress";
 
 /// `Err` says why the parameters cannot be used: the Gateway is
 /// Accepted=False InvalidParameters, and its last snapshot and objects
@@ -344,16 +366,18 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
     let worker_threads = cpu_limit(Some(&resources))
         .and_then(|cpu| cpu_cores(&cpu.0))
         .map(|cores| (cores.ceil() as u32).clamp(1, MAX_WORKER_THREADS));
-    // Operator parity: a Gateway listening on Multus networks binds on
-    // them, and nothing fronts it. One that only dials out on them still
-    // listens behind its Service.
-    let service_type = spec.service.and_then(|s| s.type_).unwrap_or(
-        if network_address || networks.iter().any(|n| !n.egress_only()) {
-            ServiceType::None
-        } else {
-            ServiceType::LoadBalancer
-        },
-    );
+    // Operator parity: a Gateway on Multus networks binds on them, and
+    // nothing fronts it. One that only dials out on them asks for its
+    // Service: a class adding such a network must never publish its
+    // Gateways around an edge.
+    let service_type =
+        spec.service
+            .and_then(|s| s.type_)
+            .unwrap_or(if network_address || !networks.is_empty() {
+                ServiceType::None
+            } else {
+                ServiceType::LoadBalancer
+            });
     Ok(Params {
         provisioning,
         replicas,
@@ -884,8 +908,8 @@ networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
     }
 
     /// A network listens unless its parameters say false; one it only
-    /// dials out on keeps the Service a Gateway without networks gets, and
-    /// counts among its egress networks, in its namespace unless named.
+    /// dials out on counts among its egress networks, in its namespace
+    /// unless named, and leaves the Service None like any network.
     #[tokio::test]
     async fn a_network_listens_unless_attached_for_dialing_out() {
         let mut cluster = cluster(None);
@@ -919,7 +943,43 @@ networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
             ),
         );
         let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
-        assert_eq!(params.service_type, ServiceType::LoadBalancer);
+        assert_eq!(
+            params.service_type,
+            ServiceType::None,
+            "a dial-out network alone never brings a Service"
+        );
+    }
+
+    /// An IPAddress inside a network the parameters dial out on would never
+    /// bind: refused once its CIDRs are known. One on a network it listens
+    /// on, or elsewhere, stands.
+    #[test]
+    fn an_ip_address_inside_a_dialed_network_is_refused() {
+        let networks = |listeners| {
+            vec![NetworkCidrs {
+                name: "transit".into(),
+                cidrs: vec!["10.250.0.0/16".into()],
+                listeners,
+            }]
+        };
+        let with = |value: &str| {
+            let mut gw = testkit::gateway("edge", 1);
+            gw.spec.addresses = Some(vec![serde_json::from_value(
+                serde_json::json!({"type": "IPAddress", "value": value}),
+            )
+            .unwrap()]);
+            gw
+        };
+        let why = dial_out_address(&with("10.250.0.5"), &networks(false)).unwrap();
+        assert!(
+            why.contains("10.250.0.5") && why.contains("\"transit\""),
+            "{why}"
+        );
+        assert_eq!(dial_out_address(&with("10.250.0.5"), &networks(true)), None);
+        assert_eq!(
+            dial_out_address(&with("203.0.113.10"), &networks(false)),
+            None
+        );
     }
 
     /// A Network address binds listeners: naming one the parameters attach

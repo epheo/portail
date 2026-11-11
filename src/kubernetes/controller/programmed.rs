@@ -15,7 +15,7 @@ use super::provision;
 use super::reports::InstanceId;
 use super::translate::Statuses;
 use super::ControllerCtx;
-use crate::dataplane::addresses::{bind_addresses_resolved, unresolved_networks};
+use crate::dataplane::addresses::{bind_addresses_resolved, unresolved_networks, DialOut};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::status::{self, condition, GatewayCondition, ListenerStatus};
 use crate::logging::debug;
@@ -402,7 +402,7 @@ fn evaluate(
                 &config.gateway.addresses,
                 &r.networks,
                 &r.interface_ips,
-                &served.networks,
+                &DialOut::reported(&served.networks, &r.dial_out_ips),
             )
         })
         .collect();
@@ -451,12 +451,19 @@ fn evaluate(
         GatewayCondition {
             ok: false,
             reason: "AddressNotUsable".to_string(),
-            message: format!(
-                "Network address {} has no IP on this pod, or its NetworkAttachmentDefinition \
-                 could not be read, so no listener of this Gateway is bound; check the \
-                 NetworkAttachmentDefinition and the pod's network attachment",
-                unresolved_networks(&config.gateway.addresses, &at_version[0].networks).join(", ")
-            ),
+            message: {
+                let unresolved: Vec<&str> =
+                    unresolved_networks(&config.gateway.addresses, &at_version[0].networks)
+                        .into_iter()
+                        .chain(DialOut::unresolved_names(&served.networks))
+                        .collect();
+                format!(
+                    "Network {} has no IP on this pod, or its NetworkAttachmentDefinition could \
+                     not be read, so no listener of this Gateway is bound; check the \
+                     NetworkAttachmentDefinition and the pod's network attachment",
+                    unresolved.join(", ")
+                )
+            },
         }
     } else if all_bound {
         GatewayCondition::ok("Programmed", "Programmed")
@@ -489,6 +496,12 @@ fn instance_addresses(
         if bind.is_none() {
             continue;
         }
+        // Held where it bound: an address on a network it only dials out
+        // on is on the pod, never bound.
+        let bound_on = |ip: &String| {
+            bind.as_ref()
+                .is_some_and(|b| b.is_empty() || b.contains(ip))
+        };
         let held: Vec<String> = spec
             .iter()
             .filter_map(|a| {
@@ -503,6 +516,7 @@ fn instance_addresses(
                     _ => None,
                 }
             })
+            .filter(bound_on)
             .collect();
         if held.is_empty() {
             // Where it bound, never a network it only dials out on.
@@ -675,6 +689,20 @@ mod tests {
             [(IP_ADDRESS, "10.250.0.9".to_string())],
             "first interface"
         );
+    }
+
+    /// A spec IPAddress on the pod but never bound, inside a network it
+    /// only dials out on, is not shown as held.
+    #[test]
+    fn an_address_never_bound_is_not_held() {
+        let mut gw = crate::kubernetes::controller::testkit::gateway("edge", 1);
+        gw.spec.addresses = Some(vec![serde_json::from_value(
+            serde_json::json!({"type": "IPAddress", "value": "10.250.0.9"}),
+        )
+        .unwrap()]);
+        let r = report("v1", &["10.250.0.9", "10.244.1.5"], true);
+        let held = instance_addresses(&gw, &[&r], &[Some(vec!["10.244.1.5".into()])]);
+        assert_eq!(held, [(IP_ADDRESS, "10.244.1.5".to_string())]);
     }
 
     fn live(reports: Vec<InstanceReport>) -> Vec<(InstanceId, InstanceReport)> {

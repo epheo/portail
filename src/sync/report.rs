@@ -48,6 +48,10 @@ pub struct InstanceReport {
     /// Network name to the pod's IP on it, for the snapshot's networks
     /// that matched a local interface.
     pub networks: BTreeMap<String, String>,
+    /// Every address on an interface of a network the Gateway only dials
+    /// out on: none of them binds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dial_out_ips: Vec<String>,
     /// DNS refresh swaps so far: a move means backend pods came or went,
     /// and named targetPorts may have moved with them.
     pub dns_epoch: u64,
