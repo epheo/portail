@@ -396,21 +396,42 @@ pub(crate) fn reconcile_to_config(
         collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut checks, &mut route_status);
     verdicts.put(gateway_key, checks.now);
 
+    let mut config = PortailConfig {
+        gateway: gateway_config,
+        http_routes: http_route_configs,
+        tcp_routes: tcp_route_configs,
+        tls_routes: tls_route_configs,
+        udp_routes: udp_route_configs,
+        endpoint_overrides: services.endpoint_overrides.clone(),
+        app_protocol_overrides: services.app_protocol_overrides.clone(),
+        headless_target_ports: services.headless_target_ports.clone(),
+        ..Default::default()
+    };
+    // Only the names this Gateway routes to: the cluster's every Service
+    // would grow each snapshot and move its version on any Service change.
+    config.cluster_ip_backends = config
+        .backend_names()
+        .filter(|name| services.cluster_ip_backends.contains(*name))
+        .map(String::from)
+        .collect();
     Ok(ReconcileResult {
-        config: PortailConfig {
-            gateway: gateway_config,
-            http_routes: http_route_configs,
-            tcp_routes: tcp_route_configs,
-            tls_routes: tls_route_configs,
-            udp_routes: udp_route_configs,
-            endpoint_overrides: services.endpoint_overrides.clone(),
-            app_protocol_overrides: services.app_protocol_overrides.clone(),
-            headless_target_ports: services.headless_target_ports.clone(),
-            ..Default::default()
-        },
+        config,
         route_status,
         policy_status,
         gateway_targets: cx.watched.into_inner(),
+    })
+}
+
+/// A backend name that is an IP address: the data plane dials such a name
+/// unchecked (tests feed it 127.0.0.1), so the controller never publishes
+/// one. Converted names never are one (`{svc}.{ns}.svc`, `{gw}.{ns}.gateway`);
+/// this holds if a future path ever made one.
+pub(crate) fn literal_backend_name(name: &str) -> Option<(&'static str, String)> {
+    name.parse::<std::net::IpAddr>().is_ok().then(|| {
+        (
+            "InvalidKind",
+            format!("Backend name {name} is an IP address, which this controller never dials"),
+        )
     })
 }
 
@@ -969,6 +990,9 @@ fn collect_routes<R: GatewayRoute>(
                          ref_kind: &str,
                          forward: bool|
          -> Option<(&'static str, String)> {
+            if let Some(refused) = literal_backend_name(backend_name) {
+                return Some(refused);
+            }
             if group != GATEWAY_GROUP || ref_kind != "Gateway" {
                 return check_ref(backend_name, group, ref_kind);
             }

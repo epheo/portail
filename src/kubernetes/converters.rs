@@ -767,6 +767,25 @@ pub(crate) fn route_namespace(meta: &kube::core::ObjectMeta) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The data plane dials a backend named by an IP address unchecked, so
+    /// no backendRef may convert to one, whatever its name.
+    #[test]
+    fn a_backend_ref_name_is_never_an_ip_address() {
+        let forms = [
+            (None, None),
+            (Some(""), Some("Service")),
+            (Some(crate::config::GATEWAY_GROUP), Some("Gateway")),
+        ];
+        for name in ["127.0.0.1", "::1", "169.254.169.254"] {
+            for namespace in [None, Some("p")] {
+                for (group, kind) in forms {
+                    let built = backend_ref_name(name, namespace, "default", group, kind);
+                    assert!(built.parse::<std::net::IpAddr>().is_err(), "{built}");
+                }
+            }
+        }
+    }
     use gateway_api::gateways::{GatewayListenersTls, GatewaySpec};
 
     /// A listener carries the refs whose cert resolved, and only those:

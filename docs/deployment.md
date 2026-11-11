@@ -181,19 +181,29 @@ Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Ne
 
 ### Service backends on attached networks
 
-Whoever can write a Service's Endpoints picks the addresses its headless name answers with, and the data plane dials them from its own pod.
-A route to such a Service could then reach a network the Gateway attaches for the platform, transit, and the other Gateways on it.
+Whoever can write a Service's Endpoints picks the addresses its headless name answers with, and whoever writes an ExternalName Service picks its target's.
+The data plane dials those addresses from its own pod: a route to such a Service could reach a network the Gateway attaches for the platform, transit and the other Gateways on it, or the pod itself.
+
+The controller marks, in each snapshot, the backend names cluster DNS answers with a VIP: Services with a real clusterIP, not headless, not ExternalName, among those this Gateway routes to.
+Every other name is dialed directly: a headless Service, an ExternalName Service (a portless one has no override, so its name answers its target's addresses), an override target, an unknown name.
 
 With `serviceEndpointsOnAttachedNetworks: Refused`, the default:
 
 - An address a Service backend or a mirror resolves to inside an attached network is never dialed: the CIDRs of the Gateway's Network addresses and of the networks it dials out on.
-- A backendRef left with no address has its share answer 500, an L4 connection closed, as for an invalid ref.
-- An attached network with no CIDRs read (its NetworkAttachmentDefinition missing or naming no subnet, or a Network address with none): no address dialed directly can be told outside it, so every one is refused. A ClusterIP still serves: cluster DNS answers its VIP, which OVN cannot route onto a secondary network.
-- Gateway backends are never refused: they are dialed on the network both share.
+- An attached network with no CIDRs read (its NetworkAttachmentDefinition missing or naming no subnet, or a Network address with none): no address dialed directly can be told outside it, so every one is refused. A marked ClusterIP still serves: OVN cannot route its VIP onto a secondary network.
 - A `networks[]` attachment the Gateway listens on without naming it as a Network address is not read, so not covered: name it as a Network address, or fence it.
 - `Allowed` dials them, for a platform serving hosts on a network it attaches.
 
-Whatever this field says, an address dialed directly (a headless answer, an ExternalName answer, an override) that is the pod's own is refused: loopback, link-local (169.254.169.254, a cloud metadata endpoint), unspecified, broadcast or multicast. 127.0.0.1 would reach the data plane's admin port. This holds for a configuration from the controller only: a standalone file's backends are its owner's, loopback included.
+Whatever this field says, an address that is the pod's own is refused: loopback (127.0.0.1 would reach the data plane's admin port), link-local (169.254.169.254, a cloud metadata endpoint), unspecified, broadcast or multicast.
+
+Both checks run on every address a Service backend or a mirror resolves to, a marked ClusterIP's included: a real VIP is never either, and a Service turned ExternalName since its last snapshot is caught when the DNS refresh resolves it again.
+IPv4-mapped addresses and the NAT64 prefix `64:ff9b::/96` count as the IPv4 address they stand for.
+
+- A backendRef left with no address has its share answer 500, an L4 connection closed, as for an invalid ref; a mirror left with none is dropped.
+- Gateway backends are never refused: they are dialed on the network both share.
+- All this holds for a configuration from the controller only: a standalone file's backends are its owner's, loopback included.
+- A backend named by an IP address goes unchecked: only tests and hand-made snapshots name one. The controller refuses a backendRef whose name is an IP address (`ResolvedRefs=False`, reason `InvalidKind`), and its converted names never are one.
+- An older controller marks no name: every name then counts as dialed directly.
 
 Only the data plane sees the DNS answers, so route status says nothing of a refused address.
 Each refused address counts in `portail_backend_addresses_refused_total`, counted at each route table build (apply and DNS refresh), and a debug line names the Service.
@@ -519,7 +529,7 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
 - ExternalName backends are refused unless the Gateway's GatewayParameters set `externalNameBackends: Allowed`: whoever writes the Service picks the name the Gateway dials, another namespace's Service or the API server included, from wherever the Gateway's pods sit (CVE-2021-25740). The Gateway API asks implementations not to support them.
-- A Service backend's address inside a network the Gateway attaches is refused unless its GatewayParameters set `serviceEndpointsOnAttachedNetworks: Allowed`, and an address dialed directly that is the pod's own (loopback, link-local, unspecified, broadcast, multicast) is refused always: whoever writes Endpoints picks a headless Service's addresses ([Service backends on attached networks](#service-backends-on-attached-networks)).
+- A Service backend's address inside a network the Gateway attaches is refused unless its GatewayParameters set `serviceEndpointsOnAttachedNetworks: Allowed`, and an address that is the pod's own (loopback, link-local, unspecified, broadcast, multicast) is refused always: whoever writes Endpoints or an ExternalName picks the addresses a name answers with ([Service backends on attached networks](#service-backends-on-attached-networks)).
 - A Gateway's ServiceAccount can be used by any pod its namespace's admin starts, each with a valid token. Its data planes hold at most `--sync-gateway-polls` polls at once, uncounted against their address, so such pods never take other Gateways' connections.
 
 ## Container Image

@@ -216,6 +216,40 @@ pub struct PortailConfig {
     /// Set from a controller's snapshot only, never from a file.
     #[serde(skip)]
     pub dial_rules: Option<super::DialRules>,
+
+    /// Backend names the controller knows cluster DNS answers with a VIP
+    /// (not serialized): every other name's answers are dialed as is.
+    #[serde(skip)]
+    pub cluster_ip_backends: std::collections::BTreeSet<String>,
+}
+
+impl PortailConfig {
+    /// Every backend name a route or a mirror names.
+    pub fn backend_names(&self) -> impl Iterator<Item = &str> {
+        let http = self
+            .http_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter().chain(mirrors)
+            });
+        let tcp = self
+            .tcp_routes
+            .iter()
+            .chain(&self.udp_routes)
+            .flat_map(|r| &r.rules)
+            .flat_map(|r| &r.backend_refs);
+        let tls = self
+            .tls_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|r| &r.backend_refs);
+        http.chain(tcp).chain(tls).map(|br| br.name.as_str())
+    }
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
