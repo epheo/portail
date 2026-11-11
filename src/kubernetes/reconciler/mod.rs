@@ -17,7 +17,7 @@ use crate::config::*;
 
 use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
-    parse_backend_dns_name, parse_gateway_backend_name, route_namespace, CertData,
+    parse_backend_dns_name, route_namespace, CertData,
 };
 use super::crds::{ExternalNameBackends, RateLimitPolicy};
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};

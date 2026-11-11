@@ -520,6 +520,18 @@ impl BackendRef {
     }
 }
 
+/// A Gateway backend's name, `{gateway}.{namespace}.gateway`, which no
+/// Service's overrides are keyed by.
+pub fn gateway_backend_name(gateway: &str, namespace: &str) -> String {
+    format!("{gateway}.{namespace}.gateway")
+}
+
+/// A Gateway backend's name back into (gateway, namespace).
+pub fn parse_gateway_backend_name(name: &str) -> Option<(String, String)> {
+    let (gateway, ns) = name.strip_suffix(".gateway")?.rsplit_once('.')?;
+    Some((gateway.to_string(), ns.to_string()))
+}
+
 fn default_backend_kind() -> String {
     "Service".to_string()
 }

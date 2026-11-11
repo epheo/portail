@@ -12,8 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::addresses::{bind_addresses_resolved, local_interfaces, resolve_networks, DialOut};
 use super::dns_refresh::{spawn_dns_refresh, Published};
-use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig, ProxyProtocolConfig};
-use crate::kubernetes::converters::parse_gateway_backend_name;
+use crate::config::{
+    parse_gateway_backend_name, ListenerConfig, PerformanceConfig, PortailConfig,
+    ProxyProtocolConfig,
+};
 use crate::logging::{error, info, warn};
 use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;

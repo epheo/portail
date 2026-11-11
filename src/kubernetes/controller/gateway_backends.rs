@@ -9,8 +9,7 @@ use futures::channel::mpsc;
 
 use super::hub::Hub;
 use super::reports::ReportStore;
-use crate::config::{BackendRef, PortailConfig};
-use crate::kubernetes::converters::parse_gateway_backend_name;
+use crate::config::{parse_gateway_backend_name, BackendRef, PortailConfig};
 use crate::logging::debug;
 use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::{BackendFrom, GatewayKey, NetworkCidrs, PendingBackend, Snapshot, Transport};
