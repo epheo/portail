@@ -197,34 +197,34 @@ pub(super) enum ClassOwner {
     Missing,
 }
 
-/// A pass that failed keeps what `key` served, but never the endpoints of,
-/// or the trust in, a Gateway since gone: republished without them, when
-/// it held any.
+/// A pass that failed keeps what `key` served, but never the endpoints of
+/// a Gateway since gone, nor trust in an address a named Gateway holds no
+/// more: republished without them, when it held any. Its own networks are
+/// the served ones: nothing is translated.
 fn drop_gone_gateways(ctx: &ControllerCtx, key: &GatewayKey) -> bool {
     let Some(served) = ctx.hub.current(key) else {
         return false;
     };
     let trusted = ctx.backends.trusted_by(key);
-    let Some((snapshot, gone)) =
-        gateway_backends::without_gone(&served, &trusted, |named| !ours(ctx, named))
-    else {
+    let Some((snapshot, kept, dropped)) = gateway_backends::without_gone(
+        &served,
+        &trusted,
+        |named| !ours(ctx, named),
+        |named| trusted_addresses(&ctx.hub, &ctx.reports, named, &served.networks),
+    ) else {
         return false;
     };
-    let names: Vec<String> = gone
+    let names: Vec<String> = dropped
         .iter()
         .map(|g| format!("{}/{}", g.namespace, g.name))
         .collect();
     warn!(
-        "Gateway {}: this pass failed; what it serves of gone Gateway(s) {} is dropped, the rest \
-         stays as served",
+        "Gateway {}: this pass failed; what it serves of Gateway(s) {} gone or moved is \
+         dropped, the rest stays as served",
         key,
         names.join(", ")
     );
-    let retained: std::collections::BTreeMap<_, _> = trusted
-        .into_iter()
-        .filter(|(k, _)| !gone.contains(k))
-        .collect();
-    ctx.backends.record_trusted(key.clone(), retained);
+    ctx.backends.record_trusted(key.clone(), kept);
     ctx.hub.publish(snapshot)
 }
 
@@ -346,9 +346,17 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     let external_name_backends = params
         .as_ref()
         .map_or(ExternalNameBackends::Refused, |p| p.external_name_backends);
-    let trusted_gateways = params
-        .as_ref()
-        .map_or(&[][..], |p| p.trusted_gateways.as_slice());
+    // Parameters that fail keep their last trust published, so the
+    // Gateways it was for still wake this one: on their lapse or delete, a
+    // failed pass drops it.
+    let last_trusted: Vec<GatewayKey>;
+    let trusted_gateways = match &params {
+        Ok(p) => p.trusted_gateways.as_slice(),
+        Err(_) => {
+            last_trusted = ctx.backends.trusted_by(&key).into_keys().collect();
+            last_trusted.as_slice()
+        }
+    };
     let mut plan = translate(ctx, gateway, external_name_backends, trusted_gateways).await;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
@@ -1359,6 +1367,134 @@ mod tests {
             "its trust dropped"
         );
         assert_eq!(served.config.http_routes.len(), 1, "the rest as served");
+    }
+
+    /// Parameters that fail keep a truster depending on the Gateways its
+    /// last trust was for, and its failed pass drops an address the named
+    /// Gateway holds no more: a live Gateway's instance that left.
+    #[tokio::test]
+    async fn a_failed_pass_keeps_the_trust_dependency_and_drops_what_left() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, Provisioning, ProxyProtocolParameters,
+            TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let unmanaged = |source: TrustedSource| {
+            let mut params = GatewayParameters::new(
+                "unmanaged",
+                GatewayParametersSpec {
+                    provisioning: Some(Provisioning::Unmanaged),
+                    proxy_protocol: Some(ProxyProtocolParameters {
+                        trusted_sources: Some(vec![source]),
+                    }),
+                    ..Default::default()
+                },
+            );
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: None,
+                gateway: Some(TrustedGateway {
+                    namespace: "default".into(),
+                    name: "edge".into(),
+                }),
+            }),
+        );
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        p.pass(&edge).await.unwrap();
+        let instance = |ip: &str, leaving: bool| InstanceReport {
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: None,
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
+                }],
+            }],
+            interface_ips: vec![ip.into()],
+            networks: [("udn-a".to_string(), ip.to_string())].into(),
+            leaving,
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, pod: &str, r: InstanceReport| {
+            p.ctx
+                .reports
+                .record(&testkit::key(&edge), InstanceId(pod.into()), r);
+            super::super::report_trigger(
+                &p.ctx,
+                Trigger {
+                    gateway: testkit::key(&edge),
+                    dns_moved: false,
+                },
+            );
+        };
+        reported(&p, "edge-a", instance("10.250.0.8", false));
+        reported(&p, "edge-b", instance("10.250.0.9", false));
+
+        let project = with_addresses(testkit::gateway("project", 1), 1, &network);
+        apply(&mut p.cluster.gateways, project.clone());
+        p.pass(&project).await.unwrap();
+        let trusted = |p: &Pipeline| {
+            p.served(&project)
+                .unwrap()
+                .config
+                .gateway
+                .proxy_protocol
+                .clone()
+                .map(|c| c.trusted_sources)
+        };
+        assert_eq!(
+            trusted(&p),
+            Some(vec![
+                "10.250.0.8/32".to_string(),
+                "10.250.0.9/32".to_string()
+            ])
+        );
+
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: Some("10.0.0.1/8".into()),
+                gateway: None,
+            }),
+        );
+        let _ = p.pass(&project).await;
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&edge)),
+            [testkit::key(&project)],
+            "still woken by edge"
+        );
+        assert_eq!(
+            trusted(&p),
+            Some(vec![
+                "10.250.0.8/32".to_string(),
+                "10.250.0.9/32".to_string()
+            ]),
+            "nothing moved"
+        );
+
+        reported(&p, "edge-b", instance("10.250.0.9", true));
+        let _ = p.pass(&project).await;
+        assert_eq!(
+            trusted(&p),
+            Some(vec!["10.250.0.8/32".to_string()]),
+            "edge-b left"
+        );
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&edge)),
+            [testkit::key(&project)]
+        );
     }
 
     /// The Programmed condition of Gateway `name`'s last status write.

@@ -304,15 +304,22 @@ pub(crate) fn trusted_addresses(
     out
 }
 
-/// `served` without what it holds of the Gateways `gone` says are gone:
-/// their endpoints, and the addresses `trusted` attributes to them alone.
-/// A pass that fails keeps the rest as it was served. None when it holds
-/// nothing of theirs; else the snapshot to publish, and who was gone.
+/// What a pass that fails publishes of `served`: all but the endpoints of
+/// the Gateways `gone` says are gone, and of the addresses `trusted`
+/// attributes to a named Gateway, only those it would trust `now`
+/// (nothing once gone). None when that changes nothing; else the snapshot
+/// to publish, the trust it keeps by Gateway, and the Gateways it dropped
+/// something of.
 pub(crate) fn without_gone(
     served: &Snapshot,
     trusted: &BTreeMap<GatewayKey, Vec<String>>,
     gone: impl Fn(&GatewayKey) -> bool,
-) -> Option<(Snapshot, BTreeSet<GatewayKey>)> {
+    now: impl Fn(&GatewayKey) -> Vec<String>,
+) -> Option<(
+    Snapshot,
+    BTreeMap<GatewayKey, Vec<String>>,
+    BTreeSet<GatewayKey>,
+)> {
     let mut dropped = BTreeSet::new();
     let mut out = served.clone();
     out.backends.external_names.retain(|entry| {
@@ -326,11 +333,26 @@ pub(crate) fn without_gone(
         }
         keep
     });
-    let (gone_trust, kept_trust): (Vec<_>, Vec<_>) = trusted.iter().partition(|(k, _)| gone(k));
-    let kept: HashSet<&String> = kept_trust.iter().flat_map(|(_, ips)| ips.iter()).collect();
-    let drop: HashSet<&String> = gone_trust
-        .iter()
-        .flat_map(|(_, ips)| ips.iter())
+    let mut changed = out.backends.external_names.len() != served.backends.external_names.len();
+    let mut kept_for = BTreeMap::new();
+    for (named, ips) in trusted {
+        let still: Vec<String> = if gone(named) {
+            Vec::new()
+        } else {
+            let now = now(named);
+            ips.iter().filter(|ip| now.contains(ip)).cloned().collect()
+        };
+        if still.len() != ips.len() {
+            dropped.insert(named.clone());
+        }
+        if !still.is_empty() {
+            kept_for.insert(named.clone(), still);
+        }
+    }
+    let kept: HashSet<&String> = kept_for.values().flatten().collect();
+    let drop: HashSet<&String> = trusted
+        .values()
+        .flatten()
         .filter(|ip| !kept.contains(ip))
         .collect();
     if let Some(proxy) = out.config.gateway.proxy_protocol.as_mut() {
@@ -338,14 +360,12 @@ pub(crate) fn without_gone(
         proxy
             .trusted_sources
             .retain(|source| !drop.contains(source));
-        if proxy.trusted_sources.len() != before {
-            dropped.extend(gone_trust.iter().map(|(k, _)| (*k).clone()));
-        }
+        changed |= proxy.trusted_sources.len() != before;
         if proxy.trusted_sources.is_empty() {
             out.config.gateway.proxy_protocol = None;
         }
     }
-    (!dropped.is_empty()).then(|| (out.seal(), dropped))
+    changed.then(|| (out.seal(), kept_for, dropped))
 }
 
 /// Fill `config`'s endpoint overrides for its valid Gateway backends: the
@@ -658,8 +678,14 @@ mod tests {
         ]
         .into();
 
-        let (pruned, gone) = without_gone(&served, &trusted, |k| *k == p).unwrap();
-        assert_eq!(gone, [p.clone()].into());
+        let as_trusted = |k: &GatewayKey| trusted.get(k).cloned().unwrap_or_default();
+        let (pruned, kept, dropped) =
+            without_gone(&served, &trusted, |k| *k == p, as_trusted).unwrap();
+        assert_eq!(dropped, [p.clone()].into());
+        assert_eq!(
+            kept,
+            [(q.clone(), vec!["10.250.0.5/32".to_string()])].into()
+        );
         let hosts: Vec<&str> = pruned
             .backends
             .external_names
@@ -674,10 +700,30 @@ mod tests {
                 .proxy_protocol
                 .unwrap()
                 .trusted_sources,
-            ["192.0.2.0/24", "10.250.0.5/32"]
+            ["192.0.2.0/24", "10.250.0.5/32"],
+            "10.250.0.5 is still trusted for q"
         );
         assert_ne!(pruned.version, served.version);
-        assert!(without_gone(&served, &trusted, |_| false).is_none());
+
+        let (lapsed, kept, dropped) =
+            without_gone(&served, &trusted, |_| false, |_| Vec::new()).unwrap();
+        assert_eq!(dropped, [p, q].into(), "live, but lapsed");
+        assert!(kept.is_empty());
+        assert_eq!(lapsed.backends.external_names.len(), 3);
+        assert_eq!(
+            lapsed
+                .config
+                .gateway
+                .proxy_protocol
+                .unwrap()
+                .trusted_sources,
+            ["192.0.2.0/24"]
+        );
+
+        assert!(
+            without_gone(&served, &trusted, |_| false, as_trusted).is_none(),
+            "nothing moved: nothing to republish"
+        );
     }
 
     fn edge_config(port: u16) -> PortailConfig {
