@@ -13,7 +13,7 @@ use crate::config::{BackendRef, PortailConfig};
 use crate::kubernetes::converters::parse_gateway_backend_name;
 use crate::logging::debug;
 use crate::proxy::proxy_protocol::Cidr;
-use crate::sync::{GatewayKey, NetworkCidrs, PendingBackend, Snapshot, Transport};
+use crate::sync::{BackendFrom, GatewayKey, NetworkCidrs, PendingBackend, Snapshot, Transport};
 
 /// Where a Gateway can be reached: per (Network name, listener port), the
 /// address and bound port of each live instance there; under
@@ -340,9 +340,11 @@ pub(crate) fn without_gone(
             .is_some_and(|key| gone(&key))
     };
     out.pending.backends.retain(|b| !named_gone(&b.host));
-    out.pending.trusted.retain(|g| !named_gone(g));
+    out.pending.trusted.retain(|t| !named_gone(&t.gateway));
+    out.backends_from.retain(|b| !named_gone(&b.host));
     let mut changed = out.backends.external_names.len() != served.backends.external_names.len()
-        || out.pending != served.pending;
+        || out.pending != served.pending
+        || out.backends_from != served.backends_from;
     let mut kept_for = BTreeMap::new();
     for (named, ips) in trusted {
         let still: Vec<String> = if gone(named) {
@@ -366,12 +368,20 @@ pub(crate) fn without_gone(
         .collect();
     out.trusted_from = kept_for
         .iter()
-        .map(
-            |(named, sources): (&GatewayKey, &Vec<String>)| crate::sync::TrustedFrom {
-                gateway: named.to_string(),
+        .map(|(named, sources): (&GatewayKey, &Vec<String>)| {
+            let gateway = named.to_string();
+            let uid = served
+                .trusted_from
+                .iter()
+                .find(|t| t.gateway == gateway)
+                .map(|t| t.uid.clone())
+                .unwrap_or_default();
+            crate::sync::TrustedFrom {
+                gateway,
+                uid,
                 sources: sources.clone(),
-            },
-        )
+            }
+        })
         .collect();
     changed |= out.trusted_from != served.trusted_from;
     if let Some(proxy) = out.config.gateway.proxy_protocol.as_mut() {
@@ -455,11 +465,13 @@ pub(crate) fn unheard(hub: &Hub, reports: &ReportStore, named: &GatewayKey) -> b
 
 /// The Gateway backends of `config` that spec allows (its refs passed
 /// every check) and that resolved to no endpoint because their target is
-/// [`unheard`]. Sorted.
+/// [`unheard`], each with the target's uid. A target without one is not
+/// there to wait for. Sorted.
 pub(crate) fn unheard_backends(
     hub: &Hub,
     reports: &ReportStore,
     config: &PortailConfig,
+    uid_of: impl Fn(&GatewayKey) -> Option<String>,
 ) -> Vec<PendingBackend> {
     let unresolved: BTreeSet<(String, u16)> = gateway_refs(config)
         .filter(|br| br.is_gateway() && !br.invalid && br.port != PRESENCE)
@@ -472,13 +484,39 @@ pub(crate) fn unheard_backends(
         .collect();
     unresolved
         .into_iter()
-        .filter(|(name, _)| {
-            parse_gateway_backend_name(name).is_some_and(|(gateway, namespace)| {
-                unheard(hub, reports, &GatewayKey::new(namespace, gateway))
+        .filter_map(|(host, port)| {
+            let (gateway, namespace) = parse_gateway_backend_name(&host)?;
+            let target = GatewayKey::new(namespace, gateway);
+            if !unheard(hub, reports, &target) {
+                return None;
+            }
+            let uid = uid_of(&target)?;
+            Some(PendingBackend { host, port, uid })
+        })
+        .collect()
+}
+
+/// The uid of the target each resolved Gateway backend of `config` came
+/// from. Sorted.
+pub(crate) fn backends_from(
+    config: &PortailConfig,
+    uid_of: impl Fn(&GatewayKey) -> Option<String>,
+) -> Vec<BackendFrom> {
+    let mut out: Vec<BackendFrom> = config
+        .endpoint_overrides
+        .keys()
+        .filter_map(|(host, port)| {
+            let (gateway, namespace) = parse_gateway_backend_name(host)?;
+            let uid = uid_of(&GatewayKey::new(namespace, gateway))?;
+            Some(BackendFrom {
+                host: host.clone(),
+                port: *port,
+                uid,
             })
         })
-        .map(|(host, port)| PendingBackend { host, port })
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 fn gateway_refs(config: &PortailConfig) -> impl Iterator<Item = &BackendRef> {
@@ -731,13 +769,17 @@ mod tests {
         ];
         let from = |gateway: &str, sources: &[&str]| crate::sync::TrustedFrom {
             gateway: gateway.into(),
+            uid: format!("{gateway}-uid"),
             sources: sources.iter().map(|s| s.to_string()).collect(),
         };
         served.trusted_from = vec![
             from("p-publish/publish", &["10.250.0.4/32", "10.250.0.5/32"]),
             from("q-publish/publish", &["10.250.0.5/32"]),
         ];
-        served.pending.trusted = vec!["p-publish/publish".into()];
+        served.pending.trusted = vec![crate::sync::PendingTrusted {
+            gateway: "p-publish/publish".into(),
+            uid: "p-uid".into(),
+        }];
         let served = served.seal();
         let (p, q) = (target(), GatewayKey::new("q-publish", "publish"));
         let trusted: BTreeMap<GatewayKey, Vec<String>> = [

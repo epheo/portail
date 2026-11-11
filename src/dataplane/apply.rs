@@ -43,25 +43,56 @@ pub struct Applier {
 }
 
 /// A Gateway backend or a trusted Gateway, as the controller marks it
-/// pending.
+/// pending, with the uid of the Gateway its value comes from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Kept {
-    Backend(String, u16),
-    Trusted(String),
+    Backend(String, u16, String),
+    Trusted(String, String),
+}
+
+/// How long a value stays fresh after the controller last vouched for it
+/// (applied it resolved, or confirmed it unchanged). Two holds: an
+/// unchanged config is confirmed once per hold, and a failover adds a
+/// reconnect. The controller counts an instance live as long.
+const FRESH: std::time::Duration = std::time::Duration::from_secs(2 * HOLD.as_secs());
+
+/// One value served: its Gateway's uid, the value, when the controller
+/// last vouched for it, and whether this data plane kept it itself.
+#[derive(Clone)]
+struct Value<T> {
+    uid: String,
+    value: T,
+    fresh: tokio::time::Instant,
+    kept: bool,
 }
 
 /// What each Gateway backend and trusted Gateway served at the last apply,
 /// and since when each has been pending. A pending one serves what it last
-/// did for one hold from when it was first seen pending, then nothing. That
+/// did, for the same Gateway (same uid) only, while that value is fresh and
+/// for one hold from when it was first seen pending, then nothing. That
 /// deadline never moves while it stays pending, across snapshots,
 /// reconnects and leaders, or a flapping controller would keep stale
 /// addresses trusted. It starts afresh only once the item was seen
 /// resolved. Nothing survives a restart of the data plane: it fails closed.
 #[derive(Default)]
 struct Keep {
-    backends: HashMap<(String, u16), Vec<(String, u16)>>,
-    trusted: HashMap<String, Vec<String>>,
+    backends: HashMap<(String, u16), Value<Vec<(String, u16)>>>,
+    trusted: HashMap<String, Value<Vec<String>>>,
     since: HashMap<Kept, tokio::time::Instant>,
+}
+
+/// `old` when it may stand in for a pending item of Gateway `uid` at
+/// `now`, with when it lapses: the same Gateway only, while fresh, and
+/// within one hold of the item first seen pending (`deadline`).
+fn carried<'a, T>(
+    old: Option<&'a Value<T>>,
+    uid: &str,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<(&'a Value<T>, tokio::time::Instant)> {
+    old.filter(|old| !uid.is_empty() && old.uid == uid)
+        .map(|old| (old, deadline.min(old.fresh + FRESH)))
+        .filter(|(_, until)| now < *until)
 }
 
 impl Keep {
@@ -73,67 +104,90 @@ impl Keep {
         config: &mut PortailConfig,
         now: tokio::time::Instant,
     ) -> Option<tokio::time::Instant> {
-        let pending_backends: HashSet<(String, u16)> = snapshot
-            .pending
-            .backends
-            .iter()
-            .map(|b| (b.host.clone(), b.port))
-            .collect();
-        let pending_trusted: HashSet<&String> = snapshot.pending.trusted.iter().collect();
-        let mut backends: HashMap<(String, u16), Vec<(String, u16)>> = config
+        let backend_uid = |host: &str, port: u16| {
+            snapshot
+                .backends_from
+                .iter()
+                .find(|b| b.host == host && b.port == port)
+                .map(|b| b.uid.clone())
+                .unwrap_or_default()
+        };
+        let mut backends: HashMap<(String, u16), Value<Vec<(String, u16)>>> = config
             .endpoint_overrides
             .iter()
             .filter(|((host, _), _)| parse_gateway_backend_name(host).is_some())
-            .map(|(key, targets)| (key.clone(), targets.clone()))
+            .map(|((host, port), targets)| {
+                let value = Value {
+                    uid: backend_uid(host, *port),
+                    value: targets.clone(),
+                    fresh: now,
+                    kept: false,
+                };
+                ((host.clone(), *port), value)
+            })
             .collect();
-        let mut trusted: HashMap<String, Vec<String>> = snapshot
+        let mut trusted: HashMap<String, Value<Vec<String>>> = snapshot
             .trusted_from
             .iter()
-            .map(|t| (t.gateway.clone(), t.sources.clone()))
+            .map(|t| {
+                let value = Value {
+                    uid: t.uid.clone(),
+                    value: t.sources.clone(),
+                    fresh: now,
+                    kept: false,
+                };
+                (t.gateway.clone(), value)
+            })
             .collect();
         let mut until: Option<tokio::time::Instant> = None;
-        let mut lapse = |deadline: tokio::time::Instant| {
-            until = Some(until.map_or(deadline, |u| u.min(deadline)));
+        let mut lapse = |at: tokio::time::Instant| {
+            until = Some(until.map_or(at, |u| u.min(at)));
         };
 
-        for key in &pending_backends {
-            let deadline = *self
-                .since
-                .entry(Kept::Backend(key.0.clone(), key.1))
-                .or_insert(now)
-                + HOLD;
-            if now >= deadline || backends.contains_key(key) {
+        let mut pending = HashSet::new();
+        for b in &snapshot.pending.backends {
+            let key = Kept::Backend(b.host.clone(), b.port, b.uid.clone());
+            let deadline = *self.since.entry(key.clone()).or_insert(now) + HOLD;
+            pending.insert(key);
+            let served = (b.host.clone(), b.port);
+            if backends.contains_key(&served) {
                 continue;
             }
-            if let Some(targets) = self.backends.get(key) {
+            if let Some((old, at)) = carried(self.backends.get(&served), &b.uid, deadline, now) {
                 config
                     .endpoint_overrides
-                    .insert(key.clone(), targets.clone());
-                backends.insert(key.clone(), targets.clone());
-                lapse(deadline);
+                    .insert(served.clone(), old.value.clone());
+                let kept = Value {
+                    kept: true,
+                    ..old.clone()
+                };
+                backends.insert(served, kept);
+                lapse(at);
             }
         }
-        for gateway in &pending_trusted {
-            let deadline = *self
-                .since
-                .entry(Kept::Trusted((*gateway).clone()))
-                .or_insert(now)
-                + HOLD;
-            if now >= deadline || trusted.contains_key(*gateway) {
+        for t in &snapshot.pending.trusted {
+            let key = Kept::Trusted(t.gateway.clone(), t.uid.clone());
+            let deadline = *self.since.entry(key.clone()).or_insert(now) + HOLD;
+            pending.insert(key);
+            if trusted.contains_key(&t.gateway) {
                 continue;
             }
-            if let Some(sources) = self.trusted.get(*gateway) {
+            if let Some((old, at)) = carried(self.trusted.get(&t.gateway), &t.uid, deadline, now) {
                 let proxy = config
                     .gateway
                     .proxy_protocol
                     .get_or_insert_with(ProxyProtocolConfig::default);
-                for source in sources {
+                for source in &old.value {
                     if !proxy.trusted_sources.contains(source) {
                         proxy.trusted_sources.push(source.clone());
                     }
                 }
-                trusted.insert((*gateway).clone(), sources.clone());
-                lapse(deadline);
+                let kept = Value {
+                    kept: true,
+                    ..old.clone()
+                };
+                trusted.insert(t.gateway.clone(), kept);
+                lapse(at);
             }
         }
 
@@ -141,21 +195,29 @@ impl Keep {
         // deadline stands until it lapses, so a revoke and re-add cannot
         // restart it either.
         self.since.retain(|key, since| {
-            let (pending, resolved) = match key {
-                Kept::Backend(host, port) => {
-                    let key = (host.clone(), *port);
-                    (pending_backends.contains(&key), backends.contains_key(&key))
-                }
-                Kept::Trusted(gateway) => (
-                    pending_trusted.contains(gateway),
-                    trusted.contains_key(gateway),
-                ),
+            let resolved = match key {
+                Kept::Backend(host, port, _) => backends
+                    .get(&(host.clone(), *port))
+                    .is_some_and(|v| !v.kept),
+                Kept::Trusted(gateway, _) => trusted.get(gateway).is_some_and(|v| !v.kept),
             };
-            pending || (!resolved && now < *since + HOLD)
+            pending.contains(key) || (!resolved && now < *since + HOLD)
         });
         self.backends = backends;
         self.trusted = trusted;
         until
+    }
+
+    /// The controller confirmed the config served unchanged: what it
+    /// resolved is fresh again, what this data plane kept is not.
+    fn confirmed(&mut self, now: tokio::time::Instant) {
+        let backends = self.backends.values_mut().map(|v| (&mut v.fresh, v.kept));
+        let trusted = self.trusted.values_mut().map(|v| (&mut v.fresh, v.kept));
+        for (fresh, kept) in backends.chain(trusted) {
+            if !kept {
+                *fresh = now;
+            }
+        }
     }
 }
 
@@ -205,6 +267,11 @@ impl Applier {
     /// When a value kept for something pending lapses: apply again then.
     pub fn kept_until(&self) -> Option<tokio::time::Instant> {
         self.kept_until
+    }
+
+    /// The controller confirmed the snapshot served current.
+    pub fn confirmed(&mut self) {
+        self.keep.confirmed(tokio::time::Instant::now());
     }
 
     /// Bring the data plane in line with `snapshot` and report the result,
@@ -734,6 +801,17 @@ mod tests {
     /// `endpoints` and Gateway `p/edge` trusted at `trusted`, either marked
     /// pending when `pending`.
     fn edge(endpoints: &[&str], trusted: &[&str], pending: bool, generation: i64) -> Snapshot {
+        edge_of(endpoints, trusted, pending, generation, "u1")
+    }
+
+    /// [`edge`], both named Gateways of `uid`.
+    fn edge_of(
+        endpoints: &[&str],
+        trusted: &[&str],
+        pending: bool,
+        generation: i64,
+        uid: &str,
+    ) -> Snapshot {
         // No listener: nothing here binds, only what is served is read.
         let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
             "gateway": {"name": "gw", "listeners": []},
@@ -757,9 +835,17 @@ mod tests {
             generation,
         };
         let mut snapshot = Snapshot::from_config(gateway, config, vec![]);
+        if !endpoints.is_empty() {
+            snapshot.backends_from = vec![crate::sync::BackendFrom {
+                host: "target.p.gateway".into(),
+                port: 80,
+                uid: uid.into(),
+            }];
+        }
         if !trusted.is_empty() {
             snapshot.trusted_from = vec![crate::sync::TrustedFrom {
                 gateway: "p/edge".into(),
+                uid: uid.into(),
                 sources: trusted.iter().map(|s| s.to_string()).collect(),
             }];
         }
@@ -768,8 +854,12 @@ mod tests {
                 backends: vec![crate::sync::PendingBackend {
                     host: "target.p.gateway".into(),
                     port: 80,
+                    uid: uid.into(),
                 }],
-                trusted: vec!["p/edge".into()],
+                trusted: vec![crate::sync::PendingTrusted {
+                    gateway: "p/edge".into(),
+                    uid: uid.into(),
+                }],
             };
         }
         snapshot.seal()
@@ -856,6 +946,53 @@ mod tests {
             until,
             Some(later + HOLD),
             "past the first hold, a fresh one"
+        );
+    }
+
+    /// A Gateway recreated under the same name is another: what was served
+    /// for the old one is never kept for the new.
+    #[test]
+    fn a_recreated_gateway_keeps_nothing_of_the_old_one() {
+        let t0 = tokio::time::Instant::now();
+        let mut keep = Keep::default();
+        served_through(
+            &mut keep,
+            &edge_of(&["10.250.0.7"], &["10.250.0.9/32"], false, 1, "u1"),
+            t0,
+        );
+        let (endpoints, trusted, until) = served_through(
+            &mut keep,
+            &edge_of(&[], &[], true, 2, "u2"),
+            t0 + Duration::from_secs(1),
+        );
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+    }
+
+    /// A value is kept only while the controller vouched for it within two
+    /// holds: applied resolved, or confirmed unchanged since. One a data
+    /// plane cut off for minutes still holds is not.
+    #[test]
+    fn only_a_fresh_value_is_kept() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let resolved = edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1);
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), t0 + FRESH + s(1));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        keep.confirmed(t0 + s(50));
+        let pending = t0 + s(70);
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), pending);
+        assert_eq!((endpoints.len(), trusted.len()), (1, 1), "confirmed at 50s");
+        assert_eq!(
+            until,
+            Some(pending + HOLD),
+            "the earlier of the hold and freshness"
         );
     }
 
