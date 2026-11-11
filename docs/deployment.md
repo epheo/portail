@@ -200,6 +200,7 @@ Two replicas spread across nodes when there are several.
 - Its NetworkAttachmentDefinition gone, or naming no subnet: its interface cannot be told apart, so the Gateway binds only the addresses it names, as for a Network address not resolved; with none, nothing binds and `Programmed` is `False`, reason `AddressNotUsable`.
 - Meanwhile a named address binds only on an interface known to listen: the one holding a resolved listening Network's IP, or the pod's own IP. Every other interface may be the unresolved network's, and its addresses are reported among the dial-out ones.
 - The pod's own IP is `POD_IP`, which Managed pods get from `status.podIP` through the downward API: the kubelet's word, not the pod's. An Unmanaged pod without `POD_IP` knows only its listening Networks' interfaces.
+- A `listeners: false` network must never be the pod's primary network: `POD_IP` would sit on it, its interface would count as listening, and named addresses would bind there.
 - A named address held back says why in `portail.epheo.eu/AddressesAssigned`, or in `Programmed` when nothing binds.
 - A dial-out interface not yet holding its IP is not recognized as dial-out: its other addresses bind until the next apply. CNI configures interfaces before the container starts, so a running data plane does not meet one.
 - It does not change the Service default: a Gateway with `networks` gets `None`. An edge behind a LoadBalancer sets `service.type: LoadBalancer`.
