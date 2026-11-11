@@ -16,8 +16,14 @@ use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::{GatewayKey, NetworkCidrs, Snapshot, Transport};
 
 /// Where a Gateway can be reached: per (Network name, listener port), the
-/// address and bound port of each live instance there.
+/// address and bound port of each live instance there; under
+/// [`PRESENCE`], each live instance's address on the Network, bound or
+/// not.
 pub(crate) type Exposure = BTreeMap<(String, u16), BTreeSet<(String, u16)>>;
+
+/// The port of a Network's presence entry: no listener and no backendRef
+/// port is 0. A truster trusts presence, so its changes wake trusters.
+const PRESENCE: u16 = 0;
 
 /// Endpoints one Network and port take at most: a Gateway runs a few
 /// replicas, so more is a forged or runaway report.
@@ -186,6 +192,12 @@ pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) ->
             if !on_network {
                 continue;
             }
+            let present = out.entry((network.name.clone(), PRESENCE)).or_default();
+            if present.len() < MAX_ENDPOINTS {
+                present.insert((ip.clone(), PRESENCE));
+            } else {
+                truncated(target);
+            }
             // One bound port per listener on one address: a report listing
             // more never crowds out the instances visited after it.
             for listener in &served.config.gateway.listeners {
@@ -229,8 +241,8 @@ fn truncated(gateway: &GatewayKey) {
 
 /// Host CIDRs a Gateway on `networks` trusts for `named`: the IP each live
 /// instance of `named` reports on one of those Networks, by name, inside
-/// that Network's CIDRs on both sides, where it bound a TCP listener: what
-/// `named`'s exposure tracks, so any change wakes the truster. Never an
+/// that Network's CIDRs on both sides, bound or not: its presence there,
+/// which `named`'s exposure tracks, so any change wakes the truster. Never an
 /// address on another network, which a recycled pod IP could give a
 /// tenant. Nothing without a shared Network or a live report: trusting
 /// less closes connections, trusting more lets a sender name any client.
@@ -269,15 +281,6 @@ pub(crate) fn trusted_addresses(
             };
             let inside = |cidrs: &[Cidr]| cidrs.iter().any(|c| c.contains(addr));
             if !inside(mine) || !inside(theirs) {
-                continue;
-            }
-            let bound = report
-                .listeners
-                .iter()
-                .flat_map(|l| &l.endpoints)
-                .filter(|e| e.bound && e.transport == Transport::Tcp)
-                .any(|e| e.address.as_ref().is_none_or(|a| a == ip));
-            if !bound {
                 continue;
             }
             let set = found.entry(name).or_default();
@@ -356,7 +359,7 @@ pub(crate) fn resolve(
     networks: &[NetworkCidrs],
 ) {
     let refs: BTreeSet<(String, u16)> = gateway_refs(config)
-        .filter(|br| br.is_gateway() && !br.invalid)
+        .filter(|br| br.is_gateway() && !br.invalid && br.port != PRESENCE)
         .map(|br| (br.name.clone(), br.port))
         .collect();
     let networks: Vec<(&NetworkCidrs, Vec<Cidr>)> = networks
@@ -517,8 +520,9 @@ mod tests {
         );
         assert_eq!(
             trusted(&transit()),
-            ["10.250.0.4/32"],
-            "b names no transit address, c bound nothing, d is outside transit"
+            ["10.250.0.4/32", "10.250.0.6/32"],
+            "b names no transit address, d is outside transit; c is trusted though its \
+             listener failed to bind there"
         );
         let elsewhere = vec![NetworkCidrs {
             name: "other".into(),
@@ -541,7 +545,11 @@ mod tests {
             InstanceId("q".into()),
             report(Some("10.250.0.4"), None, &["10.250.0.4"]),
         );
-        assert!(trusted(&transit()).is_empty(), "claimed by another Gateway");
+        assert_eq!(
+            trusted(&transit()),
+            ["10.250.0.6/32"],
+            "claimed by another Gateway"
+        );
     }
 
     /// A report listing many ports never crowds out the others: each
@@ -761,6 +769,46 @@ mod tests {
             [("10.250.0.7".to_string(), 0)].into(),
             "one port per instance and listener"
         );
+    }
+
+    /// A truster wakes on the named Gateway's presence on the Network,
+    /// whether or not a listener bound there.
+    #[test]
+    fn dependents_wake_on_presence_alone() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        let backends = GatewayBackends::default();
+        let mut wakes = backends.wakes().unwrap();
+        let truster = GatewayKey::new("p-publish", "truster");
+        backends.record(truster.clone(), [target()].into());
+        let mut unbound = report(Some("10.250.0.7"), None, &["10.250.0.7"]);
+        unbound.listeners[0].endpoints[0].bound = false;
+        reports.record(&target(), InstanceId("a".into()), unbound.clone());
+        backends.refresh(&target(), &hub, &reports);
+        assert_eq!(
+            wakes.try_recv().ok(),
+            Some(truster.clone()),
+            "present, bound nowhere"
+        );
+        unbound
+            .networks
+            .insert("transit".into(), "10.250.0.8".into());
+        reports.record(&target(), InstanceId("a".into()), unbound);
+        backends.refresh(&target(), &hub, &reports);
+        assert_eq!(wakes.try_recv().ok(), Some(truster), "its presence moved");
+    }
+
+    /// A backendRef port is never 0: the presence entry is never dialed.
+    #[test]
+    fn presence_is_never_an_endpoint() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        reports.record(
+            &target(),
+            InstanceId("a".into()),
+            report(Some("10.250.0.7"), None, &["10.250.0.7"]),
+        );
+        let mut config = edge_config(0);
+        resolve(&hub, &reports, &mut config, &transit());
+        assert!(config.endpoint_overrides.is_empty());
     }
 
     /// Dependents wake when the target's exposure moves: an address, a
