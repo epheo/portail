@@ -746,16 +746,10 @@ pub(crate) fn backend_ref_name(
     kind: Option<&str>,
 ) -> String {
     if group == Some(crate::config::GATEWAY_GROUP) && kind == Some("Gateway") {
-        format!("{}.{}.gateway", name, namespace.unwrap_or(route_namespace))
+        crate::config::gateway_backend_name(name, namespace.unwrap_or(route_namespace))
     } else {
         backend_dns_name(name, namespace, route_namespace)
     }
-}
-
-/// A Gateway backend's name back into (gateway, namespace).
-pub(crate) fn parse_gateway_backend_name(name: &str) -> Option<(String, String)> {
-    let (gateway, ns) = name.strip_suffix(".gateway")?.rsplit_once('.')?;
-    Some((gateway.to_string(), ns.to_string()))
 }
 
 /// Parse a DNS-style backend name back into (service_name, namespace).
