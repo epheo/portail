@@ -38,6 +38,7 @@ use gateway_api::gateways::Gateway;
 
 use super::auth::{Account, Authenticator, Refusal};
 use super::ca::ServingKey;
+use super::provision::ProvisionedAccount;
 use super::reconcile::{class_owner, ClassOwner};
 use super::reports::{InstanceId, LIVENESS};
 use super::ControllerCtx;
@@ -278,8 +279,11 @@ impl SyncServer {
     }
 
     /// What the cache says of the ServiceAccount `key`'s data planes run
-    /// as. A Gateway this controller does not run is Unwatched: its pods
-    /// still learn it is gone, once a TokenReview says they are its.
+    /// as. A Gateway this controller does not hold or run is Unwatched:
+    /// its pods only ever learn it is gone, once a TokenReview says they
+    /// are its. Otherwise the ServiceAccount cache decides before the
+    /// parameters: a recreate whose parameters fail must not let the
+    /// deleted Gateway's ServiceAccount, not collected yet, through.
     fn account(&self, key: &GatewayKey) -> Account {
         let Some(gateway) = self
             .ctx
@@ -292,20 +296,17 @@ impl SyncServer {
         if !self.serves(key) {
             return Account::Unwatched;
         }
-        match super::params::resolve(&self.ctx, &gateway) {
-            Ok(params) if params.provisioning == Provisioning::Managed => {
-                let uid = gateway.metadata.uid.as_deref().unwrap_or_default();
-                let name = crate::kubernetes::naming::resource_name(&key.name);
-                match self
-                    .ctx
-                    .owned
-                    .service_account_uid(&key.namespace, &name, uid)
-                {
-                    Some(uid) => Account::Provisioned(uid),
-                    None => Account::Missing,
-                }
-            }
-            Ok(_) | Err(_) => Account::Unwatched,
+        let uid = gateway.metadata.uid.as_deref().unwrap_or_default();
+        let name = crate::kubernetes::naming::resource_name(&key.name);
+        match self.ctx.owned.service_account(&key.namespace, &name, uid) {
+            ProvisionedAccount::Ours(uid) => Account::Provisioned(uid),
+            ProvisionedAccount::Another => Account::Missing,
+            // Invalid parameters fail closed: whether the last valid ones
+            // said Unmanaged is not kept.
+            ProvisionedAccount::None => match super::params::resolve(&self.ctx, &gateway) {
+                Ok(params) if params.provisioning == Provisioning::Unmanaged => Account::Unwatched,
+                Ok(_) | Err(_) => Account::Missing,
+            },
         }
     }
 
@@ -1543,11 +1544,68 @@ mod tests {
         );
     }
 
+    /// A Gateway recreated under its name with parameters that fail: the
+    /// deleted one's ServiceAccount, labeled and not collected yet, never
+    /// syncs it, from a cached verdict or a fresh review; and with none
+    /// labeled, failing parameters still refuse.
+    #[tokio::test]
+    async fn a_recreate_with_invalid_parameters_refuses_the_old_service_account() {
+        let mut f = fixture().await;
+        let v1 = f.publish(1);
+        let cached = gateway_token("default", "gw", 0);
+        assert_eq!(
+            version_of(f.sync(post(Some(&cached), &body(&key(), "", None))).await).await,
+            v1
+        );
+        assert_eq!(f.reviews(), 1);
+
+        let mut again = testkit::gateway("gw", 1);
+        again.metadata.uid = Some("gw-uid-2".into());
+        again.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "missing".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut f.cluster.gateways, again);
+        let fresh = gateway_token("default", "gw", 1);
+        for token in [&cached, &fresh] {
+            let answer = f.sync(post(Some(token), &body(&key(), "", None))).await;
+            assert_eq!(answer.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        f.cluster
+            .service_accounts
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(
+                super::super::provision::provisioned_service_account(
+                    &testkit::gateway("gw", 1),
+                    SA_UID,
+                ),
+            ));
+        let answer = f.sync(post(Some(&fresh), &body(&key(), "", None))).await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::UNAUTHORIZED,
+            "none labeled, parameters failing"
+        );
+        assert_eq!(f.reviews(), 1, "no verdict or review served the old one");
+    }
+
     /// An Unmanaged Gateway's ServiceAccount is its owner's, unwatched:
     /// its tokens are served on a review only.
     #[tokio::test]
     async fn an_unmanaged_gateways_token_is_served_on_a_review() {
         let mut f = fixture().await;
+        f.cluster
+            .service_accounts
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(
+                super::super::provision::provisioned_service_account(
+                    &testkit::gateway("gw", 1),
+                    SA_UID,
+                ),
+            ));
         let mut params = crate::kubernetes::crds::GatewayParameters::new(
             "hand-written",
             crate::kubernetes::crds::GatewayParametersSpec {

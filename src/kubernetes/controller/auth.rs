@@ -1801,11 +1801,13 @@ mod tests {
             Ok(InstanceId("pod-b".into())),
             "its own ServiceAccount is served on the signature"
         );
-        assert_eq!(
-            auth.authenticate(&claimed, &token, &gw, PEER, &recreated)
-                .await,
-            Err(Refusal::Unauthenticated)
-        );
+        for account in [&recreated, &Account::Missing] {
+            assert_eq!(
+                auth.authenticate(&claimed, &token, &gw, PEER, account)
+                    .await,
+                Err(Refusal::Unauthenticated)
+            );
+        }
         flood.iter().for_each(|f| f.abort());
 
         // Signature alone, the review failing.
@@ -1817,11 +1819,13 @@ mod tests {
                    "reason": "InternalError", "message": "down", "code": 500}),
         );
         let auth = Authenticator::new(api.client(), NS, SERVICE, None, keys_of(&signer).await);
-        assert_eq!(
-            auth.authenticate(&claimed, &token, &gw, PEER, &recreated)
-                .await,
-            Err(Refusal::Unauthenticated)
-        );
+        for account in [&recreated, &Account::Missing] {
+            assert_eq!(
+                auth.authenticate(&claimed, &token, &gw, PEER, account)
+                    .await,
+                Err(Refusal::Unauthenticated)
+            );
+        }
         assert_eq!(reviews(&api), 0, "refused before a review");
 
         // A verdict cached while it was the live one.
@@ -1853,7 +1857,7 @@ mod tests {
             "none in the cache"
         );
         assert_eq!(reviews(&api), 1, "the cached verdict never served it");
-        assert_eq!(counter(SyncAuthStage::ServiceAccount), refused + 4);
+        assert_eq!(counter(SyncAuthStage::ServiceAccount), refused + 6);
     }
 
     /// An unwatched ServiceAccount is only ever accepted on a review: a

@@ -145,6 +145,18 @@ pub(crate) struct Owned {
     retries: Retries,
 }
 
+/// A Gateway's ServiceAccount as this install's cache holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisionedAccount {
+    /// Labeled this install's and controlled by the Gateway: its uid.
+    Ours(String),
+    /// Labeled this install's, but not the Gateway's: one a deleted
+    /// Gateway of that name owned, not collected yet.
+    Another,
+    /// None labeled this install's under that name.
+    None,
+}
+
 /// Gateways whose provisioning failed with a retry pending, and the
 /// trigger stream the retry goes through.
 struct Retries {
@@ -278,19 +290,25 @@ impl Owned {
         });
     }
 
-    /// The uid of ServiceAccount `namespace/name` while the cache holds it
-    /// as this install's, controlled by the Gateway of `gateway_uid`.
-    pub(crate) fn service_account_uid(
+    /// What the cache holds of ServiceAccount `namespace/name` for the
+    /// Gateway of `gateway_uid`.
+    pub(crate) fn service_account(
         &self,
         namespace: &str,
         name: &str,
         gateway_uid: &str,
-    ) -> Option<String> {
-        let meta = meta_of(&self.service_accounts, namespace, name)?;
-        if !is_ours(&meta, gateway_uid, &self.controller.install) {
-            return None;
+    ) -> ProvisionedAccount {
+        let Some(meta) = meta_of(&self.service_accounts, namespace, name) else {
+            return ProvisionedAccount::None;
+        };
+        if label(&meta, render::LABEL_CONTROLLER) != Some(self.controller.install.as_str()) {
+            return ProvisionedAccount::None;
         }
-        meta.uid.filter(|uid| !uid.is_empty())
+        let ours = is_ours(&meta, gateway_uid, &self.controller.install);
+        match meta.uid.filter(|uid| !uid.is_empty()) {
+            Some(uid) if ours => ProvisionedAccount::Ours(uid),
+            _ => ProvisionedAccount::Another,
+        }
     }
 
     #[cfg(test)]
