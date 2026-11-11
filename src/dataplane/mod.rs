@@ -435,6 +435,11 @@ impl SyncLoop {
         } else {
             Some(Instant::now() + self.rebinds.next_ceiling())
         };
+        // A value kept for something pending lapses on the data plane's own
+        // clock, whatever the controller does meanwhile.
+        if let Some(kept) = self.applier.kept_until() {
+            self.rebind_at = Some(self.rebind_at.map_or(kept, |at| at.min(kept)));
+        }
     }
 
     /// Backend pods came or went: the controller re-reads named target
@@ -728,6 +733,33 @@ mod tests {
         );
         assert!(metrics.is_connected());
         assert!(metrics.age().unwrap() >= pause, "confirmed");
+    }
+
+    /// A value kept for something pending is dropped on the data plane's
+    /// own clock: its lapse schedules an apply, whatever the controller
+    /// sends meanwhile.
+    #[tokio::test]
+    async fn a_kept_value_schedules_the_apply_that_drops_it() {
+        let (mut sync, _) = sync_loop();
+        let mut served = snapshot();
+        served.trusted_from = vec![crate::sync::TrustedFrom {
+            gateway: "p/edge".into(),
+            sources: vec!["10.250.0.9/32".into()],
+        }];
+        served.config.gateway.proxy_protocol = Some(crate::config::ProxyProtocolConfig {
+            trusted_sources: vec!["10.250.0.9/32".into()],
+        });
+        sync.handle(Answer::Snapshot(body(&served.seal()))).await;
+        let mut pending = snapshot();
+        pending.config.gateway.name = "gw-2".into();
+        pending.pending.trusted = vec!["p/edge".into()];
+        sync.handle(Answer::Snapshot(body(&pending.seal()))).await;
+        let kept = sync.applier.kept_until().expect("trust kept");
+        assert!(
+            sync.rebind_at.is_some_and(|at| at <= kept),
+            "{:?}",
+            sync.rebind_at
+        );
     }
 
     /// An answer not signed by the controller changes nothing served: the

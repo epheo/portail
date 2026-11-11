@@ -347,6 +347,15 @@ The lapse window:
 - Each time a truster is reconciled, an address another Gateway's live instance reports is left out, whatever the edge reported last.
 - The new holder's own report does not reconcile the truster: it stays trusted until the truster's next pass. The MultiNetworkPolicy admitting only the edge's pods to a project Gateway holds meanwhile.
 
+Controller restarts and failovers:
+
+- A new leader starts with no snapshot and no report: it has not heard from any data plane yet.
+- For one hold after it takes the lead, a Gateway backend or trusted Gateway that spec still allows but that the controller has not heard from is marked pending, not left out.
+- A data plane keeps what it last served for a pending item, for one hold from when it first saw it pending, then drops it. Further pending snapshots, reconnects and leaders never extend that.
+- What spec dropped is never pending: a removed `trustedSources` entry, a deleted backendRef or target Gateway, a revoked ReferenceGrant apply at once.
+- After the window nothing is pending: an unheard Gateway backend answers 503, an unheard Gateway is trusted nowhere.
+- A data plane that restarts keeps nothing: it fails closed until its Gateway's named Gateways report.
+
 ## Primary UDN
 
 On OVN-Kubernetes, a pod in a namespace with a Primary User Defined Network reaches the apiserver and DNS on the default network, and nothing else: its data plane cannot dial the controller Service.

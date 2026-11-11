@@ -13,7 +13,7 @@ use crate::config::{BackendRef, PortailConfig};
 use crate::kubernetes::converters::parse_gateway_backend_name;
 use crate::logging::debug;
 use crate::proxy::proxy_protocol::Cidr;
-use crate::sync::{GatewayKey, NetworkCidrs, Snapshot, Transport};
+use crate::sync::{GatewayKey, NetworkCidrs, PendingBackend, Snapshot, Transport};
 
 /// Where a Gateway can be reached: per (Network name, listener port), the
 /// address and bound port of each live instance there; under
@@ -333,7 +333,16 @@ pub(crate) fn without_gone(
         }
         keep
     });
-    let mut changed = out.backends.external_names.len() != served.backends.external_names.len();
+    let named_gone = |name: &str| {
+        name.parse::<GatewayKey>()
+            .ok()
+            .or_else(|| parse_gateway_backend_name(name).map(|(gw, ns)| GatewayKey::new(ns, gw)))
+            .is_some_and(|key| gone(&key))
+    };
+    out.pending.backends.retain(|b| !named_gone(&b.host));
+    out.pending.trusted.retain(|g| !named_gone(g));
+    let mut changed = out.backends.external_names.len() != served.backends.external_names.len()
+        || out.pending != served.pending;
     let mut kept_for = BTreeMap::new();
     for (named, ips) in trusted {
         let still: Vec<String> = if gone(named) {
@@ -355,6 +364,16 @@ pub(crate) fn without_gone(
         .flatten()
         .filter(|ip| !kept.contains(ip))
         .collect();
+    out.trusted_from = kept_for
+        .iter()
+        .map(
+            |(named, sources): (&GatewayKey, &Vec<String>)| crate::sync::TrustedFrom {
+                gateway: named.to_string(),
+                sources: sources.clone(),
+            },
+        )
+        .collect();
+    changed |= out.trusted_from != served.trusted_from;
     if let Some(proxy) = out.config.gateway.proxy_protocol.as_mut() {
         let before = proxy.trusted_sources.len();
         proxy
@@ -420,6 +439,46 @@ pub(crate) fn resolve(
                 .insert((name, port), endpoints.into_iter().collect());
         }
     }
+}
+
+/// Whether this controller has yet to hear from `named`: it serves no
+/// snapshot of it, or no instance of it is live. After a start or a
+/// takeover both stores begin empty; what spec says is never read here.
+pub(crate) fn unheard(hub: &Hub, reports: &ReportStore, named: &GatewayKey) -> bool {
+    if hub.current(named).is_none() {
+        return true;
+    }
+    let mut live = false;
+    reports.for_each_live(named, |_| live = true);
+    !live
+}
+
+/// The Gateway backends of `config` that spec allows (its refs passed
+/// every check) and that resolved to no endpoint because their target is
+/// [`unheard`]. Sorted.
+pub(crate) fn unheard_backends(
+    hub: &Hub,
+    reports: &ReportStore,
+    config: &PortailConfig,
+) -> Vec<PendingBackend> {
+    let unresolved: BTreeSet<(String, u16)> = gateway_refs(config)
+        .filter(|br| br.is_gateway() && !br.invalid && br.port != PRESENCE)
+        .filter(|br| {
+            !config
+                .endpoint_overrides
+                .contains_key(&(br.name.clone(), br.port))
+        })
+        .map(|br| (br.name.clone(), br.port))
+        .collect();
+    unresolved
+        .into_iter()
+        .filter(|(name, _)| {
+            parse_gateway_backend_name(name).is_some_and(|(gateway, namespace)| {
+                unheard(hub, reports, &GatewayKey::new(namespace, gateway))
+            })
+        })
+        .map(|(host, port)| PendingBackend { host, port })
+        .collect()
 }
 
 fn gateway_refs(config: &PortailConfig) -> impl Iterator<Item = &BackendRef> {
@@ -670,6 +729,15 @@ mod tests {
             entry("publish.q-publish.gateway"),
             entry("web.apps.svc"),
         ];
+        let from = |gateway: &str, sources: &[&str]| crate::sync::TrustedFrom {
+            gateway: gateway.into(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+        };
+        served.trusted_from = vec![
+            from("p-publish/publish", &["10.250.0.4/32", "10.250.0.5/32"]),
+            from("q-publish/publish", &["10.250.0.5/32"]),
+        ];
+        served.pending.trusted = vec!["p-publish/publish".into()];
         let served = served.seal();
         let (p, q) = (target(), GatewayKey::new("q-publish", "publish"));
         let trusted: BTreeMap<GatewayKey, Vec<String>> = [
@@ -696,6 +764,15 @@ mod tests {
             .map(|e| e.host.as_str())
             .collect();
         assert_eq!(hosts, ["publish.q-publish.gateway", "web.apps.svc"]);
+        assert_eq!(
+            pruned.trusted_from,
+            [from("q-publish/publish", &["10.250.0.5/32"])],
+            "provenance follows the trust kept"
+        );
+        assert!(
+            pruned.pending.is_empty(),
+            "a gone Gateway is pending no more"
+        );
         assert_eq!(
             pruned
                 .config

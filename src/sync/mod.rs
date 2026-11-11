@@ -24,7 +24,8 @@ pub use signed::{
     SIGNER_HEADER,
 };
 pub use snapshot::{
-    AppProtocol, Backends, CertificatePem, ExternalName, HeadlessTargetPort, NetworkCidrs, Snapshot,
+    AppProtocol, Backends, CertificatePem, ExternalName, HeadlessTargetPort, NetworkCidrs, Pending,
+    PendingBackend, Snapshot, TrustedFrom,
 };
 
 /// Wire protocol revision. Additive changes keep it; a peer outside the
