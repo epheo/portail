@@ -144,6 +144,7 @@ spec:
   proxyProtocol:             # see PROXY protocol
     trustedSources:
     - cidr: 10.250.0.0/16
+    - gateway: {namespace: portail-edge, name: edge}
 ```
 
 Referenced from:
@@ -183,7 +184,15 @@ Two replicas spread across nodes when there are several.
 
 ### PROXY protocol
 
-`proxyProtocol.trustedSources`: up to 16 CIDRs whose connections open with a PROXY protocol v2 header, Managed and Unmanaged alike.
+`proxyProtocol.trustedSources`: up to 16 sources whose connections open with a PROXY protocol v2 header, Managed and Unmanaged alike.
+Each is exactly one of:
+
+- `cidr`: a network address, as written.
+- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a `portail.epheo.eu/Network` both Gateways name, inside that Network's CIDRs on both sides, where it bound a listener. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
+- At most 64 trusted addresses per Network, one per instance, the first instances by id; the rest are counted in `portail_gateway_addresses_truncated_total`.
+- An address a live instance of another Gateway reports is never trusted.
+- This Gateway is reconciled when where the named one is reachable moves.
+
 
 - The client the header names stands for the connection: `X-Forwarded-For`, access logs, rate limits.
 - A trusted source that sends no header, a malformed one, or one for anything but a TCP client is closed; LOCAL keeps its own address.
@@ -208,15 +217,106 @@ backendRefs:
 - Another namespace: a ReferenceGrant in the target's, `to: [{group: gateway.networking.k8s.io, kind: Gateway}]`.
 - Both Gateways need a `portail.epheo.eu/Network` address of the same name.
 - Its endpoints: each live instance of the target, at its IP on that Network, inside the Network's CIDRs, where it bound that listener. An interface on another network never counts, whatever its address.
-- At most 64 endpoints per Network and port: a Gateway runs a few replicas.
+- At most 64 endpoints per Network and port, one per instance and listener, the first instances by id: a report listing more never crowds out the others. What a cap leaves out is counted in `portail_gateway_addresses_truncated_total`.
+- A pass that fails, such as on invalid parameters, keeps the configuration last served, but drops the endpoints of, and the trust in, a Gateway deleted since.
 - The referencing Gateway is reconciled when where the target is reachable moves (an address, its listeners, the target gone), never on its other changes.
-- No live instance there yet: its share fails (500, or the connection closes) until one reports.
+- No live instance there yet: its share answers 503, or the connection closes, until one reports. An invalid ref's share answers 500.
 - Every connection to it opens with a PROXY protocol v2 header naming the client.
 - HTTP opens one connection per request to it: a header names one client, so none is pooled or reused.
 - The shared network must have subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC, so no pod sends from a Gateway's address.
-- Never put the shared network's CIDR in `trustedSources`: every Gateway on it could then name any client.
-- Edge mode, a Gateway behind another on a shared network, is not usable until `trustedSources` can name a Gateway.
-- Until then Gateway backends serve nothing safely: a target that does not trust the sender reads the header as request bytes and closes the connection.
+- Never put the shared network's CIDR in `trustedSources`: every Gateway on it could then name any client. The target names the referencing Gateway instead: [Edge mode](#edge-mode).
+- A target that does not trust the sender reads the header as request bytes and closes the connection.
+
+### Edge mode
+
+One public address in front of many Gateways: an edge Gateway takes every connection and hands each to the Gateway serving its hostname, over a transit network only platform pods join.
+
+```yaml
+# The edge, in a platform namespace, on transit.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: edge, namespace: portail-edge}
+spec:
+  gatewayClassName: portail
+  addresses:
+  - {type: portail.epheo.eu/Network, value: transit}
+  - {type: IPAddress, value: 203.0.113.10}      # its public address, however it gets one
+  listeners:
+  - {name: tls, protocol: TLS, port: 443, tls: {mode: Passthrough}}
+  - {name: http, protocol: HTTP, port: 80}
+---
+# Each project Gateway, on transit, trusting the edge.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata: {name: publish, namespace: p-publish}
+spec:
+  proxyProtocol:
+    trustedSources:
+    - gateway: {namespace: portail-edge, name: edge}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: publish, namespace: p-publish}
+spec:
+  gatewayClassName: portail
+  infrastructure:
+    parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: publish}
+  addresses:
+  - {type: portail.epheo.eu/Network, value: transit}
+  listeners:
+  - {name: https, protocol: HTTPS, port: 443, hostname: "*.p.apps.example.com", tls: {certificateRefs: [{name: p-tls}]}}
+  - {name: http, protocol: HTTP, port: 80, hostname: "*.p.apps.example.com"}
+---
+# The edge's routes name the project Gateway; a grant in its namespace allows it.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata: {name: p, namespace: portail-edge}
+spec:
+  parentRefs: [{name: edge, sectionName: tls}]
+  hostnames: ["*.p.apps.example.com"]
+  rules:
+  - backendRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: publish, namespace: p-publish, port: 443}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: p, namespace: portail-edge}
+spec:
+  parentRefs: [{name: edge, sectionName: http}]
+  hostnames: ["*.p.apps.example.com"]
+  rules:
+  - backendRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: publish, namespace: p-publish, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: edge, namespace: p-publish}
+spec:
+  from:
+  - {group: gateway.networking.k8s.io, kind: TLSRoute, namespace: portail-edge}
+  - {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: portail-edge}
+  to:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: publish}
+```
+
+- HTTPS passes through the edge by SNI and terminates at the project Gateway, with its own certificate; HTTP goes by Host.
+- The project Gateway sees each client, from the header the edge sends, in `X-Forwarded-For`, access logs and rate limits.
+
+Requirements:
+
+- The transit network has subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC.
+- Only platform namespaces attach it: the edge's and the project Gateways'. Nothing a tenant runs.
+- Tenants cannot create or replace NetworkAttachmentDefinitions. A shared Network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
+- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods.
+- `trustedSources` names the edge Gateway, never the transit CIDR.
+
+The lapse window:
+
+- A project Gateway trusts the addresses the edge's live instances report.
+- A data plane reports leaving on SIGTERM: it stops being trusted at once, and every Gateway trusting it is reconciled.
+- An instance that stops without that report stays trusted until it lapses, two holds (60s) after its last report.
+- Within that window transit IPAM may hand its address to another transit pod. Only platform pods attach to transit, so that pod is a project Gateway's data plane, trusted as the edge for the window: it could name any client.
+- That is why transit stays platform-only.
+- OVN-Kubernetes hands an address on only once the pod holding it is gone, so the window needs a force delete (grace 0) or a leave report that never reached the controller.
+- Each time a truster is reconciled, an address another Gateway's live instance reports is left out, whatever the edge reported last. The new holder's own report does not reconcile the truster.
 
 ## Primary UDN
 

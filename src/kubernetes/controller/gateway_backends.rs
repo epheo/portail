@@ -1,7 +1,7 @@
 //! Backends of kind Gateway: another Gateway of this controller, reached
 //! on a network both share, at the addresses its own data planes bound.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 
@@ -11,8 +11,9 @@ use super::hub::Hub;
 use super::reports::ReportStore;
 use crate::config::{BackendRef, PortailConfig};
 use crate::kubernetes::converters::parse_gateway_backend_name;
+use crate::logging::debug;
 use crate::proxy::proxy_protocol::Cidr;
-use crate::sync::{GatewayKey, NetworkCidrs, Transport};
+use crate::sync::{GatewayKey, NetworkCidrs, Snapshot, Transport};
 
 /// Where a Gateway can be reached: per (Network name, listener port), the
 /// address and bound port of each live instance there.
@@ -38,6 +39,9 @@ struct State {
     targets: HashMap<GatewayKey, BTreeSet<GatewayKey>>,
     /// Each Gateway's exposure when last refreshed; none when empty.
     exposed: HashMap<GatewayKey, Exposure>,
+    /// Per Gateway, the addresses its last published snapshot trusts for
+    /// each Gateway it names: what a failed pass drops when one is gone.
+    trusted: HashMap<GatewayKey, BTreeMap<GatewayKey, Vec<String>>>,
 }
 
 impl State {
@@ -104,6 +108,7 @@ impl GatewayBackends {
     pub(crate) fn retain(&self, live: impl Fn(&GatewayKey) -> bool) {
         let mut state = self.state();
         state.targets.retain(|referrer, _| live(referrer));
+        state.trusted.retain(|truster, _| live(truster));
         let gone: Vec<GatewayKey> = state.exposed.keys().filter(|k| !live(k)).cloned().collect();
         for target in gone {
             state.exposed.remove(&target);
@@ -111,6 +116,29 @@ impl GatewayBackends {
                 let _ = self.wakes.unbounded_send(referrer);
             }
         }
+    }
+
+    /// The addresses `truster`'s published snapshot trusts, by the Gateway
+    /// they were trusted for.
+    pub(crate) fn record_trusted(
+        &self,
+        truster: GatewayKey,
+        trusted: BTreeMap<GatewayKey, Vec<String>>,
+    ) {
+        let mut state = self.state();
+        if trusted.is_empty() {
+            state.trusted.remove(&truster);
+        } else {
+            state.trusted.insert(truster, trusted);
+        }
+    }
+
+    pub(crate) fn trusted_by(&self, truster: &GatewayKey) -> BTreeMap<GatewayKey, Vec<String>> {
+        self.state()
+            .trusted
+            .get(truster)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Gateways to reconcile because a Gateway they name moved. Taken
@@ -158,8 +186,10 @@ pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) ->
             if !on_network {
                 continue;
             }
+            // One bound port per listener on one address: a report listing
+            // more never crowds out the instances visited after it.
             for listener in &served.config.gateway.listeners {
-                let ports = report
+                let mut ports = report
                     .listeners
                     .iter()
                     .filter(|l| l.name == listener.name)
@@ -167,13 +197,16 @@ pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) ->
                     .filter(|e| e.bound && e.transport == Transport::Tcp)
                     .filter(|e| e.address.as_ref().is_none_or(|a| a == ip))
                     .map(|e| e.port);
+                let Some(port) = ports.next() else {
+                    continue;
+                };
                 let set = out
                     .entry((network.name.clone(), listener.port))
                     .or_default();
-                for port in ports {
-                    if set.len() >= MAX_ENDPOINTS {
-                        break;
-                    }
+                if ports.next().is_some() || set.len() >= MAX_ENDPOINTS {
+                    truncated(target);
+                }
+                if set.len() < MAX_ENDPOINTS {
                     set.insert((ip.clone(), port));
                 }
             }
@@ -183,10 +216,139 @@ pub(crate) fn exposure(hub: &Hub, reports: &ReportStore, target: &GatewayKey) ->
     out
 }
 
+/// A cap left addresses of `gateway`'s reports out.
+fn truncated(gateway: &GatewayKey) {
+    crate::metrics::METRICS
+        .gateway_addresses_truncated_total
+        .inc();
+    debug!(
+        "Gateway {}: its reports go over the address cap; the first instances by id are kept",
+        gateway
+    );
+}
+
+/// Host CIDRs a Gateway on `networks` trusts for `named`: the IP each live
+/// instance of `named` reports on one of those Networks, by name, inside
+/// that Network's CIDRs on both sides, where it bound a TCP listener: what
+/// `named`'s exposure tracks, so any change wakes the truster. Never an
+/// address on another network, which a recycled pod IP could give a
+/// tenant. Nothing without a shared Network or a live report: trusting
+/// less closes connections, trusting more lets a sender name any client.
+/// An IP a live instance of another Gateway reports is left out: the
+/// network's IPAM may have handed it on from an instance not yet lapsed.
+pub(crate) fn trusted_addresses(
+    hub: &Hub,
+    reports: &ReportStore,
+    named: &GatewayKey,
+    networks: &[NetworkCidrs],
+) -> Vec<String> {
+    let Some(served) = hub.current(named) else {
+        return Vec::new();
+    };
+    let parse = |n: &NetworkCidrs| -> Vec<Cidr> {
+        n.cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect()
+    };
+    let shared: Vec<(&str, Vec<Cidr>, Vec<Cidr>)> = networks
+        .iter()
+        .filter_map(|mine| {
+            let theirs = served.networks.iter().find(|n| n.name == mine.name)?;
+            Some((mine.name.as_str(), parse(mine), parse(theirs)))
+        })
+        .collect();
+    if shared.is_empty() {
+        return Vec::new();
+    }
+    let mut found: BTreeMap<&str, BTreeSet<IpAddr>> = BTreeMap::new();
+    reports.for_each_live(named, |report| {
+        for (name, mine, theirs) in &shared {
+            let Some(ip) = report.networks.get(*name) else {
+                continue;
+            };
+            let Ok(addr) = ip.parse::<IpAddr>().map(|a| a.to_canonical()) else {
+                continue;
+            };
+            let inside = |cidrs: &[Cidr]| cidrs.iter().any(|c| c.contains(addr));
+            if !inside(mine) || !inside(theirs) {
+                continue;
+            }
+            let bound = report
+                .listeners
+                .iter()
+                .flat_map(|l| &l.endpoints)
+                .filter(|e| e.bound && e.transport == Transport::Tcp)
+                .any(|e| e.address.as_ref().is_none_or(|a| a == ip));
+            if !bound {
+                continue;
+            }
+            let set = found.entry(name).or_default();
+            if set.len() < MAX_ENDPOINTS {
+                set.insert(addr);
+            } else {
+                truncated(named);
+            }
+        }
+    });
+    let candidates: HashSet<IpAddr> = found.into_values().flatten().collect();
+    let claimed = reports.claimed_besides(named, &candidates);
+    let mut out: Vec<String> = candidates
+        .difference(&claimed)
+        .map(|ip| match ip {
+            IpAddr::V4(_) => format!("{ip}/32"),
+            IpAddr::V6(_) => format!("{ip}/128"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `served` without what it holds of the Gateways `gone` says are gone:
+/// their endpoints, and the addresses `trusted` attributes to them alone.
+/// A pass that fails keeps the rest as it was served. None when it holds
+/// nothing of theirs; else the snapshot to publish, and who was gone.
+pub(crate) fn without_gone(
+    served: &Snapshot,
+    trusted: &BTreeMap<GatewayKey, Vec<String>>,
+    gone: impl Fn(&GatewayKey) -> bool,
+) -> Option<(Snapshot, BTreeSet<GatewayKey>)> {
+    let mut dropped = BTreeSet::new();
+    let mut out = served.clone();
+    out.backends.external_names.retain(|entry| {
+        let Some((name, namespace)) = parse_gateway_backend_name(&entry.host) else {
+            return true;
+        };
+        let key = GatewayKey::new(namespace, name);
+        let keep = !gone(&key);
+        if !keep {
+            dropped.insert(key);
+        }
+        keep
+    });
+    let (gone_trust, kept_trust): (Vec<_>, Vec<_>) = trusted.iter().partition(|(k, _)| gone(k));
+    let kept: HashSet<&String> = kept_trust.iter().flat_map(|(_, ips)| ips.iter()).collect();
+    let drop: HashSet<&String> = gone_trust
+        .iter()
+        .flat_map(|(_, ips)| ips.iter())
+        .filter(|ip| !kept.contains(ip))
+        .collect();
+    if let Some(proxy) = out.config.gateway.proxy_protocol.as_mut() {
+        let before = proxy.trusted_sources.len();
+        proxy
+            .trusted_sources
+            .retain(|source| !drop.contains(source));
+        if proxy.trusted_sources.len() != before {
+            dropped.extend(gone_trust.iter().map(|(k, _)| (*k).clone()));
+        }
+        if proxy.trusted_sources.is_empty() {
+            out.config.gateway.proxy_protocol = None;
+        }
+    }
+    (!dropped.is_empty()).then(|| (out.seal(), dropped))
+}
+
 /// Fill `config`'s endpoint overrides for its valid Gateway backends: the
 /// target's exposure on each of the referencing Gateway's own Networks,
 /// by name, inside that Network's CIDRs. None yet: no override, and the
-/// share is rejected until an instance of the target reports.
+/// share answers 503 until an instance of the target reports.
 pub(crate) fn resolve(
     hub: &Hub,
     reports: &ReportStore,
@@ -323,6 +485,193 @@ mod tests {
         }
     }
 
+    /// What a Gateway on transit trusts for a Gateway it names: each live
+    /// instance's transit address, inside transit on both sides, where it
+    /// bound a listener, as a host. Never another interface, never an
+    /// address another Gateway's live instance reports, and nothing
+    /// without a report or a shared Network.
+    #[test]
+    fn trusted_addresses_are_the_named_gateways_own_on_a_shared_network() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        let trusted =
+            |networks: &[NetworkCidrs]| trusted_addresses(&hub, &reports, &target(), networks);
+        assert!(trusted(&transit()).is_empty(), "no report");
+
+        reports.record(
+            &target(),
+            InstanceId("a".into()),
+            report(Some("10.250.0.4"), None, &["10.128.0.4", "10.250.0.4"]),
+        );
+        reports.record(
+            &target(),
+            InstanceId("b".into()),
+            report(None, None, &["10.250.0.5"]),
+        );
+        let mut unbound = report(Some("10.250.0.6"), None, &["10.250.0.6"]);
+        unbound.listeners[0].endpoints[0].bound = false;
+        reports.record(&target(), InstanceId("c".into()), unbound);
+        reports.record(
+            &target(),
+            InstanceId("d".into()),
+            report(Some("10.251.0.7"), None, &["10.251.0.7"]),
+        );
+        assert_eq!(
+            trusted(&transit()),
+            ["10.250.0.4/32"],
+            "b names no transit address, c bound nothing, d is outside transit"
+        );
+        let elsewhere = vec![NetworkCidrs {
+            name: "other".into(),
+            cidrs: vec!["10.250.0.0/16".into()],
+        }];
+        assert!(
+            trusted(&elsewhere).is_empty(),
+            "a network of the same CIDRs but another name"
+        );
+        assert!(trusted(&[]).is_empty(), "no Network address of its own");
+        let narrower = vec![NetworkCidrs {
+            name: "transit".into(),
+            cidrs: vec!["10.250.1.0/24".into()],
+        }];
+        assert!(trusted(&narrower).is_empty(), "outside the truster's CIDRs");
+
+        // The network's IPAM handed a's address on before a lapsed.
+        reports.record(
+            &GatewayKey::new("q-publish", "publish"),
+            InstanceId("q".into()),
+            report(Some("10.250.0.4"), None, &["10.250.0.4"]),
+        );
+        assert!(trusted(&transit()).is_empty(), "claimed by another Gateway");
+    }
+
+    /// A report listing many ports never crowds out the others: each
+    /// instance counts once per listener, and the cap is counted when it
+    /// bites.
+    #[test]
+    fn a_crowded_report_counts_once_per_listener() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        let mut crowded = report(Some("10.250.0.4"), None, &["10.250.0.4"]);
+        let endpoint = crowded.listeners[0].endpoints[0].clone();
+        crowded.listeners[0].endpoints = (0..200)
+            .map(|i| EndpointReport {
+                port: 9000 + i,
+                ..endpoint.clone()
+            })
+            .collect();
+        reports.record(&target(), InstanceId("a".into()), crowded);
+        reports.record(
+            &target(),
+            InstanceId("b".into()),
+            report(Some("10.250.0.5"), None, &["10.250.0.5"]),
+        );
+        let before = crate::metrics::METRICS
+            .gateway_addresses_truncated_total
+            .get();
+        let exposed = exposure(&hub, &reports, &target());
+        assert_eq!(
+            exposed[&("transit".to_string(), 80)],
+            [
+                ("10.250.0.4".to_string(), 9000),
+                ("10.250.0.5".to_string(), 8000)
+            ]
+            .into()
+        );
+        assert!(
+            crate::metrics::METRICS
+                .gateway_addresses_truncated_total
+                .get()
+                > before
+        );
+    }
+
+    /// More instances than the cap: the first by id are kept, the same
+    /// ones on every pass, for backends and trust alike.
+    #[test]
+    fn the_cap_keeps_the_first_instances_by_id() {
+        let (hub, reports) = (hub(), ReportStore::default());
+        for i in 0..70u8 {
+            let ip = format!("10.250.1.{i}");
+            reports.record(
+                &target(),
+                InstanceId(format!("i{i:03}")),
+                report(Some(&ip), None, &[&ip]),
+            );
+        }
+        let exposed = &exposure(&hub, &reports, &target())[&("transit".to_string(), 80)];
+        assert_eq!(exposed.len(), MAX_ENDPOINTS);
+        assert!(exposed.contains(&("10.250.1.0".to_string(), 8000)));
+        assert!(exposed.contains(&("10.250.1.63".to_string(), 8000)));
+        assert!(!exposed.contains(&("10.250.1.64".to_string(), 8000)));
+
+        let trusted = trusted_addresses(&hub, &reports, &target(), &transit());
+        assert_eq!(trusted.len(), MAX_ENDPOINTS);
+        assert!(trusted.contains(&"10.250.1.63/32".to_string()));
+        assert!(!trusted.contains(&"10.250.1.64/32".to_string()));
+    }
+
+    /// What a failed pass keeps: all but the endpoints of, and the trust
+    /// in, a Gateway gone. An address also trusted for a Gateway still
+    /// there stays. Nothing of a gone Gateway: nothing to republish.
+    #[test]
+    fn a_failed_pass_drops_only_what_gone_gateways_gave() {
+        let config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "edge", "listeners": [
+                {"name": "http", "protocol": "HTTP", "port": 80}
+            ], "proxyProtocol": {"trustedSources": [
+                "192.0.2.0/24", "10.250.0.4/32", "10.250.0.5/32"
+            ]}}
+        }))
+        .unwrap();
+        let gateway = GatewayRef {
+            namespace: "edge".into(),
+            name: "public".into(),
+            uid: "u".into(),
+            generation: 1,
+        };
+        let mut served = Snapshot::from_config(gateway, config, vec![]);
+        let entry = |host: &str| crate::sync::ExternalName {
+            host: host.into(),
+            port: 80,
+            targets: vec![("10.250.0.7".into(), 8000)],
+        };
+        served.backends.external_names = vec![
+            entry("publish.p-publish.gateway"),
+            entry("publish.q-publish.gateway"),
+            entry("web.apps.svc"),
+        ];
+        let served = served.seal();
+        let (p, q) = (target(), GatewayKey::new("q-publish", "publish"));
+        let trusted: BTreeMap<GatewayKey, Vec<String>> = [
+            (
+                p.clone(),
+                vec!["10.250.0.4/32".into(), "10.250.0.5/32".into()],
+            ),
+            (q.clone(), vec!["10.250.0.5/32".into()]),
+        ]
+        .into();
+
+        let (pruned, gone) = without_gone(&served, &trusted, |k| *k == p).unwrap();
+        assert_eq!(gone, [p.clone()].into());
+        let hosts: Vec<&str> = pruned
+            .backends
+            .external_names
+            .iter()
+            .map(|e| e.host.as_str())
+            .collect();
+        assert_eq!(hosts, ["publish.q-publish.gateway", "web.apps.svc"]);
+        assert_eq!(
+            pruned
+                .config
+                .gateway
+                .proxy_protocol
+                .unwrap()
+                .trusted_sources,
+            ["192.0.2.0/24", "10.250.0.5/32"]
+        );
+        assert_ne!(pruned.version, served.version);
+        assert!(without_gone(&served, &trusted, |_| false).is_none());
+    }
+
     fn edge_config(port: u16) -> PortailConfig {
         serde_json::from_value(serde_json::json!({
             "httpRoutes": [{"rules": [{"backendRefs": [{
@@ -407,7 +756,11 @@ mod tests {
             .collect();
         reports.record(&target(), InstanceId("a".into()), big);
         let exposed = exposure(&hub, &reports, &target());
-        assert_eq!(exposed[&("transit".into(), 80)].len(), MAX_ENDPOINTS);
+        assert_eq!(
+            exposed[&("transit".into(), 80)],
+            [("10.250.0.7".to_string(), 0)].into(),
+            "one port per instance and listener"
+        );
     }
 
     /// Dependents wake when the target's exposure moves: an address, a

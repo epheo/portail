@@ -292,8 +292,10 @@ fn analyze_http_request<'a>(
         None => return reply(503, None),
     };
     let selected_backend = &rule.backends[backend_index];
-    if selected_backend.action == BackendAction::Reject {
-        return reply(500, None);
+    match selected_backend.action {
+        BackendAction::Reject => return reply(500, None),
+        BackendAction::Unavailable => return reply(503, None),
+        BackendAction::Forward | BackendAction::ForwardProxied => {}
     }
 
     Ok(RoutingResult::HttpForward {
@@ -524,10 +526,10 @@ fn analyze_l4_request<'a>(
     else {
         return unroutable(&throttles.no_weight, "no backend with positive weight");
     };
-    if selected_backend.action == BackendAction::Reject {
+    if selected_backend.action.stands_in() {
         debug!(
-            "{} routing: port {} picked an invalid backendRef's share; rejecting",
-            proto, server_port
+            "{} routing: port {} picked a stand-in's share ({:?}); closing",
+            proto, server_port, selected_backend.action
         );
         return Ok(RoutingResult::CloseConnection);
     }

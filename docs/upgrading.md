@@ -13,6 +13,7 @@
 - Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.
 - GatewayParameters `proxyProtocol` needs data planes of this release: an older one refuses the configuration and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`.
 - An older data plane sends no PROXY header to a Gateway backend, so a target trusting it closes those connections: upgrade data planes before naming Gateway backends.
+- GatewayParameters `trustedSources` may name a Gateway: apply this release's CRD (`deploy/crds`) before writing one, as the older one requires `cidr`.
 
 ## 0.1.x to 0.2.0
 

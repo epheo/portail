@@ -236,10 +236,13 @@ fn served_gateways(ctx: &ControllerCtx) -> HashMap<(String, String), Vec<u16>> {
 }
 
 /// Translate `gateway` from the reflector caches.
+/// `trusted`: the Gateways its parameters trust, named like its Gateway
+/// backends, so a move of where one is reachable wakes this Gateway too.
 pub(crate) async fn translate(
     ctx: &ControllerCtx,
     gateway: &Gateway,
     external_name_backends: ExternalNameBackends,
+    trusted: &[GatewayKey],
 ) -> Result<Plan, Box<Rejected>> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -344,12 +347,14 @@ pub(crate) async fn translate(
         }
     };
     gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
+    let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
     let targets = std::mem::take(&mut result.gateway_targets)
         .into_iter()
         .map(|(namespace, name)| GatewayKey::new(namespace, name))
+        .chain(trusted.iter().cloned())
+        .filter(|named| *named != me)
         .collect();
-    ctx.backends
-        .record(GatewayKey::new(gw_ns.clone(), gw_name.clone()), targets);
+    ctx.backends.record(me, targets);
     let statuses = Statuses {
         accepted,
         listeners,

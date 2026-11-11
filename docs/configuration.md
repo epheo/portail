@@ -228,7 +228,7 @@ count requests dispatched to a backend.
 
 The receiving half of PROXY protocol v2, for a Gateway behind a load balancer or edge proxy that sends it.
 
-Kubernetes mode: `proxyProtocol.trustedSources` in GatewayParameters ([deployment](deployment.md#proxy-protocol)).
+Kubernetes mode: `proxyProtocol.trustedSources` in GatewayParameters, CIDRs or Gateways ([deployment](deployment.md#proxy-protocol)).
 Standalone mode:
 
 ```yaml
