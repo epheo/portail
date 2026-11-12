@@ -344,7 +344,12 @@ fn resource_requirements_schema(_: &mut schemars::SchemaGenerator) -> schemars::
 
 /// A CRD's manifest as YAML.
 fn crd_yaml_of<K: kube::CustomResourceExt>() -> anyhow::Result<String> {
-    Ok(serde_yaml::to_string(&K::crd())?)
+    let mut crd = K::crd();
+    // kube-derive writes `categories: []`; the apiserver drops it, so a
+    // GitOps tool would find the CRD out of sync forever.
+    let names = &mut crd.spec.names;
+    names.categories = names.categories.take().filter(|c| !c.is_empty());
+    Ok(serde_yaml::to_string(&crd)?)
 }
 
 /// All portail CRD manifests as one YAML document stream, for
@@ -423,6 +428,29 @@ mod tests {
             include_str!("../../deploy/crds/gatewayparameters.yaml"),
             "deploy/crds/gatewayparameters.yaml",
         );
+    }
+
+    /// The apiserver drops an empty list from a stored CRD, so a manifest
+    /// holding one never matches what a GitOps tool reads back.
+    #[test]
+    fn crds_hold_no_empty_list() {
+        fn empty_list_at(v: &serde_yaml::Value, path: &str) -> Option<String> {
+            match v {
+                serde_yaml::Value::Sequence(s) if s.is_empty() => Some(path.to_string()),
+                serde_yaml::Value::Sequence(s) => s
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, v)| empty_list_at(v, &format!("{path}[{i}]"))),
+                serde_yaml::Value::Mapping(m) => m.iter().find_map(|(k, v)| {
+                    empty_list_at(v, &format!("{path}.{}", k.as_str().unwrap_or("?")))
+                }),
+                _ => None,
+            }
+        }
+        for doc in serde_yaml::Deserializer::from_str(&crd_yaml().unwrap()) {
+            let crd = serde_yaml::Value::deserialize(doc).unwrap();
+            assert_eq!(empty_list_at(&crd, ""), None);
+        }
     }
 
     #[test]
