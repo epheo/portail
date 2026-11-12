@@ -1,5 +1,32 @@
 # Upgrading
 
+## Downgrading
+
+- A controller drops the conditions of its own domain (`portail.epheo.eu/...`) it no longer writes on its first pass.
+- One released before that, such as 0.2.1, leaves them as they were. After downgrading to it, a GatewayClass keeps a stale `portail.epheo.eu/GatewaysIsolated=True` that a console may trust.
+- Remove it by hand, `kubectl patch gatewayclass <name> --subresource=status --type=json -p '[{"op":"remove","path":"/status/conditions/<index>"}]'`, or edit the class so the older controller rewrites its conditions.
+
+## From 0.2.1
+
+- A Service backend whose addresses fall inside a network the Gateway attaches (its Network addresses, the networks it dials out on) is refused: the share of a backendRef left with none answers 500.
+- To keep them, set `serviceEndpointsOnAttachedNetworks: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
+- Find them first: headless Services (`clusterIP: None`) and ExternalName Services routed to by such Gateways, whose endpoints sit in those networks' CIDRs.
+- A Service backend's answer that is loopback, link-local, unspecified, broadcast or multicast is refused whatever the parameters. A standalone file is unchanged.
+- An older controller sends no setting and marks no ClusterIP name: a data plane of this release refuses inside attached networks, as by default, and dials every name directly.
+- A Gateway without a Service whose `spec.addresses` `IPAddress` values are on no data-plane pod now says so: `portail.epheo.eu/AddressesAssigned` `False` while another address is held, `Programmed` `False`, reason `AddressNotAssigned`, when none is. It binds as before.
+- An Unmanaged data plane on a dial-out network should set `POD_IP` (`status.podIP` through the downward API): while that network is unresolved, a named address binds only on its pod IP's interface or a listening Network's.
+- Routes to ExternalName Services are refused: `ResolvedRefs=False`, reason `InvalidKind`, and their share answers 500.
+- To keep them, set `externalNameBackends: Allowed` in the GatewayParameters of the GatewayClass or of the Gateway.
+- Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.
+- GatewayParameters `proxyProtocol` needs data planes of this release: an older one refuses the configuration and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`.
+- An older data plane sends no PROXY header to a Gateway backend, so a target trusting it closes those connections: upgrade data planes before naming Gateway backends.
+- An older data plane sends no PROXY header to a Service port with appProtocol `portail.epheo.eu/proxy-v2` either: upgrade data planes before marking one.
+- GatewayParameters `trustedSources` may name a Gateway: apply this release's CRD (`deploy/crds`) before writing one, as the older one requires `cidr`.
+- GatewayParameters `networks[].listeners`: apply this release's CRD before writing it. The older one prunes the field unknown to it, and the network then takes listeners.
+- `listeners: false` needs data planes of this release: an older one binds every interface, that network included, and reports no IP there, so Gateways trusting it trust nothing.
+- An older data plane's reports name no Gateway uid: no backend or trust resolves from them until it runs this release.
+- An Unmanaged Gateway's data planes are served on a TokenReview only: while reviews are busy or failing they get 503 and keep serving their last configuration.
+
 ## 0.1.x to 0.2.0
 
 0.2.0 splits portail into a controller and one data plane per Gateway.

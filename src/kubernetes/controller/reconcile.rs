@@ -18,18 +18,20 @@ use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HTTPRoute;
 
+use super::gateway_backends::{self, trusted_addresses};
 use super::provision::Provisioned;
 use super::translate::{translate, Observed, Plan, Rejected, Statuses};
 use super::{
     params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
     ReconcileError, ERROR_REQUEUE_SECS,
 };
-use crate::kubernetes::crds::RateLimitPolicy;
+use crate::config::ProxyProtocolConfig;
+use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::kubernetes::reconciler::{PolicyAcceptance, RouteAcceptance};
 use crate::kubernetes::status;
 use crate::logging::{debug, info, warn};
-use crate::sync::{GatewayKey, GatewayRef, Snapshot};
+use crate::sync::{GatewayKey, GatewayRef, Pending, PendingTrusted, Snapshot, TrustedFrom, HOLD};
 
 /// Per-listener attachedRoutes. The spec counts ROUTES attached to a
 /// listener, so a route whose several parentRefs land on the same listener
@@ -195,6 +197,51 @@ pub(super) enum ClassOwner {
     Missing,
 }
 
+/// A pass that failed keeps what `key` served, but never the endpoints of
+/// a Gateway since gone, nor trust in an address a named Gateway holds no
+/// more: republished without them, when it held any. Its own networks are
+/// the served ones: nothing is translated.
+fn drop_gone_gateways(ctx: &ControllerCtx, key: &GatewayKey) -> bool {
+    let Some(served) = ctx.hub.current(key) else {
+        return false;
+    };
+    let trusted = ctx.backends.trusted_by(key);
+    let Some((snapshot, kept, dropped)) = gateway_backends::without_gone(
+        &served,
+        &trusted,
+        |named| !ours(ctx, named),
+        |named| trusted_addresses(&ctx.hub, &ctx.reports, named, &served.networks),
+    ) else {
+        return false;
+    };
+    let names: Vec<String> = dropped
+        .iter()
+        .map(|g| format!("{}/{}", g.namespace, g.name))
+        .collect();
+    warn!(
+        "Gateway {}: this pass failed; what it serves of Gateway(s) {} gone or moved is \
+         dropped, the rest stays as served",
+        key,
+        names.join(", ")
+    );
+    ctx.backends.record_trusted(key.clone(), kept);
+    ctx.hub.publish(snapshot)
+}
+
+/// Whether `key` is a Gateway of a class this controller runs.
+fn ours(ctx: &ControllerCtx, key: &GatewayKey) -> bool {
+    let classes = ctx.cache.gateway_classes.state();
+    ctx.cache
+        .gateways
+        .get(&ObjectRef::new(&key.name).within(&key.namespace))
+        .is_some_and(|g| {
+            matches!(
+                class_owner(&classes, &g.spec.gateway_class_name, &ctx.controller_name),
+                ClassOwner::Ours
+            )
+        })
+}
+
 pub(super) fn class_owner(
     classes: &[Arc<GatewayClass>],
     class_name: &str,
@@ -221,9 +268,11 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
         .collect();
     ctx.hub.retain(|key| live.contains(key));
     ctx.reports.retain(|key| live.contains(key));
+    ctx.backends.retain(|key| live.contains(key));
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
-    ctx.networks.retain_named(&gateways);
+    ctx.networks
+        .retain_named(&gateways, &ctx.cache.gateway_parameters.state());
     // Our route and policy entries for them go too (follow-up 11).
     ctx.departures.wake();
 }
@@ -245,6 +294,9 @@ pub(super) struct Pass {
     invalid_parameters: Option<String>,
     /// The hub's version moved.
     published: bool,
+    /// When the snapshot published stops marking anything pending: the
+    /// pass that publishes it unmarked is due then.
+    pending_until: Option<tokio::time::Instant>,
 }
 
 /// The first half of a pass: translate, provision, publish.
@@ -268,6 +320,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         ClassOwner::Ours => {}
         ClassOwner::Other => {
             if ctx.hub.remove(&key) {
+                ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
                 info!(
                     "Gateway {} class '{}' names another controller; no longer served",
                     key, gateway.spec.gateway_class_name
@@ -293,12 +346,118 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     }
 
     let params = params::resolve(ctx, gateway);
-    let mut plan = translate(ctx, gateway).await;
+    // Invalid parameters publish nothing; the status they leave refuses.
+    let external_name_backends = params
+        .as_ref()
+        .map_or(ExternalNameBackends::Refused, |p| p.external_name_backends);
+    // Parameters that fail keep their last trust published, so the
+    // Gateways it was for still wake this one: on their lapse or delete, a
+    // failed pass drops it.
+    let last_trusted: Vec<GatewayKey>;
+    let trusted_gateways = match &params {
+        Ok(p) => p.trusted_gateways.as_slice(),
+        Err(_) => {
+            last_trusted = ctx.backends.trusted_by(&key).into_keys().collect();
+            last_trusted.as_slice()
+        }
+    };
+    let egress: Vec<(String, String)> = params
+        .as_ref()
+        .map(|p| p.egress_networks(&key.namespace))
+        .unwrap_or_default();
+    let mut plan = translate(
+        ctx,
+        gateway,
+        external_name_backends,
+        trusted_gateways,
+        &egress,
+    )
+    .await;
+    // A dial-out network's CIDRs are read at translation: only then does an
+    // IPAddress inside one show it would never bind.
+    let params = match (params, &plan) {
+        (Ok(p), Ok(plan)) => match params::dial_out_address(gateway, &plan.networks) {
+            Some(why) => Err(why),
+            None => Ok(p),
+        },
+        (params, _) => params,
+    };
+    let mut pending_until = None;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
             let provisioned = provision::reconcile(ctx, gateway, params).await;
             provisioned.stamp(&mut plan.config);
-            let snapshot = Snapshot::from_config(
+            let mut trusted = params.proxy_sources.clone();
+            let mut trusted_for = std::collections::BTreeMap::new();
+            // Within a hold of taking the lead, a named Gateway this
+            // controller has not heard from yet may still be serving: its
+            // data planes keep what they had for it rather than lose it to
+            // a store that is merely empty.
+            let window = ctx
+                .leader
+                .leading_since()
+                .map(|t| t + HOLD)
+                .filter(|end| *end > tokio::time::Instant::now());
+            let mut pending = Pending::default();
+            let uid_of = |named: &GatewayKey| {
+                ctx.cache
+                    .gateways
+                    .get(&ObjectRef::new(&named.name).within(&named.namespace))
+                    .and_then(|g| g.metadata.uid.clone())
+            };
+            for named in params
+                .trusted_gateways
+                .iter()
+                .filter(|named| **named != key)
+            {
+                if !ours(ctx, named) {
+                    warn!(
+                        "Gateway {}: trustedSources names Gateway {}/{}, not one of this \
+                         controller's: nothing trusted for it",
+                        key, named.namespace, named.name
+                    );
+                    continue;
+                }
+                let addresses = trusted_addresses(&ctx.hub, &ctx.reports, named, &plan.networks);
+                trusted.extend(addresses.iter().cloned());
+                if !addresses.is_empty() {
+                    trusted_for.insert(named.clone(), addresses);
+                } else if window.is_some()
+                    && !plan.networks.is_empty()
+                    && gateway_backends::unheard(&ctx.hub, &ctx.reports, named)
+                {
+                    if let Some(uid) = uid_of(named) {
+                        pending.trusted.push(PendingTrusted {
+                            gateway: named.to_string(),
+                            uid,
+                        });
+                    }
+                }
+            }
+            if window.is_some() {
+                pending.backends = gateway_backends::unheard_backends(
+                    &ctx.hub,
+                    &ctx.reports,
+                    &plan.config,
+                    uid_of,
+                );
+            }
+            let backends_from = gateway_backends::backends_from(&plan.config, uid_of);
+            let trusted_from = trusted_for
+                .iter()
+                .map(|(named, sources)| TrustedFrom {
+                    gateway: named.to_string(),
+                    uid: uid_of(named).unwrap_or_default(),
+                    sources: sources.clone(),
+                })
+                .collect();
+            ctx.backends.record_trusted(key.clone(), trusted_for);
+            plan.config.gateway.proxy_protocol =
+                (!trusted.is_empty()).then_some(ProxyProtocolConfig {
+                    trusted_sources: trusted,
+                });
+            pending_until = window.filter(|_| !pending.is_empty());
+            let mut snapshot = Snapshot::from_config(
                 GatewayRef {
                     namespace: key.namespace.clone(),
                     name: key.name.clone(),
@@ -308,9 +467,27 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
                 std::mem::take(&mut plan.config),
                 std::mem::take(&mut plan.networks),
             );
-            (provisioned, ctx.hub.publish(snapshot))
+            snapshot.trusted_from = trusted_from;
+            snapshot.backends_from = backends_from;
+            snapshot.pending = pending;
+            snapshot.service_endpoints_on_attached_networks = params
+                .service_endpoints_on_attached_networks
+                == crate::kubernetes::crds::AttachedNetworkEndpoints::Allowed;
+            // Instances of a Gateway this name named before report for
+            // that one: their binds and addresses are not this one's.
+            if ctx
+                .hub
+                .current(&key)
+                .is_some_and(|served| served.gateway.uid != snapshot.gateway.uid)
+            {
+                ctx.reports.forget(&key);
+            }
+            let published = ctx.hub.publish(snapshot.seal());
+            // Its listeners may have moved with its spec.
+            ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
+            (provisioned, published)
         }
-        _ => (Provisioned::unmanaged(), false),
+        _ => (Provisioned::unmanaged(), drop_gone_gateways(ctx, &key)),
     };
     // A delete in the meantime already ran its forget: a slot published
     // now would serve a deleted Gateway until the next delete event, or,
@@ -323,6 +500,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         .is_none_or(|now| now.metadata.uid != gateway.metadata.uid);
     if stale {
         ctx.hub.remove(&key);
+        ctx.backends.refresh(&key, &ctx.hub, &ctx.reports);
         return Step::Done(Action::await_change());
     }
     Step::Continue(Box::new(Pass {
@@ -331,6 +509,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         provisioned,
         invalid_parameters: params.err(),
         published,
+        pending_until,
     }))
 }
 
@@ -347,6 +526,7 @@ pub(super) async fn finish(
         provisioned,
         invalid_parameters,
         published,
+        pending_until,
     } = pass;
     let (statuses, error): (Statuses, Option<String>) = match plan {
         Ok(plan) => (plan.statuses, None),
@@ -421,10 +601,14 @@ pub(super) async fn finish(
         debug!("Gateway {} unchanged: nothing published or written", key);
         skip_requeue_secs(is_programmed, all_routes_accepted)
     };
-    let requeue = Duration::from_secs(requeue_secs);
-    Ok(Action::requeue(
-        gateway_status.recheck.map_or(requeue, |r| r.min(requeue)),
-    ))
+    let requeue = [
+        gateway_status.recheck,
+        pending_until.map(|t| t.saturating_duration_since(tokio::time::Instant::now())),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(Duration::from_secs(requeue_secs), Duration::min);
+    Ok(Action::requeue(requeue))
 }
 
 pub(super) async fn reconcile(
@@ -458,6 +642,71 @@ mod tests {
             }
             _ => vec![],
         }
+    }
+
+    /// The parameters' trusted sources ride the config the data plane
+    /// applies; none set, none sent.
+    #[tokio::test]
+    async fn trusted_proxy_sources_reach_the_data_plane() {
+        use crate::kubernetes::crds::{GatewayParameters, ProxyProtocolParameters, TrustedSource};
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        let served = p.served(&gw).unwrap();
+        assert_eq!(served.config.gateway.proxy_protocol, None);
+
+        let mut params = GatewayParameters::new(
+            "unmanaged",
+            crate::kubernetes::crds::GatewayParametersSpec {
+                provisioning: Some(crate::kubernetes::crds::Provisioning::Unmanaged),
+                proxy_protocol: Some(ProxyProtocolParameters {
+                    trusted_sources: Some(vec![TrustedSource {
+                        cidr: Some("10.250.0.0/16".into()),
+                        gateway: None,
+                    }]),
+                }),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut p.cluster.parameters, params);
+        p.pass(&gw).await.unwrap();
+        let served = p.served(&gw).unwrap();
+        assert_eq!(
+            served.config.gateway.proxy_protocol,
+            Some(ProxyProtocolConfig {
+                trusted_sources: vec!["10.250.0.0/16".into()],
+            })
+        );
+    }
+
+    /// A Gateway recreated under its name: what the previous one's
+    /// instances reported is forgotten as the new one publishes.
+    #[tokio::test]
+    async fn a_recreated_gateway_forgets_the_previous_ones_reports() {
+        use super::super::reports::InstanceId;
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("target", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        p.pass(&gw).await.unwrap();
+        let mut previous = p.ctx.reports.live(&testkit::key(&gw))[0].1.clone();
+        assert_eq!(previous.gateway_uid, "target-uid");
+        previous.interface_ips = vec!["10.128.0.99".into()];
+        p.ctx
+            .reports
+            .record(&testkit::key(&gw), InstanceId("old-pod".into()), previous);
+
+        let mut again = testkit::gateway("target", 1);
+        again.metadata.uid = Some("target-uid-2".into());
+        apply(&mut p.cluster.gateways, again.clone());
+        p.pass(&again).await.unwrap();
+        let live = p.ctx.reports.live(&testkit::key(&again));
+        assert!(
+            live.iter()
+                .all(|(id, r)| id.0 != "old-pod" && r.gateway_uid == "target-uid-2"),
+            "{live:?}"
+        );
     }
 
     /// A spec change that leaves the config alone still moves
@@ -897,6 +1146,956 @@ mod tests {
         );
     }
 
+    /// An edge on udn-a naming Gateway `target` serves where `target`'s
+    /// instances bound on udn-a. It wakes when that moves (an address, the
+    /// target's spec, the target gone), never on the target's other report
+    /// churn.
+    #[tokio::test]
+    async fn an_edge_follows_where_its_gateway_backend_bound() {
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+        let mut p = Pipeline::new();
+        let mut wakes = p.ctx.backends.wakes().unwrap();
+        let mut woken = move || {
+            let mut out = vec![];
+            while let Ok(key) = wakes.try_recv() {
+                out.push(key);
+            }
+            out
+        };
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let on_port = |port: i32, generation: i64| {
+            let mut target = with_addresses(testkit::gateway("target", 1), generation, &network);
+            target.spec.listeners[0].port = port;
+            target
+        };
+        let target = on_port(80, 1);
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&target).await.unwrap();
+        let report = |applied: &str, ip: &str| InstanceReport {
+            applied: applied.into(),
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: None,
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
+                }],
+            }],
+            interface_ips: vec![ip.into(), "10.250.9.9".into()],
+            networks: [("udn-a".to_string(), ip.to_string())].into(),
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, r: InstanceReport| {
+            p.ctx.reports.record(
+                &testkit::key(&target),
+                super::super::reports::InstanceId("pod-a".into()),
+                InstanceReport {
+                    gateway_uid: target.uid().unwrap(),
+                    ..r
+                },
+            );
+            super::super::report_trigger(
+                &p.ctx,
+                super::super::reports::Trigger {
+                    gateway: testkit::key(&target),
+                    dns_moved: false,
+                },
+            );
+        };
+        reported(&p, report("v1", "10.250.0.7"));
+
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        let mut route = testkit::http_route("r", &["edge"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
+            "backendRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                             "name": "target", "port": 80}],
+        }))
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, route);
+        p.pass(&edge).await.unwrap();
+        let served = p.served(&edge).unwrap();
+        assert_eq!(
+            served.backends.external_names,
+            [crate::sync::ExternalName {
+                host: "target.default.gateway".into(),
+                port: 80,
+                targets: vec![("10.250.0.7".into(), 8000)],
+            }],
+            "its udn-a address alone, not 10.250.9.9"
+        );
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&target)),
+            [testkit::key(&edge)]
+        );
+        let edge_key = testkit::key(&edge);
+        woken();
+
+        reported(&p, report("v2", "10.250.0.7"));
+        assert!(woken().is_empty(), "a new version alone");
+
+        reported(&p, report("v2", "10.250.0.8"));
+        assert_eq!(woken(), std::slice::from_ref(&edge_key), "an address moved");
+
+        let target = on_port(81, 2);
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&target).await.unwrap();
+        assert_eq!(
+            woken(),
+            std::slice::from_ref(&edge_key),
+            "its spec moved a listener"
+        );
+
+        p.delete(&target).await;
+        assert_eq!(woken(), [edge_key], "it is gone");
+    }
+
+    /// Right after taking the lead, a Gateway this controller has not
+    /// heard from yet is marked pending, never left out as if spec dropped
+    /// it: its trusters and edges keep what they served for one hold. What
+    /// spec does drop goes at once, inside the window too. After the window
+    /// nothing is pending, and a takeover opens a new one.
+    #[tokio::test]
+    async fn after_taking_the_lead_an_unheard_trusted_gateway_is_pending() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, Provisioning, ProxyProtocolParameters,
+            TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{InstanceReport, TrustedFrom};
+
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let parameters = |trusting: bool| {
+            let mut params = GatewayParameters::new(
+                "unmanaged",
+                GatewayParametersSpec {
+                    provisioning: Some(Provisioning::Unmanaged),
+                    proxy_protocol: trusting.then(|| ProxyProtocolParameters {
+                        trusted_sources: Some(vec![TrustedSource {
+                            cidr: None,
+                            gateway: Some(TrustedGateway {
+                                namespace: "default".into(),
+                                name: "edge".into(),
+                            }),
+                        }]),
+                    }),
+                    ..Default::default()
+                },
+            );
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        apply(&mut p.cluster.parameters, parameters(true));
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        let project = with_addresses(testkit::gateway("project", 1), 1, &network);
+        apply(&mut p.cluster.gateways, project.clone());
+        let pending = |p: &Pipeline| -> Vec<(String, String)> {
+            p.served(&project)
+                .unwrap()
+                .pending
+                .trusted
+                .iter()
+                .map(|t| (t.gateway.clone(), t.uid.clone()))
+                .collect()
+        };
+        let edge_as = |uid: &str| vec![("default/edge".to_string(), uid.to_string())];
+
+        p.pass(&project).await.unwrap();
+        assert_eq!(
+            pending(&p),
+            edge_as("edge-uid"),
+            "edge neither served nor heard"
+        );
+        assert_eq!(
+            p.served(&project).unwrap().config.gateway.proxy_protocol,
+            None
+        );
+
+        // Published, its data plane not yet heard from.
+        let _ = publish(&edge, &p.ctx).await;
+        p.pass(&project).await.unwrap();
+        assert_eq!(
+            pending(&p),
+            edge_as("edge-uid"),
+            "served, but not heard from"
+        );
+
+        p.ctx.reports.record(
+            &testkit::key(&edge),
+            InstanceId("edge-pod".into()),
+            InstanceReport {
+                gateway_uid: edge.uid().unwrap(),
+                interface_ips: vec!["10.250.0.9".into()],
+                networks: [("udn-a".to_string(), "10.250.0.9".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        super::super::report_trigger(
+            &p.ctx,
+            Trigger {
+                gateway: testkit::key(&edge),
+                dns_moved: false,
+            },
+        );
+        p.pass(&project).await.unwrap();
+        let served = p.served(&project).unwrap();
+        assert!(served.pending.is_empty(), "heard from");
+        assert_eq!(
+            served.trusted_from,
+            [TrustedFrom {
+                gateway: "default/edge".into(),
+                uid: "edge-uid".into(),
+                sources: vec!["10.250.0.9/32".into()],
+            }]
+        );
+
+        // Recreated under the same name: another Gateway, pending under its
+        // own uid, so nothing trusted for the old one is kept for it.
+        p.delete(&edge).await;
+        let mut edge = edge.clone();
+        edge.metadata.uid = Some("edge-uid-2".into());
+        apply(&mut p.cluster.gateways, edge.clone());
+        p.pass(&project).await.unwrap();
+        assert_eq!(pending(&p), edge_as("edge-uid-2"));
+        assert!(p.served(&project).unwrap().trusted_from.is_empty());
+
+        apply(&mut p.cluster.parameters, parameters(false));
+        p.pass(&project).await.unwrap();
+        let served = p.served(&project).unwrap();
+        assert!(
+            served.pending.is_empty() && served.trusted_from.is_empty(),
+            "a trustedSources entry removed inside the window drops at once"
+        );
+        assert_eq!(served.config.gateway.proxy_protocol, None);
+
+        apply(&mut p.cluster.parameters, parameters(true));
+        p.ctx.reports.retain(|k| *k != testkit::key(&edge));
+        p.pass(&project).await.unwrap();
+        assert_eq!(pending(&p), edge_as("edge-uid-2"), "unheard, window open");
+
+        p.ctx.leader.led_for(HOLD + Duration::from_secs(1));
+        p.pass(&project).await.unwrap();
+        assert!(pending(&p).is_empty(), "the window passed: nothing pending");
+
+        p.ctx.leader.take_over();
+        p.pass(&project).await.unwrap();
+        assert_eq!(
+            pending(&p),
+            edge_as("edge-uid-2"),
+            "a takeover opens a new window"
+        );
+    }
+
+    /// The same for Gateway backends: an unheard target is pending, while
+    /// a deleted backendRef, a revoked ReferenceGrant or a deleted target
+    /// drops at once. A Gateway naming no Gateway marks nothing.
+    #[tokio::test]
+    async fn after_taking_the_lead_an_unheard_gateway_backend_is_pending() {
+        use crate::sync::PendingBackend;
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        p.api.reply_to(
+            "/apis/k8s.cni.cncf.io/v1/namespaces/projects/network-attachment-definitions/udn-a",
+            200,
+            nad_udn_a("10.250.0.0/16"),
+        );
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        // Never passed: not served, not heard from.
+        let mut target = with_addresses(testkit::gateway("target", 1), 1, &network);
+        target.metadata.namespace = Some("projects".into());
+        target.spec.listeners[0].port = 80;
+        apply(&mut p.cluster.gateways, target.clone());
+        let grant: gateway_api::referencegrants::ReferenceGrant =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1beta1",
+                "kind": "ReferenceGrant",
+                "metadata": {"name": "edge", "namespace": "projects"},
+                "spec": {
+                    "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
+                              "namespace": "default"}],
+                    "to": [{"group": "gateway.networking.k8s.io", "kind": "Gateway"}],
+                },
+            }))
+            .unwrap();
+        apply(&mut p.cluster.reference_grants, grant.clone());
+
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        let naming = |target: bool| {
+            let mut route = testkit::http_route("r", &["edge"], 1);
+            let refs = if target {
+                serde_json::json!([{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                                    "name": "target", "namespace": "projects", "port": 80}])
+            } else {
+                serde_json::json!([])
+            };
+            route.spec.rules = Some(vec![serde_json::from_value(
+                serde_json::json!({"backendRefs": refs}),
+            )
+            .unwrap()]);
+            route
+        };
+        let pending = |p: &Pipeline| p.served(&edge).unwrap().pending.backends.clone();
+        let unheard_as = |uid: &str| {
+            vec![PendingBackend {
+                host: "target.projects.gateway".into(),
+                port: 80,
+                uid: uid.into(),
+            }]
+        };
+        let unheard = unheard_as("target-uid");
+
+        apply(&mut p.cluster.http_routes, naming(true));
+        p.pass(&edge).await.unwrap();
+        assert_eq!(pending(&p), unheard);
+        assert!(p.served(&edge).unwrap().backends.external_names.is_empty());
+
+        apply(&mut p.cluster.http_routes, naming(false));
+        p.pass(&edge).await.unwrap();
+        assert!(pending(&p).is_empty(), "a deleted backendRef drops at once");
+
+        apply(&mut p.cluster.http_routes, naming(true));
+        p.pass(&edge).await.unwrap();
+        assert_eq!(pending(&p), unheard);
+        p.cluster
+            .reference_grants
+            .apply_watcher_event(&kube::runtime::watcher::Event::Delete(grant));
+        p.pass(&edge).await.unwrap();
+        assert!(pending(&p).is_empty(), "a revoked grant drops at once");
+
+        apply(&mut p.cluster.reference_grants, {
+            let g: gateway_api::referencegrants::ReferenceGrant =
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "gateway.networking.k8s.io/v1beta1",
+                    "kind": "ReferenceGrant",
+                    "metadata": {"name": "edge", "namespace": "projects"},
+                    "spec": {
+                        "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
+                                  "namespace": "default"}],
+                        "to": [{"group": "gateway.networking.k8s.io", "kind": "Gateway"}],
+                    },
+                }))
+                .unwrap();
+            g
+        });
+        p.pass(&edge).await.unwrap();
+        assert_eq!(pending(&p), unheard);
+
+        // Recreated under the same name: pending under its own uid.
+        p.delete(&target).await;
+        let mut target = target.clone();
+        target.metadata.uid = Some("target-uid-2".into());
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&edge).await.unwrap();
+        assert_eq!(pending(&p), unheard_as("target-uid-2"));
+
+        p.delete(&target).await;
+        p.pass(&edge).await.unwrap();
+        assert!(pending(&p).is_empty(), "a deleted target drops at once");
+
+        let plain = testkit::gateway("plain", 1);
+        apply(&mut p.cluster.gateways, plain.clone());
+        p.pass(&plain).await.unwrap();
+        assert!(
+            p.served(&plain).unwrap().pending.is_empty(),
+            "names no Gateway"
+        );
+    }
+
+    /// A project Gateway trusting Gateway `edge` trusts edge's address on
+    /// their shared Network once edge reports it, and is woken when that
+    /// moves. A Gateway never depends on itself, and one of another
+    /// controller is trusted for nothing.
+    #[tokio::test]
+    async fn a_project_gateway_trusts_its_edge_once_the_edge_reports() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, Provisioning, ProxyProtocolParameters,
+            TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+
+        let mut p = Pipeline::new();
+        let mut wakes = p.ctx.backends.wakes().unwrap();
+        let mut woken = move || {
+            let mut out = vec![];
+            while let Ok(key) = wakes.try_recv() {
+                out.push(key);
+            }
+            out
+        };
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        apply(
+            &mut p.cluster.gateway_classes,
+            testkit::gateway_class("other", "example.com/other"),
+        );
+        let mut foreign = with_addresses(testkit::gateway("foreign", 1), 1, &network);
+        foreign.spec.gateway_class_name = "other".into();
+        apply(&mut p.cluster.gateways, foreign.clone());
+
+        let trusting = |name: &str| TrustedSource {
+            cidr: None,
+            gateway: Some(TrustedGateway {
+                namespace: "default".into(),
+                name: name.into(),
+            }),
+        };
+        let mut params = GatewayParameters::new(
+            "unmanaged",
+            GatewayParametersSpec {
+                provisioning: Some(Provisioning::Unmanaged),
+                proxy_protocol: Some(ProxyProtocolParameters {
+                    trusted_sources: Some(vec![trusting("edge"), trusting("foreign")]),
+                }),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut p.cluster.parameters, params);
+
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        p.pass(&edge).await.unwrap();
+        let project = with_addresses(testkit::gateway("project", 1), 1, &network);
+        apply(&mut p.cluster.gateways, project.clone());
+        p.pass(&project).await.unwrap();
+        assert_eq!(
+            p.served(&project).unwrap().config.gateway.proxy_protocol,
+            None,
+            "nothing trusted before edge reports"
+        );
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&edge)),
+            [testkit::key(&project)],
+            "edge trusts itself through the same parameters, and never depends on itself"
+        );
+
+        let at = |ip: &str| InstanceReport {
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: None,
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
+                }],
+            }],
+            interface_ips: vec!["10.128.0.9".into(), ip.into()],
+            networks: [("udn-a".to_string(), ip.to_string())].into(),
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, gw: &Gateway, r: InstanceReport| {
+            p.ctx.reports.record(
+                &testkit::key(gw),
+                InstanceId(format!("{}-pod", gw.name_any())),
+                InstanceReport {
+                    gateway_uid: gw.uid().unwrap(),
+                    ..r
+                },
+            );
+            super::super::report_trigger(
+                &p.ctx,
+                Trigger {
+                    gateway: testkit::key(gw),
+                    dns_moved: false,
+                },
+            );
+        };
+        woken();
+        reported(&p, &edge, at("10.250.0.9"));
+        reported(&p, &foreign, at("10.250.0.10"));
+        assert!(woken().contains(&testkit::key(&project)));
+        p.pass(&project).await.unwrap();
+        let trusted = |p: &Pipeline| {
+            p.served(&project)
+                .unwrap()
+                .config
+                .gateway
+                .proxy_protocol
+                .clone()
+                .map(|c| c.trusted_sources)
+        };
+        assert_eq!(
+            trusted(&p),
+            Some(vec!["10.250.0.9/32".to_string()]),
+            "its udn-a address alone; foreign is another controller's"
+        );
+
+        reported(&p, &edge, at("10.250.0.8"));
+        assert!(woken().contains(&testkit::key(&project)), "edge moved");
+        p.pass(&project).await.unwrap();
+        assert_eq!(trusted(&p), Some(vec!["10.250.0.8/32".to_string()]));
+    }
+
+    /// An edge attached to udn-a only to dial out names no address there:
+    /// its snapshot still carries udn-a, flagged so nothing binds on it,
+    /// it reaches the project Gateway on udn-a, and the project trusts its
+    /// udn-a address, which it reports though it binds elsewhere.
+    #[tokio::test]
+    async fn an_edge_dialing_out_on_a_network_reaches_and_is_trusted_there() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, NetworkSelection, Provisioning,
+            ProxyProtocolParameters, TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let parameters = |name: &str, spec: GatewayParametersSpec| {
+            let mut params = GatewayParameters::new(name, spec);
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        apply(
+            &mut p.cluster.parameters,
+            parameters(
+                "unmanaged",
+                GatewayParametersSpec {
+                    provisioning: Some(Provisioning::Unmanaged),
+                    proxy_protocol: Some(ProxyProtocolParameters {
+                        trusted_sources: Some(vec![TrustedSource {
+                            cidr: None,
+                            gateway: Some(TrustedGateway {
+                                namespace: "default".into(),
+                                name: "edge".into(),
+                            }),
+                        }]),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        );
+        apply(
+            &mut p.cluster.parameters,
+            parameters(
+                "edge",
+                GatewayParametersSpec {
+                    networks: Some(vec![NetworkSelection {
+                        name: "udn-a".into(),
+                        listeners: Some(false),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let mut project = with_addresses(
+            testkit::gateway("project", 1),
+            1,
+            &[(NETWORK_ADDRESS_TYPE, "udn-a")],
+        );
+        project.spec.listeners[0].port = 80;
+        apply(&mut p.cluster.gateways, project.clone());
+        p.pass(&project).await.unwrap();
+        let mut edge = testkit::gateway("edge", 1);
+        edge.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "edge".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut p.cluster.gateways, edge.clone());
+        let mut route = testkit::http_route("r", &["edge"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
+            "backendRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                             "name": "project", "port": 80}],
+        }))
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, route);
+
+        let instance = |bound_on: Option<&str>, udn_a: &str| InstanceReport {
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: bound_on.map(str::to_string),
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
+                }],
+            }],
+            interface_ips: vec!["10.128.0.9".into(), udn_a.into()],
+            networks: [("udn-a".to_string(), udn_a.to_string())].into(),
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, gw: &Gateway, r: InstanceReport| {
+            p.ctx.reports.record(
+                &testkit::key(gw),
+                InstanceId(format!("{}-pod", gw.name_any())),
+                InstanceReport {
+                    gateway_uid: gw.uid().unwrap(),
+                    ..r
+                },
+            );
+            super::super::report_trigger(
+                &p.ctx,
+                Trigger {
+                    gateway: testkit::key(gw),
+                    dns_moved: false,
+                },
+            );
+        };
+        reported(&p, &project, instance(None, "10.250.0.7"));
+
+        p.pass(&edge).await.unwrap();
+        let served = p.served(&edge).unwrap();
+        assert_eq!(
+            served.networks,
+            [crate::sync::NetworkCidrs {
+                name: "udn-a".into(),
+                cidrs: vec!["10.250.0.0/16".into()],
+                listeners: false,
+            }]
+        );
+        assert_eq!(
+            served.backends.external_names,
+            [crate::sync::ExternalName {
+                host: "project.default.gateway".into(),
+                port: 80,
+                targets: vec![("10.250.0.7".into(), 8000)],
+            }]
+        );
+
+        reported(&p, &edge, instance(Some("10.128.0.9"), "10.250.0.9"));
+        p.pass(&project).await.unwrap();
+        assert_eq!(
+            p.served(&project)
+                .unwrap()
+                .config
+                .gateway
+                .proxy_protocol
+                .clone()
+                .map(|c| c.trusted_sources),
+            Some(vec!["10.250.0.9/32".to_string()]),
+            "the edge's udn-a address, though nothing binds there"
+        );
+
+        // The NAD gone while the edge's pods keep their interface: udn-a
+        // stays in its snapshot with no CIDRs, so nothing binds where it
+        // might be.
+        p.api.reply_to(
+            NAD_UDN_A,
+            404,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        );
+        p.pass(&edge).await.unwrap();
+        assert_eq!(
+            p.served(&edge).unwrap().networks,
+            [crate::sync::NetworkCidrs {
+                name: "udn-a".into(),
+                cidrs: vec![],
+                listeners: false,
+            }]
+        );
+    }
+
+    /// An IPAddress inside a network the Gateway only dials out on is
+    /// InvalidParameters once that network's CIDRs are read.
+    #[tokio::test]
+    async fn an_address_inside_a_dialed_network_is_invalid_parameters() {
+        use crate::kubernetes::crds::{GatewayParameters, GatewayParametersSpec, NetworkSelection};
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let mut params = GatewayParameters::new(
+            "edge",
+            GatewayParametersSpec {
+                networks: Some(vec![NetworkSelection {
+                    name: "udn-a".into(),
+                    listeners: Some(false),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+        params.metadata.namespace = Some("default".into());
+        apply(&mut p.cluster.parameters, params);
+        let mut edge = with_addresses(
+            testkit::gateway("edge", 1),
+            1,
+            &[("IPAddress", "10.250.0.5")],
+        );
+        edge.spec.infrastructure = Some(gateway_api::gateways::GatewayInfrastructure {
+            parameters_ref: Some(gateway_api::gateways::GatewayInfrastructureParametersRef {
+                group: "portail.epheo.eu".into(),
+                kind: "GatewayParameters".into(),
+                name: "edge".into(),
+            }),
+            ..Default::default()
+        });
+        apply(&mut p.cluster.gateways, edge.clone());
+        let _ = p.pass(&edge).await;
+        assert!(p.served(&edge).is_none(), "nothing published");
+        let patch = p.api.status_patch("gateways", "edge").unwrap();
+        let accepted = &patch["status"]["conditions"][0];
+        assert_eq!(accepted["reason"], "InvalidParameters", "{patch}");
+        assert!(
+            accepted["message"].as_str().unwrap().contains("10.250.0.5"),
+            "{accepted}"
+        );
+    }
+
+    /// A pass that fails keeps what the Gateway served, but never the
+    /// endpoints of, or the trust in, a Gateway deleted since.
+    #[tokio::test]
+    async fn a_failed_pass_drops_what_a_deleted_gateway_gave() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, Provisioning, ProxyProtocolParameters,
+            TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let unmanaged = |source: TrustedSource| {
+            let mut params = GatewayParameters::new(
+                "unmanaged",
+                GatewayParametersSpec {
+                    provisioning: Some(Provisioning::Unmanaged),
+                    proxy_protocol: Some(ProxyProtocolParameters {
+                        trusted_sources: Some(vec![source]),
+                    }),
+                    ..Default::default()
+                },
+            );
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: None,
+                gateway: Some(TrustedGateway {
+                    namespace: "default".into(),
+                    name: "target".into(),
+                }),
+            }),
+        );
+        let mut target = with_addresses(testkit::gateway("target", 1), 1, &network);
+        target.spec.listeners[0].port = 80;
+        apply(&mut p.cluster.gateways, target.clone());
+        p.pass(&target).await.unwrap();
+        p.ctx.reports.record(
+            &testkit::key(&target),
+            InstanceId("pod-a".into()),
+            InstanceReport {
+                gateway_uid: target.uid().unwrap(),
+                listeners: vec![ListenerReport {
+                    name: "http".into(),
+                    endpoints: vec![EndpointReport {
+                        address: None,
+                        port: 8000,
+                        transport: Transport::Tcp,
+                        bound: true,
+                        error: None,
+                    }],
+                }],
+                interface_ips: vec!["10.250.0.7".into()],
+                networks: [("udn-a".to_string(), "10.250.0.7".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        super::super::report_trigger(
+            &p.ctx,
+            Trigger {
+                gateway: testkit::key(&target),
+                dns_moved: false,
+            },
+        );
+
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        let mut route = testkit::http_route("r", &["edge"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(serde_json::json!({
+            "backendRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                             "name": "target", "port": 80}],
+        }))
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, route);
+        p.pass(&edge).await.unwrap();
+        let served = p.served(&edge).unwrap();
+        assert_eq!(served.backends.external_names.len(), 1);
+        assert_eq!(
+            served
+                .config
+                .gateway
+                .proxy_protocol
+                .as_ref()
+                .unwrap()
+                .trusted_sources,
+            ["10.250.0.7/32"]
+        );
+
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: Some("10.0.0.1/8".into()),
+                gateway: None,
+            }),
+        );
+        p.delete(&target).await;
+        let _ = p.pass(&edge).await;
+        let served = p.served(&edge).unwrap();
+        assert!(
+            served.backends.external_names.is_empty(),
+            "its endpoints dropped"
+        );
+        assert_eq!(
+            served.config.gateway.proxy_protocol, None,
+            "its trust dropped"
+        );
+        assert_eq!(served.config.http_routes.len(), 1, "the rest as served");
+    }
+
+    /// Parameters that fail keep a truster depending on the Gateways its
+    /// last trust was for, and its failed pass drops an address the named
+    /// Gateway holds no more: a live Gateway's instance that left.
+    #[tokio::test]
+    async fn a_failed_pass_keeps_the_trust_dependency_and_drops_what_left() {
+        use super::super::reports::{InstanceId, Trigger};
+        use crate::kubernetes::crds::{
+            GatewayParameters, GatewayParametersSpec, Provisioning, ProxyProtocolParameters,
+            TrustedGateway, TrustedSource,
+        };
+        use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Transport};
+
+        let mut p = Pipeline::new();
+        p.api.reply_to(NAD_UDN_A, 200, nad_udn_a("10.250.0.0/16"));
+        let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
+        let unmanaged = |source: TrustedSource| {
+            let mut params = GatewayParameters::new(
+                "unmanaged",
+                GatewayParametersSpec {
+                    provisioning: Some(Provisioning::Unmanaged),
+                    proxy_protocol: Some(ProxyProtocolParameters {
+                        trusted_sources: Some(vec![source]),
+                    }),
+                    ..Default::default()
+                },
+            );
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: None,
+                gateway: Some(TrustedGateway {
+                    namespace: "default".into(),
+                    name: "edge".into(),
+                }),
+            }),
+        );
+        let edge = with_addresses(testkit::gateway("edge", 1), 1, &network);
+        apply(&mut p.cluster.gateways, edge.clone());
+        p.pass(&edge).await.unwrap();
+        let instance = |ip: &str, leaving: bool| InstanceReport {
+            listeners: vec![ListenerReport {
+                name: "http".into(),
+                endpoints: vec![EndpointReport {
+                    address: None,
+                    port: 8000,
+                    transport: Transport::Tcp,
+                    bound: true,
+                    error: None,
+                }],
+            }],
+            interface_ips: vec![ip.into()],
+            networks: [("udn-a".to_string(), ip.to_string())].into(),
+            leaving,
+            ..Default::default()
+        };
+        let reported = |p: &Pipeline, pod: &str, r: InstanceReport| {
+            p.ctx.reports.record(
+                &testkit::key(&edge),
+                InstanceId(pod.into()),
+                InstanceReport {
+                    gateway_uid: edge.uid().unwrap(),
+                    ..r
+                },
+            );
+            super::super::report_trigger(
+                &p.ctx,
+                Trigger {
+                    gateway: testkit::key(&edge),
+                    dns_moved: false,
+                },
+            );
+        };
+        reported(&p, "edge-a", instance("10.250.0.8", false));
+        reported(&p, "edge-b", instance("10.250.0.9", false));
+
+        let project = with_addresses(testkit::gateway("project", 1), 1, &network);
+        apply(&mut p.cluster.gateways, project.clone());
+        p.pass(&project).await.unwrap();
+        let trusted = |p: &Pipeline| {
+            p.served(&project)
+                .unwrap()
+                .config
+                .gateway
+                .proxy_protocol
+                .clone()
+                .map(|c| c.trusted_sources)
+        };
+        assert_eq!(
+            trusted(&p),
+            Some(vec![
+                "10.250.0.8/32".to_string(),
+                "10.250.0.9/32".to_string()
+            ])
+        );
+
+        apply(
+            &mut p.cluster.parameters,
+            unmanaged(TrustedSource {
+                cidr: Some("10.0.0.1/8".into()),
+                gateway: None,
+            }),
+        );
+        let _ = p.pass(&project).await;
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&edge)),
+            [testkit::key(&project)],
+            "still woken by edge"
+        );
+        assert_eq!(
+            trusted(&p),
+            Some(vec![
+                "10.250.0.8/32".to_string(),
+                "10.250.0.9/32".to_string()
+            ]),
+            "nothing moved"
+        );
+
+        reported(&p, "edge-b", instance("10.250.0.9", true));
+        let _ = p.pass(&project).await;
+        assert_eq!(
+            trusted(&p),
+            Some(vec!["10.250.0.8/32".to_string()]),
+            "edge-b left"
+        );
+        assert_eq!(
+            p.ctx.backends.dependents(&testkit::key(&edge)),
+            [testkit::key(&project)]
+        );
+    }
+
     /// The Programmed condition of Gateway `name`'s last status write.
     fn gateway_programmed(p: &Pipeline, name: &str) -> serde_json::Value {
         let patch = p.api.status_patch("gateways", name).unwrap();
@@ -1330,10 +2529,11 @@ mod tests {
         p.api.clear();
         let pass = Pass {
             key: testkit::key(&gw),
-            plan: translate(&p.ctx, &gw).await,
+            plan: translate(&p.ctx, &gw, ExternalNameBackends::Refused, &[], &[]).await,
             provisioned: Provisioned::unmanaged(),
             invalid_parameters: Some("GatewayParameters default/missing not found".into()),
             published: false,
+            pending_until: None,
         };
         finish(&gw, &p.ctx, pass).await.unwrap();
         assert!(p.api.status_patch("httproutes", "r").is_none());

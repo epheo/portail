@@ -77,7 +77,9 @@ metrics! {
     connections_accepted_total: "Client connections accepted across all listeners",
     http2_connections_total: "Accepted TLS connections that negotiated h2 via ALPN",
     tls_handshake_failures_total: "Client TLS handshakes that failed or timed out",
+    proxy_protocol_refused_total: "Connections from a trusted PROXY protocol source closed because their header was missing, malformed or late",
     rate_limited_total: "Requests answered 429 by a per-client rate limit",
+    backend_addresses_refused_total: "Service backend addresses a configuration from the controller resolved to and the data plane refused to dial, counted at each route table build",
     http_requests_rejected_total: "Requests answered 400 because their head or chunked body framing was malformed or ambiguous",
     upstream_connects_total: "Backend connections established",
     pool_hits_total: "Backend pool checkouts served by an idle connection",
@@ -92,6 +94,7 @@ metrics! {
     backends_marked_unhealthy_total: "Backend health transitions into UNHEALTHY",
     backends_recovered_total: "Backend health recoveries (probe or passive)",
     reconcile_runs_total: "Gateway reconcile passes that published a new snapshot or wrote status",
+    gateway_addresses_truncated_total: "Gateway backend or trusted addresses left out because a Gateway's reports went over a cap",
     reconcile_skips_total: "Gateway reconcile passes that published and wrote nothing",
     sync_throttled_total: "Sync requests answered 503 because TokenReviews in flight were at their cap or the source IP was over its review rate",
     sync_auth_stale_verdicts_total: "Sync requests served on an expired TokenReview verdict because it could not be renewed",
@@ -110,25 +113,35 @@ pub enum SyncAuthStage {
     Precheck,
     /// A TokenReview rejected the same token within the cache TTL.
     NegativeCache,
+    /// Not signed by the cluster's issuer for this controller, or not a
+    /// live pod-bound token: refused before any review.
+    Signature,
     TokenReview,
     /// Authenticated, but not as an identity that may sync this Gateway.
     Authz,
+    /// Not the ServiceAccount the Gateway's data planes run as now: its
+    /// uid differs, or there is none.
+    ServiceAccount,
 }
 
 impl SyncAuthStage {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::Precheck,
         Self::NegativeCache,
+        Self::Signature,
         Self::TokenReview,
         Self::Authz,
+        Self::ServiceAccount,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Precheck => "precheck",
             Self::NegativeCache => "negative_cache",
+            Self::Signature => "signature",
             Self::TokenReview => "tokenreview",
             Self::Authz => "authz",
+            Self::ServiceAccount => "serviceaccount",
         }
     }
 }
@@ -831,7 +844,13 @@ mod tests {
     fn sync_auth_series_render_from_zero() {
         let _serial = SYNC_AUTH_SERIAL.blocking_lock();
         let text = render(false);
-        for stage in ["precheck", "negative_cache", "tokenreview", "authz"] {
+        for stage in [
+            "precheck",
+            "negative_cache",
+            "signature",
+            "tokenreview",
+            "authz",
+        ] {
             let series = format!("portail_sync_auth_rejected_total{{stage=\"{stage}\"}} ");
             assert!(text.contains(&series), "{series}");
         }

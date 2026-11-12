@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use gateway_api::gateways::Gateway;
 
+use crate::kubernetes::crds::GatewayParameters;
 use crate::logging::{info, warn};
 use crate::sync::NetworkCidrs;
 
@@ -90,7 +91,25 @@ impl NetworkCidrCache {
     /// Keep only the networks some Gateway of `gateways` names. A dropped
     /// entry left its CIDRs for a later failed read of a re-added network
     /// to bind, and the controller would keep one per network ever named.
-    pub(crate) fn retain_named(&self, gateways: &[Arc<Gateway>]) {
+    /// Networks some GatewayParameters attach with listeners false count
+    /// as named in any namespace their selection allows: which Gateway's
+    /// namespace a selection without one reads depends on who uses it.
+    pub(crate) fn retain_named(
+        &self,
+        gateways: &[Arc<Gateway>],
+        parameters: &[Arc<GatewayParameters>],
+    ) {
+        let egress: Vec<(Option<String>, String)> = parameters
+            .iter()
+            .flat_map(|p| p.spec.networks.iter().flatten())
+            .filter(|n| n.egress_only())
+            .map(|n| (n.namespace.clone(), n.name.clone()))
+            .collect();
+        let dialed = |(namespace, name): &(String, String)| {
+            egress
+                .iter()
+                .any(|(ns, n)| n == name && ns.as_ref().is_none_or(|ns| ns == namespace))
+        };
         let named: HashSet<(String, String)> = gateways
             .iter()
             .flat_map(|gw| {
@@ -106,12 +125,14 @@ impl NetworkCidrCache {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|key, _| named.contains(key));
+            .retain(|key, _| named.contains(key) || dialed(key));
     }
 }
 
-/// The CIDRs of the networks `gateway`'s Network addresses name, for its
-/// data planes to find their own IPs in.
+/// The CIDRs of the networks `gateway`'s Network addresses name, and of
+/// the `egress` networks (namespace, name) its parameters attach with
+/// listeners false, for its data planes to find their own IPs in. A dial-out
+/// network whose NAD is gone, or names no subnet, stays, with no CIDRs.
 ///
 /// A NAD that cannot be read keeps the network's last CIDRs: unbinding on
 /// an apiserver blip was an outage. Only an answer that the network is gone
@@ -121,20 +142,24 @@ pub(crate) async fn resolve_network_cidrs(
     client: &Client,
     gateway: &Gateway,
     gw_ns: &str,
+    egress: &[(String, String)],
     last: &NetworkCidrCache,
 ) -> Result<Vec<NetworkCidrs>, String> {
-    let Some(spec_addrs) = &gateway.spec.addresses else {
-        return Ok(Vec::new());
-    };
     let gw_name = gateway.name_any();
+    let addressed = gateway
+        .spec
+        .addresses
+        .iter()
+        .flatten()
+        .filter(|a| a.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE))
+        .map(|a| (gw_ns.to_string(), a.value.clone().unwrap_or_default(), true));
+    let dialed = egress
+        .iter()
+        .map(|(ns, name)| (ns.clone(), name.clone(), false));
     let mut networks = Vec::new();
-    for addr in spec_addrs {
-        if addr.r#type.as_deref() != Some(NETWORK_ADDRESS_TYPE) {
-            continue;
-        }
-        let network_name = addr.value.as_deref().unwrap_or("");
-        let key = (gw_ns.to_string(), network_name.to_string());
-        let read = read_network(client, network_name, gw_ns).await;
+    for (namespace, network_name, listeners) in addressed.chain(dialed) {
+        let key = (namespace.clone(), network_name.clone());
+        let read = read_network(client, &network_name, &namespace).await;
         let mut known = last.0.lock().unwrap_or_else(|p| p.into_inner());
         let cidrs = match read {
             NetworkRead::Cidrs(cidrs) => {
@@ -149,28 +174,34 @@ pub(crate) async fn resolve_network_cidrs(
             }
             NetworkRead::Absent => {
                 known.remove(&key);
-                continue;
+                // Its pods may keep the interface: the data plane must
+                // still know a network it cannot tell apart is there.
+                if listeners {
+                    continue;
+                }
+                Vec::new()
             }
             NetworkRead::Unknown(e) => match known.get(&key) {
                 Some(cidrs) => {
                     warn!(
-                        "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition {network_name} \
-                         not read ({e}); keeping {}",
+                        "Gateway {gw_ns}/{gw_name}: NetworkAttachmentDefinition \
+                         {namespace}/{network_name} not read ({e}); keeping {}",
                         cidrs.join(", ")
                     );
                     cidrs.clone()
                 }
                 None => {
                     return Err(format!(
-                        "NetworkAttachmentDefinition {gw_ns}/{network_name} not read ({e}), \
+                        "NetworkAttachmentDefinition {namespace}/{network_name} not read ({e}), \
                          and never read before"
                     ));
                 }
             },
         };
         networks.push(NetworkCidrs {
-            name: network_name.to_string(),
+            name: network_name,
             cidrs,
+            listeners,
         });
     }
     Ok(networks)
@@ -249,6 +280,7 @@ mod tests {
         let networks = [NetworkCidrs {
             name: "udn-a".into(),
             cidrs,
+            listeners: true,
         }];
         let local = ["fd00:10:10:1::7".to_string(), "10.10.1.7".to_string()];
         let resolved =
@@ -286,11 +318,57 @@ mod tests {
                 .insert((ns.into(), network.into()), vec!["192.168.10.0/24".into()]);
         }
         let gw = gateway_with_addresses(&[(NETWORK_ADDRESS_TYPE, "udn-a"), ("IPAddress", "udn-b")]);
-        cache.retain_named(&[Arc::new(gw)]);
+        cache.retain_named(&[Arc::new(gw)], &[]);
         let kept: Vec<_> = cache.0.lock().unwrap().keys().cloned().collect();
         assert_eq!(kept, vec![("default".to_string(), "udn-a".to_string())]);
 
-        cache.retain_named(&[]);
+        cache.retain_named(&[], &[]);
         assert!(cache.0.lock().unwrap().is_empty());
+    }
+
+    /// A network some parameters attach to dial out on keeps its CIDRs: in
+    /// any namespace when the selection names none, else in its own.
+    #[test]
+    fn a_dialed_network_keeps_its_cidrs() {
+        use crate::kubernetes::crds::{GatewayParametersSpec, NetworkSelection};
+        let key = |ns: &str, name: &str| (ns.to_string(), name.to_string());
+        let cache = NetworkCidrCache::default();
+        let fill = || {
+            let mut known = cache.0.lock().unwrap();
+            for k in [
+                key("edge", "transit"),
+                key("infra", "transit"),
+                key("x", "other"),
+            ] {
+                known.insert(k, vec!["10.250.0.0/16".into()]);
+            }
+        };
+        let dialing = |namespace: Option<&str>| {
+            Arc::new(GatewayParameters::new(
+                "edge",
+                GatewayParametersSpec {
+                    networks: Some(vec![NetworkSelection {
+                        name: "transit".into(),
+                        namespace: namespace.map(str::to_string),
+                        listeners: Some(false),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ))
+        };
+        let kept = || {
+            let mut keys: Vec<_> = cache.0.lock().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+
+        fill();
+        cache.retain_named(&[], &[dialing(None)]);
+        assert_eq!(kept(), [key("edge", "transit"), key("infra", "transit")]);
+
+        fill();
+        cache.retain_named(&[], &[dialing(Some("infra"))]);
+        assert_eq!(kept(), [key("infra", "transit")]);
     }
 }

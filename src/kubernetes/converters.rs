@@ -93,6 +93,7 @@ pub(crate) fn convert_gateway(gw: &Gateway, cert_data: &CertData) -> Result<Gate
         name,
         listeners,
         addresses,
+        proxy_protocol: None,
     })
 }
 
@@ -480,10 +481,12 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
     let percent = rm.percent.map(|p| p.clamp(0, 100) as u32);
     RequestMirrorConfig {
         backend_ref: BackendRef {
-            name: backend_dns_name(
+            name: backend_ref_name(
                 &rm.backend_ref.name,
                 rm.backend_ref.namespace.as_deref(),
                 ns,
+                rm.backend_ref.group.as_deref(),
+                rm.backend_ref.kind.as_deref(),
             ),
             port: rm.backend_ref.port.unwrap_or(80) as u16,
             weight: 1,
@@ -527,7 +530,13 @@ fn convert_http_backend_ref(
         })
         .collect();
     let backend = BackendRef {
-        name: backend_dns_name(&br.name, br.namespace.as_deref(), ns),
+        name: backend_ref_name(
+            &br.name,
+            br.namespace.as_deref(),
+            ns,
+            br.group.as_deref(),
+            br.kind.as_deref(),
+        ),
         port: br.port.unwrap_or(80) as u16,
         weight: br.weight.unwrap_or(1) as u32,
         group: br.group.clone().unwrap_or_default(),
@@ -626,7 +635,13 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
         },
     };
     BackendRef {
-        name: backend_dns_name(br.br_name(), br.br_namespace(), ns),
+        name: backend_ref_name(
+            br.br_name(),
+            br.br_namespace(),
+            ns,
+            br.br_group(),
+            br.br_kind(),
+        ),
         port,
         weight: br.br_weight().unwrap_or(1) as u32,
         group: br.br_group().unwrap_or_default().to_string(),
@@ -720,6 +735,23 @@ pub(crate) fn backend_dns_name(
     format!("{}.{}.svc", name, ns)
 }
 
+/// A backendRef's name: a Service's DNS name, or for another Gateway
+/// `{gateway}.{namespace}.gateway`, which no Service's overrides are keyed
+/// by.
+pub(crate) fn backend_ref_name(
+    name: &str,
+    namespace: Option<&str>,
+    route_namespace: &str,
+    group: Option<&str>,
+    kind: Option<&str>,
+) -> String {
+    if group == Some(crate::config::GATEWAY_GROUP) && kind == Some("Gateway") {
+        crate::config::gateway_backend_name(name, namespace.unwrap_or(route_namespace))
+    } else {
+        backend_dns_name(name, namespace, route_namespace)
+    }
+}
+
 /// Parse a DNS-style backend name back into (service_name, namespace).
 pub(crate) fn parse_backend_dns_name(dns_name: &str) -> Option<(String, String)> {
     let stripped = dns_name.strip_suffix(".svc")?;
@@ -735,6 +767,25 @@ pub(crate) fn route_namespace(meta: &kube::core::ObjectMeta) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The data plane dials a backend named by an IP address unchecked, so
+    /// no backendRef may convert to one, whatever its name.
+    #[test]
+    fn a_backend_ref_name_is_never_an_ip_address() {
+        let forms = [
+            (None, None),
+            (Some(""), Some("Service")),
+            (Some(crate::config::GATEWAY_GROUP), Some("Gateway")),
+        ];
+        for name in ["127.0.0.1", "::1", "169.254.169.254"] {
+            for namespace in [None, Some("p")] {
+                for (group, kind) in forms {
+                    let built = backend_ref_name(name, namespace, "default", group, kind);
+                    assert!(built.parse::<std::net::IpAddr>().is_err(), "{built}");
+                }
+            }
+        }
+    }
     use gateway_api::gateways::{GatewayListenersTls, GatewaySpec};
 
     /// A listener carries the refs whose cert resolved, and only those:

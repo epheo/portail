@@ -94,6 +94,8 @@ pub enum RoutingResult<'a> {
     LocalReply(LocalReply),
     TcpForward {
         backend_addr: SocketAddr,
+        /// The connection opens with a PROXY v2 header.
+        proxied: bool,
     },
     UdpForward {
         backend_addr: SocketAddr,
@@ -290,8 +292,10 @@ fn analyze_http_request<'a>(
         None => return reply(503, None),
     };
     let selected_backend = &rule.backends[backend_index];
-    if selected_backend.action == BackendAction::Reject {
-        return reply(500, None);
+    match selected_backend.action {
+        BackendAction::Reject => return reply(500, None),
+        BackendAction::Unavailable => return reply(503, None),
+        BackendAction::Forward | BackendAction::ForwardProxied => {}
     }
 
     Ok(RoutingResult::HttpForward {
@@ -441,7 +445,9 @@ pub fn analyze_udp_request(
         "UDP",
         &UNROUTABLE,
         |port| routes.find_udp_backends(port),
-        |addr| RoutingResult::UdpForward { backend_addr: addr },
+        |b| RoutingResult::UdpForward {
+            backend_addr: b.socket_addr,
+        },
         health,
     )
 }
@@ -459,7 +465,10 @@ pub(crate) fn analyze_tcp_request(
         "TCP",
         &UNROUTABLE,
         |port| routes.find_tcp_backends(port),
-        |addr| RoutingResult::TcpForward { backend_addr: addr },
+        |b| RoutingResult::TcpForward {
+            backend_addr: b.socket_addr,
+            proxied: b.action == BackendAction::ForwardProxied,
+        },
         health,
     )
 }
@@ -488,7 +497,7 @@ fn analyze_l4_request<'a>(
     proto: &str,
     throttles: &L4Throttles,
     lookup: impl FnOnce(u16) -> Option<&'a Vec<Backend>>,
-    make_decision: impl FnOnce(SocketAddr) -> RoutingResult<'static>,
+    make_decision: impl FnOnce(&Backend) -> RoutingResult<'static>,
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
     let unroutable = |throttle: &LogThrottle, condition: &str| {
@@ -517,10 +526,10 @@ fn analyze_l4_request<'a>(
     else {
         return unroutable(&throttles.no_weight, "no backend with positive weight");
     };
-    if selected_backend.action == BackendAction::Reject {
+    if selected_backend.action.stands_in() {
         debug!(
-            "{} routing: port {} picked an invalid backendRef's share; rejecting",
-            proto, server_port
+            "{} routing: port {} picked a stand-in's share ({:?}); closing",
+            proto, server_port, selected_backend.action
         );
         return Ok(RoutingResult::CloseConnection);
     }
@@ -530,7 +539,7 @@ fn analyze_l4_request<'a>(
         proto, server_port, selected_backend.socket_addr
     );
 
-    Ok(make_decision(selected_backend.socket_addr))
+    Ok(make_decision(selected_backend))
 }
 
 #[cfg(test)]

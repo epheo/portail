@@ -77,6 +77,7 @@ impl RouteTable {
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
+            proxy_sources: Default::default(),
         }
     }
 
@@ -369,6 +370,15 @@ impl Backend {
             server_name: address,
             action: BackendAction::Forward,
         })
+    }
+
+    /// The stand-in for a valid Gateway backend with no instance reported
+    /// yet: see [`BackendAction::Unavailable`]. Never dialed.
+    pub fn unavailable(weight: u32) -> Self {
+        Self {
+            action: BackendAction::Unavailable,
+            ..Self::rejecting(weight)
+        }
     }
 
     /// The stand-in for an invalid backendRef: see [`BackendAction::Reject`].

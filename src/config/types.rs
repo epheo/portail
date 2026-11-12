@@ -29,6 +29,23 @@ pub struct GatewayConfig {
     /// names. Kubernetes mode binds the ones local to the pod.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+
+    /// Sources whose connections open with a PROXY protocol v2 header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+}
+
+/// The receiving half of PROXY protocol v2, on every TCP listener. A
+/// connection from a trusted source must open with a header, and the
+/// client it names stands for the connection: X-Forwarded-For, access
+/// logs, rate limits. Other sources are never read for one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ProxyProtocolConfig {
+    /// CIDRs, network address only.
+    #[serde(default)]
+    pub trusted_sources: Vec<String>,
 }
 
 /// Listener configuration defining protocol and port bindings
@@ -147,6 +164,7 @@ impl Default for GatewayConfig {
                 rate_limit: None,
             }],
             addresses: vec![],
+            proxy_protocol: None,
         }
     }
 }
@@ -194,6 +212,44 @@ pub struct PortailConfig {
     /// DNS A-records carry no port. Map: (backend_fqdn, service_port) → target_port.
     #[serde(skip)]
     pub headless_target_ports: std::collections::HashMap<(String, u16), u16>,
+
+    /// Set from a controller's snapshot only, never from a file.
+    #[serde(skip)]
+    pub dial_rules: Option<super::DialRules>,
+
+    /// Backend names the controller knows cluster DNS answers with a VIP
+    /// (not serialized): every other name's answers are dialed as is.
+    #[serde(skip)]
+    pub cluster_ip_backends: std::collections::BTreeSet<String>,
+}
+
+impl PortailConfig {
+    /// Every backend name a route or a mirror names.
+    pub fn backend_names(&self) -> impl Iterator<Item = &str> {
+        let http = self
+            .http_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter().chain(mirrors)
+            });
+        let tcp = self
+            .tcp_routes
+            .iter()
+            .chain(&self.udp_routes)
+            .flat_map(|r| &r.rules)
+            .flat_map(|r| &r.backend_refs);
+        let tls = self
+            .tls_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|r| &r.backend_refs);
+        http.chain(tcp).chain(tls).map(|br| br.name.as_str())
+    }
 }
 
 /// HTTP route configuration following Kubernetes Gateway API HTTPRoute specification
@@ -489,6 +545,33 @@ pub struct BackendRef {
     /// file setting it only fails that backend's share.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalid: bool,
+}
+
+/// The group of a backendRef that names another Gateway.
+pub const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
+
+/// The appProtocol of a Service port whose server reads a PROXY v2 header
+/// naming the client, as a Gateway backend does.
+pub const PROXY_V2_APP_PROTOCOL: &str = "portail.epheo.eu/proxy-v2";
+
+impl BackendRef {
+    /// Another Gateway, reached on a network both share, behind a PROXY
+    /// v2 header naming the client.
+    pub fn is_gateway(&self) -> bool {
+        self.group == GATEWAY_GROUP && self.kind == "Gateway"
+    }
+}
+
+/// A Gateway backend's name, `{gateway}.{namespace}.gateway`, which no
+/// Service's overrides are keyed by.
+pub fn gateway_backend_name(gateway: &str, namespace: &str) -> String {
+    format!("{gateway}.{namespace}.gateway")
+}
+
+/// A Gateway backend's name back into (gateway, namespace).
+pub fn parse_gateway_backend_name(name: &str) -> Option<(String, String)> {
+    let (gateway, ns) = name.strip_suffix(".gateway")?.rsplit_once('.')?;
+    Some((gateway.to_string(), ns.to_string()))
 }
 
 fn default_backend_kind() -> String {

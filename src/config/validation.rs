@@ -240,7 +240,23 @@ impl GatewayConfig {
                 .map_err(|e| anyhow!("Listener {}: {}", i, e))?;
         }
 
+        if let Some(proxy) = &self.proxy_protocol {
+            proxy.trusted()?;
+        }
+
         Ok(())
+    }
+}
+
+impl crate::config::types::ProxyProtocolConfig {
+    pub(crate) fn trusted(&self) -> Result<crate::proxy::proxy_protocol::TrustedSources> {
+        let cidrs = self
+            .trusted_sources
+            .iter()
+            .map(|s| crate::proxy::proxy_protocol::Cidr::parse(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("proxyProtocol trustedSources: {}", e))?;
+        Ok(crate::proxy::proxy_protocol::TrustedSources::new(cidrs))
     }
 }
 
@@ -484,6 +500,24 @@ fn validate_port(port: u16, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_protocol_trusts_network_cidrs_only() {
+        let mut config = PortailConfig::default();
+        let trusting = |cidr: &str| {
+            Some(crate::config::ProxyProtocolConfig {
+                trusted_sources: vec![cidr.to_string()],
+            })
+        };
+        config.gateway.proxy_protocol = trusting("10.0.0.0/8");
+        config.validate().unwrap();
+        config.gateway.proxy_protocol = trusting("10.0.0.1/8");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trustedSources") && err.contains("host bits"),
+            "{err}"
+        );
+    }
 
     fn make_rule(filters: Vec<HttpRouteFilter>, backend_refs: Vec<BackendRef>) -> HttpRouteRule {
         HttpRouteRule {
@@ -870,6 +904,7 @@ mod tests {
                 name: "gw".to_string(),
                 listeners,
                 addresses: vec![],
+                proxy_protocol: None,
             },
             ..Default::default()
         }

@@ -113,7 +113,7 @@ pub struct PolicyCondition {
 
 /// How a Gateway's data plane is run. Built-in defaults, then the
 /// GatewayClass's parameters, then the Gateway's: a set field wins field by
-/// field; `networks` and `resources` replace whole.
+/// field; `networks`, `resources` and `proxyProtocol` replace whole.
 #[derive(CustomResource, Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portail.epheo.eu",
@@ -170,6 +170,86 @@ pub struct GatewayParametersSpec {
     /// deploy/components/apiserver-proxy. Default Direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_transport: Option<ControllerTransport>,
+
+    /// Routes to Services of type ExternalName, Managed or not. Refused: the
+    /// backendRef is ResolvedRefs=False InvalidKind and its share answers
+    /// 500, so a route's author cannot make the Gateway dial any name it
+    /// likes (Gateway API: implementations SHOULD NOT support them,
+    /// CVE-2021-25740). Allowed: the data plane dials the name. Default
+    /// Refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_name_backends: Option<ExternalNameBackends>,
+
+    /// Service backends whose addresses fall inside a network the Gateway
+    /// attaches (its Network addresses and the networks it dials out on),
+    /// Managed or not. Refused: such an address is never dialed, and a ref
+    /// left with none answers 500, so whoever writes a Service's Endpoints
+    /// cannot point the Gateway at the platform's networks. Allowed: they
+    /// are dialed, for a platform serving hosts on a network it attaches.
+    /// Gateway backends are never refused. Default Refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_endpoints_on_attached_networks: Option<AttachedNetworkEndpoints>,
+
+    /// PROXY protocol v2 on the data plane's TCP listeners, Managed or not.
+    /// Replaces whole: a Gateway's own list is never added to its class's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocolParameters>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProtocolParameters {
+    /// Sources whose connections must open with a v2 header: the client
+    /// it names stands for the connection (X-Forwarded-For, access logs,
+    /// rate limits). One that sends no header, or a malformed one, is
+    /// closed; LOCAL keeps the connection's own address. Other sources are
+    /// never read for one. Empty: none. Matched per accepted connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 16))]
+    pub trusted_sources: Option<Vec<TrustedSource>>,
+}
+
+/// Exactly one of `cidr` or `gateway`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "has(self.cidr) != has(self.gateway)",
+    "message": "exactly one of cidr or gateway"
+}]))]
+pub struct TrustedSource {
+    /// An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
+    /// 10.250.0.7/16. Never a network other workloads share: any of them
+    /// could name any client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub cidr: Option<String>,
+    /// A Gateway of this controller: the address each of its live data
+    /// planes reports on a Network both Gateways name, inside its CIDRs on
+    /// both sides, bound there or not. Nothing while none reports
+    /// or this Gateway has no Network address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<TrustedGateway>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedGateway {
+    #[schemars(length(min = 1))]
+    pub namespace: String,
+    #[schemars(length(min = 1))]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ExternalNameBackends {
+    Refused,
+    Allowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AttachedNetworkEndpoints {
+    Refused,
+    Allowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -224,6 +304,20 @@ pub struct NetworkSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub interface: Option<String>,
+    /// Whether listeners bind on this network. false: the data planes
+    /// only dial out on it, reaching Gateway backends and being trusted
+    /// there by the Gateways that name this one. No listener binds on its
+    /// interface, and a Gateway with such a network binds its unaddressed
+    /// listeners on every local IP off it. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listeners: Option<bool>,
+}
+
+impl NetworkSelection {
+    /// Attached for dialing out only: no listener binds on it.
+    pub fn egress_only(&self) -> bool {
+        self.listeners == Some(false)
+    }
 }
 
 /// core/v1 ResourceRequirements as the apiserver's own CRDs describe it:

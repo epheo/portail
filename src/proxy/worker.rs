@@ -34,12 +34,13 @@ use crate::proxy::http_parser::{
     parse_digits, trim_ows,
 };
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
+use crate::proxy::proxy_protocol::{self, Header};
 use crate::proxy::request_processor::{
     analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
     RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
-use crate::routing::{BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
+use crate::routing::{BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
 
 /// Read what the client has sent into `buf`'s spare room, as one read with
 /// room up to `CLIENT_BUF` would: a read that fills the room grows the
@@ -260,8 +261,11 @@ pub(crate) struct ConnectionState {
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
-    /// Client address for X-Forwarded-For.
-    peer_ip: std::net::IpAddr,
+    /// The client: X-Forwarded-For, access logs, rate limits, and the
+    /// source of a PROXY v2 header to a backend.
+    peer: SocketAddr,
+    /// Where the client reached this data plane: the header's destination.
+    local: SocketAddr,
     /// Forwarding lines appended to every request this connection sends,
     /// formatted at the first: many connections forward none.
     forwarded: Option<ForwardedLines>,
@@ -322,7 +326,8 @@ impl ConnectionState {
         selector: Arc<BackendSelector>,
         health: Arc<HealthRegistry>,
         is_tls: bool,
-        peer_ip: std::net::IpAddr,
+        peer: SocketAddr,
+        local: SocketAddr,
         cfg: &WorkerConfig,
         listener_stats: Arc<ListenerStats>,
         drain: CancellationToken,
@@ -334,7 +339,8 @@ impl ConnectionState {
             selector,
             health,
             is_tls,
-            peer_ip,
+            peer,
+            local,
             forwarded: None,
             client_header_timeout: cfg.client_header_timeout,
             connect_timeout: cfg.connect_timeout,
@@ -351,6 +357,11 @@ impl ConnectionState {
             client_done: false,
             reset: false,
         }
+    }
+
+    /// The PROXY v2 header a proxied backend's connection opens with.
+    fn proxy_header(&self, proxied: bool) -> Option<Vec<u8>> {
+        proxied.then(|| proxy_protocol::header(self.peer, self.local))
     }
 
     /// The connection closes after a reply: a client still sending, a
@@ -505,19 +516,29 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                         }
                         let routes = routes.clone();
                         let health = health.clone();
+                        let selector = selector.clone();
+                        let shared_pool = shared_pool.clone();
+                        let listener_stats = listener_stats.clone();
+                        let drain = shutdown.child_token();
                         let conn_guard =
                             ConnGuard::new(active_connections.clone(), listener_stats.clone());
-
-                        if let Some(tls) = plan.load_full() {
-                            let selector = selector.clone();
-                            let shared_pool = shared_pool.clone();
-                            let listener_stats = listener_stats.clone();
-                            let drain = shutdown.child_token();
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
+                        let tls = plan.load_full();
+                        tokio::spawn(async move {
+                            let _guard = conn_guard;
+                            let mut tcp_stream = tcp_stream;
+                            let timeout = cfg.client_header_timeout;
+                            let Some(peer) = client_of(&mut tcp_stream, peer, &routes, timeout).await
+                            else {
+                                return;
+                            };
+                            let Ok(local) = tcp_stream.local_addr() else {
+                                return;
+                            };
+                            if let Some(tls) = tls {
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
+                                    local,
                                     tls,
                                     server_port,
                                     routes,
@@ -529,26 +550,24 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                     drain,
                                 )
                                 .await;
-                            });
-                        } else {
+                                return;
+                            }
                             let state = ConnectionState::new(
                                 server_port,
                                 routes,
                                 make_pool(&shared_pool, &cfg),
-                                selector.clone(),
+                                selector,
                                 health,
                                 false,
-                                peer.ip(),
+                                peer,
+                                local,
                                 &cfg,
-                                listener_stats.clone(),
-                                shutdown.child_token(),
+                                listener_stats,
+                                drain,
                             );
-                            tokio::spawn(async move {
-                                let _guard = conn_guard;
-                                let conn = Connection::Plain { inner: tcp_stream };
-                                let _ = handle_connection(conn, peer, state).await;
-                            });
-                        }
+                            let conn = Connection::Plain { inner: tcp_stream };
+                            let _ = handle_connection(conn, peer, state).await;
+                        });
                     }
                     Err(e) => {
                         if let Some(pause) = backoff.after(&e) {
@@ -568,6 +587,33 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     }
 }
 
+/// The client a connection speaks for: its peer, or, from a trusted
+/// source, the client its PROXY v2 header names. None closes it: a
+/// trusted source that sends no header, a malformed one, or none in time
+/// never falls back to its own address.
+async fn client_of(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    routes: &ArcSwap<RouteTable>,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    if !routes.load().proxy_sources.trusts(peer.ip()) {
+        return Some(peer);
+    }
+    match tokio::time::timeout(timeout, proxy_protocol::read_header(stream)).await {
+        Ok(Ok(Header::Proxy(client))) => Some(client),
+        Ok(Ok(Header::Local)) => Some(peer),
+        _outcome => {
+            METRICS.proxy_protocol_refused_total.inc();
+            debug!(
+                "PROXY protocol header from {} refused: {:?}",
+                peer, _outcome
+            );
+            None
+        }
+    }
+}
+
 /// One accepted connection on a TLS port: its SNI selects a listener by
 /// the port's plan, read at accept. A passthrough listener forwards the raw
 /// stream; an HTTPS one handshakes, then dispatches by ALPN: h2 goes to the
@@ -577,6 +623,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
 async fn serve_tls_connection(
     tcp_stream: TcpStream,
     peer: SocketAddr,
+    local: SocketAddr,
     plan: Arc<TlsPlan>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -609,6 +656,7 @@ async fn serve_tls_connection(
         TlsKind::Passthrough => {
             let _ = handle_tls_passthrough(
                 tcp_stream,
+                (peer, local),
                 sni.as_deref(),
                 listener.hostname.as_deref(),
                 server_port,
@@ -669,6 +717,7 @@ async fn serve_tls_connection(
                 cfg,
                 listener_stats,
                 peer,
+                local,
                 drain,
             },
         )
@@ -685,7 +734,8 @@ async fn serve_tls_connection(
         selector,
         health,
         true,
-        peer.ip(),
+        peer,
+        local,
         &cfg,
         listener_stats,
         drain,
@@ -724,10 +774,15 @@ pub(crate) async fn handle_connection(
 
     let mut buf = Vec::new();
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
-    if let Ok(Handoff::Tcp { backend_addr }) = served {
+    if let Ok(Handoff::Tcp {
+        backend_addr,
+        proxied,
+    }) = served
+    {
         return handle_tcp_connection(
             client,
             backend_addr,
+            state.proxy_header(proxied),
             &buf,
             Arc::clone(&state.health),
             state.connect_timeout,
@@ -746,7 +801,10 @@ enum Handoff {
     /// The HTTP exchanges are over: the connection closes.
     Close,
     /// Not HTTP: the connection goes to a TCP route, `buf` first.
-    Tcp { backend_addr: SocketAddr },
+    Tcp {
+        backend_addr: SocketAddr,
+        proxied: bool,
+    },
 }
 
 /// Serve requests until the connection must close, or turns out to be
@@ -786,7 +844,7 @@ async fn serve_http(
         let access = crate::access_log::capture(
             buf,
             request_started,
-            state.peer_ip,
+            state.peer.ip(),
             state.server_port,
             state.is_tls,
         );
@@ -804,8 +862,14 @@ async fn serve_http(
         // over and replayed as the next iteration's input instead of being
         // sent to the backend or lost.
         let pending: Option<Vec<u8>> = match result {
-            RoutingResult::TcpForward { backend_addr } => {
-                return Ok(Handoff::Tcp { backend_addr });
+            RoutingResult::TcpForward {
+                backend_addr,
+                proxied,
+            } => {
+                return Ok(Handoff::Tcp {
+                    backend_addr,
+                    proxied,
+                });
             }
             RoutingResult::HttpForward {
                 backend,
@@ -815,7 +879,7 @@ async fn serve_http(
                 let limited = rule
                     .limiter
                     .as_ref()
-                    .is_some_and(|l| !l.check(state.peer_ip));
+                    .is_some_and(|l| !l.check(state.peer.ip()));
                 if limited {
                     crate::metrics::METRICS.rate_limited_total.inc();
                     state.listener_stats.rate_limited.inc();
@@ -1006,12 +1070,17 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
         state.server_port,
         &state.health,
     )?;
-    let RoutingResult::TcpForward { backend_addr } = routed else {
+    let RoutingResult::TcpForward {
+        backend_addr,
+        proxied,
+    } = routed
+    else {
         return Ok(()); // the router logged why
     };
     handle_tcp_connection(
         client,
         backend_addr,
+        state.proxy_header(proxied),
         &[],
         Arc::clone(&state.health),
         state.connect_timeout,
@@ -1557,7 +1626,9 @@ async fn proxy_http_request(
     // backend conn returns to the pool only when `backend_conn_poolable`
     // allows (notably never after HEAD or a refused upgrade) and never when
     // the backend announced Connection: close.
-    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade) && !framing.backend_close
+    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade)
+        && !framing.backend_close
+        && backend_ref.action != BackendAction::ForwardProxied
     {
         state.pool.release(
             backend_addr,
@@ -1567,7 +1638,7 @@ async fn proxy_http_request(
         );
     } else if framing_clean {
         debug!(
-            "Backend {} conn not pooled (HEAD, refused upgrade, or backend Connection: close)",
+            "Backend {} conn not pooled (HEAD, refused upgrade, backend Connection: close, or a Gateway backend)",
             backend_addr
         );
     }
@@ -1692,14 +1763,27 @@ async fn connect_to_backend(
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     let (use_tls, server_name) = (backend_ref.use_tls, backend_ref.server_name.as_str());
-    let acquired = match state.pool.take_idle(backend_addr, use_tls, server_name) {
-        Some(conn) => Some(Ok((conn, true))),
-        None => {
-            let keepalive = &state.backend_keepalive;
-            let connect = state
-                .pool
-                .acquire(backend_addr, use_tls, server_name, keepalive);
-            within(timer, deadline, connect).await
+    let acquired = if backend_ref.action == BackendAction::ForwardProxied {
+        // Never pooled: its header names this request's client, and a
+        // pooled conn would carry it to another client's request.
+        let header = proxy_protocol::header(state.peer, state.local);
+        let connect = connect_proxied(
+            backend_addr,
+            state.connect_timeout,
+            &state.backend_keepalive,
+            header,
+        );
+        within(timer, deadline, connect).await
+    } else {
+        match state.pool.take_idle(backend_addr, use_tls, server_name) {
+            Some(conn) => Some(Ok((conn, true))),
+            None => {
+                let keepalive = &state.backend_keepalive;
+                let connect = state
+                    .pool
+                    .acquire(backend_addr, use_tls, server_name, keepalive);
+                within(timer, deadline, connect).await
+            }
         }
     };
     match acquired {
@@ -1728,6 +1812,21 @@ async fn connect_to_backend(
     }
 }
 
+/// A fresh plain connection to a proxied backend, its PROXY v2 header sent.
+async fn connect_proxied(
+    addr: SocketAddr,
+    connect_timeout: Duration,
+    keepalive: &socket2::TcpKeepalive,
+    header: Vec<u8>,
+) -> Result<(Connection, bool), ConnectError> {
+    let mut tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
+    METRICS.upstream_connects_total.inc();
+    tcp.write_all(&header).await.map_err(|e| {
+        ConnectError::Backend(anyhow::anyhow!("PROXY header to {} failed: {}", addr, e))
+    })?;
+    Ok((Connection::Plain { inner: tcp }, false))
+}
+
 /// Assemble the outgoing request header block into `state.scratch_buf`:
 /// hop-by-hop stripping + X-Forwarded-* (always, via parser-recorded spans),
 /// then filter header modifications (when configured).
@@ -1747,7 +1846,7 @@ fn build_outgoing_headers(
         Some(_) => Some(meta.path(raw).as_bytes()),
         None => meta.normalized_path.as_deref().map(str::as_bytes),
     };
-    let (peer_ip, is_tls) = (state.peer_ip, state.is_tls);
+    let (peer_ip, is_tls) = (state.peer.ip(), state.is_tls);
     let forwarded = state
         .forwarded
         .get_or_insert_with(|| ForwardedLines::new(peer_ip, is_tls));
@@ -2638,6 +2737,7 @@ async fn within<F: std::future::Future>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_tls_passthrough(
     client: TcpStream,
+    (peer, local): (SocketAddr, SocketAddr),
     sni: Option<&str>,
     listener: Option<&str>,
     server_port: u16,
@@ -2647,9 +2747,12 @@ async fn handle_tls_passthrough(
     cfg: &WorkerConfig,
 ) -> Result<()> {
     let route_table = routes.load();
-    let backend_addr = route_table
+    let backend = route_table
         .resolve_tls_passthrough(sni, server_port, listener, &selector, &health)
         .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
+    let backend_addr = backend.socket_addr;
+    let header = (backend.action == BackendAction::ForwardProxied)
+        .then(|| proxy_protocol::header(peer, local));
 
     // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
@@ -2657,6 +2760,7 @@ async fn handle_tls_passthrough(
     handle_tcp_connection(
         Connection::Plain { inner: client },
         backend_addr,
+        header,
         &[],
         health,
         cfg.connect_timeout,
@@ -2667,9 +2771,12 @@ async fn handle_tls_passthrough(
     .await
 }
 
+/// `header`, a PROXY v2 header for a proxied backend, goes before any
+/// byte of the client's.
 async fn handle_tcp_connection(
     client: Connection,
     backend_addr: SocketAddr,
+    header: Option<Vec<u8>>,
     initial_data: &[u8],
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
@@ -2697,8 +2804,13 @@ async fn handle_tcp_connection(
         }
     };
     health.record_success(backend_addr);
-    if !initial_data.is_empty() {
-        backend.write_all(initial_data).await?;
+    match header {
+        Some(mut first) => {
+            first.extend_from_slice(initial_data);
+            backend.write_all(&first).await?;
+        }
+        None if !initial_data.is_empty() => backend.write_all(initial_data).await?,
+        None => {}
     }
     relay_l4(client, backend, idle).await;
     Ok(())
@@ -2965,6 +3077,7 @@ fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: boo
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+    use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
     use crate::routing::{Backend, HttpHeader, PathMatchType, URLRewritePath};
     use tokio::io::DuplexStream;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -3086,7 +3199,8 @@ mod connection_tests {
             Arc::new(BackendSelector::new()),
             Arc::new(HealthRegistry::new()),
             is_tls,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:40000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
             &cfg,
             Arc::new(ListenerStats::default()),
             CancellationToken::new(),
@@ -3423,12 +3537,40 @@ mod connection_tests {
         hello
     }
 
+    /// An invalid ref's share answers 500; a Gateway backend's before any
+    /// of its instances reported answers 503: one is wrong, the other not
+    /// up yet.
+    #[tokio::test]
+    async fn an_unreported_gateway_backend_answers_503_an_invalid_ref_500() {
+        for (backend, status) in [
+            (Backend::rejecting(1), "500"),
+            (Backend::unavailable(1), "503"),
+        ] {
+            let mut rt = RouteTable::new();
+            rt.add_http_route(
+                "a.test",
+                HttpRouteRule::new(
+                    PathMatchType::Prefix,
+                    "/".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![backend],
+                ),
+            );
+            let (mut client, _task) = serve(rt);
+            let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
+            assert!(out.starts_with(&format!("HTTP/1.1 {status} ")), "{out}");
+        }
+    }
+
     /// A passthrough connection that drew an invalid backendRef's share
     /// was said to find no route or no healthy backend.
     #[tokio::test]
     async fn tls_passthrough_says_why_it_has_no_backend() {
         let mut rt = RouteTable::new();
         rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
+        rt.add_tls_route(0, "unreported.test", vec![Backend::unavailable(1)]);
         let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
         weightless.weight = 0;
         rt.add_tls_route(0, "weightless.test", vec![weightless]);
@@ -3444,6 +3586,7 @@ mod connection_tests {
         };
         for (sni, why) in [
             ("rejected.test", "drew an invalid backendRef's share"),
+            ("unreported.test", "before any instance reported"),
             ("weightless.test", "no backend with positive weight"),
             ("empty.test", "no backends available"),
             ("unrouted.test", "no route"),
@@ -3453,11 +3596,13 @@ mod connection_tests {
                 .await
                 .unwrap();
             client.write_all(&client_hello(sni)).await.unwrap();
-            let (server, _) = listener.accept().await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let local = server.local_addr().unwrap();
             let routes = Arc::clone(&routes);
             let (health, selector) = (Arc::default(), Arc::default());
             let err = handle_tls_passthrough(
                 server,
+                (peer, local),
                 Some(sni),
                 None,
                 8443,
@@ -3501,9 +3646,11 @@ mod connection_tests {
             client.write_all(&first_bytes).await.unwrap();
             let (server, peer) = listener.accept().await.unwrap();
             let stats = Arc::new(ListenerStats::default());
+            let local = server.local_addr().unwrap();
             serve_tls_connection(
                 server,
                 peer,
+                local,
                 Arc::clone(&plan),
                 8443,
                 Arc::clone(&routes),
@@ -3651,6 +3798,207 @@ mod connection_tests {
                 sock.peer_addr().ok().and_then(|a| a.as_socket()) == Some(me)
             });
             assert_eq!(accepted, want, "{addr}");
+        }
+    }
+
+    /// An accept loop on loopback over `rt`, trusting `sources` for PROXY
+    /// v2 headers, with a short header budget.
+    async fn listening(mut rt: RouteTable, sources: &[&str]) -> SocketAddr {
+        rt.proxy_sources =
+            TrustedSources::new(sources.iter().map(|s| Cidr::parse(s).unwrap()).collect());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = conn_state(rt, false);
+        let ctx = ListenerCtx {
+            server_port: addr.port(),
+            routes: state.routes.clone(),
+            cfg: WorkerConfig {
+                client_header_timeout: Duration::from_millis(300),
+                ..WorkerConfig::from_perf(&Default::default(), 4)
+            },
+            plan: Default::default(),
+            health: state.health.clone(),
+            selector: state.selector.clone(),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+        addr
+    }
+
+    /// A v2 header: PROXY for `client` over TCP4, or LOCAL.
+    fn proxy_v2(client: Option<SocketAddr>) -> Vec<u8> {
+        let mut h = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        let Some(SocketAddr::V4(client)) = client else {
+            h.extend([0x20, 0x00, 0, 0]);
+            return h;
+        };
+        h.extend([0x21, 0x11, 0, 12]);
+        h.extend(client.ip().octets());
+        h.extend([127, 0, 0, 1]);
+        h.extend(client.port().to_be_bytes());
+        h.extend(80u16.to_be_bytes());
+        h
+    }
+
+    const CLOSING_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n";
+
+    /// Everything the proxy answers to `bytes` until it closes; a close
+    /// on unread bytes resets.
+    async fn answer(addr: SocketAddr, bytes: &[u8]) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(bytes).await.unwrap();
+        let mut out = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("the proxy never closed");
+        if let Err(e) = read {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}");
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The forwarded request a trusted source's `header` brings about.
+    async fn forwarded_with(header: Vec<u8>) -> String {
+        let (backend_addr, mut rx) = backend(REFUSED).await;
+        let addr = listening(routes(backend_addr), &["127.0.0.0/8"]).await;
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        delivered(&mut rx).await
+    }
+
+    #[tokio::test]
+    async fn a_trusted_source_names_the_client_it_forwards() {
+        let seen = forwarded_with(proxy_v2(Some("203.0.113.7:50000".parse().unwrap()))).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 203.0.113.7\r\n"),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_sources_local_header_keeps_its_own_address() {
+        let seen = forwarded_with(proxy_v2(None)).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 127.0.0.1\r\n"),
+            "{seen}"
+        );
+    }
+
+    /// No fallback to the transport address: the source vouches for
+    /// every connection, so one without a header is not its.
+    #[tokio::test]
+    async fn a_trusted_source_without_a_header_in_time_is_closed() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["127.0.0.1/32"]).await;
+        let before = METRICS.proxy_protocol_refused_total.get();
+        assert_eq!(answer(addr, CLOSING_GET).await, "");
+        let cut_short = &proxy_v2(Some("203.0.113.7:1".parse().unwrap()))[..20];
+        assert_eq!(answer(addr, cut_short).await, "");
+        assert_never_connected(&backend).await;
+        assert!(METRICS.proxy_protocol_refused_total.get() >= before + 2);
+    }
+
+    /// An untrusted client's header is bytes of its request, never read:
+    /// no request opens with them.
+    #[tokio::test]
+    async fn an_untrusted_sources_header_is_not_read() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["10.0.0.0/8"]).await;
+        let header = proxy_v2(Some("203.0.113.7:1".parse().unwrap()));
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(!out.contains(" 200 "), "{out}");
+        assert_never_connected(&backend).await;
+    }
+
+    fn gateway_backend(socket_addr: SocketAddr) -> Backend {
+        Backend {
+            socket_addr,
+            weight: 1,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: crate::routing::BackendAction::ForwardProxied,
+        }
+    }
+
+    /// What `conn_state`'s client sends a Gateway backend first.
+    fn conn_state_header() -> Vec<u8> {
+        proxy_protocol::header(
+            "127.0.0.1:40000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
+        )
+    }
+
+    async fn received(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("backend connection never closed")
+            .unwrap()
+    }
+
+    /// Raw TCP to a Gateway backend: the header goes before any byte of
+    /// the client's, on a TCP-only port and after a sniff alike.
+    #[tokio::test]
+    async fn a_gateway_backend_hears_who_connected_before_the_bytes() {
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task) = serve(rt);
+        client.write_all(b"hello").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), b"hello".to_vec()].concat()
+        );
+
+        let (http, _) = backend(REFUSED).await;
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = routes(http);
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task) = serve(rt);
+        client.write_all(OPAQUE).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), OPAQUE.to_vec()].concat()
+        );
+    }
+
+    /// A Gateway backend's connection carries one client's header, so it
+    /// serves one request: never from the pool, never back to it.
+    #[tokio::test]
+    async fn each_request_to_a_gateway_backend_opens_its_own_connection() {
+        let (addr, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_http_route(
+            "a.test",
+            HttpRouteRule::new(
+                PathMatchType::Prefix,
+                "/".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![gateway_backend(addr)],
+            ),
+        );
+        let (mut client, _task) = serve(rt);
+        for _ in 0..2 {
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let reply = read_one_reply(&mut client).await;
+            assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        }
+        client.shutdown().await.unwrap();
+        for _ in 0..2 {
+            let seen = received(&mut rx).await;
+            let header = conn_state_header();
+            assert_eq!(seen[..header.len()], header[..]);
+            let request = String::from_utf8_lossy(&seen[header.len()..]).into_owned();
+            assert!(request.starts_with("GET / HTTP/1.1\r\n"), "{request}");
+            assert_eq!(request.matches("GET ").count(), 1, "{request}");
         }
     }
 

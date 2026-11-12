@@ -10,8 +10,10 @@
 
 mod auth;
 mod ca;
+mod gateway_backends;
 mod gatewayclass;
 mod hub;
+mod issuer;
 mod leader;
 mod params;
 mod programmed;
@@ -108,6 +110,8 @@ struct ControllerCtx {
     certs: Arc<validate::LastGoodCerts>,
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
+    /// Who names whom as a backend of kind Gateway, and what each exposes.
+    backends: Arc<gateway_backends::GatewayBackends>,
     leader: leader::Leader,
     /// Whether every reflector delivered its initial list, and which did
     /// not. The sync server answers 503 until then, /readyz names them.
@@ -115,6 +119,9 @@ struct ControllerCtx {
     owned: provision::Owned,
     /// Wakes the class pass, which removes departed Gateways' entries.
     departures: gatewayclass::Departures,
+    /// Whether sync tokens are verified locally, which the class status
+    /// says as portail.epheo.eu/GatewaysIsolated.
+    isolated: tokio::sync::watch::Receiver<bool>,
 }
 
 /// `portail controller`: run until `shutdown`, the lease is lost or the
@@ -237,6 +244,14 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let (store_gateway_classes, gateway_class_stream) =
         create_reflector(Api::<GatewayClass>::all(client.clone()), &listings);
     let (class_events, class_changes) = gatewayclass::class_events();
+    let issuer = Arc::new(issuer::IssuerKeys::new(client.clone()));
+    tokio::spawn(issuer.clone().run(shutdown.clone()));
+    let isolated = issuer.watch();
+    tokio::spawn(
+        class_events
+            .clone()
+            .on_change(issuer.watch(), shutdown.clone()),
+    );
     let gateway_class_stream = class_events.on(gateway_class_stream);
     // A class seen before its parameters is judged again when they come.
     let params_stream = class_events.on(params_stream);
@@ -281,10 +296,12 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         certs: Arc::default(),
         hub: Arc::default(),
         reports: Arc::default(),
+        backends: Arc::default(),
         leader: leader.clone(),
         synced: listings.clone(),
         owned,
         departures: Default::default(),
+        isolated,
     });
 
     // Every Gateway is reconciled once the caches are synced: passes before
@@ -348,11 +365,13 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             &args.namespace,
             &args.service_name,
             auth::own_service_account(),
+            issuer,
         ),
         signer,
         lapses,
         shutdown.clone(),
         args.sync_peer_connections,
+        args.sync_gateway_polls,
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -361,13 +380,24 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     .await?;
     let sync = tokio::spawn(server::serve(sync_server, tls, listener));
 
-    let named_ports = ctx.named_ports.clone();
+    let report_ctx = ctx.clone();
     let report_triggers = ctx
         .reports
         .triggers()
         .expect("a fresh report store has its triggers")
-        .map(move |trigger| report_trigger(&named_ports, trigger));
-    let lapse_triggers = lapse_wakes.map(|gateway| gateway_ref(&gateway));
+        .map(move |trigger| report_trigger(&report_ctx, trigger));
+    let lapse_ctx = ctx.clone();
+    let lapse_triggers = lapse_wakes.map(move |gateway| {
+        lapse_ctx
+            .backends
+            .refresh(&gateway, &lapse_ctx.hub, &lapse_ctx.reports);
+        gateway_ref(&gateway)
+    });
+    let dependent_triggers = ctx
+        .backends
+        .wakes()
+        .expect("a fresh backend index has its wakes")
+        .map(|gateway| gateway_ref(&gateway));
 
     // --- Gateway controller ---
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
@@ -421,6 +451,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         })
         .reconcile_on(report_triggers)
         .reconcile_on(lapse_triggers)
+        .reconcile_on(dependent_triggers)
         .reconcile_on(owned_triggers)
         .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
@@ -499,11 +530,14 @@ async fn load_ca(
 }
 
 /// The reconcile a report change asks for. Moved DNS means backend pods
-/// came or went, and a named targetPort's number lives on the pods.
-fn report_trigger(named_ports: &NamedPortCache, trigger: reports::Trigger) -> ObjectRef<Gateway> {
+/// came or went, and a named targetPort's number lives on the pods. The
+/// Gateways naming this one wake only if its exposure moved.
+fn report_trigger(ctx: &ControllerCtx, trigger: reports::Trigger) -> ObjectRef<Gateway> {
     if trigger.dns_moved {
-        named_ports.dns_changed();
+        ctx.named_ports.dns_changed();
     }
+    ctx.backends
+        .refresh(&trigger.gateway, &ctx.hub, &ctx.reports);
     gateway_ref(&trigger.gateway)
 }
 
@@ -562,15 +596,15 @@ mod tests {
     use super::testkit::{self, apply, Pipeline};
     use super::*;
 
-    #[test]
-    fn a_report_trigger_reconciles_its_gateway() {
-        let named_ports = NamedPortCache::new(Duration::from_secs(RESYNC_SECS));
+    #[tokio::test]
+    async fn a_report_trigger_reconciles_its_gateway() {
+        let p = Pipeline::new();
         let trigger = reports::Trigger {
             gateway: GatewayKey::new("apps", "web"),
             dns_moved: false,
         };
         assert_eq!(
-            report_trigger(&named_ports, trigger),
+            report_trigger(&p.ctx, trigger),
             ObjectRef::<Gateway>::new("web").within("apps")
         );
     }
@@ -614,12 +648,12 @@ mod tests {
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 1);
 
-        report_trigger(&p.ctx.named_ports, trigger(false));
+        report_trigger(&p.ctx, trigger(false));
         p.api.clear();
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 0, "same pods, read from the cache");
 
-        report_trigger(&p.ctx.named_ports, trigger(true));
+        report_trigger(&p.ctx, trigger(true));
         p.api.clear();
         p.pass(&gw).await.unwrap();
         assert_eq!(slice_lists(&p), 1, "the pods moved");

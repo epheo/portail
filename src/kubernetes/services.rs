@@ -23,12 +23,17 @@ use crate::logging::{debug, info, warn};
 /// Resolved service metadata needed for route table construction.
 pub(crate) struct ServiceState {
     pub known_services: HashSet<(String, String)>,
+    /// (name, namespace) of the ExternalName Services.
+    pub external_names: HashSet<(String, String)>,
     pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
     pub app_protocol_overrides: HashMap<(String, u16), String>,
     /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
     /// data plane connects to DNS-resolved pod IPs on the targetPort, not the
     /// service port (headless has no VIP and DNS carries no port).
     pub headless_target_ports: HashMap<(String, u16), u16>,
+    /// Backend names of the Services cluster DNS answers with a VIP: a real
+    /// clusterIP, not None and not ExternalName.
+    pub cluster_ip_backends: HashSet<String>,
 }
 
 /// A headless Service whose `targetPort` is *named*. The numeric value lives in
@@ -142,11 +147,22 @@ pub(crate) fn resolve_services(
     // fallback here so an absent/failed lookup degrades to prior behavior.
     let mut headless_target_ports: HashMap<(String, u16), u16> = HashMap::new();
     let mut named_target_ports: Vec<NamedTargetPortReq> = Vec::new();
+    let mut cluster_ip_backends: HashSet<String> = HashSet::new();
     for svc in all_services {
         let spec = match svc.spec.as_ref() {
             Some(s) => s,
             None => continue,
         };
+        let vip = spec
+            .cluster_ip
+            .as_deref()
+            .is_some_and(|ip| !ip.is_empty() && ip != "None");
+        if vip && spec.type_.as_deref() != Some("ExternalName") {
+            if let Some(name) = svc.metadata.name.as_deref() {
+                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+                cluster_ip_backends.insert(backend_dns_name(name, None, ns));
+            }
+        }
         // Headless services are marked clusterIP: None (stored as the literal "None").
         // ClusterIP/LoadBalancer resolve to a VIP and keep the service port (kube-proxy
         // maps it); ExternalName has no clusterIP and is handled via endpoint_overrides.
@@ -188,6 +204,7 @@ pub(crate) fn resolve_services(
     // Service spec — no EndpointSlices). Headless pod IPs come from DNS; only their
     // targetPort mapping (above) is taken from the Service spec.
     let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
+    let mut external_names: HashSet<(String, String)> = HashSet::new();
 
     // ExternalName services: resolve externalName DNS targets
     for svc in all_services {
@@ -208,6 +225,7 @@ pub(crate) fn resolve_services(
         };
         let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
         let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
+        external_names.insert((svc_name.to_string(), svc_ns.to_string()));
 
         if let Some(ports) = spec.ports.as_ref() {
             for sp in ports {
@@ -258,9 +276,11 @@ pub(crate) fn resolve_services(
     (
         ServiceState {
             known_services,
+            external_names,
             endpoint_overrides,
             app_protocol_overrides,
             headless_target_ports,
+            cluster_ip_backends,
         },
         named_target_ports,
     )
@@ -536,6 +556,35 @@ mod tests {
             .collect();
         kept.sort_unstable();
         assert_eq!(kept, ["shadow.prod.svc", "web.prod.svc"]);
+    }
+
+    #[test]
+    fn resolve_services_lists_external_names() {
+        use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+        let external = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("ext".to_string()),
+                namespace: Some("tenant".to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                type_: Some("ExternalName".to_string()),
+                external_name: Some("kubernetes.default.svc.cluster.local".to_string()),
+                ports: Some(vec![ServicePort {
+                    port: 443,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain = headless("db", "tenant", None, 5432, IntOrString::Int(5432));
+        let (state, _) =
+            resolve_services(&[std::sync::Arc::new(external), std::sync::Arc::new(plain)]);
+        assert_eq!(
+            state.external_names,
+            HashSet::from([("ext".to_string(), "tenant".to_string())])
+        );
     }
 
     #[test]

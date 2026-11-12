@@ -135,6 +135,9 @@ pub struct RouteTable {
     /// within its listener's. Port 0 holds the routes without parentRefs,
     /// which every passthrough listener searches after its own.
     pub tls_scopes: FnvHashMap<u16, Vec<TlsScope>>,
+    /// Read once per connection, at accept: a change applies to
+    /// connections accepted after it.
+    pub proxy_sources: crate::proxy::proxy_protocol::TrustedSources,
 }
 
 /// One port's HTTP route scopes, one per listener hostname.
@@ -437,7 +440,7 @@ impl RouteTable {
         listener: Option<&str>,
         selector: &BackendSelector,
         health: &crate::proxy::health::HealthRegistry,
-    ) -> Result<std::net::SocketAddr, PassthroughMiss> {
+    ) -> Result<&Backend, PassthroughMiss> {
         // Each route rotates on its own counter; a key collision only
         // shares one.
         let (backends, key) = if let Some(route) = self.tls_route(sni, server_port, listener) {
@@ -454,7 +457,8 @@ impl RouteTable {
         match selector.select_l4_backend(key, backends, health) {
             None => Err(PassthroughMiss::NoWeight),
             Some(b) if b.action == BackendAction::Reject => Err(PassthroughMiss::Rejected),
-            Some(b) => Ok(b.socket_addr),
+            Some(b) if b.action == BackendAction::Unavailable => Err(PassthroughMiss::Unavailable),
+            Some(b) => Ok(b),
         }
     }
 }
@@ -721,6 +725,9 @@ pub enum PassthroughMiss {
     NoWeight,
     /// Its share is an invalid backendRef's ([`BackendAction::Reject`]).
     Rejected,
+    /// Its share is a Gateway backend's with no instance reported yet
+    /// ([`BackendAction::Unavailable`]).
+    Unavailable,
 }
 
 impl std::fmt::Display for PassthroughMiss {
@@ -730,6 +737,7 @@ impl std::fmt::Display for PassthroughMiss {
             Self::NoBackends => "no backends available",
             Self::NoWeight => "no backend with positive weight",
             Self::Rejected => "drew an invalid backendRef's share; rejected",
+            Self::Unavailable => "drew a Gateway backend's share before any instance reported",
         })
     }
 }
@@ -738,12 +746,27 @@ impl std::fmt::Display for PassthroughMiss {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendAction {
     Forward,
+    /// Forward behind a PROXY v2 header naming the client: a Gateway
+    /// backend, or a Service port whose appProtocol asks for one.
+    ForwardProxied,
     /// Stands for an invalid backendRef (RefNotPermitted, BackendNotFound,
     /// InvalidKind) and keeps its weight: its share fails (HTTP 500, L4
     /// connection closed or datagram dropped) instead of moving to the
     /// valid refs (HTTPRouteRule.backendRefs, TCPRouteRule.backendRefs).
     /// Never connected to, so health never tracks it.
     Reject,
+    /// A valid Gateway backend none of whose instances reported yet: it
+    /// keeps its weight as Reject does, and its share answers 503 (L4
+    /// connection closed) until one reports.
+    Unavailable,
+}
+
+impl BackendAction {
+    /// A stand-in that keeps its weight's share and is never dialed.
+    #[inline]
+    pub fn stands_in(self) -> bool {
+        matches!(self, Self::Reject | Self::Unavailable)
+    }
 }
 
 /// True when `host` is a strict subdomain of `parent` on a label boundary
@@ -1009,7 +1032,7 @@ fn select_degraded(
     let (mut cumulative, mut rejected, mut rejected_below_slot, mut healthy) = (0u64, 0, 0, 0);
     for b in backends {
         let weight = b.weight as u64;
-        if b.action == BackendAction::Reject {
+        if b.action.stands_in() {
             rejected += weight;
             if cumulative + weight <= slot {
                 rejected_below_slot += weight;
@@ -1019,7 +1042,7 @@ fn select_degraded(
         }
         cumulative += weight;
     }
-    if backends[owner].action == BackendAction::Reject || healthy == 0 {
+    if backends[owner].action.stands_in() || healthy == 0 {
         return Some(owner);
     }
     // Forwarding picks made since the counter started: consecutive ones
@@ -1041,8 +1064,7 @@ fn nth_healthy_weighted(
 ) -> Option<usize> {
     let mut cumulative: u64 = 0;
     for (i, b) in backends.iter().enumerate() {
-        if b.weight == 0 || b.action == BackendAction::Reject || !health.is_healthy(&b.socket_addr)
-        {
+        if b.weight == 0 || b.action.stands_in() || !health.is_healthy(&b.socket_addr) {
             continue;
         }
         cumulative += b.weight as u64;

@@ -10,11 +10,15 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use kube::ResourceExt;
 
 use super::ControllerCtx;
+use crate::dataplane::addresses::in_cidr;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
-    ControllerTransport, GatewayParameters, GatewayParametersSpec, NetworkSelection, Provisioning,
-    ServiceParameters, ServiceType,
+    AttachedNetworkEndpoints, ControllerTransport, ExternalNameBackends, GatewayParameters,
+    GatewayParametersSpec, NetworkSelection, Provisioning, ServiceParameters, ServiceType,
 };
+use crate::proxy::proxy_protocol::Cidr;
+use crate::sync::GatewayKey;
+use crate::sync::NetworkCidrs;
 
 const GROUP: &str = "portail.epheo.eu";
 const KIND: &str = "GatewayParameters";
@@ -35,7 +39,52 @@ pub(crate) struct Params {
     pub service_type: ServiceType,
     pub networks: Vec<NetworkSelection>,
     pub controller_transport: ControllerTransport,
+    pub external_name_backends: ExternalNameBackends,
+    pub service_endpoints_on_attached_networks: AttachedNetworkEndpoints,
+    /// CIDRs whose connections open with a PROXY v2 header.
+    pub proxy_sources: Vec<String>,
+    /// Gateways whose data planes' addresses join `proxy_sources` once
+    /// resolved against this Gateway's own networks.
+    pub trusted_gateways: Vec<GatewayKey>,
 }
+
+impl Params {
+    /// The (namespace, NAD) of each network attached with listeners
+    /// false, a selection without a namespace in the Gateway's.
+    pub(crate) fn egress_networks(&self, gateway_ns: &str) -> Vec<(String, String)> {
+        self.networks
+            .iter()
+            .filter(|n| n.egress_only())
+            .map(|n| {
+                let ns = n
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| gateway_ns.to_string());
+                (ns, n.name.clone())
+            })
+            .collect()
+    }
+}
+
+/// Why an `IPAddress` of `gateway` cannot be used: it is inside a network
+/// its parameters attach to dial out on, where no listener binds.
+pub(crate) fn dial_out_address(gateway: &Gateway, networks: &[NetworkCidrs]) -> Option<String> {
+    let dialed = || networks.iter().filter(|n| !n.listeners);
+    gateway.spec.addresses.iter().flatten().find_map(|a| {
+        if a.r#type.as_deref().unwrap_or(IP_ADDRESS_TYPE) != IP_ADDRESS_TYPE {
+            return None;
+        }
+        let value = a.value.as_deref()?;
+        let network = dialed().find(|n| n.cidrs.iter().any(|c| in_cidr(value, c)))?;
+        Some(format!(
+            "spec.addresses: IPAddress {value} is inside network {:?}, which this Gateway's \
+             parameters attach with listeners: false: no listener binds there",
+            network.name
+        ))
+    })
+}
+
+const IP_ADDRESS_TYPE: &str = "IPAddress";
 
 /// `Err` says why the parameters cannot be used: the Gateway is
 /// Accepted=False InvalidParameters, and its last snapshot and objects
@@ -66,10 +115,27 @@ pub(crate) fn resolve(ctx: &ControllerCtx, gateway: &Gateway) -> Result<Params, 
         }
         network_address = true;
     }
-    concrete(
+    let params = concrete(
         merge(builtin(&ctx.dataplane_image), &layers),
         network_address,
-    )
+    )?;
+    let addressed = |name: &str| {
+        gateway.spec.addresses.iter().flatten().any(|a| {
+            a.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE) && a.value.as_deref() == Some(name)
+        })
+    };
+    if let Some(n) = params
+        .networks
+        .iter()
+        .find(|n| n.egress_only() && addressed(&n.name))
+    {
+        return Err(format!(
+            "spec.addresses: Network {:?} binds listeners, but this Gateway's parameters attach \
+             it with listeners: false",
+            n.name
+        ));
+    }
+    Ok(params)
 }
 
 /// Whether `class`'s parametersRef can be used, as its Accepted condition
@@ -214,11 +280,14 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         service: None,
         networks: None,
         controller_transport: Some(ControllerTransport::Direct),
+        external_name_backends: Some(ExternalNameBackends::Refused),
+        service_endpoints_on_attached_networks: Some(AttachedNetworkEndpoints::Refused),
+        proxy_protocol: None,
     }
 }
 
-/// `base` with each layer's set fields over it, in order; `networks` and
-/// `resources` replace whole.
+/// `base` with each layer's set fields over it, in order; `networks`,
+/// `resources` and `proxyProtocol` replace whole.
 fn merge(
     mut base: GatewayParametersSpec,
     layers: &[GatewayParametersSpec],
@@ -232,13 +301,20 @@ fn merge(
             service,
             networks,
             controller_transport,
+            external_name_backends,
+            service_endpoints_on_attached_networks,
+            proxy_protocol,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
         base.controller_transport = controller_transport.or(base.controller_transport);
+        base.external_name_backends = external_name_backends.or(base.external_name_backends);
+        base.service_endpoints_on_attached_networks =
+            service_endpoints_on_attached_networks.or(base.service_endpoints_on_attached_networks);
         base.replicas = replicas.or(base.replicas);
         base.image = image.or(base.image);
         base.resources = resources.or(base.resources);
         base.networks = networks.or(base.networks);
+        base.proxy_protocol = proxy_protocol.or(base.proxy_protocol);
         if let Some(type_) = service.and_then(|s| s.type_) {
             base.service = Some(ServiceParameters { type_: Some(type_) });
         }
@@ -265,12 +341,40 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
              be on two pods"
         ));
     }
+    let (mut proxy_sources, mut trusted_gateways) = (Vec::new(), Vec::new());
+    let sources = spec.proxy_protocol.and_then(|p| p.trusted_sources);
+    for (i, source) in sources.unwrap_or_default().into_iter().enumerate() {
+        match (source.cidr, source.gateway) {
+            (Some(cidr), None) => proxy_sources.push(
+                Cidr::parse(&cidr)
+                    .map_err(|e| format!("proxyProtocol.trustedSources[{i}].cidr: {e}"))?
+                    .to_string(),
+            ),
+            (None, Some(gw)) if !gw.namespace.is_empty() && !gw.name.is_empty() => {
+                trusted_gateways.push(GatewayKey::new(gw.namespace, gw.name))
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "proxyProtocol.trustedSources[{i}].gateway: needs a namespace and a name"
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "proxyProtocol.trustedSources[{i}]: needs exactly one of cidr or gateway"
+                ))
+            }
+        }
+    }
+    trusted_gateways.sort();
+    trusted_gateways.dedup();
     let resources = spec.resources.unwrap_or_default();
     let worker_threads = cpu_limit(Some(&resources))
         .and_then(|cpu| cpu_cores(&cpu.0))
         .map(|cores| (cores.ceil() as u32).clamp(1, MAX_WORKER_THREADS));
     // Operator parity: a Gateway on Multus networks binds on them, and
-    // nothing fronts it.
+    // nothing fronts it. One that only dials out on them asks for its
+    // Service: a class adding such a network must never publish its
+    // Gateways around an edge.
     let service_type =
         spec.service
             .and_then(|s| s.type_)
@@ -290,6 +394,14 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         controller_transport: spec
             .controller_transport
             .unwrap_or(ControllerTransport::Direct),
+        external_name_backends: spec
+            .external_name_backends
+            .unwrap_or(ExternalNameBackends::Refused),
+        service_endpoints_on_attached_networks: spec
+            .service_endpoints_on_attached_networks
+            .unwrap_or(AttachedNetworkEndpoints::Refused),
+        proxy_sources,
+        trusted_gateways,
     })
 }
 
@@ -429,6 +541,10 @@ mod tests {
                 service_type: ServiceType::LoadBalancer,
                 networks: vec![],
                 controller_transport: ControllerTransport::Direct,
+                external_name_backends: ExternalNameBackends::Refused,
+                service_endpoints_on_attached_networks: AttachedNetworkEndpoints::Refused,
+                proxy_sources: vec![],
+                trusted_gateways: vec![],
             }
         );
     }
@@ -522,6 +638,147 @@ networks: [{name: c}]
         );
         let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
         assert_eq!(params.provisioning, Provisioning::Unmanaged);
+    }
+
+    #[tokio::test]
+    async fn attached_network_endpoints_refused_unless_a_layer_allows_them() {
+        let params = resolve_in(&cluster(None), &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Refused
+        );
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "serviceEndpointsOnAttachedNetworks: Allowed",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Allowed
+        );
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "serviceEndpointsOnAttachedNetworks: Refused",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(
+            params.service_endpoints_on_attached_networks,
+            AttachedNetworkEndpoints::Refused
+        );
+    }
+
+    #[tokio::test]
+    async fn external_name_backends_from_the_class_unless_the_gateway_says() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "externalNameBackends: Allowed",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(params.external_name_backends, ExternalNameBackends::Allowed);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", "externalNameBackends: Refused"),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.external_name_backends, ExternalNameBackends::Refused);
+    }
+
+    #[tokio::test]
+    async fn proxy_sources_from_the_class_replaced_whole_by_the_gateway() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        let sources = |cidrs: &[&str]| {
+            let items: Vec<String> = cidrs.iter().map(|c| format!("{{cidr: \"{c}\"}}")).collect();
+            format!("proxyProtocol: {{trustedSources: [{}]}}", items.join(", "))
+        };
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                &sources(&["10.0.0.0/8", "2001:db8::/32"]),
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(params.proxy_sources, ["10.0.0.0/8", "2001:db8::/32"]);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", &sources(&["192.0.2.0/24"])),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(params.proxy_sources, ["192.0.2.0/24"]);
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", &sources(&["192.0.2.7/24"])),
+        );
+        let err = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap_err();
+        assert!(
+            err.starts_with("proxyProtocol.trustedSources[0].cidr: "),
+            "{err}"
+        );
+        assert!(err.contains("host bits"), "{err}");
+    }
+
+    /// A trusted source is a CIDR or a Gateway, never both or neither.
+    #[tokio::test]
+    async fn a_trusted_source_is_exactly_one_of_cidr_or_gateway() {
+        let mut cluster = cluster(None);
+        let resolve = |cluster: &mut TestCluster, sources: &str| {
+            apply(
+                &mut cluster.parameters,
+                parameters(
+                    "default",
+                    "mine",
+                    &format!("proxyProtocol: {{trustedSources: [{sources}]}}"),
+                ),
+            );
+            resolve_in(cluster, &gateway_with_ref("mine"))
+        };
+        let params = resolve(
+            &mut cluster,
+            "{cidr: 192.0.2.0/24}, {gateway: {namespace: edge, name: public}}, \
+             {gateway: {namespace: edge, name: public}}",
+        )
+        .unwrap();
+        assert_eq!(params.proxy_sources, ["192.0.2.0/24"]);
+        assert_eq!(params.trusted_gateways, [GatewayKey::new("edge", "public")]);
+
+        for (sources, why) in [
+            (
+                "{cidr: 192.0.2.0/24, gateway: {namespace: edge, name: public}}",
+                "proxyProtocol.trustedSources[0]: needs exactly one of cidr or gateway",
+            ),
+            (
+                "{}",
+                "proxyProtocol.trustedSources[0]: needs exactly one of cidr or gateway",
+            ),
+            (
+                "{gateway: {namespace: edge, name: ''}}",
+                "proxyProtocol.trustedSources[0].gateway: needs a namespace and a name",
+            ),
+        ] {
+            assert_eq!(
+                resolve(&mut cluster, sources).unwrap_err(),
+                why,
+                "{sources}"
+            );
+        }
     }
 
     /// A missing referent, a wrong group or kind, or a class reference
@@ -693,6 +950,106 @@ networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
             let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
             assert_eq!(params.worker_threads, Some(threads), "{cpu}");
         }
+    }
+
+    /// A network listens unless its parameters say false; one it only
+    /// dials out on counts among its egress networks, in its namespace
+    /// unless named, and leaves the Service None like any network.
+    #[tokio::test]
+    async fn a_network_listens_unless_attached_for_dialing_out() {
+        let mut cluster = cluster(None);
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: br-ex}, {name: transit, listeners: false}, \
+                 {name: shared, namespace: infra, listeners: false}]",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        let listens: Vec<bool> = params.networks.iter().map(|n| !n.egress_only()).collect();
+        assert_eq!(listens, [true, false, false]);
+        assert_eq!(
+            params.egress_networks("edge"),
+            [
+                ("edge".to_string(), "transit".to_string()),
+                ("infra".to_string(), "shared".to_string())
+            ]
+        );
+        assert_eq!(params.service_type, ServiceType::None, "br-ex listens");
+
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: transit, listeners: false}]",
+            ),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(
+            params.service_type,
+            ServiceType::None,
+            "a dial-out network alone never brings a Service"
+        );
+    }
+
+    /// An IPAddress inside a network the parameters dial out on would never
+    /// bind: refused once its CIDRs are known. One on a network it listens
+    /// on, or elsewhere, stands.
+    #[test]
+    fn an_ip_address_inside_a_dialed_network_is_refused() {
+        let networks = |listeners| {
+            vec![NetworkCidrs {
+                name: "transit".into(),
+                cidrs: vec!["10.250.0.0/16".into()],
+                listeners,
+            }]
+        };
+        let with = |value: &str| {
+            let mut gw = testkit::gateway("edge", 1);
+            gw.spec.addresses = Some(vec![serde_json::from_value(
+                serde_json::json!({"type": "IPAddress", "value": value}),
+            )
+            .unwrap()]);
+            gw
+        };
+        let why = dial_out_address(&with("10.250.0.5"), &networks(false)).unwrap();
+        assert!(
+            why.contains("10.250.0.5") && why.contains("\"transit\""),
+            "{why}"
+        );
+        assert_eq!(dial_out_address(&with("10.250.0.5"), &networks(true)), None);
+        assert_eq!(
+            dial_out_address(&with("203.0.113.10"), &networks(false)),
+            None
+        );
+    }
+
+    /// A Network address binds listeners: naming one the parameters attach
+    /// for dialing out only is a contradiction, refused.
+    #[tokio::test]
+    async fn a_network_address_cannot_name_a_dialed_network() {
+        let mut cluster = cluster(None);
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "networks: [{name: transit, listeners: false}]",
+            ),
+        );
+        let mut gw = gateway_with_ref("mine");
+        gw.spec.addresses = Some(vec![serde_json::from_value(
+            serde_json::json!({"type": NETWORK_ADDRESS_TYPE, "value": "transit"}),
+        )
+        .unwrap()]);
+        let err = resolve_in(&cluster, &gw).unwrap_err();
+        assert!(
+            err.contains("\"transit\"") && err.contains("listeners: false"),
+            "{err}"
+        );
     }
 
     /// Unset, the Service is None when the Gateway binds on networks, else

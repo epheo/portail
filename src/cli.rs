@@ -147,12 +147,12 @@ pub struct ControllerArgs {
     #[arg(long, default_value_t = 9443)]
     pub sync_port: u16,
 
-    /// Open sync connections one peer IP may hold
+    /// Open sync connections one peer IP may hold, held polls aside
     ///
-    /// A data plane holds one or two. Proxied data planes all arrive from
-    /// the apiserver, and on OVN-Kubernetes from each apiserver node's
-    /// management address: give 2 per Primary UDN data plane per apiserver
-    /// node.
+    /// A held poll counts against its Gateway (--sync-gateway-polls), not
+    /// its address: data planes polling through the apiserver all share one.
+    /// What is left here is a connection between polls, a few per data
+    /// plane at most.
     #[arg(
         long,
         value_name = "N",
@@ -160,6 +160,21 @@ pub struct ControllerArgs {
         value_parser = parse_at_least_one
     )]
     pub sync_peer_connections: usize,
+
+    /// Polls one Gateway's data planes may hold at once
+    ///
+    /// Each data-plane pod holds one. Over this a poll is answered 503 at
+    /// once: pods anyone with that namespace's admin can start on the
+    /// Gateway's ServiceAccount never take other Gateways' connections.
+    /// Held polls still take the controller's 1024: 128 Gateways at their
+    /// cap fill it, so whoever creates Gateways bounds them.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_SYNC_GATEWAY_POLLS,
+        value_parser = parse_at_least_one
+    )]
+    pub sync_gateway_polls: usize,
 
     /// Name of the leader election Lease
     #[arg(long, default_value = "portail-controller")]
@@ -179,6 +194,11 @@ pub struct ControllerArgs {
 /// IP (hostNetwork pods of one node, pods behind a SNAT, or polls through
 /// the apiserver), and no single pod holds the whole cap of 1024.
 pub const DEFAULT_SYNC_PEER_CONNECTIONS: usize = 32;
+
+/// `--sync-gateway-polls`' default: a Gateway's replicas, twice over for a
+/// rollout, with room; 128 Gateways at the cap fill the controller's 1024
+/// connections.
+pub const DEFAULT_SYNC_GATEWAY_POLLS: usize = 8;
 
 /// Where a data plane reads the controller CA's PEM when
 /// `--controller-ca-file` is not given: managed pods get it in their template.
@@ -429,6 +449,7 @@ mod tests {
         assert_eq!(c.sync_port, 9443);
         assert_eq!(c.leader_election_id, "portail-controller");
         assert_eq!(c.sync_peer_connections, 32);
+        assert_eq!(c.sync_gateway_polls, 8);
         assert_eq!(c.dataplane_image, default_dataplane_image());
         assert_eq!(c.admin.readiness_port, 19099);
 
@@ -440,6 +461,7 @@ mod tests {
             "--service-name=ctl",
             "--sync-port=8443",
             "--sync-peer-connections=200",
+            "--sync-gateway-polls=3",
             "--leader-election-id=lease",
             "--dataplane-image=registry.local/portail:dev",
             "--readiness-port=9000",
@@ -459,6 +481,7 @@ mod tests {
             (8443, 9000, "registry.local/portail:dev")
         );
         assert_eq!(c.sync_peer_connections, 200);
+        assert_eq!(c.sync_gateway_polls, 3);
         for bad in ["0", "-1", "many"] {
             let argv = [
                 "portail",

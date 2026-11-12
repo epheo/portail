@@ -95,6 +95,20 @@ impl Leader {
         rx
     }
 
+    /// Leading for `ago` already.
+    #[cfg(test)]
+    pub(crate) fn led_for(&self, ago: Duration) {
+        *self.0.since.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now().checked_sub(ago).expect("a clock past `ago`"));
+    }
+
+    /// Lose the lead and take it again, as a failover back would.
+    #[cfg(test)]
+    pub(crate) fn take_over(&self) {
+        self.set(Role::Lost);
+        self.set(Role::Leading);
+    }
+
     /// When this replica became the leader, while it leads.
     pub(crate) fn leading_since(&self) -> Option<Instant> {
         let since = *self.0.since.lock().unwrap_or_else(|p| p.into_inner());

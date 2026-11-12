@@ -15,7 +15,7 @@ use super::provision;
 use super::reports::InstanceId;
 use super::translate::Statuses;
 use super::ControllerCtx;
-use crate::dataplane::addresses::{bind_addresses_resolved, unresolved_networks};
+use crate::dataplane::addresses::{bind_addresses_resolved, unresolved_networks, DialOut};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::status::{self, condition, GatewayCondition, ListenerStatus};
 use crate::logging::debug;
@@ -139,6 +139,15 @@ enum Addresses {
     Unknown,
 }
 
+/// What the AddressesAssigned condition says.
+enum Assigned {
+    /// Each spec address no instance holds, with why; `None` when every
+    /// one is held, or a Service answers for them.
+    Known(Option<String>),
+    /// No instance at the version: what was written stays.
+    Unknown,
+}
+
 fn decide(i: &Inputs) -> GatewayStatus {
     let generation = i.gateway.metadata.generation;
     let observed = status::observed_gateway_status(i.gateway);
@@ -148,7 +157,7 @@ fn decide(i: &Inputs) -> GatewayStatus {
 
     let mut listeners = i.listeners.clone();
     let service = i.service.map(ServiceView::of);
-    let (verdict, addresses, pending) = evaluate(i, &mut listeners, service.as_ref());
+    let (verdict, addresses, pending, assigned) = evaluate(i, &mut listeners, service.as_ref());
     let verdict = if let Some(problem) = i.problem {
         Verdict::Fresh(GatewayCondition::invalid(problem))
     } else if !i.accepted.ok {
@@ -205,7 +214,11 @@ fn decide(i: &Inputs) -> GatewayStatus {
     };
     GatewayStatus {
         programmed: programmed["status"] == "True",
-        desired: status::desired_gateway_status([accepted, programmed], entries, addresses),
+        desired: status::desired_gateway_status(
+            with_assigned(vec![accepted, programmed], assigned, &observed, generation),
+            entries,
+            addresses,
+        ),
         recheck,
         routes: true,
     }
@@ -227,16 +240,21 @@ fn unpublished(i: &Inputs, why: &Unpublished, observed: &Value) -> GatewayStatus
             format!("Nothing published for this generation: {m}"),
         ),
     };
-    let conditions = [
-        condition(
-            "Accepted",
-            accepted.ok,
-            &accepted.reason,
-            &accepted.message,
-            generation,
-        ),
-        condition("Programmed", false, "Invalid", &message, generation),
-    ];
+    let conditions = with_assigned(
+        vec![
+            condition(
+                "Accepted",
+                accepted.ok,
+                &accepted.reason,
+                &accepted.message,
+                generation,
+            ),
+            condition("Programmed", false, "Invalid", &message, generation),
+        ],
+        Assigned::Unknown,
+        observed,
+        generation,
+    );
     GatewayStatus {
         desired: status::desired_gateway_status(
             conditions,
@@ -348,13 +366,18 @@ fn evaluate(
     i: &Inputs,
     listeners: &mut HashMap<String, ListenerStatus>,
     service: Option<&ServiceView>,
-) -> (Verdict, Addresses, Vec<String>) {
+) -> (Verdict, Addresses, Vec<String>, Assigned) {
     let from_service = || service.map(|s| Addresses::Known(s.addresses.clone()));
     let Some(served) = i.served else {
         let message = "No configuration published for this Gateway yet";
         let marked = mark_pending(listeners, message);
         let addresses = from_service().unwrap_or(Addresses::Unknown);
-        return (Verdict::Fresh(pending(message)), addresses, marked);
+        return (
+            Verdict::Fresh(pending(message)),
+            addresses,
+            marked,
+            Assigned::Unknown,
+        );
     };
     let at_version: Vec<&InstanceReport> = i
         .reports
@@ -391,15 +414,28 @@ fn evaluate(
                 (Verdict::Fresh(pending(&message)), addresses)
             }
         };
-        return (verdict, addresses, marked);
+        return (verdict, addresses, marked, Assigned::Unknown);
     }
 
     let config = &served.config;
     let binds: Vec<Option<Vec<String>>> = at_version
         .iter()
-        .map(|r| bind_addresses_resolved(&config.gateway.addresses, &r.networks, &r.interface_ips))
+        .map(|r| {
+            bind_addresses_resolved(
+                &config.gateway.addresses,
+                &r.networks,
+                &r.interface_ips,
+                &DialOut::reported(&served.networks, &r.dial_out_ips),
+            )
+        })
         .collect();
     let unusable = binds.iter().all(Option::is_none);
+    // A Service answers for the spec's addresses itself (AddressNotAssigned
+    // on Programmed); without one, the instances hold them or nothing does.
+    let unheld = match service {
+        Some(_) => Unheld::default(),
+        None => unheld(i.gateway, &at_version, &binds, &served.networks),
+    };
     // Only listeners the translation could program count: one without a
     // usable certificate is Invalid on its own, the rest still serve
     // (Gateway API v1.4.1: Programmed says the configuration was generated).
@@ -444,11 +480,31 @@ fn evaluate(
         GatewayCondition {
             ok: false,
             reason: "AddressNotUsable".to_string(),
+            message: {
+                let unresolved: Vec<&str> =
+                    unresolved_networks(&config.gateway.addresses, &at_version[0].networks)
+                        .into_iter()
+                        .chain(DialOut::unresolved_names(&served.networks))
+                        .collect();
+                let mut message = format!(
+                    "Network {} has no IP on this pod, or its NetworkAttachmentDefinition could \
+                     not be read, so no listener of this Gateway is bound; check the \
+                     NetworkAttachmentDefinition and the pod's network attachment",
+                    unresolved.join(", ")
+                );
+                if let Some(why) = unheld.message() {
+                    message.push_str(&format!(". Not bound: {why}"));
+                }
+                message
+            },
+        }
+    } else if unheld.none_held() {
+        GatewayCondition {
+            ok: false,
+            reason: "AddressNotAssigned".to_string(),
             message: format!(
-                "Network address {} has no IP on this pod, or its NetworkAttachmentDefinition \
-                 could not be read, so no listener of this Gateway is bound; check the \
-                 NetworkAttachmentDefinition and the pod's network attachment",
-                unresolved_networks(&config.gateway.addresses, &at_version[0].networks).join(", ")
+                "No address of this Gateway is held: {}",
+                unheld.message().unwrap_or_default()
             ),
         }
     } else if all_bound {
@@ -465,7 +521,130 @@ fn evaluate(
             Addresses::Known(held)
         }
     });
-    (Verdict::Fresh(condition), addresses, Vec::new())
+    let assigned = Assigned::Known(unheld.message());
+    (Verdict::Fresh(condition), addresses, Vec::new(), assigned)
+}
+
+/// The spec's IPAddress values no instance at the version holds where it
+/// bound, and whether it holds any address the spec names.
+#[derive(Default)]
+struct Unheld {
+    /// Each with why, in spec order.
+    addresses: Vec<(String, String)>,
+    any_held: bool,
+}
+
+impl Unheld {
+    fn message(&self) -> Option<String> {
+        (!self.addresses.is_empty()).then(|| {
+            self.addresses
+                .iter()
+                .map(|(ip, why)| format!("IPAddress {ip} {why}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    /// Addresses were named, and none is held.
+    fn none_held(&self) -> bool {
+        !self.addresses.is_empty() && !self.any_held
+    }
+}
+
+fn unheld(
+    gateway: &Gateway,
+    at_version: &[&InstanceReport],
+    binds: &[Option<Vec<String>>],
+    networks: &[crate::sync::NetworkCidrs],
+) -> Unheld {
+    let spec = gateway.spec.addresses.as_deref().unwrap_or_default();
+    let held: BTreeSet<String> = at_version
+        .iter()
+        .zip(binds)
+        .flat_map(|(report, bind)| held_by(spec, report, bind))
+        .collect();
+    let unresolved: Vec<&str> = DialOut::unresolved_names(networks).collect();
+    let addresses = spec
+        .iter()
+        .filter(|a| a.r#type.as_deref().unwrap_or(IP_ADDRESS) == IP_ADDRESS)
+        .filter_map(|a| a.value.clone())
+        .filter(|value| !held.contains(value))
+        .map(|value| {
+            let on = |r: &&&InstanceReport| r.interface_ips.contains(&value);
+            let why = match at_version.iter().find(on) {
+                None => "is on no data-plane pod".to_string(),
+                Some(r) if r.dial_out_ips.contains(&value) && !unresolved.is_empty() => format!(
+                    "is on the pod, on an interface not known to listen while network {} it \
+                     dials out on cannot be told apart",
+                    unresolved.join(", ")
+                ),
+                Some(r) if r.dial_out_ips.contains(&value) => {
+                    "is on the interface of a network this Gateway only dials out on".to_string()
+                }
+                Some(_) => "is on the pod but not bound".to_string(),
+            };
+            (value, why)
+        })
+        .collect();
+    Unheld {
+        addresses,
+        any_held: !held.is_empty(),
+    }
+}
+
+/// `conditions` with AddressesAssigned as `assigned` says: False naming
+/// the addresses, absent when all are held, the written one when nothing
+/// is known.
+fn with_assigned(
+    mut conditions: Vec<Value>,
+    assigned: Assigned,
+    observed: &Value,
+    generation: Option<i64>,
+) -> Vec<Value> {
+    let written =
+        || status::observed_condition(&observed["conditions"], status::ADDRESSES_ASSIGNED);
+    let entry = match assigned {
+        Assigned::Known(Some(message)) => Some(condition(
+            status::ADDRESSES_ASSIGNED,
+            false,
+            "AddressNotAssigned",
+            &message,
+            generation,
+        )),
+        Assigned::Known(None) => None,
+        Assigned::Unknown => written(),
+    };
+    conditions.extend(entry);
+    conditions
+}
+
+/// The spec's addresses `report`'s instance holds where it bound: its
+/// IPAddress values and its IP on each Network named. An address on a
+/// network it only dials out on is on the pod, never bound.
+fn held_by(
+    spec: &[gateway_api::gateways::GatewayAddresses],
+    report: &InstanceReport,
+    bind: &Option<Vec<String>>,
+) -> Vec<String> {
+    let bound_on = |ip: &String| {
+        bind.as_ref()
+            .is_some_and(|b| b.is_empty() || b.contains(ip))
+    };
+    spec.iter()
+        .filter_map(|a| {
+            let value = a.value.as_deref()?;
+            match a.r#type.as_deref().unwrap_or(IP_ADDRESS) {
+                IP_ADDRESS => report
+                    .interface_ips
+                    .iter()
+                    .any(|ip| ip == value)
+                    .then(|| value.to_string()),
+                t if t == NETWORK_ADDRESS_TYPE => report.networks.get(value).cloned(),
+                _ => None,
+            }
+        })
+        .filter(bound_on)
+        .collect()
 }
 
 /// status.addresses without a Service: per instance that binds, the
@@ -482,23 +661,11 @@ fn instance_addresses(
         if bind.is_none() {
             continue;
         }
-        let held: Vec<String> = spec
-            .iter()
-            .filter_map(|a| {
-                let value = a.value.as_deref()?;
-                match a.r#type.as_deref().unwrap_or(IP_ADDRESS) {
-                    IP_ADDRESS => report
-                        .interface_ips
-                        .iter()
-                        .any(|ip| ip == value)
-                        .then(|| value.to_string()),
-                    t if t == NETWORK_ADDRESS_TYPE => report.networks.get(value).cloned(),
-                    _ => None,
-                }
-            })
-            .collect();
+        let held = held_by(spec, report, bind);
         if held.is_empty() {
-            all.extend(report.interface_ips.first().cloned());
+            // Where it bound, never a network it only dials out on.
+            let bound = bind.iter().flatten().next();
+            all.extend(bound.or(report.interface_ips.first()).cloned());
         } else {
             all.extend(held);
         }
@@ -650,6 +817,36 @@ mod tests {
             interface_ips: ips.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// A Gateway without a spec address of its own reports where it bound:
+    /// never its address on a network it only dials out on, listed first.
+    #[test]
+    fn a_dialing_gateway_reports_where_it_bound() {
+        let gw = crate::kubernetes::controller::testkit::gateway("edge", 1);
+        let r = report("v1", &["10.250.0.9", "10.244.1.5"], true);
+        let held = instance_addresses(&gw, &[&r], &[Some(vec!["10.244.1.5".into()])]);
+        assert_eq!(held, [(IP_ADDRESS, "10.244.1.5".to_string())]);
+        let every = instance_addresses(&gw, &[&r], &[Some(vec![])]);
+        assert_eq!(
+            every,
+            [(IP_ADDRESS, "10.250.0.9".to_string())],
+            "first interface"
+        );
+    }
+
+    /// A spec IPAddress on the pod but never bound, inside a network it
+    /// only dials out on, is not shown as held.
+    #[test]
+    fn an_address_never_bound_is_not_held() {
+        let mut gw = crate::kubernetes::controller::testkit::gateway("edge", 1);
+        gw.spec.addresses = Some(vec![serde_json::from_value(
+            serde_json::json!({"type": "IPAddress", "value": "10.250.0.9"}),
+        )
+        .unwrap()]);
+        let r = report("v1", &["10.250.0.9", "10.244.1.5"], true);
+        let held = instance_addresses(&gw, &[&r], &[Some(vec!["10.244.1.5".into()])]);
+        assert_eq!(held, [(IP_ADDRESS, "10.244.1.5".to_string())]);
     }
 
     fn live(reports: Vec<InstanceReport>) -> Vec<(InstanceId, InstanceReport)> {
@@ -1252,6 +1449,149 @@ mod tests {
             "an instance that binds nothing gives nothing"
         );
         assert!(out.programmed, "{}", out.desired);
+    }
+
+    fn assigned_of(desired: &Value) -> Option<&Value> {
+        desired["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == status::ADDRESSES_ASSIGNED)
+    }
+
+    /// A rented IP that never lands on the pod names itself, and the
+    /// Gateway's other address keeps it Programmed.
+    #[test]
+    fn a_spec_address_no_instance_holds_names_itself() {
+        let gw = gateway(
+            1,
+            &[
+                ("IPAddress", "203.0.113.9"),
+                (NETWORK_ADDRESS_TYPE, "transit"),
+            ],
+        );
+        let served = snapshot(&gw, &["203.0.113.9", "transit"]);
+        let mut r = report(V1, &["10.0.0.5", "10.250.0.7"], true);
+        r.networks.insert("transit".into(), "10.250.0.7".into());
+        let out = Case::new(gw, served, vec![r]).run();
+        assert!(out.programmed, "{}", out.desired);
+        let assigned = assigned_of(&out.desired).expect("named");
+        assert_eq!(assigned["status"], "False");
+        assert_eq!(assigned["reason"], "AddressNotAssigned");
+        assert_eq!(
+            assigned["message"],
+            "IPAddress 203.0.113.9 is on no data-plane pod"
+        );
+        assert_eq!(addresses(&out.desired), [ip("10.250.0.7")]);
+    }
+
+    /// None of the spec's addresses held: Programmed says so (Gateway API
+    /// AddressNotAssigned), though the listeners bind every interface.
+    #[test]
+    fn no_spec_address_held_is_not_assigned() {
+        let gw = gateway(1, &[("IPAddress", "203.0.113.9")]);
+        let served = snapshot(&gw, &["203.0.113.9"]);
+        let out = Case::new(gw, served, vec![report(V1, &["10.0.0.5"], true)]).run();
+        let programmed = programmed_of(&out.desired);
+        assert_eq!(programmed["status"], "False");
+        assert_eq!(programmed["reason"], "AddressNotAssigned");
+        assert!(
+            programmed["message"]
+                .as_str()
+                .unwrap()
+                .contains("203.0.113.9"),
+            "{programmed}"
+        );
+        assert!(assigned_of(&out.desired).is_some());
+    }
+
+    /// Held, it says nothing; once the address lands, the condition goes,
+    /// and with no instance at the version what was written stays.
+    #[test]
+    fn the_condition_clears_when_the_address_lands() {
+        let gw = gateway(
+            1,
+            &[
+                ("IPAddress", "203.0.113.9"),
+                (NETWORK_ADDRESS_TYPE, "transit"),
+            ],
+        );
+        let served = snapshot(&gw, &["203.0.113.9", "transit"]);
+        let mut missing = report(V1, &["10.250.0.7"], true);
+        missing
+            .networks
+            .insert("transit".into(), "10.250.0.7".into());
+        let first = Case::new(gw.clone(), served.clone(), vec![missing]).run();
+        let gw = written(&gw, &first.desired);
+
+        let mut older = report("v0", &["10.250.0.7"], true);
+        older.networks.insert("transit".into(), "10.250.0.7".into());
+        let kept = Case::new(gw.clone(), served.clone(), vec![older]).run();
+        assert_eq!(
+            assigned_of(&kept.desired).map(|c| &c["message"]),
+            assigned_of(&first.desired).map(|c| &c["message"]),
+            "nothing known: the written one stays"
+        );
+
+        let mut landed = report(V1, &["10.250.0.7", "203.0.113.9"], true);
+        landed
+            .networks
+            .insert("transit".into(), "10.250.0.7".into());
+        let out = Case::new(gw, served, vec![landed]).run();
+        assert!(out.programmed, "{}", out.desired);
+        assert!(assigned_of(&out.desired).is_none(), "{}", out.desired);
+    }
+
+    /// A Service answers for the spec's addresses itself.
+    #[test]
+    fn a_service_writes_no_addresses_assigned() {
+        let gw = gateway(1, &[("IPAddress", "203.0.113.7")]);
+        let out = with_service(gw, load_balancer(json!([{"ip": "203.0.113.7"}])));
+        assert!(assigned_of(&out.desired).is_none(), "{}", out.desired);
+    }
+
+    /// While a dialed network cannot be told apart, an address on an
+    /// interface not known to listen is held back, and says why.
+    #[test]
+    fn an_address_held_back_while_a_dialed_network_is_unresolved_says_why() {
+        let unresolved = crate::sync::NetworkCidrs {
+            name: "transit".into(),
+            cidrs: vec![],
+            listeners: false,
+        };
+        let gw = gateway(
+            1,
+            &[("IPAddress", "10.250.0.9"), ("IPAddress", "10.244.1.5")],
+        );
+        let mut served = snapshot(&gw, &["10.250.0.9", "10.244.1.5"]);
+        served.networks = vec![unresolved.clone()];
+        let mut r = report(V1, &["10.244.1.5", "10.250.0.9"], true);
+        r.dial_out_ips = vec!["10.250.0.9".into()];
+        let out = Case::new(gw, served, vec![r.clone()]).run();
+        assert!(out.programmed, "{}", out.desired);
+        let message = assigned_of(&out.desired).unwrap()["message"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            message,
+            "IPAddress 10.250.0.9 is on the pod, on an interface not known to listen while \
+             network transit it dials out on cannot be told apart"
+        );
+
+        let gw = gateway(1, &[("IPAddress", "10.250.0.9")]);
+        let mut served = snapshot(&gw, &["10.250.0.9"]);
+        served.networks = vec![unresolved];
+        let mut unbound = r;
+        unbound.listeners[0].endpoints.clear();
+        let out = Case::new(gw, served, vec![unbound]).run();
+        let programmed = programmed_of(&out.desired);
+        assert_eq!(programmed["reason"], "AddressNotUsable");
+        let message = programmed["message"].as_str().unwrap();
+        assert!(message.contains("transit"), "{message}");
+        assert!(
+            message.contains("Not bound: IPAddress 10.250.0.9 is on the pod"),
+            "{message}"
+        );
     }
 
     fn service_of(service_type: &str, status: Value) -> Service {

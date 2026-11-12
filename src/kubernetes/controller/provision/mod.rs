@@ -145,6 +145,18 @@ pub(crate) struct Owned {
     retries: Retries,
 }
 
+/// A Gateway's ServiceAccount as this install's cache holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisionedAccount {
+    /// Labeled this install's and controlled by the Gateway: its uid.
+    Ours(String),
+    /// Labeled this install's, but not the Gateway's: one a deleted
+    /// Gateway of that name owned, not collected yet.
+    Another,
+    /// None labeled this install's under that name.
+    None,
+}
+
 /// Gateways whose provisioning failed with a retry pending, and the
 /// trigger stream the retry goes through.
 struct Retries {
@@ -276,6 +288,27 @@ impl Owned {
                 .remove(&gateway);
             let _ = trigger.unbounded_send(gateway);
         });
+    }
+
+    /// What the cache holds of ServiceAccount `namespace/name` for the
+    /// Gateway of `gateway_uid`.
+    pub(crate) fn service_account(
+        &self,
+        namespace: &str,
+        name: &str,
+        gateway_uid: &str,
+    ) -> ProvisionedAccount {
+        let Some(meta) = meta_of(&self.service_accounts, namespace, name) else {
+            return ProvisionedAccount::None;
+        };
+        if label(&meta, render::LABEL_CONTROLLER) != Some(self.controller.install.as_str()) {
+            return ProvisionedAccount::None;
+        }
+        let ours = is_ours(&meta, gateway_uid, &self.controller.install);
+        match meta.uid.filter(|uid| !uid.is_empty()) {
+            Some(uid) if ours => ProvisionedAccount::Ours(uid),
+            _ => ProvisionedAccount::Another,
+        }
     }
 
     #[cfg(test)]
@@ -467,6 +500,40 @@ fn controller_owner(meta: &ObjectMeta) -> Option<&OwnerReference> {
             && o.kind == "Gateway"
             && o.api_version.starts_with("gateway.networking.k8s.io/")
     })
+}
+
+/// `gateway`'s ServiceAccount, of `uid`, as the test install provisions
+/// it: labeled, and controlled by the Gateway.
+#[cfg(test)]
+pub(crate) fn provisioned_service_account(
+    gateway: &Gateway,
+    uid: &str,
+) -> PartialObjectMeta<ServiceAccount> {
+    PartialObjectMeta {
+        types: None,
+        metadata: ObjectMeta {
+            name: Some(resource_name(&gateway.name_any())),
+            namespace: gateway.namespace(),
+            uid: Some(uid.into()),
+            labels: Some(
+                [(
+                    render::LABEL_CONTROLLER.to_string(),
+                    render::install_label(super::testkit::CONTROLLER),
+                )]
+                .into(),
+            ),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "gateway.networking.k8s.io/v1".into(),
+                kind: "Gateway".into(),
+                name: gateway.name_any(),
+                uid: gateway.uid().unwrap_or_default(),
+                controller: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        _phantom: std::marker::PhantomData,
+    }
 }
 
 /// The Gateway an owned object's controller ownerReference names.
@@ -952,6 +1019,11 @@ mod tests {
             service_type,
             networks: vec![],
             controller_transport: crate::kubernetes::crds::ControllerTransport::Direct,
+            external_name_backends: crate::kubernetes::crds::ExternalNameBackends::Refused,
+            service_endpoints_on_attached_networks:
+                crate::kubernetes::crds::AttachedNetworkEndpoints::Refused,
+            proxy_sources: vec![],
+            trusted_gateways: vec![],
         }
     }
 

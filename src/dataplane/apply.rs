@@ -2,6 +2,7 @@
 //! close what it no longer does, build and swap the route table when the
 //! config moved, and report what is bound.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -9,13 +10,18 @@ use std::time::Instant;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio_util::sync::CancellationToken;
 
-use super::addresses::{bind_addresses_resolved, local_interface_ips, resolve_networks};
+use super::addresses::{
+    bind_addresses_resolved, listening_ips, local_interfaces, resolve_networks, DialOut,
+};
 use super::dns_refresh::{spawn_dns_refresh, Published};
-use crate::config::{ListenerConfig, PerformanceConfig, PortailConfig};
+use crate::config::{
+    parse_gateway_backend_name, ListenerConfig, PerformanceConfig, PortailConfig,
+    ProxyProtocolConfig,
+};
 use crate::logging::{error, info, warn};
 use crate::proxy::data_plane::{BindError, DataPlane, Endpoint};
 use crate::routing::RouteTable;
-use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Snapshot, Transport};
+use crate::sync::{EndpointReport, InstanceReport, ListenerReport, Snapshot, Transport, HOLD};
 
 /// Applies snapshots to a data plane, one at a time.
 pub struct Applier {
@@ -34,6 +40,216 @@ pub struct Applier {
     dns_epoch: tokio::sync::watch::Sender<u64>,
     /// Cold-start latency context for the "Data plane ready" log line.
     started: Instant,
+    keep: Keep,
+    /// When the first value [`Keep`] carried lapses: the snapshot is applied
+    /// again then, without it.
+    kept_until: Option<tokio::time::Instant>,
+    /// status.podIP, from the downward API: the kubelet's, not the pod's
+    /// own word. Its interface is known to listen while a dial-out network
+    /// cannot be told apart.
+    pod_ip: Option<String>,
+}
+
+/// A Gateway backend or a trusted Gateway, as the controller marks it
+/// pending, with the uid of the Gateway its value comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Kept {
+    Backend(String, u16, String),
+    Trusted(String, String),
+}
+
+/// How long a value stays fresh after the controller last vouched for it
+/// (applied it resolved, or confirmed it unchanged). Two holds: an
+/// unchanged config is confirmed once per hold, and a failover adds a
+/// reconnect. The controller counts an instance live as long.
+const FRESH: std::time::Duration = std::time::Duration::from_secs(2 * HOLD.as_secs());
+
+/// One value served: its Gateway's uid, the value, when the controller
+/// last vouched for it (None: never), and whether this data plane kept it
+/// itself.
+#[derive(Clone)]
+struct Value<T> {
+    uid: String,
+    value: T,
+    fresh: Option<tokio::time::Instant>,
+    kept: bool,
+}
+
+/// What each Gateway backend and trusted Gateway served at the last apply,
+/// and since when each has been pending. A pending one serves what it last
+/// did, for the same Gateway (same uid) only, while that value is fresh and
+/// for one hold from when it was first seen pending, then nothing. That
+/// deadline never moves while it stays pending, across snapshots,
+/// reconnects and leaders, or a flapping controller would keep stale
+/// addresses trusted. It starts afresh only once the item was seen
+/// resolved. Nothing survives a restart of the data plane: it fails closed.
+#[derive(Default)]
+struct Keep {
+    backends: HashMap<(String, u16), Value<Vec<(String, u16)>>>,
+    trusted: HashMap<String, Value<Vec<String>>>,
+    since: HashMap<Kept, tokio::time::Instant>,
+}
+
+/// `old` when it may stand in for a pending item of Gateway `uid` at
+/// `now`, with when it lapses: the same Gateway only, while fresh, and
+/// within one hold of the item first seen pending (`deadline`).
+fn carried<'a, T>(
+    old: Option<&'a Value<T>>,
+    uid: &str,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<(&'a Value<T>, tokio::time::Instant)> {
+    old.filter(|old| !uid.is_empty() && old.uid == uid)
+        .and_then(|old| Some((old, deadline.min(old.fresh? + FRESH))))
+        .filter(|(_, until)| now < *until)
+}
+
+/// A resolved value's freshness: now when the controller vouched for it,
+/// else the stamp its last resolved value of the same Gateway had.
+fn stamp<T>(
+    old: Option<&Value<T>>,
+    uid: &str,
+    now: tokio::time::Instant,
+    vouched: bool,
+) -> Option<tokio::time::Instant> {
+    if vouched {
+        return Some(now);
+    }
+    old.filter(|v| !v.kept && v.uid == uid)
+        .and_then(|v| v.fresh)
+}
+
+impl Keep {
+    /// Fill into `config` what `snapshot` marks pending and the last apply
+    /// served, until it lapses. Returns when the first value carried lapses.
+    /// `vouched`: the controller just sent `snapshot`. Applied again on the
+    /// data plane's own account, it vouches for nothing: what it resolves
+    /// keeps the stamp it had, so a data plane cut off retrying binds never
+    /// makes a stale value fresh.
+    fn carry(
+        &mut self,
+        snapshot: &Snapshot,
+        config: &mut PortailConfig,
+        now: tokio::time::Instant,
+        vouched: bool,
+    ) -> Option<tokio::time::Instant> {
+        let backend_uid = |host: &str, port: u16| {
+            snapshot
+                .backends_from
+                .iter()
+                .find(|b| b.host == host && b.port == port)
+                .map(|b| b.uid.clone())
+                .unwrap_or_default()
+        };
+        let mut backends: HashMap<(String, u16), Value<Vec<(String, u16)>>> = config
+            .endpoint_overrides
+            .iter()
+            .filter(|((host, _), _)| parse_gateway_backend_name(host).is_some())
+            .map(|((host, port), targets)| {
+                let key = (host.clone(), *port);
+                let uid = backend_uid(host, *port);
+                let value = Value {
+                    fresh: stamp(self.backends.get(&key), &uid, now, vouched),
+                    uid,
+                    value: targets.clone(),
+                    kept: false,
+                };
+                (key, value)
+            })
+            .collect();
+        let mut trusted: HashMap<String, Value<Vec<String>>> = snapshot
+            .trusted_from
+            .iter()
+            .map(|t| {
+                let value = Value {
+                    uid: t.uid.clone(),
+                    value: t.sources.clone(),
+                    fresh: stamp(self.trusted.get(&t.gateway), &t.uid, now, vouched),
+                    kept: false,
+                };
+                (t.gateway.clone(), value)
+            })
+            .collect();
+        let mut until: Option<tokio::time::Instant> = None;
+        let mut lapse = |at: tokio::time::Instant| {
+            until = Some(until.map_or(at, |u| u.min(at)));
+        };
+
+        let mut pending = HashSet::new();
+        for b in &snapshot.pending.backends {
+            let key = Kept::Backend(b.host.clone(), b.port, b.uid.clone());
+            let deadline = *self.since.entry(key.clone()).or_insert(now) + HOLD;
+            pending.insert(key);
+            let served = (b.host.clone(), b.port);
+            if backends.contains_key(&served) {
+                continue;
+            }
+            if let Some((old, at)) = carried(self.backends.get(&served), &b.uid, deadline, now) {
+                config
+                    .endpoint_overrides
+                    .insert(served.clone(), old.value.clone());
+                let kept = Value {
+                    kept: true,
+                    ..old.clone()
+                };
+                backends.insert(served, kept);
+                lapse(at);
+            }
+        }
+        for t in &snapshot.pending.trusted {
+            let key = Kept::Trusted(t.gateway.clone(), t.uid.clone());
+            let deadline = *self.since.entry(key.clone()).or_insert(now) + HOLD;
+            pending.insert(key);
+            if trusted.contains_key(&t.gateway) {
+                continue;
+            }
+            if let Some((old, at)) = carried(self.trusted.get(&t.gateway), &t.uid, deadline, now) {
+                let proxy = config
+                    .gateway
+                    .proxy_protocol
+                    .get_or_insert_with(ProxyProtocolConfig::default);
+                for source in &old.value {
+                    if !proxy.trusted_sources.contains(source) {
+                        proxy.trusted_sources.push(source.clone());
+                    }
+                }
+                let kept = Value {
+                    kept: true,
+                    ..old.clone()
+                };
+                trusted.insert(t.gateway.clone(), kept);
+                lapse(at);
+            }
+        }
+
+        // Seen resolved: a later pending starts a fresh hold. Absent: the
+        // deadline stands until it lapses, so a revoke and re-add cannot
+        // restart it either.
+        self.since.retain(|key, since| {
+            let resolved = match key {
+                Kept::Backend(host, port, _) => backends
+                    .get(&(host.clone(), *port))
+                    .is_some_and(|v| !v.kept),
+                Kept::Trusted(gateway, _) => trusted.get(gateway).is_some_and(|v| !v.kept),
+            };
+            pending.contains(key) || (!resolved && now < *since + HOLD)
+        });
+        self.backends = backends;
+        self.trusted = trusted;
+        until
+    }
+
+    /// The controller confirmed the config served unchanged: what it
+    /// resolved is fresh again, what this data plane kept is not.
+    fn confirmed(&mut self, now: tokio::time::Instant) {
+        let backends = self.backends.values_mut().map(|v| (&mut v.fresh, v.kept));
+        let trusted = self.trusted.values_mut().map(|v| (&mut v.fresh, v.kept));
+        for (fresh, kept) in backends.chain(trusted) {
+            if !kept {
+                *fresh = Some(now);
+            }
+        }
+    }
 }
 
 /// The data plane's last apply.
@@ -74,17 +290,52 @@ impl Applier {
             last: None,
             dns_epoch: tokio::sync::watch::Sender::new(0),
             started: Instant::now(),
+            keep: Keep::default(),
+            kept_until: None,
+            pod_ip: None,
         }
+    }
+
+    /// This pod's IP, as `POD_IP` carries it; `None` knows none.
+    pub fn with_pod_ip(mut self, pod_ip: Option<String>) -> Self {
+        self.pod_ip = pod_ip.filter(|ip| ip.parse::<std::net::IpAddr>().is_ok());
+        self
+    }
+
+    /// When a value kept for something pending lapses: apply again then.
+    pub fn kept_until(&self) -> Option<tokio::time::Instant> {
+        self.kept_until
+    }
+
+    /// The controller confirmed the snapshot served current.
+    pub fn confirmed(&mut self) {
+        self.keep.confirmed(tokio::time::Instant::now());
     }
 
     /// Bring the data plane in line with `snapshot` and report the result,
     /// under the snapshot's version as sent.
     pub async fn apply(&mut self, snapshot: &Snapshot) -> InstanceReport {
-        let config = snapshot.to_config();
-        let local = local_interface_ips();
+        self.apply_as(snapshot, true).await
+    }
+
+    /// [`Self::apply`] of the snapshot already served, on the data plane's
+    /// own account (a rebind, a lapse): the controller vouched for nothing.
+    pub async fn reapply(&mut self, snapshot: &Snapshot) -> InstanceReport {
+        self.apply_as(snapshot, false).await
+    }
+
+    async fn apply_as(&mut self, snapshot: &Snapshot, vouched: bool) -> InstanceReport {
+        let mut config = snapshot.to_config();
+        self.kept_until =
+            self.keep
+                .carry(snapshot, &mut config, tokio::time::Instant::now(), vouched);
+        let interfaces = local_interfaces();
+        let local: Vec<String> = interfaces.iter().map(|(_, ip)| ip.clone()).collect();
         let networks = resolve_networks(&config.gateway.addresses, &snapshot.networks, &local);
+        let known = listening_ips(&networks, &snapshot.networks, self.pod_ip.as_deref());
+        let dial_out = DialOut::of(&interfaces, &snapshot.networks, &known);
         let served = Served {
-            bind: bind_addresses_resolved(&config.gateway.addresses, &networks, &local),
+            bind: bind_addresses_resolved(&config.gateway.addresses, &networks, &local, &dial_out),
             config: Arc::new(config),
         };
         let state = self.bring_up(&served).await;
@@ -111,8 +362,10 @@ impl Applier {
             apply_error: state.build_error,
             interface_ips: local,
             networks,
+            dial_out_ips: dial_out.ips,
             dns_epoch: self.dns_epoch(),
             leaving: false,
+            gateway_uid: snapshot.gateway.uid.clone(),
         }
     }
 
@@ -131,6 +384,8 @@ impl Applier {
         lock(&self.data_plane).health().prune(&empty);
         self.published.store(None);
         self.last = None;
+        self.keep = Keep::default();
+        self.kept_until = None;
         if self.ready.swap(false, Ordering::AcqRel) {
             info!("Data plane cleared: no listener bound");
         }
@@ -436,6 +691,9 @@ fn data_plane_fingerprint(config: &PortailConfig, binds: &[ListenerConfig]) -> u
             )
             .collect(),
     );
+    // What a Service backend may resolve to: a network read again, or the
+    // parameters allowing it, rebuilds the table though the routes did not move.
+    h.write(format!("{:?}", config.dial_rules).as_bytes());
     for b in binds {
         h.write(format!("{:?}:{}", b.address, b.port).as_bytes());
         h.write(&[0]);
@@ -449,6 +707,7 @@ mod tests {
     use crate::config::Protocol;
     use crate::proxy::data_plane::NO_CERTIFICATE;
     use crate::sync::GatewayRef;
+    use std::time::Duration;
 
     fn lc(port: u16, target_port: Option<u16>) -> ListenerConfig {
         ListenerConfig {
@@ -589,6 +848,293 @@ mod tests {
             generation,
         };
         Snapshot::from_config(gateway, config, vec![])
+    }
+
+    /// An edge's snapshot: Gateway backend `target.p.gateway:80` at
+    /// `endpoints` and Gateway `p/edge` trusted at `trusted`, either marked
+    /// pending when `pending`.
+    fn edge(endpoints: &[&str], trusted: &[&str], pending: bool, generation: i64) -> Snapshot {
+        edge_of(endpoints, trusted, pending, generation, "u1")
+    }
+
+    /// [`edge`], both named Gateways of `uid`.
+    fn edge_of(
+        endpoints: &[&str],
+        trusted: &[&str],
+        pending: bool,
+        generation: i64,
+        uid: &str,
+    ) -> Snapshot {
+        // No listener: nothing here binds, only what is served is read.
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "gw", "listeners": []},
+        }))
+        .unwrap();
+        if !endpoints.is_empty() {
+            config.endpoint_overrides.insert(
+                ("target.p.gateway".into(), 80),
+                endpoints.iter().map(|ip| (ip.to_string(), 8000)).collect(),
+            );
+        }
+        if !trusted.is_empty() {
+            config.gateway.proxy_protocol = Some(ProxyProtocolConfig {
+                trusted_sources: trusted.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+        let gateway = GatewayRef {
+            namespace: "default".into(),
+            name: "gw".into(),
+            uid: "gw-uid".into(),
+            generation,
+        };
+        let mut snapshot = Snapshot::from_config(gateway, config, vec![]);
+        if !endpoints.is_empty() {
+            snapshot.backends_from = vec![crate::sync::BackendFrom {
+                host: "target.p.gateway".into(),
+                port: 80,
+                uid: uid.into(),
+            }];
+        }
+        if !trusted.is_empty() {
+            snapshot.trusted_from = vec![crate::sync::TrustedFrom {
+                gateway: "p/edge".into(),
+                uid: uid.into(),
+                sources: trusted.iter().map(|s| s.to_string()).collect(),
+            }];
+        }
+        if pending {
+            snapshot.pending = crate::sync::Pending {
+                backends: vec![crate::sync::PendingBackend {
+                    host: "target.p.gateway".into(),
+                    port: 80,
+                    uid: uid.into(),
+                }],
+                trusted: vec![crate::sync::PendingTrusted {
+                    gateway: "p/edge".into(),
+                    uid: uid.into(),
+                }],
+            };
+        }
+        snapshot.seal()
+    }
+
+    /// What `snapshot`, sent by the controller, serves through `keep` at
+    /// `now`: the backend's endpoint IPs, the trusted sources, and when the
+    /// first kept value lapses.
+    fn served_through(
+        keep: &mut Keep,
+        snapshot: &Snapshot,
+        now: tokio::time::Instant,
+    ) -> (Vec<String>, Vec<String>, Option<tokio::time::Instant>) {
+        carried_through(keep, snapshot, now, true)
+    }
+
+    /// [`served_through`], the snapshot sent by the controller (`vouched`)
+    /// or applied again on the data plane's own account.
+    fn carried_through(
+        keep: &mut Keep,
+        snapshot: &Snapshot,
+        now: tokio::time::Instant,
+        vouched: bool,
+    ) -> (Vec<String>, Vec<String>, Option<tokio::time::Instant>) {
+        let mut config = snapshot.to_config();
+        let until = keep.carry(snapshot, &mut config, now, vouched);
+        let endpoints = config
+            .endpoint_overrides
+            .get(&("target.p.gateway".to_string(), 80))
+            .map(|t| t.iter().map(|(ip, _)| ip.clone()).collect())
+            .unwrap_or_default();
+        let trusted = config
+            .gateway
+            .proxy_protocol
+            .map(|p| p.trusted_sources)
+            .unwrap_or_default();
+        (endpoints, trusted, until)
+    }
+
+    /// A pending item serves what it last did, until one hold from when
+    /// it was first seen pending. More pending snapshots, from a reconnect
+    /// or a new leader, never move that deadline.
+    #[test]
+    fn a_pending_item_keeps_what_it_served_for_one_hold_from_first_seen() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut keep = Keep::default();
+        let (endpoints, trusted, until) = served_through(
+            &mut keep,
+            &edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1),
+            t0,
+        );
+        assert_eq!((endpoints.len(), trusted.len(), until), (1, 1, None));
+
+        let first = t0 + s(1);
+        let deadline = first + HOLD;
+        for (now, generation) in [(first, 1), (t0 + s(10), 1), (t0 + s(20), 2)] {
+            let (endpoints, trusted, until) =
+                served_through(&mut keep, &edge(&[], &[], true, generation), now);
+            assert_eq!(endpoints, ["10.250.0.7"], "kept at {:?}", now - t0);
+            assert_eq!(trusted, ["10.250.0.9/32"], "kept at {:?}", now - t0);
+            assert_eq!(until, Some(deadline), "the deadline never moves");
+        }
+        for now in [deadline, deadline + s(5)] {
+            let (endpoints, trusted, until) =
+                served_through(&mut keep, &edge(&[], &[], true, 2), now);
+            assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+        }
+    }
+
+    /// Seen resolved, a later pending starts a fresh hold, keeping what
+    /// was resolved last.
+    #[test]
+    fn a_pending_after_a_resolved_one_starts_a_fresh_hold() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut keep = Keep::default();
+        served_through(
+            &mut keep,
+            &edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1),
+            t0,
+        );
+        served_through(&mut keep, &edge(&[], &[], true, 1), t0 + s(1));
+        served_through(
+            &mut keep,
+            &edge(&["10.250.0.8"], &["10.250.0.8/32"], false, 1),
+            t0 + s(25),
+        );
+        let later = t0 + s(40);
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), later);
+        assert_eq!(endpoints, ["10.250.0.8"]);
+        assert_eq!(trusted, ["10.250.0.8/32"]);
+        assert_eq!(
+            until,
+            Some(later + HOLD),
+            "past the first hold, a fresh one"
+        );
+    }
+
+    /// A Gateway recreated under the same name is another: what was served
+    /// for the old one is never kept for the new.
+    #[test]
+    fn a_recreated_gateway_keeps_nothing_of_the_old_one() {
+        let t0 = tokio::time::Instant::now();
+        let mut keep = Keep::default();
+        served_through(
+            &mut keep,
+            &edge_of(&["10.250.0.7"], &["10.250.0.9/32"], false, 1, "u1"),
+            t0,
+        );
+        let (endpoints, trusted, until) = served_through(
+            &mut keep,
+            &edge_of(&[], &[], true, 2, "u2"),
+            t0 + Duration::from_secs(1),
+        );
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+    }
+
+    /// A value is kept only while the controller vouched for it within two
+    /// holds: applied resolved, or confirmed unchanged since. One a data
+    /// plane cut off for minutes still holds is not.
+    #[test]
+    fn only_a_fresh_value_is_kept() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let resolved = edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1);
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), t0 + FRESH + s(1));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        keep.confirmed(t0 + s(50));
+        let pending = t0 + s(70);
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), pending);
+        assert_eq!((endpoints.len(), trusted.len()), (1, 1), "confirmed at 50s");
+        assert_eq!(
+            until,
+            Some(pending + HOLD),
+            "the earlier of the hold and freshness"
+        );
+    }
+
+    /// A data plane cut off from the controller applies its snapshot again
+    /// on its own (rebinds, listener exits): that vouches for nothing. Past
+    /// two holds of it, reconnecting to a leader marking the item pending
+    /// keeps nothing.
+    #[test]
+    fn applying_again_on_its_own_never_makes_a_value_fresh() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let resolved = edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1);
+        let mut keep = Keep::default();
+        served_through(&mut keep, &resolved, t0);
+        for at in [s(20), s(50), s(80), s(110)] {
+            let (endpoints, trusted, _) = carried_through(&mut keep, &resolved, t0 + at, false);
+            assert_eq!((endpoints.len(), trusted.len()), (1, 1), "still served");
+        }
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 2), t0 + s(120));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+    }
+
+    /// What a snapshot no longer carries, pending or not, is gone at once:
+    /// spec dropped it. Re-added pending, nothing is left to keep.
+    #[test]
+    fn what_a_snapshot_drops_is_never_kept() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut keep = Keep::default();
+        served_through(
+            &mut keep,
+            &edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1),
+            t0,
+        );
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], false, 2), t0 + s(1));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &edge(&[], &[], true, 3), t0 + s(2));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+    }
+
+    /// The marks ride the envelope: a data plane that does not know them
+    /// drops them, keeps nothing and fails closed.
+    #[test]
+    fn a_data_plane_without_pending_keeps_nothing() {
+        let t0 = tokio::time::Instant::now();
+        let mut keep = Keep::default();
+        served_through(
+            &mut keep,
+            &edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1),
+            t0,
+        );
+        let mut json = serde_json::to_value(edge(&[], &[], true, 2)).unwrap();
+        assert!(json.get("pending").is_some() && json["config"].get("pending").is_none());
+        let envelope = json.as_object_mut().unwrap();
+        envelope.remove("pending");
+        envelope.remove("trustedFrom");
+        let older: Snapshot = serde_json::from_value(json).unwrap();
+        let (endpoints, trusted, until) =
+            served_through(&mut keep, &older, t0 + Duration::from_secs(1));
+        assert!(endpoints.is_empty() && trusted.is_empty() && until.is_none());
+    }
+
+    /// The applier schedules the apply that drops a kept value.
+    #[tokio::test]
+    async fn an_apply_that_keeps_something_says_until_when() {
+        let (mut applier, _ready) = applier();
+        applier
+            .apply(&edge(&["10.250.0.7"], &["10.250.0.9/32"], false, 1))
+            .await;
+        assert_eq!(applier.kept_until(), None);
+        applier.apply(&edge(&[], &[], true, 2)).await;
+        let until = applier.kept_until().expect("kept");
+        assert!(until > tokio::time::Instant::now() + HOLD - Duration::from_secs(5));
+        applier.clear().await;
+        assert_eq!(applier.kept_until(), None);
     }
 
     fn free_ports() -> (u16, u16) {
@@ -901,6 +1447,29 @@ mod tests {
                 .unwrap()
                 .block_on(test);
         }
+    }
+
+    /// The DNS refresh rebuilds from the published config: it carries the
+    /// snapshot's dial rules, so a name re-resolved there meets them too.
+    #[tokio::test]
+    async fn the_published_config_carries_the_snapshots_dial_rules() {
+        let (mut applier, _) = applier();
+        let mut snapshot = edge(&[], &[], false, 1);
+        snapshot.networks = vec![crate::sync::NetworkCidrs {
+            name: "transit".into(),
+            cidrs: vec!["10.250.0.0/16".into()],
+            listeners: false,
+        }];
+        let snapshot = snapshot.seal();
+        applier.apply(&snapshot).await;
+        let published = applier.published.load_full().expect("published");
+        let rules = published
+            .config
+            .dial_rules
+            .clone()
+            .expect("the snapshot's rules");
+        assert!(rules.refuses("10.250.0.9".parse().unwrap(), true).is_some());
+        assert_eq!(rules.refuses("10.128.0.5".parse().unwrap(), true), None);
     }
 
     /// A 404 closes every listener and turns NotReady; the next snapshot

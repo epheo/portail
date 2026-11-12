@@ -221,7 +221,7 @@ pub(crate) fn address(address_type: &str, value: &str) -> Value {
 /// `[Accepted, Programmed]`, every listener entry, and the addresses.
 /// `addresses: None` leaves the field out: no placeholder is ever written.
 pub(crate) fn desired_gateway_status(
-    conditions: [Value; 2],
+    conditions: Vec<Value>,
     listeners: Vec<Value>,
     addresses: Option<Vec<Value>>,
 ) -> Value {
@@ -286,18 +286,28 @@ fn gateway_status_current(observed: &Value, desired: &Value) -> bool {
     }
 }
 
+/// Condition types in portail's own domain: only portail writes them.
+const OWN_CONDITIONS: &str = "portail.epheo.eu/";
+
 /// Whether every desired condition is among the observed ones, timestamps
-/// aside. Another writer's condition types do not make ours stale.
+/// aside, and no observed condition of portail's own domain is one the
+/// desired ones drop: the apply then removes it, so a condition a version
+/// stops writing never stays behind with its last status. Another writer's
+/// condition types do not make ours stale.
 fn conditions_current(observed: &Value, desired: &Value) -> bool {
     let observed: Vec<Value> = observed
         .get("conditions")
         .and_then(Value::as_array)
         .map(|a| a.iter().map(without_transition_times).collect())
         .unwrap_or_default();
-    desired
-        .get("conditions")
-        .and_then(Value::as_array)
-        .is_none_or(|conditions| conditions.iter().all(|c| observed.contains(c)))
+    let Some(desired) = desired.get("conditions").and_then(Value::as_array) else {
+        return true;
+    };
+    let dropped = observed.iter().any(|c| {
+        let kind = str_at(c, "type");
+        kind.starts_with(OWN_CONDITIONS) && !desired.iter().any(|d| str_at(d, "type") == kind)
+    });
+    !dropped && desired.iter().all(|c| observed.contains(c))
 }
 
 /// Server-side apply `status` onto `obj` as this pass read it: a pass for
@@ -407,18 +417,50 @@ pub(crate) async fn write_gateway_status(
 /// The GatewayClass status this controller owns, without timestamps:
 /// Accepted and the supported features, sorted by name as the field
 /// requires.
-pub(crate) fn desired_class_status(class: &GatewayClass, accepted: &GatewayCondition) -> Value {
+/// Says one namespace's data planes never delay another Gateway's
+/// configuration: held polls capped per Gateway, and sync tokens verified
+/// against the cluster's issuer keys before any review, reviews budgeted by
+/// the ServiceAccount they prove. A console may then let tenants' data
+/// planes poll through the apiserver, where they share one address.
+pub(crate) const GATEWAYS_ISOLATED: &str = "portail.epheo.eu/GatewaysIsolated";
+
+/// False, naming each spec address no data plane holds, while another is
+/// held: Gateway API's AddressNotAssigned on Programmed is for none held,
+/// and one missing rented IP must not take the other listeners down.
+pub(crate) const ADDRESSES_ASSIGNED: &str = "portail.epheo.eu/AddressesAssigned";
+
+/// `isolated`: sync tokens are verified locally (the per-Gateway poll cap
+/// always holds).
+pub(crate) fn desired_class_status(
+    class: &GatewayClass,
+    accepted: &GatewayCondition,
+    isolated: bool,
+) -> Value {
     let mut features: Vec<&str> = SUPPORTED_FEATURES.to_vec();
     features.sort_unstable();
     features.dedup();
+    let (reason, message) = if isolated {
+        (
+            "Isolated",
+            "One namespace's data planes never delay another Gateway's configuration",
+        )
+    } else {
+        (
+            "TokensNotVerified",
+            "The controller cannot read the cluster's ServiceAccount issuer keys: forged tokens sent through one address can delay other Gateways' first poll",
+        )
+    };
     json!({
-        "conditions": [condition(
-            "Accepted",
-            accepted.ok,
-            &accepted.reason,
-            &accepted.message,
-            class.metadata.generation,
-        )],
+        "conditions": [
+            condition(
+                "Accepted",
+                accepted.ok,
+                &accepted.reason,
+                &accepted.message,
+                class.metadata.generation,
+            ),
+            condition(GATEWAYS_ISOLATED, isolated, reason, message, class.metadata.generation),
+        ],
         "supportedFeatures": features
             .iter()
             .map(|name| json!({ "name": name }))
@@ -1076,7 +1118,7 @@ mod tests {
             ..Default::default()
         };
         desired_gateway_status(
-            [
+            vec![
                 condition("Accepted", true, "Accepted", "ok", generation),
                 condition("Programmed", true, "Programmed", "ok", generation),
             ],
@@ -1179,6 +1221,33 @@ mod tests {
         class
     }
 
+    /// A condition of portail's own domain that this version no longer
+    /// writes makes the status due, so the apply drops it: a downgrade never
+    /// leaves a stale GatewaysIsolated behind. Another writer's type does
+    /// not.
+    #[test]
+    fn a_condition_portail_no_longer_writes_is_due() {
+        let desired =
+            json!({"conditions": [condition("Accepted", true, "Accepted", "ok", Some(1))]});
+        let with = |kind: &str| {
+            let mut observed = desired.clone();
+            observed["conditions"]
+                .as_array_mut()
+                .unwrap()
+                .push(condition(kind, true, "Isolated", "ok", Some(1)));
+            observed
+        };
+        assert!(conditions_current(&desired, &desired));
+        assert!(
+            !conditions_current(&with("portail.epheo.eu/GatewaysIsolated"), &desired),
+            "an own condition left behind"
+        );
+        assert!(
+            conditions_current(&with("example.com/Audited"), &desired),
+            "another writer's condition"
+        );
+    }
+
     /// Whether a class write is due: [`write_class_status`]'s test.
     fn class_status_current(observed: &Value, desired: &Value) -> bool {
         conditions_current(observed, desired) && feature_names(observed) == feature_names(desired)
@@ -1198,7 +1267,7 @@ mod tests {
     #[test]
     fn class_status_is_accepted_with_sorted_features() {
         let accepted = GatewayCondition::ok("Accepted", "ok");
-        let desired = desired_class_status(&class(3), &accepted);
+        let desired = desired_class_status(&class(3), &accepted, false);
         assert_eq!(desired["conditions"][0]["observedGeneration"], 3);
         assert_eq!(desired["conditions"][0]["status"], "True");
         let names = feature_names(&desired);
@@ -1216,7 +1285,7 @@ mod tests {
         let stored = stored_class_status(&desired);
         assert!(class_status_current(&stored, &desired));
         assert!(!class_status_current(&json!({}), &desired));
-        let bumped = desired_class_status(&class(4), &accepted);
+        let bumped = desired_class_status(&class(4), &accepted, false);
         assert!(!class_status_current(&stored, &bumped));
         let invalid = desired_class_status(
             &class(3),
@@ -1225,6 +1294,7 @@ mod tests {
                 reason: "InvalidParameters".into(),
                 message: "missing".into(),
             },
+            false,
         );
         assert!(!class_status_current(&stored, &invalid));
 

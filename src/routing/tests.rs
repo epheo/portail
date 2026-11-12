@@ -624,6 +624,7 @@ fn resolve_pt(rt: &RouteTable, sni: &str, port: u16) -> Option<std::net::SocketA
     let health = crate::proxy::health::HealthRegistry::new();
     rt.resolve_tls_passthrough(Some(sni), port, None, &selector, &health)
         .ok()
+        .map(|b| b.socket_addr)
 }
 
 #[test]
@@ -755,6 +756,7 @@ fn test_tls_passthrough_round_robins_backends() {
         seen.insert(
             rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .unwrap()
+                .socket_addr
                 .port(),
         );
     }
@@ -808,6 +810,7 @@ fn tls_passthrough_rotates_per_route_not_per_sni() {
     let pick = |sni| {
         rt.resolve_tls_passthrough(sni, 8443, None, &selector, &health)
             .unwrap()
+            .socket_addr
             .port()
     };
     let wildcard: Vec<_> = [
@@ -838,7 +841,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
         let addr = rt
             .resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
             .unwrap();
-        assert_eq!(addr.port(), 9002);
+        assert_eq!(addr.socket_addr.port(), 9002);
     }
 
     mark_unhealthy(&health, 9002);
@@ -847,6 +850,7 @@ fn test_tls_passthrough_skips_unhealthy_backend() {
         seen.insert(
             rt.resolve_tls_passthrough(Some("svc.example.com"), 8443, None, &selector, &health)
                 .expect("all-unhealthy must fail open")
+                .socket_addr
                 .port(),
         );
     }

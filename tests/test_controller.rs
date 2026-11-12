@@ -184,6 +184,19 @@ fn items(path: &str) -> Vec<Value> {
             "spec": {"gatewayClassName": "portail", "listeners": [
                 {"name": "http", "port": 8080, "protocol": "HTTP"}]},
         })]
+    } else if path.ends_with("/serviceaccounts") {
+        // As this install provisioned it: its label, and controlled by the
+        // Gateway. The label is install_label of the controllerName.
+        vec![json!({
+            "apiVersion": "v1", "kind": "ServiceAccount",
+            "metadata": {"name": "portail-gw", "namespace": "default", "uid": SA_UID,
+                         "resourceVersion": "1",
+                         "labels": {"portail.epheo.eu/controller-name":
+                                    "portail.epheo.eu-gateway-controller-af4a749a"},
+                         "ownerReferences": [{
+                             "apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+                             "name": "gw", "uid": "gw-uid", "controller": true}]},
+        })]
     } else {
         Vec::new()
     }
@@ -262,6 +275,9 @@ fn admin_status(path: &str) -> Option<u16> {
     extract_status(&http_request(admin, request.as_bytes()).ok()?)
 }
 
+/// The uid of the ServiceAccount the controller provisioned for `default/gw`.
+const SA_UID: &str = "sa-uid";
+
 /// A projected token's claims for Gateway `default/gw`'s data plane.
 fn token() -> String {
     let part = |v: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap());
@@ -274,7 +290,8 @@ fn token() -> String {
         "{}.{}.{}",
         part(json!({"alg": "RS256"})),
         part(
-            json!({"aud": [AUDIENCE], "sub": "system:serviceaccount:default:portail-gw", "exp": exp})
+            json!({"aud": [AUDIENCE], "sub": "system:serviceaccount:default:portail-gw", "exp": exp,
+                   "kubernetes.io": {"serviceaccount": {"name": "portail-gw", "uid": SA_UID}}})
         ),
         URL_SAFE_NO_PAD.encode(b"signature")
     )

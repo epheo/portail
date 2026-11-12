@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 use gateway_api::gateways::Gateway;
 
+use super::gateway_backends;
+use super::reconcile::{class_owner, ClassOwner};
 use super::validate::{resolve_gateway_certs, validate_gateway};
 use super::watch::StatusReports;
 use super::{ControllerCtx, ResourceCache};
 use crate::config::PortailConfig;
 use crate::kubernetes::addresses::resolve_network_cidrs;
-use crate::kubernetes::crds::RateLimitPolicy;
+use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
     reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
@@ -25,7 +27,7 @@ use crate::kubernetes::services::{
 };
 use crate::kubernetes::status;
 use crate::logging::error;
-use crate::sync::NetworkCidrs;
+use crate::sync::{GatewayKey, NetworkCidrs};
 
 /// One Gateway, translated.
 pub(crate) struct Plan {
@@ -212,10 +214,36 @@ fn observed_policies(
     out
 }
 
+/// This controller's Gateways with their listener ports: what a backendRef
+/// of kind Gateway may name.
+fn served_gateways(ctx: &ControllerCtx) -> HashMap<(String, String), Vec<u16>> {
+    let classes = ctx.cache.gateway_classes.state();
+    ctx.cache
+        .gateways
+        .state()
+        .iter()
+        .filter(|g| {
+            matches!(
+                class_owner(&classes, &g.spec.gateway_class_name, &ctx.controller_name),
+                ClassOwner::Ours
+            )
+        })
+        .filter_map(|g| {
+            let ports = g.spec.listeners.iter().map(|l| l.port as u16).collect();
+            Some(((g.namespace()?, g.metadata.name.clone()?), ports))
+        })
+        .collect()
+}
+
 /// Translate `gateway` from the reflector caches.
+/// `trusted`: the Gateways its parameters trust, named like its Gateway
+/// backends, so a move of where one is reachable wakes this Gateway too.
 pub(crate) async fn translate(
     ctx: &ControllerCtx,
     gateway: &Gateway,
+    external_name_backends: ExternalNameBackends,
+    trusted: &[GatewayKey],
+    egress: &[(String, String)],
 ) -> Result<Plan, Box<Rejected>> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
@@ -242,6 +270,7 @@ pub(crate) async fn translate(
         reference_grants: cloned(&ctx.cache.reference_grants),
         services: ctx.cache.services.state(),
         rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
+        gateways: served_gateways(ctx),
     };
 
     ctx.certs.retain_referenced(&ctx.cache.gateways.state());
@@ -261,6 +290,8 @@ pub(crate) async fn translate(
         &resolved_certs.valid,
         &services,
         &ctx.route_verdicts,
+        external_name_backends,
+        !egress.is_empty(),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -299,24 +330,37 @@ pub(crate) async fn translate(
     // A network dropped from spec.addresses forgets its CIDRs: a failed read
     // once it is named again must not bind on an answer for a spec the
     // Gateway no longer had.
-    ctx.networks.retain_named(&ctx.cache.gateways.state());
-    let networks = match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, &ctx.networks).await {
-        Ok(networks) => networks,
-        Err(e) => {
-            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
-            return Err(Box::new(Rejected {
-                statuses: Statuses {
-                    accepted,
-                    listeners,
-                    routes: Vec::new(),
-                    policies: Vec::new(),
-                    observed_routes: Vec::new(),
-                    observed_policies: Vec::new(),
-                },
-                error: e,
-            }));
-        }
-    };
+    ctx.networks.retain_named(
+        &ctx.cache.gateways.state(),
+        &ctx.cache.gateway_parameters.state(),
+    );
+    let networks =
+        match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, egress, &ctx.networks).await {
+            Ok(networks) => networks,
+            Err(e) => {
+                error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
+                return Err(Box::new(Rejected {
+                    statuses: Statuses {
+                        accepted,
+                        listeners,
+                        routes: Vec::new(),
+                        policies: Vec::new(),
+                        observed_routes: Vec::new(),
+                        observed_policies: Vec::new(),
+                    },
+                    error: e,
+                }));
+            }
+        };
+    gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
+    let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
+    let targets = std::mem::take(&mut result.gateway_targets)
+        .into_iter()
+        .map(|(namespace, name)| GatewayKey::new(namespace, name))
+        .chain(trusted.iter().cloned())
+        .filter(|named| *named != me)
+        .collect();
+    ctx.backends.record(me, targets);
     let statuses = Statuses {
         accepted,
         listeners,

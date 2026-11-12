@@ -48,11 +48,21 @@ pub struct InstanceReport {
     /// Network name to the pod's IP on it, for the snapshot's networks
     /// that matched a local interface.
     pub networks: BTreeMap<String, String>,
+    /// Every address on an interface of a network the Gateway only dials
+    /// out on: none of them binds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dial_out_ips: Vec<String>,
     /// DNS refresh swaps so far: a move means backend pods came or went,
     /// and named targetPorts may have moved with them.
     pub dns_epoch: u64,
     /// Sent on SIGTERM: the instance no longer counts as live.
     pub leaving: bool,
+    /// The uid of the Gateway whose snapshot this instance serves: a
+    /// Gateway recreated under the same name never resolves backends or
+    /// trust from another's instances. Empty from an older data plane,
+    /// whose addresses then resolve nothing.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub gateway_uid: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

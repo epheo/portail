@@ -7,7 +7,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{sha256_hex, GatewayRef, PROTOCOL};
-use crate::config::PortailConfig;
+use crate::config::{DialRules, PortailConfig};
+use crate::proxy::proxy_protocol::Cidr;
 
 /// One Gateway's data-plane config. `version` is a hash of the snapshot as
 /// sent: equal versions serve equal tables, so an unchanged translation is
@@ -31,10 +32,92 @@ pub struct Snapshot {
     #[serde(default)]
     pub backends: Backends,
     /// CIDRs of the NetworkAttachmentDefinitions the Gateway's Network
-    /// addresses name, read by the controller; the data plane matches its
-    /// own interfaces against them. A name without an entry is unresolved.
+    /// addresses name, and of those its parameters attach with listeners
+    /// false, read by the controller; the data plane matches its own
+    /// interfaces against them. A name without an entry is unresolved.
     #[serde(default)]
     pub networks: Vec<NetworkCidrs>,
+    /// The trusted sources each named Gateway gave, by its key and uid:
+    /// what a data plane keeps for it while it is pending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_from: Vec<TrustedFrom>,
+    /// The uid of the Gateway each resolved Gateway backend's endpoints
+    /// came from: a data plane keeps them only for that same Gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends_from: Vec<BackendFrom>,
+    /// What spec still allows but none of whose instances has reported
+    /// since this controller took the lead. A data plane keeps what it last
+    /// served for each, one hold at most. Only reports are waited for:
+    /// what spec dropped is absent here and drops at once. A data plane
+    /// that does not know this field keeps nothing, which fails closed.
+    #[serde(default, skip_serializing_if = "Pending::is_empty")]
+    pub pending: Pending,
+    /// The Gateway's parameters let Service backends resolve into its
+    /// attached networks. Absent: refused, so a data plane newer than its
+    /// controller refuses too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_endpoints_on_attached_networks: bool,
+    /// Backend names cluster DNS answers with a VIP, sorted. A data plane
+    /// dials every other name's answers as is; with this absent (an older
+    /// controller) every name counts so, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_ip_backends: Vec<String>,
+}
+
+/// The host CIDRs trusted for one named Gateway.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedFrom {
+    /// `namespace/name`.
+    pub gateway: String,
+    /// A Gateway recreated under the same name is another: what was
+    /// trusted for the old one is never kept for the new.
+    pub uid: String,
+    pub sources: Vec<String>,
+}
+
+/// The Gateway a Gateway backend's endpoints came from.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendFrom {
+    pub host: String,
+    pub port: u16,
+    pub uid: String,
+}
+
+/// Gateway backends and trusted Gateways waiting for a first report.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pending {
+    /// Gateway backends, by the name and port their endpoints ride.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<PendingBackend>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted: Vec<PendingTrusted>,
+}
+
+/// A trusted Gateway waiting for a first report.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingTrusted {
+    /// `namespace/name`.
+    pub gateway: String,
+    pub uid: String,
+}
+
+impl Pending {
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty() && self.trusted.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBackend {
+    pub host: String,
+    pub port: u16,
+    /// The target Gateway's.
+    pub uid: String,
 }
 
 /// A certificateRef's resolved Secret. PEM is ASCII; [`Snapshot::from_config`]
@@ -106,6 +189,18 @@ pub struct AppProtocol {
 pub struct NetworkCidrs {
     pub name: String,
     pub cidrs: Vec<String>,
+    /// false: a network the Gateway only dials out on. Its data planes
+    /// report their IP there, and never bind a listener on it.
+    #[serde(default = "listens", skip_serializing_if = "is_listening")]
+    pub listeners: bool,
+}
+
+fn listens() -> bool {
+    true
+}
+
+fn is_listening(listeners: &bool) -> bool {
+    *listeners
 }
 
 /// Hex digits of SHA-256 a version keeps: 64 bits make a collision between
@@ -180,6 +275,9 @@ impl Snapshot {
         backends.external_names.sort_unstable();
         backends.app_protocols.sort_unstable();
         networks.sort_unstable();
+        let cluster_ip_backends = std::mem::take(&mut config.cluster_ip_backends)
+            .into_iter()
+            .collect();
 
         Snapshot {
             protocol: PROTOCOL,
@@ -189,6 +287,11 @@ impl Snapshot {
             certificates,
             backends,
             networks,
+            trusted_from: Vec::new(),
+            backends_from: Vec::new(),
+            pending: Pending::default(),
+            service_endpoints_on_attached_networks: false,
+            cluster_ip_backends,
         }
         .seal()
     }
@@ -249,7 +352,42 @@ impl Snapshot {
             .iter()
             .map(|a| ((a.host.clone(), a.port), a.app_protocol.clone()))
             .collect();
+        config.cluster_ip_backends = self.cluster_ip_backends.iter().cloned().collect();
+        config.dial_rules = Some(self.dial_rules());
         config
+    }
+
+    /// What a Service backend may resolve to on this Gateway. The pod's own
+    /// addresses are refused always; its attached networks unless the
+    /// parameters allow them.
+    fn dial_rules(&self) -> DialRules {
+        let cluster_ip = self.cluster_ip_backends.iter().cloned().collect();
+        if self.service_endpoints_on_attached_networks {
+            return DialRules {
+                cluster_ip,
+                ..DialRules::default()
+            };
+        }
+        let cidrs: Vec<Option<Cidr>> = self
+            .networks
+            .iter()
+            .flat_map(|n| &n.cidrs)
+            .map(|c| Cidr::covering(c))
+            .collect();
+        let named_unread = self
+            .config
+            .gateway
+            .addresses
+            .iter()
+            .filter(|a| a.parse::<std::net::IpAddr>().is_err())
+            .any(|name| !self.networks.iter().any(|n| &n.name == name));
+        DialRules {
+            unresolved: named_unread
+                || self.networks.iter().any(|n| n.cidrs.is_empty())
+                || cidrs.iter().any(Option::is_none),
+            refused: cidrs.into_iter().flatten().collect(),
+            cluster_ip,
+        }
     }
 }
 
@@ -403,6 +541,7 @@ mod tests {
                 .map(|n| NetworkCidrs {
                     name: n.to_string(),
                     cidrs: vec!["10.10.1.0/24".into()],
+                    listeners: true,
                 })
                 .collect()
         };
@@ -429,7 +568,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_version() {
         let base = Snapshot::from_config(gateway(), translated(), vec![]);
-        let changes: [(&str, fn(&mut Snapshot)); 12] = [
+        let changes: [(&str, fn(&mut Snapshot)); 18] = [
             ("protocol", |s| s.protocol += 1),
             ("gateway.namespace", |s| s.gateway.namespace.push('x')),
             ("gateway.name", |s| s.gateway.name.push('x')),
@@ -450,9 +589,41 @@ mod tests {
                 s.networks.push(NetworkCidrs {
                     name: "udn-a".into(),
                     cidrs: vec!["10.10.1.0/24".into()],
+                    listeners: true,
                 })
             }),
             ("performance", |s| s.config.performance.http2 = true),
+            ("proxyProtocol", |s| {
+                s.config.gateway.proxy_protocol = Some(crate::config::ProxyProtocolConfig {
+                    trusted_sources: vec!["10.0.0.0/8".into()],
+                })
+            }),
+            ("trustedFrom", |s| {
+                s.trusted_from.push(TrustedFrom {
+                    gateway: "edge/public".into(),
+                    uid: "u".into(),
+                    sources: vec!["10.250.0.9/32".into()],
+                })
+            }),
+            ("backendsFrom", |s| {
+                s.backends_from.push(BackendFrom {
+                    host: "edge.public.gateway".into(),
+                    port: 80,
+                    uid: "u".into(),
+                })
+            }),
+            ("pending", |s| {
+                s.pending.trusted.push(PendingTrusted {
+                    gateway: "edge/public".into(),
+                    uid: "u".into(),
+                })
+            }),
+            ("serviceEndpointsOnAttachedNetworks", |s| {
+                s.service_endpoints_on_attached_networks = true
+            }),
+            ("clusterIpBackends", |s| {
+                s.cluster_ip_backends.push("web.p.svc".into())
+            }),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -489,5 +660,80 @@ mod tests {
         assert!(serde_json::from_value::<Snapshot>(json.clone()).is_ok());
         json["config"]["gateway"]["shards"] = serde_json::json!(2);
         assert!(serde_json::from_value::<Snapshot>(json).is_err());
+    }
+
+    /// Every network a snapshot names refuses Service addresses, a subnet
+    /// written with its gateway address included. One with no CIDRs, a
+    /// Network address with no entry, or an unreadable CIDR leaves direct
+    /// addresses unknown. Allowed refuses only the pod's own addresses.
+    #[test]
+    fn a_snapshot_refuses_service_addresses_on_its_networks() {
+        let net = |name: &str, cidrs: &[&str], listeners: bool| NetworkCidrs {
+            name: name.into(),
+            cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+            listeners,
+        };
+        let mut config = translated();
+        config.gateway.addresses = vec!["transit".into(), "203.0.113.7".into()];
+        let snapshot = Snapshot::from_config(
+            gateway(),
+            config.clone(),
+            vec![
+                net("transit", &["10.250.0.1/16"], true),
+                net("egress", &["fd00::/64"], false),
+            ],
+        );
+        let rules = snapshot.to_config().dial_rules.unwrap();
+        assert!(!rules.unresolved);
+        assert!(rules
+            .refuses("10.250.9.9".parse().unwrap(), false)
+            .is_some());
+        assert!(rules.refuses("fd00::9".parse().unwrap(), false).is_some());
+        assert_eq!(rules.refuses("10.128.0.5".parse().unwrap(), true), None);
+
+        let unresolved = |networks: Vec<NetworkCidrs>| {
+            Snapshot::from_config(gateway(), config.clone(), networks)
+                .to_config()
+                .dial_rules
+                .unwrap()
+                .unresolved
+        };
+        assert!(unresolved(vec![]), "a Network address with no entry");
+        assert!(unresolved(vec![
+            net("transit", &["10.250.0.0/16"], true),
+            net("egress", &[], false)
+        ]));
+        assert!(unresolved(vec![net("transit", &["not-a-cidr"], true)]));
+
+        let mut allowed = snapshot.clone();
+        allowed.service_endpoints_on_attached_networks = true;
+        let rules = allowed.to_config().dial_rules.unwrap();
+        assert_eq!(rules, crate::config::DialRules::default());
+        assert!(rules.refuses("127.0.0.1".parse().unwrap(), true).is_some());
+
+        let file: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": []},
+        }))
+        .unwrap();
+        assert_eq!(file.dial_rules, None, "a standalone file sets none");
+    }
+
+    /// The names marked as a ClusterIP's ride the envelope. An older
+    /// controller's snapshot marks none: every name is dialed directly.
+    #[test]
+    fn cluster_ip_marks_ride_the_envelope_and_fail_closed_when_absent() {
+        let mut config = translated();
+        config.cluster_ip_backends = ["web.p.svc".to_string()].into();
+        let snapshot = Snapshot::from_config(gateway(), config, vec![]);
+        assert_eq!(snapshot.cluster_ip_backends, ["web.p.svc"]);
+        let received = over_the_wire(&snapshot);
+        let rules = received.to_config().dial_rules.unwrap();
+        assert!(!rules.direct("web.p.svc"));
+        assert!(rules.direct("head.p.svc"));
+
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json.as_object_mut().unwrap().remove("clusterIpBackends");
+        let older: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(older.to_config().dial_rules.unwrap().direct("web.p.svc"));
     }
 }

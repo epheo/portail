@@ -116,6 +116,9 @@ A name longer than a label allows is cut and suffixed with a hash of the full na
 - A listener that gains a local address leaves all interfaces for it in the same apply, and goes back when it loses it.
 - A listener whose published port changes while its bound port stays reopens that socket in the same apply, to route and terminate as the new port.
 - A Network entry with no IP on the pod binds nothing, never all interfaces: `Programmed` is `False` with reason `AddressNotUsable`.
+- No Service: an `IPAddress` in `spec.addresses` that no data plane holds is named in `portail.epheo.eu/AddressesAssigned`, `False`, reason `AddressNotAssigned`, with why for each address. `Programmed` stays `True` while another address of the Gateway is held, so a missing rented IP never takes the other listeners down.
+- None of the spec's addresses held: `Programmed` is `False`, reason `AddressNotAssigned`.
+- The condition goes once every address is held. With no data plane at the served version, what was written stays.
 
 ## GatewayParameters
 
@@ -139,7 +142,14 @@ spec:
     namespace: default
     ips: ["172.16.87.21/24"]
     gateway: ["172.16.87.1"]
+    listeners: true          # false: dial out only, see Networks to dial out on
   controllerTransport: Direct  # Managed; Direct | APIServerProxy, see Primary UDN
+  externalNameBackends: Refused  # Refused | Allowed
+  serviceEndpointsOnAttachedNetworks: Refused  # Refused | Allowed
+  proxyProtocol:             # see PROXY protocol
+    trustedSources:
+    - cidr: 10.250.0.0/16
+    - gateway: {namespace: portail-edge, name: edge}
 ```
 
 Referenced from:
@@ -147,22 +157,56 @@ Referenced from:
 - a GatewayClass, `spec.parametersRef` with its `namespace`: defaults for the class;
 - a Gateway, `spec.infrastructure.parametersRef`, in the Gateway's namespace: overrides for that Gateway.
 
-Built-in defaults, then the class's, then the Gateway's: a set field wins field by field; `networks` and `resources` replace whole.
+Built-in defaults, then the class's, then the Gateway's: a set field wins field by field; `networks`, `resources` and `proxyProtocol` replace whole.
 
 Defaults:
 
 - `provisioning: Managed`, `replicas: 1`.
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
-- `service.type`: `None` when the Gateway has a Network address or `networks` is set, else `LoadBalancer`.
+- `service.type`: `None` when the Gateway has a Network address or `networks` is set, a network it only dials out on included, else `LoadBalancer`.
 - `controllerTransport: Direct`.
+- `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
+- `serviceEndpointsOnAttachedNetworks: Refused`, Managed and Unmanaged alike: see [Service backends on attached networks](#service-backends-on-attached-networks).
+- `proxyProtocol`: no trusted source; no connection is read for a header.
 
 Rules:
 
 - `networks[].ips` requires `replicas: 1`: one static IP cannot sit on two pods.
+- A Network address naming a network `networks` attaches with `listeners: false` is invalid: a Network address binds listeners.
+- An `IPAddress` inside such a network is invalid once its CIDRs are read: it would never bind.
 - A missing or invalid GatewayParameters makes the Gateway `Accepted=False`, reason `InvalidParameters`; on a class, the class and its Gateways.
 - Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
 
 Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Network address not already listed.
+
+### Service backends on attached networks
+
+Whoever can write a Service's Endpoints picks the addresses its headless name answers with, and whoever writes an ExternalName Service picks its target's.
+The data plane dials those addresses from its own pod: a route to such a Service could reach a network the Gateway attaches for the platform, transit and the other Gateways on it, or the pod itself.
+
+The controller marks, in each snapshot, the backend names cluster DNS answers with a VIP: Services with a real clusterIP, not headless, not ExternalName, among those this Gateway routes to.
+Every other name is dialed directly: a headless Service, an ExternalName Service (a portless one has no override, so its name answers its target's addresses), an override target, an unknown name.
+
+With `serviceEndpointsOnAttachedNetworks: Refused`, the default:
+
+- An address a Service backend or a mirror resolves to inside an attached network is never dialed: the CIDRs of the Gateway's Network addresses and of the networks it dials out on.
+- An attached network with no CIDRs read (its NetworkAttachmentDefinition missing or naming no subnet, or a Network address with none): no address dialed directly can be told outside it, so every one is refused. A marked ClusterIP still serves: OVN cannot route its VIP onto a secondary network.
+- A `networks[]` attachment the Gateway listens on without naming it as a Network address is not read, so not covered: name it as a Network address, or fence it.
+- `Allowed` dials them, for a platform serving hosts on a network it attaches.
+
+Whatever this field says, an address that is the pod's own is refused: loopback (127.0.0.1 would reach the data plane's admin port), link-local (169.254.169.254, a cloud metadata endpoint), unspecified, broadcast or multicast.
+
+Both checks run on every address a Service backend or a mirror resolves to, a marked ClusterIP's included: a real VIP is never either, and a Service turned ExternalName since its last snapshot is caught when the DNS refresh resolves it again.
+IPv4-mapped addresses and the NAT64 prefix `64:ff9b::/96` count as the IPv4 address they stand for.
+
+- A backendRef left with no address has its share answer 500, an L4 connection closed, as for an invalid ref; a mirror left with none is dropped.
+- Gateway backends are never refused: they are dialed on the network both share.
+- All this holds for a configuration from the controller only: a standalone file's backends are its owner's, loopback included.
+- A backend named by an IP address goes unchecked: only tests and hand-made snapshots name one. The controller refuses a backendRef whose name is an IP address (`ResolvedRefs=False`, reason `InvalidKind`), and its converted names never are one.
+- An older controller marks no name: every name then counts as dialed directly.
+
+Only the data plane sees the DNS answers, so route status says nothing of a refused address.
+Each refused address counts in `portail_backend_addresses_refused_total`, counted at each route table build (apply and DNS refresh), and a debug line names the Service.
 
 ### Replicas
 
@@ -174,6 +218,218 @@ Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Ne
 | Controller down, a pod restarts | dark until the controller returns | the other replica serves |
 
 Two replicas spread across nodes when there are several.
+
+### Networks to dial out on
+
+`networks[].listeners: false` attaches a network the data plane only dials out on, Managed or not (Unmanaged pods attach it themselves):
+
+- No listener binds on its interface: the one holding an IP inside its CIDRs. Every address on that interface is left out, any family, inside the CIDRs or not.
+- Its data planes still report their IP there: Gateway backends are reached on it, and Gateways trusting this one trust that IP.
+- Where such a Gateway would bind every interface (no local address, or only a LoadBalancer VIP), it binds each local IP off these interfaces instead.
+- That list is read at each apply: an address the pod gains later binds at the next apply. Every other Gateway keeps every interface, which follows addresses as they come.
+- Loopback is never in that list: such a Gateway no longer answers on 127.0.0.1.
+- Its NetworkAttachmentDefinition gone, or naming no subnet: its interface cannot be told apart, so the Gateway binds only the addresses it names, as for a Network address not resolved; with none, nothing binds and `Programmed` is `False`, reason `AddressNotUsable`.
+- Meanwhile a named address binds only on an interface known to listen: the one holding a resolved listening Network's IP, or the pod's own IP. Every other interface may be the unresolved network's, and its addresses are reported among the dial-out ones.
+- The pod's own IP is `POD_IP`, which Managed pods get from `status.podIP` through the downward API: the kubelet's word, not the pod's. An Unmanaged pod without `POD_IP` knows only its listening Networks' interfaces.
+- A `listeners: false` network must never be the pod's primary network: `POD_IP` would sit on it, its interface would count as listening, and named addresses would bind there.
+- A named address held back says why in `portail.epheo.eu/AddressesAssigned`, or in `Programmed` when nothing binds.
+- A dial-out interface not yet holding its IP is not recognized as dial-out: its other addresses bind until the next apply. CNI configures interfaces before the container starts, so a running data plane does not meet one.
+- It does not change the Service default: a Gateway with `networks` gets `None`. An edge behind a LoadBalancer sets `service.type: LoadBalancer`.
+- Only platform namespaces attach such a network to Gateways; the edge is the case it is for ([Edge mode](#edge-mode)).
+
+### PROXY protocol
+
+`proxyProtocol.trustedSources`: up to 16 sources whose connections open with a PROXY protocol v2 header, Managed and Unmanaged alike.
+Each is exactly one of:
+
+- `cidr`: a network address, as written.
+- `gateway: {namespace, name}`: a Gateway of this controller. Trusted, each as a host: the address each of its live data planes reports on a network both Gateways name, inside that network's CIDRs on both sides, a listener bound there or not. This Gateway names it as a `portail.epheo.eu/Network` address; the named one, as a Network address or a network it dials out on. Never another of its addresses. Nothing while none reports, or when this Gateway has no Network address.
+- At most 64 trusted addresses per Network, one per instance, the first instances by id; the rest are counted in `portail_gateway_addresses_truncated_total`.
+- An address a live instance of another Gateway reports is never trusted.
+- This Gateway is reconciled when where the named one is reachable moves.
+
+
+- The client the header names stands for the connection: `X-Forwarded-For`, access logs, rate limits.
+- A trusted source that sends no header, a malformed one, or one for anything but a TCP client is closed; LOCAL keeps its own address.
+- Other sources are never read for one.
+- Trust only what sends a header on every connection, and nothing a tenant can run: whoever sends from a trusted address names any client it likes.
+- Details: [configuration](configuration.md#proxy-protocol).
+
+### Gateway backends
+
+A route's backendRef may name another Gateway of this controller, reached on a network both share:
+
+```yaml
+backendRefs:
+- group: gateway.networking.k8s.io
+  kind: Gateway
+  name: publish
+  namespace: p-publish   # a ReferenceGrant there must allow it
+  port: 443              # one of its listener ports
+```
+
+- HTTPRoute, TLSRoute and TCPRoute; a UDPRoute or a request mirror naming a Gateway is `ResolvedRefs=False`, reason `InvalidKind`.
+- Another namespace: a ReferenceGrant in the target's, `to: [{group: gateway.networking.k8s.io, kind: Gateway}]`.
+- The target names the network as a `portail.epheo.eu/Network` address; the referencing Gateway, as a Network address or a network it dials out on ([Networks to dial out on](#networks-to-dial-out-on)), of the same name.
+- Its endpoints: each live instance of the target, at its IP on that Network, inside the Network's CIDRs, where it bound that listener. An interface on another network never counts, whatever its address.
+- At most 64 endpoints per Network and port, one per instance and listener, the first instances by id: a report listing more never crowds out the others. What a cap leaves out is counted in `portail_gateway_addresses_truncated_total`.
+- A pass that fails, such as on invalid parameters, keeps the configuration last served, but drops the endpoints of a Gateway deleted since, and the trust in an address a named Gateway holds no more: deleted, or its instance left or lapsed.
+- A Gateway whose parameters fail is still reconciled when a Gateway its last trust was for moves.
+- The referencing Gateway is reconciled when where the target is reachable moves (an address, its listeners, the target gone), never on its other changes.
+- No live instance there yet: its share answers 503, or the connection closes, until one reports. An invalid ref's share answers 500.
+- Every connection to it opens with a PROXY protocol v2 header naming the client.
+- HTTP opens one connection per request to it: a header names one client, so none is pooled or reused.
+- The shared network must have subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC, so no pod sends from a Gateway's address.
+- Never put the shared network's CIDR in `trustedSources`: every Gateway on it could then name any client. The target names the referencing Gateway instead: [Edge mode](#edge-mode).
+- A target that does not trust the sender reads the header as request bytes and closes the connection.
+
+### PROXY protocol to a Service
+
+A Service port opts in to a PROXY protocol v2 header naming the client, for a server that reads one, such as one terminating its own TLS behind a passthrough listener:
+
+```yaml
+ports:
+- name: https
+  port: 8443
+  appProtocol: portail.epheo.eu/proxy-v2
+```
+
+- Every portail connection to that port opens with the header: TCPRoute, TLSRoute and HTTPRoute alike. A UDPRoute sends none.
+- HTTP opens one connection per request to it, as to a Gateway backend: none is pooled or reused.
+- The port has one appProtocol, so not `https` too: portail never re-encrypts to it. A server terminating TLS takes a TLSRoute.
+- A request mirror to it sends no header: its copies fail.
+- Its server must expect the header on every connection from portail, or each closes.
+- The server trusts the header by the connection's source address. A CIDR on the pod network covers every pod there, and any of them could name any client.
+- So admit only the sending Gateway's pods to that port, both selectors in one peer:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: from-edge, namespace: idm}
+spec:
+  podSelector: {matchLabels: {app: idm}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: portail-edge}}
+      podSelector: {matchLabels: {gateway.networking.k8s.io/gateway-name: edge}}
+    ports: [{port: 8443}]
+```
+
+### Edge mode
+
+One public address in front of many Gateways: an edge Gateway takes every connection and hands each to the Gateway serving its hostname, over a transit network only platform pods join.
+
+```yaml
+# The edge, in a platform namespace: transit only to dial out on.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata: {name: edge, namespace: portail-edge}
+spec:
+  service: {type: LoadBalancer}   # networks default it to None
+  networks:
+  - {name: transit, listeners: false}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: edge, namespace: portail-edge}
+spec:
+  gatewayClassName: portail
+  infrastructure:
+    parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: edge}
+  listeners:
+  - {name: tls, protocol: TLS, port: 443, tls: {mode: Passthrough}}
+  - {name: http, protocol: HTTP, port: 80}
+---
+# Each project Gateway, listening on transit, trusting the edge.
+apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata: {name: publish, namespace: p-publish}
+spec:
+  proxyProtocol:
+    trustedSources:
+    - gateway: {namespace: portail-edge, name: edge}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: publish, namespace: p-publish}
+spec:
+  gatewayClassName: portail
+  infrastructure:
+    parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: publish}
+  addresses:
+  - {type: portail.epheo.eu/Network, value: transit}
+  listeners:
+  - {name: https, protocol: HTTPS, port: 443, hostname: "*.p.apps.example.com", tls: {certificateRefs: [{name: p-tls}]}}
+  - {name: http, protocol: HTTP, port: 80, hostname: "*.p.apps.example.com"}
+---
+# The edge's routes name the project Gateway; a grant in its namespace allows it.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata: {name: p, namespace: portail-edge}
+spec:
+  parentRefs: [{name: edge, sectionName: tls}]
+  hostnames: ["*.p.apps.example.com"]
+  rules:
+  - backendRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: publish, namespace: p-publish, port: 443}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: p, namespace: portail-edge}
+spec:
+  parentRefs: [{name: edge, sectionName: http}]
+  hostnames: ["*.p.apps.example.com"]
+  rules:
+  - backendRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: publish, namespace: p-publish, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: edge, namespace: p-publish}
+spec:
+  from:
+  - {group: gateway.networking.k8s.io, kind: TLSRoute, namespace: portail-edge}
+  - {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: portail-edge}
+  to:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: publish}
+```
+
+- HTTPS passes through the edge by SNI and terminates at the project Gateway, with its own certificate; HTTP goes by Host.
+- The project Gateway sees each client, from the header the edge sends, in `X-Forwarded-For`, access logs and rate limits.
+- The edge's public side: a LoadBalancer Service, set explicitly; or an `IPAddress` local to the pod (such as on a localnet network) with `service.type: None`.
+- Its listeners bind every local IP but its transit one: nothing listens on transit.
+- Project Gateways keep transit as a Network address: they listen there.
+- Behind a LoadBalancer, keeping the client's address up to the edge needs `externalTrafficPolicy: Local` on its Service, which GatewayParameters cannot set yet.
+
+Requirements:
+
+- The transit network has subnets (IPAM on): OVN-Kubernetes then pins each pod's IP as well as its MAC.
+- Only platform namespaces attach it: the edge's and the project Gateways'. Nothing a tenant runs.
+- Tenants cannot create or replace NetworkAttachmentDefinitions. A shared network is matched by name: each Gateway reads the NetworkAttachmentDefinition of that name in its own namespace.
+- A MultiNetworkPolicy on transit admits ingress to the project Gateways only from the edge's pods. Denying transit ingress to the edge too is defense in depth: nothing listens there.
+- Beside it, `serviceEndpointsOnAttachedNetworks: Refused` keeps a tenant's Service from pointing a project Gateway at transit: defense in depth, as the MultiNetworkPolicy already fences the targets.
+- `trustedSources` names the edge Gateway, never the transit CIDR.
+
+The lapse window:
+
+- A project Gateway trusts the addresses the edge's live instances report.
+- A data plane reports leaving on SIGTERM: it stops being trusted at once, and every Gateway trusting it is reconciled.
+- An instance that stops without that report stays trusted until it lapses, two holds (60s) after its last report.
+- Within that window transit IPAM may hand its address to another transit pod. Only platform pods attach to transit, so that pod is a project Gateway's data plane, trusted as the edge for the window: it could name any client.
+- That is why transit stays platform-only.
+- OVN-Kubernetes hands an address on only once the pod holding it is gone, so the window needs a force delete (grace 0) or a leave report that never reached the controller.
+- Each time a truster is reconciled, an address another Gateway's live instance reports is left out, whatever the edge reported last.
+- The new holder's own report does not reconcile the truster: it stays trusted until the truster's next pass. The MultiNetworkPolicy admitting only the edge's pods to a project Gateway holds meanwhile.
+
+Controller restarts and failovers:
+
+- A new leader starts with no snapshot and no report: it has not heard from any data plane yet.
+- For one hold after it takes the lead, a Gateway backend or trusted Gateway that spec still allows but that the controller has not heard from is marked pending, not left out.
+- A data plane keeps what it last served for a pending item, for one hold from when it first saw it pending, then drops it. Further pending snapshots, reconnects and leaders never extend that.
+- It keeps it only for the same Gateway: a Gateway deleted and recreated under the same name in the meantime has another uid, and gets nothing of the old one's.
+- It keeps it only while fresh: sent, or confirmed unchanged, by a controller within two holds. Applying it again on its own (a rebind) does not count. A data plane cut off longer keeps nothing.
+- What spec dropped is never pending: a removed `trustedSources` entry, a deleted backendRef or target Gateway, a revoked ReferenceGrant apply at once.
+- After the window nothing is pending: an unheard Gateway backend answers 503, an unheard Gateway is trusted nowhere.
+- A data plane that restarts keeps nothing: it fails closed until its Gateway's named Gateways report.
 
 ## Primary UDN
 
@@ -239,8 +495,11 @@ Trust:
 
 Scale:
 
-- On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod. The controller caps open connections per address with `--sync-peer-connections` (default 32; a data plane holds one or two): set it to at least twice the Primary UDN data planes per apiserver node.
-- Reviews of new tokens are shared per address too, two at once and five a second: a poll over that share gets a 503 and retries, so after a controller restart such a fleet reconnects over a few seconds.
+- On OVN-Kubernetes every proxied poll reaches the controller from an apiserver node's management address (`ovn-k8s-mp0`), not from the pod.
+- A held poll counts against its Gateway (`--sync-gateway-polls`, default 8), not that address: one namespace's data planes cannot crowd out another's.
+- Held polls still take the controller's 1024 connections: 128 Gateways at their cap fill it. Whoever creates Gateways bounds that.
+- A token is checked against the cluster's issuer keys before any review, and reviewed from its ServiceAccount's budget, not that address's: a forged one costs no review, and one namespace's flood never delays another Gateway's first poll.
+- Without the keys, reviews of new tokens are shared per address, two at once and five a second: a poll over that share gets a 503 and retries.
 - Each data plane holds one request open on the apiserver, answered within the 30s hold and sent again.
 - The apiserver counts proxy requests as long-running: no request timeout cuts the hold.
 - Fine for tens to low hundreds of Gateways; past that, give the pods a route to the controller Service and use Direct.
@@ -283,8 +542,18 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 
 ## Security
 
-- Data planes authenticate with projected ServiceAccount tokens of the controller audience; the controller checks them with a TokenReview.
+- Data planes authenticate with projected ServiceAccount tokens of the controller audience.
+- The controller verifies each token against the cluster's ServiceAccount issuer keys (`/.well-known/openid-configuration`, `/openid/v1/jwks`): signature, issuer, audience, expiry and pod binding. A forged one is refused before any TokenReview.
+- A TokenReview then says whether the token's pod still runs. It is budgeted per ServiceAccount, one per Gateway; while that budget or the shared pool is busy, the signature serves a Managed Gateway's token until its next poll, so no namespace delays another's configuration.
+- An unknown key id reads the keys again at most every 30s: a rotation is seen, a forged id costs one read per period.
+- Without the keys (discovery off, or no RBAC on its URLs) tokens go to TokenReview unverified, budgeted per address, and each GatewayClass says so.
+- Each GatewayClass carries `portail.epheo.eu/GatewaysIsolated`: `True` while one namespace's data planes cannot delay another Gateway's configuration (held polls capped per Gateway, tokens verified locally), `False` with why otherwise.
 - A Gateway's configuration goes only to its own ServiceAccount, `portail-<gateway>` in its namespace: the trust boundary is the namespace.
+- Its own by uid, not only by name: a Gateway deleted and recreated under its name gets a new ServiceAccount, and the old one's pods never receive the new one's configuration, TLS keys included.
+- The cache of ServiceAccounts the controller provisioned decides first, whatever the parameters say: one labeled this install's and controlled by the Gateway is compared by uid on every request, before any review and over a cached verdict. One still controlled by a deleted Gateway of that name, or none for a Managed Gateway: refused, `portail_sync_auth_rejected_total{stage="serviceaccount"}`.
+- Parameters that fail with none labeled are refused too: whether the last valid ones said Unmanaged is not kept.
+- Unmanaged, with none labeled: the ServiceAccount is its owner's, which the controller does not watch. Its tokens are served on a TokenReview only: a busy pool answers 503 and a failed review 503, where a Managed one is served on its signature or a stale verdict. A deleted ServiceAccount's token can still serve on a verdict taken before, for one hold at most.
+- Backends and trust resolve only from instances serving the current Gateway's configuration: a Gateway recreated under its name forgets what the previous one's instances reported.
 - The data-plane pods mount no API token, and the API server refuses the controller-audience one.
 - The controller serves TLS from a CA it generates once, kept in Secret `portail-controller-ca` and published in ConfigMap `portail-controller-ca` (key `ca.crt`).
 - A data plane dialing the controller speaks TLS 1.3 only; the sync endpoint takes TLS 1.2 too, which an apiserver on an older Go FIPS stack proxies polls with.
@@ -292,6 +561,9 @@ Controller failover: data planes reconnect to the new leader within a retry; an 
 - An answer that fails, or a body over 64 MiB, changes nothing served: the data plane counts the controller as disconnected, backs off, and its reports carry why as an apply error until the controller answers again.
 - CA rotation: delete the Secret, restart the controller; every Managed data plane rolls.
 - RBAC cannot narrow Secret reads to the TLS Secrets Gateways reference: the controller reads Secrets cluster-wide, and nothing else does.
+- ExternalName backends are refused unless the Gateway's GatewayParameters set `externalNameBackends: Allowed`: whoever writes the Service picks the name the Gateway dials, another namespace's Service or the API server included, from wherever the Gateway's pods sit (CVE-2021-25740). The Gateway API asks implementations not to support them.
+- A Service backend's address inside a network the Gateway attaches is refused unless its GatewayParameters set `serviceEndpointsOnAttachedNetworks: Allowed`, and an address that is the pod's own (loopback, link-local, unspecified, broadcast, multicast) is refused always: whoever writes Endpoints or an ExternalName picks the addresses a name answers with ([Service backends on attached networks](#service-backends-on-attached-networks)).
+- A Gateway's ServiceAccount can be used by any pod its namespace's admin starts, each with a valid token. Its data planes hold at most `--sync-gateway-polls` polls at once, uncounted against their address, so such pods never take other Gateways' connections.
 
 ## Container Image
 

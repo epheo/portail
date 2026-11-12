@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use super::compile::{CompiledFilter, CompiledRule};
 use super::types::*;
-use crate::routing::{Backend, RouteTable};
+use crate::routing::{Backend, BackendAction, RouteTable};
 
 impl PortailConfig {
     /// Load configuration from file with auto-format detection
@@ -95,10 +95,21 @@ struct Resolver<'a, 'l> {
     lookup: &'a mut Lookup<'l>,
     seen: HashMap<(String, u16), Option<Vec<SocketAddr>>>,
     endpoint_overrides: &'a HashMap<(String, u16), Vec<(String, u16)>>,
+    app_protocols: &'a HashMap<(String, u16), String>,
     headless_target_ports: &'a HashMap<(String, u16), u16>,
+    dial_rules: Option<&'a super::DialRules>,
 }
 
 impl Resolver<'_, '_> {
+    /// A ref's own appProtocol (a file config), else its Service port's.
+    fn app_protocol<'s>(&'s self, br: &'s BackendRef) -> Option<&'s str> {
+        br.app_protocol.as_deref().or_else(|| {
+            self.app_protocols
+                .get(&(br.name.clone(), br.port))
+                .map(String::as_str)
+        })
+    }
+
     /// `None`: the name did not resolve and the policy is lenient. Warns on
     /// the first lookup only.
     fn addrs(&mut self, name: &str, port: u16, what: &str) -> Result<Option<&[SocketAddr]>> {
@@ -137,45 +148,104 @@ impl Resolver<'_, '_> {
     /// by (a TLS backend's SNI). Every route kind and mirror reaches a
     /// Service through here, so all heed what DNS cannot say: an ExternalName
     /// Service is its external name, and a headless one's pods listen on its
-    /// targetPort, as DNS returns their IPs but no port.
+    /// targetPort, as DNS returns their IPs but no port. The DNS refresh
+    /// builds through here too, so a name never re-resolves past the dial
+    /// rules. Returns how many addresses those rules refused.
     fn endpoints(
         &mut self,
         name: &str,
         port: u16,
         what: &str,
         mut each: impl FnMut(SocketAddr, &str),
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let key = (name.to_string(), port);
         let overrides = self.endpoint_overrides;
+        // A backend named by an IP address goes unchecked: the controller
+        // never sends one (reconciler::literal_backend_name, tested by
+        // a_literal_backend_name_is_invalid), only tests and hand-made
+        // snapshots do. An override's targets are checked, IP literal or not.
+        let rules = self
+            .dial_rules
+            .filter(|_| name.parse::<std::net::IpAddr>().is_err());
+        let mut refused = 0;
+        let mut admit = |addr: SocketAddr, direct: bool| match rules
+            .and_then(|r| r.refuses(addr.ip(), direct))
+        {
+            None => true,
+            Some(_why) => {
+                refused += 1;
+                tracing::debug!(
+                    "{} backend {}:{}: address {} refused: {}",
+                    what,
+                    name,
+                    port,
+                    addr.ip(),
+                    _why
+                );
+                false
+            }
+        };
         if let Some(targets) = overrides.get(&key).filter(|t| !t.is_empty()) {
             // An endpoint is one target.
             for (host, target_port) in targets {
                 if let Some(addr) = self.addrs(host, *target_port, what)?.and_then(one_target) {
-                    each(addr, host);
+                    if admit(addr, true) {
+                        each(addr, host);
+                    }
                 }
             }
-            return Ok(());
-        }
-        // A ClusterIP Service has no entry: kube-proxy maps its service port.
-        let connect_port = self
-            .headless_target_ports
-            .get(&key)
-            .copied()
-            .unwrap_or(port);
-        if let Some(addrs) = self.addrs(name, connect_port, what)? {
-            tracing::debug!(
-                "        {} backend {}:{} -> {} address(es) on port {}",
-                what,
-                name,
-                port,
-                addrs.len(),
-                connect_port
-            );
-            for &addr in addrs {
-                each(addr, name);
+        } else {
+            // A ClusterIP Service has no entry: kube-proxy maps its service
+            // port. Any name the controller did not mark as a ClusterIP's
+            // answers with addresses dialed as is.
+            let direct = rules.is_none_or(|r| r.direct(name));
+            let connect_port = self
+                .headless_target_ports
+                .get(&key)
+                .copied()
+                .unwrap_or(port);
+            if let Some(addrs) = self.addrs(name, connect_port, what)? {
+                tracing::debug!(
+                    "        {} backend {}:{} -> {} address(es) on port {}",
+                    what,
+                    name,
+                    port,
+                    addrs.len(),
+                    connect_port
+                );
+                for &addr in addrs {
+                    if admit(addr, direct) {
+                        each(addr, name);
+                    }
+                }
             }
         }
-        Ok(())
+        crate::metrics::METRICS
+            .backend_addresses_refused_total
+            .add(refused as u64);
+        Ok(refused)
+    }
+
+    /// A Gateway backend's endpoints: only those the controller resolved,
+    /// never DNS, where its name could find a Service. None yet: its share
+    /// answers 503 until an instance of it reports.
+    fn gateway_endpoints(&self, br: &BackendRef) -> Vec<Backend> {
+        let endpoints: Vec<Backend> = self
+            .endpoint_overrides
+            .get(&(br.name.clone(), br.port))
+            .into_iter()
+            .flatten()
+            .filter_map(|(ip, port)| Some(SocketAddr::new(ip.parse::<IpAddr>().ok()?, *port)))
+            .map(|addr| Backend {
+                action: BackendAction::ForwardProxied,
+                ..backend_at(addr, br.weight, &br.name)
+            })
+            .collect();
+        if endpoints.is_empty() {
+            vec![Backend::unavailable(br.weight)]
+        } else {
+            endpoints
+        }
     }
 
     /// One backend per endpoint of each ref, at the ref's weight. An invalid
@@ -185,10 +255,27 @@ impl Resolver<'_, '_> {
         for br in refs {
             if br.invalid {
                 backends.push(Backend::rejecting(br.weight));
+            } else if br.is_gateway() {
+                backends.extend(self.gateway_endpoints(br));
             } else {
-                self.endpoints(&br.name, br.port, what, |addr, name| {
-                    backends.push(backend_at(addr, br.weight, name))
+                // PROXY v2 has a datagram form portail never sends.
+                let action = if what == "UDP" {
+                    BackendAction::Forward
+                } else {
+                    service_action(self.app_protocol(br))
+                };
+                let before = backends.len();
+                let refused = self.endpoints(&br.name, br.port, what, |addr, name| {
+                    backends.push(Backend {
+                        action,
+                        ..backend_at(addr, br.weight, name)
+                    })
                 })?;
+                // Every address refused: its share fails, as a refused ref's,
+                // rather than moving to the other refs.
+                if refused > 0 && backends.len() == before {
+                    backends.push(Backend::rejecting(br.weight));
+                }
             }
         }
         Ok(backends)
@@ -210,6 +297,16 @@ fn one_target(addrs: &[SocketAddr]) -> Option<SocketAddr> {
         .iter()
         .copied()
         .max_by_key(|addr| std::hash::BuildHasher::hash_one(keys, addr))
+}
+
+/// A Service backend's connections open with a PROXY v2 header when its
+/// port asks for one: a server reading it fails every connection without.
+fn service_action(app_protocol: Option<&str>) -> BackendAction {
+    if app_protocol == Some(PROXY_V2_APP_PROTOCOL) {
+        BackendAction::ForwardProxied
+    } else {
+        BackendAction::Forward
+    }
 }
 
 fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
@@ -254,7 +351,9 @@ impl PortailConfig {
             lookup,
             seen: HashMap::new(),
             endpoint_overrides: &self.endpoint_overrides,
+            app_protocols: &self.app_protocol_overrides,
             headless_target_ports: &self.headless_target_ports,
+            dial_rules: self.dial_rules.as_ref(),
         };
         let mut route_table = routing::RouteTable::new();
 
@@ -471,6 +570,25 @@ impl PortailConfig {
             }
         }
 
+        // Lenient leaves a bad entry out: trusting less closes connections,
+        // trusting more would let a client name itself.
+        let mut cidrs = Vec::new();
+        for source in self
+            .gateway
+            .proxy_protocol
+            .iter()
+            .flat_map(|p| &p.trusted_sources)
+        {
+            match crate::proxy::proxy_protocol::Cidr::parse(source) {
+                Ok(cidr) => cidrs.push(cidr),
+                Err(e) if policy == BuildPolicy::Strict => {
+                    return Err(anyhow!("proxyProtocol trustedSources: {}", e));
+                }
+                Err(e) => tracing::warn!("Skipping a PROXY protocol trusted source: {}", e),
+            }
+        }
+        route_table.proxy_sources = crate::proxy::proxy_protocol::TrustedSources::new(cidrs);
+
         tracing::debug!("Route table conversion completed: {} HTTP listener scopes, {} TCP routes, {} UDP routes",
             route_table.http_scopes().count(), route_table.tcp_routes.len(), route_table.udp_routes.len());
 
@@ -584,19 +702,29 @@ impl PortailConfig {
                 backends.push(Backend::rejecting(backend_ref.weight));
                 continue;
             }
+            if backend_ref.is_gateway() {
+                for mut backend in resolver.gateway_endpoints(backend_ref) {
+                    backend.filters = backend_filters.clone();
+                    backends.push(backend);
+                }
+                continue;
+            }
 
-            let app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
-                self.app_protocol_overrides
-                    .get(&(backend_ref.name.clone(), backend_ref.port))
-                    .map(String::as_str)
-            });
+            let app_protocol = resolver.app_protocol(backend_ref);
             let use_tls = app_protocol == Some("https");
-            resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
-                let mut backend = backend_at(addr, backend_ref.weight, name);
-                backend.filters = backend_filters.clone();
-                backend.use_tls = use_tls;
-                backends.push(backend);
-            })?;
+            let action = service_action(app_protocol);
+            let before = backends.len();
+            let refused =
+                resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
+                    let mut backend = backend_at(addr, backend_ref.weight, name);
+                    backend.filters = backend_filters.clone();
+                    backend.use_tls = use_tls;
+                    backend.action = action;
+                    backends.push(backend);
+                })?;
+            if refused > 0 && backends.len() == before {
+                backends.push(Backend::rejecting(backend_ref.weight));
+            }
         }
         Ok(backends)
     }
@@ -1011,7 +1139,7 @@ mod tests {
         );
         let resolve = |sni, port, listener| {
             rt.resolve_tls_passthrough(Some(sni), port, listener, &selector, &health)
-                .map(|addr| addr.port())
+                .map(|b| b.socket_addr.port())
         };
         assert_eq!(
             resolve("a.example.com", 8443, Some("*.example.com")),
@@ -1049,7 +1177,7 @@ mod tests {
         for (port, listener) in [(8443, Some("*.example.com")), (9443, None)] {
             let backend = rt
                 .resolve_tls_passthrough(Some("s.example.com"), port, listener, &selector, &health)
-                .map(|addr| addr.port());
+                .map(|b| b.socket_addr.port());
             assert_eq!(backend, Ok(7001), "{port}");
         }
         assert_eq!(rt.tls_scopes.values().flatten().count(), 1);
@@ -1818,6 +1946,381 @@ mod tests {
         let calls = std::cell::RefCell::new(vec![]);
         let built = config.build_route_table(policy, &mut |n, p| fake_dns(&calls, n, p));
         (built, calls.into_inner())
+    }
+
+    /// A Gateway backend dials only the endpoints the controller resolved,
+    /// behind a PROXY header, and never asks DNS, where its name could find
+    /// a Service. None resolved: an unavailable share (503), on every route
+    /// kind, told apart from an invalid ref's (500).
+    #[test]
+    fn a_gateway_backend_takes_its_endpoints_from_the_controller_only() {
+        let gateway_ref = r#"{"name":"edge.p.gateway","port":80,
+            "group":"gateway.networking.k8s.io","kind":"Gateway"}"#;
+        let json = format!(
+            r#"{{
+            "gateway": {{"name":"g","listeners":[
+                {{"name":"a","protocol":"HTTP","port":8080}},
+                {{"name":"t","protocol":"TCP","port":5432}}]}},
+            "httpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"a"}}],
+                "rules":[{{"backendRefs":[{gateway_ref}]}}]}}],
+            "tcpRoutes": [{{"parentRefs":[{{"name":"g","sectionName":"t"}}],
+                "rules":[{{"backendRefs":[{gateway_ref}]}}]}}]
+            }}"#
+        );
+        let mut config: PortailConfig = serde_json::from_str(&json).unwrap();
+        let (table, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let table = table.unwrap();
+        assert!(calls.is_empty(), "{calls:?}");
+        let tcp = table.find_tcp_backends(5432).unwrap();
+        assert_eq!(tcp.len(), 1);
+        assert_eq!(tcp[0].action, crate::routing::BackendAction::Unavailable);
+
+        let mut invalid = config.clone();
+        invalid.tcp_routes[0].rules[0].backend_refs[0].invalid = true;
+        let (table, _) = build_with_fake_dns(&invalid, super::BuildPolicy::Strict);
+        let tcp = table.unwrap().find_tcp_backends(5432).unwrap().to_vec();
+        assert_eq!(tcp[0].action, crate::routing::BackendAction::Reject);
+
+        config.endpoint_overrides.insert(
+            ("edge.p.gateway".into(), 80),
+            vec![("10.250.0.7".into(), 8000), ("10.250.0.8".into(), 8000)],
+        );
+        let (table, calls) = build_with_fake_dns(&config, super::BuildPolicy::Strict);
+        let table = table.unwrap();
+        assert!(calls.is_empty(), "{calls:?}");
+        let tcp = table.find_tcp_backends(5432).unwrap();
+        let addrs: Vec<String> = tcp.iter().map(|b| b.socket_addr.to_string()).collect();
+        assert_eq!(addrs, ["10.250.0.7:8000", "10.250.0.8:8000"]);
+        assert!(tcp
+            .iter()
+            .all(|b| b.action == crate::routing::BackendAction::ForwardProxied && !b.use_tls));
+        let rule = table
+            .find_http_route("x", "GET", "/", b"", "", 8080)
+            .expect("the HTTP rule");
+        assert_eq!(rule.backends.len(), 2);
+        assert!(rule
+            .backends
+            .iter()
+            .all(|b| b.action == crate::routing::BackendAction::ForwardProxied));
+    }
+
+    /// A Gateway on transit 10.250.0.0/16 with routes to `head.p.svc`, a
+    /// headless Service whose Endpoints its tenant writes, as TCP, HTTP and
+    /// mirror backends; plus `vip.p.svc`, a ClusterIP Service.
+    fn tenant_routes(rules: Option<super::super::DialRules>) -> PortailConfig {
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [
+                {"name": "a", "protocol": "HTTP", "port": 8080},
+                {"name": "t", "protocol": "TCP", "port": 5432},
+                {"name": "v", "protocol": "TCP", "port": 5433}]},
+            "httpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "a"}],
+                "rules": [{"filters": [{"type": "RequestMirror", "requestMirror":
+                        {"backendRef": {"name": "head.p.svc", "port": 80}}}],
+                    "backendRefs": [{"name": "head.p.svc", "port": 80}]}]}],
+            "tcpRoutes": [
+                {"parentRefs": [{"name": "g", "sectionName": "t"}],
+                    "rules": [{"backendRefs": [{"name": "head.p.svc", "port": 80}]}]},
+                {"parentRefs": [{"name": "g", "sectionName": "v"}],
+                    "rules": [{"backendRefs": [{"name": "vip.p.svc", "port": 80}]}]}],
+        }))
+        .unwrap();
+        config
+            .headless_target_ports
+            .insert(("head.p.svc".into(), 80), 8080);
+        config.dial_rules = rules.map(|mut rules| {
+            rules.cluster_ip.insert("vip.p.svc".into());
+            rules
+        });
+        config
+    }
+
+    fn transit() -> Option<super::super::DialRules> {
+        Some(super::super::DialRules {
+            refused: vec![crate::proxy::proxy_protocol::Cidr::covering("10.250.0.0/16").unwrap()],
+            ..Default::default()
+        })
+    }
+
+    /// Builds `config` with each name answering its addresses, an IP literal
+    /// itself, and any other name NXDOMAIN.
+    fn answering(config: &PortailConfig, names: &[(&str, &[&str])]) -> crate::routing::RouteTable {
+        config
+            .build_route_table(super::BuildPolicy::Lenient, &mut |name, port| {
+                let ips: Vec<std::net::IpAddr> = match names.iter().find(|(n, _)| *n == name) {
+                    Some((_, answers)) => answers.iter().map(|a| a.parse().unwrap()).collect(),
+                    None => vec![name.parse()?],
+                };
+                Ok(ips
+                    .into_iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                    .collect())
+            })
+            .unwrap()
+    }
+
+    /// [`answering`], `head.p.svc` answering `head` and `vip.p.svc` its
+    /// ClusterIP 172.30.0.10.
+    fn with_answers(config: &PortailConfig, head: &[&str]) -> crate::routing::RouteTable {
+        answering(
+            config,
+            &[("head.p.svc", head), ("vip.p.svc", &["172.30.0.10"])],
+        )
+    }
+
+    fn tcp_addrs(table: &crate::routing::RouteTable, port: u16) -> Vec<String> {
+        table
+            .find_tcp_backends(port)
+            .unwrap()
+            .iter()
+            .map(|b| match b.action {
+                crate::routing::BackendAction::Reject => "rejected".to_string(),
+                _ => b.socket_addr.to_string(),
+            })
+            .collect()
+    }
+
+    fn mirrored(table: &crate::routing::RouteTable) -> Vec<String> {
+        let rule = table
+            .find_http_route("x", "GET", "/", b"", "", 8080)
+            .unwrap();
+        rule.filters
+            .iter()
+            .filter_map(|f| match f {
+                crate::routing::HttpFilter::RequestMirror { backend_addr, .. } => {
+                    Some(backend_addr.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A headless answer inside an attached network is never dialed, on any
+    /// route kind or mirror; a ref left with none fails its share, and an
+    /// IPv4-mapped answer is the same address.
+    #[test]
+    fn a_headless_answer_inside_an_attached_network_is_refused() {
+        let config = tenant_routes(transit());
+        let before = crate::metrics::METRICS
+            .backend_addresses_refused_total
+            .get();
+        for inside in ["10.250.0.9", "::ffff:10.250.0.9"] {
+            let table = with_answers(&config, &[inside]);
+            assert_eq!(tcp_addrs(&table, 5432), ["rejected"], "{inside}");
+            let rule = table
+                .find_http_route("x", "GET", "/", b"", "", 8080)
+                .unwrap();
+            assert_eq!(rule.backends.len(), 1, "{inside}");
+            assert_eq!(
+                rule.backends[0].action,
+                crate::routing::BackendAction::Reject
+            );
+            assert!(mirrored(&table).is_empty(), "{inside}");
+        }
+        assert!(
+            crate::metrics::METRICS
+                .backend_addresses_refused_total
+                .get()
+                >= before + 6
+        );
+
+        let table = with_answers(&config, &["10.250.0.9", "10.128.0.5"]);
+        assert_eq!(tcp_addrs(&table, 5432), ["10.128.0.5:8080"]);
+        assert_eq!(mirrored(&table), ["10.128.0.5:8080"]);
+        assert_eq!(tcp_addrs(&table, 5433), ["172.30.0.10:80"]);
+    }
+
+    /// The DNS refresh rebuilds through the same rules: a name that
+    /// re-resolves into an attached network is refused on the next build.
+    #[test]
+    fn a_re_resolution_into_an_attached_network_is_refused() {
+        let config = tenant_routes(transit());
+        assert_eq!(
+            tcp_addrs(&with_answers(&config, &["10.128.0.5"]), 5432),
+            ["10.128.0.5:8080"]
+        );
+        assert_eq!(
+            tcp_addrs(&with_answers(&config, &["10.250.0.5"]), 5432),
+            ["rejected"]
+        );
+    }
+
+    /// A Gateway backend is meant to be dialed on the network both share.
+    #[test]
+    fn a_gateway_backend_inside_an_attached_network_is_served() {
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "t", "protocol": "TCP", "port": 5432}]},
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "t"}],
+                "rules": [{"backendRefs": [{"name": "edge.p.gateway", "port": 80,
+                    "group": "gateway.networking.k8s.io", "kind": "Gateway"}]}]}],
+        }))
+        .unwrap();
+        config.endpoint_overrides.insert(
+            ("edge.p.gateway".into(), 80),
+            vec![("10.250.0.7".into(), 8000)],
+        );
+        config.dial_rules = transit();
+        let table = config.to_route_table().unwrap();
+        let tcp = table.find_tcp_backends(5432).unwrap();
+        assert_eq!(tcp[0].socket_addr.to_string(), "10.250.0.7:8000");
+        assert_eq!(tcp[0].action, crate::routing::BackendAction::ForwardProxied);
+    }
+
+    /// A Service port whose appProtocol asks for PROXY v2 gets it on TCP,
+    /// TLS passthrough and HTTP, never on UDP; `https` keeps its own meaning.
+    #[test]
+    fn a_proxy_v2_service_port_is_proxied_except_over_udp() {
+        let route = |listener: &str, svc: &str| {
+            serde_json::json!({"parentRefs": [{"name": "g", "sectionName": listener}],
+                "rules": [{"backendRefs": [{"name": svc, "port": 8443}]}]})
+        };
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [
+                {"name": "a", "protocol": "HTTP", "port": 8080},
+                {"name": "t", "protocol": "TCP", "port": 5432},
+                {"name": "p", "protocol": "TLS", "port": 8443, "tls": {"mode": "Passthrough"}},
+                {"name": "d", "protocol": "UDP", "port": 5353},
+                {"name": "w", "protocol": "TCP", "port": 5433}]},
+            "httpRoutes": [route("a", "idm.p.svc")],
+            "tcpRoutes": [route("t", "idm.p.svc"), route("w", "web.p.svc")],
+            "tlsRoutes": [{"parentRefs": [{"name": "g", "sectionName": "p"}],
+                "hostnames": ["idm.example.com"],
+                "rules": [{"backendRefs": [{"name": "idm.p.svc", "port": 8443}]}]}],
+            "udpRoutes": [route("d", "idm.p.svc")],
+        }))
+        .unwrap();
+        config
+            .app_protocol_overrides
+            .insert(("idm.p.svc".into(), 8443), PROXY_V2_APP_PROTOCOL.into());
+        config
+            .app_protocol_overrides
+            .insert(("web.p.svc".into(), 8443), "https".into());
+        let table = answering(
+            &config,
+            &[
+                ("idm.p.svc", &["10.128.0.5"]),
+                ("web.p.svc", &["10.128.0.6"]),
+            ],
+        );
+        use crate::routing::BackendAction::{Forward, ForwardProxied};
+
+        let tcp = &table.find_tcp_backends(5432).unwrap()[0];
+        assert_eq!((tcp.action, tcp.use_tls), (ForwardProxied, false));
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        let tls = table
+            .resolve_tls_passthrough(Some("idm.example.com"), 8443, None, &selector, &health)
+            .unwrap();
+        assert_eq!(tls.action, ForwardProxied);
+        let http = &table
+            .find_http_route("x", "GET", "/", b"", "", 8080)
+            .expect("the HTTP rule")
+            .backends[0];
+        assert_eq!((http.action, http.use_tls), (ForwardProxied, false));
+        assert_eq!(table.find_udp_backends(5353).unwrap()[0].action, Forward);
+        assert_eq!(table.find_tcp_backends(5433).unwrap()[0].action, Forward);
+    }
+
+    /// Allowed: an attached network serves, the pod's own addresses never.
+    #[test]
+    fn allowed_serves_an_attached_network_but_never_the_pods_own_addresses() {
+        let config = tenant_routes(Some(super::super::DialRules::default()));
+        let table = with_answers(&config, &["10.250.0.9"]);
+        assert_eq!(tcp_addrs(&table, 5432), ["10.250.0.9:8080"]);
+        let table = with_answers(&config, &["127.0.0.1"]);
+        assert_eq!(tcp_addrs(&table, 5432), ["rejected"]);
+    }
+
+    /// An attached network with no CIDRs read: no direct answer can be told
+    /// outside it, while a ClusterIP still serves.
+    #[test]
+    fn an_unresolved_attached_network_refuses_direct_addresses() {
+        let mut config = tenant_routes(Some(super::super::DialRules {
+            unresolved: true,
+            ..Default::default()
+        }));
+        let table = with_answers(&config, &["10.128.0.5"]);
+        assert_eq!(tcp_addrs(&table, 5432), ["rejected"]);
+        assert_eq!(tcp_addrs(&table, 5433), ["172.30.0.10:80"]);
+
+        // An older controller marks nothing: every name is dialed directly.
+        config.dial_rules.as_mut().unwrap().cluster_ip.clear();
+        let table = with_answers(&config, &["10.128.0.5"]);
+        assert_eq!(tcp_addrs(&table, 5433), ["rejected"]);
+    }
+
+    /// An ExternalName Service without ports gets no override: its name
+    /// answers what its target does, dialed as is. A name the controller
+    /// marked as a ClusterIP's that turns special since (a Service turned
+    /// ExternalName, re-resolved by the DNS refresh) is refused too.
+    #[test]
+    fn an_unmarked_or_flipped_name_answering_the_pods_own_address_is_refused() {
+        let config = tenant_routes(Some(super::super::DialRules::default()));
+        let table = answering(
+            &config,
+            &[
+                ("head.p.svc", &["10.128.0.5"]),
+                ("vip.p.svc", &["169.254.169.254"]),
+            ],
+        );
+        assert_eq!(tcp_addrs(&table, 5433), ["rejected"]);
+
+        let mut portless: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "t", "protocol": "TCP", "port": 5432}]},
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "t"}],
+                "rules": [{"backendRefs": [{"name": "ext.p.svc", "port": 80}]}]}],
+        }))
+        .unwrap();
+        portless.dial_rules = Some(super::super::DialRules::default());
+        let table = answering(&portless, &[("ext.p.svc", &["169.254.169.254"])]);
+        assert_eq!(tcp_addrs(&table, 5432), ["rejected"]);
+        let table = answering(&portless, &[("ext.p.svc", &["203.0.113.9"])]);
+        assert_eq!(tcp_addrs(&table, 5432), ["203.0.113.9:80"]);
+    }
+
+    /// A backend named by an IP address is a test's or a hand-made
+    /// snapshot's: it goes unchecked.
+    #[test]
+    fn a_literal_backend_name_is_served_from_a_snapshot() {
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "t", "protocol": "TCP", "port": 5432}]},
+            "tcpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "t"}],
+                "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 9}]}]}],
+        }))
+        .unwrap();
+        config.dial_rules = Some(super::super::DialRules {
+            unresolved: true,
+            ..transit().unwrap()
+        });
+        assert_eq!(tcp_addrs(&answering(&config, &[]), 5432), ["127.0.0.1:9"]);
+    }
+
+    /// From the controller, an answer the pod would dial itself is refused;
+    /// a standalone file's backends are its owner's, loopback included.
+    #[test]
+    fn the_pods_own_addresses_are_refused_from_the_controller_only() {
+        let from_controller = tenant_routes(Some(super::super::DialRules::default()));
+        let standalone = tenant_routes(None);
+        for special in [
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "fe80::1",
+            "224.0.0.1",
+            "0.0.0.0",
+        ] {
+            let table = with_answers(&from_controller, &[special]);
+            assert_eq!(tcp_addrs(&table, 5432), ["rejected"], "{special}");
+            let table = with_answers(&standalone, &[special]);
+            assert_ne!(tcp_addrs(&table, 5432), ["rejected"], "{special}");
+        }
+        // An ExternalName Service answering loopback is refused too.
+        let mut external = tenant_routes(Some(super::super::DialRules::default()));
+        external
+            .endpoint_overrides
+            .insert(("vip.p.svc".into(), 80), vec![("127.0.0.1".into(), 80)]);
+        assert_eq!(tcp_addrs(&with_answers(&external, &[]), 5433), ["rejected"]);
     }
 
     /// Two listeners, two hostnames, two rules on one backend, plus TCP and

@@ -17,6 +17,8 @@ fn reconcile_to_config(
         cert_data,
         services,
         &RouteVerdicts::default(),
+        ExternalNameBackends::Refused,
+        false,
     )
 }
 
@@ -70,15 +72,18 @@ fn test_snapshot(
         reference_grants,
         services: vec![],
         rate_limit_policies: vec![],
+        gateways: HashMap::new(),
     }
 }
 
 fn empty_services() -> ServiceState {
     ServiceState {
         known_services: test_known_services(),
+        external_names: HashSet::new(),
         endpoint_overrides: HashMap::new(),
         app_protocol_overrides: HashMap::new(),
         headless_target_ports: HashMap::new(),
+        cluster_ip_backends: HashSet::new(),
     }
 }
 
@@ -1707,6 +1712,66 @@ fn test_mirror_to_unknown_service_dropped() {
     assert_eq!(ra.refs_reason, "BackendNotFound");
 }
 
+/// `test_http_route`'s backend, `api-svc`, as an ExternalName Service.
+fn api_svc_external_name() -> (ClusterSnapshot, ServiceState) {
+    let snapshot = test_snapshot(
+        vec![test_http_route()],
+        vec![],
+        vec![],
+        vec![],
+        &default_ns_labels(),
+        vec![],
+    );
+    let mut services = empty_services();
+    services
+        .external_names
+        .insert(("api-svc".to_string(), "default".to_string()));
+    (snapshot, services)
+}
+
+/// Gateway API BackendObjectReference: implementations SHOULD NOT support
+/// ExternalName Services. The Service's own namespace picks the name the
+/// Gateway would dial.
+#[test]
+fn external_name_backend_is_refused_by_default() {
+    let (snapshot, services) = api_svc_external_name();
+    let result =
+        reconcile_to_config(&test_gateway(), &snapshot, &HashMap::new(), &services).unwrap();
+
+    let ra = &result.route_status[0];
+    assert!(ra.accepted);
+    assert!(!ra.refs_resolved);
+    assert_eq!(ra.refs_reason, "InvalidKind");
+    assert!(
+        ra.refs_message.contains("ExternalName"),
+        "{}",
+        ra.refs_message
+    );
+    assert!(result.config.http_routes[0].rules[0].backend_refs[0].invalid);
+    assert!(
+        crate::kubernetes::services::referenced_backends(&result.config).is_empty(),
+        "the name it holds never reaches the data plane"
+    );
+}
+
+#[test]
+fn external_name_backend_is_followed_when_allowed() {
+    let (snapshot, services) = api_svc_external_name();
+    let result = super::reconcile_to_config(
+        &test_gateway(),
+        &snapshot,
+        &HashMap::new(),
+        &services,
+        &RouteVerdicts::default(),
+        ExternalNameBackends::Allowed,
+        false,
+    )
+    .unwrap();
+
+    assert!(result.route_status[0].refs_resolved);
+    assert!(!result.config.http_routes[0].rules[0].backend_refs[0].invalid);
+}
+
 // ---- Filter values spliced into HTTP/1 bytes ----
 
 fn route_with_filters(
@@ -2054,6 +2119,8 @@ fn a_route_verdict_stands_until_its_generation_moves() {
             &HashMap::new(),
             &empty_services(),
             &verdicts,
+            ExternalNameBackends::Refused,
+            false,
         )
         .unwrap()
     };
@@ -3362,7 +3429,7 @@ fn https_and_tls_passthrough_share_a_port() {
             &health,
         )
         .unwrap();
-    assert_eq!(backend.port(), 7001);
+    assert_eq!(backend.socket_addr.port(), 7001);
     assert!(table
         .resolve_tls_passthrough(
             Some("app.example.com"),
@@ -3631,7 +3698,7 @@ fn oldest_tls_route_owns_its_hostname() {
         let backend = table
             .resolve_tls_passthrough(Some("secure.example.com"), 6443, None, &selector, &health)
             .unwrap();
-        assert_eq!(backend.port(), 7001);
+        assert_eq!(backend.socket_addr.port(), 7001);
     }
 }
 
@@ -3700,7 +3767,7 @@ fn invalid_tcp_backend_share_is_rejected() {
     let (mut forwarded, mut rejected) = (0, 0);
     for _ in 0..400 {
         match analyze_tcp_request(&table, &selector, 5432, &health).unwrap() {
-            RoutingResult::TcpForward { backend_addr } => {
+            RoutingResult::TcpForward { backend_addr, .. } => {
                 assert_eq!(backend_addr.port(), 7001);
                 forwarded += 1;
             }
@@ -3811,4 +3878,348 @@ fn same_age_routes_tie_break_on_the_namespace_slash_name_string() {
     let (a_z, a_b_c) = (route("a", "z", 8001), route("a-b", "c", 8002));
     assert_eq!(winner(vec![a_z.clone(), a_b_c.clone()]), 8002);
     assert_eq!(winner(vec![a_b_c, a_z]), 8002);
+}
+
+/// `multi-gw`, on the Network `transit` when `on_network`: an edge in
+/// front of other Gateways.
+fn edge_gateway(on_network: bool) -> Gateway {
+    let mut gw = multi_listener_gateway();
+    if on_network {
+        gw.spec.addresses = serde_json::from_value(serde_json::json!(
+            [{"type": "portail.epheo.eu/Network", "value": "transit"}]
+        ))
+        .unwrap();
+    }
+    gw
+}
+
+/// A network the edge's parameters attach to dial out on shares it as a
+/// Network address would: its Gateway backends resolve.
+#[test]
+fn a_gateway_dialing_out_on_a_network_reaches_gateway_backends() {
+    let route: HTTPRoute = edge_route(
+        "HTTPRoute",
+        "edge",
+        serde_json::json!({"backendRefs": [gateway_ref("publish", Some("p-publish"), 80)]}),
+    );
+    let snapshot = with_gateways(test_snapshot(
+        vec![route],
+        vec![],
+        vec![],
+        vec![],
+        &default_ns_labels(),
+        vec![gateway_grant()],
+    ));
+    let resolve = |dials_out| {
+        super::reconcile_to_config(
+            &edge_gateway(false),
+            &snapshot,
+            &HashMap::new(),
+            &empty_services(),
+            &RouteVerdicts::default(),
+            ExternalNameBackends::Refused,
+            dials_out,
+        )
+        .unwrap()
+    };
+    let off = resolve(false);
+    assert!(!off.route_status[0].refs_resolved);
+    let on = resolve(true);
+    assert!(
+        on.route_status[0].refs_resolved,
+        "{}",
+        on.route_status[0].refs_message
+    );
+    assert!(!on.config.http_routes[0].rules[0].backend_refs[0].invalid);
+}
+
+fn gateway_ref(name: &str, namespace: Option<&str>, port: u16) -> serde_json::Value {
+    let mut r = serde_json::json!({
+        "group": "gateway.networking.k8s.io", "kind": "Gateway", "name": name, "port": port
+    });
+    if let Some(ns) = namespace {
+        r["namespace"] = serde_json::json!(ns);
+    }
+    r
+}
+
+fn edge_route<K: serde::de::DeserializeOwned>(
+    kind: &str,
+    name: &str,
+    rule: serde_json::Value,
+) -> K {
+    let version = if kind == "HTTPRoute" {
+        "v1"
+    } else {
+        "v1alpha2"
+    };
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": format!("gateway.networking.k8s.io/{version}"),
+        "kind": kind,
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {"parentRefs": [{"name": "multi-gw"}], "rules": [rule]}
+    }))
+    .unwrap()
+}
+
+/// HTTPRoutes in `default` may name Gateways in `p-publish`.
+fn gateway_grant() -> ReferenceGrant {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1beta1",
+        "kind": "ReferenceGrant",
+        "metadata": {"name": "edge", "namespace": "p-publish"},
+        "spec": {
+            "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "default"},
+                     {"group": "gateway.networking.k8s.io", "kind": "TCPRoute", "namespace": "default"}],
+            "to": [{"group": "gateway.networking.k8s.io", "kind": "Gateway"}]
+        }
+    }))
+    .unwrap()
+}
+
+fn with_gateways(mut snapshot: ClusterSnapshot) -> ClusterSnapshot {
+    snapshot.gateways = [
+        (
+            ("p-publish".to_string(), "publish".to_string()),
+            vec![80, 443],
+        ),
+        (("default".to_string(), "multi-gw".to_string()), vec![8080]),
+    ]
+    .into();
+    snapshot
+}
+
+/// A backendRef of kind Gateway names another of this controller's
+/// Gateways, on a listener it has, past a ReferenceGrant, from a Gateway
+/// on a Network: anything else is ResolvedRefs=False and its share fails.
+#[test]
+fn a_gateway_backend_resolves_only_when_it_may() {
+    let cases: [(&str, bool, serde_json::Value, bool, Option<(&str, &str)>); 6] = [
+        (
+            "granted",
+            true,
+            gateway_ref("publish", Some("p-publish"), 80),
+            true,
+            None,
+        ),
+        (
+            "ungranted",
+            true,
+            gateway_ref("publish", Some("p-publish"), 80),
+            false,
+            Some(("RefNotPermitted", "not allowed by ReferenceGrant")),
+        ),
+        (
+            "missing",
+            true,
+            gateway_ref("absent", None, 80),
+            false,
+            Some(("BackendNotFound", "default/absent not found")),
+        ),
+        (
+            "itself",
+            true,
+            gateway_ref("multi-gw", None, 8080),
+            false,
+            Some(("BackendNotFound", "its own backend")),
+        ),
+        (
+            "unlistened port",
+            true,
+            gateway_ref("publish", Some("p-publish"), 8443),
+            true,
+            Some(("BackendNotFound", "no listener on port 8443")),
+        ),
+        (
+            "off any network",
+            false,
+            gateway_ref("publish", Some("p-publish"), 80),
+            true,
+            Some(("BackendNotFound", "portail.epheo.eu/Network")),
+        ),
+    ];
+    for (case, on_network, backend, granted, want) in cases {
+        let route: HTTPRoute = edge_route(
+            "HTTPRoute",
+            "edge",
+            serde_json::json!({"backendRefs": [backend]}),
+        );
+        let grants = if granted {
+            vec![gateway_grant()]
+        } else {
+            vec![]
+        };
+        let snapshot = with_gateways(test_snapshot(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            &default_ns_labels(),
+            grants,
+        ));
+        let result = reconcile_to_config(
+            &edge_gateway(on_network),
+            &snapshot,
+            &HashMap::new(),
+            &empty_services(),
+        )
+        .unwrap();
+        let ra = &result.route_status[0];
+        let backend = &result.config.http_routes[0].rules[0].backend_refs[0];
+        // Past the grant and not itself: the target's own events wake it.
+        let watched = !matches!(case, "ungranted" | "itself");
+        assert_eq!(!result.gateway_targets.is_empty(), watched, "{case}");
+        match want {
+            None => {
+                assert!(ra.refs_resolved, "{case}: {}", ra.refs_message);
+                assert!(!backend.invalid, "{case}");
+                assert_eq!(backend.name, "publish.p-publish.gateway", "{case}");
+                assert!(backend.is_gateway(), "{case}");
+            }
+            Some((reason, message)) => {
+                assert!(!ra.refs_resolved, "{case}");
+                assert_eq!(ra.refs_reason, reason, "{case}: {}", ra.refs_message);
+                assert!(
+                    ra.refs_message.contains(message),
+                    "{case}: {}",
+                    ra.refs_message
+                );
+                assert!(backend.invalid, "{case}");
+            }
+        }
+    }
+}
+
+/// TCPRoutes and TLSRoutes may name a Gateway; a UDPRoute or a request
+/// mirror may not: neither has a PROXY header to carry the client.
+#[test]
+fn only_tcp_borne_forward_refs_name_a_gateway() {
+    let backend =
+        || serde_json::json!({"backendRefs": [gateway_ref("publish", Some("p-publish"), 443)]});
+    let tcp: TCPRoute = edge_route("TCPRoute", "tcp", backend());
+    let udp: UDPRoute = edge_route("UDPRoute", "udp", backend());
+    let mirror: HTTPRoute = edge_route(
+        "HTTPRoute",
+        "mirror",
+        serde_json::json!({
+            "filters": [{"type": "RequestMirror",
+                         "requestMirror": {"backendRef": gateway_ref("publish", Some("p-publish"), 80)}}],
+            "backendRefs": [gateway_ref("publish", Some("p-publish"), 80)]
+        }),
+    );
+    let snapshot = with_gateways(test_snapshot(
+        vec![mirror],
+        vec![tcp],
+        vec![],
+        vec![udp],
+        &default_ns_labels(),
+        vec![gateway_grant()],
+    ));
+    let result = reconcile_to_config(
+        &edge_gateway(true),
+        &snapshot,
+        &HashMap::new(),
+        &empty_services(),
+    )
+    .unwrap();
+    let status = |name: &str| {
+        result
+            .route_status
+            .iter()
+            .find(|ra| ra.name == name)
+            .unwrap()
+    };
+
+    assert!(
+        status("tcp").refs_resolved,
+        "{}",
+        status("tcp").refs_message
+    );
+    assert!(!result.config.tcp_routes[0].rules[0].backend_refs[0].invalid);
+
+    assert_eq!(status("udp").refs_reason, "InvalidKind");
+    assert!(status("udp")
+        .refs_message
+        .contains("A UDPRoute cannot name a Gateway"));
+    assert!(result.config.udp_routes[0].rules[0].backend_refs[0].invalid);
+
+    assert_eq!(status("mirror").refs_reason, "InvalidKind");
+    assert!(status("mirror")
+        .refs_message
+        .contains("A request mirror cannot name a Gateway"));
+    let rule = &result.config.http_routes[0].rules[0];
+    assert!(rule.filters.is_empty(), "the mirror is left out");
+    assert!(!rule.backend_refs[0].invalid, "the forward ref stands");
+}
+
+/// A Gateway backend's name the converter did not write names nothing:
+/// BackendNotFound, never a resolved ref, and nothing watched.
+#[test]
+fn an_unreadable_gateway_backend_name_is_not_found() {
+    let (gateways, labels, known) = (HashMap::new(), HashMap::new(), HashSet::new());
+    let cx = RouteCollectCtx {
+        gateway_name: "multi-gw",
+        gateway_ns: "default",
+        on_network: true,
+        gateways: &gateways,
+        watched: Default::default(),
+        listeners: &[],
+        namespace_labels: &labels,
+        reference_grants: &[],
+        known_services: &known,
+        refused_external_names: &known,
+    };
+    let (reason, message) = check_gateway(&cx, "HTTPRoute", "default", "nodots", 80).unwrap();
+    assert_eq!(reason, "BackendNotFound");
+    assert!(message.contains("names no Gateway"), "{message}");
+    assert!(cx.watched.into_inner().is_empty());
+}
+
+/// A backend name that is an IP address would reach the data plane
+/// unchecked: the reconciler refuses one, however it arrived.
+#[test]
+fn a_literal_backend_name_is_invalid() {
+    for name in ["127.0.0.1", "::1", "10.250.0.7"] {
+        let (reason, why) = literal_backend_name(name).expect(name);
+        assert_eq!(reason, "InvalidKind");
+        assert!(why.contains(name), "{why}");
+    }
+    assert_eq!(literal_backend_name("web.p.svc"), None);
+    assert_eq!(literal_backend_name("127.0.0.1.default.svc"), None);
+    assert_eq!(literal_backend_name("edge.p.gateway"), None);
+}
+
+/// Only the names this Gateway routes to are marked as a ClusterIP's:
+/// the cluster's every Service would grow each snapshot.
+#[test]
+fn only_routed_cluster_ip_names_are_marked() {
+    let mut all = gw_listener("all", 8080, "HTTP");
+    all.allowed_routes = from_all_namespaces();
+    let gw = attach_gateway(vec![all]);
+    let route = app_route(
+        "r",
+        "other-ns",
+        vec![http_parent(Some("default"), None)],
+        &[("127.0.0.1", None, 8001, 1)],
+    );
+    let mut services = loopback_services();
+    services.cluster_ip_backends.extend([
+        "127.0.0.1.other-ns.svc".to_string(),
+        "unused.x.svc".to_string(),
+    ]);
+    let result = reconcile_to_config(
+        &gw,
+        &snapshot_of(vec![route], vec![], vec![]),
+        &HashMap::new(),
+        &services,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .config
+            .cluster_ip_backends
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["127.0.0.1.other-ns.svc"]
+    );
 }

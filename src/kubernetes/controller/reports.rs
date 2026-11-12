@@ -2,7 +2,8 @@
 //! status.addresses are computed from the live ones. A changed report
 //! reconciles its Gateway.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 
 use futures::channel::mpsc;
@@ -98,6 +99,60 @@ impl ReportStore {
         live
     }
 
+    /// `visit` each live report of `gateway` serving the snapshot of the
+    /// Gateway of `uid`, in place, by instance id: a report as large as its
+    /// sender made it is never copied, and a cap applied while visiting
+    /// keeps the same instances from pass to pass.
+    pub(crate) fn for_each_live(
+        &self,
+        gateway: &GatewayKey,
+        uid: &str,
+        mut visit: impl FnMut(&InstanceReport),
+    ) {
+        let gateways = self.gateways();
+        let mut live: Vec<(&InstanceId, &Entry)> = gateways
+            .get(gateway)
+            .into_iter()
+            .flatten()
+            .filter(|(_, e)| e.seen.elapsed() < LIVENESS && !e.report.leaving)
+            .filter(|(_, e)| !uid.is_empty() && e.report.gateway_uid == uid)
+            .collect();
+        live.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        for (_, entry) in live {
+            visit(&entry.report);
+        }
+    }
+
+    /// Those of `addresses` a live instance of a Gateway other than
+    /// `gateway` reports, read in place.
+    pub(crate) fn claimed_besides(
+        &self,
+        gateway: &GatewayKey,
+        addresses: &HashSet<IpAddr>,
+    ) -> HashSet<IpAddr> {
+        let mut claimed = HashSet::new();
+        if addresses.is_empty() {
+            return claimed;
+        }
+        let gateways = self.gateways();
+        let others = gateways
+            .iter()
+            .filter(|(key, _)| *key != gateway)
+            .flat_map(|(_, instances)| instances.values())
+            .filter(|e| e.seen.elapsed() < LIVENESS && !e.report.leaving);
+        for entry in others {
+            for ip in &entry.report.interface_ips {
+                if let Ok(addr) = ip.parse::<IpAddr>() {
+                    let addr = addr.to_canonical();
+                    if addresses.contains(&addr) {
+                        claimed.insert(addr);
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
     /// When an instance of `gateway` last said it was leaving: its
     /// replacement is due. Kept until that instance is pruned.
     pub(crate) fn last_leaving(&self, gateway: &GatewayKey) -> Option<Instant> {
@@ -107,6 +162,12 @@ impl ReportStore {
             .filter(|e| e.report.leaving)
             .map(|e| e.seen)
             .max()
+    }
+
+    /// Forget what every instance of `gateway` reported: another Gateway
+    /// took its name.
+    pub(crate) fn forget(&self, gateway: &GatewayKey) {
+        self.gateways().remove(gateway);
     }
 
     /// Forget every Gateway `live` rejects.

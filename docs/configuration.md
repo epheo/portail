@@ -37,7 +37,8 @@ These flags take no subcommand: `portail --http2 dataplane ...` is refused.
 | `--namespace <NS>` | Namespace of the leader election Lease, the CA Secret and ConfigMap, and the Service (default: env `POD_NAMESPACE`) |
 | `--service-name <NAME>` | The ClusterIP Service data planes dial; `<service>.<namespace>.svc` is also the audience of their tokens (default: `portail-controller`) |
 | `--sync-port <PORT>` | Port of the TLS sync endpoint, `POST /v1/sync/<namespace>/<name>` (default: `9443`) |
-| `--sync-peer-connections <N>` | Open sync connections one peer IP may hold (default: `32`; a data plane holds one or two). Polls through the apiserver's proxy arrive from the apiserver, on OVN-Kubernetes from each apiserver node's management address: at least twice the Primary UDN data planes per apiserver node |
+| `--sync-peer-connections <N>` | Open sync connections one peer IP may hold, held polls aside (default: `32`). A held poll counts against its Gateway, not its address, so data planes polling through the apiserver's proxy, which all share one, do not crowd each other out |
+| `--sync-gateway-polls <N>` | Polls one Gateway's data planes may hold at once (default: `8`; each pod holds one). Over it a poll is answered 503 at once: pods that a namespace's admin starts on its Gateway's ServiceAccount never take other Gateways' connections. Held polls still take the controller's 1024 connections, so 128 Gateways at their cap fill it |
 | `--leader-election-id <NAME>` | Name of the leader election Lease (default: `portail-controller`); the Role of `deploy/install` grants this name only |
 | `--dataplane-image <IMAGE>` | Data-plane image of Managed Gateways without a GatewayParameters `image` (default: the image this binary was published as) |
 | `--readiness-port <PORT>` | Port of the admin endpoint (default: `19099`) |
@@ -72,6 +73,7 @@ Managed data planes run with `--gateway`, `--controller-address`, `--admin-addre
 | `PORTAIL_MAX_BLOCKING_THREADS` | Tokio blocking-thread cap (default: `32`) |
 | `POD_NAMESPACE` | The controller's `--namespace` default |
 | `PORTAIL_CONTROLLER_CA` | The data plane's controller CA, as PEM, when `--controller-ca-file` is not given |
+| `POD_IP` | The data plane's pod IP, `status.podIP` through the downward API (Managed pods get it): while a network it only dials out on is unresolved, a named address binds only on this IP's interface or a listening Network's |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | Set by kubelet: the data plane's `--apiserver-address` default with `--transport apiserver-proxy` |
 
 ## Admin Endpoint
@@ -105,7 +107,8 @@ in standalone mode:
 - A data plane adds `portail_controller_connected` (`0` while it cannot reach
   the controller) and `portail_config_age_seconds`: alert on the age, since
   route and certificate changes wait for the controller.
-- The controller adds `portail_sync_auth_rejected_total{stage}`,
+- The controller adds `portail_sync_auth_rejected_total{stage}` (`precheck`,
+  `negative_cache`, `signature`, `tokenreview`, `authz`, `serviceaccount`),
   `portail_tokenreview_requests_total{result}`,
   `portail_sync_throttled_total` (503s: TokenReviews in flight at their
   cap, or a source IP past 5 reviews a second of tokens not seen yet) and
@@ -222,6 +225,29 @@ a throttled crawler stays throttled across a rate change. Observability:
 `status: 429` access-log lines. A limited request counts there only:
 `portail_http_requests_total` and `portail_listener_http_requests_total`
 count requests dispatched to a backend.
+
+## PROXY Protocol
+
+The receiving half of PROXY protocol v2, for a Gateway behind a load balancer or edge proxy that sends it.
+
+Kubernetes mode: `proxyProtocol.trustedSources` in GatewayParameters, CIDRs or Gateways ([deployment](deployment.md#proxy-protocol)).
+Standalone mode:
+
+```yaml
+gateway:
+  proxyProtocol:
+    trustedSources: ["10.250.0.0/16", "2001:db8:250::/48"]
+```
+
+- A connection from a trusted source must open with a v2 header, on every TCP listener, plain or TLS.
+- PROXY for a TCP4 or TCP6 client: that client stands for the connection: `X-Forwarded-For`, access logs, rate limits.
+- LOCAL, a health check: the connection's own address stands.
+- Anything else from a trusted source closes the connection, never falling back to its address: no header within `clientHeaderTimeout`, a malformed one, v1 text, a UDP or unix client.
+- Counted in `portail_proxy_protocol_refused_total`.
+- Other sources are never read for a header: one they send is bytes of their request.
+- TLVs are skipped. UDP listeners take no header.
+- CIDRs name networks: `10.250.0.7/16` is refused, write `10.250.0.0/16` or `10.250.0.7/32`.
+- The sending half goes to backendRefs of kind Gateway, in Kubernetes mode ([deployment](deployment.md#gateway-backends)), and to a Service port whose `appProtocol` is `portail.epheo.eu/proxy-v2` ([deployment](deployment.md#proxy-protocol-to-a-service)) or a standalone backendRef whose `app_protocol` is.
 
 ## Route Attachment
 

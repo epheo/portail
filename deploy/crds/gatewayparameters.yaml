@@ -31,7 +31,7 @@ spec:
             description: |-
               How a Gateway's data plane is run. Built-in defaults, then the
               GatewayClass's parameters, then the Gateway's: a set field wins field by
-              field; `networks` and `resources` replace whole.
+              field; `networks`, `resources` and `proxyProtocol` replace whole.
             properties:
               controllerTransport:
                 description: |-
@@ -43,6 +43,20 @@ spec:
                 enum:
                 - Direct
                 - APIServerProxy
+                - null
+                nullable: true
+                type: string
+              externalNameBackends:
+                description: |-
+                  Routes to Services of type ExternalName, Managed or not. Refused: the
+                  backendRef is ResolvedRefs=False InvalidKind and its share answers
+                  500, so a route's author cannot make the Gateway dial any name it
+                  likes (Gateway API: implementations SHOULD NOT support them,
+                  CVE-2021-25740). Allowed: the data plane dials the name. Default
+                  Refused.
+                enum:
+                - Refused
+                - Allowed
                 - null
                 nullable: true
                 type: string
@@ -76,6 +90,15 @@ spec:
                         type: string
                       nullable: true
                       type: array
+                    listeners:
+                      description: |-
+                        Whether listeners bind on this network. false: the data planes
+                        only dial out on it, reaching Gateway backends and being trusted
+                        there by the Gateways that name this one. No listener binds on its
+                        interface, and a Gateway with such a network binds its unaddressed
+                        listeners on every local IP off it. Default true.
+                      nullable: true
+                      type: boolean
                     mac:
                       minLength: 1
                       nullable: true
@@ -104,6 +127,56 @@ spec:
                 - null
                 nullable: true
                 type: string
+              proxyProtocol:
+                description: |-
+                  PROXY protocol v2 on the data plane's TCP listeners, Managed or not.
+                  Replaces whole: a Gateway's own list is never added to its class's.
+                nullable: true
+                properties:
+                  trustedSources:
+                    description: |-
+                      Sources whose connections must open with a v2 header: the client
+                      it names stands for the connection (X-Forwarded-For, access logs,
+                      rate limits). One that sends no header, or a malformed one, is
+                      closed; LOCAL keeps the connection's own address. Other sources are
+                      never read for one. Empty: none. Matched per accepted connection.
+                    items:
+                      description: Exactly one of `cidr` or `gateway`.
+                      properties:
+                        cidr:
+                          description: |-
+                            An IPv4 or IPv6 CIDR, network address only: 10.250.0.0/16, not
+                            10.250.0.7/16. Never a network other workloads share: any of them
+                            could name any client.
+                          minLength: 1
+                          nullable: true
+                          type: string
+                        gateway:
+                          description: |-
+                            A Gateway of this controller: the address each of its live data
+                            planes reports on a Network both Gateways name, inside its CIDRs on
+                            both sides, bound there or not. Nothing while none reports
+                            or this Gateway has no Network address.
+                          nullable: true
+                          properties:
+                            name:
+                              minLength: 1
+                              type: string
+                            namespace:
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          - namespace
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of cidr or gateway
+                        rule: has(self.cidr) != has(self.gateway)
+                    maxItems: 16
+                    nullable: true
+                    type: array
+                type: object
               replicas:
                 description: |-
                   Data-plane pods (Managed). Default 1; static `networks[].ips`
@@ -153,6 +226,21 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              serviceEndpointsOnAttachedNetworks:
+                description: |-
+                  Service backends whose addresses fall inside a network the Gateway
+                  attaches (its Network addresses and the networks it dials out on),
+                  Managed or not. Refused: such an address is never dialed, and a ref
+                  left with none answers 500, so whoever writes a Service's Endpoints
+                  cannot point the Gateway at the platform's networks. Allowed: they
+                  are dialed, for a platform serving hosts on a network it attaches.
+                  Gateway backends are never refused. Default Refused.
+                enum:
+                - Refused
+                - Allowed
+                - null
+                nullable: true
+                type: string
             type: object
         required:
         - spec

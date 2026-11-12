@@ -241,6 +241,7 @@ impl TestCluster {
             )),
             hub: Arc::default(),
             reports: Arc::default(),
+            backends: Arc::default(),
             leader: super::leader::Leader::always(),
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(
@@ -250,6 +251,7 @@ impl TestCluster {
                 super::provision::ControllerEndpoint::for_tests(),
             ),
             departures: Default::default(),
+            isolated: tokio::sync::watch::channel(false).1,
         })
     }
 }
