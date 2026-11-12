@@ -283,6 +283,39 @@ backendRefs:
 - Never put the shared network's CIDR in `trustedSources`: every Gateway on it could then name any client. The target names the referencing Gateway instead: [Edge mode](#edge-mode).
 - A target that does not trust the sender reads the header as request bytes and closes the connection.
 
+### PROXY protocol to a Service
+
+A Service port opts in to a PROXY protocol v2 header naming the client, for a server that reads one, such as one terminating its own TLS behind a passthrough listener:
+
+```yaml
+ports:
+- name: https
+  port: 8443
+  appProtocol: portail.epheo.eu/proxy-v2
+```
+
+- Every portail connection to that port opens with the header: TCPRoute, TLSRoute and HTTPRoute alike. A UDPRoute sends none.
+- HTTP opens one connection per request to it, as to a Gateway backend: none is pooled or reused.
+- The port has one appProtocol, so not `https` too: portail never re-encrypts to it. A server terminating TLS takes a TLSRoute.
+- A request mirror to it sends no header: its copies fail.
+- Its server must expect the header on every connection from portail, or each closes.
+- The server trusts the header by the connection's source address. A CIDR on the pod network covers every pod there, and any of them could name any client.
+- So admit only the sending Gateway's pods to that port, both selectors in one peer:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: from-edge, namespace: idm}
+spec:
+  podSelector: {matchLabels: {app: idm}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: portail-edge}}
+      podSelector: {matchLabels: {gateway.networking.k8s.io/gateway-name: edge}}
+    ports: [{port: 8443}]
+```
+
 ### Edge mode
 
 One public address in front of many Gateways: an edge Gateway takes every connection and hands each to the Gateway serving its hostname, over a transit network only platform pods join.

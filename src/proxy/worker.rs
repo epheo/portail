@@ -262,7 +262,7 @@ pub(crate) struct ConnectionState {
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
     /// The client: X-Forwarded-For, access logs, rate limits, and the
-    /// source of a PROXY v2 header to a Gateway backend.
+    /// source of a PROXY v2 header to a backend.
     peer: SocketAddr,
     /// Where the client reached this data plane: the header's destination.
     local: SocketAddr,
@@ -359,7 +359,7 @@ impl ConnectionState {
         }
     }
 
-    /// The PROXY v2 header a Gateway backend's connection opens with.
+    /// The PROXY v2 header a proxied backend's connection opens with.
     fn proxy_header(&self, proxied: bool) -> Option<Vec<u8>> {
         proxied.then(|| proxy_protocol::header(self.peer, self.local))
     }
@@ -1812,7 +1812,7 @@ async fn connect_to_backend(
     }
 }
 
-/// A fresh plain connection to a Gateway backend, its PROXY v2 header sent.
+/// A fresh plain connection to a proxied backend, its PROXY v2 header sent.
 async fn connect_proxied(
     addr: SocketAddr,
     connect_timeout: Duration,
@@ -2771,7 +2771,7 @@ async fn handle_tls_passthrough(
     .await
 }
 
-/// `header`, a PROXY v2 header for a Gateway backend, goes before any
+/// `header`, a PROXY v2 header for a proxied backend, goes before any
 /// byte of the client's.
 async fn handle_tcp_connection(
     client: Connection,

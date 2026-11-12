@@ -747,7 +747,7 @@ impl std::fmt::Display for PassthroughMiss {
 pub enum BackendAction {
     Forward,
     /// Forward behind a PROXY v2 header naming the client: a Gateway
-    /// backend, which trusts this data plane to say who connected.
+    /// backend, or a Service port whose appProtocol asks for one.
     ForwardProxied,
     /// Stands for an invalid backendRef (RefNotPermitted, BackendNotFound,
     /// InvalidKind) and keeps its weight: its share fails (HTTP 500, L4

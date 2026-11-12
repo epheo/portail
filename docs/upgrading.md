@@ -20,6 +20,7 @@
 - Find them first: `kubectl get svc -A --field-selector spec.type=ExternalName`, then the routes naming those Services.
 - GatewayParameters `proxyProtocol` needs data planes of this release: an older one refuses the configuration and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`.
 - An older data plane sends no PROXY header to a Gateway backend, so a target trusting it closes those connections: upgrade data planes before naming Gateway backends.
+- An older data plane sends no PROXY header to a Service port with appProtocol `portail.epheo.eu/proxy-v2` either: upgrade data planes before marking one.
 - GatewayParameters `trustedSources` may name a Gateway: apply this release's CRD (`deploy/crds`) before writing one, as the older one requires `cidr`.
 - GatewayParameters `networks[].listeners`: apply this release's CRD before writing it. The older one prunes the field unknown to it, and the network then takes listeners.
 - `listeners: false` needs data planes of this release: an older one binds every interface, that network included, and reports no IP there, so Gateways trusting it trust nothing.
