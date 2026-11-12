@@ -94,7 +94,7 @@ pub enum RoutingResult<'a> {
     LocalReply(LocalReply),
     TcpForward {
         backend_addr: SocketAddr,
-        /// The connection opens with a PROXY v2 header: a Gateway backend.
+        /// The connection opens with a PROXY v2 header.
         proxied: bool,
     },
     UdpForward {

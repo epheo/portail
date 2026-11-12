@@ -247,7 +247,7 @@ gateway:
 - Other sources are never read for a header: one they send is bytes of their request.
 - TLVs are skipped. UDP listeners take no header.
 - CIDRs name networks: `10.250.0.7/16` is refused, write `10.250.0.0/16` or `10.250.0.7/32`.
-- The sending half goes only to backendRefs of kind Gateway, in Kubernetes mode ([deployment](deployment.md#gateway-backends)).
+- The sending half goes to backendRefs of kind Gateway, in Kubernetes mode ([deployment](deployment.md#gateway-backends)), and to a Service port whose `appProtocol` is `portail.epheo.eu/proxy-v2` ([deployment](deployment.md#proxy-protocol-to-a-service)) or a standalone backendRef whose `app_protocol` is.
 
 ## Route Attachment
 

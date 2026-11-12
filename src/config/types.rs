@@ -550,6 +550,10 @@ pub struct BackendRef {
 /// The group of a backendRef that names another Gateway.
 pub const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 
+/// The appProtocol of a Service port whose server reads a PROXY v2 header
+/// naming the client, as a Gateway backend does.
+pub const PROXY_V2_APP_PROTOCOL: &str = "portail.epheo.eu/proxy-v2";
+
 impl BackendRef {
     /// Another Gateway, reached on a network both share, behind a PROXY
     /// v2 header naming the client.

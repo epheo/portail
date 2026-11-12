@@ -95,11 +95,21 @@ struct Resolver<'a, 'l> {
     lookup: &'a mut Lookup<'l>,
     seen: HashMap<(String, u16), Option<Vec<SocketAddr>>>,
     endpoint_overrides: &'a HashMap<(String, u16), Vec<(String, u16)>>,
+    app_protocols: &'a HashMap<(String, u16), String>,
     headless_target_ports: &'a HashMap<(String, u16), u16>,
     dial_rules: Option<&'a super::DialRules>,
 }
 
 impl Resolver<'_, '_> {
+    /// A ref's own appProtocol (a file config), else its Service port's.
+    fn app_protocol<'s>(&'s self, br: &'s BackendRef) -> Option<&'s str> {
+        br.app_protocol.as_deref().or_else(|| {
+            self.app_protocols
+                .get(&(br.name.clone(), br.port))
+                .map(String::as_str)
+        })
+    }
+
     /// `None`: the name did not resolve and the policy is lenient. Warns on
     /// the first lookup only.
     fn addrs(&mut self, name: &str, port: u16, what: &str) -> Result<Option<&[SocketAddr]>> {
@@ -248,9 +258,18 @@ impl Resolver<'_, '_> {
             } else if br.is_gateway() {
                 backends.extend(self.gateway_endpoints(br));
             } else {
+                // PROXY v2 has a datagram form portail never sends.
+                let action = if what == "UDP" {
+                    BackendAction::Forward
+                } else {
+                    service_action(self.app_protocol(br))
+                };
                 let before = backends.len();
                 let refused = self.endpoints(&br.name, br.port, what, |addr, name| {
-                    backends.push(backend_at(addr, br.weight, name))
+                    backends.push(Backend {
+                        action,
+                        ..backend_at(addr, br.weight, name)
+                    })
                 })?;
                 // Every address refused: its share fails, as a refused ref's,
                 // rather than moving to the other refs.
@@ -278,6 +297,16 @@ fn one_target(addrs: &[SocketAddr]) -> Option<SocketAddr> {
         .iter()
         .copied()
         .max_by_key(|addr| std::hash::BuildHasher::hash_one(keys, addr))
+}
+
+/// A Service backend's connections open with a PROXY v2 header when its
+/// port asks for one: a server reading it fails every connection without.
+fn service_action(app_protocol: Option<&str>) -> BackendAction {
+    if app_protocol == Some(PROXY_V2_APP_PROTOCOL) {
+        BackendAction::ForwardProxied
+    } else {
+        BackendAction::Forward
+    }
 }
 
 fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
@@ -322,6 +351,7 @@ impl PortailConfig {
             lookup,
             seen: HashMap::new(),
             endpoint_overrides: &self.endpoint_overrides,
+            app_protocols: &self.app_protocol_overrides,
             headless_target_ports: &self.headless_target_ports,
             dial_rules: self.dial_rules.as_ref(),
         };
@@ -680,18 +710,16 @@ impl PortailConfig {
                 continue;
             }
 
-            let app_protocol = backend_ref.app_protocol.as_deref().or_else(|| {
-                self.app_protocol_overrides
-                    .get(&(backend_ref.name.clone(), backend_ref.port))
-                    .map(String::as_str)
-            });
+            let app_protocol = resolver.app_protocol(backend_ref);
             let use_tls = app_protocol == Some("https");
+            let action = service_action(app_protocol);
             let before = backends.len();
             let refused =
                 resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
                     let mut backend = backend_at(addr, backend_ref.weight, name);
                     backend.filters = backend_filters.clone();
                     backend.use_tls = use_tls;
+                    backend.action = action;
                     backends.push(backend);
                 })?;
             if refused > 0 && backends.len() == before {
@@ -2135,6 +2163,63 @@ mod tests {
         let tcp = table.find_tcp_backends(5432).unwrap();
         assert_eq!(tcp[0].socket_addr.to_string(), "10.250.0.7:8000");
         assert_eq!(tcp[0].action, crate::routing::BackendAction::ForwardProxied);
+    }
+
+    /// A Service port whose appProtocol asks for PROXY v2 gets it on TCP,
+    /// TLS passthrough and HTTP, never on UDP; `https` keeps its own meaning.
+    #[test]
+    fn a_proxy_v2_service_port_is_proxied_except_over_udp() {
+        let route = |listener: &str, svc: &str| {
+            serde_json::json!({"parentRefs": [{"name": "g", "sectionName": listener}],
+                "rules": [{"backendRefs": [{"name": svc, "port": 8443}]}]})
+        };
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [
+                {"name": "a", "protocol": "HTTP", "port": 8080},
+                {"name": "t", "protocol": "TCP", "port": 5432},
+                {"name": "p", "protocol": "TLS", "port": 8443, "tls": {"mode": "Passthrough"}},
+                {"name": "d", "protocol": "UDP", "port": 5353},
+                {"name": "w", "protocol": "TCP", "port": 5433}]},
+            "httpRoutes": [route("a", "idm.p.svc")],
+            "tcpRoutes": [route("t", "idm.p.svc"), route("w", "web.p.svc")],
+            "tlsRoutes": [{"parentRefs": [{"name": "g", "sectionName": "p"}],
+                "hostnames": ["idm.example.com"],
+                "rules": [{"backendRefs": [{"name": "idm.p.svc", "port": 8443}]}]}],
+            "udpRoutes": [route("d", "idm.p.svc")],
+        }))
+        .unwrap();
+        config
+            .app_protocol_overrides
+            .insert(("idm.p.svc".into(), 8443), PROXY_V2_APP_PROTOCOL.into());
+        config
+            .app_protocol_overrides
+            .insert(("web.p.svc".into(), 8443), "https".into());
+        let table = answering(
+            &config,
+            &[
+                ("idm.p.svc", &["10.128.0.5"]),
+                ("web.p.svc", &["10.128.0.6"]),
+            ],
+        );
+        use crate::routing::BackendAction::{Forward, ForwardProxied};
+
+        let tcp = &table.find_tcp_backends(5432).unwrap()[0];
+        assert_eq!((tcp.action, tcp.use_tls), (ForwardProxied, false));
+        let (selector, health) = (
+            crate::routing::BackendSelector::new(),
+            crate::proxy::health::HealthRegistry::new(),
+        );
+        let tls = table
+            .resolve_tls_passthrough(Some("idm.example.com"), 8443, None, &selector, &health)
+            .unwrap();
+        assert_eq!(tls.action, ForwardProxied);
+        let http = &table
+            .find_http_route("x", "GET", "/", b"", "", 8080)
+            .expect("the HTTP rule")
+            .backends[0];
+        assert_eq!((http.action, http.use_tls), (ForwardProxied, false));
+        assert_eq!(table.find_udp_backends(5353).unwrap()[0].action, Forward);
+        assert_eq!(table.find_tcp_backends(5433).unwrap()[0].action, Forward);
     }
 
     /// Allowed: an attached network serves, the pod's own addresses never.
