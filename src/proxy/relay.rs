@@ -111,7 +111,7 @@ pub(super) async fn handle_tcp_connection(
         stats.upstream_send_errors.inc();
         return fail_l4_backend(health, backend_addr, ctx, "took no first byte", &e);
     }
-    relay_l4(client, backend, idle).await;
+    both_ways(client, backend, idle).await;
 }
 
 /// Record an L4 backend's failure for its health, and log it once per
@@ -157,7 +157,7 @@ const RELAY_BUF_IDLE: Duration = Duration::from_secs(1);
 /// other must make progress in every `idle` window (None: unbounded), or a
 /// peer that never closes would pin the task and both fds forever. Errors on
 /// either side end both: the transfer is best-effort once started.
-pub(super) async fn relay_l4<A, B>(a: A, b: B, idle: Option<Duration>)
+pub(super) async fn both_ways<A, B>(a: A, b: B, idle: Option<Duration>)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

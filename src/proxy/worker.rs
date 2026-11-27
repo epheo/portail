@@ -32,7 +32,7 @@ use crate::proxy::http_filters::{
 use crate::proxy::http_parser::{find_header_end, has_header_end};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::proxy_protocol::{self, Header};
-use crate::proxy::relay::{handle_tcp_connection, handle_tls_passthrough, relay_l4};
+use crate::proxy::relay::{self, handle_tcp_connection, handle_tls_passthrough};
 use crate::proxy::request_processor::{
     analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
     RequestMeta, RoutingResult,
@@ -1544,7 +1544,7 @@ async fn proxy_http_request(
             }
         }
         client.flush().await?;
-        relay_l4(&mut *client, &mut backend, state.idle_body_timeout).await;
+        relay::both_ways(&mut *client, &mut backend, state.idle_body_timeout).await;
         return Ok((false, None));
     }
 
