@@ -264,3 +264,209 @@ fn client_socket(client: &Connection) -> Option<&TcpStream> {
         Connection::ClientTls { .. } | Connection::Mem { .. } => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::testkit::{
+        closing_backend, conn_state, routes, tcp_client, tls_client, tls_read_to_end, GET_A,
+    };
+
+    /// Over TLS only close_notify tells a strict client that a
+    /// close-delimited body ended rather than was cut.
+    #[tokio::test]
+    async fn close_delimited_body_over_tls_ends_with_close_notify() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\n\r\nall of it").await;
+        let Some((mut tls, engine)) = tls_client(routes(addr)).await else {
+            return;
+        };
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (read, out) = tls_read_to_end(&mut tls).await;
+        assert!(read.is_ok(), "{read:?} after {out:?}");
+        assert!(out.ends_with("Connection: close\r\n\r\nall of it"), "{out}");
+        // Done, as a client is once the close arrives: a lingering close
+        // waits for this.
+        drop(tls);
+        engine.await.unwrap().unwrap();
+    }
+
+    /// A body cut short after its head went out must still reset: a clean
+    /// close_notify would pass it off as complete.
+    #[tokio::test]
+    async fn a_truncated_tls_response_still_resets() {
+        let addr = closing_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial").await;
+        let Some((mut tls, engine)) = tls_client(routes(addr)).await else {
+            return;
+        };
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (read, out) = tls_read_to_end(&mut tls).await;
+        let kind = read.as_ref().map_err(std::io::Error::kind);
+        assert_eq!(kind, Err(std::io::ErrorKind::ConnectionReset), "{out}");
+        engine.await.unwrap().unwrap();
+    }
+
+    /// Over plain TCP too, a body cut short resets, while one that ends at
+    /// the backend's close ends with the client's FIN.
+    #[tokio::test]
+    async fn a_truncated_plain_response_resets_and_a_closed_one_ends() {
+        for (reply, ends) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial"[..],
+                false,
+            ),
+            (b"HTTP/1.1 200 OK\r\n\r\nall of it", true),
+        ] {
+            let addr = closing_backend(reply).await;
+            let (mut client, engine) = tcp_client(conn_state(routes(addr), false)).await;
+            client.write_all(GET_A).await.unwrap();
+            let mut out = Vec::new();
+            let read = client.read_to_end(&mut out).await;
+            let out = String::from_utf8_lossy(&out);
+            match read {
+                Ok(_) => assert!(ends && out.ends_with("all of it"), "{out}"),
+                Err(e) => {
+                    assert!(!ends, "{e}: {out}");
+                    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+            }
+            drop(client);
+            engine.await.unwrap().unwrap();
+        }
+    }
+
+    /// An engine-side connection plus the peer end a test drives.
+    fn mem_pair() -> (Connection, tokio::io::DuplexStream) {
+        let (engine, peer) = tokio::io::duplex(64 * 1024);
+        (
+            Connection::Mem {
+                inner: engine,
+                aborted: Default::default(),
+            },
+            peer,
+        )
+    }
+
+    async fn relay(
+        client: &mut Connection,
+        backend: &mut Connection,
+        content_length: Option<usize>,
+        chunked: Option<ChunkedStream>,
+    ) -> RequestBody {
+        let mut buf = Vec::new();
+        relay_request_body(
+            client,
+            backend,
+            &mut buf,
+            0,
+            0,
+            content_length,
+            chunked,
+            false,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Pooled, a conn holding a partial body would take the next request's
+    /// bytes as the rest of it.
+    #[tokio::test]
+    async fn request_body_client_eof_is_truncated() {
+        let (mut client, mut client_peer) = mem_pair();
+        let (mut backend, _backend_peer) = mem_pair();
+        client_peer.write_all(b"hel").await.unwrap();
+        drop(client_peer);
+        let out = relay(&mut client, &mut backend, Some(10), None).await;
+        assert!(matches!(out, RequestBody::Truncated));
+
+        let (mut client, mut client_peer) = mem_pair();
+        client_peer.write_all(b"5\r\nhello\r\n").await.unwrap();
+        drop(client_peer);
+        let out = relay(&mut client, &mut backend, None, Some(ChunkedStream::new())).await;
+        assert!(matches!(out, RequestBody::Truncated));
+    }
+
+    #[tokio::test]
+    async fn request_body_broken_chunked_forwards_nothing_past_it() {
+        let (mut client, mut client_peer) = mem_pair();
+        let (mut backend, mut backend_peer) = mem_pair();
+        client_peer
+            .write_all(b"5\r\nhello\r\n0\r\n\nGET /smuggled HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let out = relay(&mut client, &mut backend, None, Some(ChunkedStream::new())).await;
+        assert!(matches!(out, RequestBody::Broken));
+        drop(backend);
+        let mut got = Vec::new();
+        backend_peer.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty(), "forwarded {:?}", got);
+    }
+
+    /// Broken in the initial read: reported without reading the client
+    /// again (its EOF would otherwise surface as Truncated).
+    #[tokio::test]
+    async fn request_body_already_broken_skips_client_read() {
+        let (mut client, client_peer) = mem_pair();
+        let (mut backend, _backend_peer) = mem_pair();
+        drop(client_peer);
+        let mut stream = ChunkedStream::new();
+        stream.observe(b"5 \r\n");
+        assert!(stream.is_broken());
+        let out = relay(&mut client, &mut backend, None, Some(stream)).await;
+        assert!(matches!(out, RequestBody::Broken));
+    }
+
+    fn framing(content_length: Option<usize>, chunked: bool) -> ResponseFraming {
+        ResponseFraming {
+            status: 200,
+            backend_close: false,
+            content_length,
+            no_body: false,
+            body_bytes_already_forwarded: 0,
+            chunked: chunked.then(ChunkedStream::new),
+            overshoot: false,
+        }
+    }
+
+    /// Feeds `wire` then backend EOF; returns the outcome and what the
+    /// client received.
+    async fn forward(mut framing: ResponseFraming, wire: &[u8]) -> (BodyEnd, Vec<u8>) {
+        let (mut backend, mut backend_peer) = mem_pair();
+        let (mut client, mut client_peer) = mem_pair();
+        backend_peer.write_all(wire).await.unwrap();
+        drop(backend_peer);
+        let mut buf = Vec::new();
+        let end = forward_response_body(&mut backend, &mut client, &mut buf, &mut framing, None)
+            .await
+            .unwrap();
+        drop(client);
+        let mut got = Vec::new();
+        client_peer.read_to_end(&mut got).await.unwrap();
+        (end, got)
+    }
+
+    #[tokio::test]
+    async fn response_body_outcomes() {
+        let (end, got) = forward(framing(None, true), b"5\r\nhello\r\n0\r\n\r\n").await;
+        assert!(matches!(end, BodyEnd::Complete));
+        assert_eq!(got, b"5\r\nhello\r\n0\r\n\r\n");
+
+        // Only a close-delimited body may end at backend EOF.
+        let (end, _) = forward(framing(None, false), b"all of it").await;
+        assert!(matches!(end, BodyEnd::Closed));
+        let (end, _) = forward(framing(Some(100), false), b"partial").await;
+        assert!(matches!(end, BodyEnd::Truncated));
+        let (end, got) = forward(framing(None, true), b"5\r\nhello\r\n").await;
+        assert!(matches!(end, BodyEnd::Truncated));
+        assert!(!got.ends_with(b"0\r\n\r\n"));
+
+        let wire = b"5\r\nhello\r\n0\r\n\nHTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nSMUGGLED";
+        let (end, got) = forward(framing(None, true), wire).await;
+        assert!(matches!(end, BodyEnd::Broken));
+        assert!(got.is_empty(), "forwarded {:?}", got);
+    }
+}
