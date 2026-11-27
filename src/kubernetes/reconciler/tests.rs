@@ -1,7 +1,9 @@
 use super::super::converters::backend_dns_name;
 use super::*;
 use gateway_api::gateways::*;
-use gateway_api::referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo};
+use gateway_api::referencegrants::v1beta1::{
+    ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+};
 use kube::core::ObjectMeta;
 
 /// A pass that remembers no verdict, as every test but the cache's wants.
@@ -56,10 +58,10 @@ fn test_known_services() -> HashSet<(String, String)> {
 
 /// Build a test ClusterSnapshot with the given routes and optional reference grants.
 fn test_snapshot(
-    http_routes: Vec<HTTPRoute>,
-    tcp_routes: Vec<TCPRoute>,
-    tls_routes: Vec<TLSRoute>,
-    udp_routes: Vec<UDPRoute>,
+    http_routes: Vec<HttpRoute>,
+    tcp_routes: Vec<TcpRoute>,
+    tls_routes: Vec<TlsRoute>,
+    udp_routes: Vec<UdpRoute>,
     ns_labels: &HashMap<String, BTreeMap<String, String>>,
     reference_grants: Vec<ReferenceGrant>,
 ) -> ClusterSnapshot {
@@ -144,29 +146,29 @@ fn test_gateway() -> Gateway {
     }
 }
 
-fn test_http_route() -> HTTPRoute {
-    HTTPRoute {
+fn test_http_route() -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some("test-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/v1".to_string()),
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "api-svc".to_string(),
                     port: Some(3000),
                     weight: Some(1),
@@ -218,20 +220,20 @@ fn test_reconcile_filters_routes_by_gateway() {
     let matching_route = test_http_route();
     let ns_labels = default_ns_labels();
 
-    let other_route = HTTPRoute {
+    let other_route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("other-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "other-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["other.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+            rules: Some(vec![HttpRouteRules {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "other-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -303,7 +305,7 @@ fn test_backend_dns_name_with_namespace() {
 }
 
 /// `test_http_route` moved to `ns`, its parentRef still naming default/test-gw.
-fn route_from_ns(ns: &str) -> HTTPRoute {
+fn route_from_ns(ns: &str) -> HttpRoute {
     let mut route = test_http_route();
     route.metadata.namespace = Some(ns.to_string());
     route.spec.parent_refs.as_mut().unwrap()[0].namespace = Some("default".to_string());
@@ -442,17 +444,17 @@ fn test_reconcile_no_routes() {
 fn test_route_without_parent_refs_excluded() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let orphan = HTTPRoute {
+    let orphan = HttpRoute {
         metadata: ObjectMeta {
             name: Some("orphan".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
+        spec: HttpRouteSpec {
             parent_refs: None,
             hostnames: Some(vec!["orphan.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+            rules: Some(vec![HttpRouteRules {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "orphan-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -642,27 +644,27 @@ fn test_unsupported_protocol_listener_isolated() {
 fn test_tcp_route_conversion() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
-    let tcp_route = TCPRoute {
+    let tcp_route = TcpRoute {
         metadata: ObjectMeta {
             name: Some("db-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TCPRouteSpec {
-            parent_refs: Some(vec![TCPRouteParentRefs {
+        spec: TcpRouteSpec {
+            parent_refs: Some(vec![TcpRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("tcp".to_string()),
                 ..Default::default()
             }]),
-            rules: vec![TCPRouteRules {
+            rules: vec![TcpRouteRules {
                 backend_refs: vec![
-                    TCPRouteRulesBackendRefs {
+                    TcpRouteRulesBackendRefs {
                         name: "postgres-primary".to_string(),
                         port: Some(5432),
                         weight: Some(3),
                         ..Default::default()
                     },
-                    TCPRouteRulesBackendRefs {
+                    TcpRouteRulesBackendRefs {
                         name: "postgres-replica".to_string(),
                         port: Some(5432),
                         weight: Some(1),
@@ -728,14 +730,14 @@ fn test_tcp_route_conversion() {
 fn test_tls_route_conversion() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
-    let tls_route = TLSRoute {
+    let tls_route = TlsRoute {
         metadata: ObjectMeta {
             name: Some("tls-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TLSRouteSpec {
-            parent_refs: Some(vec![TLSRouteParentRefs {
+        spec: TlsRouteSpec {
+            parent_refs: Some(vec![TlsRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("tls-passthrough".to_string()),
                 ..Default::default()
@@ -744,8 +746,8 @@ fn test_tls_route_conversion() {
                 "secure.example.com".to_string(),
                 "*.internal.example.com".to_string(),
             ],
-            rules: vec![TLSRouteRules {
-                backend_refs: vec![TLSRouteRulesBackendRefs {
+            rules: vec![TlsRouteRules {
+                backend_refs: vec![TlsRouteRulesBackendRefs {
                     name: "backend-tls".to_string(),
                     port: Some(8443),
                     ..Default::default()
@@ -786,20 +788,20 @@ fn test_tls_route_conversion() {
 fn test_udp_route_conversion() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
-    let udp_route = UDPRoute {
+    let udp_route = UdpRoute {
         metadata: ObjectMeta {
             name: Some("dns-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: UDPRouteSpec {
-            parent_refs: Some(vec![UDPRouteParentRefs {
+        spec: UdpRouteSpec {
+            parent_refs: Some(vec![UdpRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("udp".to_string()),
                 ..Default::default()
             }]),
-            rules: vec![UDPRouteRules {
-                backend_refs: vec![UDPRouteRulesBackendRefs {
+            rules: vec![UdpRouteRules {
+                backend_refs: vec![UdpRouteRulesBackendRefs {
                     name: "coredns".to_string(),
                     port: Some(53),
                     ..Default::default()
@@ -836,27 +838,27 @@ fn test_udp_route_conversion() {
 fn test_exact_path_match() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("exact-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::Exact),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::Exact),
                         value: Some("/health".to_string()),
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "health-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -886,27 +888,27 @@ fn test_exact_path_match() {
 fn test_regex_path_match() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("regex-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::RegularExpression),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::RegularExpression),
                         value: Some("/users/\\d+".to_string()),
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "users-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -938,39 +940,39 @@ fn test_regex_path_match() {
 fn test_header_match_exact_and_regex() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("header-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/".to_string()),
                     }),
                     headers: Some(vec![
-                        HTTPRouteRulesMatchesHeaders {
+                        HttpRouteRulesMatchesHeaders {
                             name: "X-Env".to_string(),
                             value: "canary".to_string(),
-                            r#type: Some(HTTPRouteRulesMatchesHeadersType::Exact),
+                            r#type: Some(HttpRouteRulesMatchesHeadersType::Exact),
                         },
-                        HTTPRouteRulesMatchesHeaders {
+                        HttpRouteRulesMatchesHeaders {
                             name: "X-Request-Id".to_string(),
                             value: "^[a-f0-9-]+$".to_string(),
-                            r#type: Some(HTTPRouteRulesMatchesHeadersType::RegularExpression),
+                            r#type: Some(HttpRouteRulesMatchesHeadersType::RegularExpression),
                         },
                     ]),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "canary-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1000,39 +1002,39 @@ fn test_header_match_exact_and_regex() {
 fn test_query_param_match() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("qp-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/search".to_string()),
                     }),
                     query_params: Some(vec![
-                        HTTPRouteRulesMatchesQueryParams {
+                        HttpRouteRulesMatchesQueryParams {
                             name: "format".to_string(),
                             value: "json".to_string(),
-                            r#type: Some(HTTPRouteRulesMatchesQueryParamsType::Exact),
+                            r#type: Some(HttpRouteRulesMatchesQueryParamsType::Exact),
                         },
-                        HTTPRouteRulesMatchesQueryParams {
+                        HttpRouteRulesMatchesQueryParams {
                             name: "id".to_string(),
                             value: "^\\d+$".to_string(),
-                            r#type: Some(HTTPRouteRulesMatchesQueryParamsType::RegularExpression),
+                            r#type: Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression),
                         },
                     ]),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "search-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1064,27 +1066,27 @@ fn test_query_param_match() {
 fn test_weighted_backends() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("weighted-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
+            rules: Some(vec![HttpRouteRules {
                 backend_refs: Some(vec![
-                    HTTPRouteRulesBackendRefs {
+                    HttpRouteRulesBackendRefs {
                         name: "stable".to_string(),
                         port: Some(80),
                         weight: Some(90),
                         ..Default::default()
                     },
-                    HTTPRouteRulesBackendRefs {
+                    HttpRouteRulesBackendRefs {
                         name: "canary".to_string(),
                         port: Some(80),
                         weight: Some(10),
@@ -1116,20 +1118,20 @@ fn test_weighted_backends() {
 fn test_default_weight_and_port() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("defaults-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+            rules: Some(vec![HttpRouteRules {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     ..Default::default()
                 }]),
@@ -1157,43 +1159,43 @@ fn test_default_weight_and_port() {
 fn test_multiple_rules_per_route() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("multi-rule".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
             rules: Some(vec![
-                HTTPRouteRules {
-                    matches: Some(vec![HTTPRouteRulesMatches {
-                        path: Some(HTTPRouteRulesMatchesPath {
-                            r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(HttpRouteRulesMatchesPath {
+                            r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                             value: Some("/v1".to_string()),
                         }),
                         ..Default::default()
                     }]),
-                    backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                         name: "v1-svc".to_string(),
                         port: Some(80),
                         ..Default::default()
                     }]),
                     ..Default::default()
                 },
-                HTTPRouteRules {
-                    matches: Some(vec![HTTPRouteRulesMatches {
-                        path: Some(HTTPRouteRulesMatchesPath {
-                            r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(HttpRouteRulesMatchesPath {
+                            r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                             value: Some("/v2".to_string()),
                         }),
                         ..Default::default()
                     }]),
-                    backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                         name: "v2-svc".to_string(),
                         port: Some(80),
                         ..Default::default()
@@ -1229,27 +1231,27 @@ fn test_multiple_rules_per_route() {
 fn test_request_header_modifier_filter() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("hdr-mod-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
-                    request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-                        add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+                    request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+                        add: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierAdd {
                             name: "X-Added".to_string(),
                             value: "yes".to_string(),
                         }]),
-                        set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                        set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                             name: "X-Set".to_string(),
                             value: "always".to_string(),
                         }]),
@@ -1257,7 +1259,7 @@ fn test_request_header_modifier_filter() {
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1291,23 +1293,23 @@ fn test_request_header_modifier_filter() {
 fn test_response_header_modifier_filter() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("resp-hdr-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::ResponseHeaderModifier,
-                    response_header_modifier: Some(HTTPRouteRulesFiltersResponseHeaderModifier {
-                        add: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierAdd {
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::ResponseHeaderModifier,
+                    response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+                        add: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierAdd {
                             name: "X-Response".to_string(),
                             value: "modified".to_string(),
                         }]),
@@ -1316,7 +1318,7 @@ fn test_response_header_modifier_filter() {
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1347,27 +1349,27 @@ fn test_response_header_modifier_filter() {
 fn test_request_redirect_filter() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("redirect-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::RequestRedirect,
-                    request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                        scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::RequestRedirect,
+                    request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                        scheme: Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
                         hostname: Some("secure.example.com".to_string()),
                         port: Some(443),
-                        path: Some(HTTPRouteRulesFiltersRequestRedirectPath {
-                            r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
+                        path: Some(HttpRouteRulesFiltersRequestRedirectPath {
+                            r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
                             replace_full_path: Some("/new-path".to_string()),
                             replace_prefix_match: None,
                         }),
@@ -1407,32 +1409,32 @@ fn test_request_redirect_filter() {
 fn test_url_rewrite_filter() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("rewrite-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::UrlRewrite,
-                    url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::UrlRewrite,
+                    url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
                         hostname: Some("internal.example.com".to_string()),
-                        path: Some(HTTPRouteRulesFiltersUrlRewritePath {
-                            r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                        path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                            r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
                             replace_prefix_match: Some("/new".to_string()),
                             replace_full_path: None,
                         }),
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1465,23 +1467,23 @@ fn test_url_rewrite_filter() {
 fn test_request_mirror_filter() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("mirror-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::RequestMirror,
-                    request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
-                        backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::RequestMirror,
+                    request_mirror: Some(HttpRouteRulesFiltersRequestMirror {
+                        backend_ref: HttpRouteRulesFiltersRequestMirrorBackendRef {
                             name: "mirror-svc".to_string(),
                             port: Some(9090),
                             ..Default::default()
@@ -1490,7 +1492,7 @@ fn test_request_mirror_filter() {
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "api-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1530,7 +1532,7 @@ fn test_multi_parentref_mixed_acceptance() {
         .parent_refs
         .as_mut()
         .unwrap()
-        .push(HTTPRouteParentRefs {
+        .push(HttpRouteParentRefs {
             name: "test-gw".to_string(),
             section_name: Some("nonexistent".to_string()),
             ..Default::default()
@@ -1568,24 +1570,24 @@ fn test_multi_parentref_mixed_acceptance() {
 
 /// Cross-namespace mirror ref helper: HTTPRoute in default mirroring to
 /// postgres-replica in db (a known service).
-fn mirror_route_to_db() -> HTTPRoute {
-    HTTPRoute {
+fn mirror_route_to_db() -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some("mirror-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::RequestMirror,
-                    request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
-                        backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
+            rules: Some(vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::RequestMirror,
+                    request_mirror: Some(HttpRouteRulesFiltersRequestMirror {
+                        backend_ref: HttpRouteRulesFiltersRequestMirrorBackendRef {
                             name: "postgres-replica".to_string(),
                             port: Some(9090),
                             namespace: Some("db".to_string()),
@@ -1595,7 +1597,7 @@ fn mirror_route_to_db() -> HTTPRoute {
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "api-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -1776,24 +1778,24 @@ fn external_name_backend_is_followed_when_allowed() {
 
 fn route_with_filters(
     name: &str,
-    filters: Vec<HTTPRouteRulesFilters>,
-    backend_filters: Vec<HTTPRouteRulesBackendRefsFilters>,
-) -> HTTPRoute {
-    HTTPRoute {
+    filters: Vec<HttpRouteRulesFilters>,
+    backend_filters: Vec<HttpRouteRulesBackendRefsFilters>,
+) -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
+            rules: Some(vec![HttpRouteRules {
                 filters: Some(filters),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     port: Some(80),
                     filters: Some(backend_filters),
@@ -1806,7 +1808,7 @@ fn route_with_filters(
     }
 }
 
-fn reconcile_http(routes: Vec<HTTPRoute>) -> ReconcileResult {
+fn reconcile_http(routes: Vec<HttpRoute>) -> ReconcileResult {
     reconcile_to_config(
         &test_gateway(),
         &test_snapshot(routes, vec![], vec![], vec![], &default_ns_labels(), vec![]),
@@ -1822,10 +1824,10 @@ fn reconcile_http(routes: Vec<HTTPRoute>) -> ReconcileResult {
 /// say why in status, while its siblings keep serving.
 #[test]
 fn test_crlf_header_value_keeps_route_out_and_reports_it() {
-    let crlf_set = HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
-        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-            set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+    let crlf_set = HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+            set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                 name: "X-Tenant".to_string(),
                 value: "a\r\nX-Injected: 1".to_string(),
             }]),
@@ -1869,10 +1871,10 @@ fn test_crlf_header_value_keeps_route_out_and_reports_it() {
 
 #[test]
 fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
-    let response_add_lf = HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::ResponseHeaderModifier,
-        response_header_modifier: Some(HTTPRouteRulesFiltersResponseHeaderModifier {
-            add: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierAdd {
+    let response_add_lf = HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::ResponseHeaderModifier,
+        response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+            add: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierAdd {
                 name: "X-A".to_string(),
                 value: "a\nSet-Cookie: s=1".to_string(),
             }]),
@@ -1880,20 +1882,20 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
         }),
         ..Default::default()
     };
-    let remove_crlf = HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
-        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+    let remove_crlf = HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
             remove: Some(vec!["X-A\r\nX-B".to_string()]),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let redirect = |hostname: Option<&str>, full_path: Option<&str>| HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::RequestRedirect,
-        request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+    let redirect = |hostname: Option<&str>, full_path: Option<&str>| HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::RequestRedirect,
+        request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
             hostname: hostname.map(str::to_string),
-            path: full_path.map(|p| HTTPRouteRulesFiltersRequestRedirectPath {
-                r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
+            path: full_path.map(|p| HttpRouteRulesFiltersRequestRedirectPath {
+                r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
                 replace_full_path: Some(p.to_string()),
                 replace_prefix_match: None,
             }),
@@ -1901,12 +1903,12 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
         }),
         ..Default::default()
     };
-    let rewrite = |hostname: Option<&str>, prefix: Option<&str>| HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::UrlRewrite,
-        url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+    let rewrite = |hostname: Option<&str>, prefix: Option<&str>| HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::UrlRewrite,
+        url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
             hostname: hostname.map(str::to_string),
-            path: prefix.map(|p| HTTPRouteRulesFiltersUrlRewritePath {
-                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+            path: prefix.map(|p| HttpRouteRulesFiltersUrlRewritePath {
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
                 replace_prefix_match: Some(p.to_string()),
                 replace_full_path: None,
             }),
@@ -1933,7 +1935,7 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
     ];
     for (filter, field) in cases {
         // The CRD refuses a redirect beside backendRefs.
-        let redirects = filter.r#type == HTTPRouteRulesFiltersType::RequestRedirect;
+        let redirects = filter.r#type == HttpRouteRulesFiltersType::RequestRedirect;
         let mut route = route_with_filters("inj", vec![filter], vec![]);
         if redirects {
             route.spec.rules.as_mut().unwrap()[0].backend_refs = None;
@@ -1950,12 +1952,12 @@ fn test_injection_in_any_wire_bound_filter_field_rejects_route() {
     }
 }
 
-fn backend_set_header(value: &str) -> HTTPRouteRulesBackendRefsFilters {
-    HTTPRouteRulesBackendRefsFilters {
-        r#type: HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier,
-        request_header_modifier: Some(HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+fn backend_set_header(value: &str) -> HttpRouteRulesBackendRefsFilters {
+    HttpRouteRulesBackendRefsFilters {
+        r#type: HttpRouteRulesBackendRefsFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HttpRouteRulesBackendRefsFiltersRequestHeaderModifier {
             set: Some(vec![
-                HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
                     name: "X-Backend".to_string(),
                     value: value.to_string(),
                 },
@@ -2000,9 +2002,9 @@ fn test_backend_ref_header_modifier_values_are_checked() {
 /// silently: the data plane never runs them, so the route served without.
 #[test]
 fn test_unsupported_backend_ref_filter_rejects_route() {
-    let redirect = HTTPRouteRulesBackendRefsFilters {
-        r#type: HTTPRouteRulesBackendRefsFiltersType::RequestRedirect,
-        request_redirect: Some(HTTPRouteRulesBackendRefsFiltersRequestRedirect {
+    let redirect = HttpRouteRulesBackendRefsFilters {
+        r#type: HttpRouteRulesBackendRefsFiltersType::RequestRedirect,
+        request_redirect: Some(HttpRouteRulesBackendRefsFiltersRequestRedirect {
             hostname: Some("example.org".to_string()),
             ..Default::default()
         }),
@@ -2026,7 +2028,7 @@ fn test_unsupported_backend_ref_filter_rejects_route() {
 }
 
 /// One rule under `parentRefs: [test-gw]` and `api.example.com`.
-fn route_with_rule(name: &str, rule: serde_json::Value) -> HTTPRoute {
+fn route_with_rule(name: &str, rule: serde_json::Value) -> HttpRoute {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "HTTPRoute",
@@ -2111,7 +2113,7 @@ fn a_route_verdict_stands_until_its_generation_moves() {
     route.metadata.uid = Some("r-uid".to_string());
     route.metadata.generation = Some(1);
     let verdicts = RouteVerdicts::default();
-    let pass = |routes: Vec<HTTPRoute>| {
+    let pass = |routes: Vec<HttpRoute>| {
         let snapshot = test_snapshot(routes, vec![], vec![], vec![], &default_ns_labels(), vec![]);
         super::reconcile_to_config(
             &test_gateway(),
@@ -2291,14 +2293,14 @@ fn test_unsupported_filters_reason() {
     assert!(result.config.http_routes.is_empty());
 }
 
-fn request_header_modifier(set: Vec<(&str, &str)>, remove: Vec<&str>) -> HTTPRouteRulesFilters {
-    HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
-        request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+fn request_header_modifier(set: Vec<(&str, &str)>, remove: Vec<&str>) -> HttpRouteRulesFilters {
+    HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+        request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
             set: Some(
                 set.into_iter()
                     .map(
-                        |(name, value)| HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                        |(name, value)| HttpRouteRulesFiltersRequestHeaderModifierSet {
                             name: name.to_string(),
                             value: value.to_string(),
                         },
@@ -2349,9 +2351,9 @@ fn test_set_host_converts_unless_url_rewrite_also_sets_it() {
             if config.set[0].name == "Host" && config.set[0].value == "internal.example.com"
     ));
 
-    let rewrite_host = HTTPRouteRulesFilters {
-        r#type: HTTPRouteRulesFiltersType::UrlRewrite,
-        url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+    let rewrite_host = HttpRouteRulesFilters {
+        r#type: HttpRouteRulesFiltersType::UrlRewrite,
+        url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
             hostname: Some("other.example.com".to_string()),
             path: None,
         }),
@@ -2379,25 +2381,25 @@ fn test_set_host_converts_unless_url_rewrite_also_sets_it() {
 fn test_timeouts_conversion() {
     let gw = test_gateway();
     let ns_labels = default_ns_labels();
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("timeout-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["api.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+            rules: Some(vec![HttpRouteRules {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "svc".to_string(),
                     port: Some(80),
                     ..Default::default()
                 }]),
-                timeouts: Some(HTTPRouteRulesTimeouts {
+                timeouts: Some(HttpRouteRulesTimeouts {
                     request: Some("30s".to_string()),
                     backend_request: Some("10s".to_string()),
                 }),
@@ -2432,21 +2434,21 @@ fn test_mixed_route_types() {
     let gw = multi_listener_gateway();
     let ns_labels = default_ns_labels();
 
-    let http_route = HTTPRoute {
+    let http_route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("http-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["web.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+            rules: Some(vec![HttpRouteRules {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "web-svc".to_string(),
                     port: Some(80),
                     ..Default::default()
@@ -2457,20 +2459,20 @@ fn test_mixed_route_types() {
         status: None,
     };
 
-    let tcp_route = TCPRoute {
+    let tcp_route = TcpRoute {
         metadata: ObjectMeta {
             name: Some("tcp-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TCPRouteSpec {
-            parent_refs: Some(vec![TCPRouteParentRefs {
+        spec: TcpRouteSpec {
+            parent_refs: Some(vec![TcpRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("tcp".to_string()),
                 ..Default::default()
             }]),
-            rules: vec![TCPRouteRules {
-                backend_refs: vec![TCPRouteRulesBackendRefs {
+            rules: vec![TcpRouteRules {
+                backend_refs: vec![TcpRouteRulesBackendRefs {
                     name: "db-svc".to_string(),
                     port: Some(5432),
                     ..Default::default()
@@ -2536,44 +2538,44 @@ fn test_reconcile_to_route_table_http() {
         status: None,
     };
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("rt-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "rt-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["app.example.com".to_string()]),
             rules: Some(vec![
-                HTTPRouteRules {
-                    matches: Some(vec![HTTPRouteRulesMatches {
-                        path: Some(HTTPRouteRulesMatchesPath {
-                            r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(HttpRouteRulesMatchesPath {
+                            r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                             value: Some("/api".to_string()),
                         }),
                         ..Default::default()
                     }]),
-                    backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                         name: "127.0.0.1".to_string(),
                         port: Some(3000),
                         ..Default::default()
                     }]),
                     ..Default::default()
                 },
-                HTTPRouteRules {
-                    matches: Some(vec![HTTPRouteRulesMatches {
-                        path: Some(HTTPRouteRulesMatchesPath {
-                            r#type: Some(HTTPRouteRulesMatchesPathType::Exact),
+                HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(HttpRouteRulesMatchesPath {
+                            r#type: Some(HttpRouteRulesMatchesPathType::Exact),
                             value: Some("/health".to_string()),
                         }),
                         ..Default::default()
                     }]),
-                    backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                         name: "127.0.0.1".to_string(),
                         port: Some(3001),
                         ..Default::default()
@@ -2635,20 +2637,20 @@ fn test_reconcile_to_route_table_tcp() {
         status: None,
     };
 
-    let tcp_route = TCPRoute {
+    let tcp_route = TcpRoute {
         metadata: ObjectMeta {
             name: Some("db-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TCPRouteSpec {
-            parent_refs: Some(vec![TCPRouteParentRefs {
+        spec: TcpRouteSpec {
+            parent_refs: Some(vec![TcpRouteParentRefs {
                 name: "tcp-gw".to_string(),
                 section_name: Some("tcp".to_string()),
                 ..Default::default()
             }]),
-            rules: vec![TCPRouteRules {
-                backend_refs: vec![TCPRouteRulesBackendRefs {
+            rules: vec![TcpRouteRules {
+                backend_refs: vec![TcpRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(5432),
                     ..Default::default()
@@ -2699,31 +2701,31 @@ fn test_reconcile_to_route_table_with_filters() {
         status: None,
     };
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("filter-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "filter-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/".to_string()),
                     }),
                     ..Default::default()
                 }]),
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    r#type: HTTPRouteRulesFiltersType::RequestHeaderModifier,
-                    request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-                        add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+                    request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+                        add: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierAdd {
                             name: "X-Gateway".to_string(),
                             value: "portail".to_string(),
                         }]),
@@ -2732,7 +2734,7 @@ fn test_reconcile_to_route_table_with_filters() {
                     }),
                     ..Default::default()
                 }]),
-                backend_refs: Some(vec![HTTPRouteRulesBackendRefs {
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(8001),
                     ..Default::default()
@@ -2785,35 +2787,35 @@ fn test_reconcile_to_route_table_weighted_backends() {
         status: None,
     };
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("wt-route".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
-            parent_refs: Some(vec![HTTPRouteParentRefs {
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "wt-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
             }]),
             hostnames: Some(vec!["app.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/".to_string()),
                     }),
                     ..Default::default()
                 }]),
                 backend_refs: Some(vec![
-                    HTTPRouteRulesBackendRefs {
+                    HttpRouteRulesBackendRefs {
                         name: "127.0.0.1".to_string(),
                         port: Some(8001),
                         weight: Some(3),
                         ..Default::default()
                     },
-                    HTTPRouteRulesBackendRefs {
+                    HttpRouteRulesBackendRefs {
                         name: "127.0.0.1".to_string(),
                         port: Some(8002),
                         weight: Some(1),
@@ -2880,10 +2882,10 @@ fn status_parents_json_matches_full_route_serialization() {
         "no status -> no parents"
     );
 
-    route.status = Some(HTTPRouteStatus {
-        parents: vec![HTTPRouteStatusParents {
+    route.status = Some(HttpRouteStatus {
+        parents: vec![HttpRouteStatusParents {
             controller_name: "epheo.eu/portail".to_string(),
-            parent_ref: HTTPRouteStatusParentsParentRef {
+            parent_ref: HttpRouteStatusParentsParentRef {
                 name: "test-gw".to_string(),
                 section_name: Some("http".to_string()),
                 ..Default::default()
@@ -2907,7 +2909,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 fn created(secs: i64) -> Option<Time> {
     Some(Time(
-        k8s_openapi::chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+        k8s_openapi::jiff::Timestamp::from_second(secs).unwrap(),
     ))
 }
 
@@ -2939,8 +2941,8 @@ fn attach_gateway(listeners: Vec<GatewayListeners>) -> Gateway {
     }
 }
 
-fn http_parent(ns: Option<&str>, section: Option<&str>) -> HTTPRouteParentRefs {
-    HTTPRouteParentRefs {
+fn http_parent(ns: Option<&str>, section: Option<&str>) -> HttpRouteParentRefs {
+    HttpRouteParentRefs {
         name: "gw".to_string(),
         namespace: ns.map(String::from),
         section_name: section.map(String::from),
@@ -2952,22 +2954,22 @@ fn http_parent(ns: Option<&str>, section: Option<&str>) -> HTTPRouteParentRefs {
 fn app_route(
     name: &str,
     ns: &str,
-    parent_refs: Vec<HTTPRouteParentRefs>,
+    parent_refs: Vec<HttpRouteParentRefs>,
     backends: &[(&str, Option<&str>, i32, i32)],
-) -> HTTPRoute {
-    HTTPRoute {
+) -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
+        spec: HttpRouteSpec {
             parent_refs: Some(parent_refs),
             hostnames: Some(vec!["app.example.com".to_string()]),
-            rules: Some(vec![HTTPRouteRules {
-                matches: Some(vec![HTTPRouteRulesMatches {
-                    path: Some(HTTPRouteRulesMatchesPath {
-                        r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+            rules: Some(vec![HttpRouteRules {
+                matches: Some(vec![HttpRouteRulesMatches {
+                    path: Some(HttpRouteRulesMatchesPath {
+                        r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
                         value: Some("/".to_string()),
                     }),
                     ..Default::default()
@@ -2975,7 +2977,7 @@ fn app_route(
                 backend_refs: Some(
                     backends
                         .iter()
-                        .map(|(svc, svc_ns, port, weight)| HTTPRouteRulesBackendRefs {
+                        .map(|(svc, svc_ns, port, weight)| HttpRouteRulesBackendRefs {
                             name: svc.to_string(),
                             namespace: svc_ns.map(String::from),
                             port: Some(*port),
@@ -3002,7 +3004,7 @@ fn loopback_services() -> ServiceState {
     services
 }
 
-fn snapshot_of(http: Vec<HTTPRoute>, tcp: Vec<TCPRoute>, udp: Vec<UDPRoute>) -> ClusterSnapshot {
+fn snapshot_of(http: Vec<HttpRoute>, tcp: Vec<TcpRoute>, udp: Vec<UdpRoute>) -> ClusterSnapshot {
     test_snapshot(http, tcp, vec![], udp, &default_ns_labels(), vec![])
 }
 
@@ -3152,8 +3154,8 @@ fn route_on_an_unservable_listener_is_served_nowhere() {
     assert!(!app_served_on(&table, 80), "leaked onto every port");
 }
 
-fn tcp_parent(section: Option<&str>, port: Option<i32>) -> TCPRouteParentRefs {
-    TCPRouteParentRefs {
+fn tcp_parent(section: Option<&str>, port: Option<i32>) -> TcpRouteParentRefs {
+    TcpRouteParentRefs {
         name: "gw".to_string(),
         section_name: section.map(String::from),
         port,
@@ -3165,24 +3167,24 @@ fn tcp_parent(section: Option<&str>, port: Option<i32>) -> TCPRouteParentRefs {
 fn tcp_route(
     name: &str,
     secs: i64,
-    parent_refs: Vec<TCPRouteParentRefs>,
+    parent_refs: Vec<TcpRouteParentRefs>,
     rules: &[&[(&str, i32, i32)]],
-) -> TCPRoute {
-    TCPRoute {
+) -> TcpRoute {
+    TcpRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             creation_timestamp: created(secs),
             ..Default::default()
         },
-        spec: TCPRouteSpec {
+        spec: TcpRouteSpec {
             parent_refs: Some(parent_refs),
             rules: rules
                 .iter()
-                .map(|backends| TCPRouteRules {
+                .map(|backends| TcpRouteRules {
                     backend_refs: backends
                         .iter()
-                        .map(|(svc, port, weight)| TCPRouteRulesBackendRefs {
+                        .map(|(svc, port, weight)| TcpRouteRulesBackendRefs {
                             name: svc.to_string(),
                             port: Some(*port),
                             weight: Some(*weight),
@@ -3369,21 +3371,21 @@ fn https_and_tls_passthrough_share_a_port() {
         vec![http_parent(None, Some("web"))],
         &[("127.0.0.1", None, 8001, 1)],
     );
-    let tls = TLSRoute {
+    let tls = TlsRoute {
         metadata: ObjectMeta {
             name: Some("secure".to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TLSRouteSpec {
-            parent_refs: Some(vec![TLSRouteParentRefs {
+        spec: TlsRouteSpec {
+            parent_refs: Some(vec![TlsRouteParentRefs {
                 name: "gw".to_string(),
                 section_name: Some("db".to_string()),
                 ..Default::default()
             }]),
             hostnames: vec!["secure.example.com".to_string()],
-            rules: vec![TLSRouteRules {
-                backend_refs: vec![TLSRouteRulesBackendRefs {
+            rules: vec![TlsRouteRules {
+                backend_refs: vec![TlsRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(7001),
                     ..Default::default()
@@ -3443,22 +3445,22 @@ fn https_and_tls_passthrough_share_a_port() {
 
 /// `default/name`, on listener `section` of `default/gw`, for `hostname`,
 /// to 127.0.0.1:`port`.
-fn tls_route_on(name: &str, section: &str, hostname: &str, port: i32) -> TLSRoute {
-    TLSRoute {
+fn tls_route_on(name: &str, section: &str, hostname: &str, port: i32) -> TlsRoute {
+    TlsRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             ..Default::default()
         },
-        spec: TLSRouteSpec {
-            parent_refs: Some(vec![TLSRouteParentRefs {
+        spec: TlsRouteSpec {
+            parent_refs: Some(vec![TlsRouteParentRefs {
                 name: "gw".to_string(),
                 section_name: Some(section.to_string()),
                 ..Default::default()
             }]),
             hostnames: vec![hostname.to_string()],
-            rules: vec![TLSRouteRules {
-                backend_refs: vec![TLSRouteRulesBackendRefs {
+            rules: vec![TlsRouteRules {
+                backend_refs: vec![TlsRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(port),
                     ..Default::default()
@@ -3546,20 +3548,20 @@ fn tcp_route_first_rule_owns_the_listener() {
 #[test]
 fn udp_route_attaches_like_tcp() {
     let gw = attach_gateway(vec![gw_listener("dns", 5353, "UDP")]);
-    let udp = |name: &str, secs: i64, port: i32| UDPRoute {
+    let udp = |name: &str, secs: i64, port: i32| UdpRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             creation_timestamp: created(secs),
             ..Default::default()
         },
-        spec: UDPRouteSpec {
-            parent_refs: Some(vec![UDPRouteParentRefs {
+        spec: UdpRouteSpec {
+            parent_refs: Some(vec![UdpRouteParentRefs {
                 name: "gw".to_string(),
                 ..Default::default()
             }]),
-            rules: vec![UDPRouteRules {
-                backend_refs: vec![UDPRouteRulesBackendRefs {
+            rules: vec![UdpRouteRules {
+                backend_refs: vec![UdpRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(port),
                     ..Default::default()
@@ -3600,21 +3602,21 @@ fn tcp_and_udp_listeners_on_one_port_both_serve() {
         vec![tcp_parent(None, None)],
         &[&[("127.0.0.1", 7001, 1)]],
     );
-    let udp = UDPRoute {
+    let udp = UdpRoute {
         metadata: ObjectMeta {
             name: Some("u".to_string()),
             namespace: Some("default".to_string()),
             creation_timestamp: created(100),
             ..Default::default()
         },
-        spec: UDPRouteSpec {
-            parent_refs: Some(vec![UDPRouteParentRefs {
+        spec: UdpRouteSpec {
+            parent_refs: Some(vec![UdpRouteParentRefs {
                 name: "gw".to_string(),
                 port: Some(53),
                 ..Default::default()
             }]),
-            rules: vec![UDPRouteRules {
-                backend_refs: vec![UDPRouteRulesBackendRefs {
+            rules: vec![UdpRouteRules {
+                backend_refs: vec![UdpRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(7002),
                     ..Default::default()
@@ -3660,21 +3662,21 @@ fn oldest_tls_route_owns_its_hostname() {
         ..Default::default()
     });
     let gw = attach_gateway(vec![passthrough]);
-    let tls = |name: &str, secs: i64, port: i32| TLSRoute {
+    let tls = |name: &str, secs: i64, port: i32| TlsRoute {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             creation_timestamp: created(secs),
             ..Default::default()
         },
-        spec: TLSRouteSpec {
-            parent_refs: Some(vec![TLSRouteParentRefs {
+        spec: TlsRouteSpec {
+            parent_refs: Some(vec![TlsRouteParentRefs {
                 name: "gw".to_string(),
                 ..Default::default()
             }]),
             hostnames: vec!["secure.example.com".to_string()],
-            rules: vec![TLSRouteRules {
-                backend_refs: vec![TLSRouteRulesBackendRefs {
+            rules: vec![TlsRouteRules {
+                backend_refs: vec![TlsRouteRulesBackendRefs {
                     name: "127.0.0.1".to_string(),
                     port: Some(port),
                     ..Default::default()
@@ -3816,7 +3818,7 @@ fn equally_specific_http_routes_oldest_wins() {
         r.metadata.creation_timestamp = created(secs);
         r
     };
-    let winner = |routes: Vec<HTTPRoute>| {
+    let winner = |routes: Vec<HttpRoute>| {
         let (_, table) = reconcile_table(&gw, &snapshot_of(routes, vec![], vec![]));
         table
             .find_http_route("app.example.com", "GET", "/", &[], "", 80)
@@ -3860,7 +3862,7 @@ fn same_age_routes_tie_break_on_the_namespace_slash_name_string() {
             .known_services
             .insert(("127.0.0.1".to_string(), ns.to_string()));
     }
-    let winner = |routes: Vec<HTTPRoute>| {
+    let winner = |routes: Vec<HttpRoute>| {
         let snapshot = snapshot_of(routes, vec![], vec![]);
         let mut config = reconcile_to_config(&gw, &snapshot, &HashMap::new(), &services)
             .unwrap()
@@ -3897,7 +3899,7 @@ fn edge_gateway(on_network: bool) -> Gateway {
 /// Network address would: its Gateway backends resolve.
 #[test]
 fn a_gateway_dialing_out_on_a_network_reaches_gateway_backends() {
-    let route: HTTPRoute = edge_route(
+    let route: HttpRoute = edge_route(
         "HTTPRoute",
         "edge",
         serde_json::json!({"backendRefs": [gateway_ref("publish", Some("p-publish"), 80)]}),
@@ -4039,7 +4041,7 @@ fn a_gateway_backend_resolves_only_when_it_may() {
         ),
     ];
     for (case, on_network, backend, granted, want) in cases {
-        let route: HTTPRoute = edge_route(
+        let route: HttpRoute = edge_route(
             "HTTPRoute",
             "edge",
             serde_json::json!({"backendRefs": [backend]}),
@@ -4096,9 +4098,9 @@ fn a_gateway_backend_resolves_only_when_it_may() {
 fn only_tcp_borne_forward_refs_name_a_gateway() {
     let backend =
         || serde_json::json!({"backendRefs": [gateway_ref("publish", Some("p-publish"), 443)]});
-    let tcp: TCPRoute = edge_route("TCPRoute", "tcp", backend());
-    let udp: UDPRoute = edge_route("UDPRoute", "udp", backend());
-    let mirror: HTTPRoute = edge_route(
+    let tcp: TcpRoute = edge_route("TCPRoute", "tcp", backend());
+    let udp: UdpRoute = edge_route("UDPRoute", "udp", backend());
+    let mirror: HttpRoute = edge_route(
         "HTTPRoute",
         "mirror",
         serde_json::json!({

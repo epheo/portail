@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use futures::Stream;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-use k8s_openapi::chrono::Utc;
+use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::Client;
 use tokio::sync::watch;
@@ -285,7 +285,7 @@ impl LeaseLock {
     /// One round; the lease's validity is judged at `started`, when the
     /// round began, the later of the two instants never in its favor.
     async fn try_acquire_or_renew(&mut self, started: Instant) -> Result<Outcome, kube::Error> {
-        let wall = MicroTime(Utc::now());
+        let wall = MicroTime(Timestamp::now());
         let duration_secs = i32::try_from(LEASE_DURATION.as_secs()).unwrap_or(i32::MAX);
         let Some(mut lease) = self.api.get_opt(&self.name).await? else {
             let lease = Lease {
@@ -362,7 +362,7 @@ impl LeaseLock {
         if spec.holder_identity.as_deref() != Some(self.identity.as_str()) {
             return Ok(());
         }
-        let wall = MicroTime(Utc::now());
+        let wall = MicroTime(Timestamp::now());
         spec.holder_identity = Some(String::new());
         spec.lease_duration_seconds = Some(RELEASED_DURATION_SECS);
         spec.acquire_time = Some(wall.clone());
@@ -645,5 +645,24 @@ mod tests {
     #[test]
     fn identities_differ_per_process_start() {
         assert_ne!(identity(), identity());
+    }
+
+    /// The Lease's times as the apiserver takes a MicroTime: microseconds
+    /// and Z. A drift in the bindings' format would pass every other test.
+    #[tokio::test(start_paused = true)]
+    async fn lease_times_are_written_in_microseconds() {
+        let leases = Arc::new(FakeLeases::default());
+        let a = Replica::start(&leases, "a");
+        sleep(0.1).await;
+        assert!(a.leads());
+        let lease = leases.lease.lock().unwrap().clone().unwrap();
+        for field in ["acquireTime", "renewTime"] {
+            let time = lease["spec"][field].as_str().unwrap();
+            assert_eq!(
+                time.replace(|c: char| c.is_ascii_digit(), "d"),
+                "dddd-dd-ddTdd:dd:dd.ddddddZ",
+                "{field}: {time}"
+            );
+        }
     }
 }

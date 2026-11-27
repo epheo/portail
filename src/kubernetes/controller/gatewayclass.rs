@@ -14,11 +14,11 @@ use kube::Client;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use gateway_api::experimental::tcproutes::TCPRoute;
-use gateway_api::experimental::tlsroutes::TLSRoute;
-use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
+use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
-use gateway_api::httproutes::HTTPRoute;
+use gateway_api::httproutes::HttpRoute;
 
 use super::params;
 use super::reconcile::{class_owner, ClassOwner};
@@ -275,10 +275,10 @@ async fn remove_departed(client: &Client, controller: &str, departed: Vec<Depart
             };
         }
         let write = match o.kind {
-            "HTTPRoute" => remove!(HTTPRoute, "parents"),
-            "TCPRoute" => remove!(TCPRoute, "parents"),
-            "TLSRoute" => remove!(TLSRoute, "parents"),
-            "UDPRoute" => remove!(UDPRoute, "parents"),
+            "HTTPRoute" => remove!(HttpRoute, "parents"),
+            "TCPRoute" => remove!(TcpRoute, "parents"),
+            "TLSRoute" => remove!(TlsRoute, "parents"),
+            "UDPRoute" => remove!(UdpRoute, "parents"),
             "RateLimitPolicy" => remove!(RateLimitPolicy, "ancestors"),
             _ => continue,
         };
@@ -582,7 +582,7 @@ mod tests {
             "written before the caches synced"
         );
 
-        routes.observe::<HTTPRoute>(&Ok(watcher::Event::InitDone));
+        routes.observe::<HttpRoute>(&Ok(watcher::Event::InitDone));
         let written = eventually(&p, "gatewayclasses", "portail").await;
         assert_eq!(written["status"]["conditions"][0]["status"], "True");
         shutdown.cancel();
@@ -633,7 +633,7 @@ mod tests {
 
     /// A route whose status holds our entries for `gateways`, a foreign
     /// controller's for the first, and that targets `target`.
-    fn route_reporting(target: &str, gateways: &[&str]) -> HTTPRoute {
+    fn route_reporting(target: &str, gateways: &[&str]) -> HttpRoute {
         let mut entries: Vec<Value> = gateways
             .iter()
             .map(|gw| testkit::status_entry(CONTROLLER, gw, "parentRef"))

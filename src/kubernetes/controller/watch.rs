@@ -175,7 +175,12 @@ fn status_code(e: &watcher::Error) -> Option<u16> {
 /// kube-rs reads a watch line by line: an indented 403 becomes one serde
 /// error per line and loses its status code.
 pub(super) async fn client() -> anyhow::Result<Client> {
-    let config = kube::Config::infer().await?;
+    let mut config = kube::Config::infer().await?;
+    // kube 4 dropped kube 2's read timeout, so a request could hang with
+    // no deadline, and turned on client-side retries, which would race the
+    // controller's own requeue on a write.
+    config.read_timeout = Some(std::time::Duration::from_secs(295));
+    config.default_retry = false;
     Ok(kube::client::ClientBuilder::try_from(config)?
         .with_layer(&tower::util::MapRequestLayer::new(accept_plain_json))
         .build())
@@ -451,10 +456,10 @@ macro_rules! impl_route_status_reports {
 }
 
 impl_route_status_reports!(
-    gateway_api::httproutes::HTTPRoute,
-    gateway_api::experimental::tcproutes::TCPRoute,
-    gateway_api::experimental::tlsroutes::TLSRoute,
-    gateway_api::experimental::udproutes::UDPRoute
+    gateway_api::httproutes::HttpRoute,
+    gateway_api::experimental::tcproutes::v1alpha2::TcpRoute,
+    gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute,
+    gateway_api::experimental::udproutes::v1alpha2::UdpRoute
 );
 
 impl StatusReports for RateLimitPolicy {
@@ -651,7 +656,7 @@ pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
 mod tests {
     use super::super::testkit::{self, apply, MockApi, CONTROLLER};
     use super::*;
-    use gateway_api::experimental::tcproutes::TCPRoute;
+    use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
 
     fn served_gateways(names: &[&str]) -> Store<Gateway> {
         let mut writer = reflector::store::Writer::default();
@@ -786,10 +791,10 @@ mod tests {
         api: &MockApi,
         pending: &Arc<PendingWatches>,
         listings: &Listings,
-    ) -> (Store<TCPRoute>, tokio::task::JoinHandle<()>) {
+    ) -> (Store<TcpRoute>, tokio::task::JoinHandle<()>) {
         let client = api.client();
         let (store, stream) = create_optional_reflector(
-            Api::<TCPRoute>::all(client.clone()),
+            Api::<TcpRoute>::all(client.clone()),
             &client,
             pending,
             listings,
@@ -896,7 +901,7 @@ mod tests {
     /// the one waiter of `changed`.
     #[tokio::test]
     async fn every_synced_waiter_wakes() {
-        use gateway_api::httproutes::HTTPRoute;
+        use gateway_api::httproutes::HttpRoute;
         let listings = Listings::default();
         let routes = listings.track("HTTPRoute", false);
         let waiters: Vec<_> = (0..2)
@@ -908,7 +913,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(waiters.iter().all(|w| !w.is_finished()));
 
-        routes.observe::<HTTPRoute>(&Ok(watcher::Event::InitDone));
+        routes.observe::<HttpRoute>(&Ok(watcher::Event::InitDone));
         listings.changed().await;
         for waiter in waiters {
             tokio::time::timeout(Duration::from_secs(5), waiter)
@@ -923,7 +928,7 @@ mod tests {
     /// named with why.
     #[tokio::test(start_paused = true)]
     async fn a_core_list_refused_keeps_the_caches_unsynced() {
-        use gateway_api::httproutes::HTTPRoute;
+        use gateway_api::httproutes::HttpRoute;
         let api = MockApi::default();
         api.reply_to(
             "/apis/gateway.networking.k8s.io/v1/httproutes",
@@ -931,7 +936,7 @@ mod tests {
             status(403, "Forbidden"),
         );
         let listings = Listings::default();
-        let (_store, stream) = create_reflector(Api::<HTTPRoute>::all(api.client()), &listings);
+        let (_store, stream) = create_reflector(Api::<HttpRoute>::all(api.client()), &listings);
         let driver = tokio::spawn(stream.for_each(|_| async {}));
         settle().await;
         assert!(!listings.is_synced());
@@ -1052,8 +1057,8 @@ mod tests {
 
     async fn first_watch_error(client: Client) -> watcher::Error {
         use k8s_openapi::api::apps::v1::Deployment;
-        let errors = kube::runtime::metadata_watcher(
-            Api::<Deployment>::all(client),
+        let errors = kube::runtime::watcher(
+            Api::<kube::core::PartialObjectMeta<Deployment>>::all(client),
             watcher::Config::default(),
         )
         .filter_map(|event| std::future::ready(event.err()));
@@ -1066,13 +1071,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_metadata_watch_reports_its_status_code() {
+        // kube 5 also decodes the indented form (kube#2062): both report it.
         let bare = Client::new(tower::service_fn(refusing_apiserver), "default");
         let e = first_watch_error(bare).await;
-        assert_eq!(
-            status_code(&e),
-            None,
-            "the stub should reproduce the bug: {e}"
-        );
+        assert_eq!(status_code(&e), Some(403), "{e}");
 
         let fixed = Client::new(
             tower::ServiceBuilder::new()

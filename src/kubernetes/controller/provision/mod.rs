@@ -30,7 +30,7 @@ use kube::api::{
 use kube::core::PartialObjectMeta;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::reflector::{ObjectRef, Store};
-use kube::runtime::{metadata_watcher, reflector, watcher, WatchStreamExt};
+use kube::runtime::{reflector, watcher, WatchStreamExt};
 use kube::{Client, Resource, ResourceExt};
 use serde::Serialize;
 
@@ -417,7 +417,7 @@ where
     ));
     let changes = reflector(
         writer,
-        metadata_watcher(Api::<K>::all(client.clone()), config)
+        watcher(Api::<PartialObjectMeta<K>>::all(client.clone()), config)
             .modify(drop_unread_metadata)
             .inspect(move |event| tracker.observe(event)),
     )

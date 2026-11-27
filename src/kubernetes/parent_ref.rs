@@ -3,9 +3,9 @@
 //! Reduces boilerplate with macros — all four route types (HTTP, TCP, TLS, UDP)
 //! share identical field layouts for parentRefs and backendRefs.
 
-use gateway_api::experimental::tcproutes::*;
-use gateway_api::experimental::tlsroutes::*;
-use gateway_api::experimental::udproutes::*;
+use gateway_api::experimental::tcproutes::v1alpha2::*;
+use gateway_api::experimental::tlsroutes::v1alpha3::*;
+use gateway_api::experimental::udproutes::v1alpha2::*;
 use gateway_api::httproutes::*;
 
 // ---------------------------------------------------------------------------
@@ -46,10 +46,10 @@ macro_rules! impl_parent_ref_access {
     };
 }
 
-impl_parent_ref_access!(HTTPRouteParentRefs);
-impl_parent_ref_access!(TCPRouteParentRefs);
-impl_parent_ref_access!(TLSRouteParentRefs);
-impl_parent_ref_access!(UDPRouteParentRefs);
+impl_parent_ref_access!(HttpRouteParentRefs);
+impl_parent_ref_access!(TcpRouteParentRefs);
+impl_parent_ref_access!(TlsRouteParentRefs);
+impl_parent_ref_access!(UdpRouteParentRefs);
 
 // ---------------------------------------------------------------------------
 // L4BackendRefAccess — abstracts over TCP/TLS/UDP backend ref types
@@ -89,9 +89,9 @@ macro_rules! impl_l4_backend_ref_access {
     };
 }
 
-impl_l4_backend_ref_access!(TCPRouteRulesBackendRefs);
-impl_l4_backend_ref_access!(TLSRouteRulesBackendRefs);
-impl_l4_backend_ref_access!(UDPRouteRulesBackendRefs);
+impl_l4_backend_ref_access!(TcpRouteRulesBackendRefs);
+impl_l4_backend_ref_access!(TlsRouteRulesBackendRefs);
+impl_l4_backend_ref_access!(UdpRouteRulesBackendRefs);
 
 // ---------------------------------------------------------------------------
 // Utility functions operating on ParentRefAccess

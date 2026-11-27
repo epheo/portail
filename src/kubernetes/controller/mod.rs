@@ -41,13 +41,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use gateway_api::experimental::tcproutes::TCPRoute;
-use gateway_api::experimental::tlsroutes::TLSRoute;
-use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
+use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
-use gateway_api::httproutes::HTTPRoute;
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::httproutes::HttpRoute;
+use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use crate::cli::ControllerArgs;
 use crate::kubernetes::addresses::NetworkCidrCache;
@@ -84,10 +84,10 @@ struct ResourceCache {
     /// Gateways whose class names this controller are ours.
     gateway_classes: Store<GatewayClass>,
     gateways: Store<Gateway>,
-    http_routes: Store<HTTPRoute>,
-    tcp_routes: Store<TCPRoute>,
-    tls_routes: Store<TLSRoute>,
-    udp_routes: Store<UDPRoute>,
+    http_routes: Store<HttpRoute>,
+    tcp_routes: Store<TcpRoute>,
+    tls_routes: Store<TlsRoute>,
+    udp_routes: Store<UdpRoute>,
     namespaces: Store<Namespace>,
     services: Store<Service>,
     secrets: Store<Secret>,
@@ -192,25 +192,25 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     // get a status (attached, or rejected with NotAllowedByListeners /
     // NoMatchingParent), which requires observing it.
     let (store_http_routes, http_route_stream) =
-        create_reflector(Api::<HTTPRoute>::all(client.clone()), &listings);
+        create_reflector(Api::<HttpRoute>::all(client.clone()), &listings);
     // RateLimitPolicy and GatewayParameters ride the optional-CRD path like
     // the experimental routes: a plain Gateway API install lacks the routes,
     // a missing GatewayParameters CRD must not hold every Gateway either.
     let pending_watches = Arc::new(PendingWatches::default());
     let (store_tcp_routes, tcp_route_stream) = create_optional_reflector(
-        Api::<TCPRoute>::all(client.clone()),
+        Api::<TcpRoute>::all(client.clone()),
         &client,
         &pending_watches,
         &listings,
     );
     let (store_tls_routes, tls_route_stream) = create_optional_reflector(
-        Api::<TLSRoute>::all(client.clone()),
+        Api::<TlsRoute>::all(client.clone()),
         &client,
         &pending_watches,
         &listings,
     );
     let (store_udp_routes, udp_route_stream) = create_optional_reflector(
-        Api::<UDPRoute>::all(client.clone()),
+        Api::<UdpRoute>::all(client.clone()),
         &client,
         &pending_watches,
         &listings,
@@ -413,16 +413,16 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
         // ones its status says we reported on.
-        .watches_stream(http_route_stream, move |route: HTTPRoute| {
+        .watches_stream(http_route_stream, move |route: HttpRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw1, &cn1)
         })
-        .watches_stream(tcp_route_stream, move |route: TCPRoute| {
+        .watches_stream(tcp_route_stream, move |route: TcpRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw2, &cn2)
         })
-        .watches_stream(tls_route_stream, move |route: TLSRoute| {
+        .watches_stream(tls_route_stream, move |route: TlsRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw3, &cn3)
         })
-        .watches_stream(udp_route_stream, move |route: UDPRoute| {
+        .watches_stream(udp_route_stream, move |route: UdpRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw4, &cn4)
         })
         // Secret: targeted — only reconcile Gateways referencing this secret in TLS

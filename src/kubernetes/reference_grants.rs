@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use gateway_api::gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom};
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use super::hostname::hostnames_intersect;
 use super::parent_ref::ParentRefAccess;

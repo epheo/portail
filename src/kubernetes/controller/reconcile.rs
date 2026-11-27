@@ -11,12 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway_api::experimental::tcproutes::TCPRoute;
-use gateway_api::experimental::tlsroutes::TLSRoute;
-use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
+use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
-use gateway_api::httproutes::HTTPRoute;
+use gateway_api::httproutes::HttpRoute;
 
 use super::gateway_backends::{self, trusted_addresses};
 use super::provision::Provisioned;
@@ -130,10 +130,10 @@ async fn write_route_statuses(
             };
         }
         writes.record(match o.kind {
-            "HTTPRoute" => write_parents!(HTTPRoute),
-            "TCPRoute" => write_parents!(TCPRoute),
-            "TLSRoute" => write_parents!(TLSRoute),
-            "UDPRoute" => write_parents!(UDPRoute),
+            "HTTPRoute" => write_parents!(HttpRoute),
+            "TCPRoute" => write_parents!(TcpRoute),
+            "TLSRoute" => write_parents!(TlsRoute),
+            "UDPRoute" => write_parents!(UdpRoute),
             _ => continue,
         });
     }
@@ -1411,7 +1411,7 @@ mod tests {
         target.metadata.namespace = Some("projects".into());
         target.spec.listeners[0].port = 80;
         apply(&mut p.cluster.gateways, target.clone());
-        let grant: gateway_api::referencegrants::ReferenceGrant =
+        let grant: gateway_api::referencegrants::v1beta1::ReferenceGrant =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "gateway.networking.k8s.io/v1beta1",
                 "kind": "ReferenceGrant",
@@ -1470,7 +1470,7 @@ mod tests {
         assert!(pending(&p).is_empty(), "a revoked grant drops at once");
 
         apply(&mut p.cluster.reference_grants, {
-            let g: gateway_api::referencegrants::ReferenceGrant =
+            let g: gateway_api::referencegrants::v1beta1::ReferenceGrant =
                 serde_json::from_value(serde_json::json!({
                     "apiVersion": "gateway.networking.k8s.io/v1beta1",
                     "kind": "ReferenceGrant",
@@ -2456,7 +2456,7 @@ mod tests {
         assert!(p.served(&gw).is_none());
         assert!(p.api.requests().is_empty(), "{:?}", p.api.requests());
 
-        routes.observe::<HTTPRoute>(&Ok(kube::runtime::watcher::Event::InitDone));
+        routes.observe::<HttpRoute>(&Ok(kube::runtime::watcher::Event::InitDone));
         p.pass(&gw).await.unwrap();
         assert!(p.served(&gw).is_some());
     }
@@ -2557,7 +2557,7 @@ mod tests {
             ("old", "2020-01-01T00:00:00Z"),
             ("new", "2021-01-01T00:00:00Z"),
         ] {
-            let route: TCPRoute = serde_json::from_value(serde_json::json!({
+            let route: TcpRoute = serde_json::from_value(serde_json::json!({
                 "apiVersion": "gateway.networking.k8s.io/v1alpha2",
                 "kind": "TCPRoute",
                 "metadata": {
