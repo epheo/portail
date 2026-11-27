@@ -176,7 +176,7 @@ struct Sessions {
 }
 
 /// Run a UDP recv_from loop on a single socket, dispatching datagrams to per-session backends.
-pub async fn run_udp_worker(
+pub async fn serve(
     socket: Arc<UdpSocket>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -493,7 +493,7 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(udp_table(addr.port(), backends)));
         let shutdown = CancellationToken::new();
-        tokio::spawn(run_udp_worker(
+        tokio::spawn(serve(
             socket,
             addr.port(),
             Arc::clone(&routes),

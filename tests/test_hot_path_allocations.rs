@@ -17,7 +17,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use portail::config::{CertificateRef, PerformanceConfig};
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::{extract_routing_info, HeadError};
-use portail::proxy::listener::{run_worker, ListenerCtx, WorkerConfig};
+use portail::proxy::listener::{self, ListenerCtx, ServeConfig};
 use portail::proxy::request_processor::{analyze_request, analyze_udp_request, RoutingResult};
 use portail::proxy::tls::{build_server_config, TlsKind, TlsPlan};
 use portail::routing::{
@@ -171,14 +171,14 @@ fn a_churned_connection_allocates_a_fixed_few_times() {
         let ctx = ListenerCtx {
             server_port: 80,
             routes: Arc::new(ArcSwap::from_pointee(table_to(backend))),
-            cfg: WorkerConfig::from_perf(&PerformanceConfig::default(), 64),
+            cfg: ServeConfig::from_perf(&PerformanceConfig::default(), 64),
             plan: Default::default(),
             health: Arc::new(HealthRegistry::new()),
             selector: Arc::new(BackendSelector::new()),
             active_connections: active.clone(),
             shared_pool: None,
         };
-        tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
         // Lazy statics, metric slots and the runtime's own tables settle.
         churn(proxy, 20, &active).await;
         let before = ALLOCATIONS.with(Cell::get);
@@ -242,14 +242,14 @@ async fn proxy(
     let ctx = ListenerCtx {
         server_port: 80,
         routes: Arc::new(ArcSwap::from_pointee(table_to(backend))),
-        cfg: WorkerConfig::from_perf(&perf, 64),
+        cfg: ServeConfig::from_perf(&perf, 64),
         plan: Arc::new(ArcSwapOption::from_pointee(plan)),
         health: Arc::new(HealthRegistry::new()),
         selector: Arc::new(BackendSelector::new()),
         active_connections: active.clone(),
         shared_pool: None,
     };
-    tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+    tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
     (addr, active)
 }
 

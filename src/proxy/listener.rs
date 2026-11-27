@@ -14,7 +14,7 @@ use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::health::HealthRegistry;
-use crate::proxy::http1::{handle_connection, ConnectionState};
+use crate::proxy::http1::{self, ConnectionState};
 use crate::proxy::proxy_protocol::{self, Header};
 use crate::proxy::relay::handle_tls_passthrough;
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
@@ -23,7 +23,7 @@ use crate::routing::{BackendSelector, RouteTable};
 /// Per-listener worker tunables, threaded from `PerformanceConfig` by the
 /// data plane.
 #[derive(Clone, Copy)]
-pub struct WorkerConfig {
+pub struct ServeConfig {
     /// Idle backend connections retained per backend in each connection's pool.
     pub max_idle_per_backend: usize,
     /// Default backend connect budget (rule-level timeouts override per request).
@@ -43,7 +43,7 @@ pub struct WorkerConfig {
     pub http2: bool,
 }
 
-impl WorkerConfig {
+impl ServeConfig {
     pub fn from_perf(perf: &crate::config::PerformanceConfig, max_idle_per_backend: usize) -> Self {
         Self {
             max_idle_per_backend,
@@ -170,7 +170,7 @@ impl Drop for ConnGuard {
 /// Pool handle for one client connection: the process-wide shared pool when
 /// `performance.backendPoolScope: process` is set, else a fresh
 /// per-connection pool (the default).
-pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerConfig) -> PoolHandle {
+pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &ServeConfig) -> PoolHandle {
     match shared {
         Some(p) => PoolHandle::Shared(p.clone()),
         None => PoolHandle::PerConn(BackendPool::new(
@@ -185,7 +185,7 @@ pub(crate) fn make_pool(shared: &Option<Arc<SharedBackendPool>>, cfg: &WorkerCon
 pub struct ListenerCtx {
     pub server_port: u16,
     pub routes: Arc<ArcSwap<RouteTable>>,
-    pub cfg: WorkerConfig,
+    pub cfg: ServeConfig,
     /// Read per connection: plain, or a TLS dispatch.
     pub plan: crate::proxy::data_plane::PortPlan,
     pub health: Arc<HealthRegistry>,
@@ -195,7 +195,7 @@ pub struct ListenerCtx {
 }
 
 /// Run an accept loop on a single listener, spawning a task per connection.
-pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: CancellationToken) {
+pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: CancellationToken) {
     let ListenerCtx {
         server_port,
         routes,
@@ -299,7 +299,7 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                                 drain,
                             );
                             let conn = Connection::Plain { inner: tcp_stream };
-                            let _ = handle_connection(conn, peer, state).await;
+                            let _ = http1::serve(conn, peer, state).await;
                         });
                     }
                     Err(e) => {
@@ -360,7 +360,7 @@ pub(super) async fn serve_tls_connection(
     plan: Arc<TlsPlan>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
-    cfg: WorkerConfig,
+    cfg: ServeConfig,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
     shared_pool: Option<Arc<SharedBackendPool>>,
@@ -474,7 +474,7 @@ pub(super) async fn serve_tls_connection(
         listener_stats,
         drain,
     );
-    let _ = handle_connection(conn, peer, state).await;
+    let _ = http1::serve(conn, peer, state).await;
 }
 
 #[cfg(test)]

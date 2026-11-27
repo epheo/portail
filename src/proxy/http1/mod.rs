@@ -28,7 +28,7 @@ use crate::proxy::http_filters::{
     sanitize_response_headers, ForwardedLines, HeaderModifications, OriginForm, MIRROR_BODY_MAX,
 };
 use crate::proxy::http_parser::{find_header_end, has_header_end};
-use crate::proxy::listener::{tcp_keepalive, WorkerConfig};
+use crate::proxy::listener::{tcp_keepalive, ServeConfig};
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::proxy_protocol;
 use crate::proxy::relay::{self, handle_tcp_connection};
@@ -184,7 +184,7 @@ impl ConnectionState {
         is_tls: bool,
         peer: SocketAddr,
         local: SocketAddr,
-        cfg: &WorkerConfig,
+        cfg: &ServeConfig,
         listener_stats: Arc<ListenerStats>,
         drain: CancellationToken,
     ) -> Self {
@@ -307,7 +307,7 @@ pub(crate) const CLIENT_BUF: usize = 64 * 1024;
 /// head. Allocated at the first read and never zeroed; it grows on need.
 const CLIENT_BUF_INITIAL: usize = 4 * 1024;
 
-pub(crate) async fn handle_connection(
+pub(crate) async fn serve(
     mut client: Connection,
     _peer: SocketAddr,
     mut state: ConnectionState,
@@ -365,7 +365,7 @@ enum Handoff {
 }
 
 /// Serve requests until the connection must close, or turns out to be
-/// opaque TCP. Every exit comes back to `handle_connection`, which owns the
+/// opaque TCP. Every exit comes back to [`serve`], which owns the
 /// one close.
 async fn serve_http(
     client: &mut Connection,
@@ -1996,13 +1996,13 @@ fn pipelined_tail(request: &[u8]) -> Option<Vec<u8>> {
     (head_end < request.len()).then(|| request[head_end..].to_vec())
 }
 
-/// One client connection driven through `handle_connection` over an
+/// One client connection driven through [`serve`] over an
 /// in-memory duplex, against real loopback backends.
 #[cfg(test)]
 mod connection_tests {
     use super::*;
     use crate::proxy::listener::{
-        carries_client_options, make_pool, run_worker, serve_tls_connection, ListenerCtx,
+        self, carries_client_options, make_pool, serve_tls_connection, ListenerCtx,
         TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES,
     };
     use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
@@ -2116,7 +2116,7 @@ mod connection_tests {
     }
 
     fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
-        let cfg = WorkerConfig {
+        let cfg = ServeConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
             client_header_timeout: Duration::from_secs(2),
@@ -2147,7 +2147,7 @@ mod connection_tests {
     fn serve_state(state: ConnectionState) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
         let (client, engine) = tokio::io::duplex(64 * 1024);
         let peer = "127.0.0.1:40000".parse().unwrap();
-        let task = tokio::spawn(handle_connection(
+        let task = tokio::spawn(super::serve(
             Connection::Mem {
                 inner: engine,
                 aborted: Default::default(),
@@ -2508,7 +2508,7 @@ mod connection_tests {
         rt.add_tls_route(0, "weightless.test", vec![weightless]);
         rt.add_tls_route(0, "empty.test", vec![]);
         let routes = Arc::new(ArcSwap::from_pointee(rt));
-        let cfg = WorkerConfig {
+        let cfg = ServeConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
             client_header_timeout: Duration::from_secs(2),
@@ -2603,7 +2603,7 @@ mod connection_tests {
             routes,
             Arc::default(),
             Arc::default(),
-            &WorkerConfig::from_perf(&Default::default(), 4),
+            &ServeConfig::from_perf(&Default::default(), 4),
             &stats,
         )
         .await;
@@ -2620,7 +2620,7 @@ mod connection_tests {
         plan.add(Some("named.test"), TlsKind::Passthrough);
         let plan = Arc::new(plan);
         let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
-        let cfg = WorkerConfig {
+        let cfg = ServeConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
             client_header_timeout: Duration::from_secs(2),
@@ -2780,9 +2780,9 @@ mod connection_tests {
             let ctx = ListenerCtx {
                 server_port: addr.port(),
                 routes: state.routes.clone(),
-                cfg: WorkerConfig {
+                cfg: ServeConfig {
                     tcp_keepalive_time: time,
-                    ..WorkerConfig::from_perf(&Default::default(), 4)
+                    ..ServeConfig::from_perf(&Default::default(), 4)
                 },
                 plan: Default::default(),
                 health: state.health.clone(),
@@ -2790,7 +2790,7 @@ mod connection_tests {
                 active_connections: Default::default(),
                 shared_pool: None,
             };
-            tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+            tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
             // Answered, so accepted.
             client
                 .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
@@ -2821,9 +2821,9 @@ mod connection_tests {
         let ctx = ListenerCtx {
             server_port: addr.port(),
             routes: state.routes.clone(),
-            cfg: WorkerConfig {
+            cfg: ServeConfig {
                 client_header_timeout: Duration::from_millis(300),
-                ..WorkerConfig::from_perf(&Default::default(), 4)
+                ..ServeConfig::from_perf(&Default::default(), 4)
             },
             plan: Default::default(),
             health: state.health.clone(),
@@ -2831,7 +2831,7 @@ mod connection_tests {
             active_connections: Default::default(),
             shared_pool: None,
         };
-        tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
         addr
     }
 
@@ -4247,7 +4247,7 @@ mod connection_tests {
             let tls = Connection::Tls {
                 inner: Box::new(tls),
             };
-            handle_connection(tls, peer, state).await
+            super::serve(tls, peer, state).await
         });
 
         let client_cfg = rustls::ClientConfig::builder()
@@ -4350,7 +4350,7 @@ mod connection_tests {
         let front_addr = front.local_addr().unwrap();
         let engine = tokio::spawn(async move {
             let (tcp, peer) = front.accept().await.unwrap();
-            handle_connection(Connection::Plain { inner: tcp }, peer, state).await
+            super::serve(Connection::Plain { inner: tcp }, peer, state).await
         });
         (TcpStream::connect(front_addr).await.unwrap(), engine)
     }

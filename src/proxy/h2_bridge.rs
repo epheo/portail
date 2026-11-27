@@ -1,6 +1,6 @@
 //! HTTP/2 front end: each h2 stream is replayed as one HTTP/1.1 exchange
 //! over an in-memory duplex into the same engine that serves h1 clients
-//! ([`http1::handle_connection`]), so routing, filters, backend pooling,
+//! ([`http1::serve`]), so routing, filters, backend pooling,
 //! timeouts, and observability behave identically across both protocols.
 //! Only ALPN-negotiated h2 connections pay the replay's in-memory copy;
 //! the h1 path is untouched.
@@ -38,7 +38,7 @@ use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
-use crate::proxy::listener::WorkerConfig;
+use crate::proxy::listener::ServeConfig;
 use crate::proxy::tls::Connection;
 use crate::proxy::upstream::response::{
     parse_response_head, response_has_no_body, BodyFraming, RESPONSE_HEADER_CAP,
@@ -88,7 +88,7 @@ pub(crate) struct H2Ctx {
     pub(crate) selector: Arc<BackendSelector>,
     pub(crate) health: Arc<HealthRegistry>,
     pub(crate) pool: Arc<SharedBackendPool>,
-    pub(crate) cfg: WorkerConfig,
+    pub(crate) cfg: ServeConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
     pub(crate) local: SocketAddr,
@@ -369,7 +369,7 @@ async fn serve_stream(
         inner: engine_io,
         aborted: aborted.clone(),
     };
-    let engine = http1::handle_connection(engine_conn, ctx.peer, state);
+    let engine = http1::serve(engine_conn, ctx.peer, state);
 
     // The bridge owns its duplex half and drops it on completion, so an
     // engine still reading the duplex sees EOF instead of parking on it.
@@ -1214,7 +1214,7 @@ mod tests {
                 }],
             ),
         );
-        let cfg = WorkerConfig {
+        let cfg = ServeConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
             client_header_timeout: budget,

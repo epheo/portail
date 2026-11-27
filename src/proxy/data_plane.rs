@@ -158,7 +158,7 @@ pub struct DataPlane {
     /// Bumped with that flip: the data plane re-applies to rebind, and
     /// reports the loss meanwhile.
     listener_exits: tokio::sync::watch::Sender<u64>,
-    worker_config: listener::WorkerConfig,
+    serve_config: listener::ServeConfig,
     health: Arc<HealthRegistry>,
     /// Cloned into every UDP worker, the controller's too: a rebuilt one
     /// would split the default session budget.
@@ -497,7 +497,7 @@ impl DataPlane {
             listener_tasks,
             ready_flag: None,
             listener_exits: tokio::sync::watch::Sender::new(0),
-            worker_config: listener::WorkerConfig::from_perf(
+            serve_config: listener::ServeConfig::from_perf(
                 performance_config,
                 DEFAULT_MAX_IDLE_PER_BACKEND,
             ),
@@ -790,7 +790,7 @@ impl DataPlane {
         let limits = self.udp_sessions.clone();
         let port = listener_cfg.port;
         self.spawn_listener_task(endpoint.clone(), port, |cancel| async move {
-            udp::run_udp_worker(socket, port, routes, limits, cancel, health).await;
+            udp::serve(socket, port, routes, limits, cancel, health).await;
         });
         Ok(())
     }
@@ -816,9 +816,9 @@ impl DataPlane {
             TcpListener::from_std(std_listener).map_err(|e| format!("TCP from_std: {}", e))?;
         // The controller's perf config takes precedence over the startup
         // one for dynamic listeners.
-        let cfg = listener::WorkerConfig::from_perf(
+        let cfg = listener::ServeConfig::from_perf(
             performance_config,
-            self.worker_config.max_idle_per_backend,
+            self.serve_config.max_idle_per_backend,
         );
         let ctx = listener::ListenerCtx {
             server_port: listener_cfg.port,
@@ -831,7 +831,7 @@ impl DataPlane {
             shared_pool: self.shared_pool.clone(),
         };
         self.spawn_listener_task(endpoint.clone(), listener_cfg.port, |cancel| async move {
-            listener::run_worker(tokio_listener, ctx, cancel).await;
+            listener::serve(tokio_listener, ctx, cancel).await;
         });
         Ok(())
     }
@@ -854,7 +854,7 @@ impl DataPlane {
             let ctx = listener::ListenerCtx {
                 server_port: port,
                 routes: routes.clone(),
-                cfg: self.worker_config,
+                cfg: self.serve_config,
                 plan,
                 health: self.health.clone(),
                 selector: self.selector.clone(),
@@ -867,7 +867,7 @@ impl DataPlane {
                 transport: Transport::Tcp,
             };
             self.spawn_listener_task(endpoint, port, |cancel| async move {
-                listener::run_worker(listener, ctx, cancel).await;
+                listener::serve(listener, ctx, cancel).await;
             });
         }
 
@@ -885,7 +885,7 @@ impl DataPlane {
                 transport: Transport::Udp,
             };
             self.spawn_listener_task(endpoint, port, |cancel| async move {
-                udp::run_udp_worker(socket, port, routes, limits, cancel, health).await;
+                udp::serve(socket, port, routes, limits, cancel, health).await;
             });
         }
 
