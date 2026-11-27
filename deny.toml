@@ -2,6 +2,8 @@
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, no known vulnerability; pulled in by serde_yaml, which kube-client and gateway-api also use" },
     { id = "RUSTSEC-2026-0258", reason = "only h2 0.3, dev-only via rewrk-core's hyper 0.14 (bench); no 0.3 fix exists; the shipped h2 0.4 is patched" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, no known vulnerability; pulled in by k8s-openapi 0.26 and kube 2, no safe upgrade exists" },
+    { id = "RUSTSEC-2026-0600", reason = "only kube-client's openssl-tls connector, which the feature ban below keeps out of the build; kube 2 has no fix, 5.2 does" },
 ]
 
 [licenses]
@@ -17,6 +19,11 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
+
+# RUSTSEC-2026-0600 is ignored above only while this connector stays out.
+[[bans.features]]
+crate = "kube-client"
+deny = ["openssl-tls"]
 
 [sources]
 unknown-registry = "deny"
