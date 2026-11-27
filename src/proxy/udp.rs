@@ -147,7 +147,7 @@ struct UdpSession {
     /// Whatever removes a session, its reply task must not live on holding
     /// the backend socket's fd and port until it idles out.
     reply_task: AbortOnDropHandle<()>,
-    /// Milliseconds since the worker epoch at the last datagram either way.
+    /// Milliseconds since the listener's epoch at the last datagram either way.
     last_active: Arc<AtomicU64>,
     /// Route-table generation `backend_addr` was last found routed in.
     generation: u64,

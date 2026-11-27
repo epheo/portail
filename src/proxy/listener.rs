@@ -20,8 +20,8 @@ use crate::proxy::relay::handle_tls_passthrough;
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendSelector, RouteTable};
 
-/// Per-listener worker tunables, threaded from `PerformanceConfig` by the
-/// data plane.
+/// What serving one client connection needs, taken from
+/// `PerformanceConfig` by the data plane.
 #[derive(Clone, Copy)]
 pub struct ServeConfig {
     /// Idle backend connections retained per backend in each connection's pool.

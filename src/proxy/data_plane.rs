@@ -160,7 +160,7 @@ pub struct DataPlane {
     listener_exits: tokio::sync::watch::Sender<u64>,
     serve_config: listener::ServeConfig,
     health: Arc<HealthRegistry>,
-    /// Cloned into every UDP worker, the controller's too: a rebuilt one
+    /// Cloned into every UDP listener's loop, the controller's too: a rebuilt one
     /// would split the default session budget.
     udp_sessions: udp::SessionLimits,
     shutdown: CancellationToken,
@@ -770,7 +770,7 @@ impl DataPlane {
         (opened, errors)
     }
 
-    /// Bind `listener_cfg`'s UDP `endpoint` and spawn its worker.
+    /// Bind `listener_cfg`'s UDP `endpoint` and spawn its loop.
     fn bind_udp(
         &mut self,
         listener_cfg: &ListenerConfig,

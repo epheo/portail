@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(next_probe_interval(PROBE_MAX_INTERVAL), PROBE_MAX_INTERVAL);
     }
 
-    /// Mark `a` unhealthy and win the probe CAS, as a worker would.
+    /// Mark `a` unhealthy and win the probe CAS, as a connection would.
     fn park(r: &HealthRegistry, a: SocketAddr) {
         for _ in 0..(FAILURE_THRESHOLD - 1) {
             r.record_failure(a);

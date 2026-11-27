@@ -425,7 +425,7 @@ impl SharedBackendPool {
 }
 
 /// A connection task's handle to whichever pool scope is configured
-/// (`performance.backendPoolScope`). Same API either way; the worker never
+/// (`performance.backendPoolScope`). Same API either way; the engine never
 /// cares which scope it got.
 pub enum PoolHandle {
     PerConn(BackendPool),

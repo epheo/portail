@@ -1,4 +1,4 @@
-//! The data plane: listener management, connection workers, HTTP
+//! The data plane: listeners, the HTTP/1 engine and the relay, HTTP
 //! parsing/filtering, backend connection pooling, TLS, and backend health.
 //! Everything that touches a client or backend socket lives here; the
 //! control planes (config file, kubernetes/) only hand it route tables.
