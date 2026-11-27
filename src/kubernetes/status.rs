@@ -849,13 +849,18 @@ mod tests {
     use super::*;
 
     /// A condition's lastTransitionTime as the apiserver takes a Time:
-    /// whole seconds and Z.
+    /// whole seconds and Z, in UTC: a local-time formatter would pass the
+    /// shape check on a host in UTC only.
     #[test]
     fn transition_times_are_written_in_seconds() {
+        let written = now();
         assert_eq!(
-            now().replace(|c: char| c.is_ascii_digit(), "d"),
+            written.replace(|c: char| c.is_ascii_digit(), "d"),
             "dddd-dd-ddTdd:dd:ddZ"
         );
+        let read: Timestamp = written.parse().unwrap();
+        let off = Timestamp::now().as_second() - read.as_second();
+        assert!((0..=5).contains(&off), "{written} is {off}s from now");
     }
 
     fn kind_of(protocol: &str) -> Option<String> {

@@ -176,9 +176,9 @@ fn status_code(e: &watcher::Error) -> Option<u16> {
 /// error per line and loses its status code.
 pub(super) async fn client() -> anyhow::Result<Client> {
     let mut config = kube::Config::infer().await?;
-    // kube 4 dropped both defaults kube 2 had: a request could then hang
-    // with no read deadline, and a write retried by the client would race
-    // the controller's own requeue.
+    // kube 4 dropped kube 2's read timeout, so a request could hang with
+    // no deadline, and turned on client-side retries, which would race the
+    // controller's own requeue on a write.
     config.read_timeout = Some(std::time::Duration::from_secs(295));
     config.default_retry = false;
     Ok(kube::client::ClientBuilder::try_from(config)?
