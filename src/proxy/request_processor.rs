@@ -159,6 +159,10 @@ pub fn analyze_request<'a>(
             is_tls,
             server_port,
         )
+    } else if is_tls {
+        // A terminated connection is an HTTPS listener's: its bytes never
+        // reach a TCP route in plaintext, whatever else took the port.
+        Ok(RoutingResult::CloseConnection)
     } else {
         analyze_tcp_request(routes, backend_selector, server_port, health)
     }
