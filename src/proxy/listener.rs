@@ -480,6 +480,13 @@ pub(super) async fn serve_tls_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::listener;
+    use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
+    use crate::proxy::testkit::{
+        assert_never_connected, backend, client_hello, delivered, idle_backend, keepalive_where,
+        read_one_reply, routes, socket_where, REFUSED,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn accept_backoff_doubles_to_a_cap_and_resets_on_success() {
@@ -518,5 +525,222 @@ mod tests {
             assert_eq!(backoff.after(&error), None, "{error}");
         }
         assert_eq!(backoff.after(&emfile), Some(Duration::from_millis(10)));
+    }
+
+    /// A TLS connection no listener takes closes, counted as a failed
+    /// handshake: an SNI no listener names on a port without a catch-all, or
+    /// bytes that are not TLS. A passthrough socket dropped them uncounted.
+    #[tokio::test]
+    async fn an_unclaimed_tls_connection_closes_counted() {
+        let mut plan = TlsPlan::default();
+        plan.add(Some("named.test"), TlsKind::Passthrough);
+        let plan = Arc::new(plan);
+        let routes = Arc::new(ArcSwap::from_pointee(RouteTable::new()));
+        let cfg = ServeConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for first_bytes in [
+            client_hello("other.test"),
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&first_bytes).await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let stats = Arc::new(ListenerStats::default());
+            let local = server.local_addr().unwrap();
+            serve_tls_connection(
+                server,
+                peer,
+                local,
+                Arc::clone(&plan),
+                8443,
+                Arc::clone(&routes),
+                cfg,
+                Arc::default(),
+                Arc::default(),
+                None,
+                Arc::clone(&stats),
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(stats.tls_handshake_failures.get(), 1);
+            let read = client.read(&mut [0u8; 1]).await;
+            assert!(!matches!(read, Ok(n) if n > 0), "closed unanswered");
+        }
+    }
+
+    /// A client that vanishes without FIN or RST would otherwise pin its
+    /// task and fd forever, and Nagle holds the tail of a reply for the
+    /// client's delayed ACK. A data-plane listener hands its keepalive and
+    /// TCP_NODELAY to every socket it accepts, one queued before the accept
+    /// loop started included; any other listener's sockets get them one by
+    /// one.
+    #[tokio::test]
+    async fn accepted_sockets_get_the_client_options() {
+        let time = Duration::from_secs(61);
+        let want = Some((time, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES));
+        let data_plane = crate::proxy::data_plane::create_tcp_listener(
+            0,
+            Some("127.0.0.1"),
+            None,
+            &tcp_keepalive(time),
+        )
+        .unwrap();
+        let data_plane = TcpListener::from_std(data_plane).unwrap();
+        assert!(carries_client_options((&data_plane).into(), time));
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(!carries_client_options((&plain).into(), time));
+
+        for listener in [data_plane, plain] {
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let ctx = ListenerCtx {
+                server_port: addr.port(),
+                routes: Arc::new(ArcSwap::from_pointee(RouteTable::new())),
+                cfg: ServeConfig {
+                    tcp_keepalive_time: time,
+                    ..ServeConfig::from_perf(&Default::default(), 4)
+                },
+                plan: Default::default(),
+                health: Arc::new(HealthRegistry::new()),
+                selector: Arc::new(BackendSelector::new()),
+                active_connections: Default::default(),
+                shared_pool: None,
+            };
+            tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
+            // Answered, so accepted.
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let reply = read_one_reply(&mut client).await;
+            assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
+            let me = client.local_addr().unwrap();
+            let is_accepted = |sock: &socket2::SockRef<'_>| {
+                sock.peer_addr().ok().and_then(|a| a.as_socket()) == Some(me)
+            };
+            assert_eq!(keepalive_where(is_accepted), want, "{addr}");
+            assert!(
+                socket_where(is_accepted, |sock| sock.tcp_nodelay().unwrap()),
+                "{addr}"
+            );
+        }
+    }
+
+    /// An accept loop on loopback over `rt`, trusting `sources` for PROXY
+    /// v2 headers, with a short header budget.
+    async fn listening(mut rt: RouteTable, sources: &[&str]) -> SocketAddr {
+        rt.proxy_sources =
+            TrustedSources::new(sources.iter().map(|s| Cidr::parse(s).unwrap()).collect());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = ListenerCtx {
+            server_port: addr.port(),
+            routes: Arc::new(ArcSwap::from_pointee(rt)),
+            cfg: ServeConfig {
+                client_header_timeout: Duration::from_millis(300),
+                ..ServeConfig::from_perf(&Default::default(), 4)
+            },
+            plan: Default::default(),
+            health: Arc::new(HealthRegistry::new()),
+            selector: Arc::new(BackendSelector::new()),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
+        addr
+    }
+
+    /// A v2 header: PROXY for `client` over TCP4, or LOCAL.
+    fn proxy_v2(client: Option<SocketAddr>) -> Vec<u8> {
+        let mut h = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        let Some(SocketAddr::V4(client)) = client else {
+            h.extend([0x20, 0x00, 0, 0]);
+            return h;
+        };
+        h.extend([0x21, 0x11, 0, 12]);
+        h.extend(client.ip().octets());
+        h.extend([127, 0, 0, 1]);
+        h.extend(client.port().to_be_bytes());
+        h.extend(80u16.to_be_bytes());
+        h
+    }
+
+    const CLOSING_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n";
+
+    /// Everything the proxy answers to `bytes` until it closes; a close
+    /// on unread bytes resets.
+    async fn answer(addr: SocketAddr, bytes: &[u8]) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(bytes).await.unwrap();
+        let mut out = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
+            .await
+            .expect("the proxy never closed");
+        if let Err(e) = read {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}");
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The forwarded request a trusted source's `header` brings about.
+    async fn forwarded_with(header: Vec<u8>) -> String {
+        let (backend_addr, mut rx) = backend(REFUSED).await;
+        let addr = listening(routes(backend_addr), &["127.0.0.0/8"]).await;
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        delivered(&mut rx).await
+    }
+
+    #[tokio::test]
+    async fn a_trusted_source_names_the_client_it_forwards() {
+        let seen = forwarded_with(proxy_v2(Some("203.0.113.7:50000".parse().unwrap()))).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 203.0.113.7\r\n"),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_sources_local_header_keeps_its_own_address() {
+        let seen = forwarded_with(proxy_v2(None)).await;
+        assert!(
+            seen.contains("\r\nX-Forwarded-For: 127.0.0.1\r\n"),
+            "{seen}"
+        );
+    }
+
+    /// No fallback to the transport address: the source vouches for
+    /// every connection, so one without a header is not its.
+    #[tokio::test]
+    async fn a_trusted_source_without_a_header_in_time_is_closed() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["127.0.0.1/32"]).await;
+        let before = METRICS.proxy_protocol_refused_total.get();
+        assert_eq!(answer(addr, CLOSING_GET).await, "");
+        let cut_short = &proxy_v2(Some("203.0.113.7:1".parse().unwrap()))[..20];
+        assert_eq!(answer(addr, cut_short).await, "");
+        assert_never_connected(&backend).await;
+        assert!(METRICS.proxy_protocol_refused_total.get() >= before + 2);
+    }
+
+    /// An untrusted client's header is bytes of its request, never read:
+    /// no request opens with them.
+    #[tokio::test]
+    async fn an_untrusted_sources_header_is_not_read() {
+        let backend = idle_backend().await;
+        let addr = listening(routes(backend.local_addr().unwrap()), &["10.0.0.0/8"]).await;
+        let header = proxy_v2(Some("203.0.113.7:1".parse().unwrap()));
+        let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
+        assert!(!out.contains(" 200 "), "{out}");
+        assert_never_connected(&backend).await;
     }
 }
