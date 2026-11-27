@@ -12,6 +12,7 @@ pub mod http_filters;
 pub mod http_parser;
 pub mod method;
 pub mod proxy_protocol;
+pub(crate) mod relay;
 pub mod request_processor;
 pub mod tls;
 pub mod udp_worker;
