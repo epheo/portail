@@ -15,7 +15,8 @@ use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_parser::{extract_routing_info, normalize_path, HttpRequestInfo};
 use crate::proxy::method::{is_idempotent, method_len};
 use crate::routing::{
-    Backend, BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable, URLRewritePath,
+    Backend, BackendAction, BackendSelector, HttpFilter, HttpRouteRule, PassthroughMiss,
+    RouteTable, URLRewritePath,
 };
 
 /// Stack-allocated request metadata: only a normalized path is on the heap.
@@ -495,6 +496,46 @@ impl L4Throttles {
     }
 }
 
+/// A client reaches this with bytes no route takes (a scanner on a public
+/// port does all day): not a fault of this process, so one line per window.
+fn warn_unroutable(
+    throttle: &LogThrottle,
+    proto: &str,
+    server_port: u16,
+    condition: impl std::fmt::Display,
+) {
+    if let Some(suppressed) = throttle.admit_now() {
+        warn!(
+            "{} routing failed for port {}: {}; {} more since the last such line, on any port",
+            proto, server_port, condition, suppressed
+        );
+    }
+}
+
+/// Say why a TLS passthrough connection goes nowhere, as the L4 path says
+/// it of its own. The client picks its SNI and how often it sends it.
+pub(crate) fn report_passthrough_miss(miss: PassthroughMiss, sni: Option<&str>, server_port: u16) {
+    static UNROUTABLE: L4Throttles = L4Throttles::new();
+    let throttle = match miss {
+        PassthroughMiss::NoRoute => &UNROUTABLE.no_route,
+        PassthroughMiss::NoBackends => &UNROUTABLE.no_backends,
+        PassthroughMiss::NoWeight => &UNROUTABLE.no_weight,
+        PassthroughMiss::Rejected | PassthroughMiss::Unavailable => {
+            debug!(
+                "TLS passthrough routing: port {} SNI {:?} {}; closing",
+                server_port, sni, miss
+            );
+            return;
+        }
+    };
+    warn_unroutable(
+        throttle,
+        "TLS passthrough",
+        server_port,
+        format_args!("{} for SNI {:?}", miss, sni),
+    );
+}
+
 fn analyze_l4_request<'a>(
     backend_selector: &BackendSelector,
     server_port: u16,
@@ -505,14 +546,7 @@ fn analyze_l4_request<'a>(
     health: &HealthRegistry,
 ) -> Result<RoutingResult<'static>> {
     let unroutable = |throttle: &LogThrottle, condition: &str| {
-        // A client reaches this with bytes no route takes (a scanner on a
-        // public port does all day): not a fault of this process.
-        if let Some(suppressed) = throttle.admit_now() {
-            warn!(
-                "{} routing failed for port {}: {}; {} more since the last such line, on any port",
-                proto, server_port, condition, suppressed
-            );
-        }
+        warn_unroutable(throttle, proto, server_port, condition);
         Ok(RoutingResult::CloseConnection)
     };
 

@@ -359,7 +359,7 @@ In Kubernetes mode these are not read from a file; the defaults apply.
 `idleBodyTimeout`:
 
 - Each step of request and response body streaming must progress within it.
-- An L4 relay or an upgraded tunnel with one direction closed ends after one to two of it without progress.
+- An L4 relay or an upgraded tunnel with one direction closed ends after one to two `idleBodyTimeout` without progress.
 - It also bounds a stalled h2 connection: writes pending that long drop it.
 - Idle keepalive waits and idle h2 connections stay unbounded.
 - `0s` disables.
