@@ -19,7 +19,8 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::{
-    connect_tcp, log_local_exhaustion, BackendPool, ConnectError, PoolHandle, SharedBackendPool,
+    connect_tcp, log_local_exhaustion, BackendPool, ConnectError, LogThrottle, PoolHandle,
+    SharedBackendPool,
 };
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::health::HealthRegistry;
@@ -36,8 +37,8 @@ use crate::proxy::http_parser::{
 use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::proxy_protocol::{self, Header};
 use crate::proxy::request_processor::{
-    analyze_request, analyze_tcp_request, client_done, is_http_request, ClientSent, LocalReply,
-    RequestMeta, RoutingResult,
+    analyze_request, analyze_tcp_request, client_done, is_http_request, report_passthrough_miss,
+    ClientSent, LocalReply, RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendAction, BackendSelector, HttpFilter, HttpRouteRule, RouteTable};
@@ -663,7 +664,7 @@ async fn serve_tls_connection(
     };
     let config = match listener.kind {
         TlsKind::Passthrough => {
-            let _ = handle_tls_passthrough(
+            handle_tls_passthrough(
                 tcp_stream,
                 (peer, local),
                 sni.as_deref(),
@@ -673,6 +674,7 @@ async fn serve_tls_connection(
                 health,
                 selector,
                 &cfg,
+                &listener_stats,
             )
             .await;
             return;
@@ -786,7 +788,7 @@ pub(crate) async fn handle_connection(
         proxied,
     }) = served
     {
-        return handle_tcp_connection(
+        handle_tcp_connection(
             client,
             backend_addr,
             state.proxy_header(proxied),
@@ -796,8 +798,10 @@ pub(crate) async fn handle_connection(
             &state.backend_keepalive,
             state.idle_body_timeout,
             "TCP",
+            &state.listener_stats,
         )
         .await;
+        return Ok(());
     }
     close_connection(&mut client, &mut buf, &state).await;
     served.map(drop)
@@ -1094,8 +1098,10 @@ async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Re
         &state.backend_keepalive,
         state.idle_body_timeout,
         "TCP",
+        &state.listener_stats,
     )
-    .await
+    .await;
+    Ok(())
 }
 
 /// The wait for a connection's next request, its first included: unbounded,
@@ -2740,7 +2746,8 @@ async fn within<F: std::future::Future>(
 
 /// L4 TLS passthrough of a connection whose ClientHello was peeked for its
 /// `sni` (lowercase), which selected the passthrough listener with
-/// hostname `listener`: forward raw TCP to its route's backend.
+/// hostname `listener`: forward raw TCP to its route's backend. One its
+/// routes send nowhere closes, and [`report_passthrough_miss`] says why.
 #[allow(clippy::too_many_arguments)]
 async fn handle_tls_passthrough(
     client: TcpStream,
@@ -2752,14 +2759,22 @@ async fn handle_tls_passthrough(
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
     cfg: &WorkerConfig,
-) -> Result<()> {
-    let route_table = routes.load();
-    let backend = route_table
+    stats: &ListenerStats,
+) {
+    // The table is let go before the relay: held across it, every open
+    // connection would keep the table it started under alive.
+    let resolved = routes
+        .load()
         .resolve_tls_passthrough(sni, server_port, listener, &selector, &health)
-        .map_err(|miss| anyhow::anyhow!("TLS passthrough for SNI {:?}: {}", sni, miss))?;
-    let backend_addr = backend.socket_addr;
-    let header = (backend.action == BackendAction::ForwardProxied)
-        .then(|| proxy_protocol::header(peer, local));
+        .map(|backend| {
+            let proxied = backend.action == BackendAction::ForwardProxied;
+            (backend.socket_addr, proxied)
+        });
+    let (backend_addr, proxied) = match resolved {
+        Ok(backend) => backend,
+        Err(miss) => return report_passthrough_miss(miss, sni, server_port),
+    };
+    let header = proxied.then(|| proxy_protocol::header(peer, local));
 
     // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
@@ -2773,12 +2788,17 @@ async fn handle_tls_passthrough(
         &tcp_keepalive(cfg.tcp_keepalive_time),
         idle_opt(cfg.idle_body_timeout),
         "TLS passthrough",
+        stats,
     )
     .await
 }
 
-/// `header`, a PROXY v2 header for a proxied backend, goes before any
-/// byte of the client's.
+/// Relay `client` to `backend_addr`. `header`, a PROXY v2 header for a
+/// proxied backend, goes before any byte of the client's. Raw TCP has no
+/// status to answer with: a backend that cannot be reached, or takes no
+/// first byte, closes the client, and its count and log line are all an
+/// operator gets.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     client: Connection,
     backend_addr: SocketAddr,
@@ -2789,37 +2809,53 @@ async fn handle_tcp_connection(
     keepalive: &socket2::TcpKeepalive,
     idle: Option<Duration>,
     ctx: &'static str,
-) -> Result<()> {
+    stats: &ListenerStats,
+) {
     let mut backend = match connect_tcp(backend_addr, connect_timeout, keepalive).await {
         Ok(backend) => backend,
-        // Raw TCP has no status to answer with: the client is just closed.
-        Err(ConnectError::Local(e)) => {
-            log_local_exhaustion(backend_addr, &e);
-            return Ok(());
-        }
+        Err(ConnectError::Local(e)) => return log_local_exhaustion(backend_addr, &e),
         Err(e) => {
-            if health.record_failure(backend_addr) {
-                HealthRegistry::spawn_probe(health, backend_addr);
-            }
-            return Err(anyhow::anyhow!(
-                "{} connect to {} failed: {}",
-                ctx,
-                backend_addr,
-                e
-            ));
+            crate::metrics::record_backend_connect_error(&backend_addr.to_string());
+            stats.upstream_connect_errors.inc();
+            return fail_l4_backend(health, backend_addr, ctx, "connect failed", &e);
         }
     };
     health.record_success(backend_addr);
-    match header {
+    let first = match header {
         Some(mut first) => {
             first.extend_from_slice(initial_data);
-            backend.write_all(&first).await?;
+            Cow::Owned(first)
         }
-        None if !initial_data.is_empty() => backend.write_all(initial_data).await?,
-        None => {}
+        None => Cow::Borrowed(initial_data),
+    };
+    if let Err(e) = backend.write_all(&first).await {
+        crate::metrics::record_backend_send_error(&backend_addr.to_string());
+        stats.upstream_send_errors.inc();
+        return fail_l4_backend(health, backend_addr, ctx, "took no first byte", &e);
     }
     relay_l4(client, backend, idle).await;
-    Ok(())
+}
+
+/// Record an L4 backend's failure for its health, and log it once per
+/// window: the client picks how often it connects, and the counters carry
+/// every failure.
+fn fail_l4_backend(
+    health: Arc<HealthRegistry>,
+    addr: SocketAddr,
+    ctx: &str,
+    what: &str,
+    e: &dyn std::fmt::Display,
+) {
+    static FAILURES: LogThrottle = LogThrottle::new();
+    if let Some(suppressed) = FAILURES.admit_now() {
+        warn!(
+            "{} backend {} {}: {}; {} more L4 backend failures since the last such line",
+            ctx, addr, what, e, suppressed
+        );
+    }
+    if health.record_failure(addr) {
+        HealthRegistry::spawn_probe(health, addr);
+    }
 }
 
 /// Per-direction copy buffer of the L4 relay: the 8 KiB each side got from
@@ -3604,24 +3640,85 @@ mod connection_tests {
             client.write_all(&client_hello(sni)).await.unwrap();
             let (server, peer) = listener.accept().await.unwrap();
             let local = server.local_addr().unwrap();
-            let routes = Arc::clone(&routes);
-            let (health, selector) = (Arc::default(), Arc::default());
-            let err = handle_tls_passthrough(
+            let (health, selector): (Arc<HealthRegistry>, Arc<BackendSelector>) =
+                Default::default();
+            let miss = routes
+                .load()
+                .resolve_tls_passthrough(Some(sni), 8443, None, &selector, &health)
+                .unwrap_err()
+                .to_string();
+            assert!(miss.contains(why), "{sni}: {miss}");
+            // The handler closes it, with nothing left to report.
+            handle_tls_passthrough(
                 server,
                 (peer, local),
                 Some(sni),
                 None,
                 8443,
-                routes,
+                Arc::clone(&routes),
                 health,
                 selector,
                 &cfg,
+                &ListenerStats::default(),
             )
-            .await
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains(why), "{sni}: {err}");
+            .await;
+            // A reset: its ClientHello was never read.
+            let read = client.read(&mut [0u8; 8]).await;
+            assert!(!matches!(read, Ok(n) if n > 0), "{sni}: {read:?}");
         }
+    }
+
+    /// Raw TCP has no status to answer with. A backend that refuses the
+    /// connect is counted on its listener and by address, as an HTTP
+    /// backend is: for a TCP route, and for TLS passthrough.
+    #[tokio::test]
+    async fn an_l4_backend_that_refuses_is_counted() {
+        let (_held, refused) = refusing_backend();
+        let by_address = || {
+            let metrics = crate::metrics::render(true);
+            let line = format!("backend=\"{refused}\"");
+            metrics
+                .lines()
+                .filter(|l| {
+                    l.starts_with("portail_upstream_connect_errors_total") && l.contains(&line)
+                })
+                .count()
+        };
+        assert_eq!(by_address(), 0);
+
+        let state = conn_state(tcp_route(refused), false);
+        let stats = Arc::clone(&state.listener_stats);
+        let (mut client, task) = serve_state(state);
+        assert_eq!(read_until_closed(&mut client).await, "");
+        task.await.unwrap().unwrap();
+        assert_eq!(stats.upstream_connect_errors.get(), 1);
+        assert_eq!(by_address(), 1);
+
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "down.test", vec![gateway_backend(refused)]);
+        let routes = Arc::new(ArcSwap::from_pointee(rt));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let local = server.local_addr().unwrap();
+        let stats = ListenerStats::default();
+        handle_tls_passthrough(
+            server,
+            (peer, local),
+            Some("down.test"),
+            None,
+            8443,
+            routes,
+            Arc::default(),
+            Arc::default(),
+            &WorkerConfig::from_perf(&Default::default(), 4),
+            &stats,
+        )
+        .await;
+        assert_eq!(client.read(&mut [0u8; 8]).await.unwrap(), 0);
+        assert_eq!(stats.upstream_connect_errors.get(), 1);
     }
 
     /// A TLS connection no listener takes closes, counted as a failed
