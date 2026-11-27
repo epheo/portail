@@ -14,11 +14,12 @@ use tokio::net::TcpStream;
 use crate::logging::warn;
 use crate::metrics::ListenerStats;
 use crate::proxy::backend_pool::{connect_tcp, log_local_exhaustion, ConnectError, LogThrottle};
+use crate::proxy::deadline::idle_opt;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::proxy_protocol;
 use crate::proxy::request_processor::report_passthrough_miss;
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{idle_opt, tcp_keepalive, WorkerConfig};
+use crate::proxy::worker::{tcp_keepalive, WorkerConfig};
 use crate::routing::{BackendAction, BackendSelector, RouteTable};
 
 /// L4 TLS passthrough of a connection whose ClientHello was peeked for its

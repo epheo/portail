@@ -31,13 +31,14 @@ use crate::logging::debug;
 use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::SharedBackendPool;
 use crate::proxy::chunked::ChunkedStream;
+use crate::proxy::deadline::{idle_opt, progress};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{self, progress, BodyFraming, WorkerConfig};
+use crate::proxy::worker::{self, BodyFraming, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough
@@ -260,7 +261,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
 pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     let io = ClientStream::new(
         tls_stream,
-        worker::idle_opt(ctx.cfg.idle_body_timeout),
+        idle_opt(ctx.cfg.idle_body_timeout),
         ctx.cfg.client_header_timeout,
     );
     let handshake = h2::server::Builder::new()
@@ -323,7 +324,7 @@ async fn serve_stream(
 ) -> Result<()> {
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
-    let idle = worker::idle_opt(ctx.cfg.idle_body_timeout);
+    let idle = idle_opt(ctx.cfg.idle_body_timeout);
 
     let Some((head, chunk_body)) = synth_request_head(&parts, body.is_end_stream()) else {
         // CONNECT or no authority: not expressible as an origin-form h1
