@@ -18,7 +18,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::logging::{debug, warn};
 use crate::metrics::{ListenerStats, METRICS};
-use crate::proxy::backend_pool::{connect_tcp, log_local_exhaustion, ConnectError, PoolHandle};
+use crate::proxy::backend_pool::{log_local_exhaustion, ConnectError, PoolHandle};
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::deadline::{clamp_to_deadline, deadline_after, idle_guarded, idle_opt, within};
 use crate::proxy::health::HealthRegistry;
@@ -37,6 +37,7 @@ use crate::proxy::request_processor::{
     RequestMeta, RoutingResult,
 };
 use crate::proxy::tls::Connection;
+use crate::proxy::upstream::connect::{backend_metric_label, connect_proxied};
 use crate::proxy::upstream::response::{
     arrived_head, frame_response, read_response_head, BodyFraming, HeadRead, ResponseFraming,
 };
@@ -1226,18 +1227,6 @@ fn backend_conn_poolable(framing_clean: bool, is_head: bool, was_upgrade: bool) 
     framing_clean && !is_head && !was_upgrade
 }
 
-/// Metrics label for a backend: the CONFIGURED name and target port
-/// ("jellyfin.jellyfin:8096") — stable while STRICT_DNS re-resolution churns
-/// the pod IPs behind it. Falls back to the socket address when a backend
-/// was built without a name (tests, manual construction).
-fn backend_metric_label(backend: &crate::routing::Backend) -> String {
-    if backend.server_name.is_empty() {
-        backend.socket_addr.to_string()
-    } else {
-        format!("{}:{}", backend.server_name, backend.socket_addr.port())
-    }
-}
-
 /// A backend connect that failed (`502`) or timed out (`504`): counted as
 /// one, then answered as [`fail_backend`] does.
 async fn fail_connect(
@@ -1369,21 +1358,6 @@ async fn connect_to_backend(
             Ok(None)
         }
     }
-}
-
-/// A fresh plain connection to a proxied backend, its PROXY v2 header sent.
-async fn connect_proxied(
-    addr: SocketAddr,
-    connect_timeout: Duration,
-    keepalive: &socket2::TcpKeepalive,
-    header: Vec<u8>,
-) -> Result<(Connection, bool), ConnectError> {
-    let mut tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
-    METRICS.upstream_connects_total.inc();
-    tcp.write_all(&header).await.map_err(|e| {
-        ConnectError::Backend(anyhow::anyhow!("PROXY header to {} failed: {}", addr, e))
-    })?;
-    Ok((Connection::Plain { inner: tcp }, false))
 }
 
 /// Assemble the outgoing request header block into `state.scratch_buf`:
