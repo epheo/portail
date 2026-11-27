@@ -9,6 +9,7 @@ pub mod data_plane;
 pub(crate) mod deadline;
 pub(crate) mod h2_bridge;
 pub mod health;
+pub(crate) mod http1;
 pub mod http_filters;
 pub mod http_parser;
 pub mod method;
