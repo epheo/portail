@@ -52,6 +52,23 @@ const (
 
 var benchSizes = []int{1, 10, 50}
 
+// CONTROLLER_BENCH_SIZES (such as "1") narrows the Gateway counts run, and
+// CONTROLLER_BENCH_ONLY=served skips A.
+func sizes() []int {
+	raw := os.Getenv("CONTROLLER_BENCH_SIZES")
+	if raw == "" {
+		return benchSizes
+	}
+	var out []int
+	for _, f := range strings.Split(raw, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(f))
+		if err == nil && n > 0 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 var (
 	gvrNamespace  = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 	gvrService    = schema.GroupVersionResource{Version: "v1", Resource: "services"}
@@ -70,6 +87,9 @@ type bench struct {
 	dyn  dynamic.Interface
 	core kubernetes.Interface
 	vip  string
+	// Per change kind, the samples over 2s by the last status they saw
+	// before being served (0: no answer within the client's timeout).
+	slowGaps map[int]int
 	// Grows with each apply that must change its object: a value that
 	// came back would make the apply a no-op, with no event.
 	flip int
@@ -94,10 +114,13 @@ func TestControllerBench(t *testing.T) {
 
 	var report strings.Builder
 	report.WriteString("\n| Gateways | Event | Passes (median) | Runs |\n|---|---|---|---|\n")
-	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst |\n|---|---|---|---|---|---|\n"
-	for _, n := range benchSizes {
+	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst | Over 2s, last answer before |\n|---|---|---|---|---|---|---|\n"
+	for _, n := range sizes() {
 		b.scaleTo(n)
 		for _, kind := range unrelatedKinds {
+			if os.Getenv("CONTROLLER_BENCH_ONLY") == "served" {
+				break
+			}
 			runs := make([]int, eventRepeats)
 			for r := range runs {
 				runs[r] = b.passesFor(kind)
@@ -111,14 +134,15 @@ func TestControllerBench(t *testing.T) {
 			run  func(int) time.Duration
 		}{{"route edit", b.routeEditServed}, {"Service created", b.serviceCreateServed}} {
 			took := make([]time.Duration, 0, servedSamples)
+			b.slowGaps = map[int]int{}
 			for i := 0; i < servedSamples; i++ {
 				took = append(took, change.run(i))
 			}
 			sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
 			at := func(q float64) time.Duration { return took[int(q*float64(len(took)-1)+0.5)] }
-			served += fmt.Sprintf("| %d | %s | %d | %s | %s | %s |\n", n, change.name, len(took),
+			served += fmt.Sprintf("| %d | %s | %d | %s | %s | %s | %v |\n", n, change.name, len(took),
 				at(0.5).Round(time.Millisecond), at(0.95).Round(time.Millisecond),
-				took[len(took)-1].Round(time.Millisecond))
+				took[len(took)-1].Round(time.Millisecond), b.slowGaps)
 		}
 	}
 	t.Log("A: reconcile passes per unrelated event" + report.String())
@@ -457,7 +481,10 @@ func (b *bench) passes() int {
 
 // --- B: edit to served -------------------------------------------------------
 
-var httpClient = &http.Client{Timeout: 2 * time.Second}
+// Short against servedPoll's grain: a request to a backend not reachable
+// yet (a ClusterIP kube-proxy has not programmed) hangs, and a long timeout
+// would round its sample up by the timeout.
+var httpClient = &http.Client{Timeout: 250 * time.Millisecond}
 
 func status(url string) int {
 	resp, err := httpClient.Get(url)
@@ -470,16 +497,31 @@ func status(url string) int {
 
 // The time from `start` until `url` first answers `want`.
 func (b *bench) waitStatus(url string, want int) time.Duration {
+	took, _ := b.waitStatusSeen(url, want)
+	return took
+}
+
+// Like waitStatus, with the last other status seen meanwhile (0: none, or
+// no answer).
+func (b *bench) waitStatusSeen(url string, want int) (time.Duration, int) {
 	b.t.Helper()
-	start := time.Now()
+	start, last := time.Now(), 0
 	for time.Since(start) < servedTimeout {
-		if status(url) == want {
-			return time.Since(start)
+		got := status(url)
+		if got == want {
+			return time.Since(start), last
 		}
+		last = got
 		time.Sleep(servedPoll)
 	}
 	b.t.Fatalf("%s did not answer %d in %s", url, want, servedTimeout)
-	return 0
+	return 0, 0
+}
+
+func (b *bench) noteGap(took time.Duration, last int) {
+	if took > 2*time.Second {
+		b.slowGaps[last]++
+	}
 }
 
 // A rule added to gw-0's route: from the apply to its path served.
@@ -489,7 +531,9 @@ func (b *bench) routeEditServed(k int) time.Duration {
 	b.waitStatus(url, 404)
 	start := time.Now()
 	b.apply(gvrRoute, b.route(0, "/base", [][2]string{{path, "svc-0"}}))
-	took := time.Since(start) + b.waitStatus(url, 200)
+	_, last := b.waitStatusSeen(url, 200)
+	took := time.Since(start)
+	b.noteGap(took, last)
 	b.apply(gvrRoute, b.route(0, "/base", nil))
 	return took
 }
@@ -509,7 +553,9 @@ spec:
   selector: {app: echo}
   ports: [{port: 8080, targetPort: 3000}]
 `, svc, benchNS))
-	took := time.Since(start) + b.waitStatus(url, 200)
+	_, last := b.waitStatusSeen(url, 200)
+	took := time.Since(start)
+	b.noteGap(took, last)
 	b.apply(gvrRoute, b.route(0, "/base", nil))
 	b.remove(gvrService, benchNS, svc)
 	return took

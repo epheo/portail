@@ -257,6 +257,8 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 	cmd := exec.Command(runtime, "run", "--rm",
 		"--network", "kind",
 		"-e", "CONTROLLER_BENCH="+bench,
+		"-e", "CONTROLLER_BENCH_SIZES="+os.Getenv("CONTROLLER_BENCH_SIZES"),
+		"-e", "CONTROLLER_BENCH_ONLY="+os.Getenv("CONTROLLER_BENCH_ONLY"),
 		"-v", testBinPath+":/conformance.test:Z",
 		"-v", internalKubeconfig.Name()+":/kubeconfig:Z",
 		"-v", reportDir+":/reports:Z",
