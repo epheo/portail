@@ -33,11 +33,16 @@ import (
 // of theirs translates and writes status but provisions nothing.
 
 const (
-	benchNS        = "bench"
-	otherNS        = "bench-other"
-	echoImage      = "registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0"
-	settleQuiet    = 3 * time.Second
-	settleAtLeast  = 8 * time.Second
+	benchNS       = "bench"
+	otherNS       = "bench-other"
+	echoImage     = "registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0"
+	settleQuiet   = 3 * time.Second
+	settleAtLeast = 8 * time.Second
+	eventRepeats  = 3
+	// After Gateways are added: their Programmed condition settles over
+	// the first half minute (a hold, then lapses), each a pass.
+	scaledQuiet    = 10 * time.Second
+	scaledAtLeast  = 40 * time.Second
 	eventWindow    = 5 * time.Second
 	servedPoll     = 10 * time.Millisecond
 	servedTimeout  = 30 * time.Second
@@ -65,7 +70,8 @@ type bench struct {
 	dyn  dynamic.Interface
 	core kubernetes.Interface
 	vip  string
-	// Toggled by each unrelated event, so every apply changes the object.
+	// Grows with each apply that must change its object: a value that
+	// came back would make the apply a no-op, with no event.
 	flip int
 }
 
@@ -87,12 +93,18 @@ func TestControllerBench(t *testing.T) {
 	b.setUp()
 
 	var report strings.Builder
-	report.WriteString("\n| Gateways | Event | Passes |\n|---|---|---|\n")
+	report.WriteString("\n| Gateways | Event | Passes (median) | Runs |\n|---|---|---|---|\n")
 	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst |\n|---|---|---|---|---|---|\n"
 	for _, n := range benchSizes {
 		b.scaleTo(n)
 		for _, kind := range unrelatedKinds {
-			fmt.Fprintf(&report, "| %d | %s | %d |\n", n, kind.name, b.passesFor(kind))
+			runs := make([]int, eventRepeats)
+			for r := range runs {
+				runs[r] = b.passesFor(kind)
+			}
+			sorted := append([]int(nil), runs...)
+			sort.Ints(sorted)
+			fmt.Fprintf(&report, "| %d | %s | %d | %v |\n", n, kind.name, sorted[len(sorted)/2], runs)
 		}
 		for _, change := range []struct {
 			name string
@@ -230,6 +242,7 @@ func (b *bench) scaleTo(n int) {
 		b.vip = b.waitVIP("gw-0")
 		b.waitStatus("http://"+b.vip+"/base", 200)
 	}
+	b.settleFor(scaledQuiet, scaledAtLeast)
 }
 
 func (b *bench) gatewayCount() int {
@@ -316,7 +329,7 @@ metadata: {name: unrelated, namespace: %s}
 spec:
   selector: {app: nothing}
   ports: [{port: %d, targetPort: 3000}]
-`, otherNS, 8080+b.flip%2))
+`, otherNS, 10000+b.flip))
 }
 
 func (b *bench) applyUnrelatedSecret() {
@@ -341,7 +354,7 @@ metadata: {name: unrelated, namespace: %s}
 spec:
   from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: nowhere-%d}]
   to: [{group: "", kind: Service}]
-`, otherNS, b.flip%2))
+`, otherNS, b.flip))
 }
 
 func (b *bench) applyUnrelatedRoute() {
@@ -352,16 +365,16 @@ metadata: {name: unrelated, namespace: %s}
 spec:
   parentRefs: [{name: nowhere}]
   rules: [{matches: [{path: {type: PathPrefix, value: "/flip-%d"}}]}]
-`, otherNS, b.flip%2))
+`, otherNS, b.flip))
 }
 
 func (b *bench) applyUnrelatedParams() {
 	b.flip++
 	b.apply(gvrParams, fmt.Sprintf(`apiVersion: portail.epheo.eu/v1alpha1
 kind: GatewayParameters
-metadata: {name: unrelated, namespace: %s}
-spec: {replicas: %d}
-`, otherNS, 1+b.flip%2))
+metadata: {name: unrelated, namespace: %s, labels: {bench-flip: "%d"}}
+spec: {replicas: 1}
+`, otherNS, b.flip))
 }
 
 func (b *bench) applyUnrelatedPolicy() {
@@ -372,7 +385,7 @@ metadata: {name: unrelated, namespace: %s}
 spec:
   targetRef: {group: gateway.networking.k8s.io, kind: Gateway, name: nowhere}
   requestsPerSecond: %d
-`, otherNS, 10+b.flip%2))
+`, otherNS, 10+b.flip))
 }
 
 // The passes one event of `kind` costs. A Gateway that is not converged
@@ -396,7 +409,9 @@ func (b *bench) applyUnrelatedNamespaceAlign() {
 
 // Wait until the pass count has not moved for settleQuiet, and at least
 // settleAtLeast: a pass that wrote status re-runs 5s later.
-func (b *bench) settle() {
+func (b *bench) settle() { b.settleFor(settleQuiet, settleAtLeast) }
+
+func (b *bench) settleFor(quiet, atLeast time.Duration) {
 	start, last, seen := time.Now(), time.Now(), b.passes()
 	for {
 		time.Sleep(500 * time.Millisecond)
@@ -405,7 +420,7 @@ func (b *bench) settle() {
 			seen, last = now, time.Now()
 			continue
 		}
-		if time.Since(last) >= settleQuiet && time.Since(start) >= settleAtLeast {
+		if time.Since(last) >= quiet && time.Since(start) >= atLeast {
 			return
 		}
 	}
