@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,8 +31,10 @@ import (
 // A: reconcile passes one event of each watched kind costs, at 1, 10 and
 // 50 Gateways: an object no Gateway reads, then one only gw-0 reads. B:
 // edit-to-served, from the apiserver accepting a change to the data plane
-// answering by it. Only bench/gw-0 is Managed: the others are Unmanaged, so
-// the node carries one data plane, and a pass of theirs translates and
+// answering by it, with what the client and gw-0's data plane saw meanwhile.
+// C: a burst of Service events: passes, publishes, status writes and other
+// apiserver requests. Only bench/gw-0 is Managed: the others are Unmanaged,
+// so the node carries one data plane, and a pass of theirs translates and
 // writes status but provisions nothing.
 
 const (
@@ -51,12 +54,15 @@ const (
 	servedTimeout  = 30 * time.Second
 	servedSamples  = 20
 	controllerPort = 19099
+	burstEvents    = 50
+	burstSpan      = time.Second
 )
 
 var benchSizes = []int{1, 10, 50}
 
 // CONTROLLER_BENCH_SIZES (such as "1") narrows the Gateway counts run, and
-// CONTROLLER_BENCH_ONLY=served skips A.
+// CONTROLLER_BENCH_ONLY lists the parts to run, such as "served,burst":
+// "served" for B, "burst" for C; unset runs all three.
 func sizes() []int {
 	raw := os.Getenv("CONTROLLER_BENCH_SIZES")
 	if raw == "" {
@@ -94,6 +100,8 @@ type bench struct {
 	// Per change kind, the samples over 2s by the last status they saw
 	// before being served (0: no answer within the client's timeout).
 	slowGaps map[int]int
+	// Per change kind, every status polled before being served.
+	seen map[int]int
 	// Grows with each apply that must change its object: a value that
 	// came back would make the apply a no-op, with no event.
 	flip int
@@ -107,6 +115,10 @@ func TestControllerBench(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// client-go's default limiter (5 a second, burst 10) would hold the
+	// bench's own applies: a timed edit then measures the token bucket,
+	// and a burst spreads over seconds.
+	cfg.QPS = -1
 	b := &bench{t: t, ctx: context.Background()}
 	if b.dyn, err = dynamic.NewForConfig(cfg); err != nil {
 		t.Fatal(err)
@@ -119,11 +131,14 @@ func TestControllerBench(t *testing.T) {
 	var report strings.Builder
 	report.WriteString("\n| Gateways | Event | Passes (median) | Runs |\n|---|---|---|---|\n")
 	events := append(append([]eventKind(nil), unrelatedKinds...), readKinds...)
-	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst | Over 2s, last answer before |\n|---|---|---|---|---|---|---|\n"
+	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst | Over 2s, last answer before | Polled before served | gw-0 data plane: connect errors, timeouts, marked unhealthy |\n|---|---|---|---|---|---|---|---|---|\n"
+	bursted := "\n| Gateways | Burst | Sent in | Passes | Pass time, total and mean | Published or wrote | Applied by gw-0 | /steady polls: answered, failed, over 50 ms, worst | Status writes | Other apiserver requests |\n|---|---|---|---|---|---|---|---|---|---|\n"
+	only := os.Getenv("CONTROLLER_BENCH_ONLY")
+	runs := func(part string) bool { return only == "" || strings.Contains(only, part) }
 	for _, n := range sizes() {
 		b.scaleTo(n)
 		for _, kind := range events {
-			if os.Getenv("CONTROLLER_BENCH_ONLY") == "served" {
+			if only != "" {
 				break
 			}
 			runs := make([]int, eventRepeats)
@@ -138,20 +153,47 @@ func TestControllerBench(t *testing.T) {
 			name string
 			run  func(int) time.Duration
 		}{{"route edit", b.routeEditServed}, {"Service created", b.serviceCreateServed}} {
+			if !runs("served") {
+				break
+			}
 			took := make([]time.Duration, 0, servedSamples)
-			b.slowGaps = map[int]int{}
+			b.slowGaps, b.seen = map[int]int{}, map[int]int{}
+			plane := b.dataPlaneFailures()
 			for i := 0; i < servedSamples; i++ {
 				took = append(took, change.run(i))
 			}
+			moved := diff(b.dataPlaneFailures(), plane)
 			sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
 			at := func(q float64) time.Duration { return took[int(q*float64(len(took)-1)+0.5)] }
-			served += fmt.Sprintf("| %d | %s | %d | %s | %s | %s | %v |\n", n, change.name, len(took),
+			served += fmt.Sprintf("| %d | %s | %d | %s | %s | %s | %v | %v | %v, %v, %v |\n", n, change.name, len(took),
 				at(0.5).Round(time.Millisecond), at(0.95).Round(time.Millisecond),
-				took[len(took)-1].Round(time.Millisecond), b.slowGaps)
+				took[len(took)-1].Round(time.Millisecond), b.slowGaps, b.seen,
+				sum(moved, "portail_upstream_connect_errors_total"),
+				sum(moved, "portail_upstream_connect_timeouts_total"),
+				sum(moved, "portail_backends_marked_unhealthy_total"))
+			for series, v := range moved {
+				t.Logf("%d Gateways, %s: gw-0 data plane %s moved by %v", n, change.name, series, v)
+			}
+		}
+		if !runs("burst") {
+			continue
+		}
+		for _, br := range bursts {
+			c := b.burstCost(br)
+			mean := time.Duration(0)
+			if c.passes > 0 {
+				mean = c.passTime / time.Duration(c.passes)
+			}
+			bursted += fmt.Sprintf("| %d | %s | %s | %d | %s, %s | %d | %d | %d, %d, %d, %s | %v | %v |\n", n, br.name,
+				c.sent.Round(time.Millisecond), c.passes,
+				c.passTime.Round(time.Microsecond), mean.Round(time.Microsecond), c.published, c.applied,
+				c.steady.answered, c.steady.failed, c.steady.slow, c.steady.worst.Round(time.Millisecond),
+				c.statusWrites, c.other)
 		}
 	}
 	t.Log("A: reconcile passes per event" + report.String())
 	t.Log("B: edit to served, polled every " + servedPoll.String() + served)
+	t.Log(fmt.Sprintf("C: %d events of one Service in %s, gw-0's backend", burstEvents, burstSpan) + bursted)
 }
 
 // --- Objects ---------------------------------------------------------------
@@ -211,18 +253,28 @@ spec: {provisioning: Unmanaged}
 	b.touchOwnParams()
 	b.touchGrant()
 	b.apply(gvrService, serviceDoc("granted", grantedNS, "nothing", 0))
+	b.apply(gvrService, serviceDoc("steady", benchNS, "echo", 0))
 	b.applyUnrelated()
 }
 
 // A Service on port 8080 selecting `app`, its bench-flip label `flip`.
 func serviceDoc(name, ns, app string, flip int) string {
+	return serviceDocProto(name, ns, app, flip, "")
+}
+
+// serviceDoc, its port's appProtocol `proto` unless empty.
+func serviceDocProto(name, ns, app string, flip int, proto string) string {
+	port := "{port: 8080, targetPort: 3000}"
+	if proto != "" {
+		port = fmt.Sprintf("{port: 8080, targetPort: 3000, appProtocol: %s}", proto)
+	}
 	return fmt.Sprintf(`apiVersion: v1
 kind: Service
 metadata: {name: %s, namespace: %s, labels: {bench-flip: "%d"}}
 spec:
   selector: {app: %s}
-  ports: [{port: 8080, targetPort: 3000}]
-`, name, ns, flip, app)
+  ports: [%s]
+`, name, ns, flip, app, port)
 }
 
 // Gateway i, its route and the Service it routes to. gw-0 is Managed, its
@@ -260,6 +312,8 @@ func (b *bench) route(i int, base string, extra [][2]string) string {
 	rules := rule(base, fmt.Sprintf("svc-%d", i))
 	if i == 0 {
 		rules += fmt.Sprintf("  - matches: [{path: {type: PathPrefix, value: /granted}}]\n    backendRefs: [{name: granted, namespace: %s, port: 8080}]\n", grantedNS)
+		// C polls it while a burst changes svc-0, which it does not use.
+		rules += rule("/steady", "steady")
 	}
 	for _, e := range extra {
 		rules += rule(e[0], e[1])
@@ -516,30 +570,91 @@ func (b *bench) settleFor(quiet, atLeast time.Duration) {
 // Every pass of every controller replica so far: the count of the pass
 // duration histogram, read through the apiserver's pod proxy.
 func (b *bench) passes() int {
+	return int(b.controllerMetric("portail_controller_reconcile_duration_seconds_count"))
+}
+
+// `name` summed over every controller replica.
+func (b *bench) controllerMetric(name string) float64 {
+	return sum(b.podMetrics(controllerNS, "app.kubernetes.io/name=portail-controller"), name)
+}
+
+// Every sample of every pod `selector` picks in `ns`, by series, summed
+// over pods.
+func (b *bench) podMetrics(ns, selector string) map[string]float64 {
 	b.t.Helper()
-	pods, err := b.core.CoreV1().Pods(controllerNS).List(b.ctx, metav1.ListOptions{
-		LabelSelector: "app.kubernetes.io/name=portail-controller",
-	})
+	pods, err := b.core.CoreV1().Pods(ns).List(b.ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		b.t.Fatal(err)
 	}
-	total := 0
+	out := map[string]float64{}
 	for _, pod := range pods.Items {
-		raw, err := b.core.CoreV1().Pods(controllerNS).
+		raw, err := b.core.CoreV1().Pods(ns).
 			ProxyGet("http", pod.Name, strconv.Itoa(controllerPort), "/metrics", nil).DoRaw(b.ctx)
 		if err != nil {
 			b.t.Fatalf("metrics of %s: %v", pod.Name, err)
 		}
-		scan := bufio.NewScanner(strings.NewReader(string(raw)))
-		for scan.Scan() {
-			line := scan.Text()
-			if strings.HasPrefix(line, "portail_controller_reconcile_duration_seconds_count ") {
-				n, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "portail_controller_reconcile_duration_seconds_count ")))
-				total += n
-			}
+		addSamples(out, raw)
+	}
+	return out
+}
+
+// Prometheus text samples into `out`, by series.
+func addSamples(out map[string]float64, raw []byte) {
+	scan := bufio.NewScanner(strings.NewReader(string(raw)))
+	scan.Buffer(make([]byte, 0, 1<<16), 1<<20)
+	for scan.Scan() {
+		line := scan.Text()
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		cut := strings.LastIndexByte(line, ' ')
+		if cut < 0 {
+			continue
+		}
+		if v, err := strconv.ParseFloat(line[cut+1:], 64); err == nil {
+			out[line[:cut]] += v
+		}
+	}
+}
+
+// The samples of the series named `name`, labelled or not, summed.
+func sum(samples map[string]float64, name string) float64 {
+	total := 0.0
+	for series, v := range samples {
+		if series == name || strings.HasPrefix(series, name+"{") {
+			total += v
 		}
 	}
 	return total
+}
+
+// The series that moved from `before` to `after`, by how much.
+func diff(after, before map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for series, v := range after {
+		if d := v - before[series]; d != 0 {
+			out[series] = d
+		}
+	}
+	return out
+}
+
+// What a client of gw-0 can make its data plane count as a failure.
+func (b *bench) dataPlaneFailures() map[string]float64 {
+	all := b.podMetrics(benchNS, "portail.epheo.eu/gateway=gw-0")
+	out := map[string]float64{}
+	for series, v := range all {
+		for _, name := range []string{
+			"portail_upstream_connect_errors_total",
+			"portail_upstream_connect_timeouts_total",
+			"portail_backends_marked_unhealthy_total",
+		} {
+			if series == name || strings.HasPrefix(series, name+"{") {
+				out[series] = v
+			}
+		}
+	}
+	return out
 }
 
 // --- B: edit to served -------------------------------------------------------
@@ -558,9 +673,13 @@ func status(url string) int {
 	return resp.StatusCode
 }
 
-// The time from `start` until `url` first answers `want`.
+// The time from `start` until `url` first answers `want`. Not counted in
+// `seen`: only the measured wait is.
 func (b *bench) waitStatus(url string, want int) time.Duration {
+	seen := b.seen
+	b.seen = nil
 	took, _ := b.waitStatusSeen(url, want)
+	b.seen = seen
 	return took
 }
 
@@ -573,6 +692,9 @@ func (b *bench) waitStatusSeen(url string, want int) (time.Duration, int) {
 		got := status(url)
 		if got == want {
 			return time.Since(start), last
+		}
+		if b.seen != nil {
+			b.seen[got]++
 		}
 		last = got
 		time.Sleep(servedPoll)
@@ -622,4 +744,174 @@ spec:
 	b.apply(gvrRoute, b.route(0, "/base", nil))
 	b.remove(gvrService, benchNS, svc)
 	return took
+}
+
+// --- C: a burst of Service events -------------------------------------------
+
+type burst struct {
+	name string
+	// The k-th event of the burst; nil sends none.
+	touch func(b *bench, k int)
+}
+
+// gw-0's backend, burstEvents times in burstSpan. A label changes no
+// pass's output; the port's appProtocol changes the snapshot each time,
+// "http" being served as no appProtocol is. Both end as they began.
+var bursts = []burst{
+	{"none (control)", nil},
+	{"label, output unchanged", func(b *bench, k int) {
+		b.flip++
+		b.apply(gvrService, serviceDoc("svc-0", benchNS, "echo", b.flip))
+	}},
+	{"appProtocol, snapshot changed", func(b *bench, k int) {
+		b.flip++
+		proto := ""
+		if k%2 == 0 {
+			proto = "http"
+		}
+		b.apply(gvrService, serviceDocProto("svc-0", benchNS, "echo", b.flip, proto))
+	}},
+}
+
+type burstCost struct {
+	// From the first event's send to the last one's answer.
+	sent              time.Duration
+	passes, published int
+	// The pass duration histogram's sum over the burst.
+	passTime time.Duration
+	// Versions gw-0's data plane rebuilt its route table for.
+	applied      int
+	steady       polled
+	statusWrites float64
+	// Non-watch requests but status writes, the bench's own and pods'
+	// (the bench reads metrics through the pod proxy), by verb and resource.
+	other map[string]float64
+}
+
+// What polls of one URL saw.
+type polled struct {
+	answered, failed, slow int
+	worst                  time.Duration
+}
+
+// Poll `url` every servedPoll until `stop` closes; a poll over 50 ms is slow.
+func pollUntil(url string, stop <-chan struct{}) polled {
+	var p polled
+	for {
+		select {
+		case <-stop:
+			return p
+		default:
+		}
+		start := time.Now()
+		code := status(url)
+		took := time.Since(start)
+		if code == 200 {
+			p.answered++
+		} else {
+			p.failed++
+		}
+		if took > 50*time.Millisecond {
+			p.slow++
+		}
+		if took > p.worst {
+			p.worst = took
+		}
+		time.Sleep(servedPoll)
+	}
+}
+
+func (b *bench) burstCost(br burst) burstCost {
+	b.align()
+	b.settle()
+	passes, published, requests := b.passes(), b.controllerMetric("portail_reconcile_runs_total"), b.apiserverRequests()
+	passTime, applied := b.controllerMetric("portail_controller_reconcile_duration_seconds_sum"), b.applies()
+	stop, steady := make(chan struct{}), make(chan polled)
+	go func() { steady <- pollUntil("http://"+b.vip+"/steady", stop) }()
+	start := time.Now()
+	for k := 0; k < burstEvents; k++ {
+		time.Sleep(time.Until(start.Add(time.Duration(k) * burstSpan / burstEvents)))
+		if br.touch != nil {
+			br.touch(b, k)
+		}
+	}
+	sent := time.Since(start)
+	b.settle()
+	close(stop)
+	c := burstCost{
+		sent:      sent,
+		passes:    b.passes() - passes,
+		published: int(b.controllerMetric("portail_reconcile_runs_total") - published),
+		passTime: time.Duration((b.controllerMetric("portail_controller_reconcile_duration_seconds_sum") - passTime) *
+			float64(time.Second)),
+		applied: b.applies() - applied,
+		steady:  <-steady,
+		other:   map[string]float64{},
+	}
+	for key, v := range diff(b.apiserverRequests(), requests) {
+		verb, target, _ := strings.Cut(key, " ")
+		resource, subresource, _ := strings.Cut(target, "/")
+		switch {
+		case subresource == "status" && verb != "GET" && verb != "LIST":
+			c.statusWrites += v
+		case resource == "pods" || resource == "":
+		case br.touch != nil && key == "APPLY services/":
+			if rest := v - burstEvents; rest != 0 {
+				c.other[key] = rest
+			}
+		case key == "PATCH gatewayclasses/":
+		default:
+			c.other[key] = v
+		}
+	}
+	return c
+}
+
+// The apiserver's non-watch requests so far, by "VERB resource/subresource".
+func (b *bench) apiserverRequests() map[string]float64 {
+	b.t.Helper()
+	raw, err := b.core.CoreV1().RESTClient().Get().AbsPath("/metrics").DoRaw(b.ctx)
+	if err != nil {
+		b.t.Fatalf("apiserver metrics: %v", err)
+	}
+	samples := map[string]float64{}
+	addSamples(samples, raw)
+	out := map[string]float64{}
+	for series, v := range samples {
+		labels, ok := strings.CutPrefix(series, "apiserver_request_total{")
+		if !ok {
+			continue
+		}
+		get := func(label string) string {
+			for _, kv := range strings.Split(strings.TrimSuffix(labels, "}"), ",") {
+				if k, val, _ := strings.Cut(kv, "="); k == label {
+					return strings.Trim(val, `"`)
+				}
+			}
+			return ""
+		}
+		if verb := get("verb"); verb != "WATCH" {
+			out[verb+" "+get("resource")+"/"+get("subresource")] += v
+		}
+	}
+	return out
+}
+
+// Route tables gw-0's data plane has built from a snapshot so far, by its
+// log: one line per rebuilt version.
+func (b *bench) applies() int {
+	b.t.Helper()
+	pods, err := b.core.CoreV1().Pods(benchNS).List(b.ctx, metav1.ListOptions{LabelSelector: "portail.epheo.eu/gateway=gw-0"})
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	total := 0
+	for _, pod := range pods.Items {
+		raw, err := b.core.CoreV1().Pods(benchNS).GetLogs(pod.Name, &corev1.PodLogOptions{}).DoRaw(b.ctx)
+		if err != nil {
+			b.t.Fatalf("logs of %s: %v", pod.Name, err)
+		}
+		total += strings.Count(string(raw), " applied (")
+	}
+	return total
 }
