@@ -336,6 +336,13 @@ pub(super) fn validate_gateway(
             ls.resolved_refs_message = "HTTPS/TLS listener requires TLS configuration".into();
         }
 
+        // A listener it cannot serve takes no kind at all
+        // (TLSRouteListenerTerminateNotSupported), as no route attaches there.
+        let served = if listener_is_served(listener) {
+            status::route_kind_for_protocol(&listener.protocol)
+        } else {
+            None
+        };
         // Check allowedRoutes.kinds validity and compute supportedKinds
         if let Some(allowed_routes) = &listener.allowed_routes {
             if let Some(kinds) = &allowed_routes.kinds {
@@ -343,7 +350,6 @@ pub(super) fn validate_gateway(
                 // listener takes no TCPRoute
                 // (TLSRouteListenerPassthroughSupportedKinds), and no listener
                 // takes GRPCRoute, which the data plane cannot serve.
-                let served = status::route_kind_for_protocol(&listener.protocol);
                 let mut supported = Vec::new();
                 let mut has_invalid = false;
                 for k in kinds {
@@ -366,10 +372,10 @@ pub(super) fn validate_gateway(
                         "One or more route kinds in allowedRoutes are not supported".into();
                 }
             } else {
-                ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
+                ls.supported_kinds = status::supported_kinds_of(served);
             }
         } else {
-            ls.supported_kinds = status::supported_kinds_for_protocol(&listener.protocol);
+            ls.supported_kinds = status::supported_kinds_of(served);
         }
 
         if !refs_failed {
@@ -870,6 +876,28 @@ mod tests {
         assert_eq!(listeners["plain"].conflicted_reason, "ProtocolConflict");
     }
 
+    /// The status written for an unserved listener lists no kind either,
+    /// allowedRoutes or not: the protocol fallback skips it.
+    #[test]
+    fn an_unserved_listener_is_written_without_kinds() {
+        let terminate = GatewayListeners {
+            tls: Some(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Terminate),
+                ..Default::default()
+            }),
+            ..listener("db", 443, "TLS", Some("web.example.com"))
+        };
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners = vec![terminate.clone()];
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        let entry = status::listener_entry(&terminate, &listeners["db"], 0, Some(1));
+        assert_eq!(entry["supportedKinds"], serde_json::json!([]));
+    }
+
     /// The data plane serves a TLS listener in Passthrough mode only: a
     /// Terminate one was Accepted and Programmed, its TLSRoutes forwarded
     /// raw, and it shared its port with HTTPS as one family. It is rejected
@@ -900,6 +928,7 @@ mod tests {
         let db = &listeners["db"];
         assert!(!db.accepted && !db.programmed && !db.conflicted);
         assert_eq!(db.accepted_reason, "UnsupportedValue");
+        assert!(db.supported_kinds.is_empty(), "{:?}", db.supported_kinds);
         assert!(
             db.accepted_message.contains("Passthrough"),
             "{}",

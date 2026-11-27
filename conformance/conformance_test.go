@@ -242,6 +242,11 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 	}
 
 	reportOutput := fmt.Sprintf("reports/%s/epheo-portail/experimental-%s-default-report.yaml", gatewayAPIVersion, portailVersion)
+	// The suite writes the report but creates no directory: a new Gateway
+	// API version has none yet.
+	if err := os.MkdirAll(filepath.Join(conformanceDir, filepath.Dir(reportOutput)), 0755); err != nil {
+		return 1, fmt.Errorf("create report dir: %w", err)
+	}
 
 	log.Printf("Executing tests on Kind network (VIP %s)...", vip)
 	cmd := exec.Command(runtime, "run", "--rm",
