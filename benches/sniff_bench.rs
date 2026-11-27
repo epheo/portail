@@ -3,12 +3,16 @@
 //! binary so parsing_bench stays byte-identical: a 26 ns loop moves by more
 //! than the gate's threshold when code alignment in its binary shifts.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+#[macro_use]
+mod common;
+
+use criterion::measurement::Measurement;
+use criterion::Criterion;
 use portail::proxy::request_processor::is_http_request;
 use std::hint::black_box;
 use std::time::Duration;
 
-fn sniff_benchmark(c: &mut Criterion) {
+fn sniff_benchmark<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let common = b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
     let extension = b"PROPFIND /calendars/ HTTP/1.1\r\nHost: example.com\r\nDepth: 0\r\n\r\n";
     let tls_client_hello: &[u8] = &[
@@ -35,9 +39,4 @@ fn config() -> Criterion {
         .sample_size(10000)
 }
 
-criterion_group! {
-    name = sniff_benches;
-    config = config();
-    targets = sniff_benchmark
-}
-criterion_main!(sniff_benches);
+bench_main!(config(); sniff_benchmark);

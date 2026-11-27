@@ -1,4 +1,8 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+#[macro_use]
+mod common;
+
+use criterion::measurement::Measurement;
+use criterion::{BenchmarkId, Criterion};
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::request_processor::analyze_udp_request;
 use portail::proxy::tls::{TlsKind, TlsPlan};
@@ -30,7 +34,7 @@ fn lookup<'a>(table: &'a RouteTable, host: &str, path: &str) -> Option<&'a HttpR
     )
 }
 
-fn routing_benchmark(c: &mut Criterion) {
+fn routing_benchmark<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut small_table = RouteTable::new();
     let mut medium_table = RouteTable::new();
     let mut large_table = RouteTable::new();
@@ -184,7 +188,7 @@ fn routing_benchmark(c: &mut Criterion) {
     selection.finish();
 }
 
-fn memory_benchmark(c: &mut Criterion) {
+fn memory_benchmark<M: Measurement + 'static>(c: &mut Criterion<M>) {
     c.bench_function("route_table_creation", |b| {
         b.iter(|| black_box(RouteTable::new()))
     });
@@ -225,7 +229,7 @@ fn route_config(rules: &[String]) -> portail::config::PortailConfig {
     serde_json::from_str(&json).unwrap()
 }
 
-fn config_benchmark(c: &mut Criterion) {
+fn config_benchmark<M: Measurement + 'static>(c: &mut Criterion<M>) {
     // A regex path match is a full match (the pattern compiles anchored).
     let regex_table = route_config(&[
         r#"{"matches":[{"path":{"type":"RegularExpression","value":"/api/v[0-9]+/users/[0-9]+"}}],"backendRefs":[{"name":"127.0.0.1","port":8080}]}"#.to_string(),
@@ -279,9 +283,4 @@ fn config_benchmark(c: &mut Criterion) {
     });
 }
 
-criterion_group! {
-    name = routing_benches;
-    config = config();
-    targets = routing_benchmark, memory_benchmark, config_benchmark
-}
-criterion_main!(routing_benches);
+bench_main!(config(); routing_benchmark, memory_benchmark, config_benchmark);
