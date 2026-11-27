@@ -1,8 +1,7 @@
 //! What the micro benches measure: wall time by default, or user-space
 //! instructions retired under `BENCH_MEASURE=instructions`, the count the
-//! regression gate compares. Wall time moves with code placement alone
-//! (follow-up 28: +16-24% on byte-identical code); the instruction count
-//! does not.
+//! regression gate compares. Wall time moves with code placement alone,
+//! by 16-24% on byte-identical code; the instruction count does not.
 
 use criterion::measurement::{Measurement, ValueFormatter};
 use criterion::Throughput;

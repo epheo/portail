@@ -9,9 +9,9 @@
 # BENCH_GATE_MEASURE picks the unit (default instructions):
 #   instructions  user-space instructions retired per iteration, read from
 #                 the PMU. Code placement alone moves wall time by 16-24%
-#                 on byte-identical code (follow-up 28); it moves no
-#                 instruction. Needs perf_event_paranoid <= 2 and a PMU,
-#                 so no VM without counter passthrough.
+#                 on byte-identical code; it moves no instruction. Needs
+#                 perf_event_paranoid <= 2 and a PMU, so no VM without
+#                 counter passthrough.
 #   time          wall time per iteration, the fallback without a PMU.
 #
 # The instruction defaults come from seven processes of one binary: 66 of

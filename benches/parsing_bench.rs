@@ -7,9 +7,9 @@ use portail::proxy::http_parser::{extract_routing_info, normalize_path};
 use std::hint::black_box;
 use std::time::Duration;
 
-/// Parse opaque input and keep the result in place. Returned by value,
-/// the 192-byte Result was copied into black_box on every iteration: about
-/// a third of what the bench measured (follow-up 28).
+/// Parse opaque input; black_box takes a reference to the result. By
+/// value, the 192-byte Result is copied on every iteration, about a third
+/// of the measurement.
 fn parse(request: &[u8]) {
     let info = extract_routing_info(black_box(request));
     black_box(&info);
