@@ -21,7 +21,7 @@ use crate::logging::{info, warn};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::listener;
 use crate::proxy::tls::{self, TlsKind, TlsPlan};
-use crate::proxy::udp_worker;
+use crate::proxy::udp;
 use crate::routing::{BackendSelector, RouteTable};
 use crate::sync::Transport;
 
@@ -162,7 +162,7 @@ pub struct DataPlane {
     health: Arc<HealthRegistry>,
     /// Cloned into every UDP worker, the controller's too: a rebuilt one
     /// would split the default session budget.
-    udp_sessions: udp_worker::SessionLimits,
+    udp_sessions: udp::SessionLimits,
     shutdown: CancellationToken,
     active_connections: Arc<AtomicUsize>,
     /// Per published TCP port, every pass's plan (see [`PortPlan`]).
@@ -502,7 +502,7 @@ impl DataPlane {
                 DEFAULT_MAX_IDLE_PER_BACKEND,
             ),
             health,
-            udp_sessions: udp_worker::SessionLimits::from_perf(performance_config),
+            udp_sessions: udp::SessionLimits::from_perf(performance_config),
             shutdown: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             plans,
@@ -790,7 +790,7 @@ impl DataPlane {
         let limits = self.udp_sessions.clone();
         let port = listener_cfg.port;
         self.spawn_listener_task(endpoint.clone(), port, |cancel| async move {
-            udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
+            udp::run_udp_worker(socket, port, routes, limits, cancel, health).await;
         });
         Ok(())
     }
@@ -885,7 +885,7 @@ impl DataPlane {
                 transport: Transport::Udp,
             };
             self.spawn_listener_task(endpoint, port, |cancel| async move {
-                udp_worker::run_udp_worker(socket, port, routes, limits, cancel, health).await;
+                udp::run_udp_worker(socket, port, routes, limits, cancel, health).await;
             });
         }
 

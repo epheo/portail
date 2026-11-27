@@ -1,4 +1,5 @@
-//! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
+//! UDP: a recv_from loop per listener, with a connected backend socket per
+//! session.
 //! Sessions are identified by source address, capped (per listener, or by one
 //! budget all listeners share), moved off a backend that a route-table swap
 //! dropped, and expire after an idle timeout.
