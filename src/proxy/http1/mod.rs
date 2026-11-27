@@ -1521,17 +1521,16 @@ mod connection_tests {
         for listener in [data_plane, plain] {
             let addr = listener.local_addr().unwrap();
             let mut client = TcpStream::connect(addr).await.unwrap();
-            let state = conn_state(RouteTable::new(), false);
             let ctx = ListenerCtx {
                 server_port: addr.port(),
-                routes: state.routes.clone(),
+                routes: Arc::new(ArcSwap::from_pointee(RouteTable::new())),
                 cfg: ServeConfig {
                     tcp_keepalive_time: time,
                     ..ServeConfig::from_perf(&Default::default(), 4)
                 },
                 plan: Default::default(),
-                health: state.health.clone(),
-                selector: state.selector.clone(),
+                health: Arc::new(HealthRegistry::new()),
+                selector: Arc::new(BackendSelector::new()),
                 active_connections: Default::default(),
                 shared_pool: None,
             };
@@ -1562,17 +1561,16 @@ mod connection_tests {
             TrustedSources::new(sources.iter().map(|s| Cidr::parse(s).unwrap()).collect());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = conn_state(rt, false);
         let ctx = ListenerCtx {
             server_port: addr.port(),
-            routes: state.routes.clone(),
+            routes: Arc::new(ArcSwap::from_pointee(rt)),
             cfg: ServeConfig {
                 client_header_timeout: Duration::from_millis(300),
                 ..ServeConfig::from_perf(&Default::default(), 4)
             },
             plan: Default::default(),
-            health: state.health.clone(),
-            selector: state.selector.clone(),
+            health: Arc::new(HealthRegistry::new()),
+            selector: Arc::new(BackendSelector::new()),
             active_connections: Default::default(),
             shared_pool: None,
         };
