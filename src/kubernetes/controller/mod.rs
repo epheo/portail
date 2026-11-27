@@ -441,7 +441,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         .watches_stream(policy_stream, move |policy: RateLimitPolicy| {
             map_policy_to_gateways(&policy, &gw6, &cn5)
         })
-        // These have multi-hop mappings; the 1s debounce coalesces bursts.
+        // These have multi-hop mappings.
         // (No EndpointSlice watch: backend pod churn is picked up by the data
         // planes' DNS refresh, which their reports carry back.)
         // Only the Gateways whose passes read the object, and those with
@@ -470,7 +470,8 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         // Also what makes an early-ended pass's empty read set safe: see
         // ReadIndex::during.
         .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
-        .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
+        // No debounce: a burst on one Gateway is bounded by its pass in
+        // flight, the runner holding one rerun at most, never by a timer.
         // In-flight passes finish before the lease is released below.
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(timed_reconcile, error_policy, ctx);

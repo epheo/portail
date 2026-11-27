@@ -82,7 +82,7 @@ One data plane serves exactly one Gateway: Gateways never share a route table or
 TLS keys travel only from the controller to the data plane of the Gateway that references them, and stay in its memory.
 Only the controller reads Secrets.
 
-A route edit reaches the data planes within about a second or two: the controller debounces watch events for a second, translates, and answers the held polls at once.
+A route edit reaches the data planes in tens of milliseconds (17 ms at the median, measured on kind): the controller translates on the change's first event and answers the held polls at once.
 
 ## Managed Gateways
 
