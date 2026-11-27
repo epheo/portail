@@ -14,7 +14,7 @@
 //! Environment:
 //!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
 //!     nf1 nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
-//!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade
+//!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade echo_tcp
 //!   - `PT_SECS`: seconds per scenario, 10 by default
 //!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
 //!     (target/release, then target/debug)
@@ -61,6 +61,11 @@ const BULK_CONNS: usize = 8;
 /// What the source writes and a bulk client reads at a time: large enough
 /// that neither end caps what the relay between them can move.
 const BULK_CHUNK: usize = 256 * 1024;
+
+/// Connections of the echo scenario, one message in flight on each.
+const ECHO_CONNS: usize = 64;
+/// A chat frame: far below any relay buffer, where the bulk ones fill it.
+const ECHO_MESSAGE: usize = 128;
 
 /// The HTTPS listener's hostname: its certificate, the SNI and its route.
 const TLS_HOST: &str = "bench.test";
@@ -282,6 +287,21 @@ fn main() {
             source.abort();
         }
 
+        // The relay again, by the message: what a chat or an RPC stream
+        // pays, where the bulk scenarios measure it by the byte.
+        if selected("echo_tcp") {
+            println!();
+            let echo = spawn_echo(SOURCE_PORT + 3).await;
+            let proxy = spawn_portail_tcp(SOURCE_PORT + 3, PORTAIL_TCP_PORT + 1);
+            println!(
+                "--- Echo: TCP route ({} connections, {}-byte messages) ---",
+                ECHO_CONNS, ECHO_MESSAGE
+            );
+            proxy.measure(run_echo_bench(PORTAIL_TCP_PORT + 1)).await;
+            drop(proxy);
+            echo.abort();
+        }
+
         drop(kiss_handles);
         println!("\n=== Benchmark complete ===");
     });
@@ -477,6 +497,12 @@ async fn run_tls_bench(
         }
     }
 
+    report(loops, wall_start).await
+}
+
+/// Wait for a closed-loop load's tasks and print what they measured.
+/// Returns the exchanges completed.
+async fn report(loops: Vec<tokio::task::JoinHandle<LoopResult>>, wall_start: Instant) -> u64 {
     let (mut latencies, mut errors) = (Vec::new(), 0);
     for task in loops {
         let (measured, failed) = task.await.unwrap();
@@ -682,6 +708,66 @@ async fn run_bulk_bench(port: u16, upgrade: bool) -> u64 {
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
+
+// --- Echo load: small messages both ways through the L4 relay ---
+
+/// A backend on this runtime that sends back what it reads.
+async fn spawn_echo(port: u16) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind the echo backend");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                // Nagle would hold each echo for the relay's delayed ACK.
+                let _ = conn.set_nodelay(true);
+                let mut buf = [0u8; ECHO_MESSAGE];
+                while conn.read_exact(&mut buf).await.is_ok() {
+                    if conn.write_all(&buf).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// Send a message and read it back, on `ECHO_CONNS` connections through
+/// `port` for `bench_duration()`. Returns the messages echoed.
+async fn run_echo_bench(port: u16) -> u64 {
+    async fn chat(mut conn: tokio::net::TcpStream, deadline: Instant) -> LoopResult {
+        let (mut latencies, mut message) = (Vec::new(), [0x5a; ECHO_MESSAGE]);
+        while Instant::now() < deadline {
+            let sent = Instant::now();
+            if conn.write_all(&message).await.is_err()
+                || conn.read_exact(&mut message).await.is_err()
+            {
+                return (latencies, 1);
+            }
+            latencies.push(sent.elapsed().as_micros() as u32);
+        }
+        (latencies, 0)
+    }
+
+    let mut open = Vec::with_capacity(ECHO_CONNS);
+    for _ in 0..ECHO_CONNS {
+        let conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to the TCP route");
+        conn.set_nodelay(true).expect("TCP_NODELAY");
+        open.push(conn);
+    }
+    let wall_start = Instant::now();
+    let deadline = wall_start + bench_duration();
+    let loops = open
+        .into_iter()
+        .map(|conn| tokio::spawn(chat(conn, deadline)))
+        .collect();
+    report(loops, wall_start).await
+}
 
 // --- Producer: generates request batches for a fixed duration ---
 

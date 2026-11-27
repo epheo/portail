@@ -1536,7 +1536,7 @@ async fn proxy_http_request(
             }
         }
         client.flush().await?;
-        let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
+        relay_l4(&mut *client, &mut backend, state.idle_body_timeout).await;
         return Ok((false, None));
     }
 
@@ -2822,15 +2822,26 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-/// Per-direction copy buffer of the L4 relay: the 8 KiB each side got from
-/// `tokio::io::copy_bidirectional`, which it replaces.
-const L4_COPY_BUF: usize = 8 * 1024;
+/// What a relay direction reads at a time: little to start, so an idle
+/// tunnel holds little, then doubled up to `RELAY_BUF_MAX` while reads fill
+/// it and the other side takes each whole. Bulk to a fast receiver grows at
+/// once; a chat never does, and a receiver slower than its sender stops
+/// where its socket does. On a TCP route, 8 KiB reads cost 226 ms of proxy
+/// CPU per GiB and 64 KiB reads 97 ms: fewer syscalls for the same bytes.
+const RELAY_BUF: usize = 8 * 1024;
+const RELAY_BUF_MAX: usize = 64 * 1024;
+
+/// How long a direction waits for bytes on a grown buffer before giving it
+/// back. A read that would have fitted `RELAY_BUF` gives it back at once.
+/// Either way a tunnel quiet or chatty after a burst holds what one that
+/// never grew does: a pod holds thousands of them.
+const RELAY_BUF_IDLE: Duration = Duration::from_secs(1);
 
 /// Copy both ways until both directions end. While both are open the relay
 /// is unbounded, like any idle TCP session; once one side has finished, the
-/// other must make progress within `idle` (None: unbounded), or a peer that
-/// never closes would pin the task and both fds forever. Errors on either
-/// side end both: the transfer is best-effort once started.
+/// other must make progress in every `idle` window (None: unbounded), or a
+/// peer that never closes would pin the task and both fds forever. Errors on
+/// either side end both: the transfer is best-effort once started.
 async fn relay_l4<A, B>(a: A, b: B, idle: Option<Duration>)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2838,74 +2849,105 @@ where
 {
     let (mut a_rd, mut a_wr) = tokio::io::split(a);
     let (mut b_rd, mut b_wr) = tokio::io::split(b);
-    let start = tokio::time::Instant::now();
-    let progress = AtomicU64::new(0);
-    let a_to_b = pump(&mut a_rd, &mut b_wr, start, &progress);
-    let b_to_a = pump(&mut b_rd, &mut a_wr, start, &progress);
+    let steps = AtomicU64::new(0);
+    let a_to_b = pump(&mut a_rd, &mut b_wr, &steps);
+    let b_to_a = pump(&mut b_rd, &mut a_wr, &steps);
     tokio::pin!(a_to_b, b_to_a);
     let a_done = tokio::select! {
         done = &mut a_to_b => if done.is_ok() { true } else { return },
         done = &mut b_to_a => if done.is_ok() { false } else { return },
     };
     if a_done {
-        finish_half(b_to_a, idle, start, &progress).await;
+        finish_half(b_to_a, idle, &steps).await;
     } else {
-        finish_half(a_to_b, idle, start, &progress).await;
+        finish_half(a_to_b, idle, &steps).await;
     }
 }
 
-/// Drive the direction still open until it ends, or until `idle` passes
-/// without progress.
+/// Drive the direction still open until it ends, or until a whole `idle`
+/// window passes without a step.
 async fn finish_half<F: std::future::Future>(
     mut half: std::pin::Pin<&mut F>,
     idle: Option<Duration>,
-    start: tokio::time::Instant,
-    progress: &AtomicU64,
+    steps: &AtomicU64,
 ) {
     let Some(idle) = idle else {
         half.await;
         return;
     };
-    let stalled_at = || start + Duration::from_nanos(progress.load(Ordering::Relaxed)) + idle;
     loop {
-        if tokio::time::timeout_at(stalled_at(), half.as_mut())
-            .await
-            .is_ok()
+        let seen = steps.load(Ordering::Relaxed);
+        if tokio::time::timeout(idle, half.as_mut()).await.is_ok()
+            || steps.load(Ordering::Relaxed) == seen
         {
-            return;
-        }
-        // Progress made while waiting pushed the deadline out.
-        if stalled_at() <= tokio::time::Instant::now() {
             return;
         }
     }
 }
 
-/// One direction of an L4 relay: copy until EOF, then pass the half-close
-/// on. Every completed step stamps `progress` (nanos since `start`), the
-/// clock `finish_half` reads.
-async fn pump<R, W>(
+/// A read into `buf`, or `None` once it has waited `idle` for bytes. Bytes
+/// already there come back before any clock is read: a timeout built up
+/// front reads it on every call, which a relay under load makes per chunk.
+async fn read_or_idle<R>(
     rd: &mut R,
-    wr: &mut W,
-    start: tokio::time::Instant,
-    progress: &AtomicU64,
-) -> std::io::Result<()>
+    buf: &mut [u8],
+    idle: Duration,
+) -> Option<std::io::Result<usize>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::{future::Future, task::Poll};
+    let mut read = std::pin::pin!(rd.read(buf));
+    let now = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+    match now {
+        Poll::Ready(read) => Some(read),
+        Poll::Pending => tokio::time::timeout(idle, read).await.ok(),
+    }
+}
+
+/// One direction of a relay: copy until EOF, then pass the half-close on.
+/// Every read and every write counts a step, which `finish_half` watches: a
+/// count, not a time, so the copy reads no clock.
+async fn pump<R, W>(rd: &mut R, wr: &mut W, steps: &AtomicU64) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let stamp = || progress.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let mut buf = vec![0u8; L4_COPY_BUF];
+    // Both directions run on one task: a plain add, no locked one.
+    let step = || steps.store(steps.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    let mut buf = vec![0u8; RELAY_BUF];
     loop {
-        let n = rd.read(&mut buf).await?;
-        stamp();
+        let n = if buf.len() == RELAY_BUF {
+            rd.read(&mut buf).await?
+        } else {
+            match read_or_idle(rd, &mut buf, RELAY_BUF_IDLE).await {
+                Some(read) => read?,
+                None => {
+                    buf = vec![0u8; RELAY_BUF];
+                    continue;
+                }
+            }
+        };
+        step();
         if n == 0 {
             return wr.shutdown().await;
         }
-        wr.write_all(&buf[..n]).await?;
+        let (mut written, mut writes) = (0, 0);
+        while written < n {
+            written += match wr.write(&buf[written..n]).await? {
+                0 => return Err(std::io::ErrorKind::WriteZero.into()),
+                wrote => wrote,
+            };
+            writes += 1;
+            step();
+        }
         // TLS holds written records until flushed.
         wr.flush().await?;
-        stamp();
+        if n == buf.len() && writes == 1 && n < RELAY_BUF_MAX {
+            buf.resize((n * 2).min(RELAY_BUF_MAX), 0);
+        } else if n <= RELAY_BUF && buf.len() > RELAY_BUF {
+            buf = vec![0u8; RELAY_BUF];
+        }
     }
 }
 
@@ -4717,6 +4759,131 @@ mod connection_tests {
         client.shutdown().await.unwrap();
         tokio::time::sleep(IDLE * 3).await;
         assert!(!task.is_finished(), "relay cut with the budget disabled");
+    }
+
+    /// What a relay direction reads next: `Some(n)` bytes, the whole buffer
+    /// it is offered when `n` is larger, then silence. Records each buffer
+    /// size it is offered.
+    struct Scripted {
+        reads: std::collections::VecDeque<usize>,
+        offered: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl tokio::io::AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.offered.lock().unwrap().push(buf.remaining());
+            let Some(n) = self.reads.pop_front() else {
+                return std::task::Poll::Pending;
+            };
+            let n = n.min(buf.remaining());
+            buf.initialize_unfilled_to(n);
+            buf.advance(n);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Takes half of every write: a receiver slower than its sender.
+    struct HalfWrites;
+
+    impl tokio::io::AsyncWrite for HalfWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len().div_ceil(2)))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The buffer sizes `pump` offers over `reads`, each once, run for
+    /// `wait` after the script ends in silence.
+    async fn offered<W: tokio::io::AsyncWrite + Unpin>(
+        reads: &[usize],
+        mut wr: W,
+        wait: Duration,
+    ) -> Vec<usize> {
+        let sizes = Arc::default();
+        let mut rd = Scripted {
+            reads: reads.iter().copied().collect(),
+            offered: Arc::clone(&sizes),
+        };
+        let steps = AtomicU64::new(0);
+        let relayed = tokio::time::timeout(wait, pump(&mut rd, &mut wr, &steps)).await;
+        assert!(relayed.is_err(), "the script ends in silence");
+        let mut sizes = sizes.lock().unwrap().clone();
+        sizes.dedup();
+        sizes
+    }
+
+    /// A relay direction reads more at a time while a burst fills its
+    /// buffer and the other side takes each read whole, and goes back to
+    /// the small buffer after it: thousands of tunnels each hold theirs.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_buffer_grows_with_a_burst_and_is_given_back_after() {
+        const K: usize = 1024;
+        const FULL: usize = usize::MAX;
+        let burst = [FULL; 5];
+        let grown = [8 * K, 16 * K, 32 * K, 64 * K];
+
+        // Silence after the burst: given back once it has waited.
+        let sizes = offered(&burst, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
+        assert_eq!(sizes, grown, "still grown before the wait is over");
+        let sizes = offered(&burst, tokio::io::sink(), RELAY_BUF_IDLE * 2).await;
+        assert_eq!(sizes, [8 * K, 16 * K, 32 * K, 64 * K, 8 * K]);
+
+        // A chat after the burst: given back at its first short read.
+        let chat = [FULL, FULL, FULL, FULL, FULL, 100];
+        let sizes = offered(&chat, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
+        assert_eq!(sizes, [8 * K, 16 * K, 32 * K, 64 * K, 8 * K]);
+
+        // Reads that would not fit the small buffer keep the grown one.
+        let stream = [FULL, FULL, FULL, FULL, 20 * K, 20 * K];
+        let sizes = offered(&stream, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
+        assert_eq!(sizes, grown);
+
+        // A receiver that takes writes in pieces: no growth to begin with.
+        let sizes = offered(&burst, HalfWrites, RELAY_BUF_IDLE / 2).await;
+        assert_eq!(sizes, [8 * K]);
+    }
+
+    /// An upgraded tunnel is the same relay: once the client has finished,
+    /// a backend that never closes ends with the idle budget.
+    #[tokio::test]
+    async fn half_closed_upgrade_tunnel_ends_after_the_idle_budget() {
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read(&mut [0u8; 4096]).await;
+            let _ = sock.write_all(SWITCHED).await;
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let mut state = conn_state(routes(silent), false);
+        state.idle_body_timeout = Some(IDLE);
+        let (mut client, task) = serve_state(state);
+        client.write_all(UPGRADE).await.unwrap();
+        client
+            .read_exact(&mut vec![0u8; SWITCHED.len()])
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "tunnel pinned after the client's FIN");
     }
 
     /// Bytes no method can open still close at once, not after the header
