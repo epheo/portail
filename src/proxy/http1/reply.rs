@@ -7,9 +7,9 @@ use std::borrow::Cow;
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 
+use super::ConnectionState;
 use crate::proxy::request_processor::LocalReply;
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::ConnectionState;
 
 /// Answer a request the proxy handles itself (redirect, 404, 429, 500, 503)
 /// and access-log it. Returns whether the connection stays open; the reply

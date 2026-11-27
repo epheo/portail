@@ -14,10 +14,10 @@ use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::health::HealthRegistry;
+use crate::proxy::http1::{handle_connection, ConnectionState};
 use crate::proxy::proxy_protocol::{self, Header};
 use crate::proxy::relay::handle_tls_passthrough;
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
-use crate::proxy::worker::{handle_connection, ConnectionState};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Per-listener worker tunables, threaded from `PerformanceConfig` by the
