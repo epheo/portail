@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -26,15 +27,17 @@ import (
 //
 //	cd conformance && CONTROLLER_BENCH=1 go test -v -timeout 90m -run TestConformance -count=1
 //
-// A: reconcile passes one unrelated event of each watched kind costs, at
-// 1, 10 and 50 Gateways. B: edit-to-served, from the apiserver accepting a
-// change to the data plane answering by it. Only bench/gw-0 is Managed:
-// the others are Unmanaged, so the node carries one data plane, and a pass
-// of theirs translates and writes status but provisions nothing.
+// A: reconcile passes one event of each watched kind costs, at 1, 10 and
+// 50 Gateways: an object no Gateway reads, then one only gw-0 reads. B:
+// edit-to-served, from the apiserver accepting a change to the data plane
+// answering by it. Only bench/gw-0 is Managed: the others are Unmanaged, so
+// the node carries one data plane, and a pass of theirs translates and
+// writes status but provisions nothing.
 
 const (
 	benchNS       = "bench"
 	otherNS       = "bench-other"
+	grantedNS     = "bench-granted"
 	echoImage     = "registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0"
 	settleQuiet   = 3 * time.Second
 	settleAtLeast = 8 * time.Second
@@ -70,6 +73,7 @@ func sizes() []int {
 }
 
 var (
+	gvrClass      = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gatewayclasses"}
 	gvrNamespace  = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 	gvrService    = schema.GroupVersionResource{Version: "v1", Resource: "services"}
 	gvrSecret     = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
@@ -114,10 +118,11 @@ func TestControllerBench(t *testing.T) {
 
 	var report strings.Builder
 	report.WriteString("\n| Gateways | Event | Passes (median) | Runs |\n|---|---|---|---|\n")
+	events := append(append([]eventKind(nil), unrelatedKinds...), readKinds...)
 	served := "\n| Gateways | Change | Samples | p50 | p95 | Worst | Over 2s, last answer before |\n|---|---|---|---|---|---|---|\n"
 	for _, n := range sizes() {
 		b.scaleTo(n)
-		for _, kind := range unrelatedKinds {
+		for _, kind := range events {
 			if os.Getenv("CONTROLLER_BENCH_ONLY") == "served" {
 				break
 			}
@@ -145,7 +150,7 @@ func TestControllerBench(t *testing.T) {
 				took[len(took)-1].Round(time.Millisecond), b.slowGaps)
 		}
 	}
-	t.Log("A: reconcile passes per unrelated event" + report.String())
+	t.Log("A: reconcile passes per event" + report.String())
 	t.Log("B: edit to served, polled every " + servedPoll.String() + served)
 }
 
@@ -175,7 +180,7 @@ func (b *bench) remove(gvr schema.GroupVersionResource, ns, name string) {
 }
 
 func (b *bench) setUp() {
-	for _, ns := range []string{benchNS, otherNS} {
+	for _, ns := range []string{benchNS, otherNS, grantedNS} {
 		b.apply(gvrNamespace, fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata: {name: %s}\n", ns))
 	}
 	b.apply(gvrDeployment, fmt.Sprintf(`apiVersion: apps/v1
@@ -201,33 +206,45 @@ kind: GatewayParameters
 metadata: {name: unmanaged, namespace: %s}
 spec: {provisioning: Unmanaged}
 `, benchNS))
-	// The unrelated objects each event below touches: no Gateway of
-	// this controller reads them.
+	// The objects only gw-0 reads, one per kind, and those no Gateway of
+	// this controller reads.
+	b.touchOwnParams()
+	b.touchGrant()
+	b.apply(gvrService, serviceDoc("granted", grantedNS, "nothing", 0))
 	b.applyUnrelated()
 }
 
+// A Service on port 8080 selecting `app`, its bench-flip label `flip`.
+func serviceDoc(name, ns, app string, flip int) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata: {name: %s, namespace: %s, labels: {bench-flip: "%d"}}
+spec:
+  selector: {app: %s}
+  ports: [{port: 8080, targetPort: 3000}]
+`, name, ns, flip, app)
+}
+
 // Gateway i, its route and the Service it routes to. gw-0 is Managed, its
-// route serves /base, the others serve every path.
+// route serves /base, the others serve every path. gw-0 alone reads a
+// namespace (its listener selects routes by label), its own parameters,
+// and a grant (a rule routes to another namespace).
 func (b *bench) addGateway(i int) {
-	params := ""
-	if i > 0 {
-		params = "  infrastructure: {parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: unmanaged}}\n"
+	params, listener := "unmanaged", "{name: http, port: 80, protocol: HTTP}"
+	if i == 0 {
+		params = "gw-0"
+		listener = fmt.Sprintf("{name: http, port: 80, protocol: HTTP, allowedRoutes: {namespaces: {from: Selector, selector: {matchLabels: {kubernetes.io/metadata.name: %s}}}}}", benchNS)
 	}
 	b.apply(gvrGateway, fmt.Sprintf(`apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: {name: gw-%d, namespace: %s}
 spec:
   gatewayClassName: portail
-%s  listeners:
-  - {name: http, port: 80, protocol: HTTP}
-`, i, benchNS, params))
-	b.apply(gvrService, fmt.Sprintf(`apiVersion: v1
-kind: Service
-metadata: {name: svc-%d, namespace: %s}
-spec:
-  selector: {app: echo}
-  ports: [{port: 8080, targetPort: 3000}]
-`, i, benchNS))
+  infrastructure: {parametersRef: {group: portail.epheo.eu, kind: GatewayParameters, name: %s}}
+  listeners:
+  - %s
+`, i, benchNS, params, listener))
+	b.apply(gvrService, serviceDoc(fmt.Sprintf("svc-%d", i), benchNS, "echo", 0))
 	path := "/"
 	if i == 0 {
 		path = "/base"
@@ -241,6 +258,9 @@ func (b *bench) route(i int, base string, extra [][2]string) string {
 		return fmt.Sprintf("  - matches: [{path: {type: PathPrefix, value: %q}}]\n    backendRefs: [{name: %s, port: 8080}]\n", path, svc)
 	}
 	rules := rule(base, fmt.Sprintf("svc-%d", i))
+	if i == 0 {
+		rules += fmt.Sprintf("  - matches: [{path: {type: PathPrefix, value: /granted}}]\n    backendRefs: [{name: granted, namespace: %s, port: 8080}]\n", grantedNS)
+	}
 	for _, e := range extra {
 		rules += rule(e[0], e[1])
 	}
@@ -322,13 +342,13 @@ func (b *bench) waitVIP(name string) string {
 
 // --- A: passes per unrelated event ----------------------------------------
 
-type unrelatedKind struct {
+type eventKind struct {
 	name  string
 	touch func(*bench)
 }
 
 // One unrelated object per watched kind: what changing it costs.
-var unrelatedKinds = []unrelatedKind{
+var unrelatedKinds = []eventKind{
 	{"none (control)", func(*bench) {}},
 	{"Service", func(b *bench) { b.applyUnrelatedService() }},
 	{"Secret", func(b *bench) { b.applyUnrelatedSecret() }},
@@ -337,6 +357,45 @@ var unrelatedKinds = []unrelatedKind{
 	{"HTTPRoute, another Gateway's", func(b *bench) { b.applyUnrelatedRoute() }},
 	{"GatewayParameters", func(b *bench) { b.applyUnrelatedParams() }},
 	{"RateLimitPolicy", func(b *bench) { b.applyUnrelatedPolicy() }},
+}
+
+// One object per kind that gw-0 alone reads: each must wake it alone.
+var readKinds = []eventKind{
+	{"Service, gw-0's backend", func(b *bench) { b.touchBackend() }},
+	{"Namespace label, gw-0's Selector read it", func(b *bench) { b.touchSelected() }},
+	{"ReferenceGrant, where gw-0 routes", func(b *bench) { b.touchGrant() }},
+	{"GatewayParameters, gw-0's own", func(b *bench) { b.touchOwnParams() }},
+}
+
+func (b *bench) touchBackend() {
+	b.flip++
+	b.apply(gvrService, serviceDoc("svc-0", benchNS, "echo", b.flip))
+}
+
+// The namespace of every Gateway: only gw-0's listener selects by label.
+func (b *bench) touchSelected() {
+	b.flip++
+	b.apply(gvrNamespace, fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata: {name: %s, labels: {bench-flip: \"%d\"}}\n", benchNS, b.flip))
+}
+
+func (b *bench) touchGrant() {
+	b.flip++
+	b.apply(gvrGrant, fmt.Sprintf(`apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: allow, namespace: %s, labels: {bench-flip: "%d"}}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: %s}]
+  to: [{group: "", kind: Service}]
+`, grantedNS, b.flip, benchNS))
+}
+
+func (b *bench) touchOwnParams() {
+	b.flip++
+	b.apply(gvrParams, fmt.Sprintf(`apiVersion: portail.epheo.eu/v1alpha1
+kind: GatewayParameters
+metadata: {name: gw-0, namespace: %s, labels: {bench-flip: "%d"}}
+spec: {provisioning: Managed}
+`, benchNS, b.flip))
 }
 
 func (b *bench) applyUnrelated() {
@@ -414,10 +473,10 @@ spec:
 
 // The passes one event of `kind` costs. A Gateway that is not converged
 // (the Unmanaged ones, never Programmed) re-checks on a 60s cadence: a
-// change every Gateway reads first lines those cadences up, then the
+// change every Gateway re-runs on first lines those cadences up, then the
 // controller is let settle, and the event lands in the quiet that follows.
-func (b *bench) passesFor(kind unrelatedKind) int {
-	b.applyUnrelatedNamespaceAlign()
+func (b *bench) passesFor(kind eventKind) int {
+	b.align()
 	b.settle()
 	before := b.passes()
 	kind.touch(b)
@@ -425,10 +484,14 @@ func (b *bench) passesFor(kind unrelatedKind) int {
 	return b.passes() - before
 }
 
-// A label on the namespace of every Gateway: each one reads its namespace.
-func (b *bench) applyUnrelatedNamespaceAlign() {
+// A label on the GatewayClass: every Gateway of the class re-runs.
+func (b *bench) align() {
+	b.t.Helper()
 	b.flip++
-	b.apply(gvrNamespace, fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata: {name: %s, labels: {bench-align: \"%d\"}}\n", benchNS, b.flip))
+	patch := fmt.Sprintf(`{"metadata": {"labels": {"bench-align": "%d"}}}`, b.flip)
+	if _, err := b.dyn.Resource(gvrClass).Patch(b.ctx, "portail", types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		b.t.Fatalf("label the GatewayClass: %v", err)
+	}
 }
 
 // Wait until the pass count has not moved for settleQuiet, and at least
