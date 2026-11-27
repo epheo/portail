@@ -674,19 +674,19 @@ pub fn render(ready: bool) -> String {
             &BACKEND_CONNECT_ERRORS,
             "upstream_connect_errors_total",
             "backend",
-            "Backend connects that failed (client saw 502, or its L4 connection closed), by configured backend, or by address for an L4 route",
+            "Backend connects that failed (client saw 502, or its L4 connection closed), by backend address, or TLS server name and port",
         ),
         (
             &BACKEND_CONNECT_TIMEOUTS,
             "upstream_connect_timeouts_total",
             "backend",
-            "Backend connects that timed out (client saw 504), by configured backend",
+            "Backend connects that timed out (client saw 504), by backend address, or TLS server name and port",
         ),
         (
             &BACKEND_SEND_ERRORS,
             "upstream_send_errors_total",
             "backend",
-            "Requests, or first L4 bytes, whose send to a freshly connected backend failed (client saw 502, or its L4 connection closed), by configured backend, or by address for an L4 route",
+            "Requests, or first L4 bytes, whose send to a freshly connected backend failed (client saw 502, or its L4 connection closed), by backend address, or TLS server name and port",
         ),
     ];
     for (family, name, label, help) in labeled {
