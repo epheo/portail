@@ -6,7 +6,7 @@ name: Bench
 # 1.5-1.6x on every suite purely from baseline-vs-PR runner hardware. The
 # enforcing gate runs locally on owned hardware with a strict threshold:
 #   make bench-baseline   # once per machine
-#   make bench-check      # fails past 1.15x the local baseline
+#   make bench-check      # fails past 1.10x the local instruction counts
 # (Moving CI itself to owned runners may re-enable blocking here later.)
 #
 # The real-socket throughput bench (benches/proxy_throughput.rs) is likewise

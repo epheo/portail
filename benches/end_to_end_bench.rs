@@ -1,4 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+#[macro_use]
+mod common;
+
+use criterion::measurement::Measurement;
+use criterion::Criterion;
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::extract_routing_info;
 use portail::proxy::request_processor::analyze_request;
@@ -17,7 +21,7 @@ fn make_rule(path: &str, backend: Backend) -> HttpRouteRule {
     )
 }
 
-fn end_to_end_benchmark(c: &mut Criterion) {
+fn end_to_end_benchmark<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut table = RouteTable::new();
 
     let services = [
@@ -120,7 +124,7 @@ fn end_to_end_benchmark(c: &mut Criterion) {
     });
 }
 
-fn throughput_simulation(c: &mut Criterion) {
+fn throughput_simulation<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut table = RouteTable::new();
 
     for i in 0..100 {
@@ -181,7 +185,7 @@ fn throughput_simulation(c: &mut Criterion) {
     });
 }
 
-fn latency_scenarios(c: &mut Criterion) {
+fn latency_scenarios<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut table = RouteTable::new();
     let backend =
         Backend::new("127.0.0.1".to_string(), 8080).expect("Failed to create fast backend");
@@ -214,7 +218,7 @@ fn latency_scenarios(c: &mut Criterion) {
 
 /// `analyze_request` per request: parse, route lookup, weighted backend
 /// selection and the invalid-backendRef check on the selected backend.
-fn request_analysis(c: &mut Criterion) {
+fn request_analysis<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut table = RouteTable::new();
     let backends = vec![
         Backend::with_weight("127.0.0.1".to_string(), 8080, 3).unwrap(),
@@ -252,7 +256,7 @@ fn request_analysis(c: &mut Criterion) {
 
 /// `analyze_request` by path shape: only a dot-segment pays the rewrite
 /// path normalization makes before the route match.
-fn path_analysis(c: &mut Criterion) {
+fn path_analysis<M: Measurement + 'static>(c: &mut Criterion<M>) {
     let mut table = RouteTable::new();
     for path in ["/", "/admin", "/static"] {
         let backend = Backend::new("127.0.0.1".to_string(), 8080).unwrap();
@@ -293,7 +297,7 @@ fn path_analysis(c: &mut Criterion) {
 /// Path modifiers per request: a redirect's Location (prefix join plus
 /// the query join), and a URLRewrite's prefix join. A value's own query
 /// was split off when its rule compiled: no request scans the value.
-fn path_modifiers(c: &mut Criterion) {
+fn path_modifiers<M: Measurement + 'static>(c: &mut Criterion<M>) {
     use portail::proxy::http_filters::extract_url_rewrite;
     use portail::routing::{HttpFilter, URLRewritePath};
 
@@ -394,9 +398,12 @@ fn config() -> Criterion {
         .with_plots()
 }
 
-criterion_group! {
-    name = e2e_benches;
-    config = config();
-    targets = end_to_end_benchmark, throughput_simulation, latency_scenarios, request_analysis, path_analysis, path_modifiers
-}
-criterion_main!(e2e_benches);
+bench_main!(
+    config();
+    end_to_end_benchmark,
+    throughput_simulation,
+    latency_scenarios,
+    request_analysis,
+    path_analysis,
+    path_modifiers,
+);
