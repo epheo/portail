@@ -394,10 +394,10 @@ fn a_keepalive_request_over_tls_allocates_twice() {
 }
 
 /// Twenty in a debug build and nineteen in release, against two for the
-/// same request over HTTP/1.1. The bridge
-/// gives each stream what a connection gets: a task, an engine with its
-/// buffers and drain watch (the churn count above), and a pipe to it.
-/// A ceiling to lower with the bridge's cost, never to raise.
+/// same request over HTTP/1.1. The bridge gives each stream what a
+/// connection gets: a task, an engine with its buffers and drain watch (the
+/// churn count above), and a pipe to it. A ceiling to lower with the
+/// bridge's cost, never to raise.
 #[test]
 fn an_h2_request_allocates_like_a_connection_of_its_own() {
     let n = per_proxied_request(Client::H2);
