@@ -18,15 +18,26 @@ use crate::kubernetes::features::SUPPORTED_FEATURES;
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::logging::{debug, warn};
 
+/// The one route kind a listener's protocol takes: what attaches to it and
+/// what its supportedKinds may list.
+pub fn route_kind_for_protocol(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "HTTP" | "HTTPS" => Some("HTTPRoute"),
+        "TLS" => Some("TLSRoute"),
+        "TCP" => Some("TCPRoute"),
+        "UDP" => Some("UDPRoute"),
+        _ => None,
+    }
+}
+
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
-    let kind = match protocol {
-        "HTTP" | "HTTPS" => "HTTPRoute",
-        "TLS" => "TLSRoute",
-        "TCP" => "TCPRoute",
-        "UDP" => "UDPRoute",
-        _ => return vec![],
-    };
-    vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})]
+    supported_kinds_of(route_kind_for_protocol(protocol))
+}
+
+/// A listener's supportedKinds when it takes `kind`, or nothing.
+pub fn supported_kinds_of(kind: Option<&str>) -> Vec<serde_json::Value> {
+    kind.map(|kind| vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})])
+        .unwrap_or_default()
 }
 
 /// Per-listener validation status computed during reconciliation.
@@ -198,7 +209,10 @@ pub(crate) fn listener_entry(
     json!({
         "name": listener.name,
         "attachedRoutes": attached_routes,
-        "supportedKinds": if ls.supported_kinds.is_empty() && ls.resolved_refs {
+        "supportedKinds": if ls.supported_kinds.is_empty()
+            && ls.resolved_refs
+            && super::reconciler::listener_is_served(listener)
+        {
             supported_kinds_for_protocol(&listener.protocol)
         } else {
             ls.supported_kinds.clone()

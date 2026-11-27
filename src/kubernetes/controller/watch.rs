@@ -457,9 +457,9 @@ macro_rules! impl_route_status_reports {
 
 impl_route_status_reports!(
     gateway_api::httproutes::HttpRoute,
-    gateway_api::experimental::tcproutes::v1alpha2::TcpRoute,
-    gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute,
-    gateway_api::experimental::udproutes::v1alpha2::UdpRoute
+    gateway_api::experimental::tcproutes::v1::TcpRoute,
+    gateway_api::experimental::tlsroutes::v1::TlsRoute,
+    gateway_api::experimental::udproutes::v1::UdpRoute
 );
 
 impl StatusReports for RateLimitPolicy {
@@ -656,7 +656,7 @@ pub(super) fn drop_unread_metadata<K: kube::Resource>(obj: &mut K) {
 mod tests {
     use super::super::testkit::{self, apply, MockApi, CONTROLLER};
     use super::*;
-    use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
+    use gateway_api::experimental::tcproutes::v1::TcpRoute;
 
     fn served_gateways(names: &[&str]) -> Store<Gateway> {
         let mut writer = reflector::store::Writer::default();
@@ -703,55 +703,53 @@ mod tests {
         assert_eq!(names(&refs), vec!["b", "a"]);
     }
 
-    const TCPROUTE_GROUP: &str = "/apis/gateway.networking.k8s.io/v1alpha2";
+    const TCPROUTE_GROUP: &str = "/apis/gateway.networking.k8s.io/v1";
 
-    fn discovery_serves_tcproutes(api: &MockApi, served: bool) {
-        let versions = if served {
-            serde_json::json!([{"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"},
-                               {"groupVersion": "gateway.networking.k8s.io/v1alpha2", "version": "v1alpha2"}])
-        } else {
-            serde_json::json!([{"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"}])
+    /// What API discovery says of the Gateway API group.
+    #[derive(Clone, Copy)]
+    enum Bundle {
+        /// No Gateway API CRDs at all.
+        Absent,
+        /// v1 served without TCPRoute: CRDs older than v1.6, or a Standard
+        /// bundle that leaves it out. HTTPRoute is served there.
+        WithoutTcpRoutes,
+        WithTcpRoutes,
+    }
+
+    fn discovery_serves(api: &MockApi, bundle: Bundle) {
+        let groups = match bundle {
+            Bundle::Absent => serde_json::json!([]),
+            _ => serde_json::json!([{
+                "name": "gateway.networking.k8s.io",
+                "versions": [{"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"}],
+                "preferredVersion": {"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"},
+            }]),
         };
         api.reply_to(
             "/apis",
             200,
+            serde_json::json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}),
+        );
+        let resource = |name: &str, kind: &str| {
             serde_json::json!({
-                "kind": "APIGroupList",
+                "name": name, "singularName": "", "namespaced": true, "kind": kind,
+                "verbs": ["get", "list", "watch"],
+            })
+        };
+        let mut resources = vec![resource("httproutes", "HTTPRoute")];
+        if let Bundle::WithTcpRoutes = bundle {
+            resources.push(resource("tcproutes", "TCPRoute"));
+        }
+        api.reply_to(
+            TCPROUTE_GROUP,
+            200,
+            serde_json::json!({
+                "kind": "APIResourceList",
                 "apiVersion": "v1",
-                "groups": [{
-                    "name": "gateway.networking.k8s.io",
-                    "versions": versions,
-                    "preferredVersion": {"groupVersion": "gateway.networking.k8s.io/v1", "version": "v1"},
-                }],
+                "groupVersion": "gateway.networking.k8s.io/v1",
+                "resources": resources,
             }),
         );
-        if served {
-            api.reply_to(
-                TCPROUTE_GROUP,
-                200,
-                serde_json::json!({
-                    "kind": "APIResourceList",
-                    "apiVersion": "v1",
-                    "groupVersion": "gateway.networking.k8s.io/v1alpha2",
-                    "resources": [{
-                        "name": "tcproutes",
-                        "singularName": "tcproute",
-                        "namespaced": true,
-                        "kind": "TCPRoute",
-                        "verbs": ["get", "list", "watch"],
-                    }],
-                }),
-            );
-        } else {
-            api.reply_to(
-                TCPROUTE_GROUP,
-                404,
-                serde_json::json!({
-                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                    "reason": "NotFound", "code": 404, "message": "not found",
-                }),
-            );
-        }
     }
 
     /// Discovery rounds: each starts with the group list.
@@ -808,7 +806,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn optional_crd_installed_later_starts_its_watch() {
         let api = MockApi::default();
-        discovery_serves_tcproutes(&api, false);
+        discovery_serves(&api, Bundle::WithoutTcpRoutes);
         let pending = Arc::new(PendingWatches::default());
         let (_store, driver) = tcproutes(&api, &pending, &Listings::default());
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -816,7 +814,7 @@ mod tests {
         settle().await;
         assert!(!tcproutes_watched(&api), "no watch before the CRD exists");
 
-        discovery_serves_tcproutes(&api, true);
+        discovery_serves(&api, Bundle::WithTcpRoutes);
         tokio::time::sleep(RECHECK).await;
         settle().await;
         assert!(
@@ -836,7 +834,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_missing_crd_counts_as_listed() {
         let api = MockApi::default();
-        discovery_serves_tcproutes(&api, false);
+        discovery_serves(&api, Bundle::WithoutTcpRoutes);
         let listings = Listings::default();
         let (store, _driver) = tcproutes(&api, &Arc::default(), &listings);
         assert!(!listings.is_synced(), "not before discovery answered");
@@ -862,7 +860,7 @@ mod tests {
         assert_eq!(unlisted[0].0, "TCPRoute");
         assert!(unlisted[0].1.contains("discovery"), "{unlisted:?}");
 
-        discovery_serves_tcproutes(&api, true);
+        discovery_serves(&api, Bundle::WithTcpRoutes);
         // Past the longest delay of kube's watcher backoff.
         tokio::time::sleep(Duration::from_secs(RETRY_CAP_SECS)).await;
         settle().await;
@@ -886,7 +884,7 @@ mod tests {
                 code,
                 status(code, reason),
             );
-            discovery_serves_tcproutes(&api, true);
+            discovery_serves(&api, Bundle::WithTcpRoutes);
             let listings = Listings::default();
             let (store, driver) = tcproutes(&api, &Arc::default(), &listings);
             settle().await;
@@ -956,7 +954,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_missing_group_is_not_asked_for_its_resources() {
         let api = MockApi::default();
-        discovery_serves_tcproutes(&api, false);
+        discovery_serves(&api, Bundle::Absent);
         let listings = Listings::default();
         let (_store, driver) = tcproutes(&api, &Arc::default(), &listings);
         settle().await;
@@ -970,11 +968,37 @@ mod tests {
         driver.abort();
     }
 
+    /// CRDs that serve v1 without TCPRoute hold back no other kind:
+    /// HTTPRoute is watched, and TCPRoute counts as listed while it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_bundle_without_tcproutes_still_watches_httproutes() {
+        use gateway_api::httproutes::HttpRoute;
+        let api = MockApi::default();
+        let httproutes = "/apis/gateway.networking.k8s.io/v1/httproutes";
+        // First: the longer prefix must win over discovery's.
+        api.reply_to(httproutes, 403, status(403, "Forbidden"));
+        discovery_serves(&api, Bundle::WithoutTcpRoutes);
+        let listings = Listings::default();
+        let (_routes, stream) = create_reflector(Api::<HttpRoute>::all(api.client()), &listings);
+        let http = tokio::spawn(stream.for_each(|_| async {}));
+        let (_tcp, tcp) = tcproutes(&api, &Arc::default(), &listings);
+        settle().await;
+        assert!(api
+            .requests()
+            .iter()
+            .any(|r| r.path.starts_with(httproutes)));
+        assert!(!tcproutes_watched(&api));
+        let unlisted: Vec<_> = listings.unlisted().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(unlisted, ["HTTPRoute"], "TCPRoute counts as listed");
+        http.abort();
+        tcp.abort();
+    }
+
     /// Discovery is read once per resync interval while a CRD is missing.
     #[tokio::test(start_paused = true)]
     async fn discovery_is_read_once_per_interval() {
         let api = MockApi::default();
-        discovery_serves_tcproutes(&api, false);
+        discovery_serves(&api, Bundle::WithoutTcpRoutes);
         let pending = Arc::new(PendingWatches::default());
         let _reflector = tcproutes(&api, &pending, &Listings::default());
         settle().await;

@@ -16,9 +16,9 @@ use kube::runtime::watcher;
 use kube::Client;
 use serde_json::{json, Value};
 
-use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
-use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
-use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
+use gateway_api::experimental::tcproutes::v1::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1::TlsRoute;
+use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::{GatewayClass, GatewayClassParametersRef, GatewayClassSpec};
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewaySpec};
 use gateway_api::httproutes::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};

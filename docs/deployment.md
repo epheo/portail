@@ -3,10 +3,10 @@
 ## Prerequisites
 
 - Kubernetes 1.28+, OpenShift and MicroShift included.
-- Gateway API CRDs v1.4.1 (experimental channel for TCPRoute, TLSRoute and UDPRoute):
+- Gateway API CRDs v1.7.0, standard or experimental channel. portail watches TCPRoute, TLSRoute and UDPRoute at v1, which older bundles do not serve: on those, those kinds wait for their CRD, and HTTPRoute is served meanwhile.
 
 ```bash
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
 
 ## Install
@@ -364,7 +364,7 @@ spec:
   - {name: http, protocol: HTTP, port: 80, hostname: "*.p.apps.example.com"}
 ---
 # The edge's routes name the project Gateway; a grant in its namespace allows it.
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
 metadata: {name: p, namespace: portail-edge}
 spec:

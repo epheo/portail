@@ -24,7 +24,7 @@ import (
 
 const (
 	clusterName       = "portail"
-	gatewayAPIVersion = "v1.4.1"
+	gatewayAPIVersion = "v1.7.0"
 	// scripts/release.sh sets it; publish.yml refuses a tag it does not match.
 	portailVersion = "v0.3.0"
 	portailImage   = "ghcr.io/epheo/portail:latest"
@@ -242,6 +242,11 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 	}
 
 	reportOutput := fmt.Sprintf("reports/%s/epheo-portail/experimental-%s-default-report.yaml", gatewayAPIVersion, portailVersion)
+	// The suite writes the report but creates no directory: a new Gateway
+	// API version has none yet.
+	if err := os.MkdirAll(filepath.Join(conformanceDir, filepath.Dir(reportOutput)), 0755); err != nil {
+		return 1, fmt.Errorf("create report dir: %w", err)
+	}
 
 	log.Printf("Executing tests on Kind network (VIP %s)...", vip)
 	cmd := exec.Command(runtime, "run", "--rm",
