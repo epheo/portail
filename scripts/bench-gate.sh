@@ -36,10 +36,10 @@ instructions)
     UNIT=inst
     DEFAULT_THRESHOLD=1.10
     DEFAULT_MIN_DELTA=2
-    # Each settles at a level set per process, so a run of the same
-    # binary fails either one: route_table_creation 1,648 to 2,356 inst,
-    # parse_malformed_request 392 or 664.
-    SKIP='^(route_table_creation|parse_malformed_request)$'
+    # Its allocations are past glibc's tcache, whose state the earlier
+    # benches leave, so a run of the same binary settles anywhere from
+    # 1,648 to 2,356 inst.
+    SKIP='^route_table_creation$'
     ;;
 time)
     UNIT=ns
