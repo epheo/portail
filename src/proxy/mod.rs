@@ -6,15 +6,19 @@
 pub mod backend_pool;
 pub mod chunked;
 pub mod data_plane;
+pub(crate) mod deadline;
 pub(crate) mod h2_bridge;
 pub mod health;
+pub(crate) mod http1;
 pub mod http_filters;
 pub mod http_parser;
 pub mod method;
 pub mod proxy_protocol;
+pub(crate) mod relay;
 pub mod request_processor;
 pub mod tls;
 pub mod udp_worker;
+pub(crate) mod upstream;
 pub mod worker;
 
 /// Test-only helpers for running the proxy out of fds.

@@ -31,13 +31,17 @@ use crate::logging::debug;
 use crate::metrics::{ListenerStats, METRICS};
 use crate::proxy::backend_pool::SharedBackendPool;
 use crate::proxy::chunked::ChunkedStream;
+use crate::proxy::deadline::{idle_opt, progress};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{self, progress, BodyFraming, WorkerConfig};
+use crate::proxy::upstream::response::{
+    parse_response_head, response_has_no_body, BodyFraming, RESPONSE_HEADER_CAP,
+};
+use crate::proxy::worker::{self, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough
@@ -70,7 +74,7 @@ const RESP_READ: usize = 16 * 1024;
 /// Ceiling on response-head bytes accumulated before the terminator is found.
 /// Tied to the engine's own header cap plus one read of body overshoot, so an
 /// engine-legal head is never rejected only on the h2 path.
-const RESPONSE_HEAD_CAP: usize = worker::RESPONSE_HEADER_CAP + RESP_READ;
+const RESPONSE_HEAD_CAP: usize = RESPONSE_HEADER_CAP + RESP_READ;
 
 /// Everything a bridged connection shares with its listener's accept loop.
 /// `pool` is resolved once per h2 connection (the process-wide pool under
@@ -260,7 +264,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
 pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     let io = ClientStream::new(
         tls_stream,
-        worker::idle_opt(ctx.cfg.idle_body_timeout),
+        idle_opt(ctx.cfg.idle_body_timeout),
         ctx.cfg.client_header_timeout,
     );
     let handshake = h2::server::Builder::new()
@@ -323,7 +327,7 @@ async fn serve_stream(
 ) -> Result<()> {
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
-    let idle = worker::idle_opt(ctx.cfg.idle_body_timeout);
+    let idle = idle_opt(ctx.cfg.idle_body_timeout);
 
     let Some((head, chunk_body)) = synth_request_head(&parts, body.is_end_stream()) else {
         // CONNECT or no authority: not expressible as an origin-form h1
@@ -608,7 +612,7 @@ async fn forward_response(
 ) -> Result<()> {
     // The engine framed its output by this same reading, which admits no
     // transfer coding but the chunked framing removed here: h2 carries none.
-    let head = worker::parse_response_head(&acc[..header_end])
+    let head = parse_response_head(&acc[..header_end])
         .ok_or_else(|| anyhow!("engine sent a malformed response head"))?;
     let status = head.status;
     let (chunked, content_length) = match head.body {
@@ -616,7 +620,7 @@ async fn forward_response(
         BodyFraming::Length(n) => (false, Some(n)),
         BodyFraming::Close => (false, None),
     };
-    let no_body = worker::response_has_no_body(status, is_head) || content_length == Some(0);
+    let no_body = response_has_no_body(status, is_head) || content_length == Some(0);
     // We reframe a chunked body into DATA, so the h2 response must not also
     // carry the backend's content-length: the DATA total need not equal it and
     // a mismatch is malformed per RFC 9113 8.1.1.
@@ -917,7 +921,7 @@ mod tests {
     fn response_mapping_strips_hop_by_hop_keeps_the_rest() {
         // Content-Length body (not chunked): the length is preserved.
         let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 3\r\nx-custom: v\r\n\r\n";
-        let status = worker::parse_response_head(head).unwrap().status;
+        let status = parse_response_head(head).unwrap().status;
         let resp = build_h2_response(head, status, false).unwrap();
         assert_eq!(resp.status(), 200);
         let h = resp.headers();
