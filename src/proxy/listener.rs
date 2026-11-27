@@ -80,7 +80,7 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
 /// the keepalive of `tcp_keepalive(time)`. Linux copies both from a listener
 /// to every socket it accepts: the data plane sets them before listen(), and
 /// then accepting costs no setsockopt per connection.
-pub(super) fn carries_client_options(sock: socket2::SockRef<'_>, time: Duration) -> bool {
+fn carries_client_options(sock: socket2::SockRef<'_>, time: Duration) -> bool {
     sock.tcp_nodelay().unwrap_or(false)
         && sock.keepalive().unwrap_or(false)
         && sock.tcp_keepalive_time().ok() == Some(time)
@@ -353,7 +353,7 @@ async fn client_of(
 /// bridge, all else stays on the h1 path. A connection no listener takes,
 /// or one that is not TLS, closes as a failed handshake.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn serve_tls_connection(
+async fn serve_tls_connection(
     tcp_stream: TcpStream,
     peer: SocketAddr,
     local: SocketAddr,

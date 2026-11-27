@@ -741,7 +741,7 @@ fn pipelined_tail(request: &[u8]) -> Option<Vec<u8>> {
 /// One client connection driven through [`serve`] over an
 /// in-memory duplex, against real loopback backends.
 #[cfg(test)]
-mod connection_tests {
+mod tests {
     use super::*;
     use crate::proxy::relay::handle_tls_passthrough;
     use crate::proxy::testkit::{

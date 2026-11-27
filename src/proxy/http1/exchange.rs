@@ -503,7 +503,7 @@ pub(super) async fn proxy_http_request(
 /// A refused upgrade is likewise never pooled: a backend may have detached
 /// the socket from its HTTP parser on seeing the upgrade request (Node's
 /// 'upgrade' event), so a refusal does not prove it still reads HTTP.
-pub(super) fn backend_conn_poolable(framing_clean: bool, is_head: bool, was_upgrade: bool) -> bool {
+fn backend_conn_poolable(framing_clean: bool, is_head: bool, was_upgrade: bool) -> bool {
     framing_clean && !is_head && !was_upgrade
 }
 
@@ -623,7 +623,7 @@ async fn write_with_tail(
 /// request, `reused` when it is still the pooled one; `Ok(None)` means the
 /// failure was already answered to the client.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_request_with_retry(
+async fn send_request_with_retry(
     client: &mut Connection,
     state: &mut ConnectionState,
     backend_ref: &crate::routing::Backend,
