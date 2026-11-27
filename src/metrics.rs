@@ -372,7 +372,7 @@ pub fn host_requests_counter(host: &str) -> Arc<AtomicU64> {
     family_counter(&HOST_REQUESTS, host)
 }
 
-/// Attribute a backend connect failure (client saw 502) to the configured
+/// Attribute a backend connect failure (502, or a closed L4 connection) to the configured
 /// backend. A registry lookup per call is fine on this path: connect
 /// errors are rare by definition and already cost a log line + health hit.
 pub fn record_backend_connect_error(backend: &str) {
@@ -454,7 +454,7 @@ pub struct ListenerStats {
     pub tls_handshake_failures: Counter,
     /// Requests answered 429 by this listener's rate limit.
     pub rate_limited: Counter,
-    /// Backend connects that failed (client saw 502) for this listener's requests.
+    /// Backend connects that failed (502, or a closed L4 connection) on this listener.
     pub upstream_connect_errors: Counter,
     /// Backend connects that timed out (client saw 504) for this listener's requests.
     pub upstream_connect_timeouts: Counter,
@@ -550,7 +550,7 @@ fn render_listeners(out: &mut String) {
         ),
         (
             "listener_upstream_connect_errors_total",
-            "Backend connects that failed (client saw 502) per listener",
+            "Backend connects that failed (client saw 502, or its L4 connection closed) per listener",
             "counter",
             |s| s.upstream_connect_errors.get(),
         ),
@@ -562,7 +562,7 @@ fn render_listeners(out: &mut String) {
         ),
         (
             "listener_upstream_send_errors_total",
-            "Requests whose send to a freshly connected backend failed (client saw 502) per listener",
+            "Requests, or first L4 bytes, whose send to a freshly connected backend failed (client saw 502, or its L4 connection closed) per listener",
             "counter",
             |s| s.upstream_send_errors.get(),
         ),
@@ -679,19 +679,19 @@ pub fn render(ready: bool) -> String {
             &BACKEND_CONNECT_ERRORS,
             "upstream_connect_errors_total",
             "backend",
-            "Backend connects that failed (client saw 502), by configured backend",
+            "Backend connects that failed (client saw 502, or its L4 connection closed), by backend address, or TLS server name and port",
         ),
         (
             &BACKEND_CONNECT_TIMEOUTS,
             "upstream_connect_timeouts_total",
             "backend",
-            "Backend connects that timed out (client saw 504), by configured backend",
+            "Backend connects that timed out (client saw 504), by backend address, or TLS server name and port",
         ),
         (
             &BACKEND_SEND_ERRORS,
             "upstream_send_errors_total",
             "backend",
-            "Requests whose send to a freshly connected backend failed (client saw 502), by configured backend",
+            "Requests, or first L4 bytes, whose send to a freshly connected backend failed (client saw 502, or its L4 connection closed), by backend address, or TLS server name and port",
         ),
     ];
     for (family, name, label, help) in labeled {
