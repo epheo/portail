@@ -163,12 +163,11 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
         .with_retries(TCP_KEEPALIVE_RETRIES)
 }
 
-/// Whether `listener` already carries what every client socket needs:
-/// TCP_NODELAY and the keepalive of `tcp_keepalive(time)`. Linux copies both
+/// Whether `sock` carries what every client socket needs: TCP_NODELAY and
+/// the keepalive of `tcp_keepalive(time)`. Linux copies both from a listener
 /// to every socket it accepts: the data plane sets them before listen(), and
 /// then accepting costs no setsockopt per connection.
-fn carries_client_options(listener: &TcpListener, time: Duration) -> bool {
-    let sock = socket2::SockRef::from(listener);
+fn carries_client_options(sock: socket2::SockRef<'_>, time: Duration) -> bool {
     sock.tcp_nodelay().unwrap_or(false)
         && sock.keepalive().unwrap_or(false)
         && sock.tcp_keepalive_time().ok() == Some(time)
@@ -495,7 +494,9 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     // otherwise park its connection task forever, since the idle wait
     // between keepalive requests is intentionally unbounded.
     let keepalive = tcp_keepalive(cfg.tcp_keepalive_time);
-    let options_inherited = carries_client_options(&listener, cfg.tcp_keepalive_time);
+    // Read on the first socket accepted, not on the listener: what a kernel
+    // copies on accept is then seen, not assumed.
+    let mut options_inherited = None;
 
     let mut backoff = AcceptBackoff::default();
     loop {
@@ -509,7 +510,10 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                 match result {
                     Ok((tcp_stream, peer)) => {
                         backoff.reset();
-                        if !options_inherited {
+                        let inherited = *options_inherited.get_or_insert_with(|| {
+                            carries_client_options((&tcp_stream).into(), cfg.tcp_keepalive_time)
+                        });
+                        if !inherited {
                             let sock = socket2::SockRef::from(&tcp_stream);
                             // _-prefixed: debug! compiles out in release builds.
                             if let Err(_e) = sock
@@ -3778,9 +3782,9 @@ mod connection_tests {
         )
         .unwrap();
         let data_plane = TcpListener::from_std(data_plane).unwrap();
-        assert!(carries_client_options(&data_plane, time));
+        assert!(carries_client_options((&data_plane).into(), time));
         let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        assert!(!carries_client_options(&plain, time));
+        assert!(!carries_client_options((&plain).into(), time));
 
         for listener in [data_plane, plain] {
             let addr = listener.local_addr().unwrap();
