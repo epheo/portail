@@ -2,13 +2,14 @@
 //! connection it accepts by what its port serves.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tokio_util::task::TaskTracker;
 
 use crate::logging::{debug, info, warn};
 use crate::metrics::{ListenerStats, METRICS};
@@ -135,24 +136,22 @@ impl AcceptBackoff {
     }
 }
 
-/// RAII in-flight-connection counter. One guard lives inside each spawned
-/// per-connection task; `data_plane::Drain::run` polls the shared count and
-/// drains until it reaches zero (or the drain timeout expires). Drop-based so
-/// the count stays correct on every exit path, including panics and aborts.
+/// One open client connection, held inside its task: what
+/// `data_plane::Drain::run` waits on, and the gauges. Drop-based so both
+/// stay correct on every exit path, including panics and aborts.
 struct ConnGuard {
-    active: Arc<AtomicUsize>,
+    _tracked: TaskTrackerToken,
     stats: Arc<ListenerStats>,
 }
 
 impl ConnGuard {
-    fn new(counter: Arc<AtomicUsize>, stats: Arc<ListenerStats>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
+    fn new(connections: &TaskTracker, stats: Arc<ListenerStats>) -> Self {
         METRICS.connections_accepted_total.inc();
         METRICS.active_connections.inc();
         stats.accepted.inc();
         stats.active.inc();
         Self {
-            active: counter,
+            _tracked: connections.token(),
             stats,
         }
     }
@@ -160,8 +159,6 @@ impl ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        // Release pairs with the Acquire load in the shutdown drain loop.
-        self.active.fetch_sub(1, Ordering::Release);
         METRICS.active_connections.dec();
         self.stats.active.dec();
     }
@@ -190,7 +187,7 @@ pub struct ListenerCtx {
     pub plan: crate::proxy::data_plane::PortPlan,
     pub health: Arc<HealthRegistry>,
     pub selector: Arc<BackendSelector>,
-    pub active_connections: Arc<AtomicUsize>,
+    pub active_connections: TaskTracker,
     pub shared_pool: Option<Arc<SharedBackendPool>>,
 }
 
@@ -254,7 +251,7 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                         let listener_stats = listener_stats.clone();
                         let drain = shutdown.child_token();
                         let conn_guard =
-                            ConnGuard::new(active_connections.clone(), listener_stats.clone());
+                            ConnGuard::new(&active_connections, listener_stats.clone());
                         let tls = plan.load_full();
                         tokio::spawn(async move {
                             let _guard = conn_guard;

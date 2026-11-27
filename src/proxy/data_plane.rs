@@ -9,12 +9,13 @@
 use anyhow::Result;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::{CertificateRef, ListenerConfig, PerformanceConfig, Protocol};
 use crate::logging::{info, warn};
@@ -164,7 +165,7 @@ pub struct DataPlane {
     /// would split the default session budget.
     udp_sessions: udp::SessionLimits,
     shutdown: CancellationToken,
-    active_connections: Arc<AtomicUsize>,
+    active_connections: TaskTracker,
     /// Per published TCP port, every pass's plan (see [`PortPlan`]).
     plans: HashMap<u16, PortPlan>,
     /// Per port with HTTPS listeners, the config terminating for them.
@@ -189,7 +190,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// the data plane itself (see [`DataPlane::drain_handle`]).
 pub struct Drain {
     shutdown: CancellationToken,
-    active_connections: Arc<AtomicUsize>,
+    active_connections: TaskTracker,
 }
 
 impl Drain {
@@ -199,28 +200,22 @@ impl Drain {
         info!("Data plane shutting down, draining in-flight connections");
         self.shutdown.cancel();
 
-        let active = self.active_connections;
-        let drain_result = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            loop {
-                let count = active.load(Ordering::Acquire);
-                if count == 0 {
-                    break;
-                }
-                info!("Waiting for {} in-flight connection(s) to drain", count);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        })
-        .await;
-
-        match drain_result {
+        let connections = self.active_connections;
+        // wait() never ends on a tracker left open.
+        connections.close();
+        if !connections.is_empty() {
+            info!(
+                "Waiting for {} in-flight connection(s) to drain",
+                connections.len()
+            );
+        }
+        match tokio::time::timeout(DRAIN_TIMEOUT, connections.wait()).await {
             Ok(()) => info!("All connections drained"),
-            Err(_) => {
-                let remaining = active.load(Ordering::Acquire);
-                warn!(
-                    "Drain timeout after {:?}: {} connections still active",
-                    DRAIN_TIMEOUT, remaining
-                );
-            }
+            Err(_) => warn!(
+                "Drain timeout after {:?}: {} connections still active",
+                DRAIN_TIMEOUT,
+                connections.len()
+            ),
         }
         info!("Data plane shutdown complete");
     }
@@ -504,7 +499,7 @@ impl DataPlane {
             health,
             udp_sessions: udp::SessionLimits::from_perf(performance_config),
             shutdown: CancellationToken::new(),
-            active_connections: Arc::new(AtomicUsize::new(0)),
+            active_connections: TaskTracker::new(),
             plans,
             terminate_configs,
             closing: Vec::new(),
@@ -1061,6 +1056,38 @@ pub(crate) mod test_ports {
 mod tests {
     use super::*;
     use crate::config::{CertificateRef, ListenerConfig, Protocol as P, TlsConfig, TlsMode as TM};
+
+    fn drain_of(connections: &TaskTracker) -> Drain {
+        Drain {
+            shutdown: CancellationToken::new(),
+            active_connections: connections.clone(),
+        }
+    }
+
+    /// The drain ends with its last connection, not at a poll's next turn:
+    /// no time passes between the two. A shutdown waited up to half a
+    /// second more than its connections needed.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_ends_when_its_last_connection_does() {
+        let connections = TaskTracker::new();
+        let open = connections.token();
+        let started = tokio::time::Instant::now();
+        let drain = tokio::spawn(drain_of(&connections).run());
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "an open connection holds the drain");
+        drop(open);
+        drain.await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_gives_up_on_connections_that_stay() {
+        let connections = TaskTracker::new();
+        let _open = connections.token();
+        let started = tokio::time::Instant::now();
+        drain_of(&connections).run().await;
+        assert_eq!(started.elapsed(), DRAIN_TIMEOUT);
+    }
 
     fn https_listener(
         name: &str,

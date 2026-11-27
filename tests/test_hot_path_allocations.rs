@@ -9,7 +9,6 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +24,7 @@ use portail::routing::{
 };
 use rustls::pki_types::CertificateDer;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 struct Counting;
 
@@ -129,7 +129,7 @@ fn spawn_backend() -> SocketAddr {
 /// `n` client connections to `proxy` from a thread of their own, each a
 /// request, its whole response, and a close; then waits until the proxy
 /// has let go of all of them.
-async fn churn(proxy: SocketAddr, n: usize, active: &AtomicUsize) {
+async fn churn(proxy: SocketAddr, n: usize, active: &TaskTracker) {
     let client = std::thread::spawn(move || {
         for _ in 0..n {
             let mut sock = std::net::TcpStream::connect(proxy).unwrap();
@@ -143,7 +143,7 @@ async fn churn(proxy: SocketAddr, n: usize, active: &AtomicUsize) {
             }
         }
     });
-    while !client.is_finished() || active.load(Ordering::Acquire) > 0 {
+    while !client.is_finished() || !active.is_empty() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     client.join().unwrap();
@@ -167,7 +167,7 @@ fn a_churned_connection_allocates_a_fixed_few_times() {
     let per_conn = rt.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap();
-        let active = Arc::new(AtomicUsize::new(0));
+        let active = TaskTracker::new();
         let ctx = ListenerCtx {
             server_port: 80,
             routes: Arc::new(ArcSwap::from_pointee(table_to(backend))),
@@ -225,7 +225,7 @@ fn tls_config() -> (CertificateDer<'static>, Arc<rustls::ServerConfig>) {
 async fn proxy(
     backend: SocketAddr,
     tls: Option<Arc<rustls::ServerConfig>>,
-) -> (SocketAddr, Arc<AtomicUsize>) {
+) -> (SocketAddr, TaskTracker) {
     let plan = tls.map(|config| {
         let mut plan = TlsPlan::default();
         plan.terminate = Some(config);
@@ -234,7 +234,7 @@ async fn proxy(
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = TaskTracker::new();
     let perf = PerformanceConfig {
         http2: true,
         ..Default::default()
@@ -342,7 +342,7 @@ fn per_request<F>(
     serve: impl FnOnce(Option<Arc<rustls::ServerConfig>>) -> F,
 ) -> usize
 where
-    F: std::future::Future<Output = (SocketAddr, Arc<AtomicUsize>)>,
+    F: std::future::Future<Output = (SocketAddr, TaskTracker)>,
 {
     const FEW: usize = 100;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -358,7 +358,7 @@ where
         for n in [FEW, FEW, FEW + EXTRA] {
             let before = ALLOCATIONS.with(Cell::get);
             let client = requests(addr, client, cert.clone(), n);
-            while !client.is_finished() || active.load(Ordering::Acquire) > 0 {
+            while !client.is_finished() || !active.is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             client.join().unwrap();
