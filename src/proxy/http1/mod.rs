@@ -745,11 +745,18 @@ mod connection_tests {
     use super::exchange::send_request_with_retry;
     use super::*;
     use crate::proxy::listener::{
-        self, carries_client_options, make_pool, serve_tls_connection, ListenerCtx,
-        TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES,
+        self, carries_client_options, serve_tls_connection, ListenerCtx, TCP_KEEPALIVE_INTERVAL,
+        TCP_KEEPALIVE_RETRIES,
     };
     use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
     use crate::proxy::relay::handle_tls_passthrough;
+    use crate::proxy::testkit::{
+        assert_never_connected, backend, client_hello, closing_backend, conn_state,
+        conn_state_header, delivered, exchange, gateway_backend, idle_backend, keepalive_where,
+        l4_backend, read_one_reply, read_until_closed, received, refusing_backend, response,
+        routes, routes_with_tcp, serve, serve_state, socket_where, tcp_client, tls_client,
+        tls_read_to_end, GET_A, IDLE, OK, OPAQUE, REFUSED, UPGRADE,
+    };
     use crate::proxy::tls::{TlsKind, TlsPlan};
     use crate::routing::{
         Backend, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, URLRewritePath,
@@ -757,151 +764,9 @@ mod connection_tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::io::DuplexStream;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc::UnboundedReceiver;
 
-    const REFUSED: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno";
     const SWITCHED: &[u8] =
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-    const UPGRADE: &[u8] =
-        b"GET /ws HTTP/1.1\r\nHost: a.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-
-    /// Backend answering the first request head of each connection with
-    /// `reply`; yields all bytes a connection delivered once it closes.
-    async fn backend(reply: &[u8]) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let reply = reply.to_vec();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let (tx, reply) = (tx.clone(), reply.clone());
-                tokio::spawn(async move {
-                    let (mut seen, mut chunk, mut replied) = (Vec::new(), [0u8; 4096], false);
-                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
-                        seen.extend_from_slice(&chunk[..n]);
-                        if !replied && find_header_end(&seen).is_some() {
-                            replied = true;
-                            if sock.write_all(&reply).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    let _ = tx.send(seen);
-                });
-            }
-        });
-        (addr, rx)
-    }
-
-    /// Backend answering the first request head of each connection with
-    /// `reply`, then closing: the end of a close-delimited body.
-    async fn closing_backend(reply: &[u8]) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let reply = reply.to_vec();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let reply = reply.clone();
-                tokio::spawn(async move {
-                    let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
-                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
-                        seen.extend_from_slice(&chunk[..n]);
-                        if find_header_end(&seen).is_some() {
-                            let _ = sock.write_all(&reply).await;
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    /// a.test proxies to `backend`; r.test redirects to https.
-    fn routes(backend: SocketAddr) -> RouteTable {
-        let rule = |filters, backends| {
-            HttpRouteRule::new(
-                PathMatchType::Prefix,
-                "/".to_string(),
-                vec![],
-                vec![],
-                filters,
-                backends,
-            )
-        };
-        let mut rt = RouteTable::new();
-        rt.add_http_route(
-            "a.test",
-            rule(
-                vec![],
-                vec![Backend {
-                    socket_addr: backend,
-                    weight: 1,
-                    filters: vec![],
-                    use_tls: false,
-                    server_name: String::new(),
-                    action: crate::routing::BackendAction::Forward,
-                }],
-            ),
-        );
-        rt.add_http_route(
-            "r.test",
-            rule(
-                vec![HttpFilter::RequestRedirect {
-                    scheme: Some("https".to_string()),
-                    hostname: None,
-                    port: None,
-                    path: None,
-                    status_code: 301,
-                }],
-                vec![],
-            ),
-        );
-        rt
-    }
-
-    fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
-        let cfg = ServeConfig {
-            max_idle_per_backend: 4,
-            connect_timeout: Duration::from_secs(2),
-            client_header_timeout: Duration::from_secs(2),
-            tcp_keepalive_time: Duration::from_secs(60),
-            idle_body_timeout: Duration::from_secs(5),
-            http2: false,
-        };
-        ConnectionState::new(
-            8080,
-            Arc::new(ArcSwap::from_pointee(rt)),
-            make_pool(&None, &cfg),
-            Arc::new(BackendSelector::new()),
-            Arc::new(HealthRegistry::new()),
-            is_tls,
-            "127.0.0.1:40000".parse().unwrap(),
-            "127.0.0.1:8080".parse().unwrap(),
-            &cfg,
-            Arc::new(ListenerStats::default()),
-            CancellationToken::new(),
-        )
-    }
-
-    fn serve(rt: RouteTable) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
-        serve_state(conn_state(rt, false))
-    }
-
-    /// `serve` for a state the test adjusted first.
-    fn serve_state(state: ConnectionState) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
-        let (client, engine) = tokio::io::duplex(64 * 1024);
-        let peer = "127.0.0.1:40000".parse().unwrap();
-        let task = tokio::spawn(super::serve(
-            Connection::Mem {
-                inner: engine,
-                aborted: Default::default(),
-            },
-            peer,
-            state,
-        ));
-        (client, task)
-    }
 
     /// `serve`, with the connection draining once `drain` is cancelled.
     fn serve_draining(
@@ -911,38 +776,6 @@ mod connection_tests {
         let mut state = conn_state(rt, false);
         state.drain = drain;
         serve_state(state)
-    }
-
-    /// Send `input`, half-close, and collect everything until the engine
-    /// closes the connection.
-    async fn exchange(client: &mut DuplexStream, input: &[u8]) -> String {
-        client.write_all(input).await.unwrap();
-        client.shutdown().await.unwrap();
-        let mut out = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
-            .await
-            .expect("engine never closed the connection")
-            .unwrap();
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    /// Everything until the engine closes, without half-closing first: the
-    /// close must be the engine's own decision.
-    async fn read_until_closed(client: &mut DuplexStream) -> String {
-        let mut out = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out))
-            .await
-            .expect("engine never closed the connection")
-            .unwrap();
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    async fn delivered(rx: &mut UnboundedReceiver<Vec<u8>>) -> String {
-        let seen = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("backend connection never closed")
-            .unwrap();
-        String::from_utf8_lossy(&seen).into_owned()
     }
 
     /// One prefix rule on `host`, with `filters`, proxying to `backend`.
@@ -1200,20 +1033,6 @@ mod connection_tests {
         assert!(seen.ends_with("\r\n\r\nHELDTUNNEL"), "{seen}");
     }
 
-    /// A client's first flight: a ClientHello naming `sni`.
-    fn client_hello(sni: &str) -> Vec<u8> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
-            .with_no_client_auth();
-        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
-        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
-        let mut hello = Vec::new();
-        conn.write_tls(&mut hello).unwrap();
-        hello
-    }
-
     /// An invalid ref's share answers 500; a Gateway backend's before any
     /// of its instances reported answers 503: one is wrong, the other not
     /// up yet.
@@ -1406,94 +1225,14 @@ mod connection_tests {
         }
     }
 
-    /// A backend nothing should reach: the test holds the listener.
-    async fn idle_backend() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0").await.unwrap()
-    }
-
-    /// A backend address that refuses connections. The socket is bound but
-    /// not listening; held, it keeps a parallel test from taking the port.
-    fn refusing_backend() -> (tokio::net::TcpSocket, SocketAddr) {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = socket.local_addr().unwrap();
-        (socket, addr)
-    }
-
-    /// Call once the engine task has finished: any connect it made is
-    /// already in the accept queue.
-    async fn assert_never_connected(listener: &TcpListener) {
-        let accepted = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
-        assert!(accepted.is_err(), "the proxy connected to the backend");
-    }
-
     /// A masked WebSocket text frame ("hello"), as a client streams it.
     const WS_FRAME: &[u8] = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
-    /// Not HTTP, but holding the blank line that ends a head.
-    const OPAQUE: &[u8] = b"\x00\x01opaque\r\n\r\n";
-
-    /// `routes(http)` plus a TCP route on the engine's port.
-    fn routes_with_tcp(http: SocketAddr, tcp: SocketAddr) -> RouteTable {
-        let mut rt = routes(http);
-        rt.add_tcp_route(
-            8080,
-            vec![Backend {
-                socket_addr: tcp,
-                weight: 1,
-                filters: vec![],
-                use_tls: false,
-                server_name: String::new(),
-                action: crate::routing::BackendAction::Forward,
-            }],
-        );
-        rt
-    }
 
     /// Keepalive time, interval and retries of the socket in this process
     /// whose local address is `local`: the proxy end of a backend connection,
     /// as the backend saw its peer. `None` when keepalive is off.
     fn keepalive_of(local: SocketAddr) -> Option<(Duration, Duration, u32)> {
         keepalive_where(|sock| sock.local_addr().ok().and_then(|a| a.as_socket()) == Some(local))
-    }
-
-    /// `keepalive_of` the socket in this process that `is_it` picks.
-    fn keepalive_where(
-        is_it: impl Fn(&socket2::SockRef<'_>) -> bool,
-    ) -> Option<(Duration, Duration, u32)> {
-        socket_where(is_it, |sock| {
-            sock.keepalive().unwrap().then(|| {
-                (
-                    sock.tcp_keepalive_time().unwrap(),
-                    sock.tcp_keepalive_interval().unwrap(),
-                    sock.tcp_keepalive_retries().unwrap(),
-                )
-            })
-        })
-    }
-
-    /// What `read` says of the socket in this process that `is_it` picks.
-    fn socket_where<T>(
-        is_it: impl Fn(&socket2::SockRef<'_>) -> bool,
-        read: impl Fn(&socket2::SockRef<'_>) -> T,
-    ) -> T {
-        use std::os::fd::FromRawFd;
-        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
-            let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse() else {
-                continue;
-            };
-            // A dup, so a test closing `fd` meanwhile cannot pull it away.
-            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-            if dup < 0 {
-                continue;
-            }
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
-            let sock = socket2::SockRef::from(&owned);
-            if !is_it(&sock) {
-                continue;
-            }
-            return read(&sock);
-        }
-        panic!("no such socket");
     }
 
     /// A client that vanishes without FIN or RST would otherwise pin its
@@ -1663,32 +1402,6 @@ mod connection_tests {
         assert_never_connected(&backend).await;
     }
 
-    fn gateway_backend(socket_addr: SocketAddr) -> Backend {
-        Backend {
-            socket_addr,
-            weight: 1,
-            filters: vec![],
-            use_tls: false,
-            server_name: String::new(),
-            action: crate::routing::BackendAction::ForwardProxied,
-        }
-    }
-
-    /// What `conn_state`'s client sends a Gateway backend first.
-    fn conn_state_header() -> Vec<u8> {
-        proxy_protocol::header(
-            "127.0.0.1:40000".parse().unwrap(),
-            "127.0.0.1:8080".parse().unwrap(),
-        )
-    }
-
-    async fn received(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("backend connection never closed")
-            .unwrap()
-    }
-
     /// Raw TCP to a Gateway backend: the header goes before any byte of
     /// the client's, on a TCP-only port and after a sniff alike.
     #[tokio::test]
@@ -1836,8 +1549,6 @@ mod connection_tests {
         }
     }
 
-    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-
     /// Plain backend answering OK by `script`.
     async fn scripted_backend(script: Script) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1933,35 +1644,6 @@ mod connection_tests {
         }
         rt
     }
-
-    /// The next response on a kept-open client connection, by its
-    /// Content-Length; whatever arrived when the engine closes instead.
-    async fn response(client: &mut DuplexStream) -> String {
-        let (mut out, mut chunk) = (Vec::new(), [0u8; 4096]);
-        loop {
-            if let Some(end) = find_header_end(&out) {
-                let head = String::from_utf8_lossy(&out[..end]).to_ascii_lowercase();
-                let len: usize = head
-                    .split("\r\ncontent-length: ")
-                    .nth(1)
-                    .and_then(|v| v.split("\r\n").next()?.parse().ok())
-                    .unwrap_or(0);
-                if out.len() >= end + len {
-                    let resp = String::from_utf8_lossy(&out[..end + len]).into_owned();
-                    out.drain(..end + len);
-                    assert!(out.is_empty(), "unexpected bytes after {resp}");
-                    return resp;
-                }
-            }
-            let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut chunk));
-            match read.await.expect("no response").unwrap() {
-                0 => return String::from_utf8_lossy(&out).into_owned(),
-                n => out.extend_from_slice(&chunk[..n]),
-            }
-        }
-    }
-
-    const GET_A: &[u8] = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
 
     /// The backend budget times each request from its own start, whatever
     /// the connection's last request left on its timer: a deadline still
@@ -2359,22 +2041,6 @@ mod connection_tests {
         }
     }
 
-    /// A TCP backend running `serve` on each connection.
-    async fn l4_backend<F, Fut>(serve: F) -> SocketAddr
-    where
-        F: Fn(TcpStream) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(serve(sock));
-            }
-        });
-        addr
-    }
-
     /// The engine on a TCP-only port relaying to `backend`.
     fn serve_l4(
         backend: SocketAddr,
@@ -2384,8 +2050,6 @@ mod connection_tests {
         state.idle_body_timeout = idle;
         serve_state(state)
     }
-
-    const IDLE: Duration = Duration::from_millis(200);
 
     /// Once one side has finished, a peer that never closes pinned the
     /// relay, its task and both fds forever.
@@ -2963,60 +2627,6 @@ mod connection_tests {
         }
     }
 
-    type TlsClient = tokio_rustls::client::TlsStream<TcpStream>;
-
-    /// A TLS client connection to the engine serving `rt`, over a real
-    /// socket. `None` when openssl is unavailable.
-    async fn tls_client(
-        rt: RouteTable,
-    ) -> Option<(TlsClient, tokio::task::JoinHandle<Result<()>>)> {
-        let (cert_pem, key_pem) = crate::proxy::tls::test_util::generate_test_cert("a.test")?;
-        let cert = crate::config::CertificateRef {
-            name: "a".to_string(),
-            cert_pem: Some(cert_pem),
-            key_pem: Some(key_pem),
-            ..Default::default()
-        };
-        let server_cfg =
-            crate::proxy::tls::build_server_config(&[cert], std::path::Path::new("/unused"), false)
-                .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        let engine = tokio::spawn(async move {
-            let (tcp, peer) = front.accept().await.unwrap();
-            let tls = acceptor.accept(tcp).await.unwrap();
-            let state = conn_state(rt, true);
-            let tls = Connection::Tls {
-                inner: Box::new(tls),
-            };
-            super::serve(tls, peer, state).await
-        });
-
-        let client_cfg = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::proxy::backend_pool::NoVerifier))
-            .with_no_client_auth();
-        let tcp = TcpStream::connect(front_addr).await.unwrap();
-        let sni = rustls::pki_types::ServerName::try_from("a.test").unwrap();
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
-            .connect(sni, tcp)
-            .await
-            .unwrap();
-        Some((tls, engine))
-    }
-
-    /// Everything until the engine closes. The read fails when the close
-    /// came without close_notify: a strict client (OpenSSL 3, rustls) reads
-    /// a bare FIN as a truncation attack.
-    async fn tls_read_to_end(tls: &mut TlsClient) -> (std::io::Result<usize>, String) {
-        let mut out = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out))
-            .await
-            .expect("engine never closed the connection");
-        (read, String::from_utf8_lossy(&out).into_owned())
-    }
-
     /// Over TLS only close_notify tells a strict client that a
     /// close-delimited body ended rather than was cut.
     #[tokio::test]
@@ -3082,41 +2692,6 @@ mod connection_tests {
         let (read, out) = tls_read_to_end(&mut tls).await;
         assert!(read.is_ok(), "{read:?} after {out:?}");
         engine.await.unwrap().unwrap();
-    }
-
-    /// A plain TCP client connection to the engine serving with `state`:
-    /// the kernel resets only real sockets.
-    async fn tcp_client(
-        state: ConnectionState,
-    ) -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        let engine = tokio::spawn(async move {
-            let (tcp, peer) = front.accept().await.unwrap();
-            super::serve(Connection::Plain { inner: tcp }, peer, state).await
-        });
-        (TcpStream::connect(front_addr).await.unwrap(), engine)
-    }
-
-    /// One response off `client`, by its Content-Length.
-    async fn read_one_reply<R: tokio::io::AsyncRead + Unpin>(client: &mut R) -> String {
-        let (mut out, mut chunk) = (Vec::new(), [0u8; 4096]);
-        loop {
-            if let Some(end) = find_header_end(&out) {
-                let head = String::from_utf8_lossy(&out[..end]).to_ascii_lowercase();
-                let len = head
-                    .split("content-length: ")
-                    .nth(1)
-                    .and_then(|v| v.split("\r\n").next()?.parse::<usize>().ok())
-                    .unwrap();
-                if out.len() >= end + len {
-                    return String::from_utf8_lossy(&out).into_owned();
-                }
-            }
-            let n = client.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "closed mid reply: {}", String::from_utf8_lossy(&out));
-            out.extend_from_slice(&chunk[..n]);
-        }
     }
 
     /// The proxy answers before the client is done sending (unrouted host,

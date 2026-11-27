@@ -17,6 +17,8 @@ pub mod method;
 pub mod proxy_protocol;
 pub(crate) mod relay;
 pub mod request_processor;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod tls;
 pub mod udp;
 pub(crate) mod upstream;
