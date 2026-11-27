@@ -1536,7 +1536,7 @@ async fn proxy_http_request(
             }
         }
         client.flush().await?;
-        let _ = tokio::io::copy_bidirectional(client, &mut backend).await;
+        relay_l4(&mut *client, &mut backend, state.idle_body_timeout).await;
         return Ok((false, None));
     }
 
@@ -2822,15 +2822,20 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-/// Per-direction copy buffer of the L4 relay: the 8 KiB each side got from
-/// `tokio::io::copy_bidirectional`, which it replaces.
-const L4_COPY_BUF: usize = 8 * 1024;
+/// What a relay direction reads at a time: little to start, so an idle
+/// tunnel holds little, then doubled up to `RELAY_BUF_MAX` while reads fill
+/// it and the other side takes each whole. Bulk to a fast receiver grows at
+/// once; a chat never does, and a receiver slower than its sender stops
+/// where its socket does. On a TCP route, 8 KiB reads cost 226 ms of proxy
+/// CPU per GiB and 64 KiB reads 97 ms: fewer syscalls for the same bytes.
+const RELAY_BUF: usize = 8 * 1024;
+const RELAY_BUF_MAX: usize = 64 * 1024;
 
 /// Copy both ways until both directions end. While both are open the relay
 /// is unbounded, like any idle TCP session; once one side has finished, the
-/// other must make progress within `idle` (None: unbounded), or a peer that
-/// never closes would pin the task and both fds forever. Errors on either
-/// side end both: the transfer is best-effort once started.
+/// other must make progress in every `idle` window (None: unbounded), or a
+/// peer that never closes would pin the task and both fds forever. Errors on
+/// either side end both: the transfer is best-effort once started.
 async fn relay_l4<A, B>(a: A, b: B, idle: Option<Duration>)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2838,74 +2843,73 @@ where
 {
     let (mut a_rd, mut a_wr) = tokio::io::split(a);
     let (mut b_rd, mut b_wr) = tokio::io::split(b);
-    let start = tokio::time::Instant::now();
-    let progress = AtomicU64::new(0);
-    let a_to_b = pump(&mut a_rd, &mut b_wr, start, &progress);
-    let b_to_a = pump(&mut b_rd, &mut a_wr, start, &progress);
+    let steps = AtomicU64::new(0);
+    let a_to_b = pump(&mut a_rd, &mut b_wr, &steps);
+    let b_to_a = pump(&mut b_rd, &mut a_wr, &steps);
     tokio::pin!(a_to_b, b_to_a);
     let a_done = tokio::select! {
         done = &mut a_to_b => if done.is_ok() { true } else { return },
         done = &mut b_to_a => if done.is_ok() { false } else { return },
     };
     if a_done {
-        finish_half(b_to_a, idle, start, &progress).await;
+        finish_half(b_to_a, idle, &steps).await;
     } else {
-        finish_half(a_to_b, idle, start, &progress).await;
+        finish_half(a_to_b, idle, &steps).await;
     }
 }
 
-/// Drive the direction still open until it ends, or until `idle` passes
-/// without progress.
+/// Drive the direction still open until it ends, or until a whole `idle`
+/// window passes without a step.
 async fn finish_half<F: std::future::Future>(
     mut half: std::pin::Pin<&mut F>,
     idle: Option<Duration>,
-    start: tokio::time::Instant,
-    progress: &AtomicU64,
+    steps: &AtomicU64,
 ) {
     let Some(idle) = idle else {
         half.await;
         return;
     };
-    let stalled_at = || start + Duration::from_nanos(progress.load(Ordering::Relaxed)) + idle;
     loop {
-        if tokio::time::timeout_at(stalled_at(), half.as_mut())
-            .await
-            .is_ok()
+        let seen = steps.load(Ordering::Relaxed);
+        if tokio::time::timeout(idle, half.as_mut()).await.is_ok()
+            || steps.load(Ordering::Relaxed) == seen
         {
-            return;
-        }
-        // Progress made while waiting pushed the deadline out.
-        if stalled_at() <= tokio::time::Instant::now() {
             return;
         }
     }
 }
 
-/// One direction of an L4 relay: copy until EOF, then pass the half-close
-/// on. Every completed step stamps `progress` (nanos since `start`), the
-/// clock `finish_half` reads.
-async fn pump<R, W>(
-    rd: &mut R,
-    wr: &mut W,
-    start: tokio::time::Instant,
-    progress: &AtomicU64,
-) -> std::io::Result<()>
+/// One direction of a relay: copy until EOF, then pass the half-close on.
+/// Every read and every write counts a step, which `finish_half` watches: a
+/// count, not a time, so the copy reads no clock.
+async fn pump<R, W>(rd: &mut R, wr: &mut W, steps: &AtomicU64) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let stamp = || progress.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let mut buf = vec![0u8; L4_COPY_BUF];
+    // Both directions run on one task: a plain add, no locked one.
+    let step = || steps.store(steps.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    let mut buf = vec![0u8; RELAY_BUF];
     loop {
         let n = rd.read(&mut buf).await?;
-        stamp();
+        step();
         if n == 0 {
             return wr.shutdown().await;
         }
-        wr.write_all(&buf[..n]).await?;
+        let (mut written, mut writes) = (0, 0);
+        while written < n {
+            written += match wr.write(&buf[written..n]).await? {
+                0 => return Err(std::io::ErrorKind::WriteZero.into()),
+                wrote => wrote,
+            };
+            writes += 1;
+            step();
+        }
         // TLS holds written records until flushed.
         wr.flush().await?;
-        stamp();
+        if n == buf.len() && writes == 1 && n < RELAY_BUF_MAX {
+            buf.resize((n * 2).min(RELAY_BUF_MAX), 0);
+        }
     }
 }
 
@@ -4717,6 +4721,30 @@ mod connection_tests {
         client.shutdown().await.unwrap();
         tokio::time::sleep(IDLE * 3).await;
         assert!(!task.is_finished(), "relay cut with the budget disabled");
+    }
+
+    /// An upgraded tunnel is the same relay: once the client has finished,
+    /// a backend that never closes ends with the idle budget.
+    #[tokio::test]
+    async fn half_closed_upgrade_tunnel_ends_after_the_idle_budget() {
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read(&mut [0u8; 4096]).await;
+            let _ = sock.write_all(SWITCHED).await;
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let mut state = conn_state(routes(silent), false);
+        state.idle_body_timeout = Some(IDLE);
+        let (mut client, task) = serve_state(state);
+        client.write_all(UPGRADE).await.unwrap();
+        client
+            .read_exact(&mut vec![0u8; SWITCHED.len()])
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "tunnel pinned after the client's FIN");
     }
 
     /// Bytes no method can open still close at once, not after the header
