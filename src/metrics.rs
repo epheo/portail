@@ -302,6 +302,11 @@ pub static REQUEST_DURATION: Histogram = Histogram::new();
 /// request forward (including the client's body), and backend processing.
 pub static UPSTREAM_TTFB: Histogram = Histogram::new();
 
+/// Every Gateway reconcile pass of the controller, whatever ends it: its
+/// count is the number of passes, which the published-or-written and
+/// skipped counters leave short of on a failed or abandoned pass.
+pub static RECONCILE_DURATION: Histogram = Histogram::new();
+
 fn render_histogram(out: &mut String, name: &str, help: &str, h: &Histogram) {
     use std::fmt::Write;
     let _ = writeln!(out, "# HELP portail_{} {}", name, help);
@@ -706,6 +711,12 @@ pub fn render(ready: bool) -> String {
         "Route match to backend response headers received (pool acquire, connect, request forward, backend processing)",
         &UPSTREAM_TTFB,
     );
+    render_histogram(
+        &mut out,
+        "controller_reconcile_duration_seconds",
+        "Gateway reconcile passes of the controller, whatever their outcome",
+        &RECONCILE_DURATION,
+    );
     let _ = write!(
         out,
         "# HELP portail_active_connections Client connections currently open\n\
@@ -750,6 +761,17 @@ mod tests {
             }
         }
         METRICS.active_connections.dec();
+    }
+
+    /// The bench reads the pass count from this family's count line.
+    #[test]
+    fn reconcile_passes_are_rendered() {
+        RECONCILE_DURATION.observe(std::time::Duration::from_millis(3));
+        let out = render(true);
+        assert!(out.contains("# TYPE portail_controller_reconcile_duration_seconds histogram"));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with("portail_controller_reconcile_duration_seconds_count ")));
     }
 
     #[test]
