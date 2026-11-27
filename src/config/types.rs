@@ -773,7 +773,9 @@ pub struct PerformanceConfig {
     /// a peer pin the task, both fds, and a backend connection forever.
     /// Also bounds an L4 relay or an upgraded tunnel once one direction has
     /// closed: a peer that never closes the other would pin it just the
-    /// same. Also bounds writes to an h2 client, which h2 leaves unbounded:
+    /// same. That one ends after one to two budgets without progress: it
+    /// is checked by the window, not by a clock read per step. Also bounds
+    /// writes to an h2 client, which h2 leaves unbounded:
     /// a connection whose client stopped reading is dropped once its writes
     /// stall this long. Does not apply to L4 relays and upgraded tunnels
     /// with both directions open, idle h2 connections, or the idle wait
