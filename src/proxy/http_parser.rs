@@ -23,6 +23,8 @@ impl std::fmt::Display for HeadError {
     }
 }
 
+impl std::error::Error for HeadError {}
+
 /// Find the end of HTTP headers (\r\n\r\n boundary).
 /// Returns the position just past the double CRLF.
 /// Uses memchr SIMD-accelerated search for \r, then checks the following 3 bytes.
