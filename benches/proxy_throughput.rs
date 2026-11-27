@@ -435,7 +435,8 @@ type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 type LoopResult = (Vec<u32>, u64);
 
 /// Closed-loop load over TLS for `bench_duration()`. Every connection is
-/// open before the clock starts: the window holds requests, no handshake.
+/// open before the clock starts: latency and req/s hold no handshake. The
+/// proxy's CPU window opens earlier and holds them all, one per connection.
 async fn run_tls_bench(
     port: u16,
     path: &'static str,
@@ -845,6 +846,7 @@ impl ProcessHandle {
             .split(' ')
             .skip(11)
             .map(|field| field.parse::<f64>().expect("a tick count"));
+        // SAFETY: sysconf reads a constant and touches no memory of ours.
         let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
         let mut seconds = || ticks.next().expect("utime and stime") / per_second;
         (seconds(), seconds())
@@ -874,7 +876,8 @@ fn cpus(var: &str) -> Option<libc::cpu_set_t> {
     for range in list.split(',') {
         let (first, last) = range.split_once('-').unwrap_or((range, range));
         for n in cpu(first)..=cpu(last) {
-            // SAFETY: CPU_SET checks `n` against the set's size.
+            // SAFETY: CPU_SET indexes the set's array, so a CPU past its
+            // size panics, here in the parent.
             unsafe { libc::CPU_SET(n, &mut set) };
         }
     }

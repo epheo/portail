@@ -324,16 +324,26 @@ fn requests(
     })
 }
 
-/// Allocations per request on a connection already open, counted on this
-/// thread, where `serve` put what answers at the address it returns. Two
-/// connections carry different numbers of requests, and their difference
+/// Requests the long connection of [`per_request`] carries beyond the short one.
+const EXTRA: usize = 200;
+
+/// Allocations a TLS connection pays once can land on either side of a
+/// window's edge: over 160 runs the difference moved by two at most. One
+/// real allocation per request adds `EXTRA`.
+const STRAY: usize = 4;
+
+/// Allocations `EXTRA` requests cost on a connection already open, counted
+/// on this thread, where `serve` put what answers at the address it returns.
+/// Two connections carry different numbers of requests, and their difference
 /// leaves out what each pays once: the handshake and the close.
-fn per_request<F>(client: Client, serve: impl FnOnce(Option<Arc<rustls::ServerConfig>>) -> F) -> f64
+fn per_request<F>(
+    client: Client,
+    serve: impl FnOnce(Option<Arc<rustls::ServerConfig>>) -> F,
+) -> usize
 where
     F: std::future::Future<Output = (SocketAddr, Arc<AtomicUsize>)>,
 {
     const FEW: usize = 100;
-    const MANY: usize = 300;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -344,21 +354,24 @@ where
         let mut counted = Vec::new();
         // The first connection only lets lazy statics, metric slots and the
         // runtime's own tables settle.
-        for n in [FEW, FEW, MANY] {
+        for n in [FEW, FEW, FEW + EXTRA] {
             let before = ALLOCATIONS.with(Cell::get);
             let client = requests(addr, client, cert.clone(), n);
             while !client.is_finished() || active.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             client.join().unwrap();
-            counted.push((ALLOCATIONS.with(Cell::get) - before) as f64);
+            counted.push(ALLOCATIONS.with(Cell::get) - before);
         }
-        (counted[2] - counted[1]) / (MANY - FEW) as f64
+        // Every ceiling below also holds at zero, which is what a proxy
+        // working on another thread would read.
+        assert!(counted[1] > 0, "the counting thread saw no connection");
+        counted[2].saturating_sub(counted[1])
     })
 }
 
 /// [`per_request`] through the proxy, in front of a backend.
-fn per_proxied_request(client: Client) -> f64 {
+fn per_proxied_request(client: Client) -> usize {
     let backend = spawn_backend();
     per_request(client, |tls| proxy(backend, tls))
 }
@@ -366,24 +379,32 @@ fn per_proxied_request(client: Client) -> f64 {
 #[test]
 fn a_keepalive_request_allocates_nothing() {
     let n = per_proxied_request(Client::Plain);
-    assert_eq!(n, 0.0, "{n} allocations per request");
+    // Exact: a plain connection leaves nothing at a window's edge.
+    assert_eq!(n, 0, "allocations over {EXTRA} requests");
 }
 
 /// Two, which TLS adds: the same request over plain TCP allocates nothing.
 #[test]
 fn a_keepalive_request_over_tls_allocates_twice() {
     let n = per_proxied_request(Client::Tls);
-    assert!(n <= 2.0, "{n} allocations per request");
+    assert!(
+        n <= 2 * EXTRA + STRAY,
+        "{n} allocations over {EXTRA} requests"
+    );
 }
 
-/// Twenty, against two for the same request over HTTP/1.1. The bridge
+/// Twenty in a debug build and nineteen in release, against two for the
+/// same request over HTTP/1.1. The bridge
 /// gives each stream what a connection gets: a task, an engine with its
 /// buffers and drain watch (the churn count above), and a pipe to it.
 /// A ceiling to lower with the bridge's cost, never to raise.
 #[test]
 fn an_h2_request_allocates_like_a_connection_of_its_own() {
     let n = per_proxied_request(Client::H2);
-    assert!(n <= 20.0, "{n} allocations per request");
+    assert!(
+        n <= 20 * EXTRA + STRAY,
+        "{n} allocations over {EXTRA} requests"
+    );
 }
 
 #[test]
