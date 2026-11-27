@@ -102,6 +102,12 @@ impl Leader {
             Some(Instant::now().checked_sub(ago).expect("a clock past `ago`"));
     }
 
+    /// Take the lead, as a standby whose campaign won.
+    #[cfg(test)]
+    pub(crate) fn lead(&self) {
+        self.set(Role::Leading);
+    }
+
     /// Lose the lead and take it again, as a failover back would.
     #[cfg(test)]
     pub(crate) fn take_over(&self) {

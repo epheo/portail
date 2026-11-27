@@ -6,7 +6,9 @@ use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::runtime::reflector::{ObjectRef, Store};
+use kube::runtime::reflector::ObjectRef;
+
+use crate::kubernetes::reads::Recorded;
 use kube::ResourceExt;
 
 use super::ControllerCtx;
@@ -150,7 +152,7 @@ pub(crate) fn check_class(ctx: &ControllerCtx, class: &GatewayClass) -> Result<(
 
 /// The class's GatewayParameters, if it names one.
 fn class_layer(
-    store: &Store<GatewayParameters>,
+    store: &Recorded<GatewayParameters>,
     class: &GatewayClass,
 ) -> Result<Option<GatewayParametersSpec>, String> {
     let Some(r) = &class.spec.parameters_ref else {
@@ -169,7 +171,7 @@ fn class_layer(
 
 /// The Gateway's own GatewayParameters, in its namespace, if it names one.
 fn gateway_layer(
-    store: &Store<GatewayParameters>,
+    store: &Recorded<GatewayParameters>,
     gateway: &Gateway,
 ) -> Result<Option<GatewayParametersSpec>, String> {
     let Some(r) = gateway
@@ -196,11 +198,11 @@ fn check_kind(who: &str, group: &str, kind: &str) -> Result<(), String> {
 
 /// The referent, its fields checked one by one.
 fn lookup(
-    store: &Store<GatewayParameters>,
+    store: &Recorded<GatewayParameters>,
     namespace: &str,
     name: &str,
 ) -> Result<GatewayParametersSpec, String> {
-    let Some(params) = store.get(&ObjectRef::new(name).within(namespace)) else {
+    let Some(params) = store.get(namespace, name) else {
         return Err(format!("{KIND} {namespace}/{name} not found"));
     };
     check_fields(&params.spec).map_err(|e| format!("{KIND} {namespace}/{name}: {e}"))?;

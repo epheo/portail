@@ -1,23 +1,26 @@
 use super::super::converters::backend_dns_name;
+use super::super::reads;
 use super::*;
 use gateway_api::gateways::*;
 use gateway_api::referencegrants::v1beta1::{
     ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
 };
+use k8s_openapi::api::core::v1::{Service, ServiceSpec};
 use kube::core::ObjectMeta;
+use std::collections::BTreeMap;
 
 /// A pass that remembers no verdict, as every test but the cache's wants.
 fn reconcile_to_config(
     gateway: &Gateway,
     snapshot: &ClusterSnapshot,
     cert_data: &CertData,
-    services: &ServiceState,
+    services: &TestServices,
 ) -> Result<ReconcileResult> {
     super::reconcile_to_config(
         gateway,
         snapshot,
         cert_data,
-        services,
+        &services.store(),
         &RouteVerdicts::default(),
         ExternalNameBackends::Refused,
         false,
@@ -70,23 +73,58 @@ fn test_snapshot(
         tcp_routes: tcp_routes.into_iter().map(Arc::new).collect(),
         tls_routes: tls_routes.into_iter().map(Arc::new).collect(),
         udp_routes: udp_routes.into_iter().map(Arc::new).collect(),
-        namespace_labels: ns_labels.clone(),
-        reference_grants,
-        services: vec![],
+        namespaces: reads::namespaces(ns_labels),
+        reference_grants: reads::grants(reference_grants),
         rate_limit_policies: vec![],
         gateways: HashMap::new(),
     }
 }
 
-fn empty_services() -> ServiceState {
-    ServiceState {
-        known_services: test_known_services(),
-        external_names: HashSet::new(),
-        endpoint_overrides: HashMap::new(),
-        app_protocol_overrides: HashMap::new(),
-        headless_target_ports: HashMap::new(),
-        cluster_ip_backends: HashSet::new(),
+/// The Services a test cluster holds, by (namespace, name).
+#[derive(Clone, Default)]
+struct TestServices(BTreeMap<(String, String), Service>);
+
+impl TestServices {
+    fn put(&mut self, name: &str, ns: &str, spec: ServiceSpec) {
+        let mut svc = Service::default();
+        svc.metadata.name = Some(name.into());
+        svc.metadata.namespace = Some(ns.into());
+        svc.spec = Some(spec);
+        self.0.insert((ns.into(), name.into()), svc);
     }
+
+    /// A Service that exists and says nothing more: no VIP, no ports.
+    fn insert_known(&mut self, name: &str, ns: &str) {
+        self.put(name, ns, ServiceSpec::default());
+    }
+
+    fn insert_external_name(&mut self, name: &str, ns: &str) {
+        let spec = ServiceSpec {
+            type_: Some("ExternalName".into()),
+            ..Default::default()
+        };
+        self.put(name, ns, spec);
+    }
+
+    fn insert_cluster_ip(&mut self, name: &str, ns: &str) {
+        let spec = ServiceSpec {
+            cluster_ip: Some("10.96.0.10".into()),
+            ..Default::default()
+        };
+        self.put(name, ns, spec);
+    }
+
+    fn store(&self) -> reads::Recorded<Service> {
+        reads::Recorded::of(reads::Kind::Service, self.0.values().cloned())
+    }
+}
+
+fn empty_services() -> TestServices {
+    let mut services = TestServices::default();
+    for (name, ns) in test_known_services() {
+        services.insert_known(&name, &ns);
+    }
+    services
 }
 
 /// Replace DNS-style backend names (e.g. "127.0.0.1.default.svc") with raw
@@ -1715,7 +1753,7 @@ fn test_mirror_to_unknown_service_dropped() {
 }
 
 /// `test_http_route`'s backend, `api-svc`, as an ExternalName Service.
-fn api_svc_external_name() -> (ClusterSnapshot, ServiceState) {
+fn api_svc_external_name() -> (ClusterSnapshot, TestServices) {
     let snapshot = test_snapshot(
         vec![test_http_route()],
         vec![],
@@ -1725,9 +1763,7 @@ fn api_svc_external_name() -> (ClusterSnapshot, ServiceState) {
         vec![],
     );
     let mut services = empty_services();
-    services
-        .external_names
-        .insert(("api-svc".to_string(), "default".to_string()));
+    services.insert_external_name("api-svc", "default");
     (snapshot, services)
 }
 
@@ -1763,7 +1799,7 @@ fn external_name_backend_is_followed_when_allowed() {
         &test_gateway(),
         &snapshot,
         &HashMap::new(),
-        &services,
+        &services.store(),
         &RouteVerdicts::default(),
         ExternalNameBackends::Allowed,
         false,
@@ -2119,7 +2155,7 @@ fn a_route_verdict_stands_until_its_generation_moves() {
             &test_gateway(),
             &snapshot,
             &HashMap::new(),
-            &empty_services(),
+            &empty_services().store(),
             &verdicts,
             ExternalNameBackends::Refused,
             false,
@@ -2994,12 +3030,10 @@ fn app_route(
 }
 
 /// The "127.0.0.1" Service exists in every namespace these tests use.
-fn loopback_services() -> ServiceState {
+fn loopback_services() -> TestServices {
     let mut services = empty_services();
     for ns in ["other-ns", "db"] {
-        services
-            .known_services
-            .insert(("127.0.0.1".to_string(), ns.to_string()));
+        services.insert_known("127.0.0.1", ns);
     }
     services
 }
@@ -3862,9 +3896,7 @@ fn same_age_routes_tie_break_on_the_namespace_slash_name_string() {
     };
     let mut services = loopback_services();
     for ns in ["a", "a-b"] {
-        services
-            .known_services
-            .insert(("127.0.0.1".to_string(), ns.to_string()));
+        services.insert_known("127.0.0.1", ns);
     }
     let winner = |routes: Vec<HttpRoute>| {
         let snapshot = snapshot_of(routes, vec![], vec![]);
@@ -3921,7 +3953,7 @@ fn a_gateway_dialing_out_on_a_network_reaches_gateway_backends() {
             &edge_gateway(false),
             &snapshot,
             &HashMap::new(),
-            &empty_services(),
+            &empty_services().store(),
             &RouteVerdicts::default(),
             ExternalNameBackends::Refused,
             dials_out,
@@ -4157,7 +4189,9 @@ fn only_tcp_borne_forward_refs_name_a_gateway() {
 /// BackendNotFound, never a resolved ref, and nothing watched.
 #[test]
 fn an_unreadable_gateway_backend_name_is_not_found() {
-    let (gateways, labels, known) = (HashMap::new(), HashMap::new(), HashSet::new());
+    let gateways = HashMap::new();
+    let (namespaces, grants) = (reads::namespaces(&HashMap::new()), reads::grants([]));
+    let services = TestServices::default().store();
     let cx = RouteCollectCtx {
         gateway_name: "multi-gw",
         gateway_ns: "default",
@@ -4165,10 +4199,10 @@ fn an_unreadable_gateway_backend_name_is_not_found() {
         gateways: &gateways,
         watched: Default::default(),
         listeners: &[],
-        namespace_labels: &labels,
-        reference_grants: &[],
-        known_services: &known,
-        refused_external_names: &known,
+        namespaces: &namespaces,
+        reference_grants: &grants,
+        services: &services,
+        refuse_external_names: true,
     };
     let (reason, message) = check_gateway(&cx, "HTTPRoute", "default", "nodots", 80).unwrap();
     assert_eq!(reason, "BackendNotFound");
@@ -4204,10 +4238,8 @@ fn only_routed_cluster_ip_names_are_marked() {
         &[("127.0.0.1", None, 8001, 1)],
     );
     let mut services = loopback_services();
-    services.cluster_ip_backends.extend([
-        "127.0.0.1.other-ns.svc".to_string(),
-        "unused.x.svc".to_string(),
-    ]);
+    services.insert_cluster_ip("127.0.0.1", "other-ns");
+    services.insert_cluster_ip("unused", "x");
     let result = reconcile_to_config(
         &gw,
         &snapshot_of(vec![route], vec![], vec![]),

@@ -13,6 +13,8 @@ use kube::core::PartialObjectMeta;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher;
+
+use crate::kubernetes::reads::{Kind as ReadKind, Recorded as RecordedStore};
 use kube::Client;
 use serde_json::{json, Value};
 
@@ -215,6 +217,10 @@ impl TestCluster {
     /// A controller context over these stores; it leads, its caches synced
     /// (no kind is tracked).
     pub fn ctx(&self, client: Client) -> Arc<ControllerCtx> {
+        self.ctx_led(client, super::leader::Leader::always())
+    }
+
+    pub fn ctx_led(&self, client: Client, leader: super::leader::Leader) -> Arc<ControllerCtx> {
         Arc::new(ControllerCtx {
             client,
             controller_name: CONTROLLER.to_string(),
@@ -226,12 +232,18 @@ impl TestCluster {
                 tcp_routes: self.tcp_routes.as_reader(),
                 tls_routes: self.tls_routes.as_reader(),
                 udp_routes: self.udp_routes.as_reader(),
-                namespaces: self.namespaces.as_reader(),
-                services: self.services.as_reader(),
+                namespaces: RecordedStore::new(self.namespaces.as_reader(), ReadKind::Namespace),
+                services: RecordedStore::new(self.services.as_reader(), ReadKind::Service),
                 secrets: self.secrets.as_reader(),
-                reference_grants: self.reference_grants.as_reader(),
+                reference_grants: RecordedStore::new(
+                    self.reference_grants.as_reader(),
+                    ReadKind::ReferenceGrant,
+                ),
                 rate_limit_policies: self.policies.as_reader(),
-                gateway_parameters: self.parameters.as_reader(),
+                gateway_parameters: RecordedStore::new(
+                    self.parameters.as_reader(),
+                    ReadKind::GatewayParameters,
+                ),
             },
             route_verdicts: Arc::default(),
             networks: Arc::default(),
@@ -242,7 +254,8 @@ impl TestCluster {
             hub: Arc::default(),
             reports: Arc::default(),
             backends: Arc::default(),
-            leader: super::leader::Leader::always(),
+            reads: Arc::default(),
+            leader,
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(
                 self.service_accounts.as_reader(),
@@ -290,6 +303,11 @@ impl Pipeline {
     /// controller, which [`gateway`] uses. Its Gateways are Unmanaged: the
     /// data plane in the loop is the hand-written one.
     pub fn new() -> Self {
+        Self::led_by(super::leader::Leader::always())
+    }
+
+    /// [`Pipeline::new`], its replica's leadership `leader`.
+    pub fn led_by(leader: super::leader::Leader) -> Self {
         let api = MockApi::default();
         let mut cluster = TestCluster::default();
         let mut unmanaged = GatewayParameters::new(
@@ -309,7 +327,7 @@ impl Pipeline {
             namespace: Some("default".into()),
         });
         apply(&mut cluster.gateway_classes, class);
-        let ctx = cluster.ctx(api.client());
+        let ctx = cluster.ctx_led(api.client(), leader);
         let perf = crate::config::PerformanceConfig::default();
         let data_plane =
             crate::proxy::data_plane::DataPlane::new(&[], &perf, std::path::Path::new("/unused"))
@@ -330,14 +348,20 @@ impl Pipeline {
         }
     }
 
-    /// One reconcile of `gw`, its data plane in the loop.
+    /// One reconcile of `gw`, its data plane in the loop, its reads
+    /// recorded as the controller's are.
     pub async fn pass(&mut self, gw: &Gateway) -> Result<Action, ReconcileError> {
-        let step = publish(gw, &self.ctx).await;
-        self.sync(gw).await;
-        match step {
-            Step::Done(action) => Ok(action),
-            Step::Continue(pass) => finish(gw, &self.ctx, *pass).await,
-        }
+        let reads = self.ctx.reads.clone();
+        reads
+            .during(key(gw), async {
+                let step = publish(gw, &self.ctx).await;
+                self.sync(gw).await;
+                match step {
+                    Step::Done(action) => Ok(action),
+                    Step::Continue(pass) => finish(gw, &self.ctx, *pass).await,
+                }
+            })
+            .await
     }
 
     /// `gw` deleted: the store's delete event, the controller forgetting

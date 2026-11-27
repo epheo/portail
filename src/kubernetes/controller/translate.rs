@@ -23,7 +23,7 @@ use crate::kubernetes::reconciler::{
     reconcile_to_config, ClusterSnapshot, GatewayRoute, PolicyAcceptance, RouteAcceptance,
 };
 use crate::kubernetes::services::{
-    referenced_backends, resolve_named_target_ports, resolve_services, retain_referenced,
+    referenced_backends, resolve_named_target_ports, retain_referenced,
 };
 use crate::kubernetes::status;
 use crate::logging::error;
@@ -59,16 +59,6 @@ pub(crate) struct Statuses {
 pub(crate) struct Rejected {
     pub statuses: Statuses,
     pub error: String,
-}
-
-/// Read all objects from a reflector store, cloning each. Only used for
-/// ReferenceGrants — small and few; routes and Services stay behind `Arc`.
-fn cloned<K>(store: &Store<K>) -> Vec<K>
-where
-    K: kube::Resource + Clone,
-    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
-{
-    store.state().iter().map(|arc| (**arc).clone()).collect()
 }
 
 /// Routes from a reflector store that target this Gateway, as `Arc`s straight
@@ -256,19 +246,8 @@ pub(crate) async fn translate(
         tcp_routes: gateway_routes(&ctx.cache.tcp_routes, &gw_name, &gw_ns),
         tls_routes: gateway_routes(&ctx.cache.tls_routes, &gw_name, &gw_ns),
         udp_routes: gateway_routes(&ctx.cache.udp_routes, &gw_name, &gw_ns),
-        namespace_labels: ctx
-            .cache
-            .namespaces
-            .state()
-            .iter()
-            .filter_map(|ns| {
-                let name = ns.metadata.name.clone()?;
-                let labels = ns.metadata.labels.clone().unwrap_or_default();
-                Some((name, labels))
-            })
-            .collect(),
-        reference_grants: cloned(&ctx.cache.reference_grants),
-        services: ctx.cache.services.state(),
+        namespaces: ctx.cache.namespaces.clone(),
+        reference_grants: ctx.cache.reference_grants.clone(),
         rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
         gateways: served_gateways(ctx),
     };
@@ -281,20 +260,21 @@ pub(crate) async fn translate(
         &ctx.cache.secrets,
         &ctx.certs,
     );
-    let (services, mut named_reqs) = resolve_services(&snapshot.services);
     let (listeners, accepted) = validate_gateway(gateway, &gw_ns, &resolved_certs);
 
     let mut result = match reconcile_to_config(
         gateway,
         &snapshot,
         &resolved_certs.valid,
-        &services,
+        &ctx.cache.services,
         &ctx.route_verdicts,
         external_name_backends,
         !egress.is_empty(),
     ) {
         Ok(r) => r,
         Err(e) => {
+            // What it would have read is unknown: anything wakes it.
+            crate::kubernetes::reads::record_everything();
             error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
             return Err(Box::new(Rejected {
                 statuses: Statuses {
@@ -316,6 +296,7 @@ pub(crate) async fn translate(
     retain_referenced(&mut result.config, &referenced);
     // A headless Service with a *named* targetPort needs endpoint data the Service
     // spec lacks; resolve those with a one-shot EndpointSlice list (no watch).
+    let mut named_reqs = std::mem::take(&mut result.named_target_ports);
     named_reqs.retain(|req| referenced.contains(&req.backend()));
     if !named_reqs.is_empty() {
         resolve_named_target_ports(
@@ -332,7 +313,8 @@ pub(crate) async fn translate(
     // Gateway no longer had.
     ctx.networks.retain_named(
         &ctx.cache.gateways.state(),
-        &ctx.cache.gateway_parameters.state(),
+        // Pruning by what is still named: no output of this pass.
+        &ctx.cache.gateway_parameters.all_unrecorded(),
     );
     let networks =
         match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, egress, &ctx.networks).await {

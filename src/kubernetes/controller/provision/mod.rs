@@ -332,7 +332,7 @@ impl Owned {
             Kind::Service => ctx
                 .cache
                 .services
-                .get(&ObjectRef::new(name).within(namespace))
+                .get(namespace, name)
                 .map(|s| s.metadata.clone()),
         }
     }
@@ -348,7 +348,9 @@ impl Owned {
         let (service_accounts, deployments, services, pdbs) = (
             self.service_accounts.state(),
             self.deployments.state(),
-            ctx.cache.services.state(),
+            // Ours only, and the Service watch wakes each one's owner: no
+            // other Service in the namespace is read.
+            ctx.cache.services.all_unrecorded(),
             self.pdbs.state(),
         );
         service_accounts
@@ -537,7 +539,7 @@ pub(crate) fn provisioned_service_account(
 }
 
 /// The Gateway an owned object's controller ownerReference names.
-fn controller_gateway(meta: &ObjectMeta) -> Option<ObjectRef<Gateway>> {
+pub(crate) fn controller_gateway(meta: &ObjectMeta) -> Option<ObjectRef<Gateway>> {
     let owner = controller_owner(meta)?;
     Some(ObjectRef::new(&owner.name).within(meta.namespace.as_deref()?))
 }
@@ -830,7 +832,7 @@ pub(crate) fn owned_service(ctx: &ControllerCtx, gateway: &Gateway) -> Option<Ar
     let namespace = gateway.namespace().unwrap_or_else(|| "default".into());
     ctx.cache
         .services
-        .get(&ObjectRef::new(&resource_name(&gateway.name_any())).within(&namespace))
+        .get(&namespace, &resource_name(&gateway.name_any()))
         .filter(|s| is_ours(&s.metadata, uid, &ctx.owned.controller.install))
 }
 

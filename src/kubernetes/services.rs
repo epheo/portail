@@ -2,9 +2,9 @@
 //! about Services beyond their name: ExternalName endpoint overrides,
 //! appProtocol overrides, and headless service-port → targetPort mappings.
 //!
-//! Computed once per reconcile pass from the Service reflector store and
-//! threaded into `reconcile_to_config`; the controller then keeps what this
-//! Gateway's routes reference ([`retain_referenced`]).
+//! Computed once per reconcile pass for the Services the Gateway's routes
+//! name, each read through the recording store; the controller then keeps
+//! what this Gateway's routes reference ([`retain_referenced`]).
 
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -16,15 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::converters::backend_dns_name;
+use super::converters::{backend_dns_name, parse_backend_dns_name};
+use super::reads::Recorded;
 use crate::config::{HttpRouteFilter, PortailConfig};
 use crate::logging::{debug, info, warn};
 
 /// Resolved service metadata needed for route table construction.
+#[derive(Default)]
 pub(crate) struct ServiceState {
-    pub known_services: HashSet<(String, String)>,
-    /// (name, namespace) of the ExternalName Services.
-    pub external_names: HashSet<(String, String)>,
     pub endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>>,
     pub app_protocol_overrides: HashMap<(String, u16), String>,
     /// (backend_fqdn, service_port) → targetPort for headless services. Used so the
@@ -116,8 +115,10 @@ impl NamedPortCache {
     }
 }
 
-/// Resolve service metadata: known services set, ExternalName overrides,
-/// appProtocol overrides, and the headless service-port → targetPort map.
+/// What the Services `backends` name tell the data plane: ExternalName
+/// targets, appProtocols, headless targetPorts by service port, and
+/// ClusterIPs. Each Service is looked up through `services`, so a pass
+/// reads the Services it routes to, and no other.
 ///
 /// Headless pod IPs are not special-cased: their per-pod A-records are resolved
 /// at the data plane via STRICT_DNS ([`crate::routing::Backend::all_with_weight`])
@@ -126,17 +127,45 @@ impl NamedPortCache {
 /// targetPort's numeric value; those are returned as [`NamedTargetPortReq`]s for
 /// the caller to resolve with a one-shot EndpointSlice list (see
 /// [`resolve_named_target_ports`]) — a targeted read, still no watch.
-pub(crate) fn resolve_services(
-    all_services: &[std::sync::Arc<Service>],
+pub(crate) fn resolve_backends<'a>(
+    services: &Recorded<Service>,
+    backends: impl IntoIterator<Item = &'a str>,
 ) -> (ServiceState, Vec<NamedTargetPortReq>) {
-    let known_services: HashSet<(String, String)> = all_services
-        .iter()
-        .filter_map(|svc| {
-            let name = svc.metadata.name.as_ref()?;
-            let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-            Some((name.clone(), ns.to_string()))
-        })
-        .collect();
+    let mut state = ServiceState::default();
+    let mut named_target_ports: Vec<NamedTargetPortReq> = Vec::new();
+    let mut seen = HashSet::new();
+    for backend in backends {
+        let Some((svc_name, svc_ns)) = parse_backend_dns_name(backend) else {
+            continue;
+        };
+        if !seen.insert((svc_name.clone(), svc_ns.clone())) {
+            continue;
+        }
+        if let Some(svc) = services.get(&svc_ns, &svc_name) {
+            resolve_service(&svc, &mut state, &mut named_target_ports);
+        }
+    }
+    (state, named_target_ports)
+}
+
+/// What one Service contributes to `state`.
+fn resolve_service(
+    svc: &Service,
+    state: &mut ServiceState,
+    named_target_ports: &mut Vec<NamedTargetPortReq>,
+) {
+    let (Some(spec), Some(svc_name)) = (svc.spec.as_ref(), svc.metadata.name.as_deref()) else {
+        return;
+    };
+    let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+    let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
+    let vip = spec
+        .cluster_ip
+        .as_deref()
+        .is_some_and(|ip| !ip.is_empty() && ip != "None");
+    if vip && spec.type_.as_deref() != Some("ExternalName") {
+        state.cluster_ip_backends.insert(svc_fqdn.clone());
+    }
 
     // Headless services have no VIP: the data plane connects directly to the pod
     // IPs DNS returns, so it must use the targetPort, not the service port. DNS
@@ -145,36 +174,10 @@ pub(crate) fn resolve_services(
     // targetPort is the one value the spec lacks; it is recorded for a one-shot
     // EndpointSlice list by the caller (no watch) and seeded with a service-port
     // fallback here so an absent/failed lookup degrades to prior behavior.
-    let mut headless_target_ports: HashMap<(String, u16), u16> = HashMap::new();
-    let mut named_target_ports: Vec<NamedTargetPortReq> = Vec::new();
-    let mut cluster_ip_backends: HashSet<String> = HashSet::new();
-    for svc in all_services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        let vip = spec
-            .cluster_ip
-            .as_deref()
-            .is_some_and(|ip| !ip.is_empty() && ip != "None");
-        if vip && spec.type_.as_deref() != Some("ExternalName") {
-            if let Some(name) = svc.metadata.name.as_deref() {
-                let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-                cluster_ip_backends.insert(backend_dns_name(name, None, ns));
-            }
-        }
-        // Headless services are marked clusterIP: None (stored as the literal "None").
-        // ClusterIP/LoadBalancer resolve to a VIP and keep the service port (kube-proxy
-        // maps it); ExternalName has no clusterIP and is handled via endpoint_overrides.
-        if spec.cluster_ip.as_deref() != Some("None") {
-            continue;
-        }
-        let svc_name = match svc.metadata.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
-        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
+    // Headless services are marked clusterIP: None (stored as the literal "None").
+    // ClusterIP/LoadBalancer resolve to a VIP and keep the service port (kube-proxy
+    // maps it); ExternalName has no clusterIP and is handled via endpoint_overrides.
+    if spec.cluster_ip.as_deref() == Some("None") {
         for sp in spec.ports.iter().flatten() {
             let service_port = sp.port as u16;
             let target_port = match sp.target_port.as_ref() {
@@ -196,94 +199,53 @@ pub(crate) fn resolve_services(
                 // An omitted targetPort defaults to the service port.
                 None => service_port,
             };
-            headless_target_ports.insert((svc_fqdn.clone(), service_port), target_port);
+            state
+                .headless_target_ports
+                .insert((svc_fqdn.clone(), service_port), target_port);
         }
     }
 
-    // ExternalName services contribute override entries below (built purely from the
-    // Service spec — no EndpointSlices). Headless pod IPs come from DNS; only their
-    // targetPort mapping (above) is taken from the Service spec.
-    let mut endpoint_overrides: HashMap<(String, u16), Vec<(String, u16)>> = HashMap::new();
-    let mut external_names: HashSet<(String, String)> = HashSet::new();
-
-    // ExternalName services: resolve externalName DNS targets
-    for svc in all_services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        if spec.type_.as_deref().unwrap_or("") != "ExternalName" {
-            continue;
-        }
-        let external_name = match spec.external_name.as_deref() {
-            Some(n) if !n.is_empty() => n,
-            _ => continue,
-        };
-        let svc_name = match svc.metadata.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
-        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
-        external_names.insert((svc_name.to_string(), svc_ns.to_string()));
-
-        if let Some(ports) = spec.ports.as_ref() {
-            for sp in ports {
-                let service_port = sp.port as u16;
-                let key = (svc_fqdn.clone(), service_port);
-                endpoint_overrides
-                    .entry(key)
-                    .or_default()
-                    .push((external_name.to_string(), service_port));
-            }
-            info!(
-                "ExternalName service {}.{} -> {} (ports: {})",
-                svc_name,
-                svc_ns,
-                external_name,
-                ports
-                    .iter()
-                    .map(|p| p.port.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-
-    // Build appProtocol overrides from Service port specs
-    let mut app_protocol_overrides: HashMap<(String, u16), String> = HashMap::new();
-    for svc in all_services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        let svc_name = match svc.metadata.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
-        let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let svc_fqdn = backend_dns_name(svc_name, None, svc_ns);
-        if let Some(ports) = spec.ports.as_ref() {
-            for sp in ports {
-                if let Some(ref app_proto) = sp.app_protocol {
-                    let key = (svc_fqdn.clone(), sp.port as u16);
-                    app_protocol_overrides.insert(key, app_proto.clone());
+    // ExternalName services: resolve externalName DNS targets, built purely
+    // from the Service spec (no EndpointSlices).
+    if spec.type_.as_deref() == Some("ExternalName") {
+        if let Some(external_name) = spec.external_name.as_deref().filter(|n| !n.is_empty()) {
+            if let Some(ports) = spec.ports.as_ref() {
+                for sp in ports {
+                    let service_port = sp.port as u16;
+                    state
+                        .endpoint_overrides
+                        .entry((svc_fqdn.clone(), service_port))
+                        .or_default()
+                        .push((external_name.to_string(), service_port));
                 }
+                info!(
+                    "ExternalName service {}.{} -> {} (ports: {})",
+                    svc_name,
+                    svc_ns,
+                    external_name,
+                    ports
+                        .iter()
+                        .map(|p| p.port.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
     }
 
-    (
-        ServiceState {
-            known_services,
-            external_names,
-            endpoint_overrides,
-            app_protocol_overrides,
-            headless_target_ports,
-            cluster_ip_backends,
-        },
-        named_target_ports,
-    )
+    // appProtocol overrides from the Service's port specs.
+    for sp in spec.ports.iter().flatten() {
+        if let Some(ref app_proto) = sp.app_protocol {
+            state
+                .app_protocol_overrides
+                .insert((svc_fqdn.clone(), sp.port as u16), app_proto.clone());
+        }
+    }
+}
+
+/// Whether `svc` is of type ExternalName.
+pub(crate) fn is_external_name(svc: &Service) -> bool {
+    svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("ExternalName")
 }
 
 impl NamedTargetPortReq {
@@ -360,7 +322,7 @@ fn slice_ports(slices: &[EndpointSlice]) -> HashMap<String, u16> {
 /// reintroduce the cluster-wide EndpointSlice firehose this branch removed). On
 /// success, overwrites the `(fqdn, service_port)` entry in `out` with the numeric
 /// targetPort; on a miss or API error it leaves the service-port fallback seeded
-/// by [`resolve_services`] in place and warns. Never fatal.
+/// by [`resolve_backends`] in place and warns. Never fatal.
 ///
 /// A read is cached until the Service changes, DNS refresh sees pods change
 /// ([`NamedPortCache::dns_changed`]) or the cache's ttl passes; passes in
@@ -417,6 +379,11 @@ pub(crate) async fn resolve_named_target_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store of `services`.
+    fn services(services: impl IntoIterator<Item = Service>) -> Recorded<Service> {
+        Recorded::of(crate::kubernetes::reads::Kind::Service, services)
+    }
 
     #[test]
     fn slice_ports_match_by_name() {
@@ -508,7 +475,7 @@ mod tests {
             80,
             IntOrString::String("http".to_string()),
         );
-        let (_, reqs) = resolve_services(&[std::sync::Arc::new(svc)]);
+        let (_, reqs) = resolve_backends(&services([svc]), ["db.prod.svc"]);
         let slice = EndpointSlice {
             ports: Some(vec![EndpointPort {
                 name: Some("web".to_string()),
@@ -559,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_services_lists_external_names() {
+    fn an_external_name_backend_is_overridden_by_its_target() {
         use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
         let external = Service {
             metadata: kube::core::ObjectMeta {
@@ -579,16 +546,21 @@ mod tests {
             ..Default::default()
         };
         let plain = headless("db", "tenant", None, 5432, IntOrString::Int(5432));
-        let (state, _) =
-            resolve_services(&[std::sync::Arc::new(external), std::sync::Arc::new(plain)]);
+        let (state, _) = resolve_backends(
+            &services([external, plain]),
+            ["ext.tenant.svc", "db.tenant.svc"],
+        );
         assert_eq!(
-            state.external_names,
-            HashSet::from([("ext".to_string(), "tenant".to_string())])
+            state.endpoint_overrides,
+            HashMap::from([(
+                ("ext.tenant.svc".to_string(), 443),
+                vec![("kubernetes.default.svc.cluster.local".to_string(), 443)]
+            )])
         );
     }
 
     #[test]
-    fn resolve_services_defers_named_targetport() {
+    fn a_named_target_port_is_deferred() {
         // Named targetPort: emit a resolve request AND seed the service-port
         // fallback, so an absent/failed EndpointSlice list degrades to prior behavior.
         let named = headless(
@@ -598,7 +570,7 @@ mod tests {
             5432,
             IntOrString::String("pg".to_string()),
         );
-        let (state, reqs) = resolve_services(&[std::sync::Arc::new(named)]);
+        let (state, reqs) = resolve_backends(&services([named]), ["db.prod.svc"]);
         assert_eq!(reqs.len(), 1);
         assert_eq!(
             (
@@ -620,7 +592,7 @@ mod tests {
 
         // Numeric targetPort: resolved directly from the spec, no request emitted.
         let numeric = headless("cache", "prod", None, 6379, IntOrString::Int(6380));
-        let (state, reqs) = resolve_services(&[std::sync::Arc::new(numeric)]);
+        let (state, reqs) = resolve_backends(&services([numeric]), ["cache.prod.svc"]);
         assert!(reqs.is_empty());
         assert_eq!(
             state
