@@ -769,7 +769,9 @@ pub(crate) async fn handle_connection(
     let (tcp_route, http_routes) = {
         let rt = state.routes.load();
         let port = state.server_port;
-        (rt.has_tcp_route(port), rt.has_http_routes(port))
+        // Never for a terminated connection: see `analyze_request`.
+        let tcp_route = !state.is_tls && rt.has_tcp_route(port);
+        (tcp_route, rt.has_http_routes(port))
     };
     // Server-speaks-first protocols (MySQL, SMTP, FTP, IMAP, POP3) send
     // nothing before the backend's banner. With no HTTP route to tell
@@ -4808,6 +4810,30 @@ mod connection_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let out = exchange(&mut client, &[b"\n", UNROUTED].concat()).await;
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    /// A terminated connection is an HTTPS listener's: its bytes never
+    /// reach a TCP route in plaintext, whatever else took the port.
+    #[tokio::test]
+    async fn terminated_bytes_never_reach_a_tcp_route() {
+        // Beside HTTP routes: opaque bytes close, relayed nowhere.
+        let (http, tcp) = (idle_backend().await, idle_backend().await);
+        let rt = routes_with_tcp(http.local_addr().unwrap(), tcp.local_addr().unwrap());
+        let (mut client, task) = serve_state(conn_state(rt, true));
+        client.write_all(OPAQUE).await.unwrap();
+        assert_eq!(read_until_closed(&mut client).await, "");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&tcp).await;
+
+        // A TCP route alone relays before the client speaks: not here,
+        // where the connection is served as HTTP and finds no route.
+        let tcp = idle_backend().await;
+        let rt = tcp_route(tcp.local_addr().unwrap());
+        let (mut client, task) = serve_state(conn_state(rt, true));
+        let out = exchange(&mut client, UNROUTED).await;
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+        task.await.unwrap().unwrap();
+        assert_never_connected(&tcp).await;
     }
 
     /// Not followed by HTTP, the bytes reach the TCP route as sent.
