@@ -16,13 +16,13 @@ use kube::runtime::watcher;
 use kube::Client;
 use serde_json::{json, Value};
 
-use gateway_api::experimental::tcproutes::TCPRoute;
-use gateway_api::experimental::tlsroutes::TLSRoute;
-use gateway_api::experimental::udproutes::UDPRoute;
+use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
+use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
 use gateway_api::gatewayclasses::{GatewayClass, GatewayClassParametersRef, GatewayClassSpec};
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewaySpec};
-use gateway_api::httproutes::{HTTPRoute, HTTPRouteParentRefs, HTTPRouteSpec};
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::httproutes::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
+use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use super::reconcile::{finish, forget_deleted_gateways, publish, Step};
 use super::reports::InstanceId;
@@ -187,10 +187,10 @@ fn object_at(path: &str) -> Value {
 pub(super) struct TestCluster {
     pub gateway_classes: Writer<GatewayClass>,
     pub gateways: Writer<Gateway>,
-    pub http_routes: Writer<HTTPRoute>,
-    pub tcp_routes: Writer<TCPRoute>,
-    pub tls_routes: Writer<TLSRoute>,
-    pub udp_routes: Writer<UDPRoute>,
+    pub http_routes: Writer<HttpRoute>,
+    pub tcp_routes: Writer<TcpRoute>,
+    pub tls_routes: Writer<TlsRoute>,
+    pub udp_routes: Writer<UdpRoute>,
     pub namespaces: Writer<Namespace>,
     pub services: Writer<Service>,
     pub secrets: Writer<Secret>,
@@ -406,8 +406,8 @@ pub(super) fn gateway(name: &str, generation: i64) -> Gateway {
 }
 
 /// An HTTPRoute with no rules attached to the Gateways named in `parents`.
-pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HTTPRoute {
-    HTTPRoute {
+pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HttpRoute {
+    HttpRoute {
         metadata: kube::core::ObjectMeta {
             name: Some(name.into()),
             namespace: Some("default".into()),
@@ -415,11 +415,11 @@ pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HTTPR
             resource_version: Some("1".into()),
             ..Default::default()
         },
-        spec: HTTPRouteSpec {
+        spec: HttpRouteSpec {
             parent_refs: Some(
                 parents
                     .iter()
-                    .map(|p| HTTPRouteParentRefs {
+                    .map(|p| HttpRouteParentRefs {
                         name: p.to_string(),
                         ..Default::default()
                     })
@@ -433,7 +433,7 @@ pub(super) fn http_route(name: &str, parents: &[&str], generation: i64) -> HTTPR
 
 /// `route` with one rule sending everything to Service `backend` in
 /// `default` on `port`.
-pub(super) fn with_backend(mut route: HTTPRoute, backend: &str, port: i32) -> HTTPRoute {
+pub(super) fn with_backend(mut route: HttpRoute, backend: &str, port: i32) -> HttpRoute {
     route.spec.rules = Some(vec![serde_json::from_value(json!({
         "backendRefs": [{"name": backend, "port": port}],
     }))
@@ -511,7 +511,7 @@ pub(super) fn with_gateway_status(mut gw: Gateway, patch: &Value) -> Gateway {
 
 /// `route` as the store holds it once the apiserver applied `patch` (a
 /// merge patch of ours), with a new resourceVersion.
-pub(super) fn with_route_status(mut route: HTTPRoute, patch: &Value) -> HTTPRoute {
+pub(super) fn with_route_status(mut route: HttpRoute, patch: &Value) -> HttpRoute {
     route.status = Some(serde_json::from_value(patch["status"].clone()).unwrap());
     let rv: u64 = route
         .metadata

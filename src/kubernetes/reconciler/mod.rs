@@ -2,12 +2,12 @@ use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use gateway_api::experimental::tcproutes::*;
-use gateway_api::experimental::tlsroutes::*;
-use gateway_api::experimental::udproutes::*;
+use gateway_api::experimental::tcproutes::v1alpha2::*;
+use gateway_api::experimental::tlsroutes::v1alpha3::*;
+use gateway_api::experimental::udproutes::v1alpha2::*;
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::httproutes::*;
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -35,10 +35,10 @@ use super::services::ServiceState;
 /// additionally be pre-filtered to this Gateway by the snapshot builder;
 /// `collect_routes` re-checks `route_targets_gateway` either way.
 pub(crate) struct ClusterSnapshot {
-    pub http_routes: Vec<Arc<HTTPRoute>>,
-    pub tcp_routes: Vec<Arc<TCPRoute>>,
-    pub tls_routes: Vec<Arc<TLSRoute>>,
-    pub udp_routes: Vec<Arc<UDPRoute>>,
+    pub http_routes: Vec<Arc<HttpRoute>>,
+    pub tcp_routes: Vec<Arc<TcpRoute>>,
+    pub tls_routes: Vec<Arc<TlsRoute>>,
+    pub udp_routes: Vec<Arc<UdpRoute>>,
     pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
     pub reference_grants: Vec<ReferenceGrant>,
     pub services: Vec<Arc<Service>>,
@@ -168,7 +168,7 @@ macro_rules! impl_gateway_route {
     };
 }
 
-impl_gateway_route!(HTTPRoute, HTTPRouteParentRefs, HttpRouteConfig, "HTTPRoute",
+impl_gateway_route!(HttpRoute, HttpRouteParentRefs, HttpRouteConfig, "HTTPRoute",
 parent_refs: self.spec.parent_refs,
 convert:     convert_http_route,
 extras: {
@@ -207,14 +207,14 @@ extras: {
     }
 });
 
-impl_gateway_route!(TCPRoute, TCPRouteParentRefs, TcpRouteConfig, "TCPRoute",
+impl_gateway_route!(TcpRoute, TcpRouteParentRefs, TcpRouteConfig, "TCPRoute",
 parent_refs: self.spec.parent_refs,
 convert:     convert_tcp_route,
 extras: {
     const ONE_ROUTE_PER_LISTENER: bool = true;
 });
 
-impl_gateway_route!(TLSRoute, TLSRouteParentRefs, TlsRouteConfig, "TLSRoute",
+impl_gateway_route!(TlsRoute, TlsRouteParentRefs, TlsRouteConfig, "TLSRoute",
 parent_refs: self.spec.parent_refs,
 convert:     convert_tls_route,
 extras: {
@@ -223,7 +223,7 @@ extras: {
     }
 });
 
-impl_gateway_route!(UDPRoute, UDPRouteParentRefs, UdpRouteConfig, "UDPRoute",
+impl_gateway_route!(UdpRoute, UdpRouteParentRefs, UdpRouteConfig, "UDPRoute",
 parent_refs: self.spec.parent_refs,
 convert:     convert_udp_route,
 extras: {
@@ -387,13 +387,13 @@ pub(crate) fn reconcile_to_config(
         now: HashMap::new(),
     };
     let http_route_configs =
-        collect_routes::<HTTPRoute>(&snapshot.http_routes, &cx, &mut checks, &mut route_status);
+        collect_routes::<HttpRoute>(&snapshot.http_routes, &cx, &mut checks, &mut route_status);
     let tcp_route_configs =
-        collect_routes::<TCPRoute>(&snapshot.tcp_routes, &cx, &mut checks, &mut route_status);
+        collect_routes::<TcpRoute>(&snapshot.tcp_routes, &cx, &mut checks, &mut route_status);
     let tls_route_configs =
-        collect_routes::<TLSRoute>(&snapshot.tls_routes, &cx, &mut checks, &mut route_status);
+        collect_routes::<TlsRoute>(&snapshot.tls_routes, &cx, &mut checks, &mut route_status);
     let udp_route_configs =
-        collect_routes::<UDPRoute>(&snapshot.udp_routes, &cx, &mut checks, &mut route_status);
+        collect_routes::<UdpRoute>(&snapshot.udp_routes, &cx, &mut checks, &mut route_status);
     verdicts.put(gateway_key, checks.now);
 
     let mut config = PortailConfig {
@@ -540,7 +540,7 @@ mod policy_tests {
         );
         p.metadata.namespace = Some("edge".into());
         p.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-            k8s_openapi::chrono::DateTime::from_timestamp(age_secs, 0).unwrap(),
+            k8s_openapi::jiff::Timestamp::from_second(age_secs).unwrap(),
         ));
         Arc::new(p)
     }

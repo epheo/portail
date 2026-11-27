@@ -9,6 +9,9 @@
 //! from them by `portail --print-crd` and a test asserts they never drift.
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
+};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -349,7 +352,49 @@ fn crd_yaml_of<K: kube::CustomResourceExt>() -> anyhow::Result<String> {
     // GitOps tool would find the CRD out of sync forever.
     let names = &mut crd.spec.names;
     names.categories = names.categories.take().filter(|c| !c.is_empty());
+    for version in &mut crd.spec.versions {
+        if let Some(schema) = version
+            .schema
+            .as_mut()
+            .and_then(|s| s.open_api_v3_schema.as_mut())
+        {
+            restore_int_or_string(schema);
+        }
+    }
     Ok(serde_yaml::to_string(&crd)?)
+}
+
+/// kube-core 5 strips `type` from every primitive `anyOf` branch, so an
+/// int-or-string's `[{type: integer}, {type: string}]` comes out `[{}, {}]`,
+/// which lets the apiserver take any value there.
+fn restore_int_or_string(schema: &mut JSONSchemaProps) {
+    if schema.x_kubernetes_int_or_string == Some(true) {
+        if let Some(branches) = schema.any_of.as_mut() {
+            if branches.len() == 2 && branches.iter().all(|b| *b == JSONSchemaProps::default()) {
+                branches[0].type_ = Some("integer".into());
+                branches[1].type_ = Some("string".into());
+            }
+        }
+    }
+    let nested = schema
+        .properties
+        .iter_mut()
+        .flat_map(|p| p.values_mut())
+        .chain(schema.any_of.iter_mut().flatten())
+        .chain(schema.all_of.iter_mut().flatten())
+        .chain(schema.one_of.iter_mut().flatten())
+        .chain(match schema.additional_properties.as_mut() {
+            Some(JSONSchemaPropsOrBool::Schema(s)) => Some(&mut **s),
+            _ => None,
+        })
+        .chain(match schema.items.as_mut() {
+            Some(JSONSchemaPropsOrArray::Schema(s)) => vec![&mut **s],
+            Some(JSONSchemaPropsOrArray::Schemas(s)) => s.iter_mut().collect(),
+            None => vec![],
+        });
+    for s in nested {
+        restore_int_or_string(s);
+    }
 }
 
 /// All portail CRD manifests as one YAML document stream, for

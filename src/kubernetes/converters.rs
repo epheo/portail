@@ -5,9 +5,9 @@
 
 use anyhow::{anyhow, Result};
 
-use gateway_api::experimental::tcproutes::*;
-use gateway_api::experimental::tlsroutes::*;
-use gateway_api::experimental::udproutes::*;
+use gateway_api::experimental::tcproutes::v1alpha2::*;
+use gateway_api::experimental::tlsroutes::v1alpha3::*;
+use gateway_api::experimental::udproutes::v1alpha2::*;
 use gateway_api::gateways::{
     Gateway, GatewayListeners, GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
 };
@@ -167,7 +167,7 @@ fn convert_listener(
 /// does not support, or one missing its config. That part is left out and
 /// the rest converted, so the config keeps every backendRef for the
 /// ResolvedRefs check. The route itself is not served.
-pub(crate) fn convert_http_route(route: &HTTPRoute) -> (HttpRouteConfig, Result<(), RouteError>) {
+pub(crate) fn convert_http_route(route: &HttpRoute) -> (HttpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let mut first = None;
     let rules = route
@@ -193,7 +193,7 @@ pub(crate) fn convert_http_route(route: &HTTPRoute) -> (HttpRouteConfig, Result<
     (config, first.map_or(Ok(()), Err))
 }
 
-fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> (HttpRouteRule, Option<RouteError>) {
+fn convert_http_rule(rule: &HttpRouteRules, ns: &str) -> (HttpRouteRule, Option<RouteError>) {
     let matches = rule
         .matches
         .as_ref()
@@ -249,26 +249,26 @@ fn convert_http_rule(rule: &HTTPRouteRules, ns: &str) -> (HttpRouteRule, Option<
     (rule, first)
 }
 
-fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
+fn convert_http_match(m: &HttpRouteRulesMatches) -> HttpRouteMatch {
     let method = m.method.as_ref().map(|m| {
         match m {
-            HTTPRouteRulesMatchesMethod::Get => "GET",
-            HTTPRouteRulesMatchesMethod::Head => "HEAD",
-            HTTPRouteRulesMatchesMethod::Post => "POST",
-            HTTPRouteRulesMatchesMethod::Put => "PUT",
-            HTTPRouteRulesMatchesMethod::Delete => "DELETE",
-            HTTPRouteRulesMatchesMethod::Connect => "CONNECT",
-            HTTPRouteRulesMatchesMethod::Options => "OPTIONS",
-            HTTPRouteRulesMatchesMethod::Trace => "TRACE",
-            HTTPRouteRulesMatchesMethod::Patch => "PATCH",
+            HttpRouteRulesMatchesMethod::Get => "GET",
+            HttpRouteRulesMatchesMethod::Head => "HEAD",
+            HttpRouteRulesMatchesMethod::Post => "POST",
+            HttpRouteRulesMatchesMethod::Put => "PUT",
+            HttpRouteRulesMatchesMethod::Delete => "DELETE",
+            HttpRouteRulesMatchesMethod::Connect => "CONNECT",
+            HttpRouteRulesMatchesMethod::Options => "OPTIONS",
+            HttpRouteRulesMatchesMethod::Trace => "TRACE",
+            HttpRouteRulesMatchesMethod::Patch => "PATCH",
         }
         .to_string()
     });
 
     let path = m.path.as_ref().map(|p| {
         let match_type = match p.r#type {
-            Some(HTTPRouteRulesMatchesPathType::Exact) => HttpPathMatchType::Exact,
-            Some(HTTPRouteRulesMatchesPathType::RegularExpression) => {
+            Some(HttpRouteRulesMatchesPathType::Exact) => HttpPathMatchType::Exact,
+            Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
                 HttpPathMatchType::RegularExpression
             }
             _ => HttpPathMatchType::PathPrefix,
@@ -299,9 +299,9 @@ fn convert_http_match(m: &HTTPRouteRulesMatches) -> HttpRouteMatch {
     }
 }
 
-fn convert_header_match(h: &HTTPRouteRulesMatchesHeaders) -> HttpHeaderMatch {
+fn convert_header_match(h: &HttpRouteRulesMatchesHeaders) -> HttpHeaderMatch {
     let match_type = match h.r#type {
-        Some(HTTPRouteRulesMatchesHeadersType::RegularExpression) => {
+        Some(HttpRouteRulesMatchesHeadersType::RegularExpression) => {
             StringMatchType::RegularExpression
         }
         _ => StringMatchType::Exact,
@@ -313,9 +313,9 @@ fn convert_header_match(h: &HTTPRouteRulesMatchesHeaders) -> HttpHeaderMatch {
     }
 }
 
-fn convert_query_param_match(q: &HTTPRouteRulesMatchesQueryParams) -> HttpQueryParamMatch {
+fn convert_query_param_match(q: &HttpRouteRulesMatchesQueryParams) -> HttpQueryParamMatch {
     let match_type = match q.r#type {
-        Some(HTTPRouteRulesMatchesQueryParamsType::RegularExpression) => {
+        Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression) => {
             StringMatchType::RegularExpression
         }
         _ => StringMatchType::Exact,
@@ -366,10 +366,10 @@ macro_rules! convert_header_mod {
 
 /// Gateway API: a filter type the implementation does not support sets
 /// Accepted=False with reason UnsupportedValue.
-fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteFilter, RouteError> {
+fn convert_http_filter(f: &HttpRouteRulesFilters, ns: &str) -> Result<HttpRouteFilter, RouteError> {
     let missing = |what: &str| RouteError::unsupported(format!("{} filter missing config", what));
     Ok(match f.r#type {
-        HTTPRouteRulesFiltersType::RequestHeaderModifier => {
+        HttpRouteRulesFiltersType::RequestHeaderModifier => {
             let hm = f
                 .request_header_modifier
                 .as_ref()
@@ -378,7 +378,7 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
                 config: convert_header_mod!(hm),
             }
         }
-        HTTPRouteRulesFiltersType::ResponseHeaderModifier => {
+        HttpRouteRulesFiltersType::ResponseHeaderModifier => {
             let hm = f
                 .response_header_modifier
                 .as_ref()
@@ -387,7 +387,7 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
                 config: convert_header_mod!(hm),
             }
         }
-        HTTPRouteRulesFiltersType::RequestRedirect => {
+        HttpRouteRulesFiltersType::RequestRedirect => {
             let rr = f
                 .request_redirect
                 .as_ref()
@@ -396,7 +396,7 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
                 config: convert_redirect_config(rr),
             }
         }
-        HTTPRouteRulesFiltersType::UrlRewrite => {
+        HttpRouteRulesFiltersType::UrlRewrite => {
             let ur = f
                 .url_rewrite
                 .as_ref()
@@ -405,7 +405,7 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
                 config: convert_url_rewrite_config(ur),
             }
         }
-        HTTPRouteRulesFiltersType::RequestMirror => {
+        HttpRouteRulesFiltersType::RequestMirror => {
             let rm = f
                 .request_mirror
                 .as_ref()
@@ -423,10 +423,10 @@ fn convert_http_filter(f: &HTTPRouteRulesFilters, ns: &str) -> Result<HttpRouteF
     })
 }
 
-fn convert_redirect_config(rr: &HTTPRouteRulesFiltersRequestRedirect) -> RequestRedirectConfig {
+fn convert_redirect_config(rr: &HttpRouteRulesFiltersRequestRedirect) -> RequestRedirectConfig {
     let scheme = rr.scheme.as_ref().map(|s| match s {
-        HTTPRouteRulesFiltersRequestRedirectScheme::Http => "http".to_string(),
-        HTTPRouteRulesFiltersRequestRedirectScheme::Https => "https".to_string(),
+        HttpRouteRulesFiltersRequestRedirectScheme::Http => "http".to_string(),
+        HttpRouteRulesFiltersRequestRedirectScheme::Https => "https".to_string(),
     });
 
     let path = rr.path.as_ref().and_then(convert_path_modifier);
@@ -441,27 +441,27 @@ fn convert_redirect_config(rr: &HTTPRouteRulesFiltersRequestRedirect) -> Request
 }
 
 fn convert_path_modifier(
-    p: &HTTPRouteRulesFiltersRequestRedirectPath,
+    p: &HttpRouteRulesFiltersRequestRedirectPath,
 ) -> Option<HttpURLRewritePath> {
     match p.r#type {
-        HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
+        HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
             .replace_full_path
             .as_ref()
             .map(|v| HttpURLRewritePath::ReplaceFullPath { value: v.clone() }),
-        HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
+        HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
             .replace_prefix_match
             .as_ref()
             .map(|v| HttpURLRewritePath::ReplacePrefixMatch { value: v.clone() }),
     }
 }
 
-fn convert_url_rewrite_config(ur: &HTTPRouteRulesFiltersUrlRewrite) -> URLRewriteConfig {
+fn convert_url_rewrite_config(ur: &HttpRouteRulesFiltersUrlRewrite) -> URLRewriteConfig {
     let path = ur.path.as_ref().and_then(|p| match p.r#type {
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
+        HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
             .replace_full_path
             .as_ref()
             .map(|v| HttpURLRewritePath::ReplaceFullPath { value: v.clone() }),
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
+        HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
             .replace_prefix_match
             .as_ref()
             .map(|v| HttpURLRewritePath::ReplacePrefixMatch { value: v.clone() }),
@@ -473,7 +473,7 @@ fn convert_url_rewrite_config(ur: &HTTPRouteRulesFiltersUrlRewrite) -> URLRewrit
     }
 }
 
-fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> RequestMirrorConfig {
+fn convert_mirror_config(rm: &HttpRouteRulesFiltersRequestMirror, ns: &str) -> RequestMirrorConfig {
     let fraction = rm.fraction.as_ref().map(|f| crate::config::MirrorFraction {
         numerator: f.numerator.max(0) as u32,
         denominator: f.denominator.map(|d| d.max(1) as u32).unwrap_or(100),
@@ -512,7 +512,7 @@ fn convert_mirror_config(rm: &HTTPRouteRulesFiltersRequestMirror, ns: &str) -> R
 /// Like `convert_http_rule`: a filter that cannot be represented is left
 /// out and named.
 fn convert_http_backend_ref(
-    br: &HTTPRouteRulesBackendRefs,
+    br: &HttpRouteRulesBackendRefs,
     ns: &str,
 ) -> (BackendRef, Option<RouteError>) {
     let mut first = None;
@@ -552,11 +552,11 @@ fn convert_http_backend_ref(
 /// applies only header modifiers per backend: any other type fails the
 /// route like an unsupported rule filter, instead of serving without it.
 fn convert_backend_ref_filter(
-    f: &HTTPRouteRulesBackendRefsFilters,
+    f: &HttpRouteRulesBackendRefsFilters,
 ) -> Result<HttpRouteFilter, RouteError> {
     let missing = |what: &str| RouteError::unsupported(format!("{} filter missing config", what));
     Ok(match f.r#type {
-        HTTPRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+        HttpRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
             let hm = f
                 .request_header_modifier
                 .as_ref()
@@ -565,7 +565,7 @@ fn convert_backend_ref_filter(
                 config: convert_header_mod!(hm),
             }
         }
-        HTTPRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+        HttpRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
             let hm = f
                 .response_header_modifier
                 .as_ref()
@@ -587,7 +587,7 @@ fn convert_backend_ref_filter(
 // Timeouts
 // ---------------------------------------------------------------------------
 
-fn convert_timeouts(t: &HTTPRouteRulesTimeouts) -> HttpRouteTimeouts {
+fn convert_timeouts(t: &HttpRouteRulesTimeouts) -> HttpRouteTimeouts {
     HttpRouteTimeouts {
         request: t
             .request
@@ -667,7 +667,7 @@ fn convert_l4_backend_refs<B: L4BackendRefAccess>(
         .collect()
 }
 
-pub(crate) fn convert_tcp_route(route: &TCPRoute) -> (TcpRouteConfig, Result<(), RouteError>) {
+pub(crate) fn convert_tcp_route(route: &TcpRoute) -> (TcpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let rules = route
         .spec
@@ -684,7 +684,7 @@ pub(crate) fn convert_tcp_route(route: &TCPRoute) -> (TcpRouteConfig, Result<(),
     (config, Ok(()))
 }
 
-pub(crate) fn convert_tls_route(route: &TLSRoute) -> (TlsRouteConfig, Result<(), RouteError>) {
+pub(crate) fn convert_tls_route(route: &TlsRoute) -> (TlsRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let hostnames = route.spec.hostnames.clone();
     let rules = route
@@ -703,7 +703,7 @@ pub(crate) fn convert_tls_route(route: &TLSRoute) -> (TlsRouteConfig, Result<(),
     (config, Ok(()))
 }
 
-pub(crate) fn convert_udp_route(route: &UDPRoute) -> (UdpRouteConfig, Result<(), RouteError>) {
+pub(crate) fn convert_udp_route(route: &UdpRoute) -> (UdpRouteConfig, Result<(), RouteError>) {
     let ns = route_namespace(&route.metadata);
     let rules = route
         .spec

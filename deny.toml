@@ -1,9 +1,7 @@
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, no known vulnerability; pulled in by serde_yaml, which kube-client and gateway-api also use" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, no known vulnerability; pulled in only by portail's own serde_yaml, now that kube and gateway-api use other YAML crates" },
     { id = "RUSTSEC-2026-0258", reason = "only h2 0.3, dev-only via rewrk-core's hyper 0.14 (bench); no 0.3 fix exists; the shipped h2 0.4 is patched" },
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, no known vulnerability; pulled in by k8s-openapi 0.26 and kube 2; kube 4 and later use jiff, so the kube upgrade ends this entry" },
-    { id = "RUSTSEC-2026-0600", reason = "only kube-client's openssl-tls connector, which the feature ban below keeps out of the build; kube 2 has no fix, 5.2 does" },
 ]
 
 [licenses]
@@ -17,10 +15,17 @@ allow = [
     "Zlib",
 ]
 
+# Mozilla's root list as data: a wasm32-only dependency of
+# rustls-platform-verifier (through kube-client), never built for Linux.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 
-# RUSTSEC-2026-0600 is ignored above only while this connector stays out.
+# One TLS stack to the apiserver: this connector also trusted OpenSSL's
+# default roots beside the cluster CA until kube 5.2 (RUSTSEC-2026-0600).
 [[bans.features]]
 crate = "kube-client"
 deny = ["openssl-tls"]

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use gateway_api::gateways::Gateway;
-use gateway_api::referencegrants::ReferenceGrant;
+use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::{ObjectRef, Store};
 
@@ -891,7 +891,7 @@ mod tests {
 
     /// Gateways of `default` may reference Secrets of `certs`.
     fn secret_grant() -> ReferenceGrant {
-        use gateway_api::referencegrants::{
+        use gateway_api::referencegrants::v1beta1::{
             ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
         };
         ReferenceGrant {
