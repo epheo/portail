@@ -16,10 +16,10 @@ use crate::metrics::ListenerStats;
 use crate::proxy::backend_pool::{connect_tcp, log_local_exhaustion, ConnectError, LogThrottle};
 use crate::proxy::deadline::idle_opt;
 use crate::proxy::health::HealthRegistry;
+use crate::proxy::listener::{tcp_keepalive, ServeConfig};
 use crate::proxy::proxy_protocol;
 use crate::proxy::request_processor::report_passthrough_miss;
 use crate::proxy::tls::Connection;
-use crate::proxy::worker::{tcp_keepalive, WorkerConfig};
 use crate::routing::{BackendAction, BackendSelector, RouteTable};
 
 /// L4 TLS passthrough of a connection whose ClientHello was peeked for its
@@ -36,7 +36,7 @@ pub(super) async fn handle_tls_passthrough(
     routes: Arc<ArcSwap<RouteTable>>,
     health: Arc<HealthRegistry>,
     selector: Arc<BackendSelector>,
-    cfg: &WorkerConfig,
+    cfg: &ServeConfig,
     stats: &ListenerStats,
 ) {
     // The table is let go before the relay: held across it, every open

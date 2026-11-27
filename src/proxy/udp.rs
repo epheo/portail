@@ -1,4 +1,5 @@
-//! UDP worker — per-listener recv_from loop with per-session connected backend sockets.
+//! UDP: a recv_from loop per listener, with a connected backend socket per
+//! session.
 //! Sessions are identified by source address, capped (per listener, or by one
 //! budget all listeners share), moved off a backend that a route-table swap
 //! dropped, and expire after an idle timeout.
@@ -146,7 +147,7 @@ struct UdpSession {
     /// Whatever removes a session, its reply task must not live on holding
     /// the backend socket's fd and port until it idles out.
     reply_task: AbortOnDropHandle<()>,
-    /// Milliseconds since the worker epoch at the last datagram either way.
+    /// Milliseconds since the listener's epoch at the last datagram either way.
     last_active: Arc<AtomicU64>,
     /// Route-table generation `backend_addr` was last found routed in.
     generation: u64,
@@ -175,7 +176,7 @@ struct Sessions {
 }
 
 /// Run a UDP recv_from loop on a single socket, dispatching datagrams to per-session backends.
-pub async fn run_udp_worker(
+pub async fn serve(
     socket: Arc<UdpSocket>,
     server_port: u16,
     routes: Arc<ArcSwap<RouteTable>>,
@@ -492,7 +493,7 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         let routes = Arc::new(ArcSwap::from_pointee(udp_table(addr.port(), backends)));
         let shutdown = CancellationToken::new();
-        tokio::spawn(run_udp_worker(
+        tokio::spawn(serve(
             socket,
             addr.port(),
             Arc::clone(&routes),

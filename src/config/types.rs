@@ -744,7 +744,7 @@ pub struct PerformanceConfig {
     /// Also bounds each connection's close: the TLS close_notify, and the
     /// read-off of what a client still sends after a closing reply. That
     /// read also ends once the client sends nothing new for 5s
-    /// (`proxy::worker::LINGER_IDLE`).
+    /// (`proxy::http1::LINGER_IDLE`).
     #[serde(default = "default_client_header_timeout", with = "human_duration")]
     pub client_header_timeout: Duration,
 
@@ -759,7 +759,7 @@ pub struct PerformanceConfig {
     /// and take down every accept loop, health listener included. Defaults
     /// to 60s — same order as Go's net/http server default (15s); the probe
     /// cadence after this idle threshold is fixed (see
-    /// `worker::TCP_KEEPALIVE_INTERVAL`), giving ~2min total reap latency.
+    /// `listener::TCP_KEEPALIVE_INTERVAL`), giving ~2min total reap latency.
     /// Backend sockets get the same keepalive: a backend that vanishes pins
     /// a client's task and fds just the same.
     #[serde(default = "default_tcp_keepalive_time", with = "human_duration")]

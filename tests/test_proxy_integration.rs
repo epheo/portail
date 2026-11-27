@@ -2008,7 +2008,7 @@ fn test_admin_endpoint_binds_its_address() {
     assert!(std::net::TcpStream::connect(other).is_err());
 }
 
-/// A copy of `portail::proxy::worker::LINGER_IDLE`, which is crate-private:
+/// A copy of `portail::proxy::http1::LINGER_IDLE`, which is crate-private:
 /// keep the two equal.
 const LINGER_IDLE: Duration = Duration::from_secs(5);
 

@@ -1,6 +1,6 @@
 //! HTTP/2 front end: each h2 stream is replayed as one HTTP/1.1 exchange
 //! over an in-memory duplex into the same engine that serves h1 clients
-//! ([`worker::handle_connection`]), so routing, filters, backend pooling,
+//! ([`http1::serve`]), so routing, filters, backend pooling,
 //! timeouts, and observability behave identically across both protocols.
 //! Only ALPN-negotiated h2 connections pay the replay's in-memory copy;
 //! the h1 path is untouched.
@@ -33,15 +33,16 @@ use crate::proxy::backend_pool::SharedBackendPool;
 use crate::proxy::chunked::ChunkedStream;
 use crate::proxy::deadline::{idle_opt, progress};
 use crate::proxy::health::HealthRegistry;
+use crate::proxy::http1;
 use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
+use crate::proxy::listener::ServeConfig;
 use crate::proxy::tls::Connection;
 use crate::proxy::upstream::response::{
     parse_response_head, response_has_no_body, BodyFraming, RESPONSE_HEADER_CAP,
 };
-use crate::proxy::worker::{self, WorkerConfig};
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough
@@ -87,7 +88,7 @@ pub(crate) struct H2Ctx {
     pub(crate) selector: Arc<BackendSelector>,
     pub(crate) health: Arc<HealthRegistry>,
     pub(crate) pool: Arc<SharedBackendPool>,
-    pub(crate) cfg: WorkerConfig,
+    pub(crate) cfg: ServeConfig,
     pub(crate) listener_stats: Arc<ListenerStats>,
     pub(crate) peer: SocketAddr,
     pub(crate) local: SocketAddr,
@@ -236,7 +237,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
         // What still comes is dropped: the size only sets reads per wake.
         let mut discard = [0u8; 4096];
         loop {
-            let left = worker::CLIENT_BUF - this.discarded;
+            let left = http1::CLIENT_BUF - this.discarded;
             if left == 0 {
                 return Poll::Ready(Ok(()));
             }
@@ -253,7 +254,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
             }
         }
         if restart {
-            let idle = tokio::time::Instant::now() + worker::LINGER_IDLE;
+            let idle = tokio::time::Instant::now() + http1::LINGER_IDLE;
             deadline.as_mut().reset(idle.min(close_by));
         }
         deadline.as_mut().poll(cx).map(Ok)
@@ -348,7 +349,7 @@ async fn serve_stream(
 
     let (io, engine_io) = tokio::io::duplex(DUPLEX_BUF);
     let aborted = Arc::new(AtomicBool::new(false));
-    let state = worker::ConnectionState::new(
+    let state = http1::ConnectionState::new(
         ctx.server_port,
         ctx.routes.clone(),
         crate::proxy::backend_pool::PoolHandle::Shared(ctx.pool.clone()),
@@ -368,7 +369,7 @@ async fn serve_stream(
         inner: engine_io,
         aborted: aborted.clone(),
     };
-    let engine = worker::handle_connection(engine_conn, ctx.peer, state);
+    let engine = http1::serve(engine_conn, ctx.peer, state);
 
     // The bridge owns its duplex half and drops it on completion, so an
     // engine still reading the duplex sees EOF instead of parking on it.
@@ -1034,11 +1035,11 @@ mod tests {
     /// runs out.
     #[tokio::test(start_paused = true)]
     async fn a_closing_h2_connection_lingers_while_the_client_sends() {
-        let budget = worker::LINGER_IDLE * 6;
-        let every = worker::LINGER_IDLE / 2;
+        let budget = http1::LINGER_IDLE * 6;
+        let every = http1::LINGER_IDLE / 2;
         for (sends, lingered) in [
-            (0, worker::LINGER_IDLE),
-            (4, every * 4 + worker::LINGER_IDLE),
+            (0, http1::LINGER_IDLE),
+            (4, every * 4 + http1::LINGER_IDLE),
             (usize::MAX, budget),
         ] {
             let (server, mut client) = tokio::io::duplex(64 * 1024);
@@ -1063,11 +1064,11 @@ mod tests {
     /// buffer's worth, as h1's close does.
     #[tokio::test(start_paused = true)]
     async fn a_closing_h2_connection_reads_off_one_buffer_at_most() {
-        let budget = worker::LINGER_IDLE * 6;
-        let every = worker::LINGER_IDLE / 2;
-        let (server, mut client) = tokio::io::duplex(worker::CLIENT_BUF);
+        let budget = http1::LINGER_IDLE * 6;
+        let every = http1::LINGER_IDLE / 2;
+        let (server, mut client) = tokio::io::duplex(http1::CLIENT_BUF);
         let sender = tokio::spawn(async move {
-            let chunk = [b'x'; worker::CLIENT_BUF / 4];
+            let chunk = [b'x'; http1::CLIENT_BUF / 4];
             loop {
                 tokio::time::sleep(every).await;
                 let _ = client.write_all(&chunk).await;
@@ -1213,7 +1214,7 @@ mod tests {
                 }],
             ),
         );
-        let cfg = WorkerConfig {
+        let cfg = ServeConfig {
             max_idle_per_backend: 4,
             connect_timeout: Duration::from_secs(2),
             client_header_timeout: budget,

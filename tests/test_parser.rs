@@ -927,8 +927,8 @@ fn body_bytes_after_the_head_are_not_parsed() {
 }
 
 /// Any accepted head must end at the first CRLFCRLF, which is where the
-/// worker cuts the head it forwards; spans must cover whole header lines.
-fn check_never_panics_and_frames_like_the_worker(req: &[u8]) {
+/// engine cuts the head it forwards; spans must cover whole header lines.
+fn check_never_panics_and_frames_like_the_engine(req: &[u8]) {
     let Ok(info) = extract_routing_info(req) else {
         return;
     };
@@ -965,20 +965,20 @@ fn mutated_heads_never_panic_and_frame_like_the_worker() {
     for seed in seeds {
         accepted(seed);
         for cut in 0..=seed.len() {
-            check_never_panics_and_frames_like_the_worker(&seed[..cut]);
+            check_never_panics_and_frames_like_the_engine(&seed[..cut]);
         }
         for i in 0..seed.len() {
             for &b in &bytes {
                 let mut m = seed.to_vec();
                 m[i] = b;
-                check_never_panics_and_frames_like_the_worker(&m);
+                check_never_panics_and_frames_like_the_engine(&m);
                 let mut m = seed.to_vec();
                 m.insert(i, b);
-                check_never_panics_and_frames_like_the_worker(&m);
+                check_never_panics_and_frames_like_the_engine(&m);
             }
             let mut m = seed.to_vec();
             m.remove(i);
-            check_never_panics_and_frames_like_the_worker(&m);
+            check_never_panics_and_frames_like_the_engine(&m);
         }
     }
 }

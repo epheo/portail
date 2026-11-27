@@ -1,4 +1,4 @@
-//! The data plane: listener management, connection workers, HTTP
+//! The data plane: listeners, the HTTP/1 engine and the relay, HTTP
 //! parsing/filtering, backend connection pooling, TLS, and backend health.
 //! Everything that touches a client or backend socket lives here; the
 //! control planes (config file, kubernetes/) only hand it route tables.
@@ -12,14 +12,14 @@ pub mod health;
 pub(crate) mod http1;
 pub mod http_filters;
 pub mod http_parser;
+pub mod listener;
 pub mod method;
 pub mod proxy_protocol;
 pub(crate) mod relay;
 pub mod request_processor;
 pub mod tls;
-pub mod udp_worker;
+pub mod udp;
 pub(crate) mod upstream;
-pub mod worker;
 
 /// Test-only helpers for running the proxy out of fds.
 #[cfg(test)]
