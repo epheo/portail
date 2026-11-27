@@ -17,6 +17,7 @@ pub(crate) mod relay;
 pub mod request_processor;
 pub mod tls;
 pub mod udp_worker;
+pub(crate) mod upstream;
 pub mod worker;
 
 /// Test-only helpers for running the proxy out of fds.

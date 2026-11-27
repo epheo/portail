@@ -326,7 +326,7 @@ fn target_bounds(line: &[u8]) -> Option<(usize, usize)> {
 
 /// Where [`sanitize_response_headers`] cuts a head whose lines all end in
 /// CRLF and none is empty, recorded by the pass that parsed it
-/// (`worker::scan_response_head`): the copy is then a few bulk copies.
+/// (`upstream::response::scan_response_head`): the copy is then a few bulk copies.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ResponseCuts {
     /// Hop-by-hop lines and every Content-Length line past the first.
@@ -339,7 +339,7 @@ pub(crate) struct ResponseCuts {
 /// Copy response headers into `out` minus hop-by-hop lines (RFC 7230 6.1).
 /// The status line is copied untouched.
 ///
-/// Framing is the caller's reading of the head (`worker::parse_response_head`),
+/// Framing is the caller's reading of the head (`upstream::response::parse_response_head`),
 /// never re-derived here. `content_length` is that reading's value: the
 /// first Content-Length line becomes `Content-Length: <n>` and the others
 /// go, since some clients (llhttp) refuse any repeat. `None` drops them all:
