@@ -248,9 +248,15 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 		return 1, fmt.Errorf("create report dir: %w", err)
 	}
 
-	log.Printf("Executing tests on Kind network (VIP %s)...", vip)
+	// CONTROLLER_BENCH runs the controller bench in place of the suite.
+	run, timeout, bench := "TestConformance", "25m", os.Getenv("CONTROLLER_BENCH")
+	if bench != "" {
+		run, timeout = "TestControllerBench", "80m"
+	}
+	log.Printf("Executing %s on Kind network (VIP %s)...", run, vip)
 	cmd := exec.Command(runtime, "run", "--rm",
 		"--network", "kind",
+		"-e", "CONTROLLER_BENCH="+bench,
 		"-v", testBinPath+":/conformance.test:Z",
 		"-v", internalKubeconfig.Name()+":/kubeconfig:Z",
 		"-v", reportDir+":/reports:Z",
@@ -261,9 +267,9 @@ func execOnKindNetwork(provider *cluster.Provider, runtime, projectDir, vip, fea
 		"registry.access.redhat.com/ubi10/ubi-minimal:latest",
 		"/conformance.test",
 		"-test.v",
-		"-test.timeout", "25m",
+		"-test.timeout", timeout,
 		"-test.count", "1",
-		"-test.run", "TestConformance",
+		"-test.run", run,
 		"-gateway-class", "portail",
 		"-conformance-profiles", "GATEWAY-HTTP,GATEWAY-TLS",
 		"-supported-features", features,

@@ -457,7 +457,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         // In-flight passes finish before the lease is released below.
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(reconcile, error_policy, ctx);
+        .run(timed_reconcile, error_policy, ctx);
 
     info!("Gateway API controller started, watching for resource changes");
 
@@ -577,6 +577,17 @@ fn skip_requeue_secs(programmed: bool, all_routes_accepted: bool) -> u64 {
     } else {
         60
     }
+}
+
+/// A pass, timed whatever ends it: the histogram counts every pass.
+async fn timed_reconcile(
+    gateway: Arc<Gateway>,
+    ctx: Arc<ControllerCtx>,
+) -> Result<Action, ReconcileError> {
+    let start = std::time::Instant::now();
+    let done = reconcile(gateway, ctx).await;
+    crate::metrics::RECONCILE_DURATION.observe(start.elapsed());
+    done
 }
 
 /// The retry of a failed pass: the cadence v0.1.x error_policy used, slow
