@@ -18,15 +18,22 @@ use crate::kubernetes::features::SUPPORTED_FEATURES;
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::logging::{debug, warn};
 
+/// The one route kind a listener's protocol takes: what attaches to it and
+/// what its supportedKinds may list.
+pub fn route_kind_for_protocol(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "HTTP" | "HTTPS" => Some("HTTPRoute"),
+        "TLS" => Some("TLSRoute"),
+        "TCP" => Some("TCPRoute"),
+        "UDP" => Some("UDPRoute"),
+        _ => None,
+    }
+}
+
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
-    let kind = match protocol {
-        "HTTP" | "HTTPS" => "HTTPRoute",
-        "TLS" => "TLSRoute",
-        "TCP" => "TCPRoute",
-        "UDP" => "UDPRoute",
-        _ => return vec![],
-    };
-    vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})]
+    route_kind_for_protocol(protocol)
+        .map(|kind| vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})])
+        .unwrap_or_default()
 }
 
 /// Per-listener validation status computed during reconciliation.

@@ -2,9 +2,9 @@ use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use gateway_api::experimental::tcproutes::v1alpha2::*;
-use gateway_api::experimental::tlsroutes::v1alpha3::*;
-use gateway_api::experimental::udproutes::v1alpha2::*;
+use gateway_api::experimental::tcproutes::v1::*;
+use gateway_api::experimental::tlsroutes::v1::*;
+use gateway_api::experimental::udproutes::v1::*;
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::httproutes::*;
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
@@ -61,7 +61,9 @@ pub(crate) trait GatewayRoute: Sized {
     const KIND: &'static str;
     /// TCP and UDP listeners carry one route: their rules have no match to
     /// choose between routes, so the oldest takes the listener
-    /// (Listener.allowedRoutes precedence) and later ones report Conflicted.
+    /// (Listener.allowedRoutes precedence). Later ones are Accepted and
+    /// counted in attachedRoutes, but get no traffic (Gateway API v1.7,
+    /// TCPRoute and UDPRouteMultipleRoutesAttachment).
     const ONE_ROUTE_PER_LISTENER: bool = false;
 
     fn parent_refs(&self) -> &Option<Vec<Self::ParentRef>>;
@@ -827,11 +829,14 @@ fn collect_routes<R: GatewayRoute>(
         let route_hostnames = route.hostnames();
         // The listeners each ref attaches to by allowedRoutes, before an
         // older route's claim: attachedRoutes counts them, accepted or not.
+        // The last field: every listener the ref selects is an older
+        // route's.
         let per_parent: Vec<(
             Option<String>,
             Option<i32>,
             Vec<String>,
             Result<Vec<String>, &'static str>,
+            bool,
         )> = route
             .parent_refs()
             .as_ref()
@@ -851,22 +856,20 @@ fn collect_routes<R: GatewayRoute>(
                             cx.namespace_labels,
                         );
                         let attached = result.clone().unwrap_or_default();
+                        let mut lost = false;
                         if R::ONE_ROUTE_PER_LISTENER {
-                            result = result.and_then(|mut listeners| {
+                            if let Ok(listeners) = &mut result {
                                 listeners
                                     .retain(|l| !port_of(l).is_some_and(|p| claimed.contains(&p)));
-                                if listeners.is_empty() {
-                                    Err("Conflicted")
-                                } else {
-                                    Ok(listeners)
-                                }
-                            });
+                                lost = listeners.is_empty();
+                            }
                         }
                         (
                             pr.ref_section_name().map(String::from),
                             pr.ref_port(),
                             attached,
                             result,
+                            lost,
                         )
                     })
                     .collect()
@@ -879,9 +882,6 @@ fn collect_routes<R: GatewayRoute>(
                     "Route hostnames do not intersect with any listener hostname"
                 }
                 "NoMatchingParent" => "No matching listener found for route parentRef",
-                "Conflicted" => {
-                    "An older route already serves every listener this parentRef selects"
-                }
                 _ => "Route not allowed by any listener policy (namespace/hostname/kind)",
             };
             RouteAcceptance {
@@ -901,8 +901,8 @@ fn collect_routes<R: GatewayRoute>(
             }
         };
 
-        if per_parent.iter().all(|(_, _, _, r)| r.is_err()) {
-            for (section_name, port, attached, result) in &per_parent {
+        if per_parent.iter().all(|(_, _, _, r, _)| r.is_err()) {
+            for (section_name, port, attached, result, _) in &per_parent {
                 let reason = result.as_ref().err().copied().unwrap_or("NoMatchingParent");
                 route_status.push(RouteAcceptance {
                     listener_names: attached.clone(),
@@ -1044,7 +1044,7 @@ fn collect_routes<R: GatewayRoute>(
             Ok(()) => ("Accepted", "Accepted".to_string()),
             Err(e) => (e.reason.as_str(), format!("Conversion failed: {}", e)),
         };
-        for (section_name, port, attached, result) in &per_parent {
+        for (section_name, port, attached, result, lost) in &per_parent {
             match result {
                 // A parentRef the listeners admit. One they reject keeps
                 // its own rejection reason.
@@ -1054,7 +1054,13 @@ fn collect_routes<R: GatewayRoute>(
                     kind,
                     accepted: verdict.is_ok(),
                     accepted_reason,
-                    message: message.clone(),
+                    message: if *lost && verdict.is_ok() {
+                        "Accepted; an older route serves every listener this parentRef \
+                         selects, so this one gets no traffic"
+                            .to_string()
+                    } else {
+                        message.clone()
+                    },
                     refs_resolved,
                     refs_reason,
                     refs_message: refs_message.clone(),
@@ -1076,12 +1082,15 @@ fn collect_routes<R: GatewayRoute>(
         let mut attached: Vec<&String> = Vec::new();
         for listener in per_parent
             .iter()
-            .filter_map(|(_, _, _, result)| result.as_ref().ok())
+            .filter_map(|(_, _, _, result, _)| result.as_ref().ok())
             .flatten()
         {
             if !attached.contains(&listener) {
                 attached.push(listener);
             }
+        }
+        if attached.is_empty() {
+            continue;
         }
         if R::ONE_ROUTE_PER_LISTENER {
             claimed.extend(attached.iter().filter_map(|l| port_of(l)));

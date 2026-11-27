@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
-use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
-use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
+use gateway_api::experimental::tcproutes::v1::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1::TlsRoute;
+use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HttpRoute;
@@ -2558,7 +2558,7 @@ mod tests {
             ("new", "2021-01-01T00:00:00Z"),
         ] {
             let route: TcpRoute = serde_json::from_value(serde_json::json!({
-                "apiVersion": "gateway.networking.k8s.io/v1alpha2",
+                "apiVersion": "gateway.networking.k8s.io/v1",
                 "kind": "TCPRoute",
                 "metadata": {
                     "name": name, "namespace": "default", "generation": 1,
@@ -2577,7 +2577,7 @@ mod tests {
         let newer = p.api.status_patch("tcproutes", "new").unwrap();
         assert_eq!(
             newer["status"]["parents"][0]["conditions"][0]["reason"],
-            "Conflicted"
+            "Accepted"
         );
         let gateway = p.api.status_patch("gateways", "gw").unwrap();
         assert_eq!(gateway["status"]["listeners"][0]["attachedRoutes"], 2);

@@ -5,9 +5,9 @@
 
 use anyhow::{anyhow, Result};
 
-use gateway_api::experimental::tcproutes::v1alpha2::*;
-use gateway_api::experimental::tlsroutes::v1alpha3::*;
-use gateway_api::experimental::udproutes::v1alpha2::*;
+use gateway_api::experimental::tcproutes::v1::*;
+use gateway_api::experimental::tlsroutes::v1::*;
+use gateway_api::experimental::udproutes::v1::*;
 use gateway_api::gateways::{
     Gateway, GatewayListeners, GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
 };

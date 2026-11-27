@@ -262,7 +262,7 @@ Kubernetes mode:
 - A TLS listener is served in `Passthrough` mode only: TLSRoute is passthrough here, and an HTTPS listener terminates. A TLS listener in `Terminate` mode reports `Accepted=False` with reason `UnsupportedProtocol`, binds nothing and takes no route.
 - A listener portail does not serve (an unsupported protocol, TLS `Terminate`) conflicts with no other: it is rejected alone.
 - Equally specific matches go to the oldest route (`creationTimestamp`), then to the first by the string `{namespace}/{name}`: `a-b/c` comes before `a/z`.
-- A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken reports `Accepted=False` with reason `Conflicted`.
+- A TCP or UDP listener carries one route, the oldest. A parentRef whose listeners are all taken is `Accepted` and counted in their `attachedRoutes`, but gets no traffic (Gateway API v1.7).
 - TCPRoute and UDPRoute rules have no match to choose between, so only the first rule is used.
 - An invalid backendRef (`RefNotPermitted`, `BackendNotFound`, `InvalidKind`) keeps its weight. Its share of HTTP requests gets `500`; its share of TCP and TLS passthrough connections is closed, of UDP datagrams dropped.
 

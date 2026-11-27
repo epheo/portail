@@ -24,14 +24,7 @@ pub(crate) fn is_route_allowed_by_listener(
     if !super::reconciler::listener_is_served(listener) {
         return false;
     }
-    let protocol_allows = match listener.protocol.as_str() {
-        "HTTP" | "HTTPS" => route_kind == "HTTPRoute",
-        "TLS" => route_kind == "TLSRoute",
-        "TCP" => route_kind == "TCPRoute",
-        "UDP" => route_kind == "UDPRoute",
-        _ => false,
-    };
-    if !protocol_allows {
+    if super::status::route_kind_for_protocol(&listener.protocol) != Some(route_kind) {
         return false;
     }
 

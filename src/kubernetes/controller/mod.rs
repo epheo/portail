@@ -41,9 +41,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use gateway_api::experimental::tcproutes::v1alpha2::TcpRoute;
-use gateway_api::experimental::tlsroutes::v1alpha3::TlsRoute;
-use gateway_api::experimental::udproutes::v1alpha2::UdpRoute;
+use gateway_api::experimental::tcproutes::v1::TcpRoute;
+use gateway_api::experimental::tlsroutes::v1::TlsRoute;
+use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HttpRoute;

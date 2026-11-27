@@ -280,10 +280,10 @@ pub(super) fn validate_gateway(
             ls.accepted_reason = "UnsupportedProtocol".into();
             ls.accepted_message = format!("Protocol '{}' is not supported", listener.protocol);
         } else if !listener_is_served(listener) {
-            // The reason GRPCRoute gives a listener whose protocol variant
-            // the implementation cannot serve.
+            // A TLS mode the implementation does not serve
+            // (TLSRouteListenerTerminateNotSupported).
             ls.accepted = false;
-            ls.accepted_reason = "UnsupportedProtocol".into();
+            ls.accepted_reason = "UnsupportedValue".into();
             ls.accepted_message =
                 "TLS listeners are served in Passthrough mode only; an HTTPS listener terminates"
                     .into();
@@ -339,17 +339,17 @@ pub(super) fn validate_gateway(
         // Check allowedRoutes.kinds validity and compute supportedKinds
         if let Some(allowed_routes) = &listener.allowed_routes {
             if let Some(kinds) = &allowed_routes.kinds {
-                // No GRPCRoute: the data plane cannot serve gRPC, so advertising
-                // it would claim attachment for routes that can never work.
-                let valid_kinds = ["HTTPRoute", "TCPRoute", "TLSRoute", "UDPRoute"];
+                // Only the kind its protocol takes, as routes attach: a TLS
+                // listener takes no TCPRoute
+                // (TLSRouteListenerPassthroughSupportedKinds), and no listener
+                // takes GRPCRoute, which the data plane cannot serve.
+                let served = status::route_kind_for_protocol(&listener.protocol);
                 let mut supported = Vec::new();
                 let mut has_invalid = false;
                 for k in kinds {
                     let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
                     let kind_str = &k.kind;
-                    if group == "gateway.networking.k8s.io"
-                        && valid_kinds.contains(&kind_str.as_str())
-                    {
+                    if group == "gateway.networking.k8s.io" && served == Some(kind_str.as_str()) {
                         supported.push(serde_json::json!({
                             "group": "gateway.networking.k8s.io",
                             "kind": kind_str,
@@ -647,6 +647,49 @@ mod tests {
         assert_eq!(ls.supported_kinds[0]["kind"], "HTTPRoute");
     }
 
+    /// A TLS listener lists the TLSRoute it takes and refuses a TCPRoute
+    /// asked of it: no TCPRoute ever attaches there.
+    #[test]
+    fn a_tls_listener_supports_tlsroute_only() {
+        use gateway_api::gateways::{
+            GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        };
+        let mut gw = https_gateway("unused");
+        gw.spec.listeners = vec![GatewayListeners {
+            tls: Some(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Passthrough),
+                ..Default::default()
+            }),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                kinds: Some(
+                    ["TCPRoute", "TLSRoute"]
+                        .map(|kind| GatewayListenersAllowedRoutesKinds {
+                            group: None,
+                            kind: kind.into(),
+                        })
+                        .to_vec(),
+                ),
+                namespaces: None,
+            }),
+            ..listener("tls-passthrough", 443, "TLS", None)
+        }];
+        let certs = ResolvedCerts {
+            valid: CertData::new(),
+            errors: HashMap::new(),
+        };
+        let (listeners, _) = validate_gateway(&gw, "default", &certs);
+        let ls = &listeners["tls-passthrough"];
+        assert!(ls.accepted);
+        assert!(!ls.resolved_refs);
+        assert_eq!(ls.resolved_refs_reason, "InvalidRouteKinds");
+        let kinds: Vec<_> = ls
+            .supported_kinds
+            .iter()
+            .map(|k| k["kind"].clone())
+            .collect();
+        assert_eq!(kinds, ["TLSRoute"]);
+    }
+
     /// Listener isolation: an unsupported-protocol listener gets its own
     /// UnsupportedProtocol condition; a valid sibling keeps the Gateway
     /// Accepted. All-invalid downgrades the Gateway with ListenersNotValid.
@@ -856,7 +899,7 @@ mod tests {
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         let db = &listeners["db"];
         assert!(!db.accepted && !db.programmed && !db.conflicted);
-        assert_eq!(db.accepted_reason, "UnsupportedProtocol");
+        assert_eq!(db.accepted_reason, "UnsupportedValue");
         assert!(
             db.accepted_message.contains("Passthrough"),
             "{}",

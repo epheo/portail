@@ -24,7 +24,7 @@ import (
 
 const (
 	clusterName       = "portail"
-	gatewayAPIVersion = "v1.4.1"
+	gatewayAPIVersion = "v1.7.0"
 	// scripts/release.sh sets it; publish.yml refuses a tag it does not match.
 	portailVersion = "v0.3.0"
 	portailImage   = "ghcr.io/epheo/portail:latest"

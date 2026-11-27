@@ -19,7 +19,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version-file: conformance/go.mod
           cache-dependency-path: conformance/go.sum
 
       - name: Run conformance tests

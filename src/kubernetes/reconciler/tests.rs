@@ -3255,7 +3255,8 @@ fn tcp_route_attaches_through_every_parent_ref() {
 
 /// config-routing #7: TCPRoutes on one listener overwrote each other in
 /// input order. Listener.allowedRoutes precedence: the oldest Route, then
-/// namespace/name; the other reports Conflicted.
+/// namespace/name, gets the traffic; the other is Accepted all the same
+/// (Gateway API v1.7, TCPRouteMultipleRoutesAttachment).
 #[test]
 fn oldest_tcp_route_owns_its_listener() {
     let gw = attach_gateway(vec![gw_listener("db", 5432, "TCP")]);
@@ -3279,9 +3280,10 @@ fn oldest_tcp_route_owns_its_listener() {
         assert_eq!(tcp_backend_port(&table, 5432), Some(7001));
         assert!(status_of(&result, "older").accepted);
         let loser = status_of(&result, "newer");
-        assert!(!loser.accepted);
-        assert_eq!(loser.accepted_reason, "Conflicted");
-        // Still attached by allowedRoutes and parentRef: attachedRoutes counts it.
+        assert!(loser.accepted);
+        assert_eq!(loser.accepted_reason, "Accepted");
+        assert!(loser.message.contains("no traffic"), "{}", loser.message);
+        // Attached by allowedRoutes and parentRef: attachedRoutes counts it.
         assert_eq!(loser.listener_names, vec!["db".to_string()]);
     }
 }
@@ -3585,7 +3587,9 @@ fn udp_route_attaches_like_tcp() {
         7001
     );
     assert!(status_of(&result, "older").accepted);
-    assert_eq!(status_of(&result, "newer").accepted_reason, "Conflicted");
+    let newer = status_of(&result, "newer");
+    assert!(newer.accepted);
+    assert_eq!(newer.listener_names.len(), 1, "attachedRoutes counts it");
 }
 
 /// DNS over TCP and UDP on one port: both listeners are served, each with
@@ -3950,13 +3954,8 @@ fn edge_route<K: serde::de::DeserializeOwned>(
     name: &str,
     rule: serde_json::Value,
 ) -> K {
-    let version = if kind == "HTTPRoute" {
-        "v1"
-    } else {
-        "v1alpha2"
-    };
     serde_json::from_value(serde_json::json!({
-        "apiVersion": format!("gateway.networking.k8s.io/{version}"),
+        "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": kind,
         "metadata": {"name": name, "namespace": "default"},
         "spec": {"parentRefs": [{"name": "multi-gw"}], "rules": [rule]}

@@ -20,7 +20,7 @@ This project was originaly a way for me to learn about io_uring and eBPF.
 But in front of the complexity, I took a step back and removed both the io_uring
 and eBPF implementations that were getting out of hands in favor of Tokio runtime.
 
-Portail targets **Gateway API v1.4.1** and does not support the mesh (GAMMA) profile.
+Portail targets **Gateway API v1.7.0** and does not support the mesh (GAMMA) profile.
 HTTP/2 is opt-in on HTTPS listeners via `--http2`, standalone or in an Unmanaged data plane.
 I plan on adding gRPC support in a future release.
 
