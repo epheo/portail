@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use gateway_api::experimental::tcproutes::v1::*;
@@ -21,8 +21,12 @@ use super::converters::{
 };
 use super::crds::{ExternalNameBackends, RateLimitPolicy};
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
+use super::reads::Recorded;
 use super::reference_grants::{is_reference_allowed, listeners_for_parent_ref};
-use super::services::ServiceState;
+use super::services::{
+    is_external_name, referenced_backends, resolve_backends, NamedTargetPortReq,
+};
+use k8s_openapi::api::core::v1::Namespace;
 
 // ---------------------------------------------------------------------------
 // Reconciliation input types — structured parameters for reconcile_to_config
@@ -39,9 +43,10 @@ pub(crate) struct ClusterSnapshot {
     pub tcp_routes: Vec<Arc<TcpRoute>>,
     pub tls_routes: Vec<Arc<TlsRoute>>,
     pub udp_routes: Vec<Arc<UdpRoute>>,
-    pub namespace_labels: HashMap<String, BTreeMap<String, String>>,
-    pub reference_grants: Vec<ReferenceGrant>,
-    pub services: Vec<Arc<Service>>,
+    /// Read through: a label lookup is a read of that namespace.
+    pub namespaces: Recorded<Namespace>,
+    /// Read through: a cross-namespace check reads its target namespace.
+    pub reference_grants: Recorded<ReferenceGrant>,
     /// Pre-filtered to policies targeting this Gateway, like routes.
     pub rate_limit_policies: Vec<Arc<RateLimitPolicy>>,
     /// This controller's Gateways by (namespace, name), with their
@@ -239,6 +244,9 @@ pub struct ReconcileResult {
     /// (namespace, name) of each Gateway a backendRef names past its
     /// ReferenceGrant, valid or not.
     pub gateway_targets: BTreeSet<(String, String)>,
+    /// The headless Services this Gateway routes to whose targetPort is
+    /// named, for a one-shot EndpointSlice list.
+    pub(crate) named_target_ports: Vec<NamedTargetPortReq>,
 }
 
 /// Computed Accepted condition for one RateLimitPolicy against this Gateway.
@@ -344,7 +352,7 @@ pub(crate) fn reconcile_to_config(
     gateway: &Gateway,
     snapshot: &ClusterSnapshot,
     cert_data: &CertData,
-    services: &ServiceState,
+    services: &Recorded<Service>,
     verdicts: &RouteVerdicts,
     external_name_backends: ExternalNameBackends,
     dials_out: bool,
@@ -377,7 +385,6 @@ pub(crate) fn reconcile_to_config(
 
     let mut route_status = Vec::new();
 
-    let none_refused = HashSet::new();
     let cx = RouteCollectCtx {
         gateway_name,
         gateway_ns,
@@ -388,13 +395,10 @@ pub(crate) fn reconcile_to_config(
         gateways: &snapshot.gateways,
         watched: Default::default(),
         listeners: &listeners,
-        namespace_labels: &snapshot.namespace_labels,
+        namespaces: &snapshot.namespaces,
         reference_grants: &snapshot.reference_grants,
-        known_services: &services.known_services,
-        refused_external_names: match external_name_backends {
-            ExternalNameBackends::Refused => &services.external_names,
-            ExternalNameBackends::Allowed => &none_refused,
-        },
+        services,
+        refuse_external_names: external_name_backends == ExternalNameBackends::Refused,
     };
     let gateway_key = (gateway_ns.to_string(), gateway_name.to_string());
     let mut checks = Checks {
@@ -417,23 +421,24 @@ pub(crate) fn reconcile_to_config(
         tcp_routes: tcp_route_configs,
         tls_routes: tls_route_configs,
         udp_routes: udp_route_configs,
-        endpoint_overrides: services.endpoint_overrides.clone(),
-        app_protocol_overrides: services.app_protocol_overrides.clone(),
-        headless_target_ports: services.headless_target_ports.clone(),
         ..Default::default()
     };
-    // Only the names this Gateway routes to: the cluster's every Service
+    // Only the Services this Gateway routes to: the cluster's every Service
     // would grow each snapshot and move its version on any Service change.
-    config.cluster_ip_backends = config
-        .backend_names()
-        .filter(|name| services.cluster_ip_backends.contains(*name))
-        .map(String::from)
-        .collect();
+    // A refused ref reads nothing: no output depends on its Service.
+    let referenced = referenced_backends(&config);
+    let (resolved, named_target_ports) =
+        resolve_backends(services, referenced.iter().map(|(name, _)| name.as_str()));
+    config.endpoint_overrides = resolved.endpoint_overrides;
+    config.app_protocol_overrides = resolved.app_protocol_overrides;
+    config.headless_target_ports = resolved.headless_target_ports;
+    config.cluster_ip_backends = resolved.cluster_ip_backends.into_iter().collect();
     Ok(ReconcileResult {
         config,
         route_status,
         policy_status,
         gateway_targets: cx.watched.into_inner(),
+        named_target_ports,
     })
 }
 
@@ -700,10 +705,11 @@ struct RouteCollectCtx<'a> {
     /// The Gateways this one's refs name past their ReferenceGrant.
     watched: std::cell::RefCell<BTreeSet<(String, String)>>,
     listeners: &'a [GatewayListeners],
-    namespace_labels: &'a HashMap<String, BTreeMap<String, String>>,
-    reference_grants: &'a [ReferenceGrant],
-    known_services: &'a HashSet<(String, String)>,
-    refused_external_names: &'a HashSet<(String, String)>,
+    namespaces: &'a Recorded<Namespace>,
+    reference_grants: &'a Recorded<ReferenceGrant>,
+    /// Each backendRef's Service is looked up here: a read of that one.
+    services: &'a Recorded<Service>,
+    refuse_external_names: bool,
 }
 
 /// Gateway API precedence between routes whose matches tie: the oldest
@@ -856,7 +862,7 @@ fn collect_routes<R: GatewayRoute>(
                             route_ns,
                             kind,
                             route_hostnames,
-                            cx.namespace_labels,
+                            cx.namespaces,
                         );
                         let attached = served.clone().unwrap_or_default();
                         let mut lost = false;
@@ -964,19 +970,13 @@ fn collect_routes<R: GatewayRoute>(
                         ),
                     ));
                 }
-                if !cx
-                    .known_services
-                    .contains(&(svc_name.clone(), svc_ns.clone()))
-                {
+                let Some(svc) = cx.services.get(&svc_ns, &svc_name) else {
                     return Some((
                         "BackendNotFound",
                         format!("Backend service {}.{} not found", svc_name, svc_ns),
                     ));
-                }
-                if cx
-                    .refused_external_names
-                    .contains(&(svc_name.clone(), svc_ns.clone()))
-                {
+                };
+                if cx.refuse_external_names && is_external_name(&svc) {
                     return Some((
                         "InvalidKind",
                         format!(

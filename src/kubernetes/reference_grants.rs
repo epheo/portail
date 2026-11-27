@@ -3,10 +3,11 @@
 //! Pure functions for checking namespace scoping, listener policy, and
 //! cross-namespace reference permissions per Gateway API spec.
 
-use std::collections::{BTreeMap, HashMap};
-
 use gateway_api::gateways::{GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom};
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
+use k8s_openapi::api::core::v1::Namespace;
+
+use super::reads::Recorded;
 
 use super::hostname::hostnames_intersect;
 use super::parent_ref::ParentRefAccess;
@@ -17,7 +18,7 @@ pub(crate) fn is_route_allowed_by_listener(
     gateway_ns: &str,
     route_ns: &str,
     route_kind: &str,
-    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+    namespace_store: &Recorded<Namespace>,
 ) -> bool {
     // The listener protocol decides the route kinds it takes. A listener the
     // data plane cannot run takes none.
@@ -57,10 +58,12 @@ pub(crate) fn is_route_allowed_by_listener(
         None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gateway_ns,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
-            let labels = match namespace_labels.get(route_ns) {
-                Some(l) => l,
-                None => return false,
+            // A read of this namespace alone: a label elsewhere selects
+            // no route of this listener.
+            let Some(namespace) = namespace_store.get_cluster(route_ns) else {
+                return false;
             };
+            let labels = namespace.metadata.labels.clone().unwrap_or_default();
             let selector = match &namespaces.selector {
                 Some(s) => s,
                 None => return true,
@@ -123,7 +126,7 @@ pub(crate) fn listeners_for_parent_ref<T: ParentRefAccess>(
     route_ns: &str,
     route_kind: &str,
     route_hostnames: &[String],
-    namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+    namespaces: &Recorded<Namespace>,
 ) -> Result<Vec<String>, &'static str> {
     let priority = |r: &str| match r {
         "NotAllowedByListeners" => 2,
@@ -149,13 +152,7 @@ pub(crate) fn listeners_for_parent_ref<T: ParentRefAccess>(
             }
             continue;
         }
-        if is_route_allowed_by_listener(
-            listener,
-            gateway_ns,
-            route_ns,
-            route_kind,
-            namespace_labels,
-        ) {
+        if is_route_allowed_by_listener(listener, gateway_ns, route_ns, route_kind, namespaces) {
             allowed.push(listener.name.clone());
         } else if priority("NotAllowedByListeners") > priority(best_reason) {
             best_reason = "NotAllowedByListeners";
@@ -171,7 +168,7 @@ pub(crate) fn listeners_for_parent_ref<T: ParentRefAccess>(
 /// Check if a cross-namespace reference is allowed by a ReferenceGrant.
 /// Same-namespace references are always allowed.
 pub(crate) fn is_reference_allowed(
-    grants: &[ReferenceGrant],
+    grants: &Recorded<ReferenceGrant>,
     from_group: &str,
     from_kind: &str,
     from_namespace: &str,
@@ -184,13 +181,8 @@ pub(crate) fn is_reference_allowed(
         return true;
     }
 
-    // Scan grants that live in the target namespace
-    for grant in grants {
-        let grant_ns = grant.metadata.namespace.as_deref().unwrap_or("default");
-        if grant_ns != to_namespace {
-            continue;
-        }
-
+    // The grants of the target namespace: a read of that namespace's.
+    for grant in grants.in_namespace(to_namespace) {
         let from_match =
             grant.spec.from.iter().any(|f| {
                 f.group == from_group && f.kind == from_kind && f.namespace == from_namespace
@@ -243,7 +235,13 @@ mod tests {
     #[test]
     fn allowed_kind_of_another_group_admits_nothing() {
         let allowed = |listener: &GatewayListeners| {
-            is_route_allowed_by_listener(listener, "ns", "ns", "HTTPRoute", &HashMap::new())
+            is_route_allowed_by_listener(
+                listener,
+                "ns",
+                "ns",
+                "HTTPRoute",
+                &crate::kubernetes::reads::namespaces(&Default::default()),
+            )
         };
         assert!(!allowed(&http_listener(vec![(
             Some("example.com"),

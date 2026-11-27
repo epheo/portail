@@ -27,6 +27,7 @@ mod translate;
 mod validate;
 mod watch;
 
+use crate::kubernetes::reads::{Kind as ReadKind, ReadIndex, Recorded};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::api::Api;
@@ -34,7 +35,7 @@ use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
 use kube::runtime::{reflector, Controller, WatchStreamExt};
-use kube::Client;
+use kube::{Client, ResourceExt};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,14 +89,14 @@ struct ResourceCache {
     tcp_routes: Store<TcpRoute>,
     tls_routes: Store<TlsRoute>,
     udp_routes: Store<UdpRoute>,
-    namespaces: Store<Namespace>,
-    services: Store<Service>,
+    namespaces: Recorded<Namespace>,
+    services: Recorded<Service>,
     secrets: Store<Secret>,
-    reference_grants: Store<ReferenceGrant>,
+    reference_grants: Recorded<ReferenceGrant>,
     /// Portail's own policy CRD; empty store when the CRD is not installed.
     rate_limit_policies: Store<RateLimitPolicy>,
     /// Empty store when the CRD is not installed.
-    gateway_parameters: Store<GatewayParameters>,
+    gateway_parameters: Recorded<GatewayParameters>,
 }
 
 struct ControllerCtx {
@@ -112,6 +113,8 @@ struct ControllerCtx {
     reports: Arc<ReportStore>,
     /// Who names whom as a backend of kind Gateway, and what each exposes.
     backends: Arc<gateway_backends::GatewayBackends>,
+    /// What each Gateway's passes read of the recorded kinds.
+    reads: Arc<ReadIndex>,
     leader: leader::Leader,
     /// Whether every reflector delivered its initial list, and which did
     /// not. The sync server answers 503 until then, /readyz names them.
@@ -281,13 +284,17 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             tcp_routes: store_tcp_routes,
             tls_routes: store_tls_routes,
             udp_routes: store_udp_routes,
-            namespaces: store_namespaces,
-            services: store_services,
+            namespaces: Recorded::new(store_namespaces, ReadKind::Namespace),
+            services: Recorded::new(store_services, ReadKind::Service),
             secrets: store_secrets,
-            reference_grants: store_reference_grants,
+            reference_grants: Recorded::new(store_reference_grants, ReadKind::ReferenceGrant),
             rate_limit_policies: store_rate_limit_policies,
-            gateway_parameters: store_gateway_parameters,
+            gateway_parameters: Recorded::new(
+                store_gateway_parameters,
+                ReadKind::GatewayParameters,
+            ),
         },
+        reads: Arc::default(),
         route_verdicts: Arc::default(),
         // A stale read lasts as long as before the cache: every requeue
         // listed the slices again.
@@ -409,6 +416,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         std::array::from_fn::<_, 11, _>(|_| store_gateways.clone());
     let [cn1, cn2, cn3, cn4, cn5] =
         std::array::from_fn::<_, 5, _>(|_| args.controller_name.clone());
+    let [reads1, reads2, reads3, reads4] = std::array::from_fn::<_, 4, _>(|_| ctx.reads.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
@@ -436,23 +444,31 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         // These have multi-hop mappings; the 1s debounce coalesces bursts.
         // (No EndpointSlice watch: backend pod churn is picked up by the data
         // planes' DNS refresh, which their reports carry back.)
-        .watches_stream(service_stream, move |_: Service| all_gateway_refs(&gw7))
-        .watches_stream(namespace_stream, move |_: Namespace| all_gateway_refs(&gw8))
-        .watches_stream(reference_grant_stream, move |_: ReferenceGrant| {
-            all_gateway_refs(&gw9)
+        // Only the Gateways whose passes read the object, and those with
+        // none recorded yet.
+        .watches_stream(service_stream, move |svc: Service| {
+            service_readers(&reads1, &gw7, &svc)
+        })
+        .watches_stream(namespace_stream, move |ns: Namespace| {
+            readers(&reads2, &gw8, ReadKind::Namespace, &ns)
+        })
+        .watches_stream(reference_grant_stream, move |grant: ReferenceGrant| {
+            readers(&reads3, &gw9, ReadKind::ReferenceGrant, &grant)
         })
         // A class appearing or changing controllerName flips which Gateways
         // are ours, so re-evaluate all of them.
         .watches_stream(gateway_class_stream, move |_: GatewayClass| {
             all_gateway_refs(&gw10)
         })
-        .watches_stream(params_stream, move |_: GatewayParameters| {
-            all_gateway_refs(&gw11)
+        .watches_stream(params_stream, move |params: GatewayParameters| {
+            readers(&reads4, &gw11, ReadKind::GatewayParameters, &params)
         })
         .reconcile_on(report_triggers)
         .reconcile_on(lapse_triggers)
         .reconcile_on(dependent_triggers)
         .reconcile_on(owned_triggers)
+        // Also what makes an early-ended pass's empty read set safe: see
+        // ReadIndex::during.
         .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         // In-flight passes finish before the lease is released below.
@@ -585,9 +601,48 @@ async fn timed_reconcile(
     ctx: Arc<ControllerCtx>,
 ) -> Result<Action, ReconcileError> {
     let start = std::time::Instant::now();
-    let done = reconcile(gateway, ctx).await;
+    let key = GatewayKey::new(gateway.namespace().unwrap_or_default(), gateway.name_any());
+    let reads = ctx.reads.clone();
+    let done = reads.during(key, reconcile(gateway, ctx)).await;
     crate::metrics::RECONCILE_DURATION.observe(start.elapsed());
     done
+}
+
+/// The Gateways a change to `object` of `kind` wakes: those whose passes
+/// read it, and those with no pass recorded yet.
+fn readers<K: kube::Resource>(
+    reads: &ReadIndex,
+    gateways: &Store<Gateway>,
+    kind: ReadKind,
+    object: &K,
+) -> Vec<ObjectRef<Gateway>> {
+    let meta = object.meta();
+    let namespace = meta.namespace.as_deref().unwrap_or_default();
+    let name = meta.name.as_deref().unwrap_or_default();
+    let keys: Vec<GatewayKey> = gateways
+        .state()
+        .iter()
+        .map(|gw| GatewayKey::new(gw.namespace().unwrap_or_default(), gw.name_any()))
+        .collect();
+    reads
+        .readers(kind, namespace, name, &keys)
+        .into_iter()
+        .map(|key| ObjectRef::new(&key.name).within(&key.namespace))
+        .collect()
+}
+
+/// [`readers`], and the Service's owner: a pass deletes the Services it
+/// owns, and reads no other Service of its namespace to find them.
+fn service_readers(
+    reads: &ReadIndex,
+    gateways: &Store<Gateway>,
+    svc: &Service,
+) -> Vec<ObjectRef<Gateway>> {
+    let mut woken = readers(reads, gateways, ReadKind::Service, svc);
+    let owner = provision::controller_gateway(&svc.metadata)
+        .filter(|gw| gateways.get(gw).is_some() && !woken.contains(gw));
+    woken.extend(owner);
+    woken
 }
 
 /// The retry of a failed pass: the cadence v0.1.x error_policy used, slow
@@ -606,6 +661,175 @@ fn error_policy(_obj: Arc<Gateway>, _error: &ReconcileError, _ctx: Arc<Controlle
 mod tests {
     use super::testkit::{self, apply, Pipeline};
     use super::*;
+    use serde_json::json;
+
+    fn woken<K: kube::Resource>(
+        p: &Pipeline,
+        kind: ReadKind,
+        object: &K,
+    ) -> Vec<ObjectRef<Gateway>> {
+        readers(&p.ctx.reads, &p.ctx.cache.gateways, kind, object)
+    }
+
+    fn gw_ref() -> Vec<ObjectRef<Gateway>> {
+        vec![ObjectRef::new("gw").within("default")]
+    }
+
+    /// A Pipeline holding Gateway `gw` and `route`, after one pass.
+    async fn passed(gw: Gateway, route: HttpRoute, setup: impl FnOnce(&mut Pipeline)) -> Pipeline {
+        let mut p = Pipeline::new();
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.http_routes, route);
+        setup(&mut p);
+        p.pass(&gw).await.unwrap();
+        p
+    }
+
+    /// The Services a route names wake its Gateway, found or not; any
+    /// other Service does not.
+    #[tokio::test]
+    async fn a_pass_is_woken_by_the_services_it_routes_to() {
+        let route = testkit::http_route("r", &["gw"], 1);
+        let mut route = testkit::with_backend(route, "web", 80);
+        let rule = &mut route.spec.rules.as_mut().unwrap()[0];
+        rule.backend_refs
+            .as_mut()
+            .unwrap()
+            .push(serde_json::from_value(json!({"name": "later", "port": 80})).unwrap());
+        let web = testkit::service("web", "http", 80, json!(8080));
+        let other = testkit::service("other", "http", 80, json!(8080));
+        let mut p = Pipeline::new();
+        apply(&mut p.cluster.gateways, testkit::gateway("gw", 1));
+        assert_eq!(
+            woken(&p, ReadKind::Service, &other),
+            gw_ref(),
+            "no pass yet"
+        );
+
+        let p = passed(testkit::gateway("gw", 1), route, |p| {
+            apply(&mut p.cluster.services, web.clone());
+            apply(&mut p.cluster.services, other.clone());
+        })
+        .await;
+        let later = testkit::service("later", "http", 80, json!(8080));
+        assert_eq!(woken(&p, ReadKind::Service, &web), gw_ref());
+        assert_eq!(woken(&p, ReadKind::Service, &later), gw_ref(), "created");
+        assert!(woken(&p, ReadKind::Service, &other).is_empty());
+    }
+
+    /// A Service the Gateway owns wakes it, read or not: its pass deletes
+    /// the ones it no longer wants.
+    #[tokio::test]
+    async fn an_owned_service_wakes_its_owner() {
+        let gw = testkit::gateway("gw", 1);
+        let p = passed(gw.clone(), testkit::http_route("r", &["gw"], 1), |_| ()).await;
+        let mut owned = testkit::service("gw-portail-old", "http", 80, json!(8080));
+        owned.metadata.owner_references = Some(vec![serde_json::from_value(json!({
+            "apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+            "name": "gw", "uid": "gw-uid", "controller": true,
+        }))
+        .unwrap()]);
+        assert_eq!(
+            service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &owned),
+            gw_ref()
+        );
+        let foreign = testkit::service("gw-portail-old", "http", 80, json!(8080));
+        assert!(service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &foreign).is_empty());
+    }
+
+    /// A standby's pass reads nothing, so no Service wakes it: safe only
+    /// because gaining the lease re-runs every Gateway, and that pass reads.
+    #[tokio::test]
+    async fn a_standby_pass_reads_nothing_until_the_lease_is_gained() {
+        use futures::FutureExt;
+        let leader = leader::Leader::standby();
+        let mut p = Pipeline::led_by(leader.clone());
+        let gw = testkit::gateway("gw", 1);
+        let web = testkit::service("web", "http", 80, json!(8080));
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.services, web.clone());
+        let route = testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 80);
+        apply(&mut p.cluster.http_routes, route);
+        p.pass(&gw).await.unwrap();
+        assert!(woken(&p, ReadKind::Service, &web).is_empty());
+
+        let mut gained = leader.gained();
+        assert_eq!(gained.next().now_or_never(), None);
+        leader.lead();
+        assert_eq!(
+            gained.next().now_or_never(),
+            Some(Some(())),
+            "the wake that re-runs every Gateway"
+        );
+        p.pass(&gw).await.unwrap();
+        assert_eq!(woken(&p, ReadKind::Service, &web), gw_ref());
+    }
+
+    /// A cross-namespace backend reads the grants of its namespace alone.
+    #[tokio::test]
+    async fn a_pass_is_woken_by_the_grants_of_namespaces_it_reaches() {
+        let mut route = testkit::http_route("r", &["gw"], 1);
+        route.spec.rules = Some(vec![serde_json::from_value(json!({
+            "backendRefs": [{"name": "db", "namespace": "data", "port": 5432}],
+        }))
+        .unwrap()]);
+        let p = passed(testkit::gateway("gw", 1), route, |_| ()).await;
+        let grant = |ns: &str| {
+            let mut grant = ReferenceGrant::new("g", Default::default());
+            grant.metadata.namespace = Some(ns.into());
+            grant
+        };
+        assert_eq!(
+            woken(&p, ReadKind::ReferenceGrant, &grant("data")),
+            gw_ref()
+        );
+        assert!(woken(&p, ReadKind::ReferenceGrant, &grant("elsewhere")).is_empty());
+    }
+
+    /// The Gateway's own parameters wake it; another's do not.
+    #[tokio::test]
+    async fn a_pass_is_woken_by_its_own_parameters() {
+        let p = passed(
+            testkit::gateway("gw", 1),
+            testkit::http_route("r", &["gw"], 1),
+            |_| (),
+        )
+        .await;
+        let params = |name: &str| {
+            let mut params = GatewayParameters::new(name, Default::default());
+            params.metadata.namespace = Some("default".into());
+            params
+        };
+        assert_eq!(
+            woken(&p, ReadKind::GatewayParameters, &params("unmanaged")),
+            gw_ref()
+        );
+        assert!(woken(&p, ReadKind::GatewayParameters, &params("another")).is_empty());
+    }
+
+    /// A Selector listener reads the labels of the namespaces its routes
+    /// live in, and of no other.
+    #[tokio::test]
+    async fn a_pass_is_woken_by_the_namespaces_its_selector_looked_up() {
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].allowed_routes = Some(
+            serde_json::from_value(json!({
+                "namespaces": {"from": "Selector", "selector": {"matchLabels": {"team": "a"}}},
+            }))
+            .unwrap(),
+        );
+        let mut route = testkit::http_route("r", &["gw"], 1);
+        route.metadata.namespace = Some("apps".into());
+        route.spec.parent_refs.as_mut().unwrap()[0].namespace = Some("default".into());
+        let p = passed(gw, route, |_| ()).await;
+        let namespace = |name: &str| {
+            let mut ns = Namespace::default();
+            ns.metadata.name = Some(name.into());
+            ns
+        };
+        assert_eq!(woken(&p, ReadKind::Namespace, &namespace("apps")), gw_ref());
+        assert!(woken(&p, ReadKind::Namespace, &namespace("other")).is_empty());
+    }
 
     #[tokio::test]
     async fn a_report_trigger_reconciles_its_gateway() {
@@ -618,6 +842,320 @@ mod tests {
             report_trigger(&p.ctx, trigger),
             ObjectRef::<Gateway>::new("web").within("apps")
         );
+    }
+
+    /// What a pass hands on: the snapshot it serves and what it wrote.
+    fn output(p: &Pipeline, gw: &Gateway) -> serde_json::Value {
+        fn untimed(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("lastTransitionTime");
+                    map.values_mut().for_each(untimed);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(untimed),
+                _ => {}
+            }
+        }
+        let writes: Vec<_> = p
+            .api
+            .requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| json!([r.method, r.path, r.body]))
+            .collect();
+        let mut out = json!({
+            "served": p.served(gw).map(|s| serde_json::to_value(&*s).unwrap()),
+            "writes": writes,
+        });
+        untimed(&mut out);
+        out
+    }
+
+    fn named<K>(ns: Option<&str>, name: &str, body: serde_json::Value) -> K
+    where
+        K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned,
+    {
+        let mut body = body;
+        body.as_object_mut()
+            .unwrap()
+            .entry("metadata")
+            .or_insert_with(|| json!({}));
+        let mut object: K = serde_json::from_value(body).unwrap();
+        object.meta_mut().name = Some(name.into());
+        object.meta_mut().namespace = ns.map(String::from);
+        object.meta_mut().resource_version = Some("1".into());
+        object
+    }
+
+    fn namespace(name: &str, labels: serde_json::Value) -> Namespace {
+        named(None, name, json!({"metadata": {"labels": labels}}))
+    }
+
+    fn svc(ns: &str, name: &str, spec: serde_json::Value) -> Service {
+        named(Some(ns), name, json!({"spec": spec}))
+    }
+
+    fn grant(ns: &str, name: &str) -> ReferenceGrant {
+        named(
+            Some(ns),
+            name,
+            json!({"spec": {
+                "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "default"}],
+                "to": [{"group": "", "kind": "Service"}],
+            }}),
+        )
+    }
+
+    fn params(name: &str, labels: serde_json::Value) -> GatewayParameters {
+        let mut params: GatewayParameters = named(
+            Some("default"),
+            name,
+            json!({"spec": {"provisioning": "Unmanaged", "externalNameBackends": "Allowed"}}),
+        );
+        params.metadata.labels = serde_json::from_value(labels).unwrap();
+        params
+    }
+
+    /// A Gateway whose routes read each recorded kind: a Selector listener,
+    /// a route in another namespace, a cross-namespace backend, Services of
+    /// each type, and objects of each kind it reads none of.
+    fn read_everywhere(p: &mut Pipeline) -> Gateway {
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].allowed_routes = Some(
+            serde_json::from_value(json!({
+                "namespaces": {"from": "Selector", "selector": {"matchLabels": {"team": "a"}}},
+            }))
+            .unwrap(),
+        );
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.namespaces,
+            namespace("default", json!({"team": "a"})),
+        );
+        apply(&mut p.cluster.namespaces, namespace("apps", json!({})));
+        apply(&mut p.cluster.namespaces, namespace("data", json!({})));
+        let mut local = testkit::http_route("local", &["gw"], 1);
+        local.spec.rules = Some(vec![serde_json::from_value(json!({"backendRefs": [
+            {"name": "web", "port": 80},
+            {"name": "hl", "port": 81},
+            {"name": "ext", "port": 443},
+            {"name": "db", "namespace": "data", "port": 5432},
+        ]}))
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, local);
+        let mut away = testkit::with_backend(testkit::http_route("away", &["gw"], 1), "web2", 80);
+        away.metadata.namespace = Some("apps".into());
+        away.spec.parent_refs.as_mut().unwrap()[0].namespace = Some("default".into());
+        apply(&mut p.cluster.http_routes, away);
+        for service in [
+            svc(
+                "default",
+                "web",
+                json!({"clusterIP": "10.96.0.1", "ports": [{"port": 80}]}),
+            ),
+            svc(
+                "default",
+                "hl",
+                json!({"clusterIP": "None", "ports": [{"port": 81, "targetPort": 8081}]}),
+            ),
+            svc(
+                "default",
+                "ext",
+                json!({"type": "ExternalName", "externalName": "x.example", "ports": [{"port": 443}]}),
+            ),
+            svc(
+                "default",
+                "noise",
+                json!({"clusterIP": "10.96.0.9", "ports": [{"port": 80}]}),
+            ),
+            svc(
+                "apps",
+                "web2",
+                json!({"clusterIP": "10.96.0.2", "ports": [{"port": 80}]}),
+            ),
+        ] {
+            apply(&mut p.cluster.services, service);
+        }
+        apply(&mut p.cluster.reference_grants, grant("elsewhere", "g"));
+        apply(&mut p.cluster.parameters, params("unmanaged", json!({})));
+        apply(&mut p.cluster.parameters, params("another", json!({})));
+        gw
+    }
+
+    /// The index is complete: a change it wakes a Gateway for none leaves
+    /// that Gateway's next pass exactly as it was. And each object a pass
+    /// read does wake it.
+    #[tokio::test]
+    async fn a_change_that_wakes_nothing_changes_no_pass() {
+        use kube::runtime::watcher::Event;
+        type Change = fn(&mut Pipeline, &ObjectRef<Gateway>) -> bool;
+        fn put<K>(p: &Pipeline, gw: &ObjectRef<Gateway>, object: &K, kind: ReadKind) -> bool
+        where
+            K: kube::Resource,
+        {
+            woken(p, kind, object).contains(gw)
+        }
+        let changes: [(&str, bool, Change); 17] = [
+            ("a routed Service changes", true, |p, gw| {
+                let s = svc(
+                    "default",
+                    "web",
+                    json!({"clusterIP": "10.96.0.1", "ports": [{"port": 80, "appProtocol": "kubernetes.io/h2c"}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            ("a headless backend's targetPort changes", true, |p, gw| {
+                let s = svc(
+                    "default",
+                    "hl",
+                    json!({"clusterIP": "None", "ports": [{"port": 81, "targetPort": 9091}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            ("an ExternalName backend's target changes", true, |p, gw| {
+                let s = svc(
+                    "default",
+                    "ext",
+                    json!({"type": "ExternalName", "externalName": "y.example", "ports": [{"port": 443}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            ("a routed Service is deleted", true, |p, gw| {
+                let s = svc(
+                    "default",
+                    "web",
+                    json!({"clusterIP": "10.96.0.1", "ports": [{"port": 80}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                p.cluster.services.apply_watcher_event(&Event::Delete(s));
+                woken
+            }),
+            ("a refused backend's Service is created", false, |p, gw| {
+                let s = svc(
+                    "data",
+                    "db",
+                    json!({"clusterIP": "10.96.0.3", "ports": [{"port": 5432}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            ("an unrouted Service changes", false, |p, gw| {
+                let s = svc(
+                    "default",
+                    "noise",
+                    json!({"clusterIP": "10.96.0.9", "ports": [{"port": 8080}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            ("an unrouted Service is created", false, |p, gw| {
+                let s = svc(
+                    "default",
+                    "late",
+                    json!({"clusterIP": "10.96.0.8", "ports": [{"port": 80}]}),
+                );
+                let woken = service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &s).contains(gw);
+                apply(&mut p.cluster.services, s);
+                woken
+            }),
+            (
+                "a route's namespace gets the selected label",
+                true,
+                |p, gw| {
+                    let ns = namespace("apps", json!({"team": "a"}));
+                    let woken = put(p, gw, &ns, ReadKind::Namespace);
+                    apply(&mut p.cluster.namespaces, ns);
+                    woken
+                },
+            ),
+            ("the Gateway's namespace loses it", true, |p, gw| {
+                let ns = namespace("default", json!({}));
+                let woken = put(p, gw, &ns, ReadKind::Namespace);
+                apply(&mut p.cluster.namespaces, ns);
+                woken
+            }),
+            ("a backend's namespace is labelled", false, |p, gw| {
+                let ns = namespace("data", json!({"team": "a"}));
+                let woken = put(p, gw, &ns, ReadKind::Namespace);
+                apply(&mut p.cluster.namespaces, ns);
+                woken
+            }),
+            (
+                "a namespace no route lives in is created",
+                false,
+                |p, gw| {
+                    let ns = namespace("fresh", json!({"team": "a"}));
+                    let woken = put(p, gw, &ns, ReadKind::Namespace);
+                    apply(&mut p.cluster.namespaces, ns);
+                    woken
+                },
+            ),
+            ("a grant lets a backend in", true, |p, gw| {
+                let g = grant("data", "g");
+                let woken = put(p, gw, &g, ReadKind::ReferenceGrant);
+                apply(&mut p.cluster.reference_grants, g);
+                woken
+            }),
+            ("a grant in a namespace no ref reaches", false, |p, gw| {
+                let mut g = grant("elsewhere", "g");
+                g.metadata.labels = Some([("v".to_string(), "2".to_string())].into());
+                let woken = put(p, gw, &g, ReadKind::ReferenceGrant);
+                apply(&mut p.cluster.reference_grants, g);
+                woken
+            }),
+            ("a grant in the Gateway's own namespace", false, |p, gw| {
+                let g = grant("default", "g");
+                let woken = put(p, gw, &g, ReadKind::ReferenceGrant);
+                apply(&mut p.cluster.reference_grants, g);
+                woken
+            }),
+            ("the Gateway's parameters change", true, |p, gw| {
+                let params = params("unmanaged", json!({"v": "2"}));
+                let woken = put(p, gw, &params, ReadKind::GatewayParameters);
+                apply(&mut p.cluster.parameters, params);
+                woken
+            }),
+            ("other parameters change", false, |p, gw| {
+                let params = params("another", json!({"v": "2"}));
+                let woken = put(p, gw, &params, ReadKind::GatewayParameters);
+                apply(&mut p.cluster.parameters, params);
+                woken
+            }),
+            ("other parameters are created", false, |p, gw| {
+                let params = params("fresh", json!({}));
+                let woken = put(p, gw, &params, ReadKind::GatewayParameters);
+                apply(&mut p.cluster.parameters, params);
+                woken
+            }),
+        ];
+        let mut changed = 0;
+        for (what, expected, change) in changes {
+            let mut p = Pipeline::new();
+            let gw = read_everywhere(&mut p);
+            let gw_ref = ObjectRef::from(&gw);
+            p.pass(&gw).await.unwrap();
+            p.api.clear();
+            p.pass(&gw).await.unwrap();
+            let before = output(&p, &gw);
+            p.api.clear();
+            let woken = change(&mut p, &gw_ref);
+            p.pass(&gw).await.unwrap();
+            let after = output(&p, &gw);
+            assert_eq!(woken, expected, "{what}: woken");
+            if !woken {
+                assert_eq!(before, after, "{what}: not woken, yet the pass changed");
+            }
+            changed += usize::from(before != after);
+        }
+        assert_eq!(changed, 7, "the changes that reach the output");
     }
 
     /// A data plane's DNS refresh saw backend pods move: the next pass reads

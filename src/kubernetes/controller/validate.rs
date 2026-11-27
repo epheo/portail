@@ -17,6 +17,9 @@ use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::converters::{secret_ref_key, CertData};
+#[cfg(test)]
+use crate::kubernetes::reads;
+use crate::kubernetes::reads::Recorded;
 use crate::kubernetes::reconciler::{listener_conflicts, listener_is_served};
 use crate::kubernetes::reference_grants::is_reference_allowed;
 use crate::kubernetes::status;
@@ -167,7 +170,7 @@ pub(super) fn resolve_cert_ref(
 pub(super) fn resolve_gateway_certs(
     gateway: &Gateway,
     gw_ns: &str,
-    reference_grants: &[ReferenceGrant],
+    reference_grants: &Recorded<ReferenceGrant>,
     store_secrets: &Store<Secret>,
     last_good: &LastGoodCerts,
 ) -> ResolvedCerts {
@@ -1035,7 +1038,13 @@ mod tests {
 
         let rotated = secret_at("uid-1", "12", &garbage());
         secrets.apply_watcher_event(&watcher::Event::Apply(rotated));
-        let resolved = resolve_gateway_certs(&https_gateway("cert"), "default", &[], &store, &last);
+        let resolved = resolve_gateway_certs(
+            &https_gateway("cert"),
+            "default",
+            &reads::grants([]),
+            &store,
+            &last,
+        );
         assert_eq!(resolved.valid.get(&key), Some(&new));
     }
 
@@ -1052,14 +1061,14 @@ mod tests {
         stored(&mut secrets, "uid-1", "certs", &good);
         let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
         let gw = gateway_with_cert_in("certs");
-        let grants = [secret_grant()];
+        let grants = reads::grants([secret_grant()]);
         let key = cert_key("certs");
 
         let resolved = resolve_gateway_certs(&gw, "default", &grants, &store, &last);
         assert_eq!(resolved.valid.get(&key), Some(&good));
         assert_eq!(carried_refs(&gw, &resolved), 1);
 
-        let resolved = resolve_gateway_certs(&gw, "default", &[], &store, &last);
+        let resolved = resolve_gateway_certs(&gw, "default", &reads::grants([]), &store, &last);
         assert!(resolved.valid.is_empty(), "revoked grant");
         assert_eq!(resolved.errors[&key].reason(), "RefNotPermitted");
         assert_eq!(carried_refs(&gw, &resolved), 0, "revoked grant");
@@ -1091,7 +1100,7 @@ mod tests {
         let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
         let gw = https_gateway("cert");
         let key = cert_key("default");
-        let resolve = || resolve_gateway_certs(&gw, "default", &[], &store, &last);
+        let resolve = || resolve_gateway_certs(&gw, "default", &reads::grants([]), &store, &last);
 
         stored(&mut secrets, "uid-1", "default", &good);
         assert_eq!(resolve().valid.get(&key), Some(&good));
@@ -1134,7 +1143,7 @@ mod tests {
         let resolved = resolve_gateway_certs(
             &gw,
             "default",
-            &[],
+            &reads::grants([]),
             &secrets.as_reader(),
             &LastGoodCerts::default(),
         );
