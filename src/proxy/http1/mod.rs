@@ -747,11 +747,11 @@ mod connection_tests {
     use crate::proxy::listener::{TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES};
     use crate::proxy::relay::handle_tls_passthrough;
     use crate::proxy::testkit::{
-        assert_never_connected, backend, client_hello, closing_backend, conn_state,
-        conn_state_header, delivered, exchange, gateway_backend, idle_backend, keepalive_where,
-        l4_backend, read_one_reply, read_until_closed, received, refusing_backend, response,
-        routes, routes_with_tcp, serve, serve_state, tcp_client, tls_client, tls_read_to_end,
-        GET_A, IDLE, OK, OPAQUE, REFUSED, UPGRADE,
+        assert_never_connected, backend, closing_backend, conn_state, conn_state_header, delivered,
+        exchange, gateway_backend, idle_backend, keepalive_where, l4_backend, read_one_reply,
+        read_until_closed, received, refusing_backend, response, routes, routes_with_tcp, serve,
+        serve_state, tcp_client, tls_client, tls_read_to_end, GET_A, IDLE, OK, OPAQUE, REFUSED,
+        UPGRADE,
     };
     use crate::routing::{
         Backend, HttpFilter, HttpHeader, HttpRouteRule, PathMatchType, URLRewritePath,
@@ -1052,68 +1052,6 @@ mod connection_tests {
             let (mut client, _task) = serve(rt);
             let out = exchange(&mut client, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await;
             assert!(out.starts_with(&format!("HTTP/1.1 {status} ")), "{out}");
-        }
-    }
-
-    /// A passthrough connection that drew an invalid backendRef's share
-    /// was said to find no route or no healthy backend.
-    #[tokio::test]
-    async fn tls_passthrough_says_why_it_has_no_backend() {
-        let mut rt = RouteTable::new();
-        rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
-        rt.add_tls_route(0, "unreported.test", vec![Backend::unavailable(1)]);
-        let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
-        weightless.weight = 0;
-        rt.add_tls_route(0, "weightless.test", vec![weightless]);
-        rt.add_tls_route(0, "empty.test", vec![]);
-        let routes = Arc::new(ArcSwap::from_pointee(rt));
-        let cfg = ServeConfig {
-            max_idle_per_backend: 4,
-            connect_timeout: Duration::from_secs(2),
-            client_header_timeout: Duration::from_secs(2),
-            tcp_keepalive_time: Duration::from_secs(60),
-            idle_body_timeout: Duration::from_secs(5),
-            http2: false,
-        };
-        for (sni, why) in [
-            ("rejected.test", "drew an invalid backendRef's share"),
-            ("unreported.test", "before any instance reported"),
-            ("weightless.test", "no backend with positive weight"),
-            ("empty.test", "no backends available"),
-            ("unrouted.test", "no route"),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mut client = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            client.write_all(&client_hello(sni)).await.unwrap();
-            let (server, peer) = listener.accept().await.unwrap();
-            let local = server.local_addr().unwrap();
-            let (health, selector): (Arc<HealthRegistry>, Arc<BackendSelector>) =
-                Default::default();
-            let miss = routes
-                .load()
-                .resolve_tls_passthrough(Some(sni), 8443, None, &selector, &health)
-                .unwrap_err()
-                .to_string();
-            assert!(miss.contains(why), "{sni}: {miss}");
-            // The handler closes it, with nothing left to report.
-            handle_tls_passthrough(
-                server,
-                (peer, local),
-                Some(sni),
-                None,
-                8443,
-                Arc::clone(&routes),
-                health,
-                selector,
-                &cfg,
-                &ListenerStats::default(),
-            )
-            .await;
-            // A reset: its ClientHello was never read.
-            let read = client.read(&mut [0u8; 8]).await;
-            assert!(!matches!(read, Ok(n) if n > 0), "{sni}: {read:?}");
         }
     }
 

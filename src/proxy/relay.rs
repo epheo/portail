@@ -269,7 +269,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::testkit::client_hello;
+    use crate::routing::Backend;
     use std::pin::Pin;
+    use tokio::net::TcpListener;
 
     /// What a relay direction reads next: `Some(n)` bytes, the whole buffer
     /// it is offered when `n` is larger, then silence. Records each buffer
@@ -370,5 +373,67 @@ mod tests {
         // A receiver that takes writes in pieces: no growth to begin with.
         let sizes = offered(&burst, HalfWrites, RELAY_BUF_IDLE / 2).await;
         assert_eq!(sizes, [8 * K]);
+    }
+
+    /// A passthrough connection that drew an invalid backendRef's share
+    /// was said to find no route or no healthy backend.
+    #[tokio::test]
+    async fn tls_passthrough_says_why_it_has_no_backend() {
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "rejected.test", vec![Backend::rejecting(1)]);
+        rt.add_tls_route(0, "unreported.test", vec![Backend::unavailable(1)]);
+        let mut weightless = Backend::new("127.0.0.1".to_string(), 9).unwrap();
+        weightless.weight = 0;
+        rt.add_tls_route(0, "weightless.test", vec![weightless]);
+        rt.add_tls_route(0, "empty.test", vec![]);
+        let routes = Arc::new(ArcSwap::from_pointee(rt));
+        let cfg = ServeConfig {
+            max_idle_per_backend: 4,
+            connect_timeout: Duration::from_secs(2),
+            client_header_timeout: Duration::from_secs(2),
+            tcp_keepalive_time: Duration::from_secs(60),
+            idle_body_timeout: Duration::from_secs(5),
+            http2: false,
+        };
+        for (sni, why) in [
+            ("rejected.test", "drew an invalid backendRef's share"),
+            ("unreported.test", "before any instance reported"),
+            ("weightless.test", "no backend with positive weight"),
+            ("empty.test", "no backends available"),
+            ("unrouted.test", "no route"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            client.write_all(&client_hello(sni)).await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let local = server.local_addr().unwrap();
+            let (health, selector): (Arc<HealthRegistry>, Arc<BackendSelector>) =
+                Default::default();
+            let miss = routes
+                .load()
+                .resolve_tls_passthrough(Some(sni), 8443, None, &selector, &health)
+                .unwrap_err()
+                .to_string();
+            assert!(miss.contains(why), "{sni}: {miss}");
+            // The handler closes it, with nothing left to report.
+            handle_tls_passthrough(
+                server,
+                (peer, local),
+                Some(sni),
+                None,
+                8443,
+                Arc::clone(&routes),
+                health,
+                selector,
+                &cfg,
+                &ListenerStats::default(),
+            )
+            .await;
+            // A reset: its ClientHello was never read.
+            let read = client.read(&mut [0u8; 8]).await;
+            assert!(!matches!(read, Ok(n) if n > 0), "{sni}: {read:?}");
+        }
     }
 }
