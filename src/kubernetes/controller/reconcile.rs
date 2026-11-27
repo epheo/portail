@@ -271,8 +271,10 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
     ctx.backends.retain(|key| live.contains(key));
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
+    ctx.reads.retain(|key| live.contains(key));
+    // Pruning by what is still named: no output of a pass.
     ctx.networks
-        .retain_named(&gateways, &ctx.cache.gateway_parameters.state());
+        .retain_named(&gateways, &ctx.cache.gateway_parameters.all_unrecorded());
     // Our route and policy entries for them go too (follow-up 11).
     ctx.departures.wake();
 }

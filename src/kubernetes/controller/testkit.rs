@@ -13,6 +13,8 @@ use kube::core::PartialObjectMeta;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher;
+
+use crate::kubernetes::reads::{Kind as ReadKind, Recorded as RecordedStore};
 use kube::Client;
 use serde_json::{json, Value};
 
@@ -226,12 +228,18 @@ impl TestCluster {
                 tcp_routes: self.tcp_routes.as_reader(),
                 tls_routes: self.tls_routes.as_reader(),
                 udp_routes: self.udp_routes.as_reader(),
-                namespaces: self.namespaces.as_reader(),
-                services: self.services.as_reader(),
+                namespaces: RecordedStore::new(self.namespaces.as_reader(), ReadKind::Namespace),
+                services: RecordedStore::new(self.services.as_reader(), ReadKind::Service),
                 secrets: self.secrets.as_reader(),
-                reference_grants: self.reference_grants.as_reader(),
+                reference_grants: RecordedStore::new(
+                    self.reference_grants.as_reader(),
+                    ReadKind::ReferenceGrant,
+                ),
                 rate_limit_policies: self.policies.as_reader(),
-                gateway_parameters: self.parameters.as_reader(),
+                gateway_parameters: RecordedStore::new(
+                    self.parameters.as_reader(),
+                    ReadKind::GatewayParameters,
+                ),
             },
             route_verdicts: Arc::default(),
             networks: Arc::default(),
@@ -242,6 +250,7 @@ impl TestCluster {
             hub: Arc::default(),
             reports: Arc::default(),
             backends: Arc::default(),
+            reads: Arc::default(),
             leader: super::leader::Leader::always(),
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(
@@ -330,14 +339,20 @@ impl Pipeline {
         }
     }
 
-    /// One reconcile of `gw`, its data plane in the loop.
+    /// One reconcile of `gw`, its data plane in the loop, its reads
+    /// recorded as the controller's are.
     pub async fn pass(&mut self, gw: &Gateway) -> Result<Action, ReconcileError> {
-        let step = publish(gw, &self.ctx).await;
-        self.sync(gw).await;
-        match step {
-            Step::Done(action) => Ok(action),
-            Step::Continue(pass) => finish(gw, &self.ctx, *pass).await,
-        }
+        let reads = self.ctx.reads.clone();
+        reads
+            .during(key(gw), async {
+                let step = publish(gw, &self.ctx).await;
+                self.sync(gw).await;
+                match step {
+                    Step::Done(action) => Ok(action),
+                    Step::Continue(pass) => finish(gw, &self.ctx, *pass).await,
+                }
+            })
+            .await
     }
 
     /// `gw` deleted: the store's delete event, the controller forgetting

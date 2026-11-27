@@ -6,6 +6,7 @@ pub mod features;
 pub mod hostname;
 pub mod naming;
 pub mod parent_ref;
+pub mod reads;
 pub mod reconciler;
 pub mod reference_grants;
 pub mod services;
