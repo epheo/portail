@@ -1,7 +1,9 @@
 //! Proxy throughput benchmark using rewrk-core + kiss backend.
 //!
 //! Spawns kiss (static file server) as backend, portail as proxy,
-//! and uses rewrk-core as the load generator.
+//! and uses rewrk-core as the load generator. The churn and TLS scenarios
+//! bring their own clients: rewrk-core keeps its connections and speaks
+//! neither TLS to a private certificate nor multiplexed HTTP/2.
 //!
 //! Prerequisites:
 //!   - `kiss` binary in PATH (cargo install kiss)
@@ -11,15 +13,26 @@
 //!
 //! Environment:
 //!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
-//!     nf1 nf4 f1 f4 pool4 churn_direct churn_conn churn_proc
+//!     nf1 nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
+//!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade
 //!   - `PT_SECS`: seconds per scenario, 10 by default
 //!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
 //!     (target/release, then target/debug)
+//!   - `PT_PROXY_CPUS`, `PT_BACKEND_CPUS`: the CPUs the proxy and the
+//!     backends are confined to, as a list such as `0-3,8`. The load
+//!     generator runs on the bench's own: start it under `taskset`.
+//!
+//! Each proxy scenario prints the proxy's CPU time per request, or per GiB
+//! relayed. Compare runs by that figure: req/s and Gbit/s also measure the
+//! load generator, and on shared cores all three follow the scheduler.
 
+use std::ffi::OsStr;
+use std::future::Future;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -27,6 +40,8 @@ use hyper_014::{Body, Method, Request, Uri};
 use rewrk_core::{
     Batch, HttpProtocol, Producer, ReWrkBenchmark, RequestBatch, Sample, SampleCollector,
 };
+use rustls::pki_types::CertificateDer;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const CONCURRENCY: usize = 64;
 const NUM_WORKERS: usize = 4;
@@ -36,9 +51,67 @@ const DEFAULT_BENCH_SECS: u64 = 10;
 const PORTAIL_PORT: u16 = 29_100;
 const PORTAIL_FILTER_PORT: u16 = 29_200;
 const KISS_BASE_PORT: u16 = 29_300;
+const PORTAIL_TLS_PORT: u16 = 29_400;
+const PORTAIL_TCP_PORT: u16 = 29_500;
+const SOURCE_PORT: u16 = 29_600;
 const NUM_BACKENDS: u16 = 4;
 
+/// Connections a bulk scenario downloads on at once.
+const BULK_CONNS: usize = 8;
+/// What the source writes and a bulk client reads at a time: large enough
+/// that neither end caps what the relay between them can move.
+const BULK_CHUNK: usize = 256 * 1024;
+
+/// The HTTPS listener's hostname: its certificate, the SNI and its route.
+const TLS_HOST: &str = "bench.test";
+
+/// What a TLS scenario keeps in flight.
+#[derive(Clone, Copy)]
+enum TlsLoad {
+    /// One request per connection.
+    H1 { conns: usize },
+    /// `streams` requests per connection.
+    H2 { conns: usize, streams: usize },
+}
+
+/// Each keeps `CONCURRENCY` requests in flight through one HTTPS listener,
+/// so the rows differ by protocol and multiplexing alone.
+const TLS_SCENARIOS: &[(&str, &str, TlsLoad)] = &[
+    (
+        "tls_h1",
+        "TLS, HTTP/1.1 (64 connections)",
+        TlsLoad::H1 { conns: CONCURRENCY },
+    ),
+    (
+        "h2_64x1",
+        "TLS, HTTP/2 (64 connections, 1 stream each)",
+        TlsLoad::H2 {
+            conns: CONCURRENCY,
+            streams: 1,
+        },
+    ),
+    (
+        "h2_8x8",
+        "TLS, HTTP/2 (8 connections, 8 streams each)",
+        TlsLoad::H2 {
+            conns: 8,
+            streams: 8,
+        },
+    ),
+    (
+        "h2_1x64",
+        "TLS, HTTP/2 (1 connection, 64 streams)",
+        TlsLoad::H2 {
+            conns: 1,
+            streams: CONCURRENCY,
+        },
+    ),
+];
+
 fn main() {
+    // rustls picks no provider on its own while the tree links two.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -69,7 +142,7 @@ fn main() {
         if selected("nf1") {
             let proxy = spawn_portail_no_filters(&backend_ports[..1], PORTAIL_PORT);
             println!("--- No-filter path (1 backend) ---");
-            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            proxy.measure(run_bench(PORTAIL_PORT, "/bench.txt")).await;
             drop(proxy);
         }
 
@@ -79,7 +152,7 @@ fn main() {
         if selected("nf4") {
             let proxy = spawn_portail_no_filters(&backend_ports, PORTAIL_PORT);
             println!("--- No-filter path ({} backends) ---", NUM_BACKENDS);
-            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            proxy.measure(run_bench(PORTAIL_PORT, "/bench.txt")).await;
             drop(proxy);
         }
 
@@ -89,7 +162,9 @@ fn main() {
         if selected("f1") {
             let proxy = spawn_portail_with_filters(&backend_ports[..1], PORTAIL_FILTER_PORT);
             println!("--- Filter path (1 backend) ---");
-            run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
+            proxy
+                .measure(run_bench(PORTAIL_FILTER_PORT, "/bench.txt"))
+                .await;
             drop(proxy);
         }
 
@@ -99,7 +174,9 @@ fn main() {
         if selected("f4") {
             let proxy = spawn_portail_with_filters(&backend_ports, PORTAIL_FILTER_PORT);
             println!("--- Filter path ({} backends) ---", NUM_BACKENDS);
-            run_bench(PORTAIL_FILTER_PORT, "/bench.txt").await;
+            proxy
+                .measure(run_bench(PORTAIL_FILTER_PORT, "/bench.txt"))
+                .await;
             drop(proxy);
         }
 
@@ -114,7 +191,7 @@ fn main() {
                 "--- No-filter path ({} backends), process-wide pool ---",
                 NUM_BACKENDS
             );
-            run_bench(PORTAIL_PORT, "/bench.txt").await;
+            proxy.measure(run_bench(PORTAIL_PORT, "/bench.txt")).await;
             drop(proxy);
         }
 
@@ -139,7 +216,9 @@ fn main() {
                 "--- Churn: proxy, per-connection pool ({} backends) ---",
                 NUM_BACKENDS
             );
-            run_churn_bench(PORTAIL_PORT, "/bench.txt").await;
+            proxy
+                .measure(run_churn_bench(PORTAIL_PORT, "/bench.txt"))
+                .await;
             drop(proxy);
         }
 
@@ -151,8 +230,56 @@ fn main() {
                 "--- Churn: proxy, process-wide pool ({} backends) ---",
                 NUM_BACKENDS
             );
-            run_churn_bench(PORTAIL_PORT, "/bench.txt").await;
+            proxy
+                .measure(run_churn_bench(PORTAIL_PORT, "/bench.txt"))
+                .await;
             drop(proxy);
+        }
+
+        for &(scenario, title, load) in TLS_SCENARIOS {
+            if selected(scenario) {
+                println!();
+                let (proxy, cert) = spawn_portail_tls(&backend_ports[..1], PORTAIL_TLS_PORT);
+                println!("--- {} ---", title);
+                proxy
+                    .measure(run_tls_bench(PORTAIL_TLS_PORT, "/bench.txt", cert, load))
+                    .await;
+                drop(proxy);
+            }
+        }
+
+        // Bulk scenarios: bytes downloaded through the L4 relay, where the
+        // HTTP ones count requests. The source is this process: its cost
+        // falls on the load generator's CPUs, not on the proxy's.
+        // A port each: an aborted source lets go of its own a moment later.
+        if selected("bulk_direct") {
+            println!();
+            let source = spawn_source(SOURCE_PORT, false).await;
+            println!("--- Bulk: direct from the source (baseline) ---");
+            run_bulk_bench(SOURCE_PORT, false).await;
+            source.abort();
+        }
+
+        if selected("bulk_tcp") {
+            println!();
+            let source = spawn_source(SOURCE_PORT + 1, false).await;
+            let proxy = spawn_portail_tcp(SOURCE_PORT + 1, PORTAIL_TCP_PORT);
+            println!("--- Bulk: TCP route ---");
+            proxy
+                .measure_bulk(run_bulk_bench(PORTAIL_TCP_PORT, false))
+                .await;
+            drop(proxy);
+            source.abort();
+        }
+
+        if selected("bulk_upgrade") {
+            println!();
+            let source = spawn_source(SOURCE_PORT + 2, true).await;
+            let proxy = spawn_portail_no_filters(&[SOURCE_PORT + 2], PORTAIL_PORT);
+            println!("--- Bulk: HTTP upgrade tunnel ---");
+            proxy.measure_bulk(run_bulk_bench(PORTAIL_PORT, true)).await;
+            drop(proxy);
+            source.abort();
         }
 
         drop(kiss_handles);
@@ -160,7 +287,9 @@ fn main() {
     });
 }
 
-async fn run_bench(port: u16, path: &str) {
+/// Returns the requests answered, as every load does: what a proxy's CPU
+/// time is divided by.
+async fn run_bench(port: u16, path: &str) -> u64 {
     let uri = Uri::builder()
         .scheme("http")
         .authority(format!("127.0.0.1:{}", port))
@@ -183,7 +312,7 @@ async fn run_bench(port: u16, path: &str) {
     let wall_elapsed = wall_start.elapsed();
 
     let collector = benchmarker.consume_collector().await;
-    collector.print_results(wall_elapsed);
+    collector.print_results(wall_elapsed)
 }
 
 /// Whether `PT_ONLY` leaves `scenario` in.
@@ -207,49 +336,16 @@ fn bench_duration() -> Duration {
 /// BACKEND close after every response too — no backend conn survives to be
 /// pooled, and pool scope can't matter. A silent close after the response is
 /// the churn shape cross-client pooling actually targets.
-async fn run_churn_bench(port: u16, path: &str) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+async fn run_churn_bench(port: u16, path: &str) -> u64 {
     const CHURN_CONCURRENCY: usize = 64;
     let deadline = Instant::now() + bench_duration();
-    let request = std::sync::Arc::new(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path));
-
-    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|w| w == needle)
-    }
-
-    fn content_length(headers: &[u8]) -> Option<usize> {
-        for line in headers.split(|&b| b == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
-                return std::str::from_utf8(&line[15..]).ok()?.trim().parse().ok();
-            }
-        }
-        None
-    }
+    let request = Arc::new(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path));
 
     async fn one(port: u16, request: &str) -> Result<()> {
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
         s.set_nodelay(true)?;
-        s.write_all(request.as_bytes()).await?;
-        let mut buf = Vec::with_capacity(1024);
-        let mut tmp = [0u8; 4096];
-        let total = loop {
-            let n = s.read(&mut tmp).await?;
-            anyhow::ensure!(n > 0, "connection closed mid-response");
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(header_end) = find_subslice(&buf, b"\r\n\r\n") {
-                let cl = content_length(&buf[..header_end])
-                    .ok_or_else(|| anyhow::anyhow!("no Content-Length"))?;
-                break header_end + 4 + cl;
-            }
-        };
-        while buf.len() < total {
-            let n = s.read(&mut tmp).await?;
-            anyhow::ensure!(n > 0, "connection closed mid-body");
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        Ok(()) // drop closes the client conn without announcing it
+        // The drop that follows closes the client conn without announcing it.
+        exchange(&mut s, request.as_bytes(), &mut Vec::with_capacity(1024)).await
     }
 
     let wall_start = Instant::now();
@@ -284,7 +380,307 @@ async fn run_churn_bench(port: u16, path: &str) {
     if errs > 0 {
         println!("  Errors:      {}", errs);
     }
+    ok
 }
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn content_length(headers: &[u8]) -> Option<usize> {
+    for line in headers.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+            return std::str::from_utf8(&line[15..]).ok()?.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// One HTTP/1.1 exchange on `s`: send `request`, read the whole response,
+/// a 200 framed by Content-Length. An error answered fast must not count
+/// as throughput. `buf` is scratch, reused from one exchange to the next.
+async fn exchange<S>(s: &mut S, request: &[u8], buf: &mut Vec<u8>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    s.write_all(request).await?;
+    buf.clear();
+    let mut tmp = [0u8; 4096];
+    let total = loop {
+        let n = s.read(&mut tmp).await?;
+        anyhow::ensure!(n > 0, "connection closed mid-response");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(header_end) = find_subslice(buf, b"\r\n\r\n") {
+            anyhow::ensure!(buf.starts_with(b"HTTP/1.1 200 "), "not a 200");
+            let cl = content_length(&buf[..header_end])
+                .ok_or_else(|| anyhow::anyhow!("no Content-Length"))?;
+            break header_end + 4 + cl;
+        }
+    };
+    while buf.len() < total {
+        let n = s.read(&mut tmp).await?;
+        anyhow::ensure!(n > 0, "connection closed mid-body");
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok(())
+}
+
+// --- TLS load: HTTP/1.1 and HTTP/2 through one HTTPS listener ---
+
+type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+/// What one closed loop measured: each request's latency in microseconds,
+/// and whether an error ended it early.
+type LoopResult = (Vec<u32>, u64);
+
+/// Closed-loop load over TLS for `bench_duration()`. Every connection is
+/// open before the clock starts: the window holds requests, no handshake.
+async fn run_tls_bench(
+    port: u16,
+    path: &'static str,
+    cert: CertificateDer<'static>,
+    load: TlsLoad,
+) -> u64 {
+    let mut loops = Vec::new();
+    let wall_start;
+    match load {
+        TlsLoad::H1 { conns } => {
+            let client = tls_client(cert, b"http/1.1");
+            let mut open = Vec::with_capacity(conns);
+            for _ in 0..conns {
+                open.push(tls_connect(&client, port).await);
+            }
+            wall_start = Instant::now();
+            let deadline = wall_start + bench_duration();
+            for tls in open {
+                loops.push(tokio::spawn(h1_loop(tls, path, deadline)));
+            }
+        }
+        TlsLoad::H2 { conns, streams } => {
+            let client = tls_client(cert, b"h2");
+            let mut open = Vec::with_capacity(conns);
+            for _ in 0..conns {
+                let tls = tls_connect(&client, port).await;
+                let (send, connection) = h2::client::handshake(tls).await.expect("h2 handshake");
+                tokio::spawn(connection);
+                open.push(send);
+            }
+            wall_start = Instant::now();
+            let deadline = wall_start + bench_duration();
+            for send in open {
+                for _ in 0..streams {
+                    loops.push(tokio::spawn(h2_loop(send.clone(), path, deadline)));
+                }
+            }
+        }
+    }
+
+    let (mut latencies, mut errors) = (Vec::new(), 0);
+    for task in loops {
+        let (measured, failed) = task.await.unwrap();
+        latencies.extend(measured);
+        errors += failed;
+    }
+    let wall = wall_start.elapsed();
+
+    latencies.sort_unstable();
+    let requests = latencies.len() as u64;
+    let at = |quantile: f64| {
+        let rank = (latencies.len() as f64 * quantile) as usize;
+        latencies
+            .get(rank)
+            .or(latencies.last())
+            .copied()
+            .unwrap_or(0)
+    };
+    println!(
+        "  Requests:    {} ({:.0} req/s)",
+        requests,
+        requests as f64 / wall.as_secs_f64()
+    );
+    println!("  Duration:    {:.2}s", wall.as_secs_f64());
+    println!(
+        "  Latency:     p50={}us  p95={}us  p99={}us  max={}us",
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        at(1.0)
+    );
+    if errors > 0 {
+        println!("  Errors:      {}", errors);
+    }
+    requests
+}
+
+/// A client that trusts the listener's own certificate and nothing else,
+/// and offers `alpn` alone: the listener cannot pick the other protocol.
+fn tls_client(cert: CertificateDer<'static>, alpn: &[u8]) -> tokio_rustls::TlsConnector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).expect("trust the bench certificate");
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+async fn tls_connect(client: &tokio_rustls::TlsConnector, port: u16) -> TlsStream {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to the TLS listener");
+    tcp.set_nodelay(true).expect("set TCP_NODELAY");
+    let name = rustls::pki_types::ServerName::try_from(TLS_HOST).expect("server name");
+    client.connect(name, tcp).await.expect("TLS handshake")
+}
+
+async fn h1_loop(mut tls: TlsStream, path: &str, deadline: Instant) -> LoopResult {
+    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\n\r\n", path, TLS_HOST);
+    let (mut latencies, mut buf) = (Vec::new(), Vec::with_capacity(1024));
+    while Instant::now() < deadline {
+        let sent = Instant::now();
+        if exchange(&mut tls, request.as_bytes(), &mut buf)
+            .await
+            .is_err()
+        {
+            return (latencies, 1);
+        }
+        latencies.push(sent.elapsed().as_micros() as u32);
+    }
+    (latencies, 0)
+}
+
+async fn h2_loop(
+    mut send: h2::client::SendRequest<bytes::Bytes>,
+    path: &str,
+    deadline: Instant,
+) -> LoopResult {
+    type Sender = h2::client::SendRequest<bytes::Bytes>;
+
+    /// One GET on a stream of its own. Hands `send` back: waiting for a
+    /// free stream consumes it.
+    async fn one(send: Sender, uri: &str) -> Result<Sender> {
+        let mut send = send.ready().await?;
+        let request = http::Request::get(uri).body(())?;
+        let (response, _) = send.send_request(request, true)?;
+        let response = response.await?;
+        anyhow::ensure!(response.status() == 200, "not a 200");
+        let mut body = response.into_body();
+        while let Some(chunk) = body.data().await {
+            // Data read stays charged to the connection's window until
+            // released: without this every stream stalls once 64 KiB of
+            // bodies have been read.
+            body.flow_control().release_capacity(chunk?.len())?;
+        }
+        Ok(send)
+    }
+
+    let uri = format!("https://{}{}", TLS_HOST, path);
+    let mut latencies = Vec::new();
+    while Instant::now() < deadline {
+        let sent = Instant::now();
+        send = match one(send, &uri).await {
+            Ok(send) => send,
+            Err(_) => return (latencies, 1),
+        };
+        latencies.push(sent.elapsed().as_micros() as u32);
+    }
+    (latencies, 0)
+}
+
+// --- Bulk load: bytes downloaded through the L4 relay ---
+
+/// What an upgrade client asks and the source answers before the bytes.
+const UPGRADE_REQUEST: &[u8] =
+    b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: bench\r\n\r\n";
+const UPGRADE_RESPONSE: &[u8] =
+    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: bench\r\n\r\n";
+
+/// A backend on this runtime that writes zeros to every connection until
+/// its peer closes. With `upgrade`, it first reads an HTTP request and
+/// answers 101, as the backend of an upgrade tunnel does.
+async fn spawn_source(port: u16, upgrade: bool) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind the bulk source");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                if upgrade {
+                    let mut head = Vec::new();
+                    while find_subslice(&head, b"\r\n\r\n").is_none() {
+                        match conn.read_buf(&mut head).await {
+                            Ok(n) if n > 0 => {}
+                            _ => return,
+                        }
+                    }
+                    if conn.write_all(UPGRADE_RESPONSE).await.is_err() {
+                        return;
+                    }
+                }
+                let zeros = vec![0u8; BULK_CHUNK];
+                while conn.write_all(&zeros).await.is_ok() {}
+            });
+        }
+    })
+}
+
+/// Download from `port` on `BULK_CONNS` connections for `bench_duration()`,
+/// through an upgrade when `upgrade`. Returns the bytes read.
+async fn run_bulk_bench(port: u16, upgrade: bool) -> u64 {
+    async fn download(port: u16, upgrade: bool, deadline: Instant) -> Result<u64> {
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let mut buf = Vec::with_capacity(BULK_CHUNK);
+        let mut bytes = 0;
+        if upgrade {
+            conn.write_all(UPGRADE_REQUEST).await?;
+            let head_end = loop {
+                anyhow::ensure!(conn.read_buf(&mut buf).await? > 0, "closed before the 101");
+                if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            anyhow::ensure!(buf.starts_with(b"HTTP/1.1 101 "), "not a 101");
+            bytes = (buf.len() - head_end) as u64;
+        }
+        while Instant::now() < deadline {
+            buf.clear();
+            let read = conn.read_buf(&mut buf).await?;
+            anyhow::ensure!(read > 0, "closed mid-download");
+            bytes += read as u64;
+        }
+        Ok(bytes)
+    }
+
+    let wall_start = Instant::now();
+    let deadline = wall_start + bench_duration();
+    let downloads: Vec<_> = (0..BULK_CONNS)
+        .map(|_| tokio::spawn(download(port, upgrade, deadline)))
+        .collect();
+    let (mut bytes, mut errors) = (0u64, 0u64);
+    for download in downloads {
+        match download.await.unwrap() {
+            Ok(read) => bytes += read,
+            Err(_) => errors += 1,
+        }
+    }
+    let wall = wall_start.elapsed();
+    println!(
+        "  Transferred: {:.1} GiB ({:.1} Gbit/s)",
+        bytes as f64 / GIB,
+        bytes as f64 * 8.0 / 1e9 / wall.as_secs_f64()
+    );
+    println!("  Duration:    {:.2}s", wall.as_secs_f64());
+    if errors > 0 {
+        println!("  Errors:      {}", errors);
+    }
+    bytes
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
 
 // --- Producer: generates request batches for a fixed duration ---
 
@@ -347,10 +743,10 @@ impl SampleCollector for BenchCollector {
 }
 
 impl BenchCollector {
-    fn print_results(&self, wall_time: Duration) {
+    fn print_results(&self, wall_time: Duration) -> u64 {
         if self.samples.is_empty() {
             println!("  No samples collected");
-            return;
+            return 0;
         }
 
         // Merge all samples
@@ -368,7 +764,7 @@ impl BenchCollector {
         println!("  Requests:    {} ({:.0} req/s)", total_reqs, rps);
         println!("  Duration:    {:.2}s", wall_time.as_secs_f64());
         println!(
-            "  Latency:     p50={:.0}µs  p95={:.0}µs  p99={:.0}µs  max={:.0}µs",
+            "  Latency:     p50={:.0}us  p95={:.0}us  p99={:.0}us  max={:.0}us",
             p50, p95, p99, max
         );
 
@@ -378,6 +774,7 @@ impl BenchCollector {
                 println!("    - {:?}", e);
             }
         }
+        total_reqs as u64
     }
 }
 
@@ -385,6 +782,8 @@ impl BenchCollector {
 
 struct ProcessHandle {
     child: Child,
+    /// The certificates the process serves, removed once it is gone.
+    _cert_dir: Option<tempfile::TempDir>,
 }
 
 impl Drop for ProcessHandle {
@@ -394,12 +793,108 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Set PR_SET_PDEATHSIG so the child is killed when the parent dies.
-/// This prevents orphan processes when the bench panics or is Ctrl+C'd.
-fn kill_on_parent_death() -> impl FnMut() -> Result<(), std::io::Error> {
-    || {
-        // SAFETY: prctl with PR_SET_PDEATHSIG is async-signal-safe
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+impl ProcessHandle {
+    /// Run `load`, then print what each of its requests cost this process.
+    async fn measure(&self, load: impl Future<Output = u64>) {
+        let (requests, (user, system)) = self.cpu_during(load).await;
+        if requests == 0 {
+            return;
+        }
+        let each = |seconds: f64| seconds * 1e6 / requests as f64;
+        println!(
+            "  Proxy CPU:   user={:.2}us  sys={:.2}us per request  (peak RSS {} MiB)",
+            each(user),
+            each(system),
+            self.peak_rss_kib() / 1024
+        );
+    }
+
+    /// Run `load`, then print what each GiB it moved cost this process.
+    async fn measure_bulk(&self, load: impl Future<Output = u64>) {
+        let (bytes, (user, system)) = self.cpu_during(load).await;
+        if bytes == 0 {
+            return;
+        }
+        let each = |seconds: f64| seconds * 1e3 / (bytes as f64 / GIB);
+        println!(
+            "  Proxy CPU:   user={:.1}ms  sys={:.1}ms per GiB  (peak RSS {} MiB)",
+            each(user),
+            each(system),
+            self.peak_rss_kib() / 1024
+        );
+    }
+
+    /// What `load` returns, and the user and system CPU seconds this
+    /// process used while it ran.
+    async fn cpu_during<T>(&self, load: impl Future<Output = T>) -> (T, (f64, f64)) {
+        let before = self.cpu_seconds();
+        let done = load.await;
+        let after = self.cpu_seconds();
+        (done, (after.0 - before.0, after.1 - before.1))
+    }
+
+    /// The user and system CPU time the process has used so far.
+    fn cpu_seconds(&self) -> (f64, f64) {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.child.id()))
+            .expect("read the proxy's /proc stat");
+        // The command name, second of the line, may hold spaces: count
+        // from its closing parenthesis. utime and stime are fields 14 and
+        // 15 of the line, in clock ticks.
+        let (_, after_name) = stat.rsplit_once(") ").expect("a command name in stat");
+        let mut ticks = after_name
+            .split(' ')
+            .skip(11)
+            .map(|field| field.parse::<f64>().expect("a tick count"));
+        let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        let mut seconds = || ticks.next().expect("utime and stime") / per_second;
+        (seconds(), seconds())
+    }
+
+    fn peak_rss_kib(&self) -> u64 {
+        std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .expect("read the proxy's /proc status")
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|kib| kib.trim().trim_end_matches(" kB").parse().ok())
+            .expect("VmHWM in status")
+    }
+}
+
+/// The CPUs `var` lists, such as `0-3,8`; `None` when it is unset. A list
+/// that does not parse stops the bench: a run believed pinned and not is
+/// worse than no run.
+fn cpus(var: &str) -> Option<libc::cpu_set_t> {
+    let list = std::env::var(var).ok()?;
+    let cpu = |s: &str| {
+        s.parse::<usize>()
+            .unwrap_or_else(|_| panic!("{}={}: not a CPU list", var, list))
+    };
+    // SAFETY: an all-zero cpu_set_t is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for range in list.split(',') {
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        for n in cpu(first)..=cpu(last) {
+            // SAFETY: CPU_SET checks `n` against the set's size.
+            unsafe { libc::CPU_SET(n, &mut set) };
+        }
+    }
+    Some(set)
+}
+
+/// Runs in the child before exec. The child dies with the bench, which a
+/// panic or Ctrl+C would otherwise orphan, and stays on `cpus` when given.
+fn child_setup(cpus: Option<libc::cpu_set_t>) -> impl FnMut() -> Result<(), std::io::Error> {
+    move || {
+        // SAFETY: prctl and sched_setaffinity are async-signal-safe.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if let Some(set) = &cpus {
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                if libc::sched_setaffinity(0, size, set) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -413,13 +908,16 @@ fn spawn_kiss(port: u16, content_dir: &PathBuf) -> ProcessHandle {
             .arg(content_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .pre_exec(kill_on_parent_death())
+            .pre_exec(child_setup(cpus("PT_BACKEND_CPUS")))
             .spawn()
             .expect("spawn kiss (is it installed? cargo install kiss)")
     };
 
     wait_for_port(port);
-    ProcessHandle { child }
+    ProcessHandle {
+        child,
+        _cert_dir: None,
+    }
 }
 
 fn backend_refs_json(ports: &[u16]) -> String {
@@ -447,7 +945,7 @@ fn spawn_portail_pool(backend_ports: &[u16], port: u16, pool_scope: &str) -> Pro
         pool_scope,
     );
 
-    spawn_portail_with_config(&config, port)
+    spawn_portail_with_config(&config, port, &[])
 }
 
 fn spawn_portail_with_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
@@ -469,10 +967,64 @@ fn spawn_portail_with_filters(backend_ports: &[u16], port: u16) -> ProcessHandle
         backend_refs_json(backend_ports),
     );
 
-    spawn_portail_with_config(&config, port)
+    spawn_portail_with_config(&config, port, &[])
 }
 
-fn spawn_portail_with_config(config: &str, port: u16) -> ProcessHandle {
+/// portail with one TCP listener whose route forwards to `backend_port`.
+fn spawn_portail_tcp(backend_port: u16, port: u16) -> ProcessHandle {
+    let config = format!(
+        r#"{{
+  "gateway": {{"name":"bench","listeners":[{{"name":"tcp","protocol":"TCP","port":{}}}]}},
+  "tcpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"tcp"}}],"rules":[{{"backendRefs":[{}]}}]}}],
+  "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
+  "performance": {{}}
+}}"#,
+        port,
+        backend_refs_json(&[backend_port]),
+    );
+
+    spawn_portail_with_config(&config, port, &[])
+}
+
+/// portail with one HTTPS listener that serves HTTP/1.1 and HTTP/2, and the
+/// certificate a client has to trust to reach it.
+fn spawn_portail_tls(backend_ports: &[u16], port: u16) -> (ProcessHandle, CertificateDer<'static>) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec![TLS_HOST.to_string()])
+            .expect("generate the bench certificate");
+    let cert_dir = tempfile::tempdir().expect("create cert dir");
+    std::fs::write(cert_dir.path().join("bench.crt"), cert.pem()).expect("write cert");
+    std::fs::write(
+        cert_dir.path().join("bench.key"),
+        signing_key.serialize_pem(),
+    )
+    .expect("write key");
+
+    let config = format!(
+        r#"{{
+  "gateway": {{"name":"bench","listeners":[{{"name":"https","protocol":"HTTPS","port":{},
+    "tls":{{"mode":"Terminate","certificateRefs":[{{"name":"bench","hostname":"{}"}}]}}}}]}},
+  "httpRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"https"}}],"hostnames":["{}"],"rules":[{{"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}],"backendRefs":[{}]}}]}}],
+  "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
+  "performance": {{}}
+}}"#,
+        port,
+        TLS_HOST,
+        TLS_HOST,
+        backend_refs_json(backend_ports),
+    );
+
+    let args = [
+        OsStr::new("--cert-dir"),
+        cert_dir.path().as_os_str(),
+        OsStr::new("--http2"),
+    ];
+    let mut proxy = spawn_portail_with_config(&config, port, &args);
+    proxy._cert_dir = Some(cert_dir);
+    (proxy, cert.der().clone())
+}
+
+fn spawn_portail_with_config(config: &str, port: u16, args: &[&OsStr]) -> ProcessHandle {
     let config_file = tempfile::Builder::new()
         .suffix(".json")
         .tempfile()
@@ -484,9 +1036,10 @@ fn spawn_portail_with_config(config: &str, port: u16) -> ProcessHandle {
         Command::new(&binary)
             .arg("--config")
             .arg(config_file.path())
+            .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .pre_exec(kill_on_parent_death())
+            .pre_exec(child_setup(cpus("PT_PROXY_CPUS")))
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {:?}: {}", binary, e))
     };
@@ -495,7 +1048,10 @@ fn spawn_portail_with_config(config: &str, port: u16) -> ProcessHandle {
     std::mem::forget(config_file);
 
     wait_for_port(port);
-    ProcessHandle { child }
+    ProcessHandle {
+        child,
+        _cert_dir: None,
+    }
 }
 
 fn portail_binary_path() -> PathBuf {

@@ -13,14 +13,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use portail::config::PerformanceConfig;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use portail::config::{CertificateRef, PerformanceConfig};
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::request_processor::{analyze_request, analyze_udp_request, RoutingResult};
+use portail::proxy::tls::{build_server_config, TlsKind, TlsPlan};
 use portail::proxy::worker::{run_worker, ListenerCtx, WorkerConfig};
 use portail::routing::{
     Backend, BackendAction, BackendSelector, HttpRouteRule, PathMatchType, RouteTable,
 };
+use rustls::pki_types::CertificateDer;
 use tokio_util::sync::CancellationToken;
 
 struct Counting;
@@ -186,6 +188,202 @@ fn a_churned_connection_allocates_a_fixed_few_times() {
         per_conn.round() <= 13.0,
         "{per_conn} allocations per connection"
     );
+}
+
+/// What a client speaks to the proxy.
+#[derive(Clone, Copy, PartialEq)]
+enum Client {
+    /// HTTP/1.1 over TCP.
+    Plain,
+    /// HTTP/1.1 over TLS.
+    Tls,
+    /// HTTP/2 over TLS.
+    H2,
+}
+
+/// A certificate for `a.test` and the config that terminates with it,
+/// HTTP/2 offered beside HTTP/1.1.
+fn tls_config() -> (CertificateDer<'static>, Arc<rustls::ServerConfig>) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["a.test".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.crt"), cert.pem()).unwrap();
+    std::fs::write(dir.path().join("a.key"), signing_key.serialize_pem()).unwrap();
+    let refs = [CertificateRef {
+        name: "a".to_string(),
+        hostname: Some("a.test".to_string()),
+        ..Default::default()
+    }];
+    let config = build_server_config(&refs, dir.path(), true).unwrap();
+    (cert.der().clone(), Arc::new(config))
+}
+
+/// A proxy on this thread's runtime, routing to `backend`; with `tls`, it
+/// terminates for `a.test`. Returns its address and its count of open
+/// connections.
+async fn proxy(
+    backend: SocketAddr,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let plan = tls.map(|config| {
+        let mut plan = TlsPlan::default();
+        plan.terminate = Some(config);
+        plan.add(Some("a.test"), TlsKind::Terminate);
+        plan
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let perf = PerformanceConfig {
+        http2: true,
+        ..Default::default()
+    };
+    let ctx = ListenerCtx {
+        server_port: 80,
+        routes: Arc::new(ArcSwap::from_pointee(table_to(backend))),
+        cfg: WorkerConfig::from_perf(&perf, 64),
+        plan: Arc::new(ArcSwapOption::from_pointee(plan)),
+        health: Arc::new(HealthRegistry::new()),
+        selector: Arc::new(BackendSelector::new()),
+        active_connections: active.clone(),
+        shared_pool: None,
+    };
+    tokio::spawn(run_worker(listener, ctx, CancellationToken::new()));
+    (addr, active)
+}
+
+/// `n` requests to `/api` on one connection to `proxy`, from a thread and a
+/// runtime of their own: none of the client's allocations is counted.
+fn requests(
+    proxy: SocketAddr,
+    client: Client,
+    cert: CertificateDer<'static>,
+    n: usize,
+) -> std::thread::JoinHandle<()> {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    async fn h1(mut conn: impl AsyncRead + AsyncWrite + Unpin, n: usize) {
+        for _ in 0..n {
+            conn.write_all(b"GET /api HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let (mut got, mut chunk) = (Vec::new(), [0u8; 4096]);
+            while !got.ends_with(b"\r\n\r\nok") {
+                let read = conn.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "{}", String::from_utf8_lossy(&got));
+                got.extend_from_slice(&chunk[..read]);
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            if client == Client::Plain {
+                return h1(tcp, n).await;
+            }
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let alpn: &[u8] = if client == Client::H2 {
+                b"h2"
+            } else {
+                b"http/1.1"
+            };
+            config.alpn_protocols = vec![alpn.to_vec()];
+            let name = rustls::pki_types::ServerName::try_from("a.test").unwrap();
+            let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(name, tcp)
+                .await
+                .unwrap();
+            if client == Client::Tls {
+                return h1(tls, n).await;
+            }
+            let (mut send, connection) = h2::client::handshake(tls).await.unwrap();
+            tokio::spawn(connection);
+            for _ in 0..n {
+                send = send.ready().await.unwrap();
+                let request = http::Request::get("https://a.test/api").body(()).unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), 200);
+                let mut body = response.into_body();
+                while let Some(chunk) = body.data().await {
+                    let read = chunk.unwrap().len();
+                    body.flow_control().release_capacity(read).unwrap();
+                }
+            }
+        });
+    })
+}
+
+/// Allocations per request on a connection already open, counted on this
+/// thread, where `serve` put what answers at the address it returns. Two
+/// connections carry different numbers of requests, and their difference
+/// leaves out what each pays once: the handshake and the close.
+fn per_request<F>(client: Client, serve: impl FnOnce(Option<Arc<rustls::ServerConfig>>) -> F) -> f64
+where
+    F: std::future::Future<Output = (SocketAddr, Arc<AtomicUsize>)>,
+{
+    const FEW: usize = 100;
+    const MANY: usize = 300;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (cert, config) = tls_config();
+        let (addr, active) = serve((client != Client::Plain).then_some(config)).await;
+        let mut counted = Vec::new();
+        // The first connection only lets lazy statics, metric slots and the
+        // runtime's own tables settle.
+        for n in [FEW, FEW, MANY] {
+            let before = ALLOCATIONS.with(Cell::get);
+            let client = requests(addr, client, cert.clone(), n);
+            while !client.is_finished() || active.load(Ordering::Acquire) > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            client.join().unwrap();
+            counted.push((ALLOCATIONS.with(Cell::get) - before) as f64);
+        }
+        (counted[2] - counted[1]) / (MANY - FEW) as f64
+    })
+}
+
+/// [`per_request`] through the proxy, in front of a backend.
+fn per_proxied_request(client: Client) -> f64 {
+    let backend = spawn_backend();
+    per_request(client, |tls| proxy(backend, tls))
+}
+
+#[test]
+fn a_keepalive_request_allocates_nothing() {
+    let n = per_proxied_request(Client::Plain);
+    assert_eq!(n, 0.0, "{n} allocations per request");
+}
+
+/// Two, which TLS adds: the same request over plain TCP allocates nothing.
+#[test]
+fn a_keepalive_request_over_tls_allocates_twice() {
+    let n = per_proxied_request(Client::Tls);
+    assert!(n <= 2.0, "{n} allocations per request");
+}
+
+/// Twenty, against two for the same request over HTTP/1.1. The bridge
+/// gives each stream what a connection gets: a task, an engine with its
+/// buffers and drain watch (the churn count above), and a pipe to it.
+/// A ceiling to lower with the bridge's cost, never to raise.
+#[test]
+fn an_h2_request_allocates_like_a_connection_of_its_own() {
+    let n = per_proxied_request(Client::H2);
+    assert!(n <= 20.0, "{n} allocations per request");
 }
 
 #[test]
