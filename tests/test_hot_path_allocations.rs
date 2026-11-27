@@ -16,6 +16,7 @@ use std::time::Duration;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use portail::config::{CertificateRef, PerformanceConfig};
 use portail::proxy::health::HealthRegistry;
+use portail::proxy::http_parser::{extract_routing_info, HeadError};
 use portail::proxy::request_processor::{analyze_request, analyze_udp_request, RoutingResult};
 use portail::proxy::tls::{build_server_config, TlsKind, TlsPlan};
 use portail::proxy::worker::{run_worker, ListenerCtx, WorkerConfig};
@@ -468,6 +469,27 @@ fn a_refused_dot_segment_allocates_nothing() {
         assert!(matches!(result, RoutingResult::LocalReply(r) if r.status == 400));
     });
     assert_eq!(n, 0);
+}
+
+#[test]
+fn an_unparseable_head_allocates_nothing() {
+    let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
+    let heads: [(&[u8], HeadError); 3] = [
+        (b"NOT A REQUEST LINE\r\n\r\n", HeadError::RequestLine),
+        (
+            b"GET /\xff HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            HeadError::RequestLineNotUtf8,
+        ),
+        (b"GET /api HTTP/1.1\r\nAccept: */*\r\n\r\n", HeadError::Host),
+    ];
+    for (head, refusal) in heads {
+        assert_eq!(extract_routing_info(head).err(), Some(refusal));
+        let n = allocations(|| {
+            let result = analyze_request(&rt, &sel, head, 80, &health, false).unwrap();
+            assert!(matches!(result, RoutingResult::LocalReply(r) if r.status == 400));
+        });
+        assert_eq!(n, 0, "{refusal}");
+    }
 }
 
 #[test]

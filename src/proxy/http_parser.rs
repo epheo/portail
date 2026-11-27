@@ -2,8 +2,26 @@
 //! All parsing functions use direct buffer references for maximum efficiency.
 
 use crate::logging::debug;
-use anyhow::{anyhow, Result};
 use std::borrow::Cow;
+
+/// Why a request head gives no request line or Host to route on. Static:
+/// the client picks how many it sends, so refusing one must not allocate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadError {
+    RequestLine,
+    RequestLineNotUtf8,
+    Host,
+}
+
+impl std::fmt::Display for HeadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RequestLine => "malformed request line",
+            Self::RequestLineNotUtf8 => "request line is not UTF-8",
+            Self::Host => "HTTP/1.1 request without a usable Host header",
+        })
+    }
+}
 
 /// Find the end of HTTP headers (\r\n\r\n boundary).
 /// Returns the position just past the double CRLF.
@@ -366,7 +384,7 @@ fn offers_h2c(value: &[u8]) -> bool {
 /// normalized: `Err` when no request line or Host can be extracted,
 /// `header_violation` for everything else. Both mean 400 and close.
 #[inline(always)]
-pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> {
+pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>, HeadError> {
     debug!(
         "UNIFIED_PARSER: Processing HTTP request - content length: {}",
         request_data.len()
@@ -382,7 +400,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
     }
     let method_end = pos;
     if method_end == 0 || data.get(pos) != Some(&b' ') {
-        return Err(anyhow!("Malformed HTTP request line"));
+        return Err(HeadError::RequestLine);
     }
     let target_start = pos + 1;
     let mut target_end = scan(data, target_start, TARGET, 0x21, TARGET_HOLES);
@@ -390,15 +408,15 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         target_end = past_query_backslashes(data, target_start, target_end);
     }
     if target_end == target_start || data.get(target_end) != Some(&b' ') {
-        return Err(anyhow!("Malformed HTTP request line"));
+        return Err(HeadError::RequestLine);
     }
     let is_http10 = match data.get(target_end + 1..target_end + 11) {
         Some(b"HTTP/1.1\r\n") => false,
         Some(b"HTTP/1.0\r\n") => true,
-        _ => return Err(anyhow!("Malformed HTTP request line")),
+        _ => return Err(HeadError::RequestLine),
     };
-    let line = std::str::from_utf8(&data[..target_end])
-        .map_err(|_| anyhow!("Non-UTF8 data in HTTP request line"))?;
+    let line =
+        std::str::from_utf8(&data[..target_end]).map_err(|_| HeadError::RequestLineNotUtf8)?;
     let method = &line[..method_end];
     let target = &line[target_start..];
 
@@ -591,7 +609,7 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         None if is_http10 => target_host.unwrap_or_default(),
         None if violation => &[][..],
         None => {
-            return Err(anyhow!("Missing required Host header in HTTP/1.1 request"));
+            return Err(HeadError::Host);
         }
     };
     // Routing reads Host while an RFC 9112 recipient of an absolute-form
@@ -600,7 +618,9 @@ pub fn extract_routing_info(request_data: &[u8]) -> Result<HttpRequestInfo<'_>> 
         violation = true;
     }
     violation |= (host.is_empty() && !is_http10) || (content_length.is_some() && is_chunked);
-    let host = std::str::from_utf8(host).map_err(|_| anyhow!("Non-ASCII Host"))?;
+    // `split_host` admits ASCII only, so this holds; client bytes get an
+    // error all the same, never a panic.
+    let host = std::str::from_utf8(host).map_err(|_| HeadError::Host)?;
 
     let (path, query_string) = match path.find('?') {
         Some(i) => (&path[..i], &path[i + 1..]),
