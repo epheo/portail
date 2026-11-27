@@ -467,6 +467,8 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         .reconcile_on(lapse_triggers)
         .reconcile_on(dependent_triggers)
         .reconcile_on(owned_triggers)
+        // Also what makes an early-ended pass's empty read set safe: see
+        // ReadIndex::during.
         .reconcile_all_on(futures::stream::select(leader.gained(), synced_trigger))
         .with_config(kube::runtime::controller::Config::default().debounce(Duration::from_secs(1)))
         // In-flight passes finish before the lease is released below.
@@ -733,6 +735,34 @@ mod tests {
         );
         let foreign = testkit::service("gw-portail-old", "http", 80, json!(8080));
         assert!(service_readers(&p.ctx.reads, &p.ctx.cache.gateways, &foreign).is_empty());
+    }
+
+    /// A standby's pass reads nothing, so no Service wakes it: safe only
+    /// because gaining the lease re-runs every Gateway, and that pass reads.
+    #[tokio::test]
+    async fn a_standby_pass_reads_nothing_until_the_lease_is_gained() {
+        use futures::FutureExt;
+        let leader = leader::Leader::standby();
+        let mut p = Pipeline::led_by(leader.clone());
+        let gw = testkit::gateway("gw", 1);
+        let web = testkit::service("web", "http", 80, json!(8080));
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(&mut p.cluster.services, web.clone());
+        let route = testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 80);
+        apply(&mut p.cluster.http_routes, route);
+        p.pass(&gw).await.unwrap();
+        assert!(woken(&p, ReadKind::Service, &web).is_empty());
+
+        let mut gained = leader.gained();
+        assert_eq!(gained.next().now_or_never(), None);
+        leader.lead();
+        assert_eq!(
+            gained.next().now_or_never(),
+            Some(Some(())),
+            "the wake that re-runs every Gateway"
+        );
+        p.pass(&gw).await.unwrap();
+        assert_eq!(woken(&p, ReadKind::Service, &web), gw_ref());
     }
 
     /// A cross-namespace backend reads the grants of its namespace alone.

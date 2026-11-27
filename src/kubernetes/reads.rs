@@ -68,6 +68,12 @@ impl ReadIndex {
     /// is noted as it happens. One that succeeds leaves its reads as the
     /// Gateway's. One that fails or is dropped (shutdown) adds them to the
     /// last: it may have stopped before reading what the last pass did.
+    ///
+    /// A pass that ends early succeeds with no reads: caches unsynced, a
+    /// standby, a class not ours or missing. That set is safe only because
+    /// each of those ends on an event that re-runs every Gateway: the
+    /// caches' sync, `leader.gained()`, a GatewayClass change. Drop one of
+    /// those wakes and its Gateways sleep through the changes they read.
     pub(crate) async fn during<T, E>(
         self: &Arc<Self>,
         gateway: GatewayKey,

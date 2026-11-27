@@ -217,6 +217,10 @@ impl TestCluster {
     /// A controller context over these stores; it leads, its caches synced
     /// (no kind is tracked).
     pub fn ctx(&self, client: Client) -> Arc<ControllerCtx> {
+        self.ctx_led(client, super::leader::Leader::always())
+    }
+
+    pub fn ctx_led(&self, client: Client, leader: super::leader::Leader) -> Arc<ControllerCtx> {
         Arc::new(ControllerCtx {
             client,
             controller_name: CONTROLLER.to_string(),
@@ -251,7 +255,7 @@ impl TestCluster {
             reports: Arc::default(),
             backends: Arc::default(),
             reads: Arc::default(),
-            leader: super::leader::Leader::always(),
+            leader,
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(
                 self.service_accounts.as_reader(),
@@ -299,6 +303,11 @@ impl Pipeline {
     /// controller, which [`gateway`] uses. Its Gateways are Unmanaged: the
     /// data plane in the loop is the hand-written one.
     pub fn new() -> Self {
+        Self::led_by(super::leader::Leader::always())
+    }
+
+    /// [`Pipeline::new`], its replica's leadership `leader`.
+    pub fn led_by(leader: super::leader::Leader) -> Self {
         let api = MockApi::default();
         let mut cluster = TestCluster::default();
         let mut unmanaged = GatewayParameters::new(
@@ -318,7 +327,7 @@ impl Pipeline {
             namespace: Some("default".into()),
         });
         apply(&mut cluster.gateway_classes, class);
-        let ctx = cluster.ctx(api.client());
+        let ctx = cluster.ctx_led(api.client(), leader);
         let perf = crate::config::PerformanceConfig::default();
         let data_plane =
             crate::proxy::data_plane::DataPlane::new(&[], &perf, std::path::Path::new("/unused"))
