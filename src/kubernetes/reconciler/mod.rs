@@ -275,6 +275,19 @@ pub struct RouteAcceptance {
 
 type Verdict = Result<(), RouteError>;
 
+/// One Gateway-matching parentRef of a route, evaluated on its own.
+struct ParentOutcome {
+    section_name: Option<String>,
+    port: Option<i32>,
+    /// The listeners it attaches to by allowedRoutes, before an older
+    /// route's claim: attachedRoutes counts them, accepted or not.
+    attached: Vec<String>,
+    /// The listeners it is served on, or why its listeners refuse it.
+    served: Result<Vec<String>, &'static str>,
+    /// Every listener it selects is an older route's.
+    lost: bool,
+}
+
 /// Route check verdicts per Gateway, by route uid, with the generation they
 /// were taken at. The check compiles every regex of a route; a pass whose
 /// routes did not change (a status echo, a requeue) takes the verdict
@@ -827,17 +840,7 @@ fn collect_routes<R: GatewayRoute>(
         // inherit Accepted from a sibling ref (previously every ref got the
         // route-wide verdict, and every entry claimed every listener).
         let route_hostnames = route.hostnames();
-        // The listeners each ref attaches to by allowedRoutes, before an
-        // older route's claim: attachedRoutes counts them, accepted or not.
-        // The last field: every listener the ref selects is an older
-        // route's.
-        let per_parent: Vec<(
-            Option<String>,
-            Option<i32>,
-            Vec<String>,
-            Result<Vec<String>, &'static str>,
-            bool,
-        )> = route
+        let per_parent: Vec<ParentOutcome> = route
             .parent_refs()
             .as_ref()
             .map(|refs| {
@@ -846,7 +849,7 @@ fn collect_routes<R: GatewayRoute>(
                         parent_ref_matches_gateway(*pr, route_ns, cx.gateway_name, cx.gateway_ns)
                     })
                     .map(|pr| {
-                        let mut result = listeners_for_parent_ref(
+                        let mut served = listeners_for_parent_ref(
                             pr,
                             cx.listeners,
                             cx.gateway_ns,
@@ -855,22 +858,22 @@ fn collect_routes<R: GatewayRoute>(
                             route_hostnames,
                             cx.namespace_labels,
                         );
-                        let attached = result.clone().unwrap_or_default();
+                        let attached = served.clone().unwrap_or_default();
                         let mut lost = false;
                         if R::ONE_ROUTE_PER_LISTENER {
-                            if let Ok(listeners) = &mut result {
+                            if let Ok(listeners) = &mut served {
                                 listeners
                                     .retain(|l| !port_of(l).is_some_and(|p| claimed.contains(&p)));
                                 lost = listeners.is_empty();
                             }
                         }
-                        (
-                            pr.ref_section_name().map(String::from),
-                            pr.ref_port(),
+                        ParentOutcome {
+                            section_name: pr.ref_section_name().map(String::from),
+                            port: pr.ref_port(),
                             attached,
-                            result,
+                            served,
                             lost,
-                        )
+                        }
                     })
                     .collect()
             })
@@ -901,12 +904,17 @@ fn collect_routes<R: GatewayRoute>(
             }
         };
 
-        if per_parent.iter().all(|(_, _, _, r, _)| r.is_err()) {
-            for (section_name, port, attached, result, _) in &per_parent {
-                let reason = result.as_ref().err().copied().unwrap_or("NoMatchingParent");
+        if per_parent.iter().all(|p| p.served.is_err()) {
+            for p in &per_parent {
+                let reason = p
+                    .served
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or("NoMatchingParent");
                 route_status.push(RouteAcceptance {
-                    listener_names: attached.clone(),
-                    ..rejection(section_name, *port, reason)
+                    listener_names: p.attached.clone(),
+                    ..rejection(&p.section_name, p.port, reason)
                 });
             }
             continue;
@@ -1044,8 +1052,8 @@ fn collect_routes<R: GatewayRoute>(
             Ok(()) => ("Accepted", "Accepted".to_string()),
             Err(e) => (e.reason.as_str(), format!("Conversion failed: {}", e)),
         };
-        for (section_name, port, attached, result, lost) in &per_parent {
-            match result {
+        for p in &per_parent {
+            match &p.served {
                 // A parentRef the listeners admit. One they reject keeps
                 // its own rejection reason.
                 Ok(_) => route_status.push(RouteAcceptance {
@@ -1054,7 +1062,7 @@ fn collect_routes<R: GatewayRoute>(
                     kind,
                     accepted: verdict.is_ok(),
                     accepted_reason,
-                    message: if *lost && verdict.is_ok() {
+                    message: if p.lost && verdict.is_ok() {
                         "Accepted; an older route serves every listener this parentRef \
                          selects, so this one gets no traffic"
                             .to_string()
@@ -1065,13 +1073,13 @@ fn collect_routes<R: GatewayRoute>(
                     refs_reason,
                     refs_message: refs_message.clone(),
                     generation,
-                    section_name: section_name.clone(),
-                    port: *port,
-                    listener_names: attached.clone(),
+                    section_name: p.section_name.clone(),
+                    port: p.port,
+                    listener_names: p.attached.clone(),
                 }),
                 Err(reason) => route_status.push(RouteAcceptance {
-                    listener_names: attached.clone(),
-                    ..rejection(section_name, *port, reason)
+                    listener_names: p.attached.clone(),
+                    ..rejection(&p.section_name, p.port, reason)
                 }),
             }
         }
@@ -1082,7 +1090,7 @@ fn collect_routes<R: GatewayRoute>(
         let mut attached: Vec<&String> = Vec::new();
         for listener in per_parent
             .iter()
-            .filter_map(|(_, _, _, result, _)| result.as_ref().ok())
+            .filter_map(|p| p.served.as_ref().ok())
             .flatten()
         {
             if !attached.contains(&listener) {
