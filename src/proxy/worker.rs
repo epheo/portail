@@ -163,12 +163,13 @@ pub(crate) fn tcp_keepalive(time: Duration) -> socket2::TcpKeepalive {
         .with_retries(TCP_KEEPALIVE_RETRIES)
 }
 
-/// Whether `listener` already carries the keepalive of `tcp_keepalive(time)`,
-/// which Linux copies to every socket it accepts: the data plane sets it
-/// before listen(), and then accepting costs no setsockopt per connection.
-fn carries_keepalive(listener: &TcpListener, time: Duration) -> bool {
-    let sock = socket2::SockRef::from(listener);
-    sock.keepalive().unwrap_or(false)
+/// Whether `sock` carries what every client socket needs: TCP_NODELAY and
+/// the keepalive of `tcp_keepalive(time)`. Linux copies both from a listener
+/// to every socket it accepts: the data plane sets them before listen(), and
+/// then accepting costs no setsockopt per connection.
+fn carries_client_options(sock: socket2::SockRef<'_>, time: Duration) -> bool {
+    sock.tcp_nodelay().unwrap_or(false)
+        && sock.keepalive().unwrap_or(false)
         && sock.tcp_keepalive_time().ok() == Some(time)
         && sock.tcp_keepalive_interval().ok() == Some(TCP_KEEPALIVE_INTERVAL)
         && sock.tcp_keepalive_retries().ok() == Some(TCP_KEEPALIVE_RETRIES)
@@ -493,7 +494,9 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
     // otherwise park its connection task forever, since the idle wait
     // between keepalive requests is intentionally unbounded.
     let keepalive = tcp_keepalive(cfg.tcp_keepalive_time);
-    let keepalive_inherited = carries_keepalive(&listener, cfg.tcp_keepalive_time);
+    // Read on the first socket accepted, not on the listener: what a kernel
+    // copies on accept is then seen, not assumed.
+    let mut options_inherited = None;
 
     let mut backoff = AcceptBackoff::default();
     loop {
@@ -507,11 +510,17 @@ pub async fn run_worker(listener: TcpListener, ctx: ListenerCtx, shutdown: Cance
                 match result {
                     Ok((tcp_stream, peer)) => {
                         backoff.reset();
-                        if !keepalive_inherited {
+                        let inherited = *options_inherited.get_or_insert_with(|| {
+                            carries_client_options((&tcp_stream).into(), cfg.tcp_keepalive_time)
+                        });
+                        if !inherited {
                             let sock = socket2::SockRef::from(&tcp_stream);
                             // _-prefixed: debug! compiles out in release builds.
-                            if let Err(_e) = sock.set_tcp_keepalive(&keepalive) {
-                                debug!("TCP keepalive setup failed for {}: {}", peer, _e);
+                            if let Err(_e) = sock
+                                .set_tcp_keepalive(&keepalive)
+                                .and_then(|()| sock.set_tcp_nodelay(true))
+                            {
+                                debug!("TCP option setup failed for {}: {}", peer, _e);
                             }
                         }
                         let routes = routes.clone();
@@ -757,8 +766,6 @@ pub(crate) async fn handle_connection(
     _peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
-    client.set_nodelay(true)?;
-
     let (tcp_route, http_routes) = {
         let rt = state.routes.load();
         let port = state.server_port;
@@ -2756,7 +2763,6 @@ async fn handle_tls_passthrough(
 
     // The peek consumed nothing, so the ClientHello is still on the socket:
     // the generic L4 forward replays it to the backend via the normal reads.
-    client.set_nodelay(true)?;
     handle_tcp_connection(
         Connection::Plain { inner: client },
         backend_addr,
@@ -3722,6 +3728,22 @@ mod connection_tests {
     fn keepalive_where(
         is_it: impl Fn(&socket2::SockRef<'_>) -> bool,
     ) -> Option<(Duration, Duration, u32)> {
+        socket_where(is_it, |sock| {
+            sock.keepalive().unwrap().then(|| {
+                (
+                    sock.tcp_keepalive_time().unwrap(),
+                    sock.tcp_keepalive_interval().unwrap(),
+                    sock.tcp_keepalive_retries().unwrap(),
+                )
+            })
+        })
+    }
+
+    /// What `read` says of the socket in this process that `is_it` picks.
+    fn socket_where<T>(
+        is_it: impl Fn(&socket2::SockRef<'_>) -> bool,
+        read: impl Fn(&socket2::SockRef<'_>) -> T,
+    ) -> T {
         use std::os::fd::FromRawFd;
         for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
             let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse() else {
@@ -3737,23 +3759,19 @@ mod connection_tests {
             if !is_it(&sock) {
                 continue;
             }
-            return sock.keepalive().unwrap().then(|| {
-                (
-                    sock.tcp_keepalive_time().unwrap(),
-                    sock.tcp_keepalive_interval().unwrap(),
-                    sock.tcp_keepalive_retries().unwrap(),
-                )
-            });
+            return read(&sock);
         }
         panic!("no such socket");
     }
 
     /// A client that vanishes without FIN or RST would otherwise pin its
-    /// task and fd forever. A data-plane listener hands its keepalive to
-    /// every socket it accepts, one queued before the accept loop started
-    /// included; any other listener's sockets get it one by one.
+    /// task and fd forever, and Nagle holds the tail of a reply for the
+    /// client's delayed ACK. A data-plane listener hands its keepalive and
+    /// TCP_NODELAY to every socket it accepts, one queued before the accept
+    /// loop started included; any other listener's sockets get them one by
+    /// one.
     #[tokio::test]
-    async fn accepted_sockets_get_the_client_keepalive() {
+    async fn accepted_sockets_get_the_client_options() {
         let time = Duration::from_secs(61);
         let want = Some((time, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_RETRIES));
         let data_plane = crate::proxy::data_plane::create_tcp_listener(
@@ -3764,9 +3782,9 @@ mod connection_tests {
         )
         .unwrap();
         let data_plane = TcpListener::from_std(data_plane).unwrap();
-        assert!(carries_keepalive(&data_plane, time));
+        assert!(carries_client_options((&data_plane).into(), time));
         let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        assert!(!carries_keepalive(&plain, time));
+        assert!(!carries_client_options((&plain).into(), time));
 
         for listener in [data_plane, plain] {
             let addr = listener.local_addr().unwrap();
@@ -3794,10 +3812,14 @@ mod connection_tests {
             let reply = read_one_reply(&mut client).await;
             assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
             let me = client.local_addr().unwrap();
-            let accepted = keepalive_where(|sock| {
+            let is_accepted = |sock: &socket2::SockRef<'_>| {
                 sock.peer_addr().ok().and_then(|a| a.as_socket()) == Some(me)
-            });
-            assert_eq!(accepted, want, "{addr}");
+            };
+            assert_eq!(keepalive_where(is_accepted), want, "{addr}");
+            assert!(
+                socket_where(is_accepted, |sock| sock.tcp_nodelay().unwrap()),
+                "{addr}"
+            );
         }
     }
 
