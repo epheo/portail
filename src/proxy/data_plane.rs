@@ -983,11 +983,18 @@ pub(crate) fn create_tcp_listener(
     // graceful restart waits up to net.ipv4.tcp_fin_timeout (60s by default)
     // per port before it can accept again.
     socket.set_reuse_address(true)?;
-    // Linux copies the keepalive to every socket accepted here. Set before
-    // listen(), so connections queued before the accept loop starts get it
-    // too; the loop sets it per socket on a listener without it.
+    // Linux copies the keepalive and TCP_NODELAY to every socket accepted
+    // here. Set before listen(), so connections queued before the accept
+    // loop starts get them too; the loop sets them per socket on a listener
+    // without them.
     if let Err(e) = socket.set_tcp_keepalive(client_keepalive) {
         warn!("TCP keepalive setup failed for listener :{}: {}", port, e);
+    }
+    // A reply leaves as several small writes: a head then a body, or h2
+    // frames. With Nagle on, the later ones wait for the client's delayed
+    // ACK, about 40 ms.
+    if let Err(e) = socket.set_tcp_nodelay(true) {
+        warn!("TCP_NODELAY setup failed for listener :{}: {}", port, e);
     }
 
     if let Some(iface) = interface {

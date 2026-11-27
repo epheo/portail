@@ -90,15 +90,6 @@ impl AsyncWrite for Connection {
 }
 
 impl Connection {
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        match self {
-            Connection::Plain { inner } => inner.set_nodelay(nodelay),
-            Connection::Tls { inner } => inner.get_ref().0.set_nodelay(nodelay),
-            Connection::ClientTls { inner } => inner.get_ref().0.set_nodelay(nodelay),
-            Connection::Mem { .. } => Ok(()),
-        }
-    }
-
     /// Whether an idle pooled connection can carry another request: the peer
     /// has neither closed it nor sent a byte nobody asked for. TLS must also
     /// hold no record it already read, such as a close_notify.
