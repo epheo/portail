@@ -17,9 +17,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use portail::config::{CertificateRef, PerformanceConfig};
 use portail::proxy::health::HealthRegistry;
 use portail::proxy::http_parser::{extract_routing_info, HeadError};
+use portail::proxy::listener::{run_worker, ListenerCtx, WorkerConfig};
 use portail::proxy::request_processor::{analyze_request, analyze_udp_request, RoutingResult};
 use portail::proxy::tls::{build_server_config, TlsKind, TlsPlan};
-use portail::proxy::worker::{run_worker, ListenerCtx, WorkerConfig};
 use portail::routing::{
     Backend, BackendAction, BackendSelector, HttpRouteRule, PathMatchType, RouteTable,
 };

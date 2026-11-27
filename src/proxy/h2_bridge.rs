@@ -37,11 +37,12 @@ use crate::proxy::http_filters::{
     header_lines, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
 };
 use crate::proxy::http_parser::{find_header_end, trim_ows};
+use crate::proxy::listener::WorkerConfig;
 use crate::proxy::tls::Connection;
 use crate::proxy::upstream::response::{
     parse_response_head, response_has_no_body, BodyFraming, RESPONSE_HEADER_CAP,
 };
-use crate::proxy::worker::{self, WorkerConfig};
+use crate::proxy::worker;
 use crate::routing::{BackendSelector, RouteTable};
 
 /// Streams per connection: enough for browser multiplexing, small enough

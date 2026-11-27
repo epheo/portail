@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::{info, warn};
-use crate::proxy::worker::AcceptBackoff;
+use crate::proxy::listener::AcceptBackoff;
 
 const READY_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
 const NOT_READY_503: &[u8] =

@@ -45,7 +45,7 @@ use super::ControllerCtx;
 use crate::kubernetes::crds::Provisioning;
 use crate::logging::{info, warn};
 use crate::metrics::METRICS;
-use crate::proxy::worker::AcceptBackoff;
+use crate::proxy::listener::AcceptBackoff;
 use crate::sync::{
     sign, valid_nonce, GatewayKey, Gone, Signed, Snapshot, SyncRequest, HOLD, PROTOCOL,
     STANDBY_HEADER, TOKEN_HEADER,
