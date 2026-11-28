@@ -25,8 +25,8 @@ use crate::sync::{GatewayKey, InstanceReport, Snapshot, HOLD};
 /// the published version: one hold. A live data plane applies a version
 /// about a second after its publish, a replacement or a reconnecting one
 /// within a hold. Conformance waits 60s (LatestObservedGenerationSet) for
-/// the latest observedGeneration: the lapse to Pending, debounce included,
-/// must come well before.
+/// the latest observedGeneration: the lapse to Pending must come well
+/// before.
 const KEEP: Duration = HOLD;
 
 /// How long, from leadership gained, no report says nothing: every data
@@ -1301,14 +1301,13 @@ mod tests {
         assert!(addresses(&out.desired).is_empty(), "{}", out.desired);
     }
 
-    /// The lapse to Pending, debounce and one refused write included,
-    /// lands inside the 60s conformance waits for the latest
-    /// observedGeneration (LatestObservedGenerationSet).
+    /// The lapse to Pending, one refused write included, lands inside the
+    /// 60s conformance waits for the latest observedGeneration
+    /// (LatestObservedGenerationSet).
     #[test]
     fn the_keep_lapses_inside_the_conformance_wait() {
-        let debounce = Duration::from_secs(1);
         let failed_write_retry = Duration::from_secs(10);
-        assert!(KEEP + debounce + failed_write_retry < Duration::from_secs(60));
+        assert!(KEEP + failed_write_retry < Duration::from_secs(60));
     }
 
     /// A LoadBalancer Service with no ingress knows the Gateway has no

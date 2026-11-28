@@ -30,8 +30,8 @@ const MAX_ENDPOINTS: usize = 64;
 
 /// Who names whom, and what each named Gateway exposes. A Gateway naming
 /// another is reconciled when that one's exposure changes, never on its
-/// other report churn: a busy target would keep the debounce from ever
-/// letting its edge run.
+/// other report churn: a busy target would rerun its edges on every
+/// report.
 pub(crate) struct GatewayBackends {
     state: Mutex<State>,
     wakes: mpsc::UnboundedSender<GatewayKey>,
