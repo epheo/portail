@@ -13,7 +13,7 @@
 //!
 //! Environment:
 //!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
-//!     nf1 nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
+//!     nf1 nf1_log nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
 //!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade echo_tcp
 //!   - `PT_SECS`: seconds per scenario, 10 by default
 //!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
@@ -147,6 +147,17 @@ fn main() {
         if selected("nf1") {
             let proxy = spawn_portail_no_filters(&backend_ports[..1], PORTAIL_PORT);
             println!("--- No-filter path (1 backend) ---");
+            proxy.measure(run_bench(PORTAIL_PORT, "/bench.txt")).await;
+            drop(proxy);
+        }
+
+        println!();
+
+        // Scenario 1 with the access log on, to stdout as a Managed data
+        // plane writes it: what a line costs, its sink /dev/null.
+        if selected("nf1_log") {
+            let proxy = spawn_portail_access_log(&backend_ports[..1], PORTAIL_PORT);
+            println!("--- No-filter path (1 backend), access log to stdout ---");
             proxy.measure(run_bench(PORTAIL_PORT, "/bench.txt")).await;
             drop(proxy);
         }
@@ -1021,7 +1032,25 @@ fn spawn_portail_no_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
     spawn_portail_pool(backend_ports, port, "connection")
 }
 
+fn spawn_portail_access_log(backend_ports: &[u16], port: u16) -> ProcessHandle {
+    spawn_portail_pool_with(
+        backend_ports,
+        port,
+        "connection",
+        &[OsStr::new("--access-log=-")],
+    )
+}
+
 fn spawn_portail_pool(backend_ports: &[u16], port: u16, pool_scope: &str) -> ProcessHandle {
+    spawn_portail_pool_with(backend_ports, port, pool_scope, &[])
+}
+
+fn spawn_portail_pool_with(
+    backend_ports: &[u16],
+    port: u16,
+    pool_scope: &str,
+    args: &[&OsStr],
+) -> ProcessHandle {
     let config = format!(
         r#"{{
   "gateway": {{"name":"bench","listeners":[{{"name":"http","protocol":"HTTP","port":{}}}]}},
@@ -1034,7 +1063,7 @@ fn spawn_portail_pool(backend_ports: &[u16], port: u16, pool_scope: &str) -> Pro
         pool_scope,
     );
 
-    spawn_portail_with_config(&config, port, &[])
+    spawn_portail_with_config(&config, port, args)
 }
 
 fn spawn_portail_with_filters(backend_ports: &[u16], port: u16) -> ProcessHandle {
