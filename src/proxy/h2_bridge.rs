@@ -278,8 +278,8 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
     // gets the same slow-loris budget as an h1 header block.
     let mut conn = match tokio::time::timeout(ctx.cfg.client_header_timeout, handshake).await {
         Ok(Ok(c)) => c,
-        Ok(Err(_e)) => {
-            debug!("h2 handshake failed from {}: {}", ctx.peer, _e);
+        Ok(Err(e)) => {
+            debug!("h2 handshake failed from {}: {}", ctx.peer, e);
             return;
         }
         Err(_) => {

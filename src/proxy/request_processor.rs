@@ -227,11 +227,11 @@ fn analyze_http_request<'a>(
             debug!("Rejecting malformed request head on port {}", server_port);
             return Ok(BAD_REQUEST);
         }
-        Err(_e) => {
+        Err(e) => {
             METRICS.http_requests_rejected_total.inc();
             debug!(
                 "Rejecting unparseable request on port {}: {}",
-                server_port, _e
+                server_port, e
             );
             return Ok(BAD_REQUEST);
         }

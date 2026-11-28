@@ -236,12 +236,11 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                         });
                         if !inherited {
                             let sock = socket2::SockRef::from(&tcp_stream);
-                            // _-prefixed: debug! compiles out in release builds.
-                            if let Err(_e) = sock
+                            if let Err(e) = sock
                                 .set_tcp_keepalive(&keepalive)
                                 .and_then(|()| sock.set_tcp_nodelay(true))
                             {
-                                debug!("TCP option setup failed for {}: {}", peer, _e);
+                                debug!("TCP option setup failed for {}: {}", peer, e);
                             }
                         }
                         let routes = routes.clone();
@@ -390,12 +389,9 @@ async fn client_of(
     match tokio::time::timeout(timeout, proxy_protocol::read_header(stream)).await {
         Ok(Ok(Header::Proxy(client))) => Some(client),
         Ok(Ok(Header::Local)) => Some(peer),
-        _outcome => {
+        outcome => {
             METRICS.proxy_protocol_refused_total.inc();
-            debug!(
-                "PROXY protocol header from {} refused: {:?}",
-                peer, _outcome
-            );
+            debug!("PROXY protocol header from {} refused: {:?}", peer, outcome);
             None
         }
     }
@@ -421,10 +417,10 @@ async fn serve_tls_connection(
     listener_stats: Arc<ListenerStats>,
     drain: CancellationToken,
 ) {
-    let refuse = |_why: &str| {
+    let refuse = |why: &str| {
         METRICS.tls_handshake_failures_total.inc();
         listener_stats.tls_handshake_failures.inc();
-        debug!("TLS connection from {} closed: {}", peer, _why);
+        debug!("TLS connection from {} closed: {}", peer, why);
     };
     // Waits out fragmented hellos.
     let mut sni = match tls::peek_client_hello(&tcp_stream, cfg.client_header_timeout).await {
@@ -476,7 +472,7 @@ async fn serve_tls_connection(
             METRICS.tls_handshake_failures_total.inc();
             listener_stats.tls_handshake_failures.inc();
             match outcome {
-                Ok(Err(_e)) => debug!("TLS handshake failed from {}: {}", peer, _e),
+                Ok(Err(e)) => debug!("TLS handshake failed from {}: {}", peer, e),
                 _ => debug!("TLS handshake from {} timed out", peer),
             }
             return;

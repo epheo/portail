@@ -172,7 +172,7 @@ impl Resolver<'_, '_> {
             .and_then(|r| r.refuses(addr.ip(), direct))
         {
             None => true,
-            Some(_why) => {
+            Some(why) => {
                 refused += 1;
                 tracing::debug!(
                     "{} backend {}:{}: address {} refused: {}",
@@ -180,7 +180,7 @@ impl Resolver<'_, '_> {
                     name,
                     port,
                     addr.ip(),
-                    _why
+                    why
                 );
                 false
             }

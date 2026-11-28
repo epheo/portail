@@ -435,8 +435,8 @@ pub(super) async fn proxy_http_request(
             reset_on_drop(client, state);
             return Ok((false, None));
         }
-        Err(_e) => {
-            debug!("Response body from backend {} failed: {}", backend_addr, _e);
+        Err(e) => {
+            debug!("Response body from backend {} failed: {}", backend_addr, e);
             reset_on_drop(client, state);
             return Ok((false, None));
         }
@@ -638,14 +638,14 @@ async fn send_request_with_retry(
     let backend_addr = backend_ref.socket_addr;
     match write_with_tail(&mut backend, &mut state.scratch_buf, headers_len, body).await {
         Ok(()) => return Ok(Some((backend, from_pool))),
-        Err(_e) if from_pool => {
+        Err(e) if from_pool => {
             // Pool entry died between probe and write. Reconnect once and
             // replay. Do NOT record_failure here: a stale pool entry is
             // expected churn, not a backend problem.
             METRICS.pool_stale_retries_total.inc();
             debug!(
                 "Backend {} pool conn died on send ({}); retrying with fresh conn",
-                backend_addr, _e
+                backend_addr, e
             );
         }
         Err(e) => {
