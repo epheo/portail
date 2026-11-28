@@ -72,6 +72,7 @@ fn test_snapshot(
         http_routes: http_routes.into_iter().map(Arc::new).collect(),
         tcp_routes: tcp_routes.into_iter().map(Arc::new).collect(),
         tls_routes: tls_routes.into_iter().map(Arc::new).collect(),
+        grpc_routes: vec![],
         udp_routes: udp_routes.into_iter().map(Arc::new).collect(),
         namespaces: reads::namespaces(ns_labels),
         reference_grants: reads::grants(reference_grants),

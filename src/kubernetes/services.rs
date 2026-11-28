@@ -265,18 +265,20 @@ impl NamedTargetPortReq {
 pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u16)> {
     config
         .http_backend_refs()
+        .chain(config.grpc_backend_refs())
         .chain(config.l4_backend_refs())
         .filter(|b| !b.invalid)
         .map(|b| (b.name.clone(), b.port))
         .collect()
 }
 
-/// (FQDN, port) of every backend an HTTP rule routes or mirrors to: the
-/// connections a BackendTLSPolicy verifies. TLSRoute is served in
+/// (FQDN, port) of every backend an HTTP or gRPC rule routes or mirrors to:
+/// the connections a BackendTLSPolicy verifies. TLSRoute is served in
 /// Passthrough only, where the client's TLS reaches the backend.
-pub(crate) fn http_backends(config: &PortailConfig) -> BTreeSet<(String, u16)> {
+pub(crate) fn verifiable_backends(config: &PortailConfig) -> BTreeSet<(String, u16)> {
     config
         .http_backend_refs()
+        .chain(config.grpc_backend_refs())
         .filter(|b| !b.invalid)
         .map(|b| (b.name.clone(), b.port))
         .collect()

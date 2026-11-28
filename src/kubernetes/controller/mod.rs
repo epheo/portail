@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use gateway_api::experimental::grpcroutes::v1::GrpcRoute;
 use gateway_api::experimental::httproutes::v1::HttpRoute;
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
 use gateway_api::experimental::tlsroutes::v1::TlsRoute;
@@ -90,6 +91,8 @@ struct ResourceCache {
     gateway_classes: Store<GatewayClass>,
     gateways: Store<Gateway>,
     http_routes: Store<HttpRoute>,
+    /// Empty store when the CRD is not installed.
+    grpc_routes: Store<GrpcRoute>,
     tcp_routes: Store<TcpRoute>,
     tls_routes: Store<TlsRoute>,
     udp_routes: Store<UdpRoute>,
@@ -217,6 +220,14 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         &pending_watches,
         &listings,
     );
+    // In the standard channel since v1.1, but a cluster on older CRDs has
+    // none: a missing kind must not hold every Gateway.
+    let (store_grpc_routes, grpc_route_stream) = create_optional_reflector(
+        Api::<GrpcRoute>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
     let (store_tls_routes, tls_route_stream) = create_optional_reflector(
         Api::<TlsRoute>::all(client.clone()),
         &client,
@@ -305,6 +316,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             gateway_classes: store_gateway_classes,
             gateways: store_gateways.clone(),
             http_routes: store_http_routes,
+            grpc_routes: store_grpc_routes,
             tcp_routes: store_tcp_routes,
             tls_routes: store_tls_routes,
             udp_routes: store_udp_routes,
@@ -457,12 +469,16 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         std::array::from_fn::<_, 6, _>(|_| ctx.reads.clone());
     let [gw12, gw13] = std::array::from_fn::<_, 2, _>(|_| store_gateways.clone());
     let controller_name = args.controller_name.clone();
+    let (gw14, cn6) = (store_gateways.clone(), args.controller_name.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
         // ones its status says we reported on.
         .watches_stream(http_route_stream, move |route: HttpRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw1, &cn1)
+        })
+        .watches_stream(grpc_route_stream, move |route: GrpcRoute| {
+            map_route_to_gateways(&route, &route.spec.parent_refs, &gw14, &cn6)
         })
         .watches_stream(tcp_route_stream, move |route: TcpRoute| {
             map_route_to_gateways(&route, &route.spec.parent_refs, &gw2, &cn2)
