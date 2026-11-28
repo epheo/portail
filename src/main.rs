@@ -125,11 +125,21 @@ fn main() -> Result<()> {
     // src/privileges.rs.
     privileges::raise_nofile_limit();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .worker_threads(worker_threads)
         .max_blocking_threads(max_blocking_threads)
-        .on_thread_park(portail::access_log::flush)
-        .enable_all()
+        .enable_all();
+    // Only with an access log: without one, a worker's park runs nothing new.
+    let access_log = match &args.command {
+        Some(cli::Command::Dataplane(dataplane)) => dataplane.access_log.is_some(),
+        Some(_) => false,
+        None => args.access_log.is_some(),
+    };
+    if access_log {
+        builder.on_thread_park(portail::access_log::flush);
+    }
+    let rt = builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
 
