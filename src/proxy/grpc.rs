@@ -492,63 +492,91 @@ mod tests {
     /// it, counted in `FLOODED`. With `one_call`, a connection closes after
     /// its first stream.
     async fn echo_backend(one_call: bool) -> (SocketAddr, UnboundedReceiver<http::request::Parts>) {
+        echo_backend_over(one_call, None).await
+    }
+
+    /// [`echo_backend`] over TLS by `tls`, which, as grpc-go since 1.67,
+    /// refuses a client that negotiates no h2.
+    async fn echo_backend_over(
+        one_call: bool,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> (SocketAddr, UnboundedReceiver<http::request::Parts>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (seen, rx) = unbounded_channel();
         tokio::spawn(async move {
             loop {
                 let (tcp, _) = listener.accept().await.unwrap();
-                let seen = seen.clone();
+                let (seen, tls) = (seen.clone(), tls.clone());
                 tokio::spawn(async move {
-                    let mut conn = h2::server::handshake(tcp).await.unwrap();
-                    while let Some(Ok((req, mut respond))) = conn.accept().await {
-                        let (parts, mut body) = req.into_parts();
-                        let cancel = parts.uri.path() == "/test.Echo/Cancel";
-                        let flood = parts.uri.path() == "/test.Echo/Flood";
-                        let _ = seen.send(parts);
-                        if cancel {
-                            respond.send_reset(h2::Reason::CANCEL);
-                        } else {
-                            tokio::spawn(async move {
-                                let head = http::Response::builder()
-                                    .header("content-type", "application/grpc")
-                                    .body(())
-                                    .unwrap();
-                                let mut out = respond.send_response(head, false).unwrap();
-                                let mut flooding = if flood { 8 << 20 } else { 0 };
-                                while flooding > 0 {
-                                    out.reserve_capacity(flooding);
-                                    let Some(Ok(granted)) =
-                                        std::future::poll_fn(|cx| out.poll_capacity(cx)).await
-                                    else {
-                                        return;
-                                    };
-                                    let granted = granted.min(flooding);
-                                    if granted > 0 {
-                                        out.send_data(Bytes::from(vec![7; granted]), false)
-                                            .unwrap();
-                                        FLOODED.fetch_add(granted, Ordering::Relaxed);
-                                        flooding -= granted;
-                                    }
-                                }
-                                while let Some(Ok(chunk)) = body.data().await {
-                                    let _ = body.flow_control().release_capacity(chunk.len());
-                                    out.send_data(chunk, false).unwrap();
-                                }
-                                let mut trailers = HeaderMap::new();
-                                trailers.insert("grpc-status", HeaderValue::from_static("0"));
-                                trailers.insert("x-trailer", HeaderValue::from_static("seen"));
-                                out.send_trailers(trailers).unwrap();
-                            });
-                        }
-                        if one_call {
-                            conn.graceful_shutdown();
-                        }
+                    let Some(tls) = tls else {
+                        return serve_echo(tcp, seen, one_call).await;
+                    };
+                    let Ok(tls) = tokio_rustls::TlsAcceptor::from(tls).accept(tcp).await else {
+                        return;
+                    };
+                    if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                        serve_echo(tls, seen, one_call).await;
                     }
                 });
             }
         });
         (addr, rx)
+    }
+
+    async fn serve_echo<S>(
+        io: S,
+        seen: tokio::sync::mpsc::UnboundedSender<http::request::Parts>,
+        one_call: bool,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        while let Some(Ok((req, mut respond))) = conn.accept().await {
+            let (parts, mut body) = req.into_parts();
+            let cancel = parts.uri.path() == "/test.Echo/Cancel";
+            let flood = parts.uri.path() == "/test.Echo/Flood";
+            let _ = seen.send(parts);
+            if cancel {
+                respond.send_reset(h2::Reason::CANCEL);
+            } else {
+                tokio::spawn(async move {
+                    let head = http::Response::builder()
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut out = respond.send_response(head, false).unwrap();
+                    let mut flooding = if flood { 8 << 20 } else { 0 };
+                    while flooding > 0 {
+                        out.reserve_capacity(flooding);
+                        let Some(Ok(granted)) =
+                            std::future::poll_fn(|cx| out.poll_capacity(cx)).await
+                        else {
+                            return;
+                        };
+                        let granted = granted.min(flooding);
+                        if granted > 0 {
+                            out.send_data(Bytes::from(vec![7; granted]), false).unwrap();
+                            FLOODED.fetch_add(granted, Ordering::Relaxed);
+                            flooding -= granted;
+                        }
+                    }
+                    while let Some(Ok(chunk)) = body.data().await {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        out.send_data(chunk, false).unwrap();
+                    }
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                    trailers.insert("x-trailer", HeaderValue::from_static("seen"));
+                    out.send_trailers(trailers).unwrap();
+                });
+            }
+            if one_call {
+                conn.graceful_shutdown();
+            }
+        }
     }
 
     static FLOODED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -700,6 +728,49 @@ mod tests {
         assert!(within(answer.data()).await.is_none());
         let trailers = within(answer.trailers()).await.unwrap().unwrap();
         assert_eq!(trailers["grpc-status"], "0");
+    }
+
+    /// A backend under a BackendTLSPolicy, as the controller writes it: the
+    /// ref's `tls` and the bundle in `backendCas`. The call goes over TLS,
+    /// its certificate checked, h2 by ALPN.
+    #[tokio::test]
+    async fn a_call_reaches_a_backend_verified_by_its_policy() {
+        use crate::proxy::testkit::TestCa;
+        let ca = TestCa::new();
+        let mut tls = ca.server_config(&["abc.example.com"], &[]);
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let (backend, mut seen) = echo_backend_over(false, Some(Arc::new(tls))).await;
+        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "grpcRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "l"}],
+                "hostnames": ["grpc.test"],
+                "rules": [{"backendRefs": [{
+                    "name": backend.ip().to_string(), "port": backend.port(),
+                    "tls": {"hostname": "abc.example.com", "ca": {"bundle": "ca"}}
+                }]}]
+            }],
+            "backendCas": {"ca": ca.pem()}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let send = client(config.to_route_table_strict().unwrap()).await;
+        let mut send = send.ready().await.unwrap();
+        let (response, _) = send.send_request(call("/test.Echo/Say"), true).unwrap();
+        let response = within(response).await.unwrap();
+        assert_eq!(
+            response.headers().get("grpc-status"),
+            None,
+            "answered by the proxy"
+        );
+        let mut answer = response.into_body();
+        while within(answer.data()).await.is_some() {}
+        let trailers = within(answer.trailers()).await.unwrap().unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        assert_eq!(
+            within(seen.recv()).await.unwrap().uri.scheme_str(),
+            Some("https")
+        );
     }
 
     /// No rule: UNIMPLEMENTED, trailers only, and no HTTP route asked.
