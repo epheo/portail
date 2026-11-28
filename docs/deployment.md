@@ -347,6 +347,35 @@ spec:
     ports: [{port: 8443}]
 ```
 
+### Backend TLS
+
+A BackendTLSPolicy makes HTTP connections to a Service TLS, and checks the certificate:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {name: api, namespace: apps}
+spec:
+  targetRefs:
+  - {group: "", kind: Service, name: api, sectionName: https}
+  validation:
+    hostname: api.apps.svc
+    caCertificateRefs:
+    - {group: "", kind: ConfigMap, name: api-ca}
+```
+
+- The policy alone makes the connection TLS: no `appProtocol: https` needed.
+- `sectionName` is a Service port's name; without it the policy covers every port. A port's own policy beats the Service's.
+- `hostname` is the SNI, and the name the certificate must carry; with `subjectAltNames` set, one of those must be on it instead.
+- `caCertificateRefs` name ConfigMaps of the policy's namespace, each with a `ca.crt` of PEM certificates. `wellKnownCACertificates: System` trusts the data plane host's store; the Managed image carries one.
+- It applies to HTTPRoute rules and their request mirrors. TLSRoute is served in Passthrough, and TCPRoute and UDPRoute carry no TLS of portail's: a policy on a Service reached by those alone has no effect and no status.
+- Fails closed: with no valid CA, a well-known set other than `System`, a wildcard `subjectAltNames` hostname, or a port with appProtocol `portail.epheo.eu/proxy-v2`, the policy is `Accepted=False` and the backend's share answers 500.
+- A certificate failing the check: 502, and no byte of the request is sent.
+- Of policies naming one Service and section, the oldest holds it (creationTimestamp, then namespace and name); the others are `Accepted=False`, reason `Conflicted`.
+- Status: one ancestor per Gateway routing to the Service, with `Accepted` and `ResolvedRefs`.
+- `appProtocol: https` without a policy is TLS without a check, as before; the controller warns once per backend.
+- The controller reads ConfigMaps cluster-wide, as it reads Secrets: by metadata only, and the data of those a policy names.
+
 ### Edge mode
 
 One public address in front of many Gateways: an edge Gateway takes every connection and hands each to the Gateway serving its hostname, over a transit network only platform pods join.
