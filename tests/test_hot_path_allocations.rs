@@ -540,7 +540,7 @@ fn a_full_path_rewrite_borrows_the_rules_values() {
 #[test]
 fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
     const TUNNELS: usize = 32;
-    const COUNTED: u64 = 128 * 1024 * 1024;
+    const COUNTED: u64 = 1024 * 1024 * 1024;
     // The scenario's pacing: each end rests after every burst.
     const REST: Duration = Duration::from_micros(400);
 
@@ -559,12 +559,17 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
             let delivered = delivered.clone();
             std::thread::spawn(move || {
                 let mut chunk = vec![0u8; 256 * 1024];
-                let mut first = true;
+                let (mut first, mut unsaid) = (true, 0u64);
                 while let Ok(n @ 1..) = sock.read(&mut chunk) {
-                    delivered.send_modify(|(tunnels, bytes)| {
-                        *tunnels += usize::from(std::mem::take(&mut first));
-                        *bytes += n as u64;
-                    });
+                    unsaid += n as u64;
+                    // Said a mebibyte at a time: each word wakes the test's
+                    // task on the proxy's thread, between two relays.
+                    if first || unsaid >= 1024 * 1024 {
+                        delivered.send_modify(|(tunnels, bytes)| {
+                            *tunnels += usize::from(std::mem::take(&mut first));
+                            *bytes += std::mem::take(&mut unsaid);
+                        });
+                    }
                     std::thread::sleep(REST);
                 }
             });
