@@ -128,6 +128,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .max_blocking_threads(max_blocking_threads)
+        .on_thread_park(portail::access_log::flush)
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;

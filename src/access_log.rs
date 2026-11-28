@@ -3,28 +3,44 @@
 //! One JSON line per completed HTTP response. Disabled costs the hot path a
 //! single relaxed load per request. Enabled, the request fields are copied
 //! out at parse time (the request buffer is reused for the response phase),
-//! the line is assembled off the response's critical await points, and
-//! handed to a dedicated writer task through a bounded channel: the data
-//! path never blocks on the log sink — a full channel drops the line and
-//! counts it in `portail_access_log_dropped_total` instead.
+//! and the line is written into its worker thread's pending buffer. A worker
+//! hands its buffer to the writer task as it parks, or once it holds
+//! `HANDOFF` bytes: an idle worker's lines go at once, a busy one's by size,
+//! none on a clock, and the writer is woken once per buffer, not per line.
+//! The data path never blocks on the log sink: past `QUEUED_MAX` bytes
+//! queued, a buffer is dropped and its lines counted in
+//! `portail_access_log_dropped_total`. Lines keep their order per worker
+//! only; each carries its timestamp.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::logging::warn;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static SENDER: OnceLock<tokio::sync::mpsc::Sender<String>> = OnceLock::new();
+static SENDER: OnceLock<UnboundedSender<String>> = OnceLock::new();
+/// Bytes handed to the writer and not yet taken by it.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
 
-/// Lines buffered towards the writer before drops start. Sized for a burst,
+/// Bytes queued towards the writer before drops start. Sized for a burst,
 /// not sustained overload: a sink slower than the request rate must shed
 /// lines, never backpressure the data path.
-const CHANNEL_CAPACITY: usize = 8192;
+const QUEUED_MAX: usize = 2 * 1024 * 1024;
+
+/// A worker hands its pending lines over once they reach this many bytes.
+const HANDOFF: usize = 16 * 1024;
+
+thread_local! {
+    /// The lines this worker thread wrote and has not handed over yet.
+    static PENDING: RefCell<String> = const { RefCell::new(String::new()) };
+}
 
 /// Request fields copied out before the buffer is reused for the response.
 /// Boxed so the disabled path moves one pointer-sized None around.
@@ -90,8 +106,9 @@ fn host_header(headers: &[u8]) -> Option<String> {
     None
 }
 
-/// Queue one log line for a completed response. `backend` is None for
-/// responses the proxy answered itself (redirects, direct errors).
+/// Write one log line for a completed response into this thread's pending
+/// buffer. `backend` is None for responses the proxy answered itself
+/// (redirects, direct errors).
 pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<SocketAddr>) {
     let Some(cap) = cap else { return };
     let Some(tx) = SENDER.get() else { return };
@@ -99,33 +116,68 @@ pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<Socket
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let line = format_line(
-        &cap,
-        status,
-        backend,
-        ts.as_secs(),
-        ts.subsec_millis(),
-        dur_us,
-    );
-    if tx.try_send(line).is_err() {
-        crate::metrics::METRICS.access_log_dropped_total.inc();
+    PENDING.with_borrow_mut(|pending| {
+        write_line(
+            pending,
+            &cap,
+            status,
+            backend,
+            ts.as_secs(),
+            ts.subsec_millis(),
+            dur_us,
+        );
+        if pending.len() >= HANDOFF {
+            hand_off(tx, pending);
+        }
+    });
+}
+
+/// Hand this thread's pending lines to the writer. The runtime calls it as
+/// a worker parks; a runtime without that hook calls it itself.
+pub fn flush() {
+    let Some(tx) = SENDER.get() else { return };
+    let _ = PENDING.try_with(|cell| {
+        if let Ok(mut pending) = cell.try_borrow_mut() {
+            if !pending.is_empty() {
+                hand_off(tx, &mut pending);
+            }
+        }
+    });
+}
+
+fn hand_off(tx: &UnboundedSender<String>, pending: &mut String) {
+    let lines = std::mem::replace(pending, String::with_capacity(HANDOFF + HANDOFF / 4));
+    let len = lines.len();
+    if QUEUED.fetch_add(len, Relaxed) + len > QUEUED_MAX {
+        QUEUED.fetch_sub(len, Relaxed);
+        drop_lines(&lines);
+        return;
+    }
+    if let Err(refused) = tx.send(lines) {
+        QUEUED.fetch_sub(len, Relaxed);
+        drop_lines(&refused.0);
     }
 }
 
-fn format_line(
+fn drop_lines(lines: &str) {
+    crate::metrics::METRICS
+        .access_log_dropped_total
+        .add(lines.matches('\n').count() as u64);
+}
+
+fn write_line(
+    out: &mut String,
     cap: &AccessCapture,
     status: u16,
     backend: Option<SocketAddr>,
     secs: u64,
     millis: u32,
     dur_us: u64,
-) -> String {
-    let backend = match backend {
-        Some(b) => Cow::Owned(format!("\"{}\"", b)),
-        None => Cow::Borrowed("null"),
-    };
-    format!(
-        "{{\"ts\":{}.{:03},\"client\":\"{}\",\"listener\":{},\"tls\":{},\"method\":\"{}\",\"path\":\"{}\",\"host\":\"{}\",\"status\":{},\"backend\":{},\"duration_us\":{}}}\n",
+) {
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "{{\"ts\":{}.{:03},\"client\":\"{}\",\"listener\":{},\"tls\":{},\"method\":\"{}\",\"path\":\"{}\",\"host\":\"{}\",\"status\":{},\"backend\":",
         secs,
         millis,
         cap.peer,
@@ -135,9 +187,28 @@ fn format_line(
         esc(&cap.path),
         esc(&cap.host),
         status,
-        backend,
-        dur_us,
-    )
+    );
+    match backend {
+        Some(b) => {
+            let _ = write!(out, "\"{b}\"");
+        }
+        None => out.push_str("null"),
+    }
+    let _ = writeln!(out, ",\"duration_us\":{dur_us}}}");
+}
+
+#[cfg(test)]
+fn format_line(
+    cap: &AccessCapture,
+    status: u16,
+    backend: Option<SocketAddr>,
+    secs: u64,
+    millis: u32,
+    dur_us: u64,
+) -> String {
+    let mut out = String::new();
+    write_line(&mut out, cap, status, backend, secs, millis, dur_us);
+    out
 }
 
 /// JSON string escaping for the attacker-controlled fields (method, path,
@@ -177,7 +248,7 @@ pub fn init(target: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to open access log {}: {}", target, e))?;
         Box::new(tokio::fs::File::from_std(file))
     };
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     SENDER
         .set(tx)
         .map_err(|_| anyhow::anyhow!("access log initialized twice"))?;
@@ -189,18 +260,23 @@ pub fn init(target: &str) -> anyhow::Result<()> {
 /// Drain the channel into batched writes, flushing whenever the queue goes
 /// quiet so lines are visible promptly without a per-line syscall under load.
 async fn writer(
-    mut rx: tokio::sync::mpsc::Receiver<String>,
+    mut rx: UnboundedReceiver<String>,
     mut sink: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 ) {
-    let mut batch = String::with_capacity(16 * 1024);
-    while let Some(line) = rx.recv().await {
-        batch.push_str(&line);
+    let mut batch = String::with_capacity(64 * 1024);
+    while let Some(lines) = rx.recv().await {
+        let mut taken = lines.len();
+        batch.push_str(&lines);
         while batch.len() < 64 * 1024 {
             match rx.try_recv() {
-                Ok(more) => batch.push_str(&more),
+                Ok(more) => {
+                    taken += more.len();
+                    batch.push_str(&more);
+                }
                 Err(_) => break,
             }
         }
+        QUEUED.fetch_sub(taken, Relaxed);
         if let Err(e) = sink.write_all(batch.as_bytes()).await {
             let lines = batch.matches('\n').count() as u64;
             crate::metrics::METRICS.access_log_dropped_total.add(lines);
@@ -215,6 +291,33 @@ async fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A buffer goes to the writer whole; past the byte budget it is
+    /// dropped whole, its lines counted, and nothing is queued.
+    #[test]
+    fn a_buffer_is_handed_over_whole_or_dropped_whole() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = QUEUED.load(Relaxed);
+        let mut pending = "a\nb\n".to_string();
+        hand_off(&tx, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(rx.try_recv().unwrap(), "a\nb\n");
+        assert_eq!(QUEUED.load(Relaxed), queued + 4);
+        QUEUED.fetch_sub(4, Relaxed);
+
+        let dropped = crate::metrics::METRICS.access_log_dropped_total.get();
+        QUEUED.fetch_add(QUEUED_MAX, Relaxed);
+        let mut pending = "c\nd\ne\n".to_string();
+        hand_off(&tx, &mut pending);
+        QUEUED.fetch_sub(QUEUED_MAX, Relaxed);
+        assert!(pending.is_empty());
+        assert!(rx.try_recv().is_err(), "over the budget, nothing queued");
+        assert_eq!(QUEUED.load(Relaxed), queued);
+        assert_eq!(
+            crate::metrics::METRICS.access_log_dropped_total.get(),
+            dropped + 3
+        );
+    }
 
     fn cap(method: &str, path: &str, host: &str) -> AccessCapture {
         AccessCapture {
