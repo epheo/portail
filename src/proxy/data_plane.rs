@@ -90,6 +90,8 @@ struct BuiltConfig {
     /// The refs whose certs loaded.
     loaded: HashSet<tls::CertKey>,
     config: Arc<rustls::ServerConfig>,
+    /// [`tls::offering_h2`] of `config`.
+    config_h2: Arc<rustls::ServerConfig>,
 }
 
 impl BuiltConfig {
@@ -305,13 +307,15 @@ fn plan_ports(
         let keys: HashSet<tls::CertKey> = refs.iter().map(tls::cert_key).collect();
         match tls::build_terminating(&refs, cert_dir, http2) {
             Ok((config, loaded)) => {
+                let config = Arc::new(config);
                 built.insert(
                     port,
                     BuiltConfig {
                         fingerprint,
                         refs: keys,
                         loaded,
-                        config: Arc::new(config),
+                        config_h2: tls::offering_h2(&config),
+                        config,
                     },
                 );
             }
@@ -353,6 +357,7 @@ fn plan_ports(
     for (port, plan) in &mut plans {
         if let Some(plan) = plan {
             plan.terminate = built.get(port).map(|b| b.config.clone());
+            plan.terminate_h2 = built.get(port).map(|b| b.config_h2.clone());
         }
     }
     (plans, errors)

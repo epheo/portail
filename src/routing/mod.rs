@@ -219,6 +219,11 @@ impl RouteTable {
         self.http.has_routes(server_port)
     }
 
+    /// Whether a port serves gRPC: it then speaks h2, h2c in the clear.
+    pub fn has_grpc_routes(&self, server_port: u16) -> bool {
+        self.grpc.has_routes(server_port)
+    }
+
     /// Every HTTP route scope: each port's, then the shared ones.
     pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
         self.http.scopes()

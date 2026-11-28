@@ -192,6 +192,8 @@ pub struct TlsPlan {
     /// `None` with no HTTPS listener on the port, or certs that failed to
     /// build: an SNI selecting an HTTPS listener is then closed.
     pub terminate: Option<Arc<ServerConfig>>,
+    /// The same, offering h2: a port's while it has gRPC routes.
+    pub terminate_h2: Option<Arc<ServerConfig>>,
     exact: HashMap<Box<str>, TlsListener>,
     /// By parent domain: `*.example.com` under "example.com".
     wildcard: HashMap<Box<str>, TlsListener>,
@@ -508,6 +510,16 @@ pub(crate) fn build_terminating(
     };
 
     Ok((config, loaded))
+}
+
+/// `config` offering h2 first by ALPN, its certs and sessions shared.
+pub(crate) fn offering_h2(config: &Arc<ServerConfig>) -> Arc<ServerConfig> {
+    if config.alpn_protocols.first().is_some_and(|p| p == b"h2") {
+        return config.clone();
+    }
+    let mut h2 = (**config).clone();
+    h2.alpn_protocols.insert(0, b"h2".to_vec());
+    Arc::new(h2)
 }
 
 /// Build a static TLS acceptor (standalone mode).

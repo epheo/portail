@@ -310,14 +310,76 @@ pub(crate) const CLIENT_BUF: usize = 64 * 1024;
 /// head. Allocated at the first read and never zeroed; it grows on need.
 const CLIENT_BUF_INITIAL: usize = 4 * 1024;
 
+/// What an h2c client sends first (RFC 9113 section 3.4), as far as an
+/// HTTP/1 parser reads it as a request head.
+const H2C_PREFACE_HEAD: &[u8] = b"PRI * HTTP/2.0\r\n\r\n";
+
+/// An h2c client the engine met on a port with gRPC routes (see
+/// [`Handoff::H2c`]): the h2 server takes it, the bytes read replayed first.
+pub(crate) struct H2c {
+    client: Connection,
+    read: Vec<u8>,
+    state: ConnectionState,
+}
+
+impl H2c {
+    pub(crate) fn into_h2(
+        self,
+        cfg: ServeConfig,
+        pool: Arc<crate::proxy::backend_pool::SharedBackendPool>,
+    ) -> (
+        crate::proxy::h2_bridge::Replay<Connection>,
+        crate::proxy::h2_bridge::H2Ctx,
+    ) {
+        let ConnectionState {
+            server_port,
+            routes,
+            selector,
+            health,
+            listener_stats,
+            peer,
+            local,
+            drain,
+            is_tls,
+            ..
+        } = self.state;
+        let ctx = crate::proxy::h2_bridge::H2Ctx {
+            server_port,
+            routes,
+            selector,
+            health,
+            pool,
+            cfg,
+            listener_stats,
+            peer,
+            local,
+            drain,
+            is_tls,
+        };
+        (
+            crate::proxy::h2_bridge::Replay::new(self.read, self.client),
+            ctx,
+        )
+    }
+}
+
+/// Serve one client connection. `Some` is an h2c client, for the h2
+/// server.
 pub(crate) async fn serve(
     mut client: Connection,
     _peer: SocketAddr,
     mut state: ConnectionState,
-) -> Result<()> {
+) -> Result<Option<H2c>> {
     let tcp_route = state.tcp_route;
     let mut buf = Vec::new();
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
+    if let Ok(Handoff::H2c) = served {
+        return Ok(Some(H2c {
+            client,
+            read: buf,
+            state,
+        }));
+    }
     if let Ok(Handoff::Tcp {
         backend_addr,
         proxied,
@@ -353,7 +415,7 @@ pub(crate) async fn serve(
             &listener_stats,
         )
         .await;
-        return Ok(());
+        return Ok(None);
     }
     close_connection(&mut client, &mut buf, &state).await;
     // For the next connection this thread serves, which then allocates none.
@@ -363,7 +425,7 @@ pub(crate) async fn serve(
         scratch: &mut state.scratch_buf,
     }
     .park();
-    served.map(drop)
+    served.map(|_| None)
 }
 
 /// Where [`serve_http`] leaves the connection.
@@ -375,6 +437,9 @@ enum Handoff {
         backend_addr: SocketAddr,
         proxied: bool,
     },
+    /// h2 with prior knowledge: the connection goes to the h2 server,
+    /// `buf` first.
+    H2c,
 }
 
 /// Serve requests until the connection must close, or turns out to be
@@ -405,6 +470,14 @@ async fn serve_http(
     }
     if buf.is_empty() {
         return Ok(Handoff::Close);
+    }
+    // Only where gRPC asks for it: h2 for HTTP routes is the http2 opt-in,
+    // over TLS.
+    if matches!(client, Connection::Plain { .. })
+        && buf.starts_with(H2C_PREFACE_HEAD)
+        && state.routes.load().has_grpc_routes(state.server_port)
+    {
+        return Ok(Handoff::H2c);
     }
     // The backend budget's timer, kept across this connection's requests:
     // see `within`. A Sleep never reset or polled is not registered.

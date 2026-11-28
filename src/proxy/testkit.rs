@@ -160,14 +160,13 @@ pub(crate) fn serve_state(
 ) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
     let (client, engine) = tokio::io::duplex(64 * 1024);
     let peer = "127.0.0.1:40000".parse().unwrap();
-    let task = tokio::spawn(http1::serve(
-        Connection::Mem {
+    let task = tokio::spawn(async move {
+        let conn = Connection::Mem {
             inner: engine,
             aborted: Default::default(),
-        },
-        peer,
-        state,
-    ));
+        };
+        http1::serve(conn, peer, state).await.map(drop)
+    });
     (client, task)
 }
 
@@ -400,7 +399,7 @@ pub(crate) async fn tls_client(
         let tls = Connection::Tls {
             inner: Box::new(tls),
         };
-        http1::serve(tls, peer, state).await
+        http1::serve(tls, peer, state).await.map(drop)
     });
 
     let client_cfg = rustls::ClientConfig::builder()
@@ -436,7 +435,9 @@ pub(crate) async fn tcp_client(
     let front_addr = front.local_addr().unwrap();
     let engine = tokio::spawn(async move {
         let (tcp, peer) = front.accept().await.unwrap();
-        http1::serve(Connection::Plain { inner: tcp }, peer, state).await
+        http1::serve(Connection::Plain { inner: tcp }, peer, state)
+            .await
+            .map(drop)
     });
     (TcpStream::connect(front_addr).await.unwrap(), engine)
 }
