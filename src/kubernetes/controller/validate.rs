@@ -341,24 +341,23 @@ pub(super) fn validate_gateway(
 
         // A listener it cannot serve takes no kind at all
         // (TLSRouteListenerTerminateNotSupported), as no route attaches there.
-        let served = if listener_is_served(listener) {
-            status::route_kind_for_protocol(&listener.protocol)
+        let served: &[&str] = if listener_is_served(listener) {
+            status::route_kinds_for_protocol(&listener.protocol)
         } else {
-            None
+            &[]
         };
         // Check allowedRoutes.kinds validity and compute supportedKinds
         if let Some(allowed_routes) = &listener.allowed_routes {
             if let Some(kinds) = &allowed_routes.kinds {
-                // Only the kind its protocol takes, as routes attach: a TLS
+                // Only the kinds its protocol takes, as routes attach: a TLS
                 // listener takes no TCPRoute
-                // (TLSRouteListenerPassthroughSupportedKinds), and no listener
-                // takes GRPCRoute, which the data plane cannot serve.
+                // (TLSRouteListenerPassthroughSupportedKinds).
                 let mut supported = Vec::new();
                 let mut has_invalid = false;
                 for k in kinds {
                     let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
                     let kind_str = &k.kind;
-                    if group == "gateway.networking.k8s.io" && served == Some(kind_str.as_str()) {
+                    if group == "gateway.networking.k8s.io" && served.contains(&kind_str.as_str()) {
                         supported.push(serde_json::json!({
                             "group": "gateway.networking.k8s.io",
                             "kind": kind_str,
@@ -623,8 +622,10 @@ mod tests {
         assert_eq!(ls.resolved_refs_reason, "InvalidCertificateRef");
     }
 
+    /// An HTTP listener takes GRPCRoute beside HTTPRoute, and lists both
+    /// when its allowedRoutes asks for both.
     #[test]
-    fn validate_gateway_grpcroute_kind_not_supported() {
+    fn an_http_listener_takes_grpcroute() {
         use gateway_api::gateways::{
             GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
         };
@@ -650,10 +651,13 @@ mod tests {
         };
         let (listeners, _) = validate_gateway(&gw, "default", &certs);
         let ls = &listeners["https"];
-        assert!(!ls.resolved_refs);
-        assert_eq!(ls.resolved_refs_reason, "InvalidRouteKinds");
-        assert_eq!(ls.supported_kinds.len(), 1);
-        assert_eq!(ls.supported_kinds[0]["kind"], "HTTPRoute");
+        assert!(ls.resolved_refs, "{}", ls.resolved_refs_message);
+        let kinds: Vec<_> = ls
+            .supported_kinds
+            .iter()
+            .map(|k| k["kind"].clone())
+            .collect();
+        assert_eq!(kinds, ["HTTPRoute", "GRPCRoute"]);
     }
 
     /// A TLS listener lists the TLSRoute it takes and refuses a TCPRoute

@@ -1008,6 +1008,52 @@ mod tests {
         assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
     }
 
+    /// A GRPCRoute on an HTTP listener is accepted beside HTTPRoutes and
+    /// served as a gRPC route, its backend resolved as an HTTP one's.
+    #[tokio::test]
+    async fn a_grpc_route_attaches_to_an_http_listener() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("echo", "grpc", 9000, serde_json::json!(9000)),
+        );
+        let route: gateway_api::experimental::grpcroutes::v1::GrpcRoute = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GRPCRoute",
+            "metadata": {"name": "g", "namespace": "default", "generation": 1, "resourceVersion": "1"},
+            "spec": {
+                "parentRefs": [{"name": "gw"}],
+                "rules": [{
+                    "matches": [{"method": {"service": "echo.Echo", "method": "Say"}}],
+                    "backendRefs": [{"name": "echo", "port": 9000}],
+                }],
+            },
+        }))
+        .unwrap();
+        apply(&mut p.cluster.grpc_routes, route);
+
+        p.pass(&gw).await.unwrap();
+        let patch = p
+            .api
+            .status_patch("grpcroutes", "g")
+            .expect("the route's status");
+        let accepted = patch["status"]["parents"][0]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .unwrap()
+            .clone();
+        assert_eq!(accepted["status"], "True", "{accepted}");
+        let served = p.served(&gw).unwrap();
+        let routes = &served.config.grpc_routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rules[0].backend_refs[0].name, "echo.default.svc");
+        assert!(served.config.http_routes.is_empty());
+    }
+
     /// A policy naming a Service the Gateway reaches by a TCPRoute alone
     /// changes no connection: the Gateway is not its ancestor.
     #[tokio::test]

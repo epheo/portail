@@ -167,6 +167,7 @@ fn object_at(path: &str) -> Value {
             json!({"gatewayClassName": "portail", "listeners": []}),
         ),
         "httproutes" => ("HTTPRoute", json!({})),
+        "grpcroutes" => ("GRPCRoute", json!({})),
         "tcproutes" => ("TCPRoute", json!({"rules": []})),
         "tlsroutes" => ("TLSRoute", json!({"hostnames": [], "rules": []})),
         "udproutes" => ("UDPRoute", json!({"rules": []})),
