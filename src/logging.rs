@@ -12,11 +12,15 @@ pub use tracing::{error, info, warn};
 #[cfg(debug_assertions)]
 pub use tracing::debug;
 
+// Still reads its arguments, never run: a value used only by a debug line
+// would otherwise be unused in release builds.
 #[cfg(not(debug_assertions))]
 #[macro_export]
 macro_rules! logging_debug {
     ($($arg:tt)*) => {
-        ()
+        if false {
+            let _ = ::std::format_args!($($arg)*);
+        }
     };
 }
 
