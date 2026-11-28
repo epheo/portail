@@ -657,6 +657,8 @@ async fn idle_read(
 ) -> std::io::Result<usize> {
     use std::future::Future;
     use std::task::Poll;
+    // Parking drops what the buffer holds: it must hold nothing yet.
+    debug_assert!(idle.read.is_empty());
     let first = std::future::poll_fn(|cx| {
         if idle.read.capacity() == 0 {
             idle.unpark();
