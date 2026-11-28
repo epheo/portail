@@ -117,6 +117,7 @@ struct ControllerCtx {
     networks: Arc<NetworkCidrCache>,
     certs: Arc<validate::LastGoodCerts>,
     ca_bundles: ca_bundles::CaBundles,
+    read_retries: reconcile::ReadRetries,
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
     /// Who names whom as a backend of kind Gateway, and what each exposes.
@@ -331,6 +332,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         networks: Arc::default(),
         certs: Arc::default(),
         ca_bundles: Default::default(),
+        read_retries: Default::default(),
         hub: Arc::default(),
         reports: Arc::default(),
         backends: Arc::default(),

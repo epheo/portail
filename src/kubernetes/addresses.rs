@@ -144,7 +144,7 @@ pub(crate) async fn resolve_network_cidrs(
     gw_ns: &str,
     egress: &[(String, String)],
     last: &NetworkCidrCache,
-) -> Result<Vec<NetworkCidrs>, String> {
+) -> Result<Vec<NetworkCidrs>, super::ReadFailed> {
     let gw_name = gateway.name_any();
     let addressed = gateway
         .spec
@@ -191,10 +191,13 @@ pub(crate) async fn resolve_network_cidrs(
                     cidrs.clone()
                 }
                 None => {
-                    return Err(format!(
-                        "NetworkAttachmentDefinition {namespace}/{network_name} not read ({e}), \
-                         and never read before"
-                    ));
+                    return Err(super::ReadFailed {
+                        transient: super::transient(&e),
+                        message: format!(
+                            "NetworkAttachmentDefinition {namespace}/{network_name} not read ({e}), \
+                             and never read before"
+                        ),
+                    });
                 }
             },
         };

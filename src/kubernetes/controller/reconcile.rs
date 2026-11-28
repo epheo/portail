@@ -8,7 +8,7 @@ use kube::runtime::controller::Action;
 use kube::runtime::reflector::ObjectRef;
 use kube::ResourceExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
@@ -21,7 +21,7 @@ use gateway_api::httproutes::HttpRoute;
 use super::external_ips::{self, Assignment};
 use super::gateway_backends::{self, trusted_addresses};
 use super::provision::Provisioned;
-use super::translate::{translate, Observed, Plan, Rejected, Statuses};
+use super::translate::{translate, Observed, Plan, Rejected, Statuses, Unplanned};
 use super::{
     params, programmed, provision, skip_requeue_secs, success_requeue_secs, ControllerCtx,
     ReconcileError, ERROR_REQUEUE_SECS,
@@ -317,6 +317,42 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
     ctx.departures.wake();
 }
 
+/// Per Gateway, the backoff of passes whose reads may succeed again.
+#[derive(Default)]
+pub(super) struct ReadRetries(Mutex<HashMap<GatewayKey, kube::runtime::watcher::DefaultBackoff>>);
+
+impl ReadRetries {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<GatewayKey, kube::runtime::watcher::DefaultBackoff>>
+    {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Until the next try: kube's watcher backoff, from 0.8 s doubled to
+    /// 30 s, jittered, and started over after two quiet minutes.
+    fn failed(&self, key: &GatewayKey) -> Duration {
+        self.lock()
+            .entry(key.clone())
+            .or_default()
+            .next()
+            .unwrap_or(Duration::from_secs(ERROR_REQUEUE_SECS))
+    }
+
+    fn cleared(&self, key: &GatewayKey) {
+        self.lock().remove(key);
+    }
+
+    /// Forget the Gateways not among `gateways`.
+    pub(super) fn retain(&self, gateways: &[Arc<Gateway>]) {
+        let live: HashSet<GatewayKey> = gateways
+            .iter()
+            .map(|g| GatewayKey::new(g.namespace().unwrap_or_default(), g.name_any()))
+            .collect();
+        self.lock().retain(|key, _| live.contains(key));
+    }
+}
+
 /// What [`publish`] leaves for [`finish`].
 pub(super) enum Step {
     /// Nothing more this pass: not the leader, or not our Gateway.
@@ -408,14 +444,35 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         .as_ref()
         .map(|p| p.egress_networks(&key.namespace))
         .unwrap_or_default();
-    let mut plan = translate(
+    let mut plan = match translate(
         ctx,
         gateway,
         external_name_backends,
         trusted_gateways,
         &egress,
     )
-    .await;
+    .await
+    {
+        Err(Unplanned::Retry(why)) => {
+            crate::metrics::METRICS.reconcile_retries_total.inc();
+            let delay = ctx.read_retries.failed(&key);
+            warn!(
+                "Gateway {}: {}; nothing written, tried again in {:.1}s",
+                key,
+                why,
+                delay.as_secs_f32()
+            );
+            return Step::Done(Action::requeue(delay));
+        }
+        Err(Unplanned::Rejected(rejected)) => {
+            ctx.read_retries.cleared(&key);
+            Err(rejected)
+        }
+        Ok(plan) => {
+            ctx.read_retries.cleared(&key);
+            Ok(plan)
+        }
+    };
     // A dial-out network's CIDRs are read at translation: only then does an
     // IPAddress inside one show it would never bind.
     let params = match (params, &plan) {
@@ -989,6 +1046,75 @@ mod tests {
         assert_eq!(p.api.status_patch("backendtlspolicies", "p"), None);
     }
 
+    /// A CA read the next try may pass writes nothing and comes back; a
+    /// refused one says why on the Gateway.
+    #[tokio::test]
+    async fn a_ca_read_that_may_pass_next_time_writes_nothing() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("web", "https", 443, serde_json::json!(8443)),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 443),
+        );
+        apply(
+            &mut p.cluster.backend_tls_policies,
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "namespace": "default", "generation": 1},
+                "spec": {
+                    "targetRefs": [{"group": "", "kind": "Service", "name": "web"}],
+                    "validation": {"hostname": "web.test", "caCertificateRefs": [
+                        {"group": "", "kind": "ConfigMap", "name": "ca"},
+                    ]},
+                },
+            }))
+            .unwrap(),
+        );
+        apply(
+            &mut p.cluster.configmaps,
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": {"name": "ca", "namespace": "default", "resourceVersion": "1"},
+            }))
+            .unwrap(),
+        );
+        let path = "/api/v1/namespaces/default/configmaps/ca";
+        let status = |code: u16, reason: &str| {
+            serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                               "reason": reason, "code": code, "message": reason})
+        };
+
+        p.api.reply_to(path, 503, status(503, "ServiceUnavailable"));
+        let retries = || crate::metrics::METRICS.reconcile_retries_total.get();
+        let before = retries();
+        let action = p.pass(&gw).await.unwrap();
+        assert!(retries() > before, "a retry is counted");
+        assert_ne!(action, Action::await_change(), "it comes back");
+        assert!(
+            p.api.requests().iter().all(|r| r.method != "PATCH"),
+            "nothing written: {:?}",
+            p.api.requests()
+        );
+
+        p.api.clear();
+        p.api.reply_to(path, 403, status(403, "Forbidden"));
+        p.pass(&gw).await.unwrap_err();
+        let programmed = gateway_programmed(&p, "gw");
+        assert_eq!(programmed["status"], "False");
+        assert!(
+            programmed["message"]
+                .as_str()
+                .unwrap()
+                .contains("CA bundles"),
+            "{programmed}"
+        );
+    }
+
     /// A policy's CA ConfigMap, cached by metadata, is fetched by name and
     /// judged: a CA accepts the policy, a ConfigMap without one refuses it.
     #[tokio::test]
@@ -1375,7 +1501,9 @@ mod tests {
 
     /// A NetworkAttachmentDefinition never read publishes nothing, as no
     /// read said the network is gone: a first pass published the Gateway
-    /// bound nowhere, a later one replaced the snapshot served.
+    /// bound nowhere, a later one replaced the snapshot served. A read that
+    /// may pass next time writes no status either: it says nothing of the
+    /// Gateway.
     #[tokio::test]
     async fn an_unread_network_publishes_nothing() {
         let mut p = Pipeline::new();
@@ -1383,9 +1511,13 @@ mod tests {
         let network = [(NETWORK_ADDRESS_TYPE, "udn-a")];
         let gw = with_addresses(testkit::gateway("gw", 1), 1, &network);
         apply(&mut p.cluster.gateways, gw.clone());
-        assert!(p.pass(&gw).await.is_err());
+        assert!(p.pass(&gw).await.is_ok(), "a read that may pass comes back");
         assert!(p.served(&gw).is_none());
-        assert_eq!(gateway_programmed(&p, "gw")["status"], "False");
+        assert_eq!(
+            p.api.status_patch("gateways", "gw"),
+            None,
+            "nothing written"
+        );
 
         let gw = with_addresses(testkit::gateway("gw", 1), 2, &[]);
         apply(&mut p.cluster.gateways, gw.clone());
@@ -1393,11 +1525,35 @@ mod tests {
         let served = p.served(&gw).unwrap();
         let gw = with_addresses(gw, 3, &network);
         apply(&mut p.cluster.gateways, gw.clone());
-        assert!(p.pass(&gw).await.is_err());
+        assert!(p.pass(&gw).await.is_ok());
         assert!(
             Arc::ptr_eq(&served, &p.served(&gw).unwrap()),
             "the served snapshot stays"
         );
+    }
+
+    /// A NetworkAttachmentDefinition the controller may not read never
+    /// will: the Gateway says why.
+    #[tokio::test]
+    async fn a_refused_network_read_says_why() {
+        let mut p = Pipeline::new();
+        p.api.reply_to(
+            NAD_UDN_A,
+            403,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Forbidden", "code": 403, "message": "forbidden",
+            }),
+        );
+        let gw = with_addresses(
+            testkit::gateway("gw", 1),
+            1,
+            &[(NETWORK_ADDRESS_TYPE, "udn-a")],
+        );
+        apply(&mut p.cluster.gateways, gw.clone());
+        assert!(p.pass(&gw).await.is_err());
+        assert!(p.served(&gw).is_none());
+        assert_eq!(gateway_programmed(&p, "gw")["status"], "False");
     }
 
     /// An edge on udn-a naming Gateway `target` serves where `target`'s
@@ -2390,7 +2546,7 @@ mod tests {
             nad_unreadable(&p);
             let gw = with_addresses(gw, 3, &network);
             apply(&mut p.cluster.gateways, gw.clone());
-            assert!(p.pass(&gw).await.is_err());
+            assert!(p.pass(&gw).await.is_ok());
             let served = p.served(&gw).unwrap();
             assert_eq!(served.gateway.generation, 2);
             assert!(served.networks.is_empty(), "published a forgotten answer");
@@ -2424,7 +2580,7 @@ mod tests {
             nad_unreadable(&p);
             apply(&mut p.cluster.gateways, gw.clone());
             p.api.clear();
-            assert!(p.pass(&gw).await.is_err());
+            assert!(p.pass(&gw).await.is_ok());
             assert!(p.served(&gw).is_none());
             assert!(!accepts(&ip), "bound on a deleted Gateway's answer");
         });
@@ -2783,7 +2939,11 @@ mod tests {
         p.api.clear();
         let pass = Pass {
             key: testkit::key(&gw),
-            plan: translate(&p.ctx, &gw, ExternalNameBackends::Refused, &[], &[]).await,
+            plan: match translate(&p.ctx, &gw, ExternalNameBackends::Refused, &[], &[]).await {
+                Ok(plan) => Ok(plan),
+                Err(Unplanned::Rejected(rejected)) => Err(rejected),
+                Err(Unplanned::Retry(why)) => panic!("{why}"),
+            },
             provisioned: Provisioned::unmanaged(),
             invalid_parameters: Some("GatewayParameters default/missing not found".into()),
             published: false,
