@@ -22,6 +22,14 @@
 //! after it came back (a Service that gained its first endpoints hours later).
 //! The probe instead backs off to `PROBE_MAX_INTERVAL` and keeps going until the
 //! backend answers or a route-table swap prunes the entry, which aborts it.
+//!
+//! An ejection lasts about as long as the outage. The first probe comes
+//! `PROBE_INITIAL_INTERVAL` after it and each failed one doubles the wait, so a
+//! backend is back within twice the time it was away: a ClusterIP dialed
+//! before kube-proxy programmed it sat out 10 s for a gap of 300 ms. A backend
+//! that fails again soon after it recovered is flapping: its probes carry on
+//! from where the last ejection ended instead of starting over (see
+//! `first_probe_interval`).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -32,6 +40,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tokio::net::TcpStream;
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 use crate::logging::{debug, info, warn};
 use crate::routing::RouteTable;
@@ -44,8 +53,8 @@ const STATUS_PROBING: u8 = 2;
 
 /// Number of consecutive failures before a backend is marked unhealthy.
 pub const FAILURE_THRESHOLD: u32 = 3;
-/// Delay before the first probe; doubles after every failed probe.
-const PROBE_INITIAL_INTERVAL: Duration = Duration::from_secs(10);
+/// Delay before an ejection's first probe; doubles after every failed probe.
+const PROBE_INITIAL_INTERVAL: Duration = Duration::from_millis(100);
 /// Backoff ceiling. One TCP connect per parked backend per five minutes is the
 /// cost of never abandoning one.
 const PROBE_MAX_INTERVAL: Duration = Duration::from_secs(300);
@@ -54,6 +63,22 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn next_probe_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(PROBE_MAX_INTERVAL)
+}
+
+/// A recovery by probe: the wait its last probe followed, and when.
+type Recovery = (Duration, Instant);
+
+/// The wait before the first probe of an ejection starting `now`.
+///
+/// A backend ejected again sooner after its last recovery than that recovery
+/// took to come is flapping: each recovery costs the requests that eject it
+/// again, so its wait carries on doubling from the last one. One that stayed
+/// healthy longer starts over.
+fn first_probe_interval(last: Option<Recovery>, now: Instant) -> Duration {
+    match last {
+        Some((wait, at)) if now.saturating_duration_since(at) < wait => next_probe_interval(wait),
+        _ => PROBE_INITIAL_INTERVAL,
+    }
 }
 
 struct BackendHealth {
@@ -66,6 +91,8 @@ struct BackendHealth {
     /// Aborted when the entry leaves the map, so a pruned backend is not
     /// probed forever and a recycled address starts without the old probe.
     probe: Mutex<Option<AbortHandle>>,
+    /// Kept across ejections: see `first_probe_interval`.
+    last_recovery: Mutex<Option<Recovery>>,
 }
 
 impl BackendHealth {
@@ -74,6 +101,7 @@ impl BackendHealth {
             consecutive_failures: AtomicU32::new(0),
             status: AtomicU8::new(STATUS_HEALTHY),
             probe: Mutex::new(None),
+            last_recovery: Mutex::new(None),
         }
     }
 }
@@ -250,7 +278,12 @@ impl HealthRegistry {
     }
 
     async fn run_probe(registry: Arc<Self>, addr: SocketAddr) {
-        let mut interval = PROBE_INITIAL_INTERVAL;
+        let last = registry.backends.get(&addr).and_then(|e| {
+            *e.last_recovery
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
+        let mut interval = first_probe_interval(last, Instant::now());
         let mut attempt: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
@@ -291,6 +324,11 @@ impl HealthRegistry {
                         )
                         .is_ok()
                     {
+                        *entry
+                            .last_recovery
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            Some((interval, Instant::now()));
                         crate::metrics::METRICS.backends_recovered_total.inc();
                         info!(
                             "Backend {} recovered after {} probe attempt(s)",
@@ -483,6 +521,71 @@ mod tests {
         }
         assert_eq!(d, PROBE_MAX_INTERVAL);
         assert_eq!(next_probe_interval(PROBE_MAX_INTERVAL), PROBE_MAX_INTERVAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_first_ejection_and_one_after_a_healthy_stretch_start_at_the_initial_wait() {
+        let now = Instant::now();
+        assert_eq!(first_probe_interval(None, now), PROBE_INITIAL_INTERVAL);
+        let wait = PROBE_INITIAL_INTERVAL * 8;
+        let recovered = Some((wait, now));
+        assert_eq!(
+            first_probe_interval(recovered, now + wait),
+            PROBE_INITIAL_INTERVAL
+        );
+    }
+
+    /// Each recovery of a flapping backend costs the requests that eject it
+    /// again: its wait grows from one ejection to the next, up to the cap.
+    #[tokio::test(start_paused = true)]
+    async fn an_ejection_soon_after_a_recovery_carries_on_from_its_wait() {
+        let now = Instant::now();
+        let wait = PROBE_INITIAL_INTERVAL * 8;
+        let just_before = now + wait - Duration::from_millis(1);
+        assert_eq!(
+            first_probe_interval(Some((wait, now)), just_before),
+            wait * 2
+        );
+        assert_eq!(
+            first_probe_interval(Some((PROBE_MAX_INTERVAL, now)), now),
+            PROBE_MAX_INTERVAL
+        );
+    }
+
+    /// A backend away for a moment is back about as soon: it sat out the
+    /// old first probe's 10 s, whatever the outage.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_outage_makes_a_short_ejection() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let a = socket.local_addr().unwrap().as_socket().unwrap();
+        let r = Arc::new(HealthRegistry::new());
+        park(&r, a);
+        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+
+        let outage = Duration::from_millis(250);
+        tokio::time::sleep(outage).await;
+        assert!(!r.is_healthy(&a));
+        socket.listen(8).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let _listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
+        tokio::time::timeout(outage * 2, probe)
+            .await
+            .expect("back within twice the outage")
+            .unwrap();
+        assert!(r.is_healthy(&a));
+
+        // Ejected again at once: a flap, so the next probe waits longer than
+        // the one that found it back.
+        park(&r, a);
+        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+        tokio::time::sleep(outage).await;
+        assert!(!r.is_healthy(&a), "a flapping backend is back as fast");
+        probe.await.unwrap();
+        assert!(r.is_healthy(&a));
     }
 
     /// Mark `a` unhealthy and win the probe CAS, as a connection would.
