@@ -150,6 +150,8 @@ spec:
     trustedSources:
     - cidr: 10.250.0.0/16
     - gateway: {namespace: portail-edge, name: edge}
+  accessLog: Disabled        # Managed; Disabled | Stdout
+  http2: Disabled            # Managed; Disabled | Enabled
 ```
 
 Referenced from:
@@ -168,6 +170,9 @@ Defaults:
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
 - `serviceEndpointsOnAttachedNetworks: Refused`, Managed and Unmanaged alike: see [Service backends on attached networks](#service-backends-on-attached-networks).
 - `proxyProtocol`: no trusted source; no connection is read for a header.
+- `accessLog: Disabled`. `Stdout`: one JSON line per HTTP response on the data plane's stdout (`--access-log=-`); a sink slower than the request rate sheds lines, counted in `portail_access_log_dropped_total`, rather than slowing requests.
+- `http2: Disabled`. `Enabled`: TLS-terminate listeners offer h2 by ALPN (`--http2`), each stream bridged through the HTTP/1.1 engine at more CPU per request than HTTP/1.1.
+- `accessLog` and `http2` are data-plane flags: changing either rolls the Gateway's Deployment. They set nothing on an Unmanaged Gateway, whose owner passes the flags.
 
 Rules:
 

@@ -33,6 +33,18 @@ spec:
               GatewayClass's parameters, then the Gateway's: a set field wins field by
               field; `networks`, `resources` and `proxyProtocol` replace whole.
             properties:
+              accessLog:
+                description: |-
+                  One JSON line per HTTP response on the data plane's stdout
+                  (Managed). A sink slower than the request rate sheds lines, counted
+                  in portail_access_log_dropped_total, rather than slowing requests.
+                  Default Disabled.
+                enum:
+                - Disabled
+                - Stdout
+                - null
+                nullable: true
+                type: string
               controllerTransport:
                 description: |-
                   How the data-plane pods reach the controller (Managed). Direct: its
@@ -57,6 +69,17 @@ spec:
                 enum:
                 - Refused
                 - Allowed
+                - null
+                nullable: true
+                type: string
+              http2:
+                description: |-
+                  HTTP/2 on the TLS-terminate listeners (Managed): ALPN offers h2, and
+                  each stream is bridged through the HTTP/1.1 engine, at more CPU per
+                  request than HTTP/1.1. Default Disabled.
+                enum:
+                - Disabled
+                - Enabled
                 - null
                 nullable: true
                 type: string

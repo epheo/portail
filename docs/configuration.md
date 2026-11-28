@@ -63,7 +63,7 @@ These flags take no subcommand: `portail --http2 dataplane ...` is refused.
 | `--http2` | As in standalone mode |
 
 Managed data planes run with `--gateway`, `--controller-address`, `--admin-address=$(POD_IP)`, `--shutdown-delay=0s` under a `Recreate` rollout, and `--transport apiserver-proxy` under GatewayParameters `controllerTransport: APIServerProxy`, with the API token and `kube-root-ca.crt` mounted at the `--apiserver-*-file` defaults.
-`--access-log` and `--http2` are for Unmanaged data planes: GatewayParameters do not set them yet.
+Managed data planes get `--access-log=-` under GatewayParameters `accessLog: Stdout`, and `--http2` under `http2: Enabled`; an Unmanaged data plane's owner passes them.
 
 ## Environment Variables
 

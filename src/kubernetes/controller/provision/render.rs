@@ -27,7 +27,9 @@ use crate::cli::{ControllerArgs, CONTROLLER_CA_ENV};
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::controller::ca::ControllerCa;
 use crate::kubernetes::controller::params::Params;
-use crate::kubernetes::crds::{ControllerTransport, NetworkSelection, ServiceType};
+use crate::kubernetes::crds::{
+    AccessLog, ControllerTransport, Http2, NetworkSelection, ServiceType,
+};
 use crate::kubernetes::naming::{
     controller_audience, label_value, resource_name, LABEL_GATEWAY, LABEL_GATEWAY_NAME,
     LABEL_MANAGED_BY, LABEL_NAME, MANAGED_BY, NAME,
@@ -294,6 +296,12 @@ fn render(
     let proxied = params.controller_transport == ControllerTransport::ApiServerProxy;
     if proxied {
         args.extend(["--transport".into(), "apiserver-proxy".into()]);
+    }
+    if params.access_log == AccessLog::Stdout {
+        args.push("--access-log=-".into());
+    }
+    if params.http2 == Http2::Enabled {
+        args.push("--http2".into());
     }
 
     let mut env = vec![
@@ -767,6 +775,38 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
             )
             .await,
         );
+    }
+
+    /// accessLog and http2 become the data plane's own flags, as its parser
+    /// reads them; neither is passed by default.
+    #[tokio::test]
+    async fn access_log_and_http2_reach_the_data_plane() {
+        use clap::Parser;
+        let gw = gateway(
+            "gw",
+            serde_json::json!([{"name": "http", "port": 8080, "protocol": "HTTP"}]),
+            serde_json::Value::Null,
+        );
+        let parsed = |objects: &[serde_json::Value]| {
+            let args = deployment_of(objects)["spec"]["template"]["spec"]["containers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap().replace("$(POD_IP)", "10.0.0.1"))
+                .collect::<Vec<_>>();
+            let args =
+                crate::cli::Args::try_parse_from(std::iter::once("portail".into()).chain(args))
+                    .unwrap();
+            let Some(crate::cli::Command::Dataplane(args)) = args.command else {
+                panic!("data plane args");
+            };
+            args
+        };
+        let plain = parsed(&objects_of(&gw, None, None).await);
+        assert!(plain.access_log.is_none() && !plain.http2);
+        let both = parsed(&objects_of(&gw, None, Some("accessLog: Stdout\nhttp2: Enabled")).await);
+        assert_eq!(both.access_log.as_deref(), Some("-"));
+        assert!(both.http2);
     }
 
     /// The mounts are where the data plane's defaults read its tokens and

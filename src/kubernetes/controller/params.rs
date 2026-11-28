@@ -15,8 +15,9 @@ use super::ControllerCtx;
 use crate::dataplane::addresses::in_cidr;
 use crate::kubernetes::addresses::NETWORK_ADDRESS_TYPE;
 use crate::kubernetes::crds::{
-    AttachedNetworkEndpoints, ControllerTransport, ExternalNameBackends, GatewayParameters,
-    GatewayParametersSpec, NetworkSelection, Provisioning, ServiceParameters, ServiceType,
+    AccessLog, AttachedNetworkEndpoints, ControllerTransport, ExternalNameBackends,
+    GatewayParameters, GatewayParametersSpec, Http2, NetworkSelection, Provisioning,
+    ServiceParameters, ServiceType,
 };
 use crate::proxy::proxy_protocol::Cidr;
 use crate::sync::GatewayKey;
@@ -48,6 +49,8 @@ pub(crate) struct Params {
     /// Gateways whose data planes' addresses join `proxy_sources` once
     /// resolved against this Gateway's own networks.
     pub trusted_gateways: Vec<GatewayKey>,
+    pub access_log: AccessLog,
+    pub http2: Http2,
 }
 
 impl Params {
@@ -285,6 +288,8 @@ fn builtin(image: &str) -> GatewayParametersSpec {
         external_name_backends: Some(ExternalNameBackends::Refused),
         service_endpoints_on_attached_networks: Some(AttachedNetworkEndpoints::Refused),
         proxy_protocol: None,
+        access_log: Some(AccessLog::Disabled),
+        http2: Some(Http2::Disabled),
     }
 }
 
@@ -306,6 +311,8 @@ fn merge(
             external_name_backends,
             service_endpoints_on_attached_networks,
             proxy_protocol,
+            access_log,
+            http2,
         } = layer.clone();
         base.provisioning = provisioning.or(base.provisioning);
         base.controller_transport = controller_transport.or(base.controller_transport);
@@ -317,6 +324,8 @@ fn merge(
         base.resources = resources.or(base.resources);
         base.networks = networks.or(base.networks);
         base.proxy_protocol = proxy_protocol.or(base.proxy_protocol);
+        base.access_log = access_log.or(base.access_log);
+        base.http2 = http2.or(base.http2);
         if let Some(type_) = service.and_then(|s| s.type_) {
             base.service = Some(ServiceParameters { type_: Some(type_) });
         }
@@ -404,6 +413,8 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
             .unwrap_or(AttachedNetworkEndpoints::Refused),
         proxy_sources,
         trusted_gateways,
+        access_log: spec.access_log.unwrap_or(AccessLog::Disabled),
+        http2: spec.http2.unwrap_or(Http2::Disabled),
     })
 }
 
@@ -547,6 +558,8 @@ mod tests {
                 service_endpoints_on_attached_networks: AttachedNetworkEndpoints::Refused,
                 proxy_sources: vec![],
                 trusted_gateways: vec![],
+                access_log: AccessLog::Disabled,
+                http2: Http2::Disabled,
             }
         );
     }
@@ -698,6 +711,34 @@ networks: [{name: c}]
         );
         let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
         assert_eq!(params.external_name_backends, ExternalNameBackends::Refused);
+    }
+
+    #[tokio::test]
+    async fn access_log_and_http2_from_the_class_unless_the_gateway_says() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "accessLog: Stdout\nhttp2: Enabled",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        assert_eq!(
+            (params.access_log, params.http2),
+            (AccessLog::Stdout, Http2::Enabled)
+        );
+
+        apply(
+            &mut cluster.parameters,
+            parameters("default", "mine", "accessLog: Disabled\nhttp2: Disabled"),
+        );
+        let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
+        assert_eq!(
+            (params.access_log, params.http2),
+            (AccessLog::Disabled, Http2::Disabled)
+        );
     }
 
     #[tokio::test]
