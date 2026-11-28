@@ -1260,6 +1260,7 @@ mod tests {
         // The data plane's own bind finds the free target, with no probe
         // before it: a probe's socket, closed, can still be referenced by a
         // test running beside this one (see `bind_until`).
+        let mut refused = None;
         let (dp, target) = test_ports::candidates()
             .take(64)
             .find_map(|target| {
@@ -1274,10 +1275,16 @@ mod tests {
                     tls: None,
                     rate_limit: None,
                 }];
-                let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"));
-                Some((dp.ok()?, target))
+                DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"))
+                    .map(|dp| (dp, target))
+                    .map_err(|e| refused = Some(e))
+                    .ok()
             })
-            .expect("no target port could be bound");
+            .unwrap_or_else(|| {
+                panic!(
+                    "no target port could be bound, or the data plane bound the published port: {refused:?}"
+                )
+            });
 
         // Readiness keys on the bound (target) port, not the published port.
         assert!(dp.is_ready_for_endpoints(&[tcp(None, target)]));
