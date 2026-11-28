@@ -197,6 +197,19 @@ pub struct GatewayParametersSpec {
     /// Replaces whole: a Gateway's own list is never added to its class's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocolParameters>,
+
+    /// One JSON line per HTTP response on the data plane's stdout
+    /// (Managed). A sink slower than the request rate sheds lines, counted
+    /// in portail_access_log_dropped_total, rather than slowing requests.
+    /// Default Disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<AccessLog>,
+
+    /// HTTP/2 on the TLS-terminate listeners (Managed): ALPN offers h2, and
+    /// each stream is bridged through the HTTP/1.1 engine, at more CPU per
+    /// request than HTTP/1.1. Default Disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -247,6 +260,18 @@ pub struct TrustedGateway {
 pub enum ExternalNameBackends {
     Refused,
     Allowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AccessLog {
+    Disabled,
+    Stdout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum Http2 {
+    Disabled,
+    Enabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
