@@ -96,6 +96,7 @@ metrics! {
     reconcile_runs_total: "Gateway reconcile passes that published a new snapshot or wrote status",
     gateway_addresses_truncated_total: "Gateway backend or trusted addresses left out because a Gateway's reports went over a cap",
     reconcile_skips_total: "Gateway reconcile passes that published and wrote nothing",
+    reconcile_retries_total: "Gateway reconcile passes put off by a read that may pass next time: nothing written, tried again on a backoff",
     sync_throttled_total: "Sync requests answered 503 because TokenReviews in flight were at their cap or the source IP was over its review rate",
     sync_auth_stale_verdicts_total: "Sync requests served on an expired TokenReview verdict because it could not be renewed",
 }

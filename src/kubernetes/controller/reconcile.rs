@@ -454,6 +454,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     .await
     {
         Err(Unplanned::Retry(why)) => {
+            crate::metrics::METRICS.reconcile_retries_total.inc();
             let delay = ctx.read_retries.failed(&key);
             warn!(
                 "Gateway {}: {}; nothing written, tried again in {:.1}s",
@@ -1089,7 +1090,10 @@ mod tests {
         };
 
         p.api.reply_to(path, 503, status(503, "ServiceUnavailable"));
+        let retries = || crate::metrics::METRICS.reconcile_retries_total.get();
+        let before = retries();
         let action = p.pass(&gw).await.unwrap();
+        assert!(retries() > before, "a retry is counted");
         assert_ne!(action, Action::await_change(), "it comes back");
         assert!(
             p.api.requests().iter().all(|r| r.method != "PATCH"),
