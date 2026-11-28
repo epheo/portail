@@ -38,11 +38,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::logging::{debug, info, warn};
+use crate::proxy::backend_pool::BackendProto;
 use crate::routing::RouteTable;
 
 // Status constants — module-private; callers use `is_healthy()` only.
@@ -258,11 +260,13 @@ impl HealthRegistry {
         false
     }
 
-    /// Spawn a background Tokio task that probes `addr` until it recovers.
-    /// Call this only when [`record_failure`] returns `true`.
-    pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr) {
+    /// Spawn a background Tokio task that probes `addr` until it recovers,
+    /// reaching it as `proto` says requests do. Call this only when
+    /// [`record_failure`] returns `true`.
+    pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto) {
         info!("Spawning recovery probe for backend {}", addr);
-        let probe = tokio::spawn(Self::run_probe(Arc::clone(&registry), addr)).abort_handle();
+        let probe =
+            tokio::spawn(Self::run_probe(Arc::clone(&registry), addr, proto)).abort_handle();
         match registry.backends.get(&addr) {
             Some(entry) => {
                 let mut slot = entry.probe.lock().unwrap_or_else(PoisonError::into_inner);
@@ -277,7 +281,7 @@ impl HealthRegistry {
         }
     }
 
-    async fn run_probe(registry: Arc<Self>, addr: SocketAddr) {
+    async fn run_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto) {
         let last = registry.backends.get(&addr).and_then(|e| {
             *e.last_recovery
                 .lock()
@@ -305,7 +309,16 @@ impl HealthRegistry {
 
             debug!("Probe attempt {} for backend {}", attempt, addr);
 
-            let connected = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
+            // As a request reaches it. A connect alone brought back a port
+            // that accepts and then fails its handshake or its policy, and
+            // its share failed again until the next ejection.
+            let reach = async {
+                let mut conn = proto.as_ref().over(TcpStream::connect(addr).await?).await?;
+                // Told the session ends, not left to log a truncation.
+                let _ = conn.shutdown().await;
+                std::io::Result::Ok(())
+            };
+            let connected = tokio::time::timeout(PROBE_TIMEOUT, reach)
                 .await
                 .is_ok_and(|r| r.is_ok());
 
@@ -564,7 +577,11 @@ mod tests {
         let a = socket.local_addr().unwrap().as_socket().unwrap();
         let r = Arc::new(HealthRegistry::new());
         park(&r, a);
-        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+        let probe = tokio::spawn(HealthRegistry::run_probe(
+            Arc::clone(&r),
+            a,
+            BackendProto::Plain,
+        ));
 
         let outage = Duration::from_millis(250);
         tokio::time::sleep(outage).await;
@@ -581,7 +598,11 @@ mod tests {
         // Ejected again at once: a flap, so the next probe waits longer than
         // the one that found it back.
         park(&r, a);
-        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+        let probe = tokio::spawn(HealthRegistry::run_probe(
+            Arc::clone(&r),
+            a,
+            BackendProto::Plain,
+        ));
         tokio::time::sleep(outage).await;
         assert!(!r.is_healthy(&a), "a flapping backend is back as fast");
         probe.await.unwrap();
@@ -678,7 +699,7 @@ mod tests {
         let r = Arc::new(HealthRegistry::new());
         let a = addr(8091);
         park(&r, a);
-        HealthRegistry::spawn_probe(Arc::clone(&r), a);
+        HealthRegistry::spawn_probe(Arc::clone(&r), a, BackendProto::Plain);
         r.prune(&RouteTable::new());
         // The sleeping probe holds the only other reference. Time cannot
         // advance while this task keeps yielding, so only an abort frees it.
@@ -701,7 +722,7 @@ mod tests {
         // notice the missing entry and return instead of probing forever.
         tokio::time::timeout(
             PROBE_MAX_INTERVAL,
-            HealthRegistry::run_probe(Arc::clone(&r), a),
+            HealthRegistry::run_probe(Arc::clone(&r), a, BackendProto::Plain),
         )
         .await
         .expect("probe loop must exit once its entry is gone");
@@ -722,7 +743,11 @@ mod tests {
         park(&r, a);
         assert!(!r.is_healthy(&a));
 
-        let probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a));
+        let probe = tokio::spawn(HealthRegistry::run_probe(
+            Arc::clone(&r),
+            a,
+            BackendProto::Plain,
+        ));
 
         // Let more probes fail than the old bounded loop allowed before the
         // backend finally appears.
@@ -738,6 +763,43 @@ mod tests {
             .expect("probe must succeed once the backend listens")
             .unwrap();
         drop(listener);
+        assert!(r.is_healthy(&a));
+    }
+
+    /// The probe reaches a backend as its requests do. One that accepts
+    /// and then fails its policy is not back; a connect alone said it was,
+    /// and its share failed again until the next ejection.
+    #[tokio::test]
+    async fn a_backend_that_fails_its_policy_is_not_probed_back() {
+        use crate::config::{BackendCa, BackendTls};
+        use crate::proxy::testkit::{TestCa, OK};
+        use crate::proxy::upstream::tls::Verify;
+        let (ca, other) = (TestCa::new(), TestCa::new());
+        let (a, mut seen) = ca.backend(&["svc.test"], &[], OK.as_bytes()).await;
+        let under = |trusted: &TestCa| {
+            let tls = BackendTls {
+                hostname: "svc.test".to_string(),
+                subject_alt_names: vec![],
+                ca: BackendCa::Bundle("ca".to_string()),
+            };
+            let bundles = [("ca".to_string(), trusted.pem())].into_iter().collect();
+            BackendProto::Verified(Verify::of(&tls, &bundles).unwrap())
+        };
+        let r = Arc::new(HealthRegistry::new());
+        park(&r, a);
+
+        let mut probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a, under(&other)));
+        // Two attempts reached it: the first was judged before the second.
+        for _ in 0..2 {
+            tokio::select! {
+                refused = seen.recv() => assert_eq!(refused.unwrap(), b""),
+                _ = &mut probe => panic!("probed back while it fails its policy"),
+            }
+        }
+        assert!(!r.is_healthy(&a));
+        probe.abort();
+
+        HealthRegistry::run_probe(Arc::clone(&r), a, under(&ca)).await;
         assert!(r.is_healthy(&a));
     }
 }

@@ -42,7 +42,7 @@ pub(super) async fn fail_connect(
             state.listener_stats.upstream_connect_errors.inc();
         }
     }
-    fail_backend(state, client, backend_ref.socket_addr, code).await
+    fail_backend(state, client, backend_ref, code).await
 }
 
 /// A request that failed to send on a freshly connected backend conn: a
@@ -55,7 +55,7 @@ pub(super) async fn fail_send(
 ) -> Result<()> {
     crate::metrics::record_backend_send_error(&backend_metric_label(backend_ref));
     state.listener_stats.upstream_send_errors.inc();
-    fail_backend(state, client, backend_ref.socket_addr, 502).await
+    fail_backend(state, client, backend_ref, 502).await
 }
 
 /// Record a backend failure (spawning a health probe if this newly trips the
@@ -64,11 +64,15 @@ pub(super) async fn fail_send(
 async fn fail_backend(
     state: &mut ConnectionState,
     client: &mut Connection,
-    addr: SocketAddr,
+    backend_ref: &crate::routing::Backend,
     code: u16,
 ) -> Result<()> {
-    if state.health.record_failure(addr) {
-        HealthRegistry::spawn_probe(Arc::clone(&state.health), addr);
+    if state.health.record_failure(backend_ref.socket_addr) {
+        HealthRegistry::spawn_probe(
+            Arc::clone(&state.health),
+            backend_ref.socket_addr,
+            backend_ref.proto.clone(),
+        );
     }
     state.refused(code);
     send_error_response(client, code).await
@@ -106,7 +110,7 @@ pub(super) async fn connect_to_backend(
     deadline: Option<tokio::time::Instant>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
-    let proto = backend_ref.proto();
+    let proto = backend_ref.proto.as_ref();
     let acquired = if backend_ref.action == BackendAction::ForwardProxied {
         // Never pooled: its header names this request's client, and a
         // pooled conn would carry it to another client's request.

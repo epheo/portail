@@ -366,9 +366,8 @@ impl Backend {
             socket_addr,
             weight,
             filters: vec![],
-            use_tls: false,
+            proto: crate::proxy::backend_pool::BackendProto::Plain,
             server_name: address,
-            verify: None,
             action: BackendAction::Forward,
         })
     }
@@ -389,9 +388,8 @@ impl Backend {
             socket_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             weight,
             filters: vec![],
-            use_tls: false,
+            proto: crate::proxy::backend_pool::BackendProto::Plain,
             server_name: String::new(),
-            verify: None,
             action: BackendAction::Reject,
         }
     }
@@ -412,9 +410,8 @@ impl Backend {
                 socket_addr,
                 weight,
                 filters: vec![],
-                use_tls: false,
+                proto: crate::proxy::backend_pool::BackendProto::Plain,
                 server_name: address.clone(),
-                verify: None,
                 action: BackendAction::Forward,
             })
             .collect())
