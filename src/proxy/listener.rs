@@ -494,7 +494,10 @@ async fn serve_tls_connection(
                 cfg.connect_timeout,
             ))
         });
-        crate::proxy::h2_bridge::serve(
+        // Boxed, as the engine below: a TLS port's task would else be the
+        // size of the largest thing behind it, and a passthrough tunnel
+        // carries that for as long as it lives.
+        Box::pin(crate::proxy::h2_bridge::serve(
             tls_stream,
             crate::proxy::h2_bridge::H2Ctx {
                 server_port,
@@ -508,7 +511,7 @@ async fn serve_tls_connection(
                 local,
                 drain,
             },
-        )
+        ))
         .await;
         return;
     }
@@ -529,7 +532,7 @@ async fn serve_tls_connection(
         listener_stats,
         drain,
     );
-    let _ = http1::serve(conn, peer, state).await;
+    let _ = Box::pin(http1::serve(conn, peer, state)).await;
 }
 
 #[cfg(test)]

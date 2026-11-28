@@ -564,45 +564,81 @@ pub enum Hello {
     Unreadable,
 }
 
+/// What the peek asks for first: room for a ClientHello with a post-quantum
+/// key share, about 1.6 KiB.
+const PEEK_FIRST: usize = 2048;
+/// The peek's window: a TLS record carries 16 KiB at most. One that fills
+/// it without ending cannot complete.
+const PEEK_MOST: usize = 16384;
+
 /// Peek the client's first TLS record and extract SNI, waiting within
 /// `budget` for a fragmented ClientHello to finish arriving. Runs once per
 /// TLS connection before dispatch — never on the per-request path.
-pub async fn peek_client_hello(stream: &tokio::net::TcpStream, budget: Duration) -> Hello {
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut buf = [0u8; 16384];
-    let mut last_n = 0usize;
+pub async fn peek_client_hello(stream: &TcpStream, budget: Duration) -> Hello {
+    tokio::time::timeout(budget, peek_first_record(stream))
+        .await
+        .unwrap_or(Hello::Unreadable)
+}
+
+async fn peek_first_record(stream: &TcpStream) -> Hello {
+    use std::mem::MaybeUninit;
+    use tokio::io::Interest;
+
+    // On the heap and gone with this call: an array here is part of the
+    // future, and so of every TLS connection's task for as long as it
+    // lives. Not zeroed: only what a peek filled is read.
+    let mut buf = vec![MaybeUninit::<u8>::uninit(); PEEK_FIRST];
+    let mut seen = 0;
     loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-        if remaining.is_zero() {
+        let Ok(ready) = stream.ready(Interest::READABLE).await else {
             return Hello::Unreadable;
-        }
-        let n = match tokio::time::timeout(remaining, stream.peek(&mut buf)).await {
-            Ok(Ok(n)) => n,
+        };
+        // A peek that shows nothing new is refused as WouldBlock: tokio
+        // then forgets the socket was readable, unless something arrived
+        // meanwhile, and `ready` waits for its next event. A peek left to
+        // succeed returns the same bytes at once, for ever, and the wait
+        // for the rest becomes a sleep or a spin.
+        let peeked = stream.try_io(Interest::READABLE, || {
+            #[cfg(test)]
+            HELLO_PEEKS.with(|n| n.set(n.get() + 1));
+            let n = socket2::SockRef::from(stream)
+                .recv_with_flags(&mut buf, libc::MSG_PEEK | libc::MSG_DONTWAIT)?;
+            if n != 0 && n == seen {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            Ok(n)
+        });
+        let n = match peeked {
+            Ok(n) if n > 0 => n,
+            // Nothing new, and nothing more will come: a close keeps the
+            // socket readable for good, so the loop would spin on it.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && !ready.is_read_closed() => continue,
             _ => return Hello::Unreadable,
         };
-        if n == 0 {
-            return Hello::Unreadable;
-        }
-        match classify_client_hello(&buf[..n]) {
+        // SAFETY: the peek filled the first `n` bytes of `buf`.
+        let record = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+        match classify_client_hello(record) {
             ClientHelloPeek::Complete(Some(sni)) => return Hello::Sni(sni),
             ClientHelloPeek::Complete(None) => return Hello::Nameless,
             ClientHelloPeek::NotTls => return Hello::Unreadable,
             ClientHelloPeek::Partial => {
                 if n == buf.len() {
-                    // Record larger than the peek window; cannot complete.
-                    return Hello::Nameless;
+                    if n == PEEK_MOST {
+                        return Hello::Nameless;
+                    }
+                    // More may be queued than the buffer showed.
+                    buf.resize(PEEK_MOST, MaybeUninit::uninit());
                 }
-                if n == last_n {
-                    // peek() returns instantly while the tail is in flight;
-                    // yield briefly instead of spinning on identical bytes.
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                last_n = n;
+                seen = n;
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The peeks `peek_first_record` made on this thread.
+    static HELLO_PEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Extract SNI hostname from a TLS ClientHello message.
@@ -860,6 +896,93 @@ mod tests {
         // a loaded CI runner cannot flake it.
         assert!(start.elapsed() < Duration::from_secs(3));
         client.await.unwrap();
+    }
+
+    /// A client and the server's end of its connection.
+    async fn hello_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        client.set_nodelay(true).unwrap();
+        (client, listener.accept().await.unwrap().0)
+    }
+
+    /// Waiting for the rest of a hello is waiting for the socket's next
+    /// event. The peek slept 1 ms at a time on the bytes it had: a hello in
+    /// two segments, as one with a post-quantum key share is on the wire,
+    /// cost its handshake a millisecond.
+    #[tokio::test]
+    async fn the_rest_of_a_hello_is_waited_for_not_polled() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = hello_pair().await;
+        let record = build_tls_record(&build_client_hello(&build_sni_extension(b"frag.test")));
+        client.write_all(&record[..40]).await.unwrap();
+        HELLO_PEEKS.with(|n| n.set(0));
+        let mut peek = std::pin::pin!(peek_client_hello(&server, Duration::from_secs(5)));
+        let waited = tokio::time::timeout(Duration::from_millis(150), peek.as_mut()).await;
+        assert!(waited.is_err(), "a hello cut short is not an answer yet");
+        let peeks = HELLO_PEEKS.with(|n| n.get());
+        // One that sees them, one refused, and a wakeup or two the runtime
+        // owes nothing for; a 1 ms poll would make 150.
+        assert!(peeks <= 5, "{peeks} peeks at the same 40 bytes");
+
+        client.write_all(&record[40..]).await.unwrap();
+        assert_eq!(peek.await, Hello::Sni("frag.test".into()));
+    }
+
+    /// A close with the hello cut short ends the wait: the socket stays
+    /// readable for good then, and nothing more will come.
+    #[tokio::test]
+    async fn a_hello_cut_short_by_a_close_is_unreadable_at_once() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = hello_pair().await;
+        let record = build_tls_record(&build_client_hello(&build_sni_extension(b"frag.test")));
+        client.write_all(&record[..40]).await.unwrap();
+        client.shutdown().await.unwrap();
+        HELLO_PEEKS.with(|n| n.set(0));
+        let hello = tokio::time::timeout(
+            Duration::from_secs(2),
+            peek_client_hello(&server, Duration::from_secs(30)),
+        )
+        .await
+        .expect("waited out its budget on a closed connection");
+        assert_eq!(hello, Hello::Unreadable);
+        let peeks = HELLO_PEEKS.with(|n| n.get());
+        assert!(peeks <= 5, "{peeks} peeks: a spin");
+    }
+
+    /// A hello longer than the first buffer is read whole, and a record
+    /// that fills the window without ending is left to the catch-all.
+    #[tokio::test]
+    async fn a_long_hello_is_read_whole_up_to_the_window() {
+        use tokio::io::AsyncWriteExt;
+
+        // A padding extension (21) takes the hello past PEEK_FIRST.
+        let mut extensions = build_sni_extension(b"long.test");
+        extensions.extend_from_slice(&[0, 21]);
+        extensions.extend_from_slice(&3000u16.to_be_bytes());
+        extensions.extend_from_slice(&[0u8; 3000]);
+        let record = build_tls_record(&build_client_hello(&extensions));
+        assert!(record.len() > PEEK_FIRST);
+        let (mut client, server) = hello_pair().await;
+        client.write_all(&record).await.unwrap();
+        assert_eq!(
+            peek_client_hello(&server, Duration::from_secs(2)).await,
+            Hello::Sni("long.test".into())
+        );
+
+        // A record that says it is longer than the window.
+        let (mut client, server) = hello_pair().await;
+        let mut endless = vec![0x16, 0x03, 0x01, 0xff, 0xff];
+        endless.resize(PEEK_MOST + 100, 0);
+        client.write_all(&endless).await.unwrap();
+        assert_eq!(
+            peek_client_hello(&server, Duration::from_secs(2)).await,
+            Hello::Nameless
+        );
     }
 
     /// A hello without SNI is a TLS handshake all the same: the port's
