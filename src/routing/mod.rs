@@ -224,6 +224,16 @@ impl RouteTable {
         self.grpc.has_routes(server_port)
     }
 
+    /// Whether a TLS client naming `sni` (lowercase) may make gRPC calls on
+    /// `server_port`. One naming none, by IP, may wherever the port serves
+    /// gRPC: it gives no name to narrow by.
+    pub fn grpc_serves(&self, server_port: u16, sni: Option<&str>) -> bool {
+        match sni {
+            Some(host) => self.grpc.serves_host(server_port, host),
+            None => self.has_grpc_routes(server_port),
+        }
+    }
+
     /// Every HTTP route scope: each port's, then the shared ones.
     pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
         self.http.scopes()
@@ -341,6 +351,21 @@ impl RuleScopes {
     pub fn has_routes(&self, server_port: u16) -> bool {
         let port = self.listener_scopes.get(&server_port);
         port.is_some_and(|p| !p.scopes.is_empty()) || !self.shared_scopes_of(port).is_empty()
+    }
+
+    /// Whether some rule may match a request for `host` (lowercase) on
+    /// `server_port`: a scope there takes the host, and holds routes for
+    /// it, exact, wildcard or catch-all.
+    pub fn serves_host(&self, server_port: u16, host: &str) -> bool {
+        let port = self.listener_scopes.get(&server_port);
+        let own = port.map_or(&[][..], |p| &p.scopes[..]);
+        own.iter().chain(self.shared_scopes_of(port)).any(|scope| {
+            scope.hostname_match_priority(host).is_some()
+                && (scope.http_routes.contains_key(host)
+                    || parent_domains(host)
+                        .any(|parent| scope.wildcard_http_routes.contains_key(parent))
+                    || scope.catch_all_http_routes.is_some())
+        })
     }
 
     /// The shared scopes a port with `port`'s entry searches: none, unless

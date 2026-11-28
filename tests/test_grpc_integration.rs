@@ -22,6 +22,8 @@ fn grpc_port(offset: u16) -> u16 {
 }
 
 const HOST: &str = "grpc.example.test";
+/// A hostname with only an HTTP route, on every listener.
+const WWW: &str = "www.example.test";
 
 /// An h2c gRPC backend: each message echoed, then grpc-status 0.
 async fn echo_backend() -> SocketAddr {
@@ -56,11 +58,11 @@ async fn echo_backend() -> SocketAddr {
 }
 
 /// Four listeners: plain and TLS with gRPC routes, plain and TLS with only
-/// an HTTP route.
+/// an HTTP route. `HOST` has both routes, `WWW` only the HTTP one.
 fn config(base: u16, grpc: SocketAddr, http: SocketAddr) -> String {
     let listener = |name: &str, protocol: &str, port: u16| {
         let tls = if protocol == "HTTPS" {
-            r#", "tls": {"mode": "Terminate", "certificateRefs": [{"name": "grpc", "hostname": "grpc.example.test"}]}"#
+            r#", "tls": {"mode": "Terminate", "certificateRefs": [{"name": "grpc", "hostname": "grpc.example.test"}, {"name": "www", "hostname": "www.example.test"}]}"#
         } else {
             ""
         };
@@ -83,7 +85,7 @@ fn config(base: u16, grpc: SocketAddr, http: SocketAddr) -> String {
   }}],
   "httpRoutes": [{{
     "parentRefs": [{}],
-    "hostnames": ["{HOST}"],
+    "hostnames": ["{HOST}", "{WWW}"],
     "rules": [{{"backendRefs": [{{"name": "{}", "port": {}}}]}}]
   }}],
   "observability": {{"logging": {{"level": "info", "format": "pretty", "output": "stderr"}}}},
@@ -104,9 +106,13 @@ fn config(base: u16, grpc: SocketAddr, http: SocketAddr) -> String {
 
 fn spawn(base: u16, grpc: SocketAddr, http: SocketAddr) -> Option<PortailProcess> {
     let (cert, key) = generate_test_cert(HOST)?;
+    let (www_cert, www_key) = generate_test_cert(WWW)?;
     let proxy = PortailProcess::spawn_with_certs(
         config(base, grpc, http),
-        &[("grpc", HOST, &cert, &key)],
+        &[
+            ("grpc", HOST, &cert, &key),
+            ("www", WWW, &www_cert, &www_key),
+        ],
         base,
         &[],
     );
@@ -117,7 +123,7 @@ fn spawn(base: u16, grpc: SocketAddr, http: SocketAddr) -> Option<PortailProcess
     Some(proxy)
 }
 
-async fn tls_connect(port: u16) -> tokio_rustls::client::TlsStream<TcpStream> {
+async fn tls_connect(port: u16, sni: &'static str) -> tokio_rustls::client::TlsStream<TcpStream> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut config = rustls::ClientConfig::builder()
         .dangerous()
@@ -126,7 +132,7 @@ async fn tls_connect(port: u16) -> tokio_rustls::client::TlsStream<TcpStream> {
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(rustls::pki_types::ServerName::try_from(HOST).unwrap(), tcp)
+        .connect(rustls::pki_types::ServerName::try_from(sni).unwrap(), tcp)
         .await
         .unwrap()
 }
@@ -185,7 +191,7 @@ async fn a_grpc_port_serves_h2c_and_alpn_h2_without_the_http2_opt_in() {
         (&b"\0\0\0\0\x02hi"[..], "0")
     );
 
-    let tls = tls_connect(base + 1).await;
+    let tls = tls_connect(base + 1, HOST).await;
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
     let (got, status) = within(call(tls)).await.expect("h2 call over TLS");
     assert_eq!(
@@ -208,6 +214,22 @@ async fn a_port_without_grpc_routes_speaks_no_h2() {
     let plain = TcpStream::connect(("127.0.0.1", base + 2)).await.unwrap();
     assert!(within(call(plain)).await.is_err(), "h2c taken");
 
-    let tls = tls_connect(base + 3).await;
+    let tls = tls_connect(base + 3, HOST).await;
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+}
+
+/// On a TLS port with gRPC routes, h2 is offered only to a client naming a
+/// hostname with some: a browser naming another stays on HTTP/1.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_is_offered_by_the_hostname_a_client_names() {
+    let grpc = echo_backend().await;
+    let http = TestBackend::spawn("http");
+    let base = grpc_port(20);
+    let Some(_proxy) = spawn(base, grpc, http.addr) else {
+        return;
+    };
+    let tls = tls_connect(base + 1, WWW).await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    let tls = tls_connect(base + 1, HOST).await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
 }

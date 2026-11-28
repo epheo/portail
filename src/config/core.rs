@@ -3114,6 +3114,32 @@ mod tests {
 
     /// What a gRPC rule cannot do fails its route, from a file or a
     /// snapshot alike, rather than be served otherwise than written.
+    /// What decides h2 by ALPN on a TLS port: gRPC routes for the hostname
+    /// a client names, exact or under a wildcard, or any on the port for a
+    /// client naming none.
+    #[test]
+    fn grpc_is_served_by_the_hostname_named() {
+        let config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "grpcRoutes": [{"parentRefs": [{"name": "g", "sectionName": "l"}],
+                            "hostnames": ["grpc.test", "*.rpc.test"], "rules": [{"backendRefs": to(8001)}]}],
+            "httpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "l"}],
+                            "hostnames": ["www.test"], "rules": [{"backendRefs": to(8002)}]}]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let rt = config.to_route_table_strict().unwrap();
+        assert!(rt.grpc_serves(8080, Some("grpc.test")));
+        assert!(rt.grpc_serves(8080, Some("a.rpc.test")));
+        assert!(
+            !rt.grpc_serves(8080, Some("rpc.test")),
+            "a wildcard is not its own parent"
+        );
+        assert!(!rt.grpc_serves(8080, Some("www.test")));
+        assert!(rt.grpc_serves(8080, None));
+        assert!(!rt.grpc_serves(9090, None));
+    }
+
     #[test]
     fn a_grpc_rule_refuses_what_it_cannot_do() {
         let gateway_ref = serde_json::json!([{"group": "gateway.networking.k8s.io", "kind": "Gateway",

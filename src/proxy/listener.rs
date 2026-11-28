@@ -475,9 +475,10 @@ async fn serve_tls_connection(
         }
         TlsKind::NoCert => return refuse("its listener's certs failed to load"),
         TlsKind::Terminate => {
-            // gRPC speaks h2: a port with gRPC routes offers it whatever the
-            // http2 opt-in.
-            let offer_h2 = !cfg.http2 && routes.load().has_grpc_routes(server_port);
+            // gRPC speaks h2: offered whatever the http2 opt-in to a client
+            // naming a hostname with gRPC routes. Other clients stay on
+            // HTTP/1.1, which the bridge would cost twice.
+            let offer_h2 = !cfg.http2 && routes.load().grpc_serves(server_port, sni.as_deref());
             match if offer_h2 {
                 &plan.terminate_h2
             } else {
