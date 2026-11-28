@@ -428,13 +428,20 @@ async fn open(
     let failed = |e: &dyn std::fmt::Display| {
         ConnectError::Backend(anyhow!("gRPC backend {} handshake failed: {}", addr, e))
     };
-    let conn = backend
-        .proto
-        .as_ref()
-        .over_h2(tcp)
+    // A backend that accepts and then says nothing holds no stream past the
+    // connect's own budget, given again for the TLS and h2 handshakes.
+    let handshakes = async {
+        let conn = backend
+            .proto
+            .as_ref()
+            .over_h2(tcp)
+            .await
+            .map_err(|e| failed(&e))?;
+        handshake(conn, key, ctx).await.map_err(|e| failed(&e))
+    };
+    tokio::time::timeout(ctx.cfg.connect_timeout, handshakes)
         .await
-        .map_err(|e| failed(&e))?;
-    handshake(conn, key, ctx).await.map_err(|e| failed(&e))
+        .unwrap_or_else(|_| Err(failed(&"timed out")))
 }
 
 /// The h2 handshake on a new backend connection, which then runs until the
@@ -771,6 +778,33 @@ mod tests {
             within(seen.recv()).await.unwrap().uri.scheme_str(),
             Some("https")
         );
+    }
+
+    /// A TLS backend that accepts and never answers its handshake: the
+    /// call is UNAVAILABLE once the connect's budget passes again, the
+    /// client not held until it gives up.
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_silent_in_its_handshake_is_unavailable() {
+        let silent = crate::proxy::testkit::idle_backend().await;
+        let addr = silent.local_addr().unwrap();
+        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "grpcRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "l"}],
+                "hostnames": ["grpc.test"],
+                "rules": [{"backendRefs": [{
+                    "name": addr.ip().to_string(), "port": addr.port(), "app_protocol": "https"
+                }]}]
+            }]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let send = client(config.to_route_table_strict().unwrap()).await;
+        let mut send = send.ready().await.unwrap();
+        let (response, _) = send.send_request(call("/test.Echo/Say"), true).unwrap();
+        let response = within(response).await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], "14");
+        drop(silent);
     }
 
     /// No rule: UNIMPLEMENTED, trailers only, and no HTTP route asked.

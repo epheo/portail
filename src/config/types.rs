@@ -1038,8 +1038,12 @@ pub enum PoolScope {
     Process,
 }
 
+/// A connect that has not completed in 10 s is retried as a new
+/// connection, not waited on: one whose first SYN left before kube-proxy's
+/// rule for a new Service stays blackholed through every retransmission.
+/// Envoy Gateway and Istio wait as long.
 fn default_backend_timeout() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(10)
 }
 
 fn default_udp_session_timeout() -> Duration {
