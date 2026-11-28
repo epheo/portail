@@ -369,7 +369,7 @@ impl HealthRegistry {
 /// `RouteTable::dns_signature` covers, or every swap would wipe the state of
 /// the backends it misses.
 fn routed_addrs(table: &RouteTable) -> HashSet<SocketAddr> {
-    let http = table.http_scopes().flat_map(|scope| {
+    let http = table.rule_scopes().flat_map(|scope| {
         scope
             .http_routes
             .values()
