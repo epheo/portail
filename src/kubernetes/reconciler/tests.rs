@@ -76,6 +76,8 @@ fn test_snapshot(
         namespaces: reads::namespaces(ns_labels),
         reference_grants: reads::grants(reference_grants),
         rate_limit_policies: vec![],
+        backend_tls_policies: reads::Recorded::of(reads::Kind::BackendTlsPolicy, []),
+        configmaps: reads::Recorded::of(reads::Kind::ConfigMap, []),
         gateways: HashMap::new(),
     }
 }

@@ -1,4 +1,5 @@
 pub mod addresses;
+pub mod backend_tls;
 pub mod controller;
 pub mod converters;
 pub mod crds;

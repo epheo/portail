@@ -30,7 +30,8 @@ mod watch;
 
 use crate::kubernetes::reads::{Kind as ReadKind, ReadIndex, Recorded};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use gateway_api::backendtlspolicies::BackendTlsPolicy;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
@@ -98,6 +99,9 @@ struct ResourceCache {
     rate_limit_policies: Store<RateLimitPolicy>,
     /// Empty store when the CRD is not installed.
     gateway_parameters: Recorded<GatewayParameters>,
+    /// Empty store when the CRD is not installed.
+    backend_tls_policies: Recorded<BackendTlsPolicy>,
+    configmaps: Recorded<ConfigMap>,
 }
 
 struct ControllerCtx {
@@ -233,6 +237,12 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         &pending_watches,
         &listings,
     );
+    let (store_backend_tls_policies, backend_tls_stream) = create_optional_reflector(
+        Api::<BackendTlsPolicy>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
     tokio::spawn(pending_watches.recheck_every(
         client.clone(),
         Duration::from_secs(RESYNC_SECS),
@@ -241,6 +251,10 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
 
     let (store_namespaces, namespace_stream) =
         create_reflector(Api::<Namespace>::all(client.clone()), &listings);
+    // A BackendTLSPolicy's CA bundles: its caCertificateRefs name
+    // ConfigMaps of its namespace, any namespace.
+    let (store_configmaps, configmap_stream) =
+        create_reflector(Api::<ConfigMap>::all(client.clone()), &listings);
     let (store_services, service_stream) =
         create_reflector(Api::<Service>::all(client.clone()), &listings);
     let (store_reference_grants, reference_grant_stream) =
@@ -296,6 +310,11 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
                 store_gateway_parameters,
                 ReadKind::GatewayParameters,
             ),
+            backend_tls_policies: Recorded::new(
+                store_backend_tls_policies,
+                ReadKind::BackendTlsPolicy,
+            ),
+            configmaps: Recorded::new(store_configmaps, ReadKind::ConfigMap),
         },
         reads: Arc::default(),
         claims: Arc::default(),
@@ -425,7 +444,10 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         std::array::from_fn::<_, 11, _>(|_| store_gateways.clone());
     let [cn1, cn2, cn3, cn4, cn5] =
         std::array::from_fn::<_, 5, _>(|_| args.controller_name.clone());
-    let [reads1, reads2, reads3, reads4] = std::array::from_fn::<_, 4, _>(|_| ctx.reads.clone());
+    let [reads1, reads2, reads3, reads4, reads5, reads6] =
+        std::array::from_fn::<_, 6, _>(|_| ctx.reads.clone());
+    let [gw12, gw13] = std::array::from_fn::<_, 2, _>(|_| store_gateways.clone());
+    let controller_name = args.controller_name.clone();
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
@@ -471,6 +493,20 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         })
         .watches_stream(params_stream, move |params: GatewayParameters| {
             readers(&reads4, &gw11, ReadKind::GatewayParameters, &params)
+        })
+        // A policy wakes its readers, and the Gateways its status names, so
+        // a policy that moved to another Service drops its old entries.
+        .watches_stream(backend_tls_stream, move |policy: BackendTlsPolicy| {
+            let mut woken = readers(&reads5, &gw12, ReadKind::BackendTlsPolicy, &policy);
+            for gateway in reported_ancestors(&policy, &gw12, &controller_name) {
+                if !woken.contains(&gateway) {
+                    woken.push(gateway);
+                }
+            }
+            woken
+        })
+        .watches_stream(configmap_stream, move |configmap: ConfigMap| {
+            readers(&reads6, &gw13, ReadKind::ConfigMap, &configmap)
         })
         .reconcile_on(report_triggers)
         .reconcile_on(lapse_triggers)
@@ -654,6 +690,31 @@ fn service_readers(
         .filter(|gw| gateways.get(gw).is_some() && !woken.contains(gw));
     woken.extend(owner);
     woken
+}
+
+/// The Gateways of `store` a BackendTLSPolicy's status says `controller`
+/// wrote an ancestor entry for.
+fn reported_ancestors(
+    policy: &BackendTlsPolicy,
+    store: &Store<Gateway>,
+    controller: &str,
+) -> Vec<ObjectRef<Gateway>> {
+    policy
+        .status
+        .iter()
+        .flat_map(|s| s.ancestors.iter())
+        .filter(|a| a.controller_name == controller)
+        .filter(|a| a.ancestor_ref.kind.as_deref().unwrap_or("Gateway") == "Gateway")
+        .filter_map(|a| {
+            let namespace = a
+                .ancestor_ref
+                .namespace
+                .clone()
+                .or_else(|| policy.namespace())?;
+            let gateway = ObjectRef::new(&a.ancestor_ref.name).within(&namespace);
+            store.get(&gateway).map(|_| gateway)
+        })
+        .collect()
 }
 
 /// The retry of a failed pass: the cadence v0.1.x error_policy used, slow

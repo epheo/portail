@@ -10,10 +10,10 @@ metadata:
   name: portail-controller
 rules:
 - apiGroups: [gateway.networking.k8s.io]
-  resources: [gatewayclasses, gateways, httproutes, tcproutes, tlsroutes, udproutes, referencegrants]
+  resources: [gatewayclasses, gateways, httproutes, tcproutes, tlsroutes, udproutes, referencegrants, backendtlspolicies]
   verbs: [get, list, watch]
 - apiGroups: [gateway.networking.k8s.io]
-  resources: [gatewayclasses/status, gateways/status, httproutes/status, tcproutes/status, tlsroutes/status, udproutes/status]
+  resources: [gatewayclasses/status, gateways/status, httproutes/status, tcproutes/status, tlsroutes/status, udproutes/status, backendtlspolicies/status]
   verbs: [patch]
 - apiGroups: [portail.epheo.eu]
   resources: [ratelimitpolicies, gatewayparameters]
@@ -22,8 +22,9 @@ rules:
   resources: [ratelimitpolicies/status]
   verbs: [patch]
 # Secrets: RBAC cannot narrow a read to the TLS Secrets Gateways reference.
+# ConfigMaps alike, for the CA bundles BackendTLSPolicies reference.
 - apiGroups: [""]
-  resources: [namespaces, secrets]
+  resources: [namespaces, secrets, configmaps]
   verbs: [get, list, watch]
 # Per-Gateway objects. Server-side apply creates through patch, but the
 # apiserver still asks for create; create cannot be scoped by name.

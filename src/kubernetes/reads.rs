@@ -21,6 +21,8 @@ pub(crate) enum Kind {
     Namespace,
     ReferenceGrant,
     GatewayParameters,
+    BackendTlsPolicy,
+    ConfigMap,
 }
 
 /// What one read covered.
@@ -177,6 +179,8 @@ pub(crate) fn record_everything() {
         Kind::Namespace,
         Kind::ReferenceGrant,
         Kind::GatewayParameters,
+        Kind::BackendTlsPolicy,
+        Kind::ConfigMap,
     ] {
         record(Read::All(kind));
     }

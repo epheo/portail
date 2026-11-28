@@ -174,6 +174,10 @@ fn object_at(path: &str) -> Value {
             "RateLimitPolicy",
             json!({"targetRef": {"group": "", "kind": "Gateway", "name": "gw"}, "requestsPerSecond": 1}),
         ),
+        "backendtlspolicies" => (
+            "BackendTLSPolicy",
+            json!({"targetRefs": [], "validation": {"hostname": "x.test"}}),
+        ),
         other => panic!("mock apiserver has no object for {other}"),
     };
     json!({
@@ -199,6 +203,8 @@ pub(super) struct TestCluster {
     pub reference_grants: Writer<ReferenceGrant>,
     pub policies: Writer<RateLimitPolicy>,
     pub parameters: Writer<GatewayParameters>,
+    pub backend_tls_policies: Writer<gateway_api::backendtlspolicies::BackendTlsPolicy>,
+    pub configmaps: Writer<k8s_openapi::api::core::v1::ConfigMap>,
     pub service_accounts: Writer<PartialObjectMeta<ServiceAccount>>,
     pub deployments: Writer<PartialObjectMeta<Deployment>>,
     pub pdbs: Writer<PartialObjectMeta<PodDisruptionBudget>>,
@@ -244,6 +250,11 @@ impl TestCluster {
                     self.parameters.as_reader(),
                     ReadKind::GatewayParameters,
                 ),
+                backend_tls_policies: RecordedStore::new(
+                    self.backend_tls_policies.as_reader(),
+                    ReadKind::BackendTlsPolicy,
+                ),
+                configmaps: RecordedStore::new(self.configmaps.as_reader(), ReadKind::ConfigMap),
             },
             route_verdicts: Arc::default(),
             networks: Arc::default(),

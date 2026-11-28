@@ -186,6 +186,42 @@ async fn write_policy_statuses(
     }
 }
 
+/// BackendTLSPolicy status: one `status.ancestors` write per observed
+/// policy whose entry for this Gateway differs from its judgement.
+async fn write_backend_tls_statuses(
+    ctx: &ControllerCtx,
+    gateway: &GatewayKey,
+    judged: &[crate::kubernetes::backend_tls::PolicyStatus],
+    observed: &[Observed],
+    writes: &mut Writes,
+) {
+    let owner = status::Owner {
+        controller: &ctx.controller_name,
+        gw_name: &gateway.name,
+        gw_ns: &gateway.namespace,
+    };
+    for o in observed {
+        let entries: Vec<serde_json::Value> = judged
+            .iter()
+            .filter(|p| p.namespace == o.namespace && p.name == o.name)
+            .map(|p| status::backend_tls_ancestor_entry(&ctx.controller_name, gateway, p))
+            .collect();
+        writes.record(
+            status::write_owned_entries::<gateway_api::backendtlspolicies::BackendTlsPolicy>(
+                &ctx.client,
+                &o.namespace,
+                &o.name,
+                ("ancestors", "ancestorRef"),
+                &owner,
+                &o.entries,
+                entries,
+                FIELD_MANAGER,
+            )
+            .await,
+        );
+    }
+}
+
 /// Whose a Gateway is, by its class.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ClassOwner {
@@ -598,6 +634,14 @@ pub(super) async fn finish(
             &mut writes,
         )
         .await;
+        write_backend_tls_statuses(
+            ctx,
+            &key,
+            &statuses.backend_tls,
+            &statuses.observed_backend_tls,
+            &mut writes,
+        )
+        .await;
     }
 
     if let Some(e) = error {
@@ -904,6 +948,68 @@ mod tests {
             .status_patch("ratelimitpolicies", "p")
             .expect("our stale ancestor is removed");
         assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
+    }
+
+    /// A BackendTLSPolicy naming a Service the Gateway routes to gets the
+    /// Gateway as an ancestor, with Accepted and ResolvedRefs; one that
+    /// moved to a Service the Gateway does not use loses our entry.
+    #[tokio::test]
+    async fn a_backend_tls_policy_gets_its_gateway_as_ancestor() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("web", "https", 443, serde_json::json!(8443)),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 443),
+        );
+        let policy = |name: &str, target: &str| {
+            serde_json::from_value::<gateway_api::backendtlspolicies::BackendTlsPolicy>(
+                serde_json::json!({
+                    "metadata": {"name": name, "namespace": "default", "generation": 2},
+                    "spec": {
+                        "targetRefs": [{"group": "", "kind": "Service", "name": target}],
+                        "validation": {"hostname": "web.test", "wellKnownCACertificates": "System"},
+                    },
+                }),
+            )
+            .unwrap()
+        };
+        apply(&mut p.cluster.backend_tls_policies, policy("p", "web"));
+        let mut moved = policy("moved", "elsewhere");
+        moved.status = Some(
+            serde_json::from_value(serde_json::json!({ "ancestors": [
+                testkit::status_entry(testkit::CONTROLLER, "gw", "ancestorRef"),
+            ]}))
+            .unwrap(),
+        );
+        apply(&mut p.cluster.backend_tls_policies, moved);
+
+        p.pass(&gw).await.unwrap();
+        let patch = p
+            .api
+            .status_patch("backendtlspolicies", "p")
+            .expect("the policy's ancestor entry");
+        let ancestors = patch["status"]["ancestors"].as_array().unwrap();
+        assert_eq!(ancestors.len(), 1, "{ancestors:?}");
+        assert_eq!(ancestors[0]["ancestorRef"]["name"], "gw");
+        let conditions: HashMap<String, serde_json::Value> = ancestors[0]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["type"].as_str().unwrap().to_string(), c.clone()))
+            .collect();
+        assert_eq!(conditions["Accepted"]["status"], "True");
+        assert_eq!(conditions["ResolvedRefs"]["status"], "True");
+        assert_eq!(conditions["Accepted"]["observedGeneration"], 2);
+        let stale = p
+            .api
+            .status_patch("backendtlspolicies", "moved")
+            .expect("our stale ancestor is removed");
+        assert_eq!(stale["status"]["ancestors"], serde_json::json!([]));
     }
 
     /// Listener conditions of the first `status_patch` for `gw`, by type.
