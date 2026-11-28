@@ -18,26 +18,28 @@ use crate::kubernetes::features::SUPPORTED_FEATURES;
 use crate::kubernetes::naming::FIELD_MANAGER;
 use crate::logging::{debug, warn};
 
-/// The one route kind a listener's protocol takes: what attaches to it and
+/// The route kinds a listener's protocol takes: what attaches to it and
 /// what its supportedKinds may list.
-pub fn route_kind_for_protocol(protocol: &str) -> Option<&'static str> {
+pub fn route_kinds_for_protocol(protocol: &str) -> &'static [&'static str] {
     match protocol {
-        "HTTP" | "HTTPS" => Some("HTTPRoute"),
-        "TLS" => Some("TLSRoute"),
-        "TCP" => Some("TCPRoute"),
-        "UDP" => Some("UDPRoute"),
-        _ => None,
+        "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
+        "TLS" => &["TLSRoute"],
+        "TCP" => &["TCPRoute"],
+        "UDP" => &["UDPRoute"],
+        _ => &[],
     }
 }
 
 pub fn supported_kinds_for_protocol(protocol: &str) -> Vec<serde_json::Value> {
-    supported_kinds_of(route_kind_for_protocol(protocol))
+    supported_kinds_of(route_kinds_for_protocol(protocol))
 }
 
-/// A listener's supportedKinds when it takes `kind`, or nothing.
-pub fn supported_kinds_of(kind: Option<&str>) -> Vec<serde_json::Value> {
-    kind.map(|kind| vec![serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind})])
-        .unwrap_or_default()
+/// A listener's supportedKinds when it takes `kinds`.
+pub fn supported_kinds_of(kinds: &[&str]) -> Vec<serde_json::Value> {
+    kinds
+        .iter()
+        .map(|kind| serde_json::json!({"group": "gateway.networking.k8s.io", "kind": kind}))
+        .collect()
 }
 
 /// Per-listener validation status computed during reconciliation.
@@ -886,22 +888,20 @@ mod tests {
         assert!((0..=5).contains(&off), "{written} is {off}s from now");
     }
 
-    fn kind_of(protocol: &str) -> Option<String> {
-        let kinds = supported_kinds_for_protocol(protocol);
-        kinds
-            .first()
-            .and_then(|k| k.get("kind"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
+    fn kinds_of(protocol: &str) -> Vec<String> {
+        supported_kinds_for_protocol(protocol)
+            .iter()
+            .filter_map(|k| k.get("kind").and_then(|v| v.as_str()).map(String::from))
+            .collect()
     }
 
     #[test]
     fn supported_kinds_map_protocols_to_route_kinds() {
-        assert_eq!(kind_of("HTTP").as_deref(), Some("HTTPRoute"));
-        assert_eq!(kind_of("HTTPS").as_deref(), Some("HTTPRoute"));
-        assert_eq!(kind_of("TLS").as_deref(), Some("TLSRoute"));
-        assert_eq!(kind_of("TCP").as_deref(), Some("TCPRoute"));
-        assert_eq!(kind_of("UDP").as_deref(), Some("UDPRoute"));
+        assert_eq!(kinds_of("HTTP"), ["HTTPRoute", "GRPCRoute"]);
+        assert_eq!(kinds_of("HTTPS"), ["HTTPRoute", "GRPCRoute"]);
+        assert_eq!(kinds_of("TLS"), ["TLSRoute"]);
+        assert_eq!(kinds_of("TCP"), ["TCPRoute"]);
+        assert_eq!(kinds_of("UDP"), ["UDPRoute"]);
         assert!(supported_kinds_for_protocol("SCTP").is_empty());
     }
 

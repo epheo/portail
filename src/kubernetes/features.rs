@@ -8,6 +8,9 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "GatewayAddressEmpty",
     "GatewayHTTPListenerIsolation",
     "GatewayPort8080",
+    "GRPCRoute",
+    "GRPCRouteNamedRouteRule",
+    "GRPCRouteRequestHeaderModifier",
     // GatewayStaticAddresses is deferred under the operator model: honoring a
     // specific spec.addresses requires the operator to drive the per-Gateway
     // LoadBalancer Service's IP assignment (e.g. MetalLB) and reflect
