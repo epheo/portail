@@ -200,6 +200,9 @@ pub(crate) fn set_on(head: &mut Vec<u8>, lines: &[u8]) {
             at = end;
         }
     }
+    // The blank line `sanitize_response_headers` and the header modifier
+    // both end a head with.
+    debug_assert!(head.ends_with(b"\r\n\r\n"));
     let blank = head.len().saturating_sub(2);
     head.splice(blank..blank, lines.iter().copied());
 }
