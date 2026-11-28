@@ -386,7 +386,11 @@ where
         if crate::proxy::grpc::is_grpc(req.headers()) {
             let routes = ctx.routes.load_full();
             if routes.has_grpc_routes(ctx.server_port) {
-                tokio::spawn(crate::proxy::grpc::serve_stream(req, respond, ctx, routes));
+                // Boxed: spawn moves a future by value on its way to the task,
+                // a stream's several times.
+                tokio::spawn(Box::pin(crate::proxy::grpc::serve_stream(
+                    req, respond, ctx, routes,
+                )));
                 continue;
             }
         }

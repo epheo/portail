@@ -362,6 +362,17 @@ async fn ready_connection(
             }
         }
     }
+    // Boxed: a connect's future, TLS and h2 handshakes in it, is many times
+    // the rest of a stream's, and would be moved into every stream's.
+    Box::pin(connect(backend, ctx, key)).await
+}
+
+/// A new connection to `backend`, held for `ctx`'s next streams, and ready.
+async fn connect(
+    backend: &Backend,
+    ctx: &H2Ctx,
+    key: Key,
+) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
     let addr = backend.socket_addr;
     let (id, send) = match open(backend, ctx, key.clone()).await {
         Ok(opened) => opened,
