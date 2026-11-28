@@ -261,16 +261,17 @@ impl HealthRegistry {
     }
 
     /// Spawn a background Tokio task that probes `addr` until it recovers,
-    /// reaching it as `proto` says requests do. Call this only when
-    /// [`record_failure`] returns `true`.
+    /// reaching it as `proto` says requests do, offering h2 by ALPN when
+    /// `h2`, as gRPC does. Call this only when [`record_failure`] returns
+    /// `true`.
     ///
     /// Health is kept per address, so an address reached two ways (a TCP
     /// route in the clear and an HTTP rule over TLS, to one pod port) is
     /// probed as the ref whose failure ejected it.
-    pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto) {
+    pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto, h2: bool) {
         info!("Spawning recovery probe for backend {}", addr);
         let probe =
-            tokio::spawn(Self::run_probe(Arc::clone(&registry), addr, proto)).abort_handle();
+            tokio::spawn(Self::run_probe(Arc::clone(&registry), addr, proto, h2)).abort_handle();
         match registry.backends.get(&addr) {
             Some(entry) => {
                 let mut slot = entry.probe.lock().unwrap_or_else(PoisonError::into_inner);
@@ -285,7 +286,7 @@ impl HealthRegistry {
         }
     }
 
-    async fn run_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto) {
+    async fn run_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto, h2: bool) {
         let last = registry.backends.get(&addr).and_then(|e| {
             *e.last_recovery
                 .lock()
@@ -317,7 +318,12 @@ impl HealthRegistry {
             // that accepts and then fails its handshake or its policy, and
             // its share failed again until the next ejection.
             let reach = async {
-                let mut conn = proto.as_ref().over(TcpStream::connect(addr).await?).await?;
+                let tcp = TcpStream::connect(addr).await?;
+                let mut conn = if h2 {
+                    proto.as_ref().over_h2(tcp).await?
+                } else {
+                    proto.as_ref().over(tcp).await?
+                };
                 // Told the session ends, not left to log a truncation.
                 let _ = conn.shutdown().await;
                 std::io::Result::Ok(())
@@ -585,6 +591,7 @@ mod tests {
             Arc::clone(&r),
             a,
             BackendProto::Plain,
+            false,
         ));
 
         let outage = Duration::from_millis(250);
@@ -606,6 +613,7 @@ mod tests {
             Arc::clone(&r),
             a,
             BackendProto::Plain,
+            false,
         ));
         tokio::time::sleep(outage).await;
         assert!(!r.is_healthy(&a), "a flapping backend is back as fast");
@@ -703,7 +711,7 @@ mod tests {
         let r = Arc::new(HealthRegistry::new());
         let a = addr(8091);
         park(&r, a);
-        HealthRegistry::spawn_probe(Arc::clone(&r), a, BackendProto::Plain);
+        HealthRegistry::spawn_probe(Arc::clone(&r), a, BackendProto::Plain, false);
         r.prune(&RouteTable::new());
         // The sleeping probe holds the only other reference. Time cannot
         // advance while this task keeps yielding, so only an abort frees it.
@@ -726,7 +734,7 @@ mod tests {
         // notice the missing entry and return instead of probing forever.
         tokio::time::timeout(
             PROBE_MAX_INTERVAL,
-            HealthRegistry::run_probe(Arc::clone(&r), a, BackendProto::Plain),
+            HealthRegistry::run_probe(Arc::clone(&r), a, BackendProto::Plain, false),
         )
         .await
         .expect("probe loop must exit once its entry is gone");
@@ -751,6 +759,7 @@ mod tests {
             Arc::clone(&r),
             a,
             BackendProto::Plain,
+            false,
         ));
 
         // Let more probes fail than the old bounded loop allowed before the
@@ -792,7 +801,12 @@ mod tests {
         let r = Arc::new(HealthRegistry::new());
         park(&r, a);
 
-        let mut probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a, under(&other)));
+        let mut probe = tokio::spawn(HealthRegistry::run_probe(
+            Arc::clone(&r),
+            a,
+            under(&other),
+            false,
+        ));
         // Two attempts reached it: the first was judged before the second.
         for _ in 0..2 {
             tokio::select! {
@@ -803,7 +817,33 @@ mod tests {
         assert!(!r.is_healthy(&a));
         probe.abort();
 
-        HealthRegistry::run_probe(Arc::clone(&r), a, under(&ca)).await;
+        HealthRegistry::run_probe(Arc::clone(&r), a, under(&ca), false).await;
+        assert!(r.is_healthy(&a));
+    }
+
+    /// A gRPC server may refuse a handshake that offers no h2, as grpc-go
+    /// does since 1.67: probed as an HTTP/1 request reaches it, a backend
+    /// a gRPC stream ejected would never come back.
+    #[tokio::test]
+    async fn a_backend_that_requires_h2_is_probed_with_it() {
+        use crate::proxy::testkit::TestCa;
+        let (a, mut offered) = TestCa::new().h2_only_backend(&["svc.test"]).await;
+        let tls = || BackendProto::Tls("svc.test".into());
+        let r = Arc::new(HealthRegistry::new());
+        park(&r, a);
+
+        let mut probe = tokio::spawn(HealthRegistry::run_probe(Arc::clone(&r), a, tls(), false));
+        for _ in 0..2 {
+            tokio::select! {
+                h2 = offered.recv() => assert!(!h2.unwrap()),
+                _ = &mut probe => panic!("probed back without offering h2"),
+            }
+        }
+        assert!(!r.is_healthy(&a));
+        probe.abort();
+
+        HealthRegistry::run_probe(Arc::clone(&r), a, tls(), true).await;
+        assert!(offered.recv().await.unwrap());
         assert!(r.is_healthy(&a));
     }
 }

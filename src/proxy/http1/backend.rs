@@ -90,6 +90,7 @@ fn note_failure(state: &ConnectionState, backend_ref: &crate::routing::Backend) 
             Arc::clone(&state.health),
             backend_ref.socket_addr,
             backend_ref.proto.clone(),
+            false,
         );
     }
 }

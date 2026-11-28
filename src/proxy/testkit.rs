@@ -523,20 +523,7 @@ impl TestCa {
         uris: &[&str],
         reply: &[u8],
     ) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
-        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-        let names = dns.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-        let mut params = rcgen::CertificateParams::new(names).unwrap();
-        params.subject_alt_names.extend(
-            uris.iter()
-                .map(|uri| rcgen::SanType::URI((*uri).try_into().unwrap())),
-        );
-        let key = rcgen::KeyPair::generate().unwrap();
-        let leaf = params.signed_by(&key, &self.0).unwrap();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf.der().clone()], key)
-            .unwrap();
+        let config = self.server_config(dns, uris);
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -562,6 +549,63 @@ impl TestCa {
                         }
                     }
                     let _ = tx.send(seen);
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    /// A server config whose certificate carries `dns` and `uris`.
+    pub(crate) fn server_config(&self, dns: &[&str], uris: &[&str]) -> rustls::ServerConfig {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let names = dns.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
+        params.subject_alt_names.extend(
+            uris.iter()
+                .map(|uri| rcgen::SanType::URI((*uri).try_into().unwrap())),
+        );
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &self.0).unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap()
+    }
+
+    /// A TLS backend that, as grpc-go since 1.67, refuses a handshake
+    /// offering no h2 by ALPN. It yields, per handshake, whether h2 was
+    /// offered.
+    pub(crate) async fn h2_only_backend(
+        &self,
+        dns: &[&str],
+    ) -> (SocketAddr, UnboundedReceiver<bool>) {
+        let mut config = self.server_config(dns, &[]);
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Arc::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (tx, config) = (tx.clone(), config.clone());
+                tokio::spawn(async move {
+                    let acceptor = rustls::server::Acceptor::default();
+                    let Ok(start) = tokio_rustls::LazyConfigAcceptor::new(acceptor, sock).await
+                    else {
+                        return;
+                    };
+                    let h2 = start
+                        .client_hello()
+                        .alpn()
+                        .is_some_and(|mut offered| offered.any(|p| p == b"h2"));
+                    let _ = tx.send(h2);
+                    // Dropped unfinished: the client's handshake fails.
+                    if h2 {
+                        if let Ok(mut tls) = start.into_stream(config).await {
+                            let _ = tls.shutdown().await;
+                        }
+                    }
                 });
             }
         });

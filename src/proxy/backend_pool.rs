@@ -53,6 +53,27 @@ fn tls_connector() -> &'static tokio_rustls::TlsConnector {
     })
 }
 
+/// [`tls_connector`], offering h2 by ALPN: gRPC's.
+fn tls_connector_h2() -> &'static tokio_rustls::TlsConnector {
+    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
+    CONNECTOR.get_or_init(|| {
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        tokio_rustls::TlsConnector::from(Arc::new(client_config))
+    })
+}
+
+/// The name an unverified handshake sends: one that is no DNS name or IP
+/// sends `localhost`, which nothing checks.
+fn sni_of(server_name: &str) -> rustls::pki_types::ServerName<'static> {
+    rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap_or_else(|_| {
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+    })
+}
+
 /// Idle conns to one backend address. One addr can be reachable both plain
 /// and TLS (two routes, different backendRef TLS), and a plain conn handed
 /// to a TLS request (or vice versa) would speak the wrong protocol. TLS
@@ -156,14 +177,21 @@ impl<'a> Proto<'a> {
     pub(crate) async fn over(self, tcp: TcpStream) -> std::io::Result<Connection> {
         let tls = match self {
             Proto::Plain => return Ok(Connection::Plain { inner: tcp }),
-            Proto::Tls(server_name) => {
-                let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
-                    .unwrap_or_else(|_| {
-                        rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-                    });
-                tls_connector().connect(domain, tcp).await?
-            }
+            Proto::Tls(server_name) => tls_connector().connect(sni_of(server_name), tcp).await?,
             Proto::Verified(verify) => verify.connect(tcp).await?,
+        };
+        Ok(Connection::ClientTls {
+            inner: Box::new(tls),
+        })
+    }
+
+    /// [`Self::over`], offering h2 by ALPN: how gRPC reaches a backend, and
+    /// a gRPC server may refuse a handshake without it (grpc-go since 1.67).
+    pub(crate) async fn over_h2(self, tcp: TcpStream) -> std::io::Result<Connection> {
+        let tls = match self {
+            Proto::Plain => return Ok(Connection::Plain { inner: tcp }),
+            Proto::Tls(server_name) => tls_connector_h2().connect(sni_of(server_name), tcp).await?,
+            Proto::Verified(verify) => verify.connect_h2(tcp).await?,
         };
         Ok(Connection::ClientTls {
             inner: Box::new(tls),

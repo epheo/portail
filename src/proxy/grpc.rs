@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
 use anyhow::{anyhow, Result};
@@ -25,7 +25,7 @@ use http::HeaderMap;
 
 use crate::logging::{debug, warn};
 use crate::metrics::METRICS;
-use crate::proxy::backend_pool::{connect_tcp, BackendProto, ConnectError, NoVerifier};
+use crate::proxy::backend_pool::{connect_tcp, BackendProto, ConnectError};
 use crate::proxy::h2_bridge::{unless_reset, H2Ctx};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http_filters::{extract_header_mods, HeaderModifications};
@@ -37,11 +37,16 @@ const UNIMPLEMENTED: u8 = 12;
 const UNAVAILABLE: u8 = 14;
 
 /// Whether a request is gRPC: its content-type is `application/grpc`, or
-/// one of its `+proto`, `+json` forms.
+/// one of its `+proto`, `+json` forms, parameters allowed. Not gRPC-Web
+/// (`application/grpc-web`), another protocol, its trailers in the body.
 pub(crate) fn is_grpc(headers: &HeaderMap) -> bool {
-    headers
-        .get(http::header::CONTENT_TYPE)
-        .is_some_and(|ct| ct.as_bytes().starts_with(b"application/grpc"))
+    const GRPC: &[u8] = b"application/grpc";
+    headers.get(http::header::CONTENT_TYPE).is_some_and(|ct| {
+        let ct = ct.as_bytes();
+        ct.len() >= GRPC.len()
+            && ct[..GRPC.len()].eq_ignore_ascii_case(GRPC)
+            && matches!(ct.get(GRPC.len()), None | Some(b'+' | b';'))
+    })
 }
 
 /// One gRPC stream: matched in `routes`, sent to its backend, and its
@@ -386,7 +391,7 @@ async fn connect(
         Err(ConnectError::Backend(e)) => {
             warn!("gRPC backend {} connect failed: {}", addr, e);
             if ctx.health.record_failure(addr) {
-                HealthRegistry::spawn_probe(ctx.health.clone(), addr, backend.proto.clone());
+                HealthRegistry::spawn_probe(ctx.health.clone(), addr, backend.proto.clone(), true);
             }
             return Err("backend connect failed");
         }
@@ -423,24 +428,13 @@ async fn open(
     let failed = |e: &dyn std::fmt::Display| {
         ConnectError::Backend(anyhow!("gRPC backend {} handshake failed: {}", addr, e))
     };
-    match &backend.proto {
-        BackendProto::Plain => handshake(tcp, key, ctx).await.map_err(|e| failed(&e)),
-        BackendProto::Tls(name) => {
-            let name =
-                rustls::pki_types::ServerName::try_from(name.to_string()).unwrap_or_else(|_| {
-                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-                });
-            let tls = unverified_h2()
-                .connect(name, tcp)
-                .await
-                .map_err(|e| failed(&e))?;
-            handshake(tls, key, ctx).await.map_err(|e| failed(&e))
-        }
-        BackendProto::Verified(verify) => {
-            let tls = verify.connect_h2(tcp).await.map_err(|e| failed(&e))?;
-            handshake(tls, key, ctx).await.map_err(|e| failed(&e))
-        }
-    }
+    let conn = backend
+        .proto
+        .as_ref()
+        .over_h2(tcp)
+        .await
+        .map_err(|e| failed(&e))?;
+    handshake(conn, key, ctx).await.map_err(|e| failed(&e))
 }
 
 /// The h2 handshake on a new backend connection, which then runs until the
@@ -474,20 +468,6 @@ where
         }
     });
     Ok((id, send))
-}
-
-/// TLS to an `https` port without a policy, offering h2: unverified, as an
-/// HTTP/1 request to that port is.
-fn unverified_h2() -> &'static tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| {
-        let mut config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec()];
-        tokio_rustls::TlsConnector::from(Arc::new(config))
-    })
 }
 
 #[cfg(test)]
@@ -643,6 +623,35 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), f)
             .await
             .expect("timed out")
+    }
+
+    #[test]
+    fn grpc_is_told_by_its_content_type_and_grpc_web_is_not_grpc() {
+        let of = |ct: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_str(ct).unwrap(),
+            );
+            is_grpc(&headers)
+        };
+        for grpc in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc;charset=utf-8",
+            "Application/gRPC+json",
+        ] {
+            assert!(of(grpc), "{grpc}");
+        }
+        for other in [
+            "application/grpc-web",
+            "application/grpc-web-text+proto",
+            "application/grpcx",
+            "application/json",
+        ] {
+            assert!(!of(other), "{other}");
+        }
+        assert!(!is_grpc(&HeaderMap::new()));
     }
 
     #[tokio::test]

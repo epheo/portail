@@ -178,7 +178,7 @@ fn fail_l4_backend(
         );
     }
     if health.record_failure(addr) {
-        HealthRegistry::spawn_probe(health, addr, BackendProto::Plain);
+        HealthRegistry::spawn_probe(health, addr, BackendProto::Plain, false);
     }
 }
 
