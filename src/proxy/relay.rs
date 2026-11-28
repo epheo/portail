@@ -202,8 +202,7 @@ thread_local! {
     /// A direction borrows its buffer for a read and gives it back once the
     /// bytes are written, or at once when the read finds none. A tunnel
     /// with nothing to move holds no buffer: a pod holds thousands of them.
-    /// A size change borrows another size, where a buffer of the tunnel's
-    /// own was reallocated at each.
+    /// A change of read size borrows another size: nothing is reallocated.
     static SPARE: std::cell::RefCell<[Vec<Vec<u8>>; SIZES]> =
         const { std::cell::RefCell::new([const { Vec::new() }; SIZES]) };
 }

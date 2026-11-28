@@ -535,16 +535,19 @@ fn a_full_path_rewrite_borrows_the_rules_values() {
 }
 
 /// Many tunnels on one worker, each end sending and reading in bursts: the
-/// relay allocates nothing per read. Reads change size with every burst,
-/// and a buffer of the tunnel's own was reallocated at each change: 64
-/// allocations per mebibyte under this very load.
+/// relay allocates nothing per read. Reads change size with every burst; a
+/// tunnel that owned its buffer would reallocate it at each change.
 #[test]
 fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     const TUNNELS: usize = 32;
+    const COUNTED: u64 = 128 * 1024 * 1024;
+    // The scenario's pacing: each end rests after every burst.
     const REST: Duration = Duration::from_micros(400);
-    static MOVED: AtomicU64 = AtomicU64::new(0);
-    static STOP: AtomicBool = AtomicBool::new(false);
+
+    // Tunnels that have delivered their first bytes, and bytes delivered.
+    let (delivered, mut seen) = tokio::sync::watch::channel((0usize, 0u64));
+    let delivered = Arc::new(delivered);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Reads a burst, then rests: on threads of its own, as the senders are,
     // so only the proxy's allocations are counted.
@@ -553,10 +556,15 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
     std::thread::spawn(move || {
         for sock in listener.incoming() {
             let Ok(mut sock) = sock else { return };
+            let delivered = delivered.clone();
             std::thread::spawn(move || {
                 let mut chunk = vec![0u8; 256 * 1024];
+                let mut first = true;
                 while let Ok(n @ 1..) = sock.read(&mut chunk) {
-                    MOVED.fetch_add(n as u64, Ordering::Relaxed);
+                    delivered.send_modify(|(tunnels, bytes)| {
+                        *tunnels += usize::from(std::mem::take(&mut first));
+                        *bytes += n as u64;
+                    });
                     std::thread::sleep(REST);
                 }
             });
@@ -579,7 +587,7 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
         .enable_all()
         .build()
         .unwrap();
-    let (allocations, mebibytes) = rt.block_on(async {
+    let allocations = rt.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap();
         let ctx = ListenerCtx {
@@ -594,27 +602,30 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
         };
         tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
         for _ in 0..TUNNELS {
+            let stop = stop.clone();
             std::thread::spawn(move || {
                 let mut sock = std::net::TcpStream::connect(proxy).unwrap();
                 let chunk = vec![7u8; 64 * 1024];
-                while !STOP.load(Ordering::Relaxed) && sock.write_all(&chunk).is_ok() {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                    && sock.write_all(&chunk).is_ok()
+                {
                     std::thread::sleep(REST);
                 }
             });
         }
-        // Every tunnel is open and has borrowed its first buffers.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let (a0, m0) = (ALLOCATIONS.with(Cell::get), MOVED.load(Ordering::Relaxed));
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let (a1, m1) = (ALLOCATIONS.with(Cell::get), MOVED.load(Ordering::Relaxed));
-        STOP.store(true, Ordering::Relaxed);
-        (a1 - a0, (m1 - m0) as f64 / (1024.0 * 1024.0))
+        // Every tunnel is open, and each direction has borrowed once.
+        let warm = seen.wait_for(|(tunnels, _)| *tunnels == TUNNELS).await;
+        let from = warm.unwrap().1;
+        let before = ALLOCATIONS.with(Cell::get);
+        let moved = seen.wait_for(|(_, bytes)| *bytes >= from + COUNTED).await;
+        drop(moved);
+        ALLOCATIONS.with(Cell::get) - before
     });
-    assert!(mebibytes > 64.0, "{mebibytes} MiB moved: no load");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     // A relay that allocates per read makes 16 a mebibyte at the least.
-    let per_mebibyte = allocations as f64 / mebibytes;
+    let most = (COUNTED / (1024 * 1024)) as usize;
     assert!(
-        per_mebibyte < 1.0,
-        "{allocations} allocations for {mebibytes:.0} MiB: {per_mebibyte:.2} per MiB"
+        allocations < most,
+        "{allocations} allocations for {most} MiB"
     );
 }
