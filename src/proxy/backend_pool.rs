@@ -235,9 +235,8 @@ pub(crate) async fn connect_tcp(
         }
     };
     tcp.set_nodelay(true).map_err(|e| connect_error(addr, e))?;
-    // _-prefixed: debug! compiles out in release builds.
-    if let Err(_e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(keepalive) {
-        debug!("TCP keepalive setup failed for backend {}: {}", addr, _e);
+    if let Err(e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(keepalive) {
+        debug!("TCP keepalive setup failed for backend {}: {}", addr, e);
     }
     Ok(tcp)
 }
