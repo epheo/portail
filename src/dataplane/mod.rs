@@ -100,6 +100,7 @@ pub async fn run(args: DataplaneArgs, stop: CancellationToken) -> anyhow::Result
         tokio::time::sleep(args.shutdown_delay).await;
         ready.store(false, Ordering::Release);
         drain.run().await;
+        crate::access_log::finish().await;
     };
     tokio::join!(sync.leave(&mut client), stopping);
     refresh_stop.cancel();

@@ -51,6 +51,10 @@ pub(crate) struct Params {
     pub trusted_gateways: Vec<GatewayKey>,
     pub access_log: AccessLog,
     pub http2: Http2,
+    /// The GatewayClass's externalIPs allowlist; empty: none.
+    pub external_ip_cidrs: Vec<Cidr>,
+    /// This pass's: the Gateway's IPAddress values its Service carries.
+    pub external_ips: Vec<std::net::IpAddr>,
 }
 
 impl Params {
@@ -96,15 +100,26 @@ const IP_ADDRESS_TYPE: &str = "IPAddress";
 /// stay as they are.
 pub(crate) fn resolve(ctx: &ControllerCtx, gateway: &Gateway) -> Result<Params, String> {
     let store = &ctx.cache.gateway_parameters;
-    let mut layers = Vec::new();
-    if let Some(class) = ctx
+    let class = match ctx
         .cache
         .gateway_classes
         .get(&ObjectRef::new(&gateway.spec.gateway_class_name))
     {
-        layers.extend(class_layer(store, &class)?);
+        Some(class) => class_layer(store, &class)?,
+        None => None,
+    };
+    let own = gateway_layer(store, gateway)?;
+    if own
+        .as_ref()
+        .and_then(|s| s.service.as_ref())
+        .is_some_and(|s| s.external_ips.is_some())
+    {
+        return Err(
+            "service.externalIPs: only the GatewayClass's parameters may set it".to_string(),
+        );
     }
-    layers.extend(gateway_layer(store, gateway)?);
+    let external_ip_cidrs = external_ip_cidrs(class.as_ref())?;
+    let layers: Vec<_> = class.into_iter().chain(own).collect();
 
     let mut network_address = false;
     for addr in gateway.spec.addresses.iter().flatten() {
@@ -120,10 +135,11 @@ pub(crate) fn resolve(ctx: &ControllerCtx, gateway: &Gateway) -> Result<Params, 
         }
         network_address = true;
     }
-    let params = concrete(
+    let mut params = concrete(
         merge(builtin(&ctx.dataplane_image), &layers),
         network_address,
     )?;
+    params.external_ip_cidrs = external_ip_cidrs;
     let addressed = |name: &str| {
         gateway.spec.addresses.iter().flatten().any(|a| {
             a.r#type.as_deref() == Some(NETWORK_ADDRESS_TYPE) && a.value.as_deref() == Some(name)
@@ -150,6 +166,7 @@ pub(crate) fn check_class(ctx: &ControllerCtx, class: &GatewayClass) -> Result<(
     let layers: Vec<_> = class_layer(&ctx.cache.gateway_parameters, class)?
         .into_iter()
         .collect();
+    external_ip_cidrs(layers.first())?;
     concrete(merge(builtin(&ctx.dataplane_image), &layers), false).map(|_| ())
 }
 
@@ -293,6 +310,22 @@ fn builtin(image: &str) -> GatewayParametersSpec {
     }
 }
 
+/// The class's externalIPs allowlist: a bad entry fails the whole list
+/// rather than shortening it.
+fn external_ip_cidrs(class: Option<&GatewayParametersSpec>) -> Result<Vec<Cidr>, String> {
+    class
+        .and_then(|s| s.service.as_ref())
+        .and_then(|s| s.external_ips.as_ref())
+        .and_then(|e| e.allowed_cidrs.as_ref())
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, cidr)| {
+            Cidr::parse(cidr).map_err(|e| format!("service.externalIPs.allowedCIDRs[{i}]: {e}"))
+        })
+        .collect()
+}
+
 /// `base` with each layer's set fields over it, in order; `networks`,
 /// `resources` and `proxyProtocol` replace whole.
 fn merge(
@@ -327,7 +360,10 @@ fn merge(
         base.access_log = access_log.or(base.access_log);
         base.http2 = http2.or(base.http2);
         if let Some(type_) = service.and_then(|s| s.type_) {
-            base.service = Some(ServiceParameters { type_: Some(type_) });
+            base.service = Some(ServiceParameters {
+                type_: Some(type_),
+                ..Default::default()
+            });
         }
     }
     base
@@ -415,6 +451,8 @@ fn concrete(spec: GatewayParametersSpec, network_address: bool) -> Result<Params
         trusted_gateways,
         access_log: spec.access_log.unwrap_or(AccessLog::Disabled),
         http2: spec.http2.unwrap_or(Http2::Disabled),
+        external_ip_cidrs: vec![],
+        external_ips: vec![],
     })
 }
 
@@ -560,6 +598,8 @@ mod tests {
                 trusted_gateways: vec![],
                 access_log: AccessLog::Disabled,
                 http2: Http2::Disabled,
+                external_ip_cidrs: vec![],
+                external_ips: vec![],
             }
         );
     }
@@ -1125,6 +1165,58 @@ networks: [{name: br-ex-network, ips: [172.16.87.21/24]}]
         );
         let params = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap();
         assert_eq!(params.service_type, ServiceType::NodePort);
+    }
+
+    /// The externalIPs allowlist is the class's alone: read from its
+    /// parameters, refused on a Gateway's own, and a bad entry fails the
+    /// class rather than shortening the list.
+    #[tokio::test]
+    async fn external_ips_are_the_classs_to_allow() {
+        let mut cluster = cluster(Some(class_ref(Some("portail-system"), "defaults")));
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "service: {externalIPs: {allowedCIDRs: [192.0.2.0/28, \"2001:db8::/64\"]}}",
+            ),
+        );
+        let params = resolve_in(&cluster, &testkit::gateway("gw", 1)).unwrap();
+        let cidrs: Vec<String> = params
+            .external_ip_cidrs
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(cidrs, ["192.0.2.0/28", "2001:db8::/64"]);
+
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "default",
+                "mine",
+                "service: {externalIPs: {allowedCIDRs: [198.51.100.0/24]}}",
+            ),
+        );
+        let err = resolve_in(&cluster, &gateway_with_ref("mine")).unwrap_err();
+        assert!(err.contains("only the GatewayClass's parameters"), "{err}");
+
+        apply(
+            &mut cluster.parameters,
+            parameters(
+                "portail-system",
+                "defaults",
+                "service: {externalIPs: {allowedCIDRs: [192.0.2.0/28, 192.0.2.7/24]}}",
+            ),
+        );
+        let ctx = cluster.ctx(MockApi::default().client());
+        let class = ctx
+            .cache
+            .gateway_classes
+            .get(&ObjectRef::new("portail"))
+            .unwrap();
+        let err = check_class(&ctx, &class).unwrap_err();
+        assert!(err.contains("allowedCIDRs[1]"), "{err}");
+        assert!(resolve_in(&cluster, &testkit::gateway("gw", 1)).is_err());
     }
 
     #[tokio::test]

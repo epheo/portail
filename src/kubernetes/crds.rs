@@ -301,6 +301,34 @@ pub struct ServiceParameters {
     /// LoadBalancer.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<ServiceType>,
+
+    /// The Service externalIPs Gateways may ask for (Managed), set only in
+    /// the GatewayClass's parameters: on a Gateway's own, the Gateway is
+    /// Accepted=False InvalidParameters. Unset: none. Only addresses routed
+    /// to the nodes for Gateways belong here, never a node's or the control
+    /// plane's: a Service's externalIPs take that address's traffic on every
+    /// node.
+    #[serde(
+        rename = "externalIPs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_ips: Option<ExternalIpsParameters>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalIpsParameters {
+    /// IPv4 or IPv6 CIDRs, network address only. An IPAddress of a
+    /// Gateway's spec.addresses inside one goes on its Service's
+    /// externalIPs, unless an older Gateway asks for it too: one address,
+    /// one Gateway. Any other IPAddress is AddressNotUsable.
+    #[serde(
+        rename = "allowedCIDRs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(max = 64))]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
