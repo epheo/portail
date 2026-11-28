@@ -221,13 +221,26 @@ pub struct PortailConfig {
     /// (not serialized): every other name's answers are dialed as is.
     #[serde(skip)]
     pub cluster_ip_backends: std::collections::BTreeSet<String>,
+
+    /// The CA bundles `BackendCa::Bundle` names, as PEM, by name. Unlike
+    /// the tables above it is written out: a file brings its own, and a
+    /// snapshot's ride here, each once whatever the number of backendRefs
+    /// under it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub backend_cas: std::collections::BTreeMap<String, String>,
 }
 
 impl PortailConfig {
     /// Every backend name a route or a mirror names.
     pub fn backend_names(&self) -> impl Iterator<Item = &str> {
-        let http = self
-            .http_routes
+        self.http_backend_refs()
+            .chain(self.l4_backend_refs())
+            .map(|br| br.name.as_str())
+    }
+
+    /// The backendRefs of HTTP rules and of their mirrors.
+    pub(crate) fn http_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
+        self.http_routes
             .iter()
             .flat_map(|r| &r.rules)
             .flat_map(|rule| {
@@ -236,7 +249,11 @@ impl PortailConfig {
                     _ => None,
                 });
                 rule.backend_refs.iter().chain(mirrors)
-            });
+            })
+    }
+
+    /// The backendRefs of TCP, UDP and TLS routes.
+    pub(crate) fn l4_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
         let tcp = self
             .tcp_routes
             .iter()
@@ -248,7 +265,7 @@ impl PortailConfig {
             .iter()
             .flat_map(|r| &r.rules)
             .flat_map(|r| &r.backend_refs);
-        http.chain(tcp).chain(tls).map(|br| br.name.as_str())
+        tcp.chain(tls)
     }
 }
 
@@ -545,6 +562,51 @@ pub struct BackendRef {
     /// file setting it only fails that backend's share.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalid: bool,
+    /// TLS to this backend, verified: set by the controller from the
+    /// BackendTLSPolicy on its Service port, or by a file. Absent: TLS
+    /// when `app_protocol` says so, and then unverified. HTTP rules and
+    /// their mirrors only; a ref of another route that carries it fails.
+    /// A data plane that does not know the field refuses the whole
+    /// snapshot and serves on what it had, rather than connect unverified
+    /// where a policy asked to verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BackendTls>,
+}
+
+/// What a BackendTLSPolicy's validation asks of a backend's certificate,
+/// resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BackendTls {
+    /// The SNI sent, and the name the certificate must carry unless
+    /// `subject_alt_names` is set.
+    pub hostname: String,
+    /// When not empty, the certificate must carry one of these, and
+    /// `hostname` is no longer checked: it only selects the certificate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_alt_names: Vec<San>,
+    pub ca: BackendCa,
+}
+
+/// A Subject Alternative Name a backend's certificate may carry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum San {
+    /// A DNS name, matched as a server name is: a wildcard certificate
+    /// covers it.
+    Hostname(String),
+    /// A URI, matched whole: a SPIFFE ID.
+    Uri(String),
+}
+
+/// The trust anchors a backend's certificate must chain to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendCa {
+    /// A bundle of the config's `backendCas`, by name.
+    Bundle(String),
+    /// The roots the data plane's host trusts.
+    System,
 }
 
 /// The group of a backendRef that names another Gateway.

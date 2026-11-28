@@ -621,6 +621,8 @@ pub enum HttpFilter {
     RequestMirror {
         backend_addr: std::net::SocketAddr,
         fraction: Fraction,
+        /// How its copies are sent: as requests to that Service port are.
+        proto: crate::proxy::backend_pool::BackendProto,
     },
 }
 
@@ -710,7 +712,22 @@ pub struct Backend {
     pub use_tls: bool,
     /// Hostname for TLS SNI (the original DNS name before resolution)
     pub server_name: String,
+    /// The BackendTLSPolicy its TLS is verified under, when one is: then
+    /// the policy's hostname is the SNI, not `server_name`.
+    pub verify: Option<std::sync::Arc<crate::proxy::upstream::tls::Verify>>,
     pub action: BackendAction,
+}
+
+impl Backend {
+    /// How this backend is spoken to.
+    pub fn proto(&self) -> crate::proxy::backend_pool::Proto<'_> {
+        use crate::proxy::backend_pool::Proto;
+        match &self.verify {
+            Some(verify) => Proto::Verified(verify),
+            None if self.use_tls => Proto::Tls(&self.server_name),
+            None => Proto::Plain,
+        }
+    }
 }
 
 /// Why a TLS passthrough connection goes nowhere, worded as the L4

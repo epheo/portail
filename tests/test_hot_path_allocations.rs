@@ -92,6 +92,7 @@ fn table_to(backend: SocketAddr) -> RouteTable {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                verify: None,
                 action: BackendAction::Forward,
             }],
         ),
@@ -588,6 +589,7 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
             filters: vec![],
             use_tls: false,
             server_name: String::new(),
+            verify: None,
             action: BackendAction::Forward,
         }],
     );

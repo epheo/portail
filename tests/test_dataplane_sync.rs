@@ -195,6 +195,98 @@ fn serves_a_snapshot_and_reports_its_binds() {
     );
 }
 
+/// An HTTPS backend answering every request with `body`, its certificate
+/// for `svc.test` from a CA of its own: its address and that CA.
+fn tls_backend(body: &'static str) -> (SocketAddr, String) {
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::io::{Read, Write};
+
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["svc.test".to_string()])
+        .unwrap()
+        .signed_by(&key, &ca)
+        .unwrap();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.der().clone()], key)
+        .unwrap();
+    let config = std::sync::Arc::new(config);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let conn = rustls::ServerConnection::new(config).unwrap();
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let (mut seen, mut chunk) = (Vec::new(), [0u8; 4096]);
+                while let Ok(n @ 1..) = tls.read(&mut chunk) {
+                    seen.extend_from_slice(&chunk[..n]);
+                    if seen.ends_with(b"\r\n\r\n") {
+                        seen.clear();
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if tls.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, ca.pem())
+}
+
+/// A snapshot's `tls` and `backendCas` reach the data plane as written:
+/// the backend whose certificate chains to the bundle serves, and one
+/// from another CA is refused before any request.
+#[test]
+fn a_backend_is_verified_as_the_snapshot_says() {
+    let (trusted, ca) = tls_backend("verified");
+    let (untrusted, _its_ca) = tls_backend("never served");
+    let (ok, refused) = (free_port(), free_port());
+    let route = |listener: &str, backend: SocketAddr| {
+        serde_json::json!({
+            "parentRefs": [{"name": "gw", "sectionName": listener}],
+            "rules": [{"backendRefs": [{
+                "name": backend.ip().to_string(),
+                "port": backend.port(),
+                "tls": {"hostname": "svc.test", "ca": {"bundle": "ca"}},
+            }]}],
+        })
+    };
+    let served = snapshot(serde_json::json!({
+        "gateway": {"name": "gw", "listeners": [
+            {"name": "ok", "protocol": "HTTP", "port": ok},
+            {"name": "refused", "protocol": "HTTP", "port": refused},
+        ]},
+        "backendCas": {"ca": ca},
+        "httpRoutes": [route("ok", trusted), route("refused", untrusted)],
+    }));
+    let stub = ControllerStub::start(SHORT_HOLD, Mode::Serve(Some(served)));
+    let dp = start_dataplane(&stub, &[]);
+
+    wait_serving(&dp, ok, "verified");
+    let (status, _) = get(refused, "/").unwrap();
+    assert_eq!(status, 502, "{}", dp.process.output());
+    assert!(
+        dp.process.output().contains("invalid peer certificate"),
+        "{}",
+        dp.process.output()
+    );
+}
+
 /// A new version is applied; an unchanged one loops on 204s; a 404 closes
 /// every listener and the data plane polls on, as a first sync, until the
 /// Gateway is back.

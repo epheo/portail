@@ -66,6 +66,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 # Verifies a signed controller answer against the public key of the leaf it
 # carries; already in the tree through rustls, with these features.
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
+# The host's trust store, for backends a BackendTLSPolicy verifies against the
+# system roots. Already in the tree through kube-client.
+rustls-native-certs = "0.8"
 # A request layer on the controller's kube client; already in the tree
 # through kube-client, with this feature.
 tower = { version = "0.5", features = ["util"] }

@@ -324,6 +324,43 @@ In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirr
 - A mirror sends its copies to one address: the smallest the Service resolves to.
 - These single addresses change only when the address set does; a reordered DNS answer changes nothing.
 
+## Backend TLS
+
+A backendRef of an HTTP rule, or of its `RequestMirror`, is reached over TLS when its Service port's `appProtocol` is `https`, or when it carries `tls`. Only `tls` verifies the backend:
+
+- `hostname`: the SNI sent, and the name the certificate must carry.
+- `subjectAltNames`: when set, the certificate must carry one of them instead, each a `hostname` or a `uri` (a SPIFFE ID), and `hostname` only selects the certificate.
+- `ca`: what the certificate must chain to. `system`: the roots of the host portail runs on. `bundle: <name>`: a PEM bundle of the config's `backendCas`.
+
+In a config file:
+
+```yaml
+backendCas:
+  internal: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+httpRoutes:
+  - parentRefs: [{name: gateway}]
+    hostnames: [api.example.com]
+    rules:
+      - backendRefs:
+          - name: api.internal
+            port: 8443
+            tls:
+              hostname: api.internal
+              ca:
+                bundle: internal
+```
+
+- A backend that fails the check gets no byte of the request. The client gets a 502, and the failure counts against the backend's health as a refused connection does.
+- A mirror's copy is sent the way a request to that backend would be, or not at all: never in the clear to an `https` port, never to a backend that fails its check.
+- A `tls` that cannot be honoured is never downgraded to an unverified connection: no bundle of that name, a bundle with no certificate, no system root on the host. A config file is refused at load; from a controller the backendRef's share answers 500, and a mirror copies nothing.
+- `tls` on a backendRef of a TCP, UDP or TLS route fails that share the same way: only HTTP rules originate TLS. So does `tls` on a port whose `appProtocol` asks for a [PROXY header](deployment.md#proxy-protocol-to-a-service): that connection is made in the clear.
+- Without `tls`, an `https` port is encrypted and unverified.
+- Idle backend connections are kept per policy: one opened under a policy serves that policy's requests only. A bundle counts by its content, so an edited one is another policy.
+- TLS sessions are resumed per policy, across client connections and route changes.
+
 ## Performance Options
 
 The `performance` block of a config file (all durations accept `"30s"`-style

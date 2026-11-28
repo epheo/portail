@@ -499,6 +499,7 @@ fn convert_mirror_config(rm: &HttpRouteRulesFiltersRequestMirror, ns: &str) -> R
             filters: vec![],
             app_protocol: None,
             invalid: false,
+            tls: None,
         },
         percent,
         fraction,
@@ -544,6 +545,7 @@ fn convert_http_backend_ref(
         filters,
         app_protocol: None,
         invalid: false,
+        tls: None,
     };
     (backend, first)
 }
@@ -652,6 +654,7 @@ pub(crate) fn convert_l4_backend_ref<B: L4BackendRefAccess>(
         filters: vec![],
         app_protocol: None,
         invalid: false,
+        tls: None,
     }
 }
 

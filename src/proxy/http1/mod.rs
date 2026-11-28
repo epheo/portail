@@ -1115,6 +1115,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: crate::routing::BackendAction::Forward,
                 }],
             );
