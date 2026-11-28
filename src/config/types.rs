@@ -252,6 +252,20 @@ impl PortailConfig {
             })
     }
 
+    /// The backendRefs of HTTP rules and of their mirrors, to change.
+    pub(crate) fn http_backend_refs_mut(&mut self) -> impl Iterator<Item = &mut BackendRef> {
+        self.http_routes
+            .iter_mut()
+            .flat_map(|r| &mut r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter_mut().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&mut config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter_mut().chain(mirrors)
+            })
+    }
+
     /// The backendRefs of TCP, UDP and TLS routes.
     pub(crate) fn l4_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
         let tcp = self

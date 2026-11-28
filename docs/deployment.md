@@ -367,7 +367,7 @@ spec:
 - The policy alone makes the connection TLS: no `appProtocol: https` needed.
 - `sectionName` is a Service port's name; without it the policy covers every port. A port's own policy beats the Service's.
 - `hostname` is the SNI, and the name the certificate must carry; with `subjectAltNames` set, one of those must be on it instead.
-- `caCertificateRefs` name ConfigMaps of the policy's namespace, each with a `ca.crt` of PEM certificates. `wellKnownCACertificates: System` trusts the data plane host's store; the Managed image carries one.
+- `caCertificateRefs` name ConfigMaps of the policy's namespace, each with a `ca.crt` of PEM certificates. `wellKnownCACertificates: System` trusts the data plane host's store. The Managed image is ubi-minimal, whose CA bundle is where the data plane looks; no conformance test covers `System`, so check it once on your cluster.
 - It applies to HTTPRoute rules and their request mirrors. TLSRoute is served in Passthrough, and TCPRoute and UDPRoute carry no TLS of portail's: a policy on a Service reached by those alone has no effect and no status.
 - Fails closed: with no valid CA, a well-known set other than `System`, a wildcard `subjectAltNames` hostname, or a port with appProtocol `portail.epheo.eu/proxy-v2`, the policy is `Accepted=False` and the backend's share answers 500.
 - A certificate failing the check: 502, and no byte of the request is sent.

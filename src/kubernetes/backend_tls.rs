@@ -21,7 +21,6 @@ use rustls::pki_types::CertificateDer;
 
 use super::converters::parse_backend_dns_name;
 use super::reads::Recorded;
-use super::services::http_refs_mut;
 use crate::config::{BackendCa, BackendTls, PortailConfig, San, PROXY_V2_APP_PROTOCOL};
 use crate::logging::warn;
 
@@ -235,7 +234,7 @@ pub(crate) fn emit(config: &mut PortailConfig, decisions: &HashMap<(String, u16)
             (backend.clone(), tls)
         })
         .collect();
-    for r in http_refs_mut(config) {
+    for r in config.http_backend_refs_mut() {
         if r.invalid {
             continue;
         }
@@ -401,7 +400,8 @@ pub(crate) fn for_service(
                     "Invalid",
                     format!(
                         "Service {svc_name} port {port} asks for a PROXY header \
-                         (appProtocol {PROXY_V2_APP_PROTOCOL}), which TLS to the backend cannot follow"
+                         (appProtocol {PROXY_V2_APP_PROTOCOL}), which TLS to the backend cannot follow: \
+                         that port is refused, the policy's other ports verify"
                     ),
                 );
             }
@@ -562,7 +562,7 @@ fn ca_bundle(
         };
         if roots.add(cert).is_err() {
             return Err(invalid(&format!(
-                "{CA_KEY} holds a certificate that is no CA"
+                "{CA_KEY} holds a certificate that cannot be read as a trust anchor"
             )));
         }
         count += 1;
