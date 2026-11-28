@@ -187,12 +187,24 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
     })
 }
 
+/// The most attempts a rule may ask for beyond the first.
+pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 100;
+
 /// `None` for a stanza that asks for no attempt beyond the first.
 fn compile_retry(retry: &HttpRouteRetry) -> Result<Option<routing::Retry>, RouteError> {
     // What the API allows: a status below 400 is no failure to try again.
     if let Some(code) = retry.codes.iter().find(|code| !(400..=599).contains(*code)) {
         return Err(RouteError::unsupported(format!(
             "retry codes must be 400 to 599, got {code}"
+        )));
+    }
+    // The API sets no ceiling, and each attempt is a connect a client can
+    // ask for: without one, a request to backends that all refuse would
+    // make as many as the rule says.
+    if retry.attempts > MAX_RETRY_ATTEMPTS {
+        return Err(RouteError::unsupported(format!(
+            "retry attempts above {MAX_RETRY_ATTEMPTS} are not supported, got {}",
+            retry.attempts
         )));
     }
     Ok((retry.attempts > 0).then(|| routing::Retry {

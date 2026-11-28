@@ -2965,6 +2965,13 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{refused:#}").contains("400 to 599"), "{refused:#}");
         }
+        retrying(serde_json::json!({"attempts": 100}))
+            .to_route_table_strict()
+            .unwrap();
+        let refused = retrying(serde_json::json!({"attempts": 101}))
+            .to_route_table_strict()
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("above 100"), "{refused:#}");
         let unknown = serde_json::json!({
             "gateway": {"name": "g", "listeners": []},
             "httpRoutes": [{"rules": [{"retry": {"attempts": 1, "perTryTimeout": "1s"}, "backendRefs": []}]}]
