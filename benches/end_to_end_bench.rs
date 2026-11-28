@@ -248,6 +248,7 @@ fn request_analysis<M: Measurement + 'static>(c: &mut Criterion<M>) {
                 std::hint::black_box(80),
                 &health,
                 false,
+                &mut Vec::new(),
             );
             std::hint::black_box(result.is_ok())
         })
@@ -287,7 +288,7 @@ fn path_analysis<M: Measurement + 'static>(c: &mut Criterion<M>) {
                     black_box(request),
                     black_box(80),
                     &health,
-                    false,
+                    false, &mut Vec::new(),
                 )
             })
         });
@@ -332,6 +333,7 @@ fn path_modifiers<M: Measurement + 'static>(c: &mut Criterion<M>) {
                 black_box(80),
                 &health,
                 false,
+                &mut Vec::new(),
             )
         })
     });
@@ -383,6 +385,7 @@ fn path_modifiers<M: Measurement + 'static>(c: &mut Criterion<M>) {
                 black_box(80),
                 &health,
                 false,
+                &mut Vec::new(),
             )
         })
     });

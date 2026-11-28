@@ -314,6 +314,33 @@ A backend or mirror name DNS cannot resolve:
 - The DNS refresh (`dnsRefreshInterval`) brings it back once it resolves.
 - Standalone: the config fails to load; a SIGHUP reload keeps the running routes.
 
+## CORS
+
+The `CORS` filter of an HTTPRoute rule, written the same in a config file:
+
+```yaml
+filters:
+  - type: CORS
+    cors:
+      allowOrigins: ["https://app.example.com", "https://*.example.org"]
+      allowMethods: [GET, PUT]
+      allowHeaders: [content-type, authorization]
+      exposeHeaders: [x-request-id]
+      allowCredentials: true
+      maxAge: 600
+```
+
+- An origin is allowed when it equals one of `allowOrigins`: scheme, host and port, the scheme's own port counting as written. A host may start with `*`, which stands for anything before the rest, dots included: `https://*.example.org` allows `https://a.b.example.org`, not `https://example.org`. `*` alone allows every origin.
+- An allowed origin is echoed in `Access-Control-Allow-Origin`, never answered with `*`. So every response of the rule carries `Vary: Origin`.
+- A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered by portail with a 204 and never reaches a backend, whatever the rule's backends are. From an origin that is not allowed: 403, without CORS headers.
+- The preflight answer lists `allowMethods` and `allowHeaders` as configured. Where one holds `*`, what the preflight asks for is echoed instead.
+- `maxAge` is 5 seconds when not set.
+- On any other request from an allowed origin, the response carries the allow-origin, `allowCredentials` and `exposeHeaders` headers, in place of any the backend sent. From another origin, or without `Origin`, it carries none of them, the backend's included.
+- portail's own answers for the rule carry them too: a redirect, a 500, a 502, a 503, a 504. A browser then reports that answer, not a CORS failure.
+- `exposeHeaders: ["*"]` is sent as `*` without `allowCredentials`. With it nothing is exposed: browsers refuse the wildcard then.
+- One `CORS` filter per rule, none on a backendRef.
+- A value that cannot be a header (an origin that is no `<scheme>://<host>[:<port>]`, a method or header name that is no token) rejects the route, as any filter value portail cannot apply.
+
 ## Backend Services
 
 In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirror` all reach a Service the same way:

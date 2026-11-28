@@ -130,6 +130,9 @@ pub(crate) struct ConnectionState {
     /// scratch (mem::swap partner). Empty until a filtered route is hit, so
     /// the no-filter path never allocates it.
     filter_buf: Vec<u8>,
+    /// The CORS lines of the request being answered (see
+    /// `analyze_request`). Never allocated without a CORS filter.
+    cors_lines: Vec<u8>,
     /// Per-step body-streaming progress budget; None = disabled.
     idle_body_timeout: Option<Duration>,
     /// Per-listener stats slot (shared with the accept loop) for per-port
@@ -194,6 +197,7 @@ impl ConnectionState {
             header_buf: Vec::new(),
             scratch_buf: Vec::with_capacity(1024),
             filter_buf: Vec::new(),
+            cors_lines: Vec::new(),
             idle_body_timeout: idle_opt(cfg.idle_body_timeout),
             listener_stats,
             last_status: 0,
@@ -400,6 +404,7 @@ async fn serve_http(
             state.server_port,
             &state.health,
             state.is_tls,
+            &mut state.cors_lines,
         )?;
 
         // Bytes read past this request (a pipelined next request) are carried
@@ -690,7 +695,7 @@ async fn complete_headers(
         Ok(Ok(None)) => {
             // The rest of the head may still be on its way.
             state.refused(431);
-            let _ = send_error_response(client, 431).await;
+            let _ = send_error_response(client, 431, &[]).await;
             Err(anyhow::anyhow!("Request headers exceed buffer size"))
         }
         // A reset, or a TLS record that does not decode: the connection is
@@ -698,7 +703,7 @@ async fn complete_headers(
         Ok(Err(e)) => Err(e.into()),
         Err(_) => {
             // No linger: this client already used its whole budget.
-            let _ = send_error_response(client, 408).await;
+            let _ = send_error_response(client, 408, &[]).await;
             Err(anyhow::anyhow!("client header read timed out"))
         }
     }

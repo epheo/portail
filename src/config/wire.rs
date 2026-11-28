@@ -156,6 +156,9 @@ pub(crate) fn check_filter(filter: &HttpRouteFilter) -> Result<()> {
         ),
         // Resolved to a socket address; none of it reaches the wire.
         HttpRouteFilter::RequestMirror { .. } => Ok(()),
+        // Checked where it is built: each value becomes a header only
+        // through `Cors::new`.
+        HttpRouteFilter::Cors { .. } => Ok(()),
     }
 }
 

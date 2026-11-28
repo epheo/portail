@@ -422,7 +422,7 @@ fn a_404_allocates_nothing() {
     let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
     let req = b"GET /api HTTP/1.1\r\nHost: nope.test\r\n\r\n";
     let n = allocations(|| {
-        let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+        let result = analyze_request(&rt, &sel, req, 80, &health, false, &mut Vec::new()).unwrap();
         assert!(matches!(result, RoutingResult::LocalReply(_)));
     });
     assert_eq!(n, 0);
@@ -438,7 +438,8 @@ fn a_routed_request_allocates_nothing() {
         b"GET /api/a%20b/%2e%2ex HTTP/1.1\r\nHost: a.test\r\n\r\n",
     ] {
         let n = allocations(|| {
-            let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+            let result =
+                analyze_request(&rt, &sel, req, 80, &health, false, &mut Vec::new()).unwrap();
             assert!(matches!(result, RoutingResult::HttpForward { .. }));
         });
         assert_eq!(n, 0, "{}", String::from_utf8_lossy(req));
@@ -453,7 +454,8 @@ fn an_unrouted_l4_port_allocates_nothing() {
     let tls_hello = [0x16, 0x03, 0x01, 0x00, 0xf4, 0x01, 0x00, 0x00];
     let n = allocations(|| {
         let udp = analyze_udp_request(&rt, &sel, 5353, &health).unwrap();
-        let tcp = analyze_request(&rt, &sel, &tls_hello, 5432, &health, false).unwrap();
+        let tcp =
+            analyze_request(&rt, &sel, &tls_hello, 5432, &health, false, &mut Vec::new()).unwrap();
         assert!(matches!(udp, RoutingResult::CloseConnection));
         assert!(matches!(tcp, RoutingResult::CloseConnection));
     });
@@ -465,7 +467,7 @@ fn a_refused_dot_segment_allocates_nothing() {
     let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
     let req = b"GET /public/..;/api HTTP/1.1\r\nHost: a.test\r\n\r\n";
     let n = allocations(|| {
-        let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+        let result = analyze_request(&rt, &sel, req, 80, &health, false, &mut Vec::new()).unwrap();
         assert!(matches!(result, RoutingResult::LocalReply(r) if r.status == 400));
     });
     assert_eq!(n, 0);
@@ -485,7 +487,8 @@ fn an_unparseable_head_allocates_nothing() {
     for (head, refusal) in heads {
         assert_eq!(extract_routing_info(head).err(), Some(refusal));
         let n = allocations(|| {
-            let result = analyze_request(&rt, &sel, head, 80, &health, false).unwrap();
+            let result =
+                analyze_request(&rt, &sel, head, 80, &health, false, &mut Vec::new()).unwrap();
             assert!(matches!(result, RoutingResult::LocalReply(r) if r.status == 400));
         });
         assert_eq!(n, 0, "{refusal}");
@@ -497,7 +500,7 @@ fn a_path_to_normalize_allocates_once() {
     let (rt, sel, health) = (table(), BackendSelector::new(), HealthRegistry::new());
     let req = b"GET /public/%2e%2e/api/./users?page=2 HTTP/1.1\r\nHost: a.test\r\n\r\n";
     let n = allocations(|| {
-        let result = analyze_request(&rt, &sel, req, 80, &health, false).unwrap();
+        let result = analyze_request(&rt, &sel, req, 80, &health, false, &mut Vec::new()).unwrap();
         assert!(matches!(result, RoutingResult::HttpForward { .. }));
     });
     assert!(n <= 1, "{n} allocations");
