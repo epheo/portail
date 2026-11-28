@@ -263,6 +263,10 @@ impl HealthRegistry {
     /// Spawn a background Tokio task that probes `addr` until it recovers,
     /// reaching it as `proto` says requests do. Call this only when
     /// [`record_failure`] returns `true`.
+    ///
+    /// Health is kept per address, so an address reached two ways (a TCP
+    /// route in the clear and an HTTP rule over TLS, to one pod port) is
+    /// probed as the ref whose failure ejected it.
     pub fn spawn_probe(registry: Arc<Self>, addr: SocketAddr, proto: BackendProto) {
         info!("Spawning recovery probe for backend {}", addr);
         let probe =
