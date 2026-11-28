@@ -6,6 +6,12 @@
 - One released before that, such as 0.2.1, leaves them as they were. After downgrading to it, a GatewayClass keeps a stale `portail.epheo.eu/GatewaysIsolated=True` that a console may trust.
 - Remove it by hand, `kubectl patch gatewayclass <name> --subresource=status --type=json -p '[{"op":"remove","path":"/status/conditions/<index>"}]'`, or edit the class so the older controller rewrites its conditions.
 
+## From 0.3.0
+
+- BackendTLSPolicy needs data planes of this release: an older one refuses a configuration carrying one and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`; upgrade Unmanaged ones before writing a policy.
+- The controller's ClusterRole gains BackendTLSPolicy read and status patch, and ConfigMap read: apply this release's `deploy/install`.
+- A request mirror to a port with appProtocol `https` is sent over TLS: it went out in the clear.
+
 ## From 0.2.1
 
 - A Service backend whose addresses fall inside a network the Gateway attaches (its Network addresses, the networks it dials out on) is refused: the share of a backendRef left with none answers 500.

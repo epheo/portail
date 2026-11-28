@@ -632,6 +632,29 @@ pub(crate) fn policy_ancestor_entry(
     })
 }
 
+/// One Gateway's ancestor entry on a BackendTLSPolicy: its Accepted and
+/// ResolvedRefs conditions.
+pub(crate) fn backend_tls_ancestor_entry(
+    controller_name: &str,
+    gateway: &crate::sync::GatewayKey,
+    policy: &crate::kubernetes::backend_tls::PolicyStatus,
+) -> Value {
+    let (a, r) = (&policy.accepted, &policy.resolved_refs);
+    json!({
+        "ancestorRef": {
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "namespace": gateway.namespace,
+            "name": gateway.name,
+        },
+        "controllerName": controller_name,
+        "conditions": [
+            condition("Accepted", a.ok, a.reason, &a.message, policy.generation),
+            condition("ResolvedRefs", r.ok, r.reason, &r.message, policy.generation),
+        ],
+    })
+}
+
 /// The (controller, Gateway) pair whose entries a pass owns in an atomic
 /// status list. Gateway API keys route parents and policy ancestors by
 /// controllerName plus the Gateway ref.

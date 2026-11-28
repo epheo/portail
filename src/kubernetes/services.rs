@@ -11,14 +11,14 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::Api;
 use kube::Client;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use super::converters::{backend_dns_name, parse_backend_dns_name};
 use super::reads::Recorded;
-use crate::config::{HttpRouteFilter, PortailConfig};
+use crate::config::PortailConfig;
 use crate::logging::{debug, info, warn};
 
 /// Resolved service metadata needed for route table construction.
@@ -263,25 +263,20 @@ impl NamedTargetPortReq {
 /// resolved, and a RefNotPermitted one names a namespace this Gateway may
 /// not read.
 pub(crate) fn referenced_backends(config: &PortailConfig) -> HashSet<(String, u16)> {
-    let http_rules = config.http_routes.iter().flat_map(|r| &r.rules);
-    let mirrors = http_rules
-        .clone()
-        .flat_map(|rule| &rule.filters)
-        .filter_map(|f| match f {
-            HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
-            _ => None,
-        });
-    let http = http_rules
-        .flat_map(|rule| &rule.backend_refs)
-        .chain(mirrors);
-    let l4 = config
-        .tcp_routes
-        .iter()
-        .chain(&config.udp_routes)
-        .flat_map(|r| &r.rules)
-        .chain(config.tls_routes.iter().flat_map(|r| &r.rules))
-        .flat_map(|rule| &rule.backend_refs);
-    http.chain(l4)
+    config
+        .http_backend_refs()
+        .chain(config.l4_backend_refs())
+        .filter(|b| !b.invalid)
+        .map(|b| (b.name.clone(), b.port))
+        .collect()
+}
+
+/// (FQDN, port) of every backend an HTTP rule routes or mirrors to: the
+/// connections a BackendTLSPolicy verifies. TLSRoute is served in
+/// Passthrough only, where the client's TLS reaches the backend.
+pub(crate) fn http_backends(config: &PortailConfig) -> BTreeSet<(String, u16)> {
+    config
+        .http_backend_refs()
         .filter(|b| !b.invalid)
         .map(|b| (b.name.clone(), b.port))
         .collect()
