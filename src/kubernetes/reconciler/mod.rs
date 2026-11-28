@@ -15,7 +15,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use crate::config::compile::compile_http_route;
 use crate::config::*;
 
-use super::backend_tls;
 use super::converters::{
     convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
     parse_backend_dns_name, route_namespace, CertData,
@@ -27,8 +26,6 @@ use super::reference_grants::{is_reference_allowed, listeners_for_parent_ref};
 use super::services::{
     is_external_name, referenced_backends, resolve_backends, NamedTargetPortReq,
 };
-use gateway_api::backendtlspolicies::BackendTlsPolicy;
-use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::core::v1::Namespace;
 
 // ---------------------------------------------------------------------------
@@ -52,10 +49,6 @@ pub(crate) struct ClusterSnapshot {
     pub reference_grants: Recorded<ReferenceGrant>,
     /// Pre-filtered to policies targeting this Gateway, like routes.
     pub rate_limit_policies: Vec<Arc<RateLimitPolicy>>,
-    /// Read through: the policies of a backend Service's namespace.
-    pub backend_tls_policies: Recorded<BackendTlsPolicy>,
-    /// Read through: a policy's CA bundles, each by name.
-    pub configmaps: Recorded<ConfigMap>,
     /// This controller's Gateways by (namespace, name), with their
     /// listener ports: what a backendRef of kind Gateway may name.
     pub gateways: HashMap<(String, String), Vec<u16>>,
@@ -254,8 +247,6 @@ pub struct ReconcileResult {
     /// The headless Services this Gateway routes to whose targetPort is
     /// named, for a one-shot EndpointSlice list.
     pub(crate) named_target_ports: Vec<NamedTargetPortReq>,
-    /// The BackendTLSPolicies naming its Service backends, judged.
-    pub(crate) backend_tls: backend_tls::GatewayPolicies,
 }
 
 /// Computed Accepted condition for one RateLimitPolicy against this Gateway.
@@ -442,24 +433,12 @@ pub(crate) fn reconcile_to_config(
     config.app_protocol_overrides = resolved.app_protocol_overrides;
     config.headless_target_ports = resolved.headless_target_ports;
     config.cluster_ip_backends = resolved.cluster_ip_backends.into_iter().collect();
-    let backend_tls = backend_tls::for_backends(
-        &referenced,
-        services,
-        &snapshot.backend_tls_policies,
-        &snapshot.configmaps,
-    );
-    backend_tls::warn_unverified(
-        &config.app_protocol_overrides,
-        &backend_tls.decisions,
-        &referenced,
-    );
     Ok(ReconcileResult {
         config,
         route_status,
         policy_status,
         gateway_targets: cx.watched.into_inner(),
         named_target_ports,
-        backend_tls,
     })
 }
 

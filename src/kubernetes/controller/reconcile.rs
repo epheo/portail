@@ -950,6 +950,96 @@ mod tests {
         assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
     }
 
+    /// A policy's CA ConfigMap, cached by metadata, is fetched by name and
+    /// judged: a CA accepts the policy, a ConfigMap without one refuses it.
+    #[tokio::test]
+    async fn a_policys_ca_configmap_is_fetched_and_judged() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("web", "https", 443, serde_json::json!(8443)),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 443),
+        );
+        apply(
+            &mut p.cluster.backend_tls_policies,
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "namespace": "default", "generation": 1},
+                "spec": {
+                    "targetRefs": [{"group": "", "kind": "Service", "name": "web"}],
+                    "validation": {"hostname": "web.test", "caCertificateRefs": [
+                        {"group": "", "kind": "ConfigMap", "name": "ca"},
+                    ]},
+                },
+            }))
+            .unwrap(),
+        );
+        let meta = |version: &str| {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": {"name": "ca", "namespace": "default", "resourceVersion": version},
+            }))
+            .unwrap()
+        };
+        let configmap = |version: &str, data: serde_json::Value| {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "ca", "namespace": "default", "resourceVersion": version},
+                "data": data,
+            })
+        };
+        let mut ca = rcgen::CertificateParams::new(vec!["ca.test".into()]).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let pem = ca
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        let path = "/api/v1/namespaces/default/configmaps/ca";
+        let accepted = |p: &Pipeline| {
+            let patch = p
+                .api
+                .status_patch("backendtlspolicies", "p")
+                .expect("a status write");
+            patch["status"]["ancestors"][0]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "Accepted")
+                .map(|c| (c["status"].clone(), c["reason"].clone()))
+                .unwrap()
+        };
+
+        apply(&mut p.cluster.configmaps, meta("1"));
+        p.api.reply_to(
+            path,
+            200,
+            configmap("1", serde_json::json!({"ca.crt": pem})),
+        );
+        p.pass(&gw).await.unwrap();
+        assert_eq!(accepted(&p), ("True".into(), "Accepted".into()));
+        assert!(p
+            .api
+            .requests()
+            .iter()
+            .any(|r| r.method == "GET" && r.path == path));
+
+        p.api.clear();
+        apply(&mut p.cluster.configmaps, meta("2"));
+        p.api
+            .reply_to(path, 200, configmap("2", serde_json::json!({"other": "x"})));
+        p.pass(&gw).await.unwrap();
+        assert_eq!(
+            accepted(&p),
+            ("False".into(), "NoValidCACertificate".into())
+        );
+    }
+
     /// A BackendTLSPolicy naming a Service the Gateway routes to gets the
     /// Gateway as an ancestor, with Accepted and ResolvedRefs; one that
     /// moved to a Service the Gateway does not use loses our entry.

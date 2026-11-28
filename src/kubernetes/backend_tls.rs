@@ -11,9 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gateway_api::backendtlspolicies::{
-    BackendTlsPolicy, BackendTlsPolicyValidation, BackendTlsPolicyValidationSubjectAltNamesType,
+    BackendTlsPolicy, BackendTlsPolicyTargetRefs, BackendTlsPolicyValidation,
+    BackendTlsPolicyValidationSubjectAltNamesType,
 };
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::core::v1::Service;
 use kube::ResourceExt;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
@@ -23,7 +24,19 @@ use super::reads::Recorded;
 use crate::logging::warn;
 
 /// The ConfigMap key a CA bundle is read from (Gateway API Core support).
-const CA_KEY: &str = "ca.crt";
+pub(crate) const CA_KEY: &str = "ca.crt";
+
+/// A ConfigMap a caCertificateRef names, as the controller found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CaRef {
+    Missing,
+    NoKey,
+    /// Its `ca.crt`, unchecked.
+    Pem(String),
+}
+
+/// A ConfigMap by namespace and name.
+pub(crate) type ConfigMapKey = (String, String);
 const SYSTEM: &str = "System";
 
 /// How a Service port's backend connections are verified.
@@ -110,33 +123,76 @@ pub(crate) struct GatewayPolicies {
     pub decisions: HashMap<(String, u16), Decision>,
 }
 
-/// For the Service backends `referenced` of one Gateway, as FQDN and port.
-/// Each Service is read through `services`, and the policies and
-/// ConfigMaps of its namespace through theirs.
-pub(crate) fn for_backends<'a>(
+/// The Service backends of `referenced`, as FQDN and port, by Service.
+fn by_service<'a>(
     referenced: impl IntoIterator<Item = &'a (String, u16)>,
-    services: &Recorded<Service>,
-    policies: &Recorded<BackendTlsPolicy>,
-    configmaps: &Recorded<ConfigMap>,
-) -> GatewayPolicies {
-    let mut by_service: BTreeMap<(String, String), (String, BTreeSet<u16>)> = BTreeMap::new();
+) -> BTreeMap<(String, String), (String, BTreeSet<u16>)> {
+    let mut out: BTreeMap<(String, String), (String, BTreeSet<u16>)> = BTreeMap::new();
     for (fqdn, port) in referenced {
         if let Some((name, ns)) = parse_backend_dns_name(fqdn) {
-            by_service
-                .entry((ns, name))
+            out.entry((ns, name))
                 .or_insert_with(|| (fqdn.clone(), BTreeSet::new()))
                 .1
                 .insert(*port);
         }
     }
+    out
+}
+
+fn is_service(target: &BackendTlsPolicyTargetRefs, service: &str) -> bool {
+    target.group.is_empty() && target.kind == "Service" && target.name == service
+}
+
+fn names_service(policy: &BackendTlsPolicy, service: &str) -> bool {
+    policy
+        .spec
+        .target_refs
+        .iter()
+        .any(|t| is_service(t, service))
+}
+
+/// The ConfigMaps that the policies naming the Service backends of
+/// `referenced` name, read as [`for_backends`] reads them.
+pub(crate) fn wanted_configmaps<'a>(
+    referenced: impl IntoIterator<Item = &'a (String, u16)>,
+    services: &Recorded<Service>,
+    policies: &Recorded<BackendTlsPolicy>,
+) -> BTreeSet<ConfigMapKey> {
+    let mut out = BTreeSet::new();
+    for (ns, name) in by_service(referenced).into_keys() {
+        if services.get(&ns, &name).is_none() {
+            continue;
+        }
+        for policy in policies.in_namespace(&ns) {
+            if !names_service(&policy, &name) {
+                continue;
+            }
+            let refs = policy.spec.validation.ca_certificate_refs.iter().flatten();
+            for r in refs.filter(|r| r.group.is_empty() && r.kind == "ConfigMap") {
+                out.insert((ns.clone(), r.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// For the Service backends `referenced` of one Gateway, as FQDN and port.
+/// Each Service is read through `services`, the policies of its namespace
+/// through `policies`; `configmap` looks a ConfigMap up by namespace and name.
+pub(crate) fn for_backends<'a>(
+    referenced: impl IntoIterator<Item = &'a (String, u16)>,
+    services: &Recorded<Service>,
+    policies: &Recorded<BackendTlsPolicy>,
+    configmap: impl Fn(&str, &str) -> CaRef,
+) -> GatewayPolicies {
     let mut out = GatewayPolicies::default();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for ((ns, name), (fqdn, ports)) in by_service {
+    for ((ns, name), (fqdn, ports)) in by_service(referenced) {
         let Some(service) = services.get(&ns, &name) else {
             continue;
         };
         let in_ns = policies.in_namespace(&ns);
-        let found = for_service(&in_ns, &service, ports, |cm| configmaps.get(&ns, cm));
+        let found = for_service(&in_ns, &service, ports, |cm| configmap(&ns, cm));
         for (port, decision) in found.by_port {
             out.decisions.insert((fqdn.clone(), port), decision);
         }
@@ -200,7 +256,7 @@ pub(crate) fn for_service(
     policies: &[Arc<BackendTlsPolicy>],
     service: &Service,
     ports: impl IntoIterator<Item = u16>,
-    configmap: impl Fn(&str) -> Option<Arc<ConfigMap>>,
+    configmap: impl Fn(&str) -> CaRef,
 ) -> ServicePolicies {
     let svc_name = service.name_any();
     let port_named = |name: &str| {
@@ -220,7 +276,7 @@ pub(crate) fn for_service(
     for policy in policies {
         let mut targets_it = false;
         for target in &policy.spec.target_refs {
-            if !target.group.is_empty() || target.kind != "Service" || target.name != svc_name {
+            if !is_service(target, &svc_name) {
                 continue;
             }
             targets_it = true;
@@ -297,10 +353,7 @@ struct Judged {
     decision: Decision,
 }
 
-fn judge(
-    validation: &BackendTlsPolicyValidation,
-    configmap: &impl Fn(&str) -> Option<Arc<ConfigMap>>,
-) -> Judged {
+fn judge(validation: &BackendTlsPolicyValidation, configmap: &impl Fn(&str) -> CaRef) -> Judged {
     let resolved = Cond::ok("ResolvedRefs", "All references resolved");
     let invalid = |message: String| Judged {
         accepted: Cond::not("Invalid", message),
@@ -404,7 +457,7 @@ fn ca_bundle(
     group: &str,
     kind: &str,
     name: &str,
-    configmap: &impl Fn(&str) -> Option<Arc<ConfigMap>>,
+    configmap: &impl Fn(&str) -> CaRef,
 ) -> Result<String, Cond> {
     if !group.is_empty() || kind != "ConfigMap" {
         return Err(Cond::not(
@@ -418,11 +471,10 @@ fn ca_bundle(
             format!("caCertificateRef ConfigMap {name}: {why}"),
         )
     };
-    let Some(cm) = configmap(name) else {
-        return Err(invalid("not found"));
-    };
-    let Some(pem) = cm.data.as_ref().and_then(|d| d.get(CA_KEY)) else {
-        return Err(invalid(&format!("no key {CA_KEY}")));
+    let pem = match configmap(name) {
+        CaRef::Missing => return Err(invalid("not found")),
+        CaRef::NoKey => return Err(invalid(&format!("no key {CA_KEY}"))),
+        CaRef::Pem(pem) => pem,
     };
     let mut roots = rustls::RootCertStore::empty();
     let mut count = 0;
@@ -440,7 +492,7 @@ fn ca_bundle(
     if count == 0 {
         return Err(invalid(&format!("{CA_KEY} holds no certificate")));
     }
-    Ok(pem.clone())
+    Ok(pem)
 }
 
 #[cfg(test)]
@@ -496,17 +548,6 @@ mod tests {
         params.self_signed(&key).unwrap().pem()
     }
 
-    fn configmap(data: &[(&str, &str)]) -> Arc<ConfigMap> {
-        Arc::new(ConfigMap {
-            data: Some(
-                data.iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            ),
-            ..Default::default()
-        })
-    }
-
     fn status<'a>(out: &'a ServicePolicies, name: &str) -> &'a PolicyStatus {
         out.statuses.iter().find(|s| s.name == name).unwrap()
     }
@@ -521,7 +562,7 @@ mod tests {
             policy("whole-1", 100, None, system("one.test")),
             policy("port", 200, Some("https-1"), system("port.test")),
         ];
-        let out = for_service(&policies, &service(), [443, 8443], |_| None);
+        let out = for_service(&policies, &service(), [443, 8443], |_| CaRef::Missing);
         assert_eq!(status(&out, "whole-1").accepted.reason, "Accepted");
         assert_eq!(status(&out, "whole-2").accepted.reason, "Conflicted");
         assert!(!status(&out, "whole-2").accepted.ok);
@@ -552,7 +593,10 @@ mod tests {
                 &[policy(name, 1, None, validation)],
                 &service(),
                 [443],
-                |cm| (cm == "keyless").then(|| configmap(&[("other", "x")])),
+                |cm| match cm {
+                    "keyless" => CaRef::NoKey,
+                    _ => CaRef::Missing,
+                },
             );
             let s = status(&out, name);
             assert_eq!(
@@ -582,7 +626,10 @@ mod tests {
             &[policy("p", 1, None, validation)],
             &service(),
             [443],
-            |cm| (cm == "ca").then(|| configmap(&[(CA_KEY, &pem)])),
+            |cm| match cm {
+                "ca" => CaRef::Pem(pem.clone()),
+                _ => CaRef::Missing,
+            },
         );
         let s = status(&out, "p");
         assert!(s.accepted.ok && s.resolved_refs.ok, "{s:?}");
@@ -613,7 +660,7 @@ mod tests {
                 &[policy("p", 1, None, validation)],
                 &service(),
                 [443],
-                |_| None,
+                |_| CaRef::Missing,
             );
             assert_eq!(status(&out, "p").accepted.reason, "Invalid");
             assert_eq!(out.by_port[&443], Decision::Refuse);
@@ -627,7 +674,7 @@ mod tests {
             &[policy("p", 1, Some("nope"), system("a.test"))],
             &service(),
             [443],
-            |_| None,
+            |_| CaRef::Missing,
         );
         assert_eq!(status(&out, "p").accepted.reason, "TargetNotFound");
         assert!(!out.by_port.contains_key(&443), "nothing applies");
@@ -640,7 +687,7 @@ mod tests {
             &[policy("p", 1, Some("https-1"), system("a.test"))],
             &service(),
             [443, 8443],
-            |_| None,
+            |_| CaRef::Missing,
         );
         assert!(out.by_port.contains_key(&443));
         assert!(!out.by_port.contains_key(&8443));

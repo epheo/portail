@@ -10,6 +10,7 @@
 
 mod auth;
 mod ca;
+mod ca_bundles;
 mod external_ips;
 mod gateway_backends;
 mod gatewayclass;
@@ -33,6 +34,7 @@ use futures::StreamExt;
 use gateway_api::backendtlspolicies::BackendTlsPolicy;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use kube::api::Api;
+use kube::core::PartialObjectMeta;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher;
@@ -101,7 +103,7 @@ struct ResourceCache {
     gateway_parameters: Recorded<GatewayParameters>,
     /// Empty store when the CRD is not installed.
     backend_tls_policies: Recorded<BackendTlsPolicy>,
-    configmaps: Recorded<ConfigMap>,
+    configmaps: Recorded<PartialObjectMeta<ConfigMap>>,
 }
 
 struct ControllerCtx {
@@ -114,6 +116,7 @@ struct ControllerCtx {
     named_ports: Arc<NamedPortCache>,
     networks: Arc<NetworkCidrCache>,
     certs: Arc<validate::LastGoodCerts>,
+    ca_bundles: ca_bundles::CaBundles,
     hub: Arc<Hub>,
     reports: Arc<ReportStore>,
     /// Who names whom as a backend of kind Gateway, and what each exposes.
@@ -251,10 +254,13 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
 
     let (store_namespaces, namespace_stream) =
         create_reflector(Api::<Namespace>::all(client.clone()), &listings);
-    // A BackendTLSPolicy's CA bundles: its caCertificateRefs name
-    // ConfigMaps of its namespace, any namespace.
-    let (store_configmaps, configmap_stream) =
-        create_reflector(Api::<ConfigMap>::all(client.clone()), &listings);
+    // A BackendTLSPolicy's caCertificateRefs name ConfigMaps of its
+    // namespace, any namespace: by metadata, see `ca_bundles`.
+    let (store_configmaps, configmap_stream) = create_reflector_with_config(
+        Api::<PartialObjectMeta<ConfigMap>>::all(client.clone()),
+        watcher::Config::default(),
+        &listings,
+    );
     let (store_services, service_stream) =
         create_reflector(Api::<Service>::all(client.clone()), &listings);
     let (store_reference_grants, reference_grant_stream) =
@@ -324,6 +330,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         named_ports: Arc::new(NamedPortCache::new(Duration::from_secs(RESYNC_SECS))),
         networks: Arc::default(),
         certs: Arc::default(),
+        ca_bundles: Default::default(),
         hub: Arc::default(),
         reports: Arc::default(),
         backends: Arc::default(),
@@ -505,9 +512,12 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             }
             woken
         })
-        .watches_stream(configmap_stream, move |configmap: ConfigMap| {
-            readers(&reads6, &gw13, ReadKind::ConfigMap, &configmap)
-        })
+        .watches_stream(
+            configmap_stream,
+            move |configmap: PartialObjectMeta<ConfigMap>| {
+                readers(&reads6, &gw13, ReadKind::ConfigMap, &configmap)
+            },
+        )
         .reconcile_on(report_triggers)
         .reconcile_on(lapse_triggers)
         .reconcile_on(dependent_triggers)

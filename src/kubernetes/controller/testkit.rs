@@ -204,7 +204,7 @@ pub(super) struct TestCluster {
     pub policies: Writer<RateLimitPolicy>,
     pub parameters: Writer<GatewayParameters>,
     pub backend_tls_policies: Writer<gateway_api::backendtlspolicies::BackendTlsPolicy>,
-    pub configmaps: Writer<k8s_openapi::api::core::v1::ConfigMap>,
+    pub configmaps: Writer<kube::core::PartialObjectMeta<k8s_openapi::api::core::v1::ConfigMap>>,
     pub service_accounts: Writer<PartialObjectMeta<ServiceAccount>>,
     pub deployments: Writer<PartialObjectMeta<Deployment>>,
     pub pdbs: Writer<PartialObjectMeta<PodDisruptionBudget>>,
@@ -259,6 +259,7 @@ impl TestCluster {
             route_verdicts: Arc::default(),
             networks: Arc::default(),
             certs: Arc::default(),
+            ca_bundles: Default::default(),
             named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(
                 std::time::Duration::from_secs(super::RESYNC_SECS),
             )),

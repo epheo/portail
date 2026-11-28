@@ -17,6 +17,7 @@ use super::watch::StatusReports;
 use super::{ControllerCtx, ResourceCache};
 use crate::config::PortailConfig;
 use crate::kubernetes::addresses::resolve_network_cidrs;
+use crate::kubernetes::backend_tls;
 use crate::kubernetes::crds::{ExternalNameBackends, RateLimitPolicy};
 use crate::kubernetes::parent_ref::route_targets_gateway;
 use crate::kubernetes::reconciler::{
@@ -58,6 +59,25 @@ pub(crate) struct Statuses {
     /// Every BackendTLSPolicy this pass owes status: those, and the ones
     /// still carrying our entry for this Gateway.
     pub observed_backend_tls: Vec<Observed>,
+}
+
+impl Statuses {
+    /// What a pass that failed past validation still says.
+    fn translation_only(
+        accepted: status::GatewayCondition,
+        listeners: HashMap<String, status::ListenerStatus>,
+    ) -> Self {
+        Statuses {
+            accepted,
+            listeners,
+            routes: Vec::new(),
+            policies: Vec::new(),
+            observed_routes: Vec::new(),
+            observed_policies: Vec::new(),
+            backend_tls: Vec::new(),
+            observed_backend_tls: Vec::new(),
+        }
+    }
 }
 
 /// Translation failed: nothing new to serve, the snapshot served stays.
@@ -300,12 +320,11 @@ pub(crate) async fn translate(
         namespaces: ctx.cache.namespaces.clone(),
         reference_grants: ctx.cache.reference_grants.clone(),
         rate_limit_policies: gateway_policies(&ctx.cache.rate_limit_policies, &gw_name, &gw_ns),
-        backend_tls_policies: ctx.cache.backend_tls_policies.clone(),
-        configmaps: ctx.cache.configmaps.clone(),
         gateways: served_gateways(ctx),
     };
 
     ctx.certs.retain_referenced(&ctx.cache.gateways.state());
+    ctx.ca_bundles.retain(&ctx.cache.gateways.state());
     let resolved_certs = resolve_gateway_certs(
         gateway,
         &gw_ns,
@@ -330,16 +349,7 @@ pub(crate) async fn translate(
             crate::kubernetes::reads::record_everything();
             error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
             return Err(Box::new(Rejected {
-                statuses: Statuses {
-                    accepted,
-                    listeners,
-                    routes: Vec::new(),
-                    policies: Vec::new(),
-                    observed_routes: Vec::new(),
-                    observed_policies: Vec::new(),
-                    backend_tls: Vec::new(),
-                    observed_backend_tls: Vec::new(),
-                },
+                statuses: Statuses::translation_only(accepted, listeners),
                 error: e.to_string(),
             }));
         }
@@ -377,22 +387,41 @@ pub(crate) async fn translate(
             Err(e) => {
                 error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
                 return Err(Box::new(Rejected {
-                    statuses: Statuses {
-                        accepted,
-                        listeners,
-                        routes: Vec::new(),
-                        policies: Vec::new(),
-                        observed_routes: Vec::new(),
-                        observed_policies: Vec::new(),
-                        backend_tls: Vec::new(),
-                        observed_backend_tls: Vec::new(),
-                    },
+                    statuses: Statuses::translation_only(accepted, listeners),
                     error: e,
                 }));
             }
         };
-    gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
     let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
+    let services = &ctx.cache.services;
+    let policies = &ctx.cache.backend_tls_policies;
+    let wanted = backend_tls::wanted_configmaps(&referenced, services, policies);
+    let cas = match ctx
+        .ca_bundles
+        .resolve(&ctx.client, &ctx.cache.configmaps, &me, wanted)
+        .await
+    {
+        Ok(cas) => cas,
+        Err(e) => {
+            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
+            return Err(Box::new(Rejected {
+                statuses: Statuses::translation_only(accepted, listeners),
+                error: format!("reading the CA bundles of BackendTLSPolicies: {e}"),
+            }));
+        }
+    };
+    let backend_tls = backend_tls::for_backends(&referenced, services, policies, |ns, name| {
+        let key = (ns.to_string(), name.to_string());
+        cas.get(&key)
+            .cloned()
+            .unwrap_or(backend_tls::CaRef::Missing)
+    });
+    backend_tls::warn_unverified(
+        &result.config.app_protocol_overrides,
+        &backend_tls.decisions,
+        &referenced,
+    );
+    gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
     let targets = std::mem::take(&mut result.gateway_targets)
         .into_iter()
         .map(|(namespace, name)| GatewayKey::new(namespace, name))
@@ -418,13 +447,13 @@ pub(crate) async fn translate(
             &gw_ns,
         ),
         observed_backend_tls: observed_backend_tls(
-            &result.backend_tls.statuses,
+            &backend_tls.statuses,
             &ctx.cache.backend_tls_policies,
             &ctx.controller_name,
             &gw_name,
             &gw_ns,
         ),
-        backend_tls: std::mem::take(&mut result.backend_tls.statuses),
+        backend_tls: backend_tls.statuses,
         routes: result.route_status,
         policies: result.policy_status,
     };
