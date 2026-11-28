@@ -7,7 +7,7 @@
 //! oldest holds it (creationTimestamp, then namespace and name), the others
 //! are Accepted=False Conflicted. A port's own policy beats the Service's.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gateway_api::backendtlspolicies::{
@@ -21,6 +21,7 @@ use rustls::pki_types::CertificateDer;
 
 use super::converters::parse_backend_dns_name;
 use super::reads::Recorded;
+use crate::config::PROXY_V2_APP_PROTOCOL;
 use crate::logging::warn;
 
 /// The ConfigMap key a CA bundle is read from (Gateway API Core support).
@@ -186,7 +187,7 @@ pub(crate) fn for_backends<'a>(
     configmap: impl Fn(&str, &str) -> CaRef,
 ) -> GatewayPolicies {
     let mut out = GatewayPolicies::default();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut statuses: BTreeMap<(String, String), PolicyStatus> = BTreeMap::new();
     for ((ns, name), (fqdn, ports)) in by_service(referenced) {
         let Some(service) = services.get(&ns, &name) else {
             continue;
@@ -196,15 +197,20 @@ pub(crate) fn for_backends<'a>(
         for (port, decision) in found.by_port {
             out.decisions.insert((fqdn.clone(), port), decision);
         }
-        // A policy naming two Services of this Gateway is reported once.
+        // A policy naming two Services of this Gateway is reported once,
+        // by what is wrong with it if anything is.
         for status in found.statuses {
-            if seen.insert((status.namespace.clone(), status.name.clone())) {
-                out.statuses.push(status);
+            let key = (status.namespace.clone(), status.name.clone());
+            match statuses.get_mut(&key) {
+                Some(kept) if kept.accepted.ok && !status.accepted.ok => *kept = status,
+                Some(_) => {}
+                None => {
+                    statuses.insert(key, status);
+                }
             }
         }
     }
-    out.statuses
-        .sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    out.statuses = statuses.into_values().collect();
     out
 }
 
@@ -330,16 +336,44 @@ pub(crate) fn for_service(
         });
         judged.insert(key, verdict);
     }
+    let asks_proxy_header = |port: u16| {
+        service
+            .spec
+            .iter()
+            .flat_map(|s| s.ports.iter().flatten())
+            .any(|p| {
+                p.port as u16 == port && p.app_protocol.as_deref() == Some(PROXY_V2_APP_PROTOCOL)
+            })
+    };
     for port in ports {
         let holder = holders
             .get(&Section::Port(port))
             .or_else(|| holders.get(&Section::Whole));
-        if let Some(holder) = holder {
-            let key = (holder.namespace().unwrap_or_default(), holder.name_any());
-            if let Some(verdict) = judged.get(&key) {
-                out.by_port.insert(port, verdict.decision.clone());
+        let Some(holder) = holder else { continue };
+        let key = (holder.namespace().unwrap_or_default(), holder.name_any());
+        let Some(verdict) = judged.get(&key) else {
+            continue;
+        };
+        // The data plane writes that header in the clear and speaks no TLS
+        // after it: refused, never sent unverified.
+        if asks_proxy_header(port) {
+            out.by_port.insert(port, Decision::Refuse);
+            if let Some(status) = out
+                .statuses
+                .iter_mut()
+                .find(|s| (&s.namespace, &s.name) == (&key.0, &key.1))
+            {
+                status.accepted = Cond::not(
+                    "Invalid",
+                    format!(
+                        "Service {svc_name} port {port} asks for a PROXY header \
+                         (appProtocol {PROXY_V2_APP_PROTOCOL}), which TLS to the backend cannot follow"
+                    ),
+                );
             }
+            continue;
         }
+        out.by_port.insert(port, verdict.decision.clone());
     }
     out.statuses
         .sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
@@ -677,6 +711,25 @@ mod tests {
             assert_eq!(status(&out, "p").accepted.reason, "Invalid");
             assert_eq!(out.by_port[&443], Decision::Refuse);
         }
+    }
+
+    /// A port that asks for a PROXY header first cannot be spoken TLS to:
+    /// the policy says so and the port is refused; its other ports verify.
+    #[test]
+    fn a_proxy_header_port_refuses_the_policy() {
+        let mut svc = service();
+        svc.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].app_protocol =
+            Some(PROXY_V2_APP_PROTOCOL.into());
+        let out = for_service(
+            &[policy("p", 1, None, system("a.test"))],
+            &svc,
+            [443, 8443],
+            |_| CaRef::Missing,
+        );
+        let s = status(&out, "p");
+        assert_eq!((s.accepted.ok, s.accepted.reason), (false, "Invalid"));
+        assert_eq!(out.by_port[&443], Decision::Refuse);
+        assert!(matches!(out.by_port[&8443], Decision::Verify(_)));
     }
 
     /// A sectionName the Service has no port for attaches to nothing.
