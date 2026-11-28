@@ -29,7 +29,7 @@ use crate::proxy::method::{is_method_byte, MAX_METHOD_LEN};
 use crate::proxy::proxy_protocol;
 use crate::proxy::relay::handle_tcp_connection;
 use crate::proxy::request_processor::{
-    analyze_request, analyze_tcp_request, is_http_request, LocalReply, RoutingResult,
+    analyze_request, is_http_request, LocalReply, RoutingResult,
 };
 use crate::proxy::tls::Connection;
 use crate::routing::{BackendSelector, RouteTable};
@@ -99,6 +99,12 @@ pub(crate) struct ConnectionState {
     health: Arc<HealthRegistry>,
     /// Whether this connection was accepted via TLS (used for redirect scheme).
     is_tls: bool,
+    /// Its port has a TCP route beside its HTTP routes, and it is not
+    /// terminated TLS: bytes that open no request go to that route. Read
+    /// from the table once, by whoever accepted the connection, in the
+    /// same look that sends a port with no HTTP route straight to the
+    /// relay: the engine never sees one.
+    tcp_route: bool,
     /// The client: X-Forwarded-For, access logs, rate limits, and the
     /// source of a PROXY v2 header to a backend.
     peer: SocketAddr,
@@ -164,6 +170,7 @@ impl ConnectionState {
         selector: Arc<BackendSelector>,
         health: Arc<HealthRegistry>,
         is_tls: bool,
+        tcp_route: bool,
         peer: SocketAddr,
         local: SocketAddr,
         cfg: &ServeConfig,
@@ -177,6 +184,7 @@ impl ConnectionState {
             selector,
             health,
             is_tls,
+            tcp_route,
             peer,
             local,
             forwarded: None,
@@ -294,21 +302,7 @@ pub(crate) async fn serve(
     _peer: SocketAddr,
     mut state: ConnectionState,
 ) -> Result<()> {
-    let (tcp_route, http_routes) = {
-        let rt = state.routes.load();
-        let port = state.server_port;
-        // Never for a terminated connection: see `analyze_request`.
-        let tcp_route = !state.is_tls && rt.has_tcp_route(port);
-        (tcp_route, rt.has_http_routes(port))
-    };
-    // Server-speaks-first protocols (MySQL, SMTP, FTP, IMAP, POP3) send
-    // nothing before the backend's banner. With no HTTP route to tell
-    // apart there is nothing to sniff, and waiting for the client's first
-    // bytes would deadlock them.
-    if tcp_route && !http_routes {
-        return forward_to_tcp_route(client, &state).await;
-    }
-
+    let tcp_route = state.tcp_route;
     let mut buf = Vec::new();
     let served = serve_http(&mut client, &mut buf, &mut state, tcp_route).await;
     if let Ok(Handoff::Tcp {
@@ -316,17 +310,28 @@ pub(crate) async fn serve(
         proxied,
     }) = served
     {
+        let header = state.proxy_header(proxied);
+        // The tunnel keeps nothing of the engine: its state, pool and
+        // buffers would otherwise live as long as it does.
+        let ConnectionState {
+            health,
+            connect_timeout,
+            backend_keepalive,
+            idle_body_timeout,
+            listener_stats,
+            ..
+        } = state;
         handle_tcp_connection(
             client,
             backend_addr,
-            state.proxy_header(proxied),
-            &buf,
-            Arc::clone(&state.health),
-            state.connect_timeout,
-            &state.backend_keepalive,
-            state.idle_body_timeout,
+            header,
+            buf,
+            health,
+            connect_timeout,
+            &backend_keepalive,
+            idle_body_timeout,
             "TCP",
-            &state.listener_stats,
+            &listener_stats,
         )
         .await;
         return Ok(());
@@ -600,38 +605,6 @@ async fn read_off(client: &mut Connection, buf: &mut Vec<u8>, deadline: tokio::t
     }
 }
 
-/// Relay a connection on a TCP-only port to its route, before the client
-/// has sent anything.
-async fn forward_to_tcp_route(client: Connection, state: &ConnectionState) -> Result<()> {
-    let routed = analyze_tcp_request(
-        &state.routes.load(),
-        &state.selector,
-        state.server_port,
-        &state.health,
-    )?;
-    let RoutingResult::TcpForward {
-        backend_addr,
-        proxied,
-    } = routed
-    else {
-        return Ok(()); // the router logged why
-    };
-    handle_tcp_connection(
-        client,
-        backend_addr,
-        state.proxy_header(proxied),
-        &[],
-        Arc::clone(&state.health),
-        state.connect_timeout,
-        &state.backend_keepalive,
-        state.idle_body_timeout,
-        "TCP",
-        &state.listener_stats,
-    )
-    .await;
-    Ok(())
-}
-
 /// The wait for a connection's next request, its first included: unbounded,
 /// as long idle is legitimate there, until a drain ends it like an EOF
 /// would (0).
@@ -743,12 +716,11 @@ fn pipelined_tail(request: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::relay::handle_tls_passthrough;
     use crate::proxy::testkit::{
         assert_never_connected, backend, conn_state, conn_state_header, delivered, exchange,
-        gateway_backend, idle_backend, l4_backend, read_one_reply, read_until_closed, received,
+        gateway_backend, idle_backend, read_one_reply, read_until_closed, received,
         refusing_backend, response, routes, routes_with_tcp, serve, serve_state, tcp_client,
-        tls_client, tls_read_to_end, GET_A, IDLE, OPAQUE, REFUSED, UPGRADE,
+        tcp_route, tls_client, tls_read_to_end, GET_A, OPAQUE, REFUSED, UPGRADE,
     };
     use crate::routing::{Backend, HttpRouteRule, PathMatchType};
     use tokio::io::DuplexStream;
@@ -762,87 +734,6 @@ mod tests {
         let mut state = conn_state(rt, false);
         state.drain = drain;
         serve_state(state)
-    }
-
-    /// Raw TCP has no status to answer with. A backend that refuses the
-    /// connect is counted on its listener and by address, as an HTTP
-    /// backend is: for a TCP route, and for TLS passthrough.
-    #[tokio::test]
-    async fn an_l4_backend_that_refuses_is_counted() {
-        let (_held, refused) = refusing_backend();
-        let by_address = || {
-            let metrics = crate::metrics::render(true);
-            let line = format!("backend=\"{refused}\"");
-            metrics
-                .lines()
-                .filter(|l| {
-                    l.starts_with("portail_upstream_connect_errors_total") && l.contains(&line)
-                })
-                .count()
-        };
-        assert_eq!(by_address(), 0);
-
-        let state = conn_state(tcp_route(refused), false);
-        let stats = Arc::clone(&state.listener_stats);
-        let (mut client, task) = serve_state(state);
-        assert_eq!(read_until_closed(&mut client).await, "");
-        task.await.unwrap().unwrap();
-        assert_eq!(stats.upstream_connect_errors.get(), 1);
-        assert_eq!(by_address(), 1);
-
-        let mut rt = RouteTable::new();
-        rt.add_tls_route(0, "down.test", vec![gateway_backend(refused)]);
-        let routes = Arc::new(ArcSwap::from_pointee(rt));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, peer) = listener.accept().await.unwrap();
-        let local = server.local_addr().unwrap();
-        let stats = ListenerStats::default();
-        handle_tls_passthrough(
-            server,
-            (peer, local),
-            Some("down.test"),
-            None,
-            8443,
-            routes,
-            Arc::default(),
-            Arc::default(),
-            &ServeConfig::from_perf(&Default::default(), 4),
-            &stats,
-        )
-        .await;
-        assert_eq!(client.read(&mut [0u8; 8]).await.unwrap(), 0);
-        assert_eq!(stats.upstream_connect_errors.get(), 1);
-    }
-
-    /// Raw TCP to a Gateway backend: the header goes before any byte of
-    /// the client's, on a TCP-only port and after a sniff alike.
-    #[tokio::test]
-    async fn a_gateway_backend_hears_who_connected_before_the_bytes() {
-        let (tcp, mut rx) = backend(REFUSED).await;
-        let mut rt = RouteTable::new();
-        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
-        let (mut client, _task) = serve(rt);
-        client.write_all(b"hello").await.unwrap();
-        client.shutdown().await.unwrap();
-        assert_eq!(
-            received(&mut rx).await,
-            [conn_state_header(), b"hello".to_vec()].concat()
-        );
-
-        let (http, _) = backend(REFUSED).await;
-        let (tcp, mut rx) = backend(REFUSED).await;
-        let mut rt = routes(http);
-        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
-        let (mut client, _task) = serve(rt);
-        client.write_all(OPAQUE).await.unwrap();
-        client.shutdown().await.unwrap();
-        assert_eq!(
-            received(&mut rx).await,
-            [conn_state_header(), OPAQUE.to_vec()].concat()
-        );
     }
 
     /// The buffer starts small but the head cap stays put: a head ending
@@ -860,56 +751,6 @@ mod tests {
             let reply = response(&mut client).await;
             assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
         }
-    }
-
-    /// Only a TCP route on the engine's port.
-    fn tcp_route(backend: SocketAddr) -> RouteTable {
-        let mut rt = RouteTable::new();
-        rt.add_tcp_route(
-            8080,
-            vec![Backend {
-                socket_addr: backend,
-                weight: 1,
-                filters: vec![],
-                use_tls: false,
-                server_name: String::new(),
-                action: crate::routing::BackendAction::Forward,
-            }],
-        );
-        rt
-    }
-
-    /// Sends `banner` on accept, as MySQL or SMTP do, then echoes until EOF.
-    async fn banner_backend(banner: &'static [u8]) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let (mut rd, mut wr) = sock.split();
-                    if wr.write_all(banner).await.is_ok() {
-                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    /// MySQL, SMTP, FTP, IMAP and POP3 clients send nothing before the
-    /// server's banner: the proxy waiting for their first bytes to sniff
-    /// deadlocked them.
-    #[tokio::test]
-    async fn tcp_only_port_connects_before_the_client_speaks() {
-        const BANNER: &[u8] = b"220 smtp.test ESMTP\r\n";
-        let (mut client, _task) = serve(tcp_route(banner_backend(BANNER).await));
-        let mut banner = [0u8; BANNER.len()];
-        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut banner))
-            .await
-            .expect("no banner")
-            .unwrap();
-        assert_eq!(banner, BANNER);
-        assert_eq!(exchange(&mut client, b"QUIT\r\n").await, "QUIT\r\n");
     }
 
     /// A first segment too short for the sniff ("GET", "PROPF") went to TCP
@@ -932,78 +773,6 @@ mod tests {
             let out = exchange(&mut client, rest.as_bytes()).await;
             assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{first:?}: {out}");
         }
-    }
-
-    /// The engine on a TCP-only port relaying to `backend`.
-    fn serve_l4(
-        backend: SocketAddr,
-        idle: Option<Duration>,
-    ) -> (DuplexStream, tokio::task::JoinHandle<Result<()>>) {
-        let mut state = conn_state(tcp_route(backend), false);
-        state.idle_body_timeout = idle;
-        serve_state(state)
-    }
-
-    /// Once one side has finished, a peer that never closes pinned the
-    /// relay, its task and both fds forever.
-    #[tokio::test]
-    async fn half_closed_l4_relay_ends_after_the_idle_budget() {
-        // The client is done; the backend never answers nor closes.
-        let silent = l4_backend(|mut sock| async move {
-            let _ = sock.read_to_end(&mut Vec::new()).await;
-            std::future::pending::<()>().await;
-        })
-        .await;
-        let (mut client, task) = serve_l4(silent, Some(IDLE));
-        client.write_all(b"QUIT\r\n").await.unwrap();
-        client.shutdown().await.unwrap();
-        let ended = tokio::time::timeout(IDLE * 10, task).await;
-        assert!(ended.is_ok(), "relay pinned after the client's FIN");
-
-        // The backend is done; the client never closes.
-        let done = l4_backend(|mut sock| async move {
-            let _ = sock.write_all(b"bye").await;
-            let _ = sock.shutdown().await;
-            std::future::pending::<()>().await;
-        })
-        .await;
-        let (mut client, task) = serve_l4(done, Some(IDLE));
-        client.read_exact(&mut [0u8; 3]).await.unwrap();
-        let ended = tokio::time::timeout(IDLE * 10, task).await;
-        assert!(ended.is_ok(), "relay pinned after the backend's FIN");
-    }
-
-    /// The bound is on a stalled half, not on how long it runs; with both
-    /// sides open, or the budget disabled, the relay stays unbounded.
-    #[tokio::test]
-    async fn l4_relay_bounds_only_a_stalled_half() {
-        let trickle = l4_backend(|mut sock| async move {
-            let _ = sock.read_to_end(&mut Vec::new()).await;
-            for _ in 0..5 {
-                tokio::time::sleep(IDLE / 2).await;
-                if sock.write_all(b"x").await.is_err() {
-                    return;
-                }
-            }
-        })
-        .await;
-        let (mut client, _task) = serve_l4(trickle, Some(IDLE));
-        assert_eq!(exchange(&mut client, b"GO").await, "xxxxx");
-
-        let (mut client, task) = serve_l4(banner_backend(b"").await, Some(IDLE));
-        tokio::time::sleep(IDLE * 3).await;
-        assert!(!task.is_finished(), "relay cut with both sides open");
-        assert_eq!(exchange(&mut client, b"ping").await, "ping");
-
-        let silent = l4_backend(|mut sock| async move {
-            let _ = sock.read_to_end(&mut Vec::new()).await;
-            std::future::pending::<()>().await;
-        })
-        .await;
-        let (mut client, task) = serve_l4(silent, None);
-        client.shutdown().await.unwrap();
-        tokio::time::sleep(IDLE * 3).await;
-        assert!(!task.is_finished(), "relay cut with the budget disabled");
     }
 
     /// Bytes no method can open still close at once, not after the header
@@ -1081,6 +850,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let out = exchange(&mut client, &[b"\n", UNROUTED].concat()).await;
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+
+    /// Raw TCP to a Gateway backend after a sniff: the header goes before
+    /// the bytes the engine read to tell them from a request.
+    #[tokio::test]
+    async fn a_gateway_backend_hears_who_connected_before_the_sniffed_bytes() {
+        let (http, _) = backend(REFUSED).await;
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = routes(http);
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task) = serve(rt);
+        client.write_all(OPAQUE).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), OPAQUE.to_vec()].concat()
+        );
     }
 
     /// A terminated connection is an HTTPS listener's: its bytes never

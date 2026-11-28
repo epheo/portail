@@ -17,7 +17,7 @@ use crate::proxy::backend_pool::{BackendPool, PoolHandle, SharedBackendPool};
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::http1::{self, ConnectionState};
 use crate::proxy::proxy_protocol::{self, Header};
-use crate::proxy::relay::handle_tls_passthrough;
+use crate::proxy::relay::{self, handle_tls_passthrough};
 use crate::proxy::tls::{self, Connection, Hello, TlsKind, TlsPlan};
 use crate::routing::{BackendSelector, RouteTable};
 
@@ -247,24 +247,25 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                         let routes = routes.clone();
                         let health = health.clone();
                         let selector = selector.clone();
-                        let shared_pool = shared_pool.clone();
                         let listener_stats = listener_stats.clone();
-                        let drain = shutdown.child_token();
                         let conn_guard =
                             ConnGuard::new(&active_connections, listener_stats.clone());
-                        let tls = plan.load_full();
-                        tokio::spawn(async move {
-                            let _guard = conn_guard;
-                            let mut tcp_stream = tcp_stream;
-                            let timeout = cfg.client_header_timeout;
-                            let Some(peer) = client_of(&mut tcp_stream, peer, &routes, timeout).await
-                            else {
-                                return;
-                            };
-                            let Ok(local) = tcp_stream.local_addr() else {
-                                return;
-                            };
-                            if let Some(tls) = tls {
+                        let timeout = cfg.client_header_timeout;
+                        // A task for each kind, not one for all: a task is as
+                        // large as everything it might do, and a TCP tunnel
+                        // would carry the HTTP engine and the TLS handshake
+                        // for as long as it lives.
+                        if let Some(tls) = plan.load_full() {
+                            let shared_pool = shared_pool.clone();
+                            let drain = shutdown.child_token();
+                            tokio::spawn(async move {
+                                let _guard = conn_guard;
+                                let mut tcp_stream = tcp_stream;
+                                let Some((peer, local)) =
+                                    ends_of(&mut tcp_stream, peer, &routes, timeout).await
+                                else {
+                                    return;
+                                };
                                 serve_tls_connection(
                                     tcp_stream,
                                     peer,
@@ -280,8 +281,51 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                                     drain,
                                 )
                                 .await;
+                            });
+                            continue;
+                        }
+                        // One look at the table decides both, so the engine
+                        // never meets a port the relay should have taken.
+                        let (tcp_route, http_routes) = {
+                            let rt = routes.load();
+                            (
+                                rt.has_tcp_route(server_port),
+                                rt.has_http_routes(server_port),
+                            )
+                        };
+                        if tcp_route && !http_routes {
+                            tokio::spawn(async move {
+                                let _guard = conn_guard;
+                                let mut tcp_stream = tcp_stream;
+                                let Some(ends) =
+                                    ends_of(&mut tcp_stream, peer, &routes, timeout).await
+                                else {
+                                    return;
+                                };
+                                relay::handle_tcp_route(
+                                    Connection::Plain { inner: tcp_stream },
+                                    ends,
+                                    server_port,
+                                    &routes,
+                                    health,
+                                    &selector,
+                                    &cfg,
+                                    &listener_stats,
+                                )
+                                .await;
+                            });
+                            continue;
+                        }
+                        let shared_pool = shared_pool.clone();
+                        let drain = shutdown.child_token();
+                        tokio::spawn(async move {
+                            let _guard = conn_guard;
+                            let mut tcp_stream = tcp_stream;
+                            let Some((peer, local)) =
+                                ends_of(&mut tcp_stream, peer, &routes, timeout).await
+                            else {
                                 return;
-                            }
+                            };
                             let state = ConnectionState::new(
                                 server_port,
                                 routes,
@@ -289,6 +333,7 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                                 selector,
                                 health,
                                 false,
+                                tcp_route,
                                 peer,
                                 local,
                                 &cfg,
@@ -315,6 +360,18 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
             }
         }
     }
+}
+
+/// The two ends of an accepted connection: the client it speaks for (see
+/// [`client_of`]) and the address it reached. None closes it.
+async fn ends_of(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    routes: &ArcSwap<RouteTable>,
+    timeout: Duration,
+) -> Option<(SocketAddr, SocketAddr)> {
+    let client = client_of(stream, peer, routes, timeout).await?;
+    Some((client, stream.local_addr().ok()?))
 }
 
 /// The client a connection speaks for: its peer, or, from a trusted
@@ -465,6 +522,7 @@ async fn serve_tls_connection(
         selector,
         health,
         true,
+        false,
         peer,
         local,
         &cfg,
@@ -480,8 +538,9 @@ mod tests {
     use crate::proxy::listener;
     use crate::proxy::proxy_protocol::{Cidr, TrustedSources};
     use crate::proxy::testkit::{
-        assert_never_connected, backend, client_hello, delivered, idle_backend, keepalive_where,
-        read_one_reply, routes, socket_where, REFUSED,
+        assert_never_connected, backend, banner_backend, client_hello, delivered, idle_backend,
+        keepalive_where, read_one_reply, routes, routes_with_tcp, socket_where, tcp_route, OPAQUE,
+        REFUSED,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -739,5 +798,58 @@ mod tests {
         let out = answer(addr, &[header, CLOSING_GET.to_vec()].concat()).await;
         assert!(!out.contains(" 200 "), "{out}");
         assert_never_connected(&backend).await;
+    }
+
+    /// A listener on loopback over `rt`, whose routes are keyed by 8080 as
+    /// the testkit's tables are.
+    async fn listening_on(rt: RouteTable) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = ListenerCtx {
+            server_port: 8080,
+            routes: Arc::new(ArcSwap::from_pointee(rt)),
+            cfg: ServeConfig::from_perf(&Default::default(), 4),
+            plan: Default::default(),
+            health: Arc::default(),
+            selector: Arc::default(),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
+        addr
+    }
+
+    /// MySQL, SMTP, FTP, IMAP and POP3 clients send nothing before the
+    /// server's banner: the proxy waiting for their first bytes to sniff
+    /// deadlocked them.
+    #[tokio::test]
+    async fn tcp_only_port_connects_before_the_client_speaks() {
+        const BANNER: &[u8] = b"220 smtp.test ESMTP\r\n";
+        let addr = listening_on(tcp_route(banner_backend(BANNER).await)).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut banner = [0u8; BANNER.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut banner))
+            .await
+            .expect("no banner")
+            .unwrap();
+        assert_eq!(banner, BANNER);
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"QUIT\r\n");
+    }
+
+    /// With HTTP routes beside its TCP route, a port's bytes decide: the
+    /// listener hands the engine the right to send them on.
+    #[tokio::test]
+    async fn a_port_with_both_kinds_tells_them_apart() {
+        let (http, _) = backend(REFUSED).await;
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let addr = listening_on(routes_with_tcp(http, tcp)).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(OPAQUE).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(delivered(&mut rx).await.as_bytes(), OPAQUE);
     }
 }

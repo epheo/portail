@@ -356,6 +356,7 @@ async fn serve_stream(
         ctx.selector.clone(),
         ctx.health.clone(),
         true,
+        false,
         ctx.peer,
         ctx.local,
         &ctx.cfg,
