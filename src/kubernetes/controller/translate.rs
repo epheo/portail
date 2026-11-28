@@ -12,7 +12,7 @@ use gateway_api::gateways::Gateway;
 
 use super::gateway_backends;
 use super::reconcile::{class_owner, ClassOwner};
-use super::validate::{resolve_gateway_certs, validate_gateway};
+use super::validate::{resolve_gateway_certs, served_gateway, validate_gateway};
 use super::watch::StatusReports;
 use super::{ControllerCtx, ResourceCache};
 use crate::config::PortailConfig;
@@ -341,7 +341,11 @@ pub(crate) async fn translate(
         gateways: served_gateways(ctx),
     };
 
-    ctx.certs.retain_referenced(&ctx.cache.gateways.state());
+    // Bookkeeping, no output of this pass: the sets read unrecorded.
+    ctx.certs.retain_referenced(
+        &ctx.cache.gateways.state(),
+        &ctx.cache.listener_sets.all_unrecorded(),
+    );
     ctx.ca_bundles.retain(&ctx.cache.gateways.state());
     ctx.read_retries.retain(&ctx.cache.gateways.state());
     let resolved_certs = resolve_gateway_certs(
@@ -354,7 +358,7 @@ pub(crate) async fn translate(
     let (listeners, accepted) = validate_gateway(gateway, &gw_ns, &resolved_certs);
 
     let mut result = match reconcile_to_config(
-        gateway,
+        &served_gateway(gateway, &resolved_certs),
         &snapshot,
         &resolved_certs.valid,
         &ctx.cache.services,

@@ -46,16 +46,18 @@ pub(crate) fn is_route_allowed_by_listener(
             }
         }
     }
+    // A ListenerSet's listener is of the set's namespace.
+    let own_ns = super::listener_sets::namespace_of(&listener.name, gateway_ns);
     let allowed = match &listener.allowed_routes {
-        None => return route_ns == gateway_ns,
+        None => return route_ns == own_ns,
         Some(ar) => ar,
     };
     let namespaces = match &allowed.namespaces {
-        None => return route_ns == gateway_ns,
+        None => return route_ns == own_ns,
         Some(ns) => ns,
     };
     match &namespaces.from {
-        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gateway_ns,
+        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == own_ns,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
         Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
             // A read of this namespace alone: a label elsewhere selects

@@ -445,9 +445,21 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         .as_ref()
         .map(|p| p.egress_networks(&key.namespace))
         .unwrap_or_default();
+    // The Gateway as served: its own listeners, then its admitted
+    // ListenerSets'. Its status stays its own: `gateway` writes it.
+    let sets = crate::kubernetes::listener_sets::attached(
+        gateway,
+        &key.namespace,
+        &ctx.cache.listener_sets.all(),
+        &ctx.cache.namespaces,
+    );
+    let served = crate::kubernetes::listener_sets::merged(
+        gateway,
+        sets.iter().filter(|a| a.admitted).map(|a| &*a.set),
+    );
     let mut plan = match translate(
         ctx,
-        gateway,
+        &served,
         external_name_backends,
         trusted_gateways,
         &egress,
@@ -477,7 +489,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     // A dial-out network's CIDRs are read at translation: only then does an
     // IPAddress inside one show it would never bind.
     let params = match (params, &plan) {
-        (Ok(p), Ok(plan)) => match params::dial_out_address(gateway, &plan.networks) {
+        (Ok(p), Ok(plan)) => match params::dial_out_address(&served, &plan.networks) {
             Some(why) => Err(why),
             None => Ok(p),
         },
@@ -495,7 +507,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
     let mut pending_until = None;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
-            let provisioned = provision::reconcile(ctx, gateway, params).await;
+            let provisioned = provision::reconcile(ctx, &served, params).await;
             provisioned.stamp(&mut plan.config);
             let mut trusted = params.proxy_sources.clone();
             let mut trusted_for = std::collections::BTreeMap::new();
@@ -1294,6 +1306,64 @@ mod tests {
         assert_eq!(accepted["status"], "False", "{accepted}");
         assert_eq!(accepted["reason"], "UnsupportedValue", "{accepted}");
         assert!(p.served(&gw).unwrap().config.http_routes.is_empty());
+    }
+
+    /// A ListenerSet the Gateway admits adds its listeners to what is
+    /// served, under names of their own; one it does not admit adds none.
+    /// The Gateway's status lists its own listeners only.
+    #[tokio::test]
+    async fn an_admitted_listener_set_is_served_with_the_gateway() {
+        let mut p = Pipeline::new();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].port = 80;
+        apply(&mut p.cluster.gateways, gw.clone());
+        let set = |name: &str, port: i32| -> gateway_api::listenersets::ListenerSet {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "ListenerSet",
+                "metadata": {"name": name, "namespace": "default", "generation": 1},
+                "spec": {
+                    "parentRef": {"name": "gw"},
+                    "listeners": [{"name": "extra", "port": port, "protocol": "HTTP"}],
+                },
+            }))
+            .unwrap()
+        };
+        apply(&mut p.cluster.listener_sets, set("web", 8081));
+
+        p.pass(&gw).await.unwrap();
+        let names = |p: &Pipeline| -> Vec<String> {
+            p.served(&gw)
+                .unwrap()
+                .config
+                .gateway
+                .listeners
+                .iter()
+                .map(|l| l.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&p), ["http"], "not admitted: allowedListeners unset");
+
+        let mut admitting = testkit::gateway("gw", 2);
+        admitting.spec.listeners[0].port = 80;
+        admitting.spec.allowed_listeners = Some(
+            serde_json::from_value(serde_json::json!({"namespaces": {"from": "Same"}})).unwrap(),
+        );
+        apply(&mut p.cluster.gateways, admitting.clone());
+        p.api.clear();
+        p.pass(&admitting).await.unwrap();
+        assert_eq!(names(&p), ["http", "ls/default/web/extra"]);
+        let patch = p
+            .api
+            .status_patch("gateways", "gw")
+            .expect("the Gateway's status");
+        let listed: Vec<_> = patch["status"]["listeners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].clone())
+            .collect();
+        assert_eq!(listed, ["http"], "a set's listener is the set's to report");
     }
 
     /// A BackendTLSPolicy naming a Service the Gateway routes to gets the

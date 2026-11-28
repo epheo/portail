@@ -55,7 +55,39 @@ impl CertRefError {
 /// can be in both: a bad rotation serves its last good pair, unresolved.
 pub(super) struct ResolvedCerts {
     pub valid: CertData,
+    /// What is wrong with a Secret itself, whoever refers to it.
     pub errors: HashMap<(String, String), CertRefError>,
+    /// A listener's ref its referrer may not make, by (listener, Secret).
+    /// Per listener: a Secret the Gateway may use is not a ListenerSet's
+    /// of another namespace to use too.
+    pub denied: HashMap<(String, (String, String)), CertRefError>,
+}
+
+/// `gateway` with each listener's denied refs left out, so that a Secret
+/// another listener may use never reaches it.
+pub(super) fn served_gateway<'g>(
+    gateway: &'g Gateway,
+    certs: &ResolvedCerts,
+) -> std::borrow::Cow<'g, Gateway> {
+    if certs.denied.is_empty() {
+        return std::borrow::Cow::Borrowed(gateway);
+    }
+    let mut served = gateway.clone();
+    for listener in &mut served.spec.listeners {
+        let name = listener.name.clone();
+        let gw_ns = kube::ResourceExt::namespace(gateway).unwrap_or_else(|| "default".to_string());
+        if let Some(refs) = listener
+            .tls
+            .as_mut()
+            .and_then(|tls| tls.certificate_refs.as_mut())
+        {
+            refs.retain(|r| {
+                secret_ref_key(r, &gw_ns)
+                    .is_none_or(|key| !certs.denied.contains_key(&(name.clone(), key)))
+            });
+        }
+    }
+    std::borrow::Cow::Owned(served)
 }
 
 /// The last pair each TLS Secret validated with, by (name, namespace), with
@@ -103,11 +135,15 @@ impl LastGoodCerts {
         }
     }
 
-    /// Keep only the Secrets some Gateway of `gateways` references. A pair
-    /// whose Secret no listener names any more would otherwise outlive
-    /// every Gateway that served it.
-    pub(super) fn retain_referenced(&self, gateways: &[Arc<Gateway>]) {
-        let referenced: HashSet<(String, String)> = gateways
+    /// Keep only the Secrets some Gateway of `gateways` or ListenerSet of
+    /// `sets` references. A pair whose Secret no listener names any more
+    /// would otherwise outlive every Gateway that served it.
+    pub(super) fn retain_referenced(
+        &self,
+        gateways: &[Arc<Gateway>],
+        sets: &[Arc<gateway_api::listenersets::ListenerSet>],
+    ) {
+        let mut referenced: HashSet<(String, String)> = gateways
             .iter()
             .flat_map(|gw| {
                 let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
@@ -119,6 +155,22 @@ impl LastGoodCerts {
                     .filter_map(move |r| secret_ref_key(r, ns))
             })
             .collect();
+        for set in sets {
+            let ns = set.metadata.namespace.as_deref().unwrap_or("default");
+            let refs = set
+                .spec
+                .listeners
+                .iter()
+                .filter_map(|l| l.tls.as_ref()?.certificate_refs.as_ref())
+                .flatten();
+            for r in refs {
+                let core = r.group.as_deref().is_none_or(str::is_empty)
+                    && r.kind.as_deref().is_none_or(|k| k == "Secret");
+                if core {
+                    referenced.insert((r.name.clone(), r.namespace.clone().unwrap_or(ns.into())));
+                }
+            }
+        }
         self.lock().retain(|key, _| referenced.contains(key));
     }
 }
@@ -177,33 +229,53 @@ pub(super) fn resolve_gateway_certs(
     let mut resolved = ResolvedCerts {
         valid: CertData::new(),
         errors: HashMap::new(),
+        denied: HashMap::new(),
     };
     for listener in &gateway.spec.listeners {
         let Some(tls) = &listener.tls else { continue };
         let Some(cert_refs) = &tls.certificate_refs else {
             continue;
         };
+        // Whose ReferenceGrants count: a ListenerSet's listener refers from
+        // its set, in the set's namespace.
+        let (referrer_kind, referrer_ns) =
+            match crate::kubernetes::listener_sets::owner(&listener.name) {
+                Some(owner) => ("ListenerSet", owner.namespace),
+                None => ("Gateway", gw_ns),
+            };
         // validate_gateway reports the refs of another group or kind.
         for (cert_ref, key) in cert_refs
             .iter()
             .filter_map(|r| Some((r, secret_ref_key(r, gw_ns)?)))
         {
             let secret_ns = key.1.as_str();
-            if resolved.valid.contains_key(&key) || resolved.errors.contains_key(&key) {
-                continue; // same Secret referenced by several listeners
-            }
-
-            let cross_ns_allowed = secret_ns == gw_ns
+            let permitted = secret_ns == referrer_ns
                 || is_reference_allowed(
                     reference_grants,
                     "gateway.networking.k8s.io",
-                    "Gateway",
-                    gw_ns,
+                    referrer_kind,
+                    referrer_ns,
                     "",
                     "Secret",
                     secret_ns,
                     &cert_ref.name,
                 );
+            if !permitted {
+                let e = resolve_cert_ref(None, false, secret_ns, &cert_ref.name).unwrap_err();
+                warn!(
+                    "Certificate ref {}/{} of listener {}: {}",
+                    secret_ns,
+                    cert_ref.name,
+                    listener.name,
+                    e.message()
+                );
+                resolved.denied.insert((listener.name.clone(), key), e);
+                continue;
+            }
+            if resolved.valid.contains_key(&key) || resolved.errors.contains_key(&key) {
+                continue; // same Secret referenced by several listeners
+            }
+            let cross_ns_allowed = true;
             let secret_ref = ObjectRef::<Secret>::new(&cert_ref.name).within(secret_ns);
             let secret = store_secrets.get(&secret_ref);
 
@@ -326,7 +398,8 @@ pub(super) fn validate_gateway(
                     // Resolution (ReferenceGrant check + Secret lookup + real
                     // rustls parse) ran once in resolve_gateway_certs; the
                     // condition just reports its outcome.
-                    if let Some(err) = certs.errors.get(&key) {
+                    let denied = certs.denied.get(&(listener.name.clone(), key.clone()));
+                    if let Some(err) = denied.or_else(|| certs.errors.get(&key)) {
                         refs_failed = true;
                         ls.resolved_refs_reason = err.reason().into();
                         ls.resolved_refs_message = err.message().to_string();
@@ -575,6 +648,7 @@ mod tests {
         let mut certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         certs.errors.insert(
             ("bad-cert".into(), "default".into()),
@@ -599,6 +673,7 @@ mod tests {
         let mut certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         certs
             .valid
@@ -615,6 +690,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, _) = validate_gateway(&gw, "default", &certs);
         let ls = &listeners["https"];
@@ -648,6 +724,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, _) = validate_gateway(&gw, "default", &certs);
         let ls = &listeners["https"];
@@ -689,6 +766,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, _) = validate_gateway(&gw, "default", &certs);
         let ls = &listeners["tls-passthrough"];
@@ -722,6 +800,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         let bad = &listeners["grpc"];
@@ -752,6 +831,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         assert!(listeners.values().all(|ls| ls.conflicted && !ls.accepted));
@@ -790,6 +870,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         for name in ["tcp-a", "tcp-b", "dns-a", "dns-b", "web", "web-dup"] {
@@ -821,6 +902,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         for name in ["dns-tcp", "dns-udp", "web", "quic"] {
@@ -865,6 +947,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         for name in ["web", "db"] {
@@ -899,6 +982,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, _) = validate_gateway(&gw, "default", &certs);
         let entry = status::listener_entry(&terminate, &listeners["db"], 0, Some(1));
@@ -930,6 +1014,7 @@ mod tests {
         let certs = ResolvedCerts {
             valid: CertData::new(),
             errors: HashMap::new(),
+            denied: HashMap::new(),
         };
         let (listeners, gw_cond) = validate_gateway(&gw, "default", &certs);
         let db = &listeners["db"];
@@ -1002,7 +1087,9 @@ mod tests {
     /// plane with. The listener itself always does, with no ref left: left
     /// out, its SNI would fall to a catch-all sibling's cert.
     fn carried_refs(gw: &Gateway, resolved: &ResolvedCerts) -> usize {
-        let config = crate::kubernetes::converters::convert_gateway(gw, &resolved.valid).unwrap();
+        let served = served_gateway(gw, resolved);
+        let config =
+            crate::kubernetes::converters::convert_gateway(&served, &resolved.valid).unwrap();
         let [https] = config.listeners.as_slice() else {
             panic!("the HTTPS listener is sent: {:?}", config.listeners);
         };
@@ -1056,6 +1143,54 @@ mod tests {
     /// all. The ref still reached the data plane, without PEM, and it took
     /// that unchanged set of refs for a bad rotation: it kept serving the
     /// cert.
+    /// A ListenerSet's listener refers from its set: a Secret the Gateway
+    /// may use in its own namespace is not the set's to use from another,
+    /// without a grant to the set. The Gateway keeps it.
+    #[test]
+    fn a_listener_set_of_another_namespace_needs_its_own_grant() {
+        let Some(good) = generate_test_cert("app.example.com") else {
+            return; // openssl unavailable
+        };
+        let mut secrets = Writer::<Secret>::default();
+        stored(&mut secrets, "uid-1", "default", &good);
+        let (store, last) = (secrets.as_reader(), LastGoodCerts::default());
+        let gw = https_gateway("cert");
+        let set: gateway_api::listenersets::ListenerSet =
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "web", "namespace": "team"},
+                "spec": {
+                    "parentRef": {"name": "gw", "namespace": "default"},
+                    "listeners": [{"name": "https", "port": 8443, "protocol": "HTTPS",
+                        "hostname": "team.example.com",
+                        "tls": {"certificateRefs": [{"name": "cert", "namespace": "default"}]}}],
+                },
+            }))
+            .unwrap();
+        let merged = crate::kubernetes::listener_sets::merged(&gw, [&set]);
+        let resolved = resolve_gateway_certs(&merged, "default", &reads::grants([]), &store, &last);
+        let key = cert_key("default");
+        assert_eq!(resolved.valid.get(&key), Some(&good), "the Gateway's own");
+        let denied = &resolved.denied[&("ls/team/web/https".to_string(), key.clone())];
+        assert_eq!(denied.reason(), "RefNotPermitted");
+        let (listeners, _) = validate_gateway(&merged, "default", &resolved);
+        assert!(listeners["https"].resolved_refs);
+        assert_eq!(
+            listeners["ls/team/web/https"].resolved_refs_reason,
+            "RefNotPermitted"
+        );
+        let served = served_gateway(&merged, &resolved);
+        let refs = |name: &str| {
+            served
+                .spec
+                .listeners
+                .iter()
+                .find(|l| l.name == name)
+                .and_then(|l| l.tls.as_ref()?.certificate_refs.as_ref())
+                .map_or(0, Vec::len)
+        };
+        assert_eq!((refs("https"), refs("ls/team/web/https")), (1, 0));
+    }
+
     #[test]
     fn a_revoked_grant_or_a_deleted_secret_resolves_nothing() {
         let Some(good) = generate_test_cert("app.example.com") else {
@@ -1074,7 +1209,8 @@ mod tests {
 
         let resolved = resolve_gateway_certs(&gw, "default", &reads::grants([]), &store, &last);
         assert!(resolved.valid.is_empty(), "revoked grant");
-        assert_eq!(resolved.errors[&key].reason(), "RefNotPermitted");
+        let denied = &resolved.denied[&("https".to_string(), key.clone())];
+        assert_eq!(denied.reason(), "RefNotPermitted");
         assert_eq!(carried_refs(&gw, &resolved), 0, "revoked grant");
 
         let mut deleted = tls_secret("cert", "certs", &good.0, &good.1);
@@ -1172,11 +1308,11 @@ mod tests {
                 },
             );
         }
-        last.retain_referenced(&[Arc::new(gateway_with_cert_in("certs"))]);
+        last.retain_referenced(&[Arc::new(gateway_with_cert_in("certs"))], &[]);
         let kept: Vec<_> = last.0.lock().unwrap().keys().cloned().collect();
         assert_eq!(kept, vec![cert_key("certs")]);
 
-        last.retain_referenced(&[]);
+        last.retain_referenced(&[], &[]);
         assert!(last.0.lock().unwrap().is_empty());
     }
 

@@ -689,7 +689,15 @@ mod policy_tests {
 /// not serve conflicts with none: it is rejected alone, as
 /// GatewaySpec.listeners has it for TCP listeners an implementation does
 /// not support ("the previous rule does not apply").
+///
+/// Across objects, the merged Gateway's listeners (its own, then each
+/// ListenerSet's in turn) have an order, and the earlier keeps its port:
+/// only the later of two indistinct listeners of different objects is
+/// rejected (ListenerSetSpec.listeners).
 pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str, &'static str> {
+    fn object(l: &GatewayListeners) -> Option<(&str, &str)> {
+        crate::kubernetes::listener_sets::owner(&l.name).map(|o| (o.namespace, o.set))
+    }
     fn family(protocol: &str) -> &str {
         match protocol {
             "HTTPS" => "TLS",
@@ -712,7 +720,12 @@ pub(crate) fn listener_conflicts(listeners: &[GatewayListeners]) -> HashMap<&str
             } else {
                 continue;
             };
-            for l in [a, b] {
+            let rejected: &[&&GatewayListeners] = if object(a) == object(b) {
+                &[a, b]
+            } else {
+                &[b]
+            };
+            for l in rejected {
                 let slot = conflicts.entry(l.name.as_str()).or_insert(reason);
                 if reason == "ProtocolConflict" {
                     *slot = reason;

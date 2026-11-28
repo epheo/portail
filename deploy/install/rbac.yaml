@@ -10,10 +10,10 @@ metadata:
   name: portail-controller
 rules:
 - apiGroups: [gateway.networking.k8s.io]
-  resources: [gatewayclasses, gateways, httproutes, grpcroutes, tcproutes, tlsroutes, udproutes, referencegrants, backendtlspolicies]
+  resources: [gatewayclasses, gateways, httproutes, grpcroutes, tcproutes, tlsroutes, udproutes, referencegrants, backendtlspolicies, listenersets]
   verbs: [get, list, watch]
 - apiGroups: [gateway.networking.k8s.io]
-  resources: [gatewayclasses/status, gateways/status, httproutes/status, grpcroutes/status, tcproutes/status, tlsroutes/status, udproutes/status, backendtlspolicies/status]
+  resources: [gatewayclasses/status, gateways/status, httproutes/status, grpcroutes/status, tcproutes/status, tlsroutes/status, udproutes/status, backendtlspolicies/status, listenersets/status]
   verbs: [patch]
 - apiGroups: [portail.epheo.eu]
   resources: [ratelimitpolicies, gatewayparameters]

@@ -53,6 +53,7 @@ use gateway_api::experimental::tlsroutes::v1::TlsRoute;
 use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
+use gateway_api::listenersets::ListenerSet;
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use crate::cli::ControllerArgs;
@@ -106,6 +107,8 @@ struct ResourceCache {
     gateway_parameters: Recorded<GatewayParameters>,
     /// Empty store when the CRD is not installed.
     backend_tls_policies: Recorded<BackendTlsPolicy>,
+    /// Empty store when the CRD is not installed.
+    listener_sets: Recorded<ListenerSet>,
     configmaps: Recorded<PartialObjectMeta<ConfigMap>>,
 }
 
@@ -252,6 +255,12 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         &pending_watches,
         &listings,
     );
+    let (store_listener_sets, listener_set_stream) = create_optional_reflector(
+        Api::<ListenerSet>::all(client.clone()),
+        &client,
+        &pending_watches,
+        &listings,
+    );
     let (store_backend_tls_policies, backend_tls_stream) = create_optional_reflector(
         Api::<BackendTlsPolicy>::all(client.clone()),
         &client,
@@ -334,6 +343,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
                 ReadKind::BackendTlsPolicy,
             ),
             configmaps: Recorded::new(store_configmaps, ReadKind::ConfigMap),
+            listener_sets: Recorded::new(store_listener_sets, ReadKind::ListenerSet),
         },
         reads: Arc::default(),
         claims: Arc::default(),
@@ -470,6 +480,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
     let [gw12, gw13] = std::array::from_fn::<_, 2, _>(|_| store_gateways.clone());
     let controller_name = args.controller_name.clone();
     let (gw14, cn6) = (store_gateways.clone(), args.controller_name.clone());
+    let (gw15, reads7) = (store_gateways.clone(), ctx.reads.clone());
 
     let gw_controller = Controller::for_stream(gw_stream, store_gateways)
         // Routes: targeted, to the Gateway(s) its parentRefs name and the
@@ -510,6 +521,11 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         })
         .watches_stream(reference_grant_stream, move |grant: ReferenceGrant| {
             readers(&reads3, &gw9, ReadKind::ReferenceGrant, &grant)
+        })
+        // A pass reads every set to find its own: a set's change wakes the
+        // Gateways it named and names, whichever read it.
+        .watches_stream(listener_set_stream, move |set: ListenerSet| {
+            readers(&reads7, &gw15, ReadKind::ListenerSet, &set)
         })
         // A class appearing or changing controllerName flips which Gateways
         // are ours, so re-evaluate all of them.

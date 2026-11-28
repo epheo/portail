@@ -206,6 +206,7 @@ pub(super) struct TestCluster {
     pub policies: Writer<RateLimitPolicy>,
     pub parameters: Writer<GatewayParameters>,
     pub backend_tls_policies: Writer<gateway_api::backendtlspolicies::BackendTlsPolicy>,
+    pub listener_sets: Writer<gateway_api::listenersets::ListenerSet>,
     pub configmaps: Writer<kube::core::PartialObjectMeta<k8s_openapi::api::core::v1::ConfigMap>>,
     pub service_accounts: Writer<PartialObjectMeta<ServiceAccount>>,
     pub deployments: Writer<PartialObjectMeta<Deployment>>,
@@ -258,6 +259,10 @@ impl TestCluster {
                     ReadKind::BackendTlsPolicy,
                 ),
                 configmaps: RecordedStore::new(self.configmaps.as_reader(), ReadKind::ConfigMap),
+                listener_sets: RecordedStore::new(
+                    self.listener_sets.as_reader(),
+                    ReadKind::ListenerSet,
+                ),
             },
             route_verdicts: Arc::default(),
             networks: Arc::default(),

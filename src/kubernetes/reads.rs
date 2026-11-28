@@ -23,6 +23,7 @@ pub(crate) enum Kind {
     GatewayParameters,
     BackendTlsPolicy,
     ConfigMap,
+    ListenerSet,
 }
 
 /// What one read covered.
@@ -181,6 +182,7 @@ pub(crate) fn record_everything() {
         Kind::GatewayParameters,
         Kind::BackendTlsPolicy,
         Kind::ConfigMap,
+        Kind::ListenerSet,
     ] {
         record(Read::All(kind));
     }
@@ -229,7 +231,6 @@ impl<K: Resource<DynamicType = ()> + Clone + 'static> Recorded<K> {
     }
 
     /// Every object: the Gateway then wakes on any change of the kind.
-    #[cfg(test)]
     pub(crate) fn all(&self) -> Vec<Arc<K>> {
         record(Read::All(self.kind));
         self.store.state()
