@@ -356,9 +356,10 @@ rules:
         port: 8080
 ```
 
-- A request is attempted again when no connection to its backend could be made, when the backend answers one of `codes`, or when it gives no answer within `timeouts.backendRequest`.
+- A request is attempted again when its backend refuses or resets the connection, or answers one of `codes`.
+- A connect or an answer that takes the whole budget is tried again only when the rule sets `timeouts.backendRequest`, as the API asks. Without it each attempt has the 30 s default, and a backend that never answers gets one.
 - `attempts` counts the tries after the first: one when not written, none at 0, at most 100. The API sets no ceiling; each attempt is a connect a client can ask for, so portail sets one, and a rule above it rejects its route.
-- `codes` are 400 to 599. With none, only a failed connect or a backend timeout is tried again.
+- `codes` are 400 to 599. With none, only a refused connect, or a backend timeout under `backendRequest`, is tried again.
 - Only a request that is whole in portail's hands is tried again: its body arrived with its head, in the connection's read buffer. A request whose body is still arriving, and an upgrade, are never tried again: the first answer is the client's. Nothing is buffered for the sake of a retry.
 - Each attempt chooses its backend again among the rule's healthy ones.
 - `timeouts.request` bounds all the attempts together, `timeouts.backendRequest` each of them.

@@ -90,13 +90,24 @@ pub(super) struct Again<'a> {
     /// The response statuses to try again after; `None` on the last
     /// attempt, or the only one.
     codes: Option<&'a [u16]>,
+    /// The rule sets `timeouts.backendRequest`, the only budget the API
+    /// retries after. Without it each attempt has the 30 s default, and
+    /// 101 of them to a backend that never answers would hold the request
+    /// most of an hour.
+    after_timeouts: bool,
     asked: bool,
 }
 
 impl Again<'_> {
-    /// After a failed connect, or no answer within the backend's budget.
-    pub(super) fn after_no_answer(&mut self) -> bool {
+    /// After a connect the backend refused or reset.
+    pub(super) fn after_refusal(&mut self) -> bool {
         self.asked = self.codes.is_some();
+        self.asked
+    }
+
+    /// After a connect, or a response head, that took the whole budget.
+    pub(super) fn after_timeout(&mut self) -> bool {
+        self.asked = self.after_timeouts && self.codes.is_some();
         self.asked
     }
 
@@ -109,9 +120,10 @@ impl Again<'_> {
 /// What an exchange does once, however many attempts it takes.
 #[derive(Default)]
 struct Once {
-    /// The client was told to send its body (`100 Continue`). Kept for
-    /// safety only: such a request has no body in hand when it starts, so
-    /// it is never retried.
+    /// The client was told to send its body (`100 Continue`). A client may
+    /// send it without waiting, and a small one then arrives whole with
+    /// the head: such a request is retried, and must not hear `100
+    /// Continue` twice.
     continued: bool,
     /// The request went to the rule's mirrors.
     mirrored: bool,
@@ -236,6 +248,7 @@ pub(super) async fn proxy_http_request(
         };
         let again = &mut Again {
             codes: retry.filter(|_| left > 0).map(|retry| &*retry.codes),
+            after_timeouts: rule.backend_request_timeout.is_some_and(|d| !d.is_zero()),
             asked: false,
         };
 
@@ -933,7 +946,7 @@ async fn forward_response_headers(
             send_error_response(client, 502, cors).await?;
             return Ok(HeaderPhase::ErrorSent(502));
         }
-        None if again.after_no_answer() => return Ok(HeaderPhase::Again),
+        None if again.after_timeout() => return Ok(HeaderPhase::Again),
         None => {
             send_error_response(client, 504, cors).await?;
             return Ok(HeaderPhase::ErrorSent(504));
@@ -1697,6 +1710,7 @@ mod tests {
                 None,
                 &mut Again {
                     codes: None,
+                    after_timeouts: false,
                     asked: false,
                 },
             )
@@ -2379,5 +2393,66 @@ mod tests {
                 assert!(grown / 2 <= wait && wait <= grown, "{made}: {wait:?}");
             }
         }
+    }
+
+    /// A client may send its body with `Expect: 100-continue` without
+    /// waiting, and a small one arrives whole with the head: retried, it
+    /// hears `100 Continue` once.
+    #[tokio::test]
+    async fn a_retried_request_that_expects_100_continue_hears_it_once() {
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 1}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let request = b"POST / HTTP/1.1\r\nHost: a.test\r\nExpect: 100-continue\r\n\
+                        Content-Length: 4\r\n\r\nbody";
+        let answer = exchange(&mut client, request).await;
+        assert_eq!(answer.matches("100 Continue").count(), 1, "{answer}");
+        assert!(answer.contains("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    /// An attempt that takes the whole budget is tried again under the
+    /// rule's own `backendRequest`.
+    #[tokio::test]
+    async fn a_backend_timeout_the_rule_sets_is_tried_again() {
+        let (backend, seen) = scripted(vec![None, Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"attempts": 1},
+            "timeouts": {"backendRequest": "100ms"},
+            "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let answer = exchange(&mut client, GET_A).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    /// Without it the budget is the 30 s default, and a backend that
+    /// never answers is not given it again: one budget, then the 504.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_backend_timeout_a_silent_backend_is_not_tried_again() {
+        use tokio::io::AsyncWriteExt;
+        let (backend, seen) = scripted(vec![None]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 3}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let started = tokio::time::Instant::now();
+        client.write_all(GET_A).await.unwrap();
+        client.shutdown().await.unwrap();
+        // No timeout of the test's own: the paused clock runs to the
+        // engine's next timer at once, so one budget is 30 s of it.
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

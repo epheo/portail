@@ -44,7 +44,11 @@ pub(super) async fn fail_connect(
             state.listener_stats.upstream_connect_errors.inc();
         }
     }
-    if again.after_no_answer() {
+    let asked = match code {
+        504 => again.after_timeout(),
+        _ => again.after_refusal(),
+    };
+    if asked {
         note_failure(state, backend_ref);
         return Ok(());
     }
