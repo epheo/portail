@@ -354,14 +354,24 @@ fn service_action(app_protocol: Option<&str>) -> BackendAction {
     }
 }
 
+/// How an endpoint of a ref is spoken to: under the ref's policy, which
+/// wins over its appProtocol; else over unverified TLS to an `https` port,
+/// by the name the endpoint goes by; else in the clear.
+fn proto_of(verify: &Option<Arc<Verify>>, https: bool, server_name: &str) -> BackendProto {
+    match verify {
+        Some(verify) => BackendProto::Verified(verify.clone()),
+        None if https => BackendProto::Tls(server_name.into()),
+        None => BackendProto::Plain,
+    }
+}
+
 fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backend {
     Backend {
         socket_addr,
         weight,
         filters: vec![],
-        use_tls: false,
+        proto: crate::proxy::backend_pool::BackendProto::Plain,
         server_name: server_name.to_string(),
-        verify: None,
         action: crate::routing::BackendAction::Forward,
     }
 }
@@ -763,8 +773,7 @@ impl PortailConfig {
             }
 
             let app_protocol = resolver.app_protocol(backend_ref);
-            // A policy on the port wins over its appProtocol.
-            let use_tls = verify.is_some() || app_protocol == Some("https");
+            let https = app_protocol == Some("https");
             let action = service_action(app_protocol);
             // That connect writes the header and no TLS follows it.
             if verify.is_some() && action == BackendAction::ForwardProxied {
@@ -781,8 +790,7 @@ impl PortailConfig {
                 resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
                     let mut backend = backend_at(addr, backend_ref.weight, name);
                     backend.filters = backend_filters.clone();
-                    backend.use_tls = use_tls;
-                    backend.verify = verify.clone();
+                    backend.proto = proto_of(&verify, https, name);
                     backend.action = action;
                     backends.push(backend);
                 })?;
@@ -829,11 +837,7 @@ fn rule_filters(
                     },
                 )?;
                 if let Some((backend_addr, server_name)) = smallest {
-                    let proto = match verify {
-                        Some(verify) => BackendProto::Verified(verify),
-                        None if https => BackendProto::Tls(server_name),
-                        None => BackendProto::Plain,
-                    };
+                    let proto = proto_of(&verify, https, &server_name);
                     out.push(crate::routing::HttpFilter::RequestMirror {
                         backend_addr,
                         fraction: *fraction,
@@ -899,6 +903,7 @@ fn intersect_hostnames(listener_hostname: Option<&str>, route_hostnames: &[Strin
 mod tests {
     use super::super::parsing::parse_duration;
     use super::super::*;
+    use crate::proxy::backend_pool::BackendProto;
     use std::time::Duration;
 
     #[test]
@@ -2074,9 +2079,10 @@ mod tests {
         let tcp = table.find_tcp_backends(5432).unwrap();
         let addrs: Vec<String> = tcp.iter().map(|b| b.socket_addr.to_string()).collect();
         assert_eq!(addrs, ["10.250.0.7:8000", "10.250.0.8:8000"]);
-        assert!(tcp
-            .iter()
-            .all(|b| b.action == crate::routing::BackendAction::ForwardProxied && !b.use_tls));
+        assert!(tcp.iter().all(
+            |b| b.action == crate::routing::BackendAction::ForwardProxied
+                && matches!(b.proto, BackendProto::Plain)
+        ));
         let rule = table
             .find_http_route("x", "GET", "/", b"", "", 8080)
             .expect("the HTTP rule");
@@ -2287,7 +2293,8 @@ mod tests {
         use crate::routing::BackendAction::{Forward, ForwardProxied};
 
         let tcp = &table.find_tcp_backends(5432).unwrap()[0];
-        assert_eq!((tcp.action, tcp.use_tls), (ForwardProxied, false));
+        assert_eq!(tcp.action, ForwardProxied);
+        assert!(matches!(tcp.proto, BackendProto::Plain));
         let (selector, health) = (
             crate::routing::BackendSelector::new(),
             crate::proxy::health::HealthRegistry::new(),
@@ -2300,7 +2307,8 @@ mod tests {
             .find_http_route("x", "GET", "/", b"", "", 8080)
             .expect("the HTTP rule")
             .backends[0];
-        assert_eq!((http.action, http.use_tls), (ForwardProxied, false));
+        assert_eq!(http.action, ForwardProxied);
+        assert!(matches!(http.proto, BackendProto::Plain));
         assert_eq!(table.find_udp_backends(5353).unwrap()[0].action, Forward);
         assert_eq!(table.find_tcp_backends(5433).unwrap()[0].action, Forward);
     }
@@ -2743,19 +2751,18 @@ mod tests {
         let [verified, plain] = &rule.backends[..] else {
             panic!("{} backends", rule.backends.len())
         };
-        assert!(verified.use_tls && verified.verify.is_some());
-        assert!(!plain.use_tls && plain.verify.is_none());
+        let BackendProto::Verified(under) = &verified.proto else {
+            panic!("{:?}", verified.proto)
+        };
+        assert!(matches!(plain.proto, BackendProto::Plain));
         let [crate::routing::HttpFilter::RequestMirror {
-            proto: crate::proxy::backend_pool::BackendProto::Verified(verify),
+            proto: BackendProto::Verified(mirrored),
             ..
         }] = &rule.filters[..]
         else {
             panic!("{:?}", rule.filters)
         };
-        assert!(std::sync::Arc::ptr_eq(
-            verify,
-            verified.verify.as_ref().unwrap()
-        ));
+        assert!(std::sync::Arc::ptr_eq(mirrored, under));
     }
 
     /// A copy goes out as a request to that port would: over TLS to an
@@ -2791,7 +2798,7 @@ mod tests {
             .iter()
             .map(|f| match f {
                 crate::routing::HttpFilter::RequestMirror {
-                    proto: crate::proxy::backend_pool::BackendProto::Tls(name),
+                    proto: BackendProto::Tls(name),
                     ..
                 } => &**name,
                 other => panic!("{other:?}"),

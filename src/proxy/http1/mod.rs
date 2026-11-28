@@ -1113,9 +1113,8 @@ mod tests {
                     socket_addr: addr,
                     weight: 1,
                     filters: vec![],
-                    use_tls: false,
+                    proto: crate::proxy::backend_pool::BackendProto::Plain,
                     server_name: String::new(),
-                    verify: None,
                     action: crate::routing::BackendAction::Forward,
                 }],
             );

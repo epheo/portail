@@ -101,9 +101,8 @@ pub(crate) fn routes(backend: SocketAddr) -> RouteTable {
                 socket_addr: backend,
                 weight: 1,
                 filters: vec![],
-                use_tls: false,
+                proto: crate::proxy::backend_pool::BackendProto::Plain,
                 server_name: String::new(),
-                verify: None,
                 action: crate::routing::BackendAction::Forward,
             }],
         ),
@@ -251,9 +250,8 @@ pub(crate) fn routes_with_tcp(http: SocketAddr, tcp: SocketAddr) -> RouteTable {
             socket_addr: tcp,
             weight: 1,
             filters: vec![],
-            use_tls: false,
+            proto: crate::proxy::backend_pool::BackendProto::Plain,
             server_name: String::new(),
-            verify: None,
             action: crate::routing::BackendAction::Forward,
         }],
     );
@@ -305,9 +303,8 @@ pub(crate) fn gateway_backend(socket_addr: SocketAddr) -> Backend {
         socket_addr,
         weight: 1,
         filters: vec![],
-        use_tls: false,
+        proto: crate::proxy::backend_pool::BackendProto::Plain,
         server_name: String::new(),
-        verify: None,
         action: crate::routing::BackendAction::ForwardProxied,
     }
 }
@@ -474,9 +471,8 @@ pub(crate) fn tcp_route(backend: SocketAddr) -> RouteTable {
             socket_addr: backend,
             weight: 1,
             filters: vec![],
-            use_tls: false,
+            proto: crate::proxy::backend_pool::BackendProto::Plain,
             server_name: String::new(),
-            verify: None,
             action: crate::routing::BackendAction::Forward,
         }],
     );

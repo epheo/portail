@@ -708,26 +708,14 @@ pub struct Backend {
     pub weight: u32,
     /// Per-backend filters (e.g. BackendRequestHeaderModifier)
     pub filters: Vec<HttpFilter>,
-    /// Whether to use TLS when connecting to this backend
-    pub use_tls: bool,
-    /// Hostname for TLS SNI (the original DNS name before resolution)
+    /// How it is spoken to: in the clear, over TLS, over TLS verified
+    /// under a BackendTLSPolicy. Requests, mirrors and the health probe
+    /// all go by it.
+    pub proto: crate::proxy::backend_pool::BackendProto,
+    /// The name it was resolved from: its metrics label, and its SNI over
+    /// unverified TLS.
     pub server_name: String,
-    /// The BackendTLSPolicy its TLS is verified under, when one is: then
-    /// the policy's hostname is the SNI, not `server_name`.
-    pub verify: Option<std::sync::Arc<crate::proxy::upstream::tls::Verify>>,
     pub action: BackendAction,
-}
-
-impl Backend {
-    /// How this backend is spoken to.
-    pub fn proto(&self) -> crate::proxy::backend_pool::Proto<'_> {
-        use crate::proxy::backend_pool::Proto;
-        match &self.verify {
-            Some(verify) => Proto::Verified(verify),
-            None if self.use_tls => Proto::Tls(&self.server_name),
-            None => Proto::Plain,
-        }
-    }
 }
 
 /// Why a TLS passthrough connection goes nowhere, worded as the L4

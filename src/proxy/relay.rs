@@ -12,7 +12,9 @@ use tokio::net::TcpStream;
 
 use crate::logging::warn;
 use crate::metrics::ListenerStats;
-use crate::proxy::backend_pool::{connect_tcp, log_local_exhaustion, ConnectError, LogThrottle};
+use crate::proxy::backend_pool::{
+    connect_tcp, log_local_exhaustion, BackendProto, ConnectError, LogThrottle,
+};
 use crate::proxy::deadline::idle_opt;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::listener::{tcp_keepalive, ServeConfig};
@@ -176,7 +178,7 @@ fn fail_l4_backend(
         );
     }
     if health.record_failure(addr) {
-        HealthRegistry::spawn_probe(health, addr);
+        HealthRegistry::spawn_probe(health, addr, BackendProto::Plain);
     }
 }
 
