@@ -192,6 +192,7 @@ fn test_http_route() -> HttpRoute {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 section_name: Some("http".to_string()),
@@ -265,6 +266,7 @@ fn test_reconcile_filters_routes_by_gateway() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "other-gw".to_string(),
                 ..Default::default()
@@ -489,6 +491,7 @@ fn test_route_without_parent_refs_excluded() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: None,
             hostnames: Some(vec!["orphan.example.com".to_string()]),
             rules: Some(vec![HttpRouteRules {
@@ -883,6 +886,7 @@ fn test_exact_path_match() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -933,6 +937,7 @@ fn test_regex_path_match() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -985,6 +990,7 @@ fn test_header_match_exact_and_regex() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1047,6 +1053,7 @@ fn test_query_param_match() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1111,6 +1118,7 @@ fn test_weighted_backends() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1163,6 +1171,7 @@ fn test_default_weight_and_port() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1204,6 +1213,7 @@ fn test_multiple_rules_per_route() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1276,6 +1286,7 @@ fn test_request_header_modifier_filter() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1338,6 +1349,7 @@ fn test_response_header_modifier_filter() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1394,6 +1406,7 @@ fn test_request_redirect_filter() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1454,6 +1467,7 @@ fn test_url_rewrite_filter() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1512,6 +1526,7 @@ fn test_request_mirror_filter() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1616,6 +1631,7 @@ fn mirror_route_to_db() -> HttpRoute {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -1824,6 +1840,7 @@ fn route_with_filters(
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -2424,6 +2441,7 @@ fn test_timeouts_conversion() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "test-gw".to_string(),
                 ..Default::default()
@@ -2477,6 +2495,7 @@ fn test_mixed_route_types() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "multi-gw".to_string(),
                 section_name: Some("http".to_string()),
@@ -2581,6 +2600,7 @@ fn test_reconcile_to_route_table_http() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "rt-gw".to_string(),
                 section_name: Some("http".to_string()),
@@ -2744,6 +2764,7 @@ fn test_reconcile_to_route_table_with_filters() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "filter-gw".to_string(),
                 section_name: Some("http".to_string()),
@@ -2830,6 +2851,7 @@ fn test_reconcile_to_route_table_weighted_backends() {
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: "wt-gw".to_string(),
                 section_name: Some("http".to_string()),
@@ -3000,6 +3022,7 @@ fn app_route(
             ..Default::default()
         },
         spec: HttpRouteSpec {
+            use_default_gateways: None,
             parent_refs: Some(parent_refs),
             hostnames: Some(vec!["app.example.com".to_string()]),
             rules: Some(vec![HttpRouteRules {

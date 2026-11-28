@@ -5,13 +5,19 @@
 
 use anyhow::{anyhow, Result};
 
+// The experimental channel's: a superset of the standard types, so every
+// route the cluster's CRDs admit decodes, and what this proxy does not
+// implement is refused rather than dropped. A standard type lacks
+// ExternalAuth, and one such route failed its decode: unseen, or served at
+// its last version. useDefaultGateways needs no refusal: no Gateway of
+// portail's is a default one.
+use gateway_api::experimental::httproutes::v1::*;
 use gateway_api::experimental::tcproutes::v1::*;
 use gateway_api::experimental::tlsroutes::v1::*;
 use gateway_api::experimental::udproutes::v1::*;
 use gateway_api::gateways::{
     Gateway, GatewayListeners, GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
 };
-use gateway_api::httproutes::*;
 
 use crate::config::*;
 use crate::logging::warn;
@@ -203,6 +209,11 @@ fn convert_http_rule(rule: &HttpRouteRules, ns: &str) -> (HttpRouteRule, Option<
     // A filter this proxy cannot represent fails the route, never dropped
     // while the route serves without it.
     let mut first = None;
+    if rule.session_persistence.is_some() {
+        first = Some(RouteError::unsupported(
+            "sessionPersistence is not supported",
+        ));
+    }
     let filters: Vec<HttpRouteFilter> = rule
         .filters
         .iter()
@@ -915,6 +926,47 @@ mod tests {
                 Some(b"key".as_slice())
             )]
         );
+    }
+
+    /// A route the experimental CRDs admit decodes, alone or in a list,
+    /// where the standard types refused it; what it asks that the proxy
+    /// does not do fails it, naming the part.
+    #[test]
+    fn an_experimental_route_decodes_and_what_is_not_done_is_refused() {
+        let route = |rule: serde_json::Value| {
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": {"name": "r", "namespace": "apps", "resourceVersion": "1"},
+                "spec": {"parentRefs": [{"name": "gw"}], "rules": [rule]},
+            })
+        };
+        let auth = route(serde_json::json!({
+            "filters": [{"type": "ExternalAuth", "externalAuth": {
+                "protocol": "HTTP", "backendRef": {"name": "auth", "port": 8080}}}],
+            "backendRefs": [{"name": "web", "port": 80}],
+        }));
+        let sticky = route(serde_json::json!({
+            "sessionPersistence": {"type": "Cookie", "sessionName": "s"},
+            "backendRefs": [{"name": "web", "port": 80}],
+        }));
+        // Why the types changed: the standard ones cannot read the first.
+        assert!(
+            serde_json::from_value::<gateway_api::httproutes::HttpRoute>(auth.clone()).is_err()
+        );
+        let list: kube::core::ObjectList<HttpRoute> = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRouteList",
+            "metadata": {"resourceVersion": "2"}, "items": [auth.clone(), sticky.clone()],
+        }))
+        .expect("a list holding them decodes whole");
+        assert_eq!(list.items.len(), 2);
+
+        for (route, part) in [(auth, "ExternalAuth"), (sticky, "sessionPersistence")] {
+            let route: HttpRoute = serde_json::from_value(route).unwrap();
+            let err = convert_http_route(&route).1.unwrap_err();
+            assert_eq!(err.reason.as_str(), "UnsupportedValue", "{err}");
+            assert!(err.to_string().contains(part), "{err}");
+        }
     }
 
     /// A rule's retry reaches the config as the API means it: attempts one

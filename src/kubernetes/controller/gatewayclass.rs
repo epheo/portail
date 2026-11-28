@@ -14,11 +14,11 @@ use kube::Client;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use gateway_api::experimental::httproutes::v1::HttpRoute;
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
 use gateway_api::experimental::tlsroutes::v1::TlsRoute;
 use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
-use gateway_api::httproutes::HttpRoute;
 
 use super::params;
 use super::reconcile::{class_owner, ClassOwner};
