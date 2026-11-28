@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795863735305,
+  "lastUpdate": 1795866416641,
   "repoUrl": "https://github.com/epheo/portail",
   "entries": {
     "Benchmark": [
@@ -30424,6 +30424,462 @@ window.BENCHMARK_DATA = {
           {
             "name": "sniff_non_http",
             "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "root@epheo.eu",
+            "name": "Thibaut Lapierre",
+            "username": "epheo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e597ec02f0c90e616326e57b94b69dc92d0c4b70",
+          "message": "Data plane: a keep-alive connection waiting for its next request holds no buffer (#83)\n\nWhile a connection waits for its next request, its read buffer, response-head buffer and outgoing-head scratch are its worker thread's, for whichever of the thread's connections next has bytes. The wait borrows them only while a read finds bytes; a closing connection gives them to the thread too. At most 16 sets per thread, each buffer within its kind's most.\n\nProxy memory per idle connection: 16,777 to 7,433 bytes for HTTP/1.1 keep-alive, 27,646 to 18,319 over terminated TLS. A churned connection allocates 10 times, from 13; an h2 request through the bridge 17, from 20.\n\nThe cost, the user's choice to take: about 190 instructions per keep-alive request whose next one is not already waiting (+1.2% to +1.6%). Pinned CPU per request +0 to +1.9%. Peak RSS under load +1 to 2 MiB, the threads' spares.\n\nAssisted by LLM",
+          "timestamp": "2026-11-28T12:15:47+01:00",
+          "tree_id": "2a210433989bd1ab5ae732bbc9da2bd7af83157d",
+          "url": "https://github.com/epheo/portail/commit/e597ec02f0c90e616326e57b94b69dc92d0c4b70"
+        },
+        "date": 1795866415944,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "e2e_http_request_processing",
+            "value": 621,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_auth_request",
+            "value": 142,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_single_product_search",
+            "value": 129,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_health_check_processing",
+            "value": 53,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_404_route_processing",
+            "value": 87,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "throughput_simulation_1000_requests",
+            "value": 344440,
+            "range": "± 20347",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_simple_get",
+            "value": 87,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_auth",
+            "value": 120,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_with_cookies",
+            "value": 108,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "latency_scenario_complex_path",
+            "value": 123,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_request_weighted_backends",
+            "value": 169,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_clean",
+            "value": 171,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_dotted",
+            "value": 183,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_path_dot_segments",
+            "value": 298,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_redirect_prefix_with_query",
+            "value": 405,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "url_rewrite_prefix",
+            "value": 33,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "url_rewrite_full_path",
+            "value": 16,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "e2e_analyze_redirect_full_value_query",
+            "value": 416,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple",
+            "value": 55,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical",
+            "value": 121,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex",
+            "value": 349,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_simple_repeated",
+            "value": 55,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_typical_repeated",
+            "value": 120,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_complex_repeated",
+            "value": 349,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_malformed_request",
+            "value": 13,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/100",
+            "value": 79,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/500",
+            "value": 174,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/1000",
+            "value": 252,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/2000",
+            "value": 410,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_request_size/parse_headers_fast/4000",
+            "value": 722,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/GET",
+            "value": 61,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/POST",
+            "value": 62,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PUT",
+            "value": 61,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/DELETE",
+            "value": 60,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/PATCH",
+            "value": 62,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/HEAD",
+            "value": 62,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_method/parse_headers_fast/OPTIONS",
+            "value": 60,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/0",
+            "value": 52,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/1",
+            "value": 63,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/2",
+            "value": 75,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/3",
+            "value": 67,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_by_host_complexity/parse_headers_fast/4",
+            "value": 67,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/clean",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dotted",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dot_segments",
+            "value": 93,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "normalize_path/dot_segment_params",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation",
+            "value": 81,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "parse_headers_fast_allocation_test",
+            "value": 80,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/100",
+            "value": 54,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/1000",
+            "value": 56,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_lookup_by_table_size/http_route_lookup/10000",
+            "value": 58,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_miss/unknown_host",
+            "value": 53,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_miss/unrouted_path",
+            "value": 66,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_simple",
+            "value": 43,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_complex",
+            "value": 37,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tcp_route_lookup",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tls_sni_listener_select",
+            "value": 66,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tls_route_resolve_wildcard",
+            "value": 102,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "udp_route_miss",
+            "value": 42,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_selection/l4_round_robin_100",
+            "value": 128,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_selection/http_weighted_4",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_table_creation",
+            "value": 140,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "backend_creation",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "add_http_route",
+            "value": 467,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_regex_hit",
+            "value": 85,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "path_matching_regex_miss",
+            "value": 62,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "http_route_lookup_shared_scope",
+            "value": 40,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "http_route_lookup_own_and_shared",
+            "value": 67,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "route_table_build_1000_rules",
+            "value": 1144028,
+            "range": "± 31681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_common_method",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_extension_method",
+            "value": 17,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sniff_non_http",
+            "value": 1,
             "range": "± 0",
             "unit": "ns/iter"
           }
