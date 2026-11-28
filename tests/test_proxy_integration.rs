@@ -1508,8 +1508,8 @@ fn test_access_log_lines_written() {
     .expect("unrouted request");
     let miss_status = extract_status(&miss).expect("proxy-generated status");
 
-    // The writer flushes as soon as its queue drains; this loop only absorbs
-    // task scheduling delay, bounded hard at 5s.
+    // A worker hands its lines over as it parks, and the writer flushes as
+    // its queue drains; this loop only absorbs that scheduling, bounded at 5s.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let content = loop {
         let text = std::fs::read_to_string(log_file.path()).expect("read access log");
@@ -1523,7 +1523,12 @@ fn test_access_log_lines_written() {
         thread::sleep(Duration::from_millis(20));
     };
 
-    let first = content.lines().next().unwrap();
+    // Lines keep their order per worker only: each request's is found by
+    // what it asked.
+    let first = content
+        .lines()
+        .find(|l| l.contains("\"path\":\"/hello\""))
+        .expect("the proxied request's line");
     for field in [
         "\"method\":\"GET\"".to_string(),
         "\"path\":\"/hello\"".to_string(),
@@ -1537,7 +1542,10 @@ fn test_access_log_lines_written() {
         assert!(first.contains(&field), "missing {field} in line: {first}");
     }
 
-    let second = content.lines().nth(1).unwrap();
+    let second = content
+        .lines()
+        .find(|l| l.contains("nosuch.example"))
+        .expect("the unrouted request's line");
     assert!(
         second.contains(&format!("\"status\":{}", miss_status)),
         "line: {second}"
@@ -1547,6 +1555,31 @@ fn test_access_log_lines_written() {
         second.contains("\"host\":\"nosuch.example\""),
         "line: {second}"
     );
+}
+
+/// A request answered right before SIGTERM still has its line: the
+/// workers' lines are handed over and written before the process leaves.
+#[test]
+fn test_access_log_line_survives_shutdown() {
+    let backend = TestBackend::spawn("last");
+    let log_file = tempfile::NamedTempFile::new().expect("temp log file");
+    let mut proxy = PortailProcess::spawn_with_access_log(
+        &[("localhost", "/", backend.addr)],
+        proxy_port(64),
+        log_file.path(),
+    );
+    let reply = http_request(
+        proxy.proxy_addr,
+        b"GET /last HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("proxied request");
+    assert_eq!(extract_status(&reply), Some(200));
+    proxy.terminate();
+    proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("the proxy exits on SIGTERM");
+    let text = std::fs::read_to_string(log_file.path()).expect("read access log");
+    assert!(text.contains("\"path\":\"/last\""), "line lost: {text:?}");
 }
 
 #[test]

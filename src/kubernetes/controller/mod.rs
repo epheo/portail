@@ -10,6 +10,7 @@
 
 mod auth;
 mod ca;
+mod external_ips;
 mod gateway_backends;
 mod gatewayclass;
 mod hub;
@@ -115,6 +116,8 @@ struct ControllerCtx {
     backends: Arc<gateway_backends::GatewayBackends>,
     /// What each Gateway's passes read of the recorded kinds.
     reads: Arc<ReadIndex>,
+    /// The externalIPs each Gateway asks for and is allowed.
+    claims: Arc<external_ips::Claims>,
     leader: leader::Leader,
     /// Whether every reflector delivered its initial list, and which did
     /// not. The sync server answers 503 until then, /readyz names them.
@@ -295,6 +298,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
             ),
         },
         reads: Arc::default(),
+        claims: Arc::default(),
         route_verdicts: Arc::default(),
         // A stale read lasts as long as before the cache: every requeue
         // listed the slices again.
@@ -405,6 +409,11 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         .wakes()
         .expect("a fresh backend index has its wakes")
         .map(|gateway| gateway_ref(&gateway));
+    let claim_triggers = ctx
+        .claims
+        .wakes()
+        .expect("a fresh claims index has its wakes")
+        .map(|gateway| gateway_ref(&gateway));
 
     // --- Gateway controller ---
     // Routes → map to parent Gateway(s) via parentRefs (targeted)
@@ -466,6 +475,7 @@ pub async fn run(args: ControllerArgs, shutdown: CancellationToken) -> anyhow::R
         .reconcile_on(report_triggers)
         .reconcile_on(lapse_triggers)
         .reconcile_on(dependent_triggers)
+        .reconcile_on(claim_triggers)
         .reconcile_on(owned_triggers)
         // Also what makes an early-ended pass's empty read set safe: see
         // ReadIndex::during.
