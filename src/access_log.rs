@@ -12,13 +12,14 @@
 //! `portail_access_log_dropped_total`. Lines keep their order per worker
 //! thread only: a connection's requests may run on different workers, so
 //! even its lines can arrive out of order; each carries its timestamp. At
-//! shutdown, [`finish`] waits for the workers' lines and their write.
+//! shutdown, [`finish`] hands every thread's buffer over itself and waits
+//! for their write.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::OnceCell;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
@@ -30,12 +31,8 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static SENDER: OnceLock<UnboundedSender<Message>> = OnceLock::new();
 /// Bytes handed to the writer and not yet taken by it.
 static QUEUED: AtomicUsize = AtomicUsize::new(0);
-/// Bytes in the workers' pending buffers.
-static PENDING_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Set by [`finish`]: from then on a hand-off that empties the workers'
-/// buffers wakes it. Unset, a hand-off pays one load for it.
-static FINISHING: AtomicBool = AtomicBool::new(false);
-static HANDED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+/// Every pending buffer of a thread that logged, for [`finish`].
+static BUFFERS: Mutex<Vec<Arc<Mutex<String>>>> = Mutex::new(Vec::new());
 
 /// What the writer receives.
 enum Message {
@@ -53,8 +50,14 @@ const QUEUED_MAX: usize = 2 * 1024 * 1024;
 const HANDOFF: usize = 16 * 1024;
 
 thread_local! {
-    /// The lines this worker thread wrote and has not handed over yet.
-    static PENDING: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The lines this thread wrote and has not handed over yet, registered
+    /// in `BUFFERS` with its first line. Only its own thread locks it, but
+    /// for [`finish`].
+    static PENDING: OnceCell<Arc<Mutex<String>>> = const { OnceCell::new() };
+}
+
+fn lock(buffer: &Mutex<String>) -> MutexGuard<'_, String> {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Request fields copied out before the buffer is reused for the response.
@@ -131,10 +134,18 @@ pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<Socket
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    PENDING.with_borrow_mut(|pending| {
-        let before = pending.len();
+    PENDING.with(|cell| {
+        let buffer = cell.get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(String::new()));
+            BUFFERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&buffer));
+            buffer
+        });
+        let mut pending = lock(buffer);
         write_line(
-            pending,
+            &mut pending,
             &cap,
             status,
             backend,
@@ -142,30 +153,27 @@ pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<Socket
             ts.subsec_millis(),
             dur_us,
         );
-        PENDING_BYTES.fetch_add(pending.len() - before, Relaxed);
         if pending.len() >= HANDOFF {
-            hand_off(tx, pending);
+            hand_off(tx, &mut pending);
         }
     });
 }
 
-/// Hand over this thread's lines, wait for every worker's (each hands its
-/// over as it parks, and after the drain they are idle), then for the
-/// writer to have written and flushed them all. Called once, after the
-/// drain: the last requests' lines must not be lost to the exit.
+/// Hand every thread's pending lines over, then wait for the writer to
+/// have written and flushed them all. Called once, after the drain: the
+/// last requests' lines must not be lost to the exit, and no worker is
+/// waited on, busy or not.
 pub async fn finish() {
     let Some(tx) = SENDER.get() else { return };
-    FINISHING.store(true, SeqCst);
-    flush();
-    let handed = HANDED.get_or_init(tokio::sync::Notify::new);
-    loop {
-        let notified = handed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if PENDING_BYTES.load(SeqCst) == 0 {
-            break;
+    let buffers: Vec<_> = BUFFERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for buffer in &buffers {
+        let mut pending = lock(buffer);
+        if !pending.is_empty() {
+            hand_off(tx, &mut pending);
         }
-        notified.await;
     }
     let (written, done) = tokio::sync::oneshot::channel();
     if tx.send(Message::Finished(written)).is_ok() {
@@ -174,11 +182,13 @@ pub async fn finish() {
 }
 
 /// Hand this thread's pending lines to the writer. The runtime calls it as
-/// a worker parks; a runtime without that hook calls it itself.
+/// a worker parks. A thread that never logged registers nothing here.
 pub fn flush() {
     let Some(tx) = SENDER.get() else { return };
     let _ = PENDING.try_with(|cell| {
-        if let Ok(mut pending) = cell.try_borrow_mut() {
+        let Some(buffer) = cell.get() else { return };
+        // Held by finish at this moment: it hands this buffer over itself.
+        if let Ok(mut pending) = buffer.try_lock() {
             if !pending.is_empty() {
                 hand_off(tx, &mut pending);
             }
@@ -199,11 +209,6 @@ fn hand_off(tx: &UnboundedSender<Message>, pending: &mut String) {
         QUEUED.fetch_sub(len, Relaxed);
         if let Message::Lines(lines) = refused.0 {
             drop_lines(&lines);
-        }
-    }
-    if PENDING_BYTES.fetch_sub(len, SeqCst) == len && FINISHING.load(SeqCst) {
-        if let Some(handed) = HANDED.get() {
-            handed.notify_waiters();
         }
     }
 }
@@ -354,7 +359,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let queued = QUEUED.load(Relaxed);
         let mut pending = "a\nb\n".to_string();
-        PENDING_BYTES.fetch_add(4, Relaxed);
         hand_off(&tx, &mut pending);
         assert!(pending.is_empty());
         let Ok(Message::Lines(lines)) = rx.try_recv() else {
@@ -367,7 +371,6 @@ mod tests {
         let dropped = crate::metrics::METRICS.access_log_dropped_total.get();
         QUEUED.fetch_add(QUEUED_MAX, Relaxed);
         let mut pending = "c\nd\ne\n".to_string();
-        PENDING_BYTES.fetch_add(6, Relaxed);
         hand_off(&tx, &mut pending);
         QUEUED.fetch_sub(QUEUED_MAX, Relaxed);
         assert!(pending.is_empty());
