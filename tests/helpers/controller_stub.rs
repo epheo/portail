@@ -91,11 +91,26 @@ struct State {
 pub struct ControllerStub {
     pub addr: SocketAddr,
     pub ca_pem: String,
+    /// Bound to `addr` for the stub's whole life and never listening: while
+    /// the stub is down a connect is refused, and no other socket can take
+    /// the port. A port released between down and up became the local port
+    /// of another test's connection, and the stub's bind failed for as long
+    /// as that connection lived.
+    _held: socket2::Socket,
     tls: Arc<rustls::ServerConfig>,
     state: Arc<State>,
     runtime: tokio::runtime::Runtime,
-    /// Cancelled to go down: the listener and every connection close.
-    up: Mutex<Option<CancellationToken>>,
+    /// Cancelled to go down: the listener and every connection close. The
+    /// accept loop ends once its listener listens no more.
+    up: Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
+}
+
+/// A socket bound to `addr` that shares it with the stub's others.
+fn bound(addr: SocketAddr) -> socket2::Socket {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_reuse_port(true).unwrap();
+    socket.bind(&addr.into()).unwrap();
+    socket
 }
 
 impl ControllerStub {
@@ -109,15 +124,14 @@ impl ControllerStub {
     /// Down at first, on an address it takes when [`Self::up`].
     pub fn down(hold: Duration, mode: Mode) -> Self {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let held = bound(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let addr = held.local_addr().unwrap().as_socket().unwrap();
         let (ca_pem, tls, signer) = test_pki(addr.ip());
         let (_, _, forger) = test_pki(addr.ip());
         Self {
             addr,
             ca_pem,
+            _held: held,
             tls: Arc::new(tls),
             state: Arc::new(State {
                 mode: watch::Sender::new(mode),
@@ -145,24 +159,26 @@ impl ControllerStub {
     /// Serve again on the same address.
     pub fn up(&self) {
         let token = CancellationToken::new();
-        let listener = self.runtime.block_on(async {
-            // The port was ours a moment ago: give a lingering socket of
-            // another test's a few tries.
-            for _ in 0..50 {
-                if let Ok(listener) = tokio::net::TcpListener::bind(self.addr).await {
-                    return listener;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            panic!("controller stub: {} stays taken", self.addr);
-        });
+        let listener = bound(self.addr);
+        listener.listen(1024).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = {
+            let _runtime = self.runtime.enter();
+            tokio::net::TcpListener::from_std(listener.into()).unwrap()
+        };
         let acceptor = tokio_rustls::TlsAcceptor::from(self.tls.clone());
         let state = self.state.clone();
         let stop = token.clone();
-        self.runtime.spawn(async move {
+        let accepting = self.runtime.spawn(async move {
             loop {
                 let (tcp, _) = tokio::select! {
-                    _ = stop.cancelled() => return,
+                    _ = stop.cancelled() => {
+                        // Not left to the drop: a data plane another test
+                        // is forking holds a copy of this socket until it
+                        // execs, and it would listen on until then.
+                        let _ = socket2::SockRef::from(&listener).shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
                     accepted = listener.accept() => match accepted {
                         Ok(accepted) => accepted,
                         Err(_) => continue,
@@ -186,25 +202,24 @@ impl ControllerStub {
                 });
             }
         });
-        *self.up.lock().unwrap() = Some(token);
+        *self.up.lock().unwrap() = Some((token, accepting));
     }
 
     /// Stop serving: connects are refused, connections closed.
     pub fn go_down(&self) {
-        if let Some(token) = self.up.lock().unwrap().take() {
+        if let Some((token, accepting)) = self.up.lock().unwrap().take() {
             token.cancel();
+            self.runtime.block_on(accepting).unwrap();
         }
-        // The accept loop drops its listener as it sees the cancel.
-        for _ in 0..50 {
-            if std::net::TcpListener::bind(self.addr).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!(
-            "controller stub: {} still bound after going down",
-            self.addr
-        );
+    }
+
+    /// Listening on the stub's address and never accepting: the kernel
+    /// completes the TCP handshake and nothing answers. For a stub that is
+    /// down, until the listener is dropped.
+    pub fn blackhole(&self) -> std::net::TcpListener {
+        let listener = bound(self.addr);
+        listener.listen(16).unwrap();
+        listener.into()
     }
 
     pub fn set(&self, mode: Mode) {
@@ -240,7 +255,7 @@ impl ControllerStub {
 
 impl Drop for ControllerStub {
     fn drop(&mut self) {
-        if let Some(token) = self.up.lock().unwrap().take() {
+        if let Some((token, _)) = self.up.lock().unwrap().take() {
             token.cancel();
         }
     }

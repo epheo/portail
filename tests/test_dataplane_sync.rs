@@ -496,6 +496,32 @@ fn the_token_is_read_per_request() {
     );
 }
 
+/// A stub keeps its address while down: a connect is refused, and no other
+/// socket can take the port before the stub is up again.
+#[test]
+fn a_stub_that_is_down_keeps_its_address() {
+    let taken = |addr| {
+        std::net::TcpListener::bind(addr)
+            .map(drop)
+            .map_err(|e| e.kind())
+    };
+    let stub = ControllerStub::down(SHORT_HOLD, Mode::Serve(None));
+    for _ in 0..2 {
+        assert!(
+            TcpStream::connect(stub.addr).is_err(),
+            "down, yet it answers"
+        );
+        assert_eq!(taken(stub.addr), Err(std::io::ErrorKind::AddrInUse));
+        stub.up();
+        assert!(TcpStream::connect(stub.addr).is_ok(), "up, yet it refuses");
+        stub.go_down();
+    }
+    assert!(
+        TcpStream::connect(stub.addr).is_err(),
+        "down, yet it answers"
+    );
+}
+
 /// With no controller to answer, a new data plane is NotReady and binds
 /// nothing; the controller's first snapshot makes it Ready.
 #[test]
@@ -736,9 +762,8 @@ fn leaving_an_unreachable_controller_takes_the_connect_timeout_at_most() {
     wait_serving(&dp, port, "ok");
 
     stub.go_down();
-    // Listening, never accepting: the kernel completes the TCP handshake
-    // and the TLS one hangs.
-    let _blackhole = std::net::TcpListener::bind(stub.addr).unwrap();
+    // The TCP handshake completes and the TLS one hangs.
+    let _blackhole = stub.blackhole();
     let stopped = Instant::now();
     dp.process.terminate();
     let status = dp
