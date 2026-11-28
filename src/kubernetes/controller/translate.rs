@@ -87,6 +87,22 @@ pub(crate) struct Rejected {
     pub error: String,
 }
 
+/// Why a pass has no plan.
+pub(crate) enum Unplanned {
+    /// The Gateway cannot be served as the cluster has it: status says why.
+    Rejected(Box<Rejected>),
+    /// A read failed that may not fail again. It says nothing of the
+    /// Gateway: the status written and the snapshot served are still true,
+    /// so nothing is written and the pass comes back.
+    Retry(String),
+}
+
+impl Unplanned {
+    fn rejected(statuses: Statuses, error: String) -> Self {
+        Unplanned::Rejected(Box::new(Rejected { statuses, error }))
+    }
+}
+
 /// Routes from a reflector store that target this Gateway, as `Arc`s straight
 /// out of the store — the per-Gateway filter runs before anything is copied,
 /// so a cluster full of other Gateways' routes costs pointer moves only.
@@ -305,7 +321,7 @@ pub(crate) async fn translate(
     external_name_backends: ExternalNameBackends,
     trusted: &[GatewayKey],
     egress: &[(String, String)],
-) -> Result<Plan, Box<Rejected>> {
+) -> Result<Plan, Unplanned> {
     let gw_name = gateway.name_any();
     let gw_ns = gateway.namespace().unwrap_or_else(|| "default".to_string());
 
@@ -325,6 +341,7 @@ pub(crate) async fn translate(
 
     ctx.certs.retain_referenced(&ctx.cache.gateways.state());
     ctx.ca_bundles.retain(&ctx.cache.gateways.state());
+    ctx.read_retries.retain(&ctx.cache.gateways.state());
     let resolved_certs = resolve_gateway_certs(
         gateway,
         &gw_ns,
@@ -348,10 +365,10 @@ pub(crate) async fn translate(
             // What it would have read is unknown: anything wakes it.
             crate::kubernetes::reads::record_everything();
             error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
-            return Err(Box::new(Rejected {
-                statuses: Statuses::translation_only(accepted, listeners),
-                error: e.to_string(),
-            }));
+            return Err(Unplanned::rejected(
+                Statuses::translation_only(accepted, listeners),
+                e.to_string(),
+            ));
         }
     };
 
@@ -384,12 +401,16 @@ pub(crate) async fn translate(
     let networks =
         match resolve_network_cidrs(&ctx.client, gateway, &gw_ns, egress, &ctx.networks).await {
             Ok(networks) => networks,
+            Err(e) if e.transient => return Err(Unplanned::Retry(e.message)),
             Err(e) => {
-                error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
-                return Err(Box::new(Rejected {
-                    statuses: Statuses::translation_only(accepted, listeners),
-                    error: e,
-                }));
+                error!(
+                    "Failed to translate Gateway {}/{}: {}",
+                    gw_ns, gw_name, e.message
+                );
+                return Err(Unplanned::rejected(
+                    Statuses::translation_only(accepted, listeners),
+                    e.message,
+                ));
             }
         };
     let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
@@ -404,11 +425,15 @@ pub(crate) async fn translate(
     {
         Ok(cas) => cas,
         Err(e) => {
-            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, e);
-            return Err(Box::new(Rejected {
-                statuses: Statuses::translation_only(accepted, listeners),
-                error: format!("reading the CA bundles of BackendTLSPolicies: {e}"),
-            }));
+            let why = format!("reading the CA bundles of BackendTLSPolicies: {e}");
+            if crate::kubernetes::transient(&e) {
+                return Err(Unplanned::Retry(why));
+            }
+            error!("Failed to translate Gateway {}/{}: {}", gw_ns, gw_name, why);
+            return Err(Unplanned::rejected(
+                Statuses::translation_only(accepted, listeners),
+                why,
+            ));
         }
     };
     let backend_tls = backend_tls::for_backends(&https, services, policies, |ns, name| {

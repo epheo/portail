@@ -260,6 +260,7 @@ impl TestCluster {
             networks: Arc::default(),
             certs: Arc::default(),
             ca_bundles: Default::default(),
+            read_retries: Default::default(),
             named_ports: Arc::new(crate::kubernetes::services::NamedPortCache::new(
                 std::time::Duration::from_secs(super::RESYNC_SECS),
             )),
