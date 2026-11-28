@@ -21,7 +21,8 @@ use rustls::pki_types::CertificateDer;
 
 use super::converters::parse_backend_dns_name;
 use super::reads::Recorded;
-use crate::config::PROXY_V2_APP_PROTOCOL;
+use super::services::http_refs_mut;
+use crate::config::{BackendCa, BackendTls, PortailConfig, San, PROXY_V2_APP_PROTOCOL};
 use crate::logging::warn;
 
 /// The ConfigMap key a CA bundle is read from (Gateway API Core support).
@@ -48,12 +49,6 @@ pub(crate) struct Verify {
     /// When set, the names that count instead of `hostname`.
     pub subject_alt_names: Vec<San>,
     pub ca: Ca,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum San {
-    Hostname(String),
-    Uri(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +207,45 @@ pub(crate) fn for_backends<'a>(
     }
     out.statuses = statuses.into_values().collect();
     out
+}
+
+/// Each HTTP ref of `config` a decision applies to carries it, verified or
+/// invalid, and the config the CA bundles the verified ones name, by hash:
+/// one bundle travels once however many refs name it.
+pub(crate) fn emit(config: &mut PortailConfig, decisions: &HashMap<(String, u16), Decision>) {
+    let mut bundles = BTreeMap::new();
+    let tls: HashMap<(String, u16), Option<BackendTls>> = decisions
+        .iter()
+        .map(|(backend, decision)| {
+            let tls = match decision {
+                Decision::Refuse => None,
+                Decision::Verify(v) => Some(BackendTls {
+                    hostname: v.hostname.clone(),
+                    subject_alt_names: v.subject_alt_names.clone(),
+                    ca: match &v.ca {
+                        Ca::System => BackendCa::System,
+                        Ca::Bundle(pem) => {
+                            let name = crate::sync::sha256_hex(pem.as_bytes());
+                            bundles.entry(name.clone()).or_insert_with(|| pem.clone());
+                            BackendCa::Bundle(name)
+                        }
+                    },
+                }),
+            };
+            (backend.clone(), tls)
+        })
+        .collect();
+    for r in http_refs_mut(config) {
+        if r.invalid {
+            continue;
+        }
+        match tls.get(&(r.name.clone(), r.port)) {
+            None => {}
+            Some(None) => r.invalid = true,
+            Some(Some(verify)) => r.tls = Some(verify.clone()),
+        }
+    }
+    config.backend_cas = bundles;
 }
 
 /// Backends already told to connect with TLS unverified, so the warning is
@@ -730,6 +764,51 @@ mod tests {
         assert_eq!((s.accepted.ok, s.accepted.reason), (false, "Invalid"));
         assert_eq!(out.by_port[&443], Decision::Refuse);
         assert!(matches!(out.by_port[&8443], Decision::Verify(_)));
+    }
+
+    /// A verified backend's refs, its mirrors' included, carry its check,
+    /// and the config its bundle once by hash; a refused backend's refs are
+    /// invalid; a backend no policy names is left alone. It all survives
+    /// the wire.
+    #[test]
+    fn every_http_ref_of_a_backend_carries_its_decision() {
+        let json = r#"{"httpRoutes": [{"hostnames": ["m.example.com"], "rules": [{
+            "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "web.apps.svc", "port": 443}}}],
+            "backendRefs": [{"name": "web.apps.svc", "port": 443}, {"name": "web.apps.svc", "port": 8443},
+                            {"name": "other.apps.svc", "port": 443}]}]}]}"#;
+        let mut config: PortailConfig = serde_json::from_str(json).unwrap();
+        let verify = Verify {
+            hostname: "web.test".into(),
+            subject_alt_names: vec![San::Uri("spiffe://apps/web".into())],
+            ca: Ca::Bundle("PEM".into()),
+        };
+        let decisions = HashMap::from([
+            (("web.apps.svc".to_string(), 443), Decision::Verify(verify)),
+            (("web.apps.svc".to_string(), 8443), Decision::Refuse),
+        ]);
+        emit(&mut config, &decisions);
+
+        let name = crate::sync::sha256_hex(b"PEM");
+        let want = Some(BackendTls {
+            hostname: "web.test".into(),
+            subject_alt_names: vec![San::Uri("spiffe://apps/web".into())],
+            ca: BackendCa::Bundle(name.clone()),
+        });
+        let config: PortailConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            config.backend_cas,
+            BTreeMap::from([(name, "PEM".to_string())])
+        );
+        let rule = &config.http_routes[0].rules[0];
+        assert_eq!(rule.backend_refs[0].tls, want);
+        assert!(rule.backend_refs[1].invalid && rule.backend_refs[1].tls.is_none());
+        assert!(!rule.backend_refs[2].invalid && rule.backend_refs[2].tls.is_none());
+        let crate::config::HttpRouteFilter::RequestMirror { config: mirror } = &rule.filters[0]
+        else {
+            panic!("the mirror filter");
+        };
+        assert_eq!(mirror.backend_ref.tls, want);
     }
 
     /// A sectionName the Service has no port for attaches to nothing.

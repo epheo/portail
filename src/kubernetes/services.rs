@@ -292,6 +292,21 @@ fn http_refs(config: &PortailConfig) -> impl Iterator<Item = &BackendRef> {
         .chain(mirrors)
 }
 
+/// Every backend an HTTP rule of `config` routes or mirrors to, to change.
+pub(crate) fn http_refs_mut(config: &mut PortailConfig) -> impl Iterator<Item = &mut BackendRef> {
+    config
+        .http_routes
+        .iter_mut()
+        .flat_map(|r| &mut r.rules)
+        .flat_map(|rule| {
+            let mirrors = rule.filters.iter_mut().filter_map(|f| match f {
+                HttpRouteFilter::RequestMirror { config } => Some(&mut config.backend_ref),
+                _ => None,
+            });
+            rule.backend_refs.iter_mut().chain(mirrors)
+        })
+}
+
 /// (FQDN, port) of every backend an HTTP rule routes or mirrors to: the
 /// connections a BackendTLSPolicy verifies. TLSRoute is served in
 /// Passthrough only, where the client's TLS reaches the backend.

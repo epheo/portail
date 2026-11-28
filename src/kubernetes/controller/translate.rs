@@ -422,6 +422,7 @@ pub(crate) async fn translate(
         &backend_tls.decisions,
         &https,
     );
+    backend_tls::emit(&mut result.config, &backend_tls.decisions);
     gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
     let targets = std::mem::take(&mut result.gateway_targets)
         .into_iter()

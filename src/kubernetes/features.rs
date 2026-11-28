@@ -2,6 +2,8 @@
 /// Used both in GatewayClass status reporting and conformance test configuration.
 /// Keep sorted alphabetically for easy diffing.
 pub const SUPPORTED_FEATURES: &[&str] = &[
+    "BackendTLSPolicy",
+    "BackendTLSPolicySANValidation",
     "Gateway",
     "GatewayAddressEmpty",
     "GatewayHTTPListenerIsolation",
