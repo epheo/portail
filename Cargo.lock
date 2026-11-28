@@ -2062,6 +2062,7 @@ dependencies = [
  "regex-syntax",
  "rewrk-core",
  "rustls",
+ "rustls-native-certs",
  "rustls-webpki",
  "schemars",
  "serde",

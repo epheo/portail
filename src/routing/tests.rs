@@ -13,6 +13,7 @@ fn backend(port: u16) -> Backend {
         filters: vec![],
         use_tls: false,
         server_name: String::new(),
+        verify: None,
         action: BackendAction::Forward,
     }
 }
@@ -286,6 +287,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
                 Backend {
@@ -294,6 +296,7 @@ fn test_weighted_backend() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
             ],
@@ -904,6 +907,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
                 Backend {
@@ -912,6 +916,7 @@ fn test_equal_weights() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
             ],
@@ -952,6 +957,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
                 Backend {
@@ -960,6 +966,7 @@ fn test_zero_weight_backend_never_selected() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
             ],
@@ -1251,6 +1258,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
                 Backend {
@@ -1259,6 +1267,7 @@ fn test_cumulative_weights_precomputed() {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 },
             ],

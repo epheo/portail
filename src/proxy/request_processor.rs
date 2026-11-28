@@ -612,6 +612,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 }],
             ),
@@ -667,6 +668,7 @@ mod tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                verify: None,
                 action: BackendAction::Forward,
             }],
         );
@@ -887,6 +889,7 @@ mod tests {
             vec![HttpFilter::RequestMirror {
                 backend_addr: "127.0.0.1:9999".parse().unwrap(),
                 fraction: Fraction::ALL,
+                proto: crate::proxy::backend_pool::BackendProto::Plain,
             }],
         );
         let sel = BackendSelector::new();
@@ -901,6 +904,7 @@ mod tests {
                     HttpFilter::RequestMirror {
                         backend_addr,
                         fraction,
+                        ..
                     } => Some((*backend_addr, *fraction)),
                     _ => None,
                 })
@@ -924,10 +928,12 @@ mod tests {
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9998".parse().unwrap(),
                     fraction: Fraction::new(1, 2).unwrap(),
+                    proto: crate::proxy::backend_pool::BackendProto::Plain,
                 },
                 HttpFilter::RequestMirror {
                     backend_addr: "127.0.0.1:9999".parse().unwrap(),
                     fraction: Fraction::ALL,
+                    proto: crate::proxy::backend_pool::BackendProto::Plain,
                 },
             ],
         );
@@ -943,6 +949,7 @@ mod tests {
                     HttpFilter::RequestMirror {
                         backend_addr,
                         fraction,
+                        ..
                     } => Some((*backend_addr, *fraction)),
                     _ => None,
                 })
@@ -978,6 +985,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 }],
             ),
@@ -1088,6 +1096,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: BackendAction::Forward,
                 }],
             ),

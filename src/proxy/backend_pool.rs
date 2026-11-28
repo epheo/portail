@@ -33,6 +33,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
+use crate::proxy::upstream::tls::Verify;
+
 /// Client TLS connector that skips certificate verification.
 /// Backend services in k8s typically use self-signed certs.
 ///
@@ -61,8 +63,24 @@ fn tls_connector() -> &'static tokio_rustls::TlsConnector {
 #[derive(Default)]
 struct IdleConns {
     plain: Vec<Connection>,
-    /// A handful of names per address at most, so a scan.
-    tls: Vec<(Box<str>, Vec<Connection>)>,
+    /// A handful of keys per address at most, so a scan.
+    tls: Vec<(TlsKey<Box<str>>, Vec<Connection>)>,
+}
+
+/// What an idle TLS conn is kept by: the server name it was opened with,
+/// or the policy it was verified under. `verified` is its own field so
+/// that no server name, whatever it spells, finds a verified conn, and no
+/// policy an unverified one.
+#[derive(Clone, Copy)]
+struct TlsKey<S> {
+    verified: bool,
+    name: S,
+}
+
+impl TlsKey<&str> {
+    fn is(&self, kept: &TlsKey<Box<str>>) -> bool {
+        self.verified == kept.verified && *self.name == *kept.name
+    }
 }
 
 impl IdleConns {
@@ -71,10 +89,10 @@ impl IdleConns {
     /// a supposedly idle HTTP backend (poisoned or desynced) all make a
     /// conn unusable. The probe cannot see a close racing the next
     /// request: the caller's from_pool replay covers that.
-    fn take_live(&mut self, sni: Option<&str>) -> Option<Connection> {
-        let conns = match sni {
+    fn take_live(&mut self, key: Option<TlsKey<&str>>) -> Option<Connection> {
+        let conns = match key {
             None => &mut self.plain,
-            Some(sni) => &mut self.tls.iter_mut().find(|(s, _)| **s == *sni)?.1,
+            Some(key) => &mut self.tls.iter_mut().find(|(kept, _)| key.is(kept))?.1,
         };
         while let Some(mut conn) = conns.pop() {
             if conn.idle_and_open() {
@@ -86,14 +104,18 @@ impl IdleConns {
         None
     }
 
-    fn put(&mut self, sni: Option<&str>, conn: Connection, max_idle: usize) {
-        let conns = match sni {
+    fn put(&mut self, key: Option<TlsKey<&str>>, conn: Connection, max_idle: usize) {
+        let conns = match key {
             None => &mut self.plain,
-            Some(sni) => {
-                let i = match self.tls.iter().position(|(s, _)| **s == *sni) {
+            Some(key) => {
+                let i = match self.tls.iter().position(|(kept, _)| key.is(kept)) {
                     Some(i) => i,
                     None => {
-                        self.tls.push((sni.into(), Vec::new()));
+                        let kept = TlsKey {
+                            verified: key.verified,
+                            name: key.name.into(),
+                        };
+                        self.tls.push((kept, Vec::new()));
                         self.tls.len() - 1
                     }
                 };
@@ -109,10 +131,62 @@ impl IdleConns {
     }
 }
 
-/// The SNI an idle conn is keyed by: its server name over TLS, none in the
-/// clear.
-fn sni(use_tls: bool, server_name: &str) -> Option<&str> {
-    use_tls.then_some(server_name)
+/// How a backend is spoken to, and so what an idle connection to it is
+/// kept by.
+#[derive(Clone, Copy)]
+pub enum Proto<'a> {
+    Plain,
+    /// TLS to this server name, its certificate not checked.
+    Tls(&'a str),
+    /// TLS under a BackendTLSPolicy.
+    Verified(&'a Verify),
+}
+
+impl<'a> Proto<'a> {
+    fn key(self) -> Option<TlsKey<&'a str>> {
+        let (verified, name) = match self {
+            Proto::Plain => return None,
+            Proto::Tls(server_name) => (false, server_name),
+            Proto::Verified(verify) => (true, verify.key()),
+        };
+        Some(TlsKey { verified, name })
+    }
+
+    /// `tcp`, the handshake done when there is one.
+    pub(crate) async fn over(self, tcp: TcpStream) -> std::io::Result<Connection> {
+        let tls = match self {
+            Proto::Plain => return Ok(Connection::Plain { inner: tcp }),
+            Proto::Tls(server_name) => {
+                let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
+                    .unwrap_or_else(|_| {
+                        rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+                    });
+                tls_connector().connect(domain, tcp).await?
+            }
+            Proto::Verified(verify) => verify.connect(tcp).await?,
+        };
+        Ok(Connection::ClientTls {
+            inner: Box::new(tls),
+        })
+    }
+}
+
+/// A [`Proto`] a route table keeps.
+#[derive(Debug, Clone)]
+pub enum BackendProto {
+    Plain,
+    Tls(Box<str>),
+    Verified(Arc<Verify>),
+}
+
+impl BackendProto {
+    pub fn as_ref(&self) -> Proto<'_> {
+        match self {
+            BackendProto::Plain => Proto::Plain,
+            BackendProto::Tls(server_name) => Proto::Tls(server_name),
+            BackendProto::Verified(verify) => Proto::Verified(verify),
+        }
+    }
 }
 
 /// Why a backend connection could not be opened.
@@ -244,32 +318,23 @@ pub(crate) async fn connect_tcp(
 async fn connect_new(
     connect_timeout: Duration,
     addr: SocketAddr,
-    use_tls: bool,
-    server_name: &str,
+    proto: Proto<'_>,
     keepalive: &TcpKeepalive,
 ) -> Result<Connection, ConnectError> {
-    debug!("Pool miss: connecting to {} (tls={})", addr, use_tls);
+    debug!(
+        "Pool miss: connecting to {} (tls={})",
+        addr,
+        proto.key().is_some()
+    );
     let tcp = connect_tcp(addr, connect_timeout, keepalive).await?;
     METRICS.upstream_connects_total.inc();
-
-    if use_tls {
-        let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
-            .unwrap_or_else(|_| {
-                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-            });
-        let tls_stream = tls_connector().connect(domain, tcp).await.map_err(|e| {
-            ConnectError::Backend(anyhow::anyhow!(
-                "Backend TLS handshake failed {}: {}",
-                addr,
-                e
-            ))
-        })?;
-        Ok(Connection::ClientTls {
-            inner: Box::new(tls_stream),
-        })
-    } else {
-        Ok(Connection::Plain { inner: tcp })
-    }
+    proto.over(tcp).await.map_err(|e| {
+        ConnectError::Backend(anyhow::anyhow!(
+            "Backend TLS handshake failed {}: {}",
+            addr,
+            e
+        ))
+    })
 }
 
 pub struct BackendPool {
@@ -289,14 +354,9 @@ impl BackendPool {
 
     /// A live idle conn opened for this address, protocol and SNI, if the
     /// pool holds one. Never waits.
-    pub fn take_idle(
-        &mut self,
-        addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
-    ) -> Option<Connection> {
+    pub fn take_idle(&mut self, addr: SocketAddr, proto: Proto<'_>) -> Option<Connection> {
         let idle = self.pools.get_mut(&addr)?;
-        let conn = idle.take_live(sni(use_tls, server_name))?;
+        let conn = idle.take_live(proto.key())?;
         debug!("Pool hit: reusing connection to {}", addr);
         Some(conn)
     }
@@ -313,16 +373,15 @@ impl BackendPool {
     pub async fn acquire(
         &mut self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
-        if let Some(conn) = self.take_idle(addr, use_tls, server_name) {
+        if let Some(conn) = self.take_idle(addr, proto) {
             return Ok((conn, true));
         }
 
         METRICS.pool_misses_total.inc();
-        let conn = connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await?;
+        let conn = connect_new(self.connect_timeout, addr, proto, keepalive).await?;
         Ok((conn, false))
     }
 
@@ -331,25 +390,17 @@ impl BackendPool {
     pub async fn acquire_fresh(
         &self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<Connection, ConnectError> {
-        connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await
+        connect_new(self.connect_timeout, addr, proto, keepalive).await
     }
 
-    pub fn release(
-        &mut self,
-        addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
-        conn: Connection,
-    ) {
-        self.pools.entry(addr).or_default().put(
-            sni(use_tls, server_name),
-            conn,
-            self.max_idle_per_backend,
-        );
+    pub fn release(&mut self, addr: SocketAddr, proto: Proto<'_>, conn: Connection) {
+        self.pools
+            .entry(addr)
+            .or_default()
+            .put(proto.key(), conn, self.max_idle_per_backend);
     }
 }
 
@@ -373,17 +424,9 @@ impl SharedBackendPool {
         }
     }
 
-    pub fn take_idle(
-        &self,
-        addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
-    ) -> Option<Connection> {
+    pub fn take_idle(&self, addr: SocketAddr, proto: Proto<'_>) -> Option<Connection> {
         // Shard lock held only for the sync pop+probe loop.
-        let conn = self
-            .pools
-            .get_mut(&addr)?
-            .take_live(sni(use_tls, server_name))?;
+        let conn = self.pools.get_mut(&addr)?.take_live(proto.key())?;
         debug!("Shared pool hit: reusing connection to {}", addr);
         Some(conn)
     }
@@ -391,35 +434,32 @@ impl SharedBackendPool {
     pub async fn acquire(
         &self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
-        if let Some(conn) = self.take_idle(addr, use_tls, server_name) {
+        if let Some(conn) = self.take_idle(addr, proto) {
             return Ok((conn, true));
         }
 
         METRICS.pool_misses_total.inc();
-        let conn = connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await?;
+        let conn = connect_new(self.connect_timeout, addr, proto, keepalive).await?;
         Ok((conn, false))
     }
 
     pub async fn acquire_fresh(
         &self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<Connection, ConnectError> {
-        connect_new(self.connect_timeout, addr, use_tls, server_name, keepalive).await
+        connect_new(self.connect_timeout, addr, proto, keepalive).await
     }
 
-    pub fn release(&self, addr: SocketAddr, use_tls: bool, server_name: &str, conn: Connection) {
-        self.pools.entry(addr).or_default().put(
-            sni(use_tls, server_name),
-            conn,
-            self.max_idle_per_backend,
-        );
+    pub fn release(&self, addr: SocketAddr, proto: Proto<'_>, conn: Connection) {
+        self.pools
+            .entry(addr)
+            .or_default()
+            .put(proto.key(), conn, self.max_idle_per_backend);
     }
 }
 
@@ -434,54 +474,41 @@ pub enum PoolHandle {
 impl PoolHandle {
     /// A live idle conn, if the pool holds one: a hit needs no connect
     /// budget, and arming one costs a timer.
-    pub fn take_idle(
-        &mut self,
-        addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
-    ) -> Option<Connection> {
+    pub fn take_idle(&mut self, addr: SocketAddr, proto: Proto<'_>) -> Option<Connection> {
         match self {
-            PoolHandle::PerConn(p) => p.take_idle(addr, use_tls, server_name),
-            PoolHandle::Shared(p) => p.take_idle(addr, use_tls, server_name),
+            PoolHandle::PerConn(p) => p.take_idle(addr, proto),
+            PoolHandle::Shared(p) => p.take_idle(addr, proto),
         }
     }
 
     pub async fn acquire(
         &mut self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<(Connection, bool), ConnectError> {
         match self {
-            PoolHandle::PerConn(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
-            PoolHandle::Shared(p) => p.acquire(addr, use_tls, server_name, keepalive).await,
+            PoolHandle::PerConn(p) => p.acquire(addr, proto, keepalive).await,
+            PoolHandle::Shared(p) => p.acquire(addr, proto, keepalive).await,
         }
     }
 
     pub async fn acquire_fresh(
         &self,
         addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
+        proto: Proto<'_>,
         keepalive: &TcpKeepalive,
     ) -> Result<Connection, ConnectError> {
         match self {
-            PoolHandle::PerConn(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
-            PoolHandle::Shared(p) => p.acquire_fresh(addr, use_tls, server_name, keepalive).await,
+            PoolHandle::PerConn(p) => p.acquire_fresh(addr, proto, keepalive).await,
+            PoolHandle::Shared(p) => p.acquire_fresh(addr, proto, keepalive).await,
         }
     }
 
-    pub fn release(
-        &mut self,
-        addr: SocketAddr,
-        use_tls: bool,
-        server_name: &str,
-        conn: Connection,
-    ) {
+    pub fn release(&mut self, addr: SocketAddr, proto: Proto<'_>, conn: Connection) {
         match self {
-            PoolHandle::PerConn(p) => p.release(addr, use_tls, server_name, conn),
-            PoolHandle::Shared(p) => p.release(addr, use_tls, server_name, conn),
+            PoolHandle::PerConn(p) => p.release(addr, proto, conn),
+            PoolHandle::Shared(p) => p.release(addr, proto, conn),
         }
     }
 }
@@ -640,7 +667,7 @@ mod tests {
         });
         let mut pool = BackendPool::new(4, Duration::from_secs(2));
         let keepalive = TcpKeepalive::new();
-        let (mut conn, _) = pool.acquire(addr, false, "", &keepalive).await.unwrap();
+        let (mut conn, _) = pool.acquire(addr, Proto::Plain, &keepalive).await.unwrap();
         conn.write_all(b"ping").await.unwrap();
         // Read as the engine does, with room to spare: a short read tells
         // tokio the socket is drained.
@@ -648,10 +675,10 @@ mod tests {
         while got < 4 {
             got += conn.read(&mut pong[got..]).await.unwrap();
         }
-        pool.release(addr, false, "", conn);
+        pool.release(addr, Proto::Plain, conn);
 
         let before = peek_syscalls();
-        let (_, reused) = pool.acquire(addr, false, "", &keepalive).await.unwrap();
+        let (_, reused) = pool.acquire(addr, Proto::Plain, &keepalive).await.unwrap();
         assert!(reused);
         assert_eq!(
             peek_syscalls(),
@@ -760,42 +787,45 @@ mod tests {
             PoolHandle::PerConn(BackendPool::new(4, timeout)),
             PoolHandle::Shared(Arc::new(SharedBackendPool::new(4, timeout))),
         ] {
-            let (mut conn, _) = pool.acquire(tls, true, "a.test", &keepalive).await.unwrap();
+            let (mut conn, _) = pool
+                .acquire(tls, Proto::Tls("a.test"), &keepalive)
+                .await
+                .unwrap();
             conn.read_exact(&mut [0u8; 1]).await.unwrap();
-            pool.release(tls, true, "a.test", conn);
-            let (_, reused) = pool.acquire(tls, true, "b.test", &keepalive).await.unwrap();
+            pool.release(tls, Proto::Tls("a.test"), conn);
+            let (_, reused) = pool
+                .acquire(tls, Proto::Tls("b.test"), &keepalive)
+                .await
+                .unwrap();
             assert!(!reused, "a conn opened for a.test served b.test");
-            let (_, reused) = pool.acquire(tls, true, "a.test", &keepalive).await.unwrap();
+            let (_, reused) = pool
+                .acquire(tls, Proto::Tls("a.test"), &keepalive)
+                .await
+                .unwrap();
             assert!(reused, "a.test lost its pooled conn");
 
             // One address, both protocols: neither kind serves the other.
-            let (conn, _) = pool
-                .acquire(tls, false, "a.test", &keepalive)
+            let (conn, _) = pool.acquire(tls, Proto::Plain, &keepalive).await.unwrap();
+            pool.release(tls, Proto::Plain, conn);
+            let (mut conn, reused) = pool
+                .acquire(tls, Proto::Tls("a.test"), &keepalive)
                 .await
                 .unwrap();
-            pool.release(tls, false, "a.test", conn);
-            let (mut conn, reused) = pool.acquire(tls, true, "a.test", &keepalive).await.unwrap();
             assert!(!reused, "a plain conn served a TLS request");
             conn.read_exact(&mut [0u8; 1]).await.unwrap();
-            pool.release(tls, true, "a.test", conn);
-            let (_, reused) = pool
-                .acquire(tls, false, "a.test", &keepalive)
-                .await
-                .unwrap();
+            pool.release(tls, Proto::Tls("a.test"), conn);
+            let (_, reused) = pool.acquire(tls, Proto::Plain, &keepalive).await.unwrap();
             assert!(reused, "the plain conn was lost");
-            let (_, reused) = pool
-                .acquire(tls, false, "a.test", &keepalive)
-                .await
-                .unwrap();
+            let (_, reused) = pool.acquire(tls, Proto::Plain, &keepalive).await.unwrap();
             assert!(!reused, "a TLS conn served a plain request");
 
             let (conn, _) = pool
-                .acquire(plain_addr, false, "x", &keepalive)
+                .acquire(plain_addr, Proto::Plain, &keepalive)
                 .await
                 .unwrap();
-            pool.release(plain_addr, false, "x", conn);
+            pool.release(plain_addr, Proto::Plain, conn);
             let (_, reused) = pool
-                .acquire(plain_addr, false, "y", &keepalive)
+                .acquire(plain_addr, Proto::Plain, &keepalive)
                 .await
                 .unwrap();
             assert!(reused, "a plain conn was keyed by server name");
@@ -842,5 +872,60 @@ mod tests {
         server.flush().await.unwrap();
         conn.read_exact(&mut [0u8; 1]).await.unwrap();
         assert!(!conn.idle_and_open());
+    }
+
+    /// A conn is handed back only to what asks exactly as it was opened:
+    /// never one verified under a policy to another policy or to a request
+    /// that verifies nothing, never an unverified one to a policy, even
+    /// when a server name spells a policy's key.
+    #[tokio::test]
+    async fn a_verified_conn_serves_its_own_policy_only() {
+        use crate::config::{BackendCa, BackendTls};
+        use crate::proxy::testkit::{TestCa, GET_A as GET, OK};
+        let ca = TestCa::new();
+        let (backend, _seen) = ca.backend(&["a.test", "b.test"], &[], OK.as_bytes()).await;
+        let bundles = [("ca".to_string(), ca.pem())].into_iter().collect();
+        let policy = |hostname: &str| {
+            let tls = BackendTls {
+                hostname: hostname.to_string(),
+                subject_alt_names: vec![],
+                ca: BackendCa::Bundle("ca".to_string()),
+            };
+            Verify::of(&tls, &bundles).unwrap()
+        };
+        let (a, b) = (policy("a.test"), policy("b.test"));
+        let keepalive = TcpKeepalive::new();
+        let timeout = Duration::from_secs(2);
+        for mut pool in [
+            PoolHandle::PerConn(BackendPool::new(4, timeout)),
+            PoolHandle::Shared(Arc::new(SharedBackendPool::new(4, timeout))),
+        ] {
+            let reused = async |pool: &mut PoolHandle, proto: Proto<'_>, keep: bool| {
+                use tokio::io::AsyncReadExt;
+                let (mut conn, reused) = pool.acquire(backend, proto, &keepalive).await.unwrap();
+                if keep {
+                    // As a conn comes back in use: an exchange done, and
+                    // with it the session tickets read.
+                    conn.write_all(GET).await.unwrap();
+                    conn.read_exact(&mut [0u8; OK.len()]).await.unwrap();
+                    pool.release(backend, proto, conn);
+                }
+                reused
+            };
+            assert!(!reused(&mut pool, Proto::Verified(&a), true).await);
+            for other in [
+                Proto::Verified(&b),
+                Proto::Tls("a.test"),
+                Proto::Tls(a.key()),
+                Proto::Plain,
+            ] {
+                assert!(!reused(&mut pool, other, false).await);
+            }
+            assert!(reused(&mut pool, Proto::Verified(&a), false).await);
+
+            assert!(!reused(&mut pool, Proto::Tls(a.key()), true).await);
+            assert!(!reused(&mut pool, Proto::Verified(&a), false).await);
+            assert!(reused(&mut pool, Proto::Tls(a.key()), false).await);
+        }
     }
 }

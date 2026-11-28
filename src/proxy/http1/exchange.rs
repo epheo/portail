@@ -470,12 +470,9 @@ pub(super) async fn proxy_http_request(
         && !framing.backend_close
         && backend_ref.action != BackendAction::ForwardProxied
     {
-        state.pool.release(
-            backend_addr,
-            backend_ref.use_tls,
-            &backend_ref.server_name,
-            backend,
-        );
+        state
+            .pool
+            .release(backend_addr, backend_ref.proto(), backend);
     } else if framing_clean {
         debug!(
             "Backend {} conn not pooled (HEAD, refused upgrade, backend Connection: close, or a Gateway backend)",
@@ -691,12 +688,9 @@ async fn resend_on_fresh(
     );
     let mut backend = match tokio::time::timeout(
         fresh_budget,
-        state.pool.acquire_fresh(
-            backend_addr,
-            backend_ref.use_tls,
-            &backend_ref.server_name,
-            &state.backend_keepalive,
-        ),
+        state
+            .pool
+            .acquire_fresh(backend_addr, backend_ref.proto(), &state.backend_keepalive),
     )
     .await
     {
@@ -919,6 +913,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: crate::routing::BackendAction::Forward,
                 }],
             ),
@@ -1029,6 +1024,7 @@ mod tests {
                         filters: vec![],
                         use_tls: false,
                         server_name: String::new(),
+                        verify: None,
                         action: crate::routing::BackendAction::Forward,
                     }],
                 ),
@@ -1294,6 +1290,7 @@ mod tests {
                         filters: vec![],
                         use_tls: true,
                         server_name: sni.to_string(),
+                        verify: None,
                         action: crate::routing::BackendAction::Forward,
                     }],
                 ),
@@ -1319,6 +1316,7 @@ mod tests {
                     filters: vec![],
                     use_tls: false,
                     server_name: String::new(),
+                    verify: None,
                     action: crate::routing::BackendAction::Forward,
                 };
                 let path = "/".to_string();
@@ -1512,6 +1510,7 @@ mod tests {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                verify: None,
                 action: crate::routing::BackendAction::Forward,
             };
             // A conn whose peer is gone: the first write fails.

@@ -103,6 +103,7 @@ pub(crate) fn routes(backend: SocketAddr) -> RouteTable {
                 filters: vec![],
                 use_tls: false,
                 server_name: String::new(),
+                verify: None,
                 action: crate::routing::BackendAction::Forward,
             }],
         ),
@@ -252,6 +253,7 @@ pub(crate) fn routes_with_tcp(http: SocketAddr, tcp: SocketAddr) -> RouteTable {
             filters: vec![],
             use_tls: false,
             server_name: String::new(),
+            verify: None,
             action: crate::routing::BackendAction::Forward,
         }],
     );
@@ -305,6 +307,7 @@ pub(crate) fn gateway_backend(socket_addr: SocketAddr) -> Backend {
         filters: vec![],
         use_tls: false,
         server_name: String::new(),
+        verify: None,
         action: crate::routing::BackendAction::ForwardProxied,
     }
 }
@@ -473,6 +476,7 @@ pub(crate) fn tcp_route(backend: SocketAddr) -> RouteTable {
             filters: vec![],
             use_tls: false,
             server_name: String::new(),
+            verify: None,
             action: crate::routing::BackendAction::Forward,
         }],
     );
@@ -494,4 +498,76 @@ pub(crate) async fn banner_backend(banner: &'static [u8]) -> SocketAddr {
         }
     });
     addr
+}
+
+/// A certificate authority, and TLS backends holding certificates from it.
+pub(crate) struct TestCa(rcgen::CertifiedIssuer<'static, rcgen::KeyPair>);
+
+impl TestCa {
+    pub(crate) fn new() -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        Self(rcgen::CertifiedIssuer::self_signed(params, key).unwrap())
+    }
+
+    pub(crate) fn pem(&self) -> String {
+        self.0.pem()
+    }
+
+    /// A TLS backend whose certificate carries `dns` and `uris`. It
+    /// answers every request head with `reply`, and yields all bytes a
+    /// connection delivered once it closes: none for one that did not
+    /// finish its handshake.
+    pub(crate) async fn backend(
+        &self,
+        dns: &[&str],
+        uris: &[&str],
+        reply: &[u8],
+    ) -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let names = dns.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
+        params.subject_alt_names.extend(
+            uris.iter()
+                .map(|uri| rcgen::SanType::URI((*uri).try_into().unwrap())),
+        );
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &self.0).unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = reply.to_vec();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (tx, reply, acceptor) = (tx.clone(), reply.clone(), acceptor.clone());
+                tokio::spawn(async move {
+                    let (mut seen, mut chunk, mut answered) = (Vec::new(), [0u8; 4096], 0);
+                    if let Ok(mut tls) = acceptor.accept(sock).await {
+                        'conn: while let Ok(n @ 1..) = tls.read(&mut chunk).await {
+                            seen.extend_from_slice(&chunk[..n]);
+                            while let Some(end) = find_header_end(&seen[answered..]) {
+                                answered += end;
+                                if tls.write_all(&reply).await.is_err()
+                                    || tls.flush().await.is_err()
+                                {
+                                    break 'conn;
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send(seen);
+                });
+            }
+        });
+        (addr, rx)
+    }
 }

@@ -47,9 +47,35 @@ impl PortailConfig {
         self.validate_port_conflicts()?;
         self.validate_port_protocols()?;
         self.validate_parent_refs_resolve()?;
+        self.validate_backend_tls()?;
         self.performance.validate()?;
 
         Ok(())
+    }
+
+    /// A file asking for a verified TLS that cannot be given is refused
+    /// here; from a snapshot only that backend's share fails.
+    fn validate_backend_tls(&self) -> Result<()> {
+        for br in self.http_backend_refs() {
+            let Some(tls) = &br.tls else { continue };
+            if br.is_gateway() {
+                return Err(anyhow!(
+                    "Backend {}:{}: tls: a Gateway is not reached over TLS",
+                    br.name,
+                    br.port
+                ));
+            }
+            crate::proxy::upstream::tls::Verify::of(tls, &self.backend_cas)
+                .map_err(|why| anyhow!("Backend {}:{}: tls: {}", br.name, br.port, why))?;
+        }
+        match self.l4_backend_refs().find(|br| br.tls.is_some()) {
+            Some(br) => Err(anyhow!(
+                "Backend {}:{}: tls: only an HTTP rule reaches its backends over TLS",
+                br.name,
+                br.port
+            )),
+            None => Ok(()),
+        }
     }
 
     fn validate_port_conflicts(&self) -> Result<()> {
@@ -538,6 +564,7 @@ mod tests {
             filters: vec![],
             app_protocol: None,
             invalid: false,
+            tls: None,
         }
     }
 
@@ -664,6 +691,7 @@ mod tests {
                         filters: vec![],
                         app_protocol: None,
                         invalid: false,
+                        tls: None,
                     },
                     percent: None,
                     fraction: None,
@@ -1017,6 +1045,7 @@ mod tests {
                     filters: vec![],
                     app_protocol: None,
                     invalid: false,
+                    tls: None,
                 }],
                 timeouts: None,
             }],
@@ -1051,6 +1080,7 @@ mod tests {
                     filters: vec![],
                     app_protocol: None,
                     invalid: false,
+                    tls: None,
                 }],
                 timeouts: None,
             }],

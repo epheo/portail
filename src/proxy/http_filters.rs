@@ -593,11 +593,12 @@ static MIRROR_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 /// and by `MIRROR_PERMITS` in flight.
 pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
     for filter in filters {
-        let (addr, fraction) = match filter {
+        let (addr, fraction, proto) = match filter {
             HttpFilter::RequestMirror {
                 backend_addr,
                 fraction,
-            } => (*backend_addr, *fraction),
+                proto,
+            } => (*backend_addr, *fraction, proto.clone()),
             _ => continue,
         };
 
@@ -619,10 +620,14 @@ pub(crate) fn dispatch_mirrors(filters: &[HttpFilter], data: &[u8]) {
             // Total timeout: 5s covers connect + write. Prevents leaked tasks
             // when the mirror backend is slow or unreachable.
             let result = tokio::time::timeout(Duration::from_secs(5), async {
-                let connect_result =
-                    tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await;
-                if let Ok(Ok(mut conn)) = connect_result {
+                // A copy that cannot go out as its backend is spoken to
+                // does not go out: never in the clear to a TLS port.
+                let connect = async { proto.as_ref().over(TcpStream::connect(addr).await?).await };
+                if let Ok(Ok(mut conn)) =
+                    tokio::time::timeout(Duration::from_secs(2), connect).await
+                {
                     let _ = conn.write_all(&data).await;
+                    let _ = conn.flush().await;
                 }
             })
             .await;
@@ -1451,5 +1456,42 @@ mod tests {
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.contains("Server: portail"));
         assert!(!result_str.contains("old-server"));
+    }
+
+    /// A copy goes out as a request to that backend would, or not at
+    /// all: over the policy's TLS, over unverified TLS to an `https` port,
+    /// and no byte of it to a backend that fails the policy.
+    #[tokio::test]
+    async fn a_mirror_is_copied_the_way_its_backend_is_spoken_to() {
+        use crate::config::{BackendCa, BackendTls};
+        use crate::proxy::backend_pool::BackendProto;
+        use crate::proxy::testkit::{delivered, TestCa, GET_A, OK};
+        use crate::proxy::upstream::tls::Verify;
+        let (ca, other) = (TestCa::new(), TestCa::new());
+        let bundles = [("ca".to_string(), ca.pem())].into_iter().collect();
+        let tls = BackendTls {
+            hostname: "svc.test".to_string(),
+            subject_alt_names: vec![],
+            ca: BackendCa::Bundle("ca".to_string()),
+        };
+        let verified = BackendProto::Verified(Verify::of(&tls, &bundles).unwrap());
+        let unverified = BackendProto::Tls("svc.test".into());
+
+        for (issuer, proto, copied) in [
+            (&ca, &verified, true),
+            (&other, &verified, false),
+            (&other, &unverified, true),
+        ] {
+            let (backend, mut seen) = issuer.backend(&["svc.test"], &[], OK.as_bytes()).await;
+            let mirror = HttpFilter::RequestMirror {
+                backend_addr: backend,
+                fraction: crate::routing::Fraction::ALL,
+                proto: proto.clone(),
+            };
+            dispatch_mirrors(&[mirror], GET_A);
+            let seen = delivered(&mut seen).await;
+            let want = if copied { GET_A } else { b"" };
+            assert_eq!(seen.as_bytes(), want, "{proto:?}");
+        }
     }
 }

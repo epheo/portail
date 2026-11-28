@@ -3,9 +3,12 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::compile::{CompiledFilter, CompiledRule};
 use super::types::*;
+use crate::proxy::backend_pool::BackendProto;
+use crate::proxy::upstream::tls::Verify;
 use crate::routing::{Backend, BackendAction, RouteTable};
 
 impl PortailConfig {
@@ -87,6 +90,9 @@ pub(crate) enum BuildPolicy {
 /// fail lookups without a resolver.
 pub(crate) type Lookup<'l> = dyn FnMut(&str, u16) -> Result<Vec<SocketAddr>> + 'l;
 
+/// A backendRef asks for a verified TLS that cannot be given.
+struct Unverifiable;
+
 /// One lookup per distinct (name, port) per build: rules sharing a backend
 /// get one address set, and a dead name costs one resolver timeout, not one
 /// per rule.
@@ -98,9 +104,40 @@ struct Resolver<'a, 'l> {
     app_protocols: &'a HashMap<(String, u16), String>,
     headless_target_ports: &'a HashMap<(String, u16), u16>,
     dial_rules: Option<&'a super::DialRules>,
+    backend_cas: &'a std::collections::BTreeMap<String, String>,
+    /// One per distinct policy per build. `None`: it cannot be honoured.
+    verifies: HashMap<BackendTls, Option<Arc<Verify>>>,
 }
 
 impl Resolver<'_, '_> {
+    /// The verified TLS `br` asks for, if it asks. `Err`: it cannot be
+    /// given (no such bundle, nothing in it to trust, no system root, a
+    /// ref that is not reached over TLS), and the ref's share must fail
+    /// rather than go out unverified. Said once per policy and build.
+    fn verify(&mut self, br: &BackendRef) -> Result<Option<Arc<Verify>>, Unverifiable> {
+        let Some(tls) = &br.tls else {
+            return Ok(None);
+        };
+        if br.is_gateway() {
+            tracing::error!(
+                "Backend {}:{} is refused: a Gateway is not reached over TLS",
+                br.name,
+                br.port
+            );
+            return Err(Unverifiable);
+        }
+        if let Some(known) = self.verifies.get(tls) {
+            return known.clone().map(Some).ok_or(Unverifiable);
+        }
+        let built = Verify::of(tls, self.backend_cas)
+            .inspect_err(|why| {
+                tracing::error!("Backends verified as {} are refused: {}", tls.hostname, why)
+            })
+            .ok();
+        self.verifies.insert(tls.clone(), built.clone());
+        built.map(Some).ok_or(Unverifiable)
+    }
+
     /// A ref's own appProtocol (a file config), else its Service port's.
     fn app_protocol<'s>(&'s self, br: &'s BackendRef) -> Option<&'s str> {
         br.app_protocol.as_deref().or_else(|| {
@@ -253,7 +290,15 @@ impl Resolver<'_, '_> {
     fn backends(&mut self, refs: &[BackendRef], what: &str) -> Result<Vec<Backend>> {
         let mut backends = Vec::new();
         for br in refs {
-            if br.invalid {
+            if br.tls.is_some() {
+                tracing::error!(
+                    "{} backend {}:{} is refused: only an HTTP rule reaches its backends over TLS",
+                    what,
+                    br.name,
+                    br.port
+                );
+            }
+            if br.invalid || br.tls.is_some() {
                 backends.push(Backend::rejecting(br.weight));
             } else if br.is_gateway() {
                 backends.extend(self.gateway_endpoints(br));
@@ -316,6 +361,7 @@ fn backend_at(socket_addr: SocketAddr, weight: u32, server_name: &str) -> Backen
         filters: vec![],
         use_tls: false,
         server_name: server_name.to_string(),
+        verify: None,
         action: crate::routing::BackendAction::Forward,
     }
 }
@@ -354,6 +400,8 @@ impl PortailConfig {
             app_protocols: &self.app_protocol_overrides,
             headless_target_ports: &self.headless_target_ports,
             dial_rules: self.dial_rules.as_ref(),
+            backend_cas: &self.backend_cas,
+            verifies: HashMap::new(),
         };
         let mut route_table = routing::RouteTable::new();
 
@@ -702,6 +750,10 @@ impl PortailConfig {
                 backends.push(Backend::rejecting(backend_ref.weight));
                 continue;
             }
+            let Ok(verify) = resolver.verify(backend_ref) else {
+                backends.push(Backend::rejecting(backend_ref.weight));
+                continue;
+            };
             if backend_ref.is_gateway() {
                 for mut backend in resolver.gateway_endpoints(backend_ref) {
                     backend.filters = backend_filters.clone();
@@ -711,14 +763,26 @@ impl PortailConfig {
             }
 
             let app_protocol = resolver.app_protocol(backend_ref);
-            let use_tls = app_protocol == Some("https");
+            // A policy on the port wins over its appProtocol.
+            let use_tls = verify.is_some() || app_protocol == Some("https");
             let action = service_action(app_protocol);
+            // That connect writes the header and no TLS follows it.
+            if verify.is_some() && action == BackendAction::ForwardProxied {
+                tracing::error!(
+                    "Backend {}:{} is refused: a port that takes a PROXY header is not reached over TLS",
+                    backend_ref.name,
+                    backend_ref.port
+                );
+                backends.push(Backend::rejecting(backend_ref.weight));
+                continue;
+            }
             let before = backends.len();
             let refused =
                 resolver.endpoints(&backend_ref.name, backend_ref.port, "HTTP", |addr, name| {
                     let mut backend = backend_at(addr, backend_ref.weight, name);
                     backend.filters = backend_filters.clone();
                     backend.use_tls = use_tls;
+                    backend.verify = verify.clone();
                     backend.action = action;
                     backends.push(backend);
                 })?;
@@ -744,18 +808,36 @@ fn rule_filters(
             CompiledFilter::Ready(filter) => out.push(filter.clone()),
             CompiledFilter::Mirror { backend, .. } if backend.invalid => {}
             CompiledFilter::Mirror { backend, fraction } => {
+                // No copy at all, rather than one in the clear.
+                let Ok(verify) = resolver.verify(backend) else {
+                    continue;
+                };
+                let https = resolver.app_protocol(backend) == Some("https");
                 // Copies go to one endpoint (HTTPRequestMirrorFilter.backendRef).
                 // The smallest address, not the resolver's first: records
                 // reordered between lookups would change the table and its
                 // DNS signature, and the refresh would swap on every tick.
-                let mut smallest: Option<SocketAddr> = None;
-                resolver.endpoints(&backend.name, backend.port, "RequestMirror", |addr, _| {
-                    smallest = Some(smallest.map_or(addr, |s| s.min(addr)));
-                })?;
-                if let Some(backend_addr) = smallest {
+                let mut smallest: Option<(SocketAddr, Box<str>)> = None;
+                resolver.endpoints(
+                    &backend.name,
+                    backend.port,
+                    "RequestMirror",
+                    |addr, name| {
+                        if smallest.as_ref().is_none_or(|(s, _)| addr < *s) {
+                            smallest = Some((addr, name.into()));
+                        }
+                    },
+                )?;
+                if let Some((backend_addr, server_name)) = smallest {
+                    let proto = match verify {
+                        Some(verify) => BackendProto::Verified(verify),
+                        None if https => BackendProto::Tls(server_name),
+                        None => BackendProto::Plain,
+                    };
                     out.push(crate::routing::HttpFilter::RequestMirror {
                         backend_addr,
                         fraction: *fraction,
+                        proto,
                     });
                 }
             }
@@ -1528,6 +1610,7 @@ mod tests {
         if let crate::routing::HttpFilter::RequestMirror {
             backend_addr,
             fraction,
+            ..
         } = &rule.filters[0]
         {
             assert_eq!(backend_addr.port(), 9999);
@@ -2616,5 +2699,209 @@ mod tests {
         for (kind, addrs) in dialed(&external) {
             assert_eq!(addrs, vec![picked], "{kind}");
         }
+    }
+
+    /// One route of `kind` whose first ref asks for `tls`, as its mirror
+    /// does when the route is an HTTP one.
+    fn with_tls(kind: &str, tls: serde_json::Value, cas: serde_json::Value) -> PortailConfig {
+        let http = kind == "httpRoutes";
+        let mut rule = serde_json::json!({"backendRefs": [
+            {"name": "127.0.0.1", "port": 8001, "tls": tls},
+            {"name": "127.0.0.1", "port": 8002}
+        ]});
+        let mut route = serde_json::json!({"parentRefs": [{"name": "g", "sectionName": "l"}]});
+        if http {
+            rule["filters"] = serde_json::json!([{"type": "RequestMirror", "requestMirror": {
+                "backendRef": {"name": "127.0.0.1", "port": 9999, "tls": tls}}}]);
+            route["hostnames"] = serde_json::json!(["x.test"]);
+        }
+        route["rules"] = serde_json::json!([rule]);
+        let protocol = if http { "HTTP" } else { "TCP" };
+        serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": protocol, "port": 8080}]},
+            "backendCas": cas,
+            kind: [route]
+        }))
+        .unwrap()
+    }
+
+    fn a_bundle() -> String {
+        crate::proxy::testkit::TestCa::new().pem()
+    }
+
+    /// The policy makes the ref TLS by itself, and its mirror with it.
+    #[test]
+    fn a_ref_with_tls_is_reached_verified_and_so_is_its_mirror() {
+        let tls = serde_json::json!({"hostname": "svc.test", "ca": {"bundle": "ca"}});
+        let config = with_tls("httpRoutes", tls, serde_json::json!({"ca": a_bundle()}));
+        config.validate().unwrap();
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("x.test", "GET", "/", &[], "", 8080)
+            .unwrap();
+
+        let [verified, plain] = &rule.backends[..] else {
+            panic!("{} backends", rule.backends.len())
+        };
+        assert!(verified.use_tls && verified.verify.is_some());
+        assert!(!plain.use_tls && plain.verify.is_none());
+        let [crate::routing::HttpFilter::RequestMirror {
+            proto: crate::proxy::backend_pool::BackendProto::Verified(verify),
+            ..
+        }] = &rule.filters[..]
+        else {
+            panic!("{:?}", rule.filters)
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            verify,
+            verified.verify.as_ref().unwrap()
+        ));
+    }
+
+    /// A copy goes out as a request to that port would: over TLS to an
+    /// `https` one, where it used to go in the clear.
+    #[test]
+    fn a_mirror_to_an_https_port_is_copied_over_tls() {
+        let mut config: PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "l"}],
+                "hostnames": ["x.test"],
+                "rules": [{
+                    "filters": [
+                        {"type": "RequestMirror", "requestMirror": {
+                            "backendRef": {"name": "127.0.0.1", "port": 9998, "app_protocol": "https"}}},
+                        {"type": "RequestMirror", "requestMirror": {
+                            "backendRef": {"name": "localhost", "port": 9999}}}
+                    ],
+                    "backendRefs": [{"name": "127.0.0.1", "port": 8001}]
+                }]
+            }]
+        }))
+        .unwrap();
+        config
+            .app_protocol_overrides
+            .insert(("localhost".to_string(), 9999), "https".to_string());
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("x.test", "GET", "/", &[], "", 8080)
+            .unwrap();
+        let names: Vec<_> = rule
+            .filters
+            .iter()
+            .map(|f| match f {
+                crate::routing::HttpFilter::RequestMirror {
+                    proto: crate::proxy::backend_pool::BackendProto::Tls(name),
+                    ..
+                } => &**name,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["127.0.0.1", "localhost"]);
+    }
+
+    /// From a snapshot nothing is validated first: the ref keeps its
+    /// share and fails it, its mirror copies nothing, the rest serves.
+    #[test]
+    fn a_ref_whose_tls_cannot_be_given_fails_its_share_and_is_never_reached_unverified() {
+        let tls = serde_json::json!({"hostname": "svc.test", "ca": {"bundle": "absent"}});
+        let config = with_tls("httpRoutes", tls, serde_json::json!({"ca": a_bundle()}));
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("x.test", "GET", "/", &[], "", 8080)
+            .unwrap();
+
+        let actions: Vec<_> = rule.backends.iter().map(|b| b.action).collect();
+        assert_eq!(
+            actions,
+            [
+                crate::routing::BackendAction::Reject,
+                crate::routing::BackendAction::Forward
+            ]
+        );
+        assert!(rule.filters.is_empty());
+
+        let refused = config.validate().unwrap_err().to_string();
+        assert!(refused.contains("no CA bundle named absent"), "{refused}");
+    }
+
+    /// Only an HTTP rule originates TLS: elsewhere the setting would be
+    /// dropped and the backend reached in the clear.
+    #[test]
+    fn tls_on_a_ref_that_is_not_an_http_rules_fails_its_share() {
+        let tls = serde_json::json!({"hostname": "svc.test", "ca": {"bundle": "ca"}});
+        let config = with_tls("tcpRoutes", tls, serde_json::json!({"ca": a_bundle()}));
+        let rt = config.to_route_table_strict().unwrap();
+        let actions: Vec<_> = rt
+            .find_tcp_backends(8080)
+            .unwrap()
+            .iter()
+            .map(|b| b.action)
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                crate::routing::BackendAction::Reject,
+                crate::routing::BackendAction::Forward
+            ]
+        );
+
+        let refused = config.validate().unwrap_err().to_string();
+        assert!(refused.contains("only an HTTP rule"), "{refused}");
+    }
+
+    /// A port that takes a PROXY header is connected to in the clear: a
+    /// policy on it cannot be honoured, so its share fails.
+    #[test]
+    fn tls_on_a_port_that_takes_a_proxy_header_fails_its_share() {
+        let tls = serde_json::json!({"hostname": "svc.test", "ca": {"bundle": "ca"}});
+        let mut config = with_tls("httpRoutes", tls, serde_json::json!({"ca": a_bundle()}));
+        config.app_protocol_overrides.insert(
+            ("127.0.0.1".to_string(), 8001),
+            PROXY_V2_APP_PROTOCOL.to_string(),
+        );
+        let rt = config.to_route_table_strict().unwrap();
+        let rule = rt
+            .find_http_route("x.test", "GET", "/", &[], "", 8080)
+            .unwrap();
+        let actions: Vec<_> = rule.backends.iter().map(|b| b.action).collect();
+        assert_eq!(
+            actions,
+            [
+                crate::routing::BackendAction::Reject,
+                crate::routing::BackendAction::Forward
+            ]
+        );
+    }
+
+    /// What goes over the wire and what a file writes are one shape. A
+    /// field this build does not know refuses the whole config: a data
+    /// plane never drops part of what a policy asks.
+    #[test]
+    fn backend_tls_survives_the_wire_and_refuses_what_it_does_not_know() {
+        let tls = serde_json::json!({
+            "hostname": "svc.test",
+            "subjectAltNames": [{"hostname": "svc.test"}, {"uri": "spiffe://td/ns/a/sa/b"}],
+            "ca": "system"
+        });
+        let config = with_tls("httpRoutes", tls.clone(), serde_json::json!({"ca": "pem"}));
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            wire["httpRoutes"][0]["rules"][0]["backendRefs"][0]["tls"],
+            tls
+        );
+        assert_eq!(wire["backendCas"], serde_json::json!({"ca": "pem"}));
+        let back: PortailConfig = serde_json::from_value(wire.clone()).unwrap();
+        let back_tls = &back.http_routes[0].rules[0].backend_refs[0].tls;
+        assert_eq!(
+            *back_tls,
+            config.http_routes[0].rules[0].backend_refs[0].tls
+        );
+        assert_eq!(back.backend_cas, config.backend_cas);
+
+        let mut unknown = wire;
+        unknown["httpRoutes"][0]["rules"][0]["backendRefs"][0]["tls"]["clientCertificate"] =
+            serde_json::json!("c");
+        assert!(serde_json::from_value::<PortailConfig>(unknown).is_err());
     }
 }

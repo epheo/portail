@@ -368,6 +368,7 @@ impl Backend {
             filters: vec![],
             use_tls: false,
             server_name: address,
+            verify: None,
             action: BackendAction::Forward,
         })
     }
@@ -390,6 +391,7 @@ impl Backend {
             filters: vec![],
             use_tls: false,
             server_name: String::new(),
+            verify: None,
             action: BackendAction::Reject,
         }
     }
@@ -412,6 +414,7 @@ impl Backend {
                 filters: vec![],
                 use_tls: false,
                 server_name: address.clone(),
+                verify: None,
                 action: BackendAction::Forward,
             })
             .collect())
@@ -495,6 +498,7 @@ mod tests {
                 .map(|addr| HttpFilter::RequestMirror {
                     backend_addr: addr.parse().unwrap(),
                     fraction: Fraction::ALL,
+                    proto: crate::proxy::backend_pool::BackendProto::Plain,
                 })
                 .into_iter()
                 .collect();

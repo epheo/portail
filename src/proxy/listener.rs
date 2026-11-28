@@ -679,8 +679,11 @@ mod tests {
             let reply = read_one_reply(&mut client).await;
             assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
             let me = client.local_addr().unwrap();
+            // Both ends: a client of another test may hold the same port
+            // towards another listener.
             let is_accepted = |sock: &socket2::SockRef<'_>| {
-                sock.peer_addr().ok().and_then(|a| a.as_socket()) == Some(me)
+                let end = |a: std::io::Result<socket2::SockAddr>| a.ok()?.as_socket();
+                end(sock.peer_addr()) == Some(me) && end(sock.local_addr()) == Some(addr)
             };
             assert_eq!(keepalive_where(is_accepted), want, "{addr}");
             assert!(

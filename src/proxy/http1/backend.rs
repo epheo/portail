@@ -106,7 +106,7 @@ pub(super) async fn connect_to_backend(
     deadline: Option<tokio::time::Instant>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
-    let (use_tls, server_name) = (backend_ref.use_tls, backend_ref.server_name.as_str());
+    let proto = backend_ref.proto();
     let acquired = if backend_ref.action == BackendAction::ForwardProxied {
         // Never pooled: its header names this request's client, and a
         // pooled conn would carry it to another client's request.
@@ -119,13 +119,11 @@ pub(super) async fn connect_to_backend(
         );
         within(timer, deadline, connect).await
     } else {
-        match state.pool.take_idle(backend_addr, use_tls, server_name) {
+        match state.pool.take_idle(backend_addr, proto) {
             Some(conn) => Some(Ok((conn, true))),
             None => {
                 let keepalive = &state.backend_keepalive;
-                let connect = state
-                    .pool
-                    .acquire(backend_addr, use_tls, server_name, keepalive);
+                let connect = state.pool.acquire(backend_addr, proto, keepalive);
                 within(timer, deadline, connect).await
             }
         }
@@ -319,5 +317,63 @@ mod tests {
             let out = exchange(&mut client, GET_A).await;
             assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
         });
+    }
+
+    /// What a snapshot or a file gives: a backendRef with `tls`, and the
+    /// bundle it names.
+    fn verified(backend: std::net::SocketAddr, hostname: &str, ca_pem: &str) -> RouteTable {
+        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+            "backendCas": {"ca": ca_pem},
+            "httpRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "http"}],
+                "hostnames": ["a.test"],
+                "rules": [{"backendRefs": [{
+                    "name": "127.0.0.1",
+                    "port": backend.port(),
+                    "tls": {"hostname": hostname, "ca": {"bundle": "ca"}}
+                }]}]
+            }]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        config.to_route_table_strict().unwrap()
+    }
+
+    /// No appProtocol on the ref: the policy alone makes it TLS.
+    #[tokio::test]
+    async fn a_request_reaches_a_backend_verified_under_its_policy() {
+        use crate::proxy::testkit::{delivered, response, TestCa, OK};
+        let ca = TestCa::new();
+        let (backend, mut seen) = ca.backend(&["svc.test"], &[], OK.as_bytes()).await;
+        let (mut client, _engine) = serve(verified(backend, "svc.test", &ca.pem()));
+
+        for _ in 0..2 {
+            client.write_all(GET_A).await.unwrap();
+            assert_eq!(response(&mut client).await, OK);
+        }
+        drop(client);
+        let seen = delivered(&mut seen).await;
+        assert_eq!(
+            seen.matches("GET / HTTP/1.1").count(),
+            2,
+            "one conn: {seen}"
+        );
+    }
+
+    /// Wrong issuer or wrong name: the handshake stops before any request
+    /// byte, and the client is told the backend is bad.
+    #[tokio::test]
+    async fn a_backend_failing_its_policy_gets_no_request_and_the_client_a_502() {
+        use crate::proxy::testkit::{delivered, TestCa, OK};
+        let (ca, other) = (TestCa::new(), TestCa::new());
+        for (issuer, hostname) in [(&other, "svc.test"), (&ca, "else.test")] {
+            let (backend, mut seen) = issuer.backend(&["svc.test"], &[], OK.as_bytes()).await;
+            let (mut client, _engine) = serve(verified(backend, hostname, &ca.pem()));
+
+            let out = exchange(&mut client, GET_A).await;
+            assert!(out.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{out}");
+            assert_eq!(delivered(&mut seen).await, "");
+        }
     }
 }
