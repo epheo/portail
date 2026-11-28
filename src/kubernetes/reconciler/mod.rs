@@ -2,11 +2,11 @@ use anyhow::Result;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use gateway_api::experimental::httproutes::v1::*;
 use gateway_api::experimental::tcproutes::v1::*;
 use gateway_api::experimental::tlsroutes::v1::*;
 use gateway_api::experimental::udproutes::v1::*;
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
-use gateway_api::httproutes::*;
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use k8s_openapi::api::core::v1::Service;

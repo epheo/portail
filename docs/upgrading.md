@@ -13,6 +13,8 @@
 - A request mirror to a port with appProtocol `https` is sent over TLS: it went out in the clear.
 - A `CORS` filter on an HTTPRoute needs data planes of this release, for the same reason: an older one refuses the configuration and keeps serving its last. Until now such a route was `Accepted=False`, reason `UnsupportedValue`.
 - So does a rule's `retry`: until now the stanza was ignored, and a request was sent once. With data planes of this release a rule that has one retries, once by default, as the API defines it.
+- With the experimental Gateway API CRDs, an HTTPRoute rule with `sessionPersistence` was served without it. It is now `Accepted=False`, reason `UnsupportedValue`.
+- So is one with an `ExternalAuth` filter. Until now such a route was never seen: it got no status, or, edited in, its last version went on being served.
 
 ## From 0.2.1
 

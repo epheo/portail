@@ -18,12 +18,12 @@ use crate::kubernetes::reads::{Kind as ReadKind, Recorded as RecordedStore};
 use kube::Client;
 use serde_json::{json, Value};
 
+use gateway_api::experimental::httproutes::v1::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
 use gateway_api::experimental::tlsroutes::v1::TlsRoute;
 use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::{GatewayClass, GatewayClassParametersRef, GatewayClassSpec};
 use gateway_api::gateways::{Gateway, GatewayListeners, GatewaySpec};
-use gateway_api::httproutes::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use super::reconcile::{finish, forget_deleted_gateways, publish, Step};

@@ -456,7 +456,7 @@ macro_rules! impl_route_status_reports {
 }
 
 impl_route_status_reports!(
-    gateway_api::httproutes::HttpRoute,
+    gateway_api::experimental::httproutes::v1::HttpRoute,
     gateway_api::experimental::tcproutes::v1::TcpRoute,
     gateway_api::experimental::tlsroutes::v1::TlsRoute,
     gateway_api::experimental::udproutes::v1::UdpRoute
@@ -899,7 +899,7 @@ mod tests {
     /// the one waiter of `changed`.
     #[tokio::test]
     async fn every_synced_waiter_wakes() {
-        use gateway_api::httproutes::HttpRoute;
+        use gateway_api::experimental::httproutes::v1::HttpRoute;
         let listings = Listings::default();
         let routes = listings.track("HTTPRoute", false);
         let waiters: Vec<_> = (0..2)
@@ -926,7 +926,7 @@ mod tests {
     /// named with why.
     #[tokio::test(start_paused = true)]
     async fn a_core_list_refused_keeps_the_caches_unsynced() {
-        use gateway_api::httproutes::HttpRoute;
+        use gateway_api::experimental::httproutes::v1::HttpRoute;
         let api = MockApi::default();
         api.reply_to(
             "/apis/gateway.networking.k8s.io/v1/httproutes",
@@ -972,7 +972,7 @@ mod tests {
     /// HTTPRoute is watched, and TCPRoute counts as listed while it waits.
     #[tokio::test(start_paused = true)]
     async fn a_bundle_without_tcproutes_still_watches_httproutes() {
-        use gateway_api::httproutes::HttpRoute;
+        use gateway_api::experimental::httproutes::v1::HttpRoute;
         let api = MockApi::default();
         let httproutes = "/apis/gateway.networking.k8s.io/v1/httproutes";
         // First: the longer prefix must win over discovery's.

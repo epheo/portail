@@ -11,12 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use gateway_api::experimental::httproutes::v1::HttpRoute;
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
 use gateway_api::experimental::tlsroutes::v1::TlsRoute;
 use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
-use gateway_api::httproutes::HttpRoute;
 
 use super::external_ips::{self, Assignment};
 use super::gateway_backends::{self, trusted_addresses};
@@ -1203,6 +1203,50 @@ mod tests {
             accepted(&p),
             ("False".into(), "NoValidCACertificate".into())
         );
+    }
+
+    /// A served route edited to ask for what the proxy does not do is no
+    /// longer served, and says why. With the standard types its edit did not
+    /// decode, and the last version went on being served.
+    #[tokio::test]
+    async fn a_route_edited_to_ask_the_unsupported_stops_being_served() {
+        let mut p = Pipeline::new();
+        let gw = testkit::gateway("gw", 1);
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("web", "http", 80, serde_json::json!(8080)),
+        );
+        apply(
+            &mut p.cluster.http_routes,
+            testkit::with_backend(testkit::http_route("r", &["gw"], 1), "web", 80),
+        );
+        p.pass(&gw).await.unwrap();
+        assert_eq!(p.served(&gw).unwrap().config.http_routes.len(), 1);
+
+        let mut edited = testkit::with_backend(testkit::http_route("r", &["gw"], 2), "web", 80);
+        edited.spec.rules.as_mut().unwrap()[0].filters = Some(vec![serde_json::from_value(
+            serde_json::json!({"type": "ExternalAuth", "externalAuth": {
+                "protocol": "HTTP", "backendRef": {"name": "auth", "port": 8080}}}),
+        )
+        .unwrap()]);
+        apply(&mut p.cluster.http_routes, edited);
+        p.api.clear();
+        p.pass(&gw).await.unwrap();
+        let patch = p
+            .api
+            .status_patch("httproutes", "r")
+            .expect("the route's status");
+        let accepted = patch["status"]["parents"][0]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .unwrap()
+            .clone();
+        assert_eq!(accepted["status"], "False", "{accepted}");
+        assert_eq!(accepted["reason"], "UnsupportedValue", "{accepted}");
+        assert!(p.served(&gw).unwrap().config.http_routes.is_empty());
     }
 
     /// A BackendTLSPolicy naming a Service the Gateway routes to gets the

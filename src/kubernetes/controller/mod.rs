@@ -46,12 +46,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use gateway_api::experimental::httproutes::v1::HttpRoute;
 use gateway_api::experimental::tcproutes::v1::TcpRoute;
 use gateway_api::experimental::tlsroutes::v1::TlsRoute;
 use gateway_api::experimental::udproutes::v1::UdpRoute;
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
-use gateway_api::httproutes::HttpRoute;
 use gateway_api::referencegrants::v1beta1::ReferenceGrant;
 
 use crate::cli::ControllerArgs;

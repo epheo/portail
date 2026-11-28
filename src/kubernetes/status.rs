@@ -1065,7 +1065,7 @@ mod tests {
     /// What the apiserver hands back after we wrote `entries`, through the
     /// typed route status the reflector stores.
     fn stored_route_parents(entries: Vec<Value>) -> Vec<Value> {
-        let typed: gateway_api::httproutes::HttpRouteStatus =
+        let typed: gateway_api::experimental::httproutes::v1::HttpRouteStatus =
             serde_json::from_value(json!({ "parents": entries })).unwrap();
         typed
             .parents
