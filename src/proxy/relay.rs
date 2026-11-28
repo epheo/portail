@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::logging::warn;
@@ -180,21 +180,61 @@ fn fail_l4_backend(
     }
 }
 
-/// What a relay direction reads at a time: little to start, so an idle
-/// tunnel holds little, then doubled up to `RELAY_BUF_MAX` while reads fill
-/// it and the other side takes each whole. Bulk to a fast receiver grows at
-/// once; a chat never does, and a receiver slower than its sender stops
-/// where its socket does. On a TCP route, 8 KiB reads cost 226 ms of proxy
-/// CPU per GiB and 64 KiB reads 97 ms: fewer syscalls for the same bytes.
+/// What a relay direction reads at a time: little to start, then doubled
+/// up to `RELAY_BUF_MAX` while reads fill it and the other side takes each
+/// whole. Bulk to a fast receiver grows at once; a chat never does, and a
+/// receiver slower than its sender stops where its socket does, which
+/// bounds what a tunnel holds while its write waits. On a TCP route, 8 KiB
+/// reads cost 226 ms of proxy CPU per GiB and 64 KiB reads 97 ms: fewer
+/// syscalls for the same bytes.
 const RELAY_BUF: usize = 8 * 1024;
 
 const RELAY_BUF_MAX: usize = 64 * 1024;
 
-/// How long a direction waits for bytes on a grown buffer before giving it
-/// back. A read that would have fitted `RELAY_BUF` gives it back at once.
-/// Either way a tunnel quiet or chatty after a burst holds what one that
-/// never grew does: a pod holds thousands of them.
-const RELAY_BUF_IDLE: Duration = Duration::from_secs(1);
+/// How many sizes a direction reads at: `RELAY_BUF` doubled up to
+/// `RELAY_BUF_MAX`.
+const SIZES: usize = (RELAY_BUF_MAX / RELAY_BUF).trailing_zeros() as usize + 1;
+
+/// Buffers of each size a worker thread keeps for its relays.
+const SPARE_PER_SIZE: usize = 4;
+
+thread_local! {
+    /// A direction borrows its buffer for a read and gives it back once the
+    /// bytes are written, or at once when the read finds none. A tunnel
+    /// with nothing to move holds no buffer: a pod holds thousands of them.
+    /// A change of read size borrows another size: nothing is reallocated.
+    static SPARE: std::cell::RefCell<[Vec<Vec<u8>>; SIZES]> =
+        const { std::cell::RefCell::new([const { Vec::new() }; SIZES]) };
+}
+
+fn spare_of(size: usize) -> usize {
+    (size / RELAY_BUF).trailing_zeros() as usize
+}
+
+fn borrow(size: usize) -> Vec<u8> {
+    #[cfg(test)]
+    BORROWED.with(|n| n.set(n.get() + 1));
+    SPARE
+        .with_borrow_mut(|spare| spare[spare_of(size)].pop())
+        .unwrap_or_else(|| vec![0u8; size])
+}
+
+fn give_back(buf: Vec<u8>) {
+    #[cfg(test)]
+    BORROWED.with(|n| n.set(n.get() - 1));
+    SPARE.with_borrow_mut(|spare| {
+        let kept = &mut spare[spare_of(buf.len())];
+        if kept.len() < SPARE_PER_SIZE {
+            kept.push(buf);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Buffers out of this thread's hands: borrowed and not given back.
+    static BORROWED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
 
 /// Copy both ways until both directions end. While both are open the relay
 /// is unbounded, like any idle TCP session; once one side has finished, the
@@ -244,24 +284,32 @@ async fn finish_half<F: std::future::Future>(
     }
 }
 
-/// A read into `buf`, or `None` once it has waited `idle` for bytes. Bytes
-/// already there come back before any clock is read: a timeout built up
-/// front reads it on every call, which a relay under load makes per chunk.
-async fn read_or_idle<R>(
-    rd: &mut R,
-    buf: &mut [u8],
-    idle: Duration,
-) -> Option<std::io::Result<usize>>
+/// A read of up to `size` bytes into a borrowed buffer, which comes back
+/// with the count. While the read waits it holds none: the buffer is given
+/// back each time it finds nothing, and the reader keeps the task's waker.
+async fn read_borrowing<R>(rd: &mut R, size: usize) -> std::io::Result<(Vec<u8>, usize)>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use std::{future::Future, task::Poll};
-    let mut read = std::pin::pin!(rd.read(buf));
-    let now = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
-    match now {
-        Poll::Ready(read) => Some(read),
-        Poll::Pending => tokio::time::timeout(idle, read).await.ok(),
-    }
+    use std::task::Poll;
+    std::future::poll_fn(|cx| {
+        let mut buf = borrow(size);
+        let polled = {
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            std::pin::Pin::new(&mut *rd)
+                .poll_read(cx, &mut read)
+                .map_ok(|()| read.filled().len())
+        };
+        match polled {
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok((buf, n))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                give_back(buf);
+                Poll::Pending
+            }
+        }
+    })
+    .await
 }
 
 /// One direction of a relay: copy until EOF, then pass the half-close on.
@@ -274,21 +322,12 @@ where
 {
     // Both directions run on one task: a plain add, no locked one.
     let step = || steps.store(steps.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-    let mut buf = vec![0u8; RELAY_BUF];
+    let mut size = RELAY_BUF;
     loop {
-        let n = if buf.len() == RELAY_BUF {
-            rd.read(&mut buf).await?
-        } else {
-            match read_or_idle(rd, &mut buf, RELAY_BUF_IDLE).await {
-                Some(read) => read?,
-                None => {
-                    buf = vec![0u8; RELAY_BUF];
-                    continue;
-                }
-            }
-        };
+        let (buf, n) = read_borrowing(rd, size).await?;
         step();
         if n == 0 {
+            give_back(buf);
             return wr.shutdown().await;
         }
         let (mut written, mut writes) = (0, 0);
@@ -302,10 +341,11 @@ where
         }
         // TLS holds written records until flushed.
         wr.flush().await?;
-        if n == buf.len() && writes == 1 && n < RELAY_BUF_MAX {
-            buf.resize((n * 2).min(RELAY_BUF_MAX), 0);
-        } else if n <= RELAY_BUF && buf.len() > RELAY_BUF {
-            buf = vec![0u8; RELAY_BUF];
+        give_back(buf);
+        if n == size && writes == 1 {
+            size = (size * 2).min(RELAY_BUF_MAX);
+        } else if n <= RELAY_BUF {
+            size = RELAY_BUF;
         }
     }
 }
@@ -319,7 +359,7 @@ mod tests {
     };
     use crate::routing::Backend;
     use std::pin::Pin;
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncReadExt, DuplexStream};
     use tokio::net::TcpListener;
 
     /// What a relay direction reads next: `Some(n)` bytes, the whole buffer
@@ -394,33 +434,71 @@ mod tests {
 
     /// A relay direction reads more at a time while a burst fills its
     /// buffer and the other side takes each read whole, and goes back to
-    /// the small buffer after it: thousands of tunnels each hold theirs.
+    /// the small size at a read that would have fitted it.
     #[tokio::test(start_paused = true)]
-    async fn a_relay_buffer_grows_with_a_burst_and_is_given_back_after() {
+    async fn a_relay_reads_more_at_a_time_through_a_burst() {
         const K: usize = 1024;
         const FULL: usize = usize::MAX;
+        const WAIT: Duration = Duration::from_millis(100);
         let burst = [FULL; 5];
         let grown = [8 * K, 16 * K, 32 * K, 64 * K];
 
-        // Silence after the burst: given back once it has waited.
-        let sizes = offered(&burst, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
-        assert_eq!(sizes, grown, "still grown before the wait is over");
-        let sizes = offered(&burst, tokio::io::sink(), RELAY_BUF_IDLE * 2).await;
-        assert_eq!(sizes, [8 * K, 16 * K, 32 * K, 64 * K, 8 * K]);
+        let sizes = offered(&burst, tokio::io::sink(), WAIT).await;
+        assert_eq!(sizes, grown);
 
-        // A chat after the burst: given back at its first short read.
+        // A chat after the burst: back to the small size after its first
+        // short read.
         let chat = [FULL, FULL, FULL, FULL, FULL, 100];
-        let sizes = offered(&chat, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
+        let sizes = offered(&chat, tokio::io::sink(), WAIT).await;
         assert_eq!(sizes, [8 * K, 16 * K, 32 * K, 64 * K, 8 * K]);
 
-        // Reads that would not fit the small buffer keep the grown one.
+        // Reads that would not fit the small size keep the grown one.
         let stream = [FULL, FULL, FULL, FULL, 20 * K, 20 * K];
-        let sizes = offered(&stream, tokio::io::sink(), RELAY_BUF_IDLE / 2).await;
+        let sizes = offered(&stream, tokio::io::sink(), WAIT).await;
         assert_eq!(sizes, grown);
 
         // A receiver that takes writes in pieces: no growth to begin with.
-        let sizes = offered(&burst, HalfWrites, RELAY_BUF_IDLE / 2).await;
+        let sizes = offered(&burst, HalfWrites, WAIT).await;
         assert_eq!(sizes, [8 * K]);
+    }
+
+    /// A direction holds a buffer from a read that found bytes to the end
+    /// of their write, and none while it waits.
+    #[tokio::test]
+    async fn a_direction_waiting_for_bytes_holds_no_buffer() {
+        let (mut client, relayed) = tokio::io::duplex(1024);
+        let (backend, mut served) = tokio::io::duplex(1024);
+        let out = || BORROWED.with(|n| n.get());
+        let before = out();
+        let mut relay = std::pin::pin!(both_ways(relayed, backend, None));
+        // Both directions have looked for bytes and found none.
+        assert!(futures::poll!(relay.as_mut()).is_pending());
+        assert_eq!(
+            out(),
+            before,
+            "a buffer held by a direction with nothing to move"
+        );
+
+        client.write_all(b"ping").await.unwrap();
+        assert!(futures::poll!(relay.as_mut()).is_pending());
+        let mut got = [0u8; 4];
+        served.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+        assert_eq!(out(), before, "a buffer kept after its bytes were written");
+    }
+
+    /// A thread keeps a few buffers of each size and lets the rest go.
+    #[test]
+    fn a_thread_keeps_few_spare_buffers() {
+        let kept = |size: usize| SPARE.with_borrow(|spare| spare[spare_of(size)].len());
+        for size in [RELAY_BUF, RELAY_BUF_MAX] {
+            let out: Vec<_> = (0..SPARE_PER_SIZE + 3).map(|_| borrow(size)).collect();
+            assert!(out.iter().all(|buf| buf.len() == size));
+            out.into_iter().for_each(give_back);
+            assert_eq!(kept(size), SPARE_PER_SIZE);
+            assert_eq!(borrow(size).len(), size);
+            assert_eq!(kept(size), SPARE_PER_SIZE - 1);
+        }
     }
 
     /// A passthrough connection that drew an invalid backendRef's share

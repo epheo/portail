@@ -533,3 +533,116 @@ fn a_full_path_rewrite_borrows_the_rules_values() {
     );
     drop(rewrite);
 }
+
+/// Many tunnels on one worker, each end sending and reading in bursts: the
+/// relay allocates nothing per read. Reads change size with every burst; a
+/// tunnel that owned its buffer would reallocate it at each change.
+#[test]
+fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
+    const TUNNELS: usize = 32;
+    const COUNTED: u64 = 1024 * 1024 * 1024;
+    // The scenario's pacing: each end rests after every burst.
+    const REST: Duration = Duration::from_micros(400);
+
+    // Tunnels that have delivered their first bytes, bytes delivered, and
+    // senders that could not connect or send: one of those would leave the
+    // waits below waiting.
+    let (delivered, mut seen) = tokio::sync::watch::channel((0usize, 0u64, 0usize));
+    let delivered = Arc::new(delivered);
+    let failed = delivered.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Reads a burst, then rests: on threads of its own, as the senders are,
+    // so only the proxy's allocations are counted.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let delivered = delivered.clone();
+            std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 256 * 1024];
+                let (mut first, mut unsaid) = (true, 0u64);
+                while let Ok(n @ 1..) = sock.read(&mut chunk) {
+                    unsaid += n as u64;
+                    // Said a mebibyte at a time: each word wakes the test's
+                    // task on the proxy's thread, between two relays.
+                    if first || unsaid >= 1024 * 1024 {
+                        delivered.send_modify(|(tunnels, bytes, _)| {
+                            *tunnels += usize::from(std::mem::take(&mut first));
+                            *bytes += std::mem::take(&mut unsaid);
+                        });
+                    }
+                    std::thread::sleep(REST);
+                }
+            });
+        }
+    });
+
+    let mut table = RouteTable::new();
+    table.add_tcp_route(
+        80,
+        vec![Backend {
+            socket_addr: backend,
+            weight: 1,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: BackendAction::Forward,
+        }],
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let allocations = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let ctx = ListenerCtx {
+            server_port: 80,
+            routes: Arc::new(ArcSwap::from_pointee(table)),
+            cfg: ServeConfig::from_perf(&PerformanceConfig::default(), 64),
+            plan: Default::default(),
+            health: Arc::new(HealthRegistry::new()),
+            selector: Arc::new(BackendSelector::new()),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
+        for _ in 0..TUNNELS {
+            let (stop, failed) = (stop.clone(), failed.clone());
+            std::thread::spawn(move || {
+                let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
+                let chunk = vec![7u8; 64 * 1024];
+                let sent = std::net::TcpStream::connect(proxy).and_then(|mut sock| {
+                    while !stopped() {
+                        sock.write_all(&chunk)?;
+                        std::thread::sleep(REST);
+                    }
+                    Ok(())
+                });
+                if sent.is_err() && !stopped() {
+                    failed.send_modify(|(_, _, failed)| *failed += 1);
+                }
+            });
+        }
+        // Every tunnel is open, and each direction has borrowed once.
+        let warm = seen
+            .wait_for(|(tunnels, _, failed)| *tunnels == TUNNELS || *failed > 0)
+            .await;
+        let from = warm.unwrap().1;
+        let before = ALLOCATIONS.with(Cell::get);
+        let moved = seen
+            .wait_for(|(_, bytes, failed)| *bytes >= from + COUNTED || *failed > 0)
+            .await;
+        assert_eq!(moved.unwrap().2, 0, "a sender could not connect or send");
+        ALLOCATIONS.with(Cell::get) - before
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A relay that allocates per read makes 16 a mebibyte at the least.
+    let most = (COUNTED / (1024 * 1024)) as usize;
+    assert!(
+        allocations < most,
+        "{allocations} allocations for {most} MiB"
+    );
+}
