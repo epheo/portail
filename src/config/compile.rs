@@ -75,6 +75,7 @@ pub(crate) struct CompiledRule<'a> {
     pub filters: Vec<CompiledFilter<'a>>,
     /// Filters of each entry of `source.backend_refs`, in order.
     pub backend_filters: Vec<Vec<routing::HttpFilter>>,
+    pub retry: Option<routing::Retry>,
 }
 
 pub(crate) enum CompiledFilter<'a> {
@@ -102,6 +103,7 @@ impl CompiledMatch {
         filters: &[routing::HttpFilter],
         backends: &[routing::Backend],
         timeouts: Option<&HttpRouteTimeouts>,
+        retry: Option<&routing::Retry>,
     ) -> routing::HttpRouteRule {
         let mut rule = routing::HttpRouteRule::new(
             self.path_match_type.clone(),
@@ -117,6 +119,7 @@ impl CompiledMatch {
             rule.request_timeout = timeouts.request;
             rule.backend_request_timeout = timeouts.backend_request;
         }
+        rule.retry = retry.cloned();
         rule
     }
 }
@@ -175,7 +178,28 @@ fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
         matches,
         filters,
         backend_filters,
+        retry: rule
+            .retry
+            .as_ref()
+            .map(compile_retry)
+            .transpose()?
+            .flatten(),
     })
+}
+
+/// `None` for a stanza that asks for no attempt beyond the first.
+fn compile_retry(retry: &HttpRouteRetry) -> Result<Option<routing::Retry>, RouteError> {
+    // What the API allows: a status below 400 is no failure to try again.
+    if let Some(code) = retry.codes.iter().find(|code| !(400..=599).contains(*code)) {
+        return Err(RouteError::unsupported(format!(
+            "retry codes must be 400 to 599, got {code}"
+        )));
+    }
+    Ok((retry.attempts > 0).then(|| routing::Retry {
+        codes: retry.codes.clone().into(),
+        attempts: retry.attempts,
+        backoff: retry.backoff,
+    }))
 }
 
 /// Combinations within one rule that would put a malformed message on the

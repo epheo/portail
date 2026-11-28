@@ -245,6 +245,7 @@ fn convert_http_rule(rule: &HttpRouteRules, ns: &str) -> (HttpRouteRule, Option<
         filters,
         backend_refs,
         timeouts,
+        retry: None,
     };
     (rule, first)
 }
