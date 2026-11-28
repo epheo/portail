@@ -360,6 +360,16 @@ fn judge(validation: &BackendTlsPolicyValidation, configmap: &impl Fn(&str) -> C
         resolved_refs: resolved.clone(),
         decision: Decision::Refuse,
     };
+    // The CRD lets `*.` through; what it would match is not said, and a
+    // certificate check matches a server name, which a wildcard is not.
+    if let Some(wild) = sans(validation).into_iter().find_map(|san| match san {
+        San::Hostname(h) if h.starts_with("*.") => Some(h),
+        _ => None,
+    }) {
+        return invalid(format!(
+            "subjectAltNames hostname {wild}: a wildcard is not supported"
+        ));
+    }
     let refs = validation
         .ca_certificate_refs
         .as_deref()
@@ -647,12 +657,14 @@ mod tests {
         assert_eq!(v.ca, Ca::Bundle(pem));
     }
 
-    /// An unknown wellKnownCACertificates, or both CA sources at once, is
-    /// Accepted=False Invalid and refuses the backend.
+    /// An unknown wellKnownCACertificates, both CA sources at once, or a
+    /// wildcard SAN, is Accepted=False Invalid and refuses the backend.
     #[test]
     fn a_bad_ca_source_is_invalid() {
         for validation in [
             json!({"hostname": "a.test", "wellKnownCACertificates": "example.com/mine"}),
+            json!({"hostname": "a.test", "wellKnownCACertificates": "System",
+                   "subjectAltNames": [{"type": "Hostname", "hostname": "*.a.test"}]}),
             json!({"hostname": "a.test", "wellKnownCACertificates": "System",
                    "caCertificateRefs": [{"group": "", "kind": "ConfigMap", "name": "ca"}]}),
         ] {
