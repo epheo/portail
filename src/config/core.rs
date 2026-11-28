@@ -467,100 +467,55 @@ impl PortailConfig {
                 );
             }
 
-            let matched_listeners: Vec<&ListenerConfig> =
-                find_listeners_for_route(&http_route.parent_refs, &self.gateway)
-                    .into_iter()
-                    .filter(|l| takes_http_routes(l))
-                    .collect();
-
-            // No parentRefs: route without gateway context. One pseudo-scope
-            // on port 0, with no hostname constraint, so hostname
-            // intersection passes routes through; the HTTP and HTTPS
-            // listener ports share it, and no other port does
-            // (`share_any_port_scopes_on`). One copy, not one per port.
-            // Rate limiting rides the listener, so the pseudo-scope has
-            // none. Refs that select no listener attach nowhere.
-            type Scope<'a> = (
-                u16,
-                Option<&'a str>,
-                &'a str,
-                Option<std::sync::Arc<crate::rate_limit::Limiter>>,
-            );
-            let scopes: Vec<Scope> = if http_route.parent_refs.is_empty() {
-                vec![(0, None, "", None)]
-            } else {
-                matched_listeners
-                    .iter()
-                    .map(|l| {
-                        // Registry get-or-create, keyed on the listener
-                        // identity: every rebuild re-attaches the same
-                        // limiter, so bucket state survives table swaps.
-                        let limiter = l.rate_limit.as_ref().map(|rl| {
-                            crate::rate_limit::limiter_for(
-                                l.port,
-                                &l.name,
-                                rl.requests_per_second,
-                                rl.effective_burst(),
-                            )
-                        });
-                        (l.port, l.hostname.as_deref(), l.name.as_str(), limiter)
-                    })
-                    .collect()
-            };
-
-            // For each scope, compute hostname intersection and add routes
-            for (port, listener_hostname, listener_name, limiter) in scopes {
-                let effective_hostnames = if http_route.hostnames.is_empty() {
-                    // Route has no hostnames = match all.
-                    // Use listener hostname if set, otherwise catch-all "*".
-                    vec![listener_hostname.unwrap_or("*").to_string()]
-                } else {
-                    let hostnames = intersect_hostnames(listener_hostname, &http_route.hostnames);
-                    if hostnames.is_empty() {
-                        tracing::warn!(
-                            "HTTP route {} has no hostnames matching listener '{}' scope, skipping",
-                            route_idx,
-                            listener_name
-                        );
-                        continue;
-                    }
-                    hostnames
-                };
-
-                for hostname in &effective_hostnames {
-                    tracing::debug!(
-                        "  Processing hostname: {} for listener {}:{} ({:?})",
-                        hostname,
-                        listener_name,
-                        port,
-                        listener_hostname
-                    );
-                    for rule in &rules {
-                        let mut routing_rule = rule.clone();
-                        // Each inserted rule rotates over its backends alone,
-                        // as when every insert compiled its own rule.
-                        routing_rule.counter = Default::default();
-                        routing_rule.limiter = limiter.clone();
-                        routing_rule.route_index = route_idx as u32;
-                        tracing::debug!(
-                            "      Adding route: {} {} -> {} backends (listener {}:{:?})",
-                            hostname,
-                            routing_rule.path,
-                            routing_rule.backends.len(),
-                            port,
-                            listener_hostname
-                        );
-                        route_table.push_http_route_for_listener(
-                            port,
-                            listener_hostname,
-                            hostname,
-                            routing_rule,
-                        );
-                    }
-                }
-            }
+            self.place_rules(&mut route_table.http, http_route, route_idx, "HTTP", &rules);
         }
         route_table.sort_http_routes();
+
+        // gRPC routes, matched as HTTP routes on the request's
+        // `/{service}/{method}` path, in their own scopes: a request goes to
+        // them or to the HTTP ones by its content-type, never to both.
+        for (route_idx, grpc_route) in self.grpc_routes.iter().enumerate() {
+            // One that fails is left out (lenient) and the rest goes live.
+            let refuse = |e: super::compile::RouteError| -> Result<()> {
+                if policy == BuildPolicy::Strict {
+                    return Err(anyhow!("gRPC route {}: {}", route_idx, e));
+                }
+                tracing::warn!(
+                    "Skipping gRPC route {} {:?} ({}): {}",
+                    route_idx,
+                    grpc_route.hostnames,
+                    e.reason.as_str(),
+                    e
+                );
+                Ok(())
+            };
+            let (http, ranks) = match super::compile::grpc_as_http(grpc_route) {
+                Ok(translated) => translated,
+                Err(e) => {
+                    refuse(e)?;
+                    continue;
+                }
+            };
+            let compiled = match super::compile::compile_http_route(&http) {
+                Ok(compiled) => compiled,
+                Err(e) => {
+                    refuse(e)?;
+                    continue;
+                }
+            };
+            let mut rules = Vec::new();
+            for (rule, rule_ranks) in compiled.rules.iter().zip(&ranks) {
+                let backends = self.rule_backends(rule, &mut resolver)?;
+                let filters = rule_filters(&rule.filters, &mut resolver)?;
+                for (m, rank) in rule.matches.iter().zip(rule_ranks) {
+                    let mut routing_rule = m.to_rule(&filters, &backends, None, None);
+                    routing_rule.grpc_rank = *rank;
+                    rules.push(routing_rule);
+                }
+            }
+            self.place_rules(&mut route_table.grpc, &http, route_idx, "gRPC", &rules);
+        }
+        route_table.sort_grpc_routes();
         route_table.share_any_port_scopes_on(
             self.gateway
                 .listeners
@@ -747,6 +702,106 @@ fn find_listeners_for_route<'a>(
 }
 
 impl PortailConfig {
+    /// Place a route's compiled `rules` in `table`: once per listener its
+    /// parentRefs attach it to, and per hostname it serves there.
+    fn place_rules(
+        &self,
+        table: &mut crate::routing::RuleScopes,
+        route: &HttpRouteConfig,
+        route_idx: usize,
+        kind: &str,
+        rules: &[crate::routing::HttpRouteRule],
+    ) {
+        let matched_listeners: Vec<&ListenerConfig> =
+            find_listeners_for_route(&route.parent_refs, &self.gateway)
+                .into_iter()
+                .filter(|l| takes_http_routes(l))
+                .collect();
+
+        // No parentRefs: route without gateway context. One pseudo-scope
+        // on port 0, with no hostname constraint, so hostname
+        // intersection passes routes through; the HTTP and HTTPS
+        // listener ports share it, and no other port does
+        // (`share_any_port_scopes_on`). One copy, not one per port.
+        // Rate limiting rides the listener, so the pseudo-scope has
+        // none. Refs that select no listener attach nowhere.
+        type Scope<'a> = (
+            u16,
+            Option<&'a str>,
+            &'a str,
+            Option<std::sync::Arc<crate::rate_limit::Limiter>>,
+        );
+        let scopes: Vec<Scope> = if route.parent_refs.is_empty() {
+            vec![(0, None, "", None)]
+        } else {
+            matched_listeners
+                .iter()
+                .map(|l| {
+                    // Registry get-or-create, keyed on the listener
+                    // identity: every rebuild re-attaches the same
+                    // limiter, so bucket state survives table swaps.
+                    let limiter = l.rate_limit.as_ref().map(|rl| {
+                        crate::rate_limit::limiter_for(
+                            l.port,
+                            &l.name,
+                            rl.requests_per_second,
+                            rl.effective_burst(),
+                        )
+                    });
+                    (l.port, l.hostname.as_deref(), l.name.as_str(), limiter)
+                })
+                .collect()
+        };
+
+        // For each scope, compute hostname intersection and add routes
+        for (port, listener_hostname, listener_name, limiter) in scopes {
+            let effective_hostnames = if route.hostnames.is_empty() {
+                // Route has no hostnames = match all.
+                // Use listener hostname if set, otherwise catch-all "*".
+                vec![listener_hostname.unwrap_or("*").to_string()]
+            } else {
+                let hostnames = intersect_hostnames(listener_hostname, &route.hostnames);
+                if hostnames.is_empty() {
+                    tracing::warn!(
+                        "{} route {} has no hostnames matching listener '{}' scope, skipping",
+                        kind,
+                        route_idx,
+                        listener_name
+                    );
+                    continue;
+                }
+                hostnames
+            };
+
+            for hostname in &effective_hostnames {
+                tracing::debug!(
+                    "  Processing hostname: {} for listener {}:{} ({:?})",
+                    hostname,
+                    listener_name,
+                    port,
+                    listener_hostname
+                );
+                for rule in rules {
+                    let mut routing_rule = rule.clone();
+                    // Each inserted rule rotates over its backends alone,
+                    // as when every insert compiled its own rule.
+                    routing_rule.counter = Default::default();
+                    routing_rule.limiter = limiter.clone();
+                    routing_rule.route_index = route_idx as u32;
+                    tracing::debug!(
+                        "      Adding route: {} {} -> {} backends (listener {}:{:?})",
+                        hostname,
+                        routing_rule.path,
+                        routing_rule.backends.len(),
+                        port,
+                        listener_hostname
+                    );
+                    table.push(port, listener_hostname, hostname, routing_rule);
+                }
+            }
+        }
+    }
+
     /// Backends of one compiled rule, resolved through `resolver`.
     fn rule_backends(&self, rule: &CompiledRule, resolver: &mut Resolver) -> Result<Vec<Backend>> {
         let mut backends = Vec::new();
@@ -2977,5 +3032,121 @@ mod tests {
             "httpRoutes": [{"rules": [{"retry": {"attempts": 1, "perTryTimeout": "1s"}, "backendRefs": []}]}]
         });
         assert!(serde_json::from_value::<PortailConfig>(unknown).is_err());
+    }
+
+    /// A gRPC route and an HTTP one on the same hostname and listener,
+    /// each rule's backend port telling which answered.
+    fn grpc_and_http(grpc_rules: serde_json::Value) -> PortailConfig {
+        serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "grpcRoutes": [{"parentRefs": [{"name": "g", "sectionName": "l"}],
+                            "hostnames": ["grpc.test"], "rules": grpc_rules}],
+            "httpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "l"}],
+                            "hostnames": ["grpc.test"],
+                            "rules": [{"backendRefs": [{"name": "127.0.0.1", "port": 8009}]}]}]
+        }))
+        .unwrap()
+    }
+
+    fn to(port: u16) -> serde_json::Value {
+        serde_json::json!([{"name": "127.0.0.1", "port": port}])
+    }
+
+    /// Gateway API's GRPCRoute precedence after the hostname: the longer
+    /// service, then the longer method, then more header matches, then the
+    /// first rule.
+    #[test]
+    fn a_grpc_request_takes_the_rule_with_the_most_specific_match() {
+        let config = grpc_and_http(serde_json::json!([
+            {"backendRefs": to(8005)},
+            {"matches": [{"method": {"type": "RegularExpression", "service": "echo\\..*"}}],
+             "backendRefs": to(8004)},
+            {"matches": [{"method": {"method": "Say"}}], "backendRefs": to(8003)},
+            {"matches": [{"method": {"service": "echo.Echo"}}], "backendRefs": to(8002)},
+            {"matches": [{"method": {"service": "echo.Echo", "method": "Say"}}], "backendRefs": to(8001)},
+            {"matches": [{"method": {"service": "echo.Echo", "method": "Say"},
+                          "headers": [{"name": "version", "value": "2"}]}],
+             "backendRefs": to(8006)}
+        ]));
+        config.validate().unwrap();
+        let rt = config.to_route_table_strict().unwrap();
+        let grpc = |path: &str, headers: &str| {
+            let rule = rt.find_grpc_route("grpc.test", path, headers.as_bytes(), 8080);
+            rule.map(|rule| rule.backends[0].socket_addr.port())
+        };
+        assert_eq!(grpc("/echo.Echo/Say", "version: 2\r\n"), Some(8006));
+        assert_eq!(grpc("/echo.Echo/Say", ""), Some(8001));
+        assert_eq!(grpc("/echo.Echo/Hear", ""), Some(8002));
+        assert_eq!(grpc("/other.Svc/Say", ""), Some(8003));
+        assert_eq!(grpc("/echo.Other/Hear", ""), Some(8004));
+        assert_eq!(grpc("/x.Y/z", ""), Some(8005));
+        assert_eq!(grpc("/echo.Echo/Say", ""), grpc("/echo.Echo/Say", ""));
+
+        // The tables never meet: the HTTP route serves no gRPC request,
+        // and no gRPC rule an HTTP one.
+        let http = rt.find_http_route("grpc.test", "POST", "/echo.Echo/Say", &[], "", 8080);
+        assert_eq!(
+            http.map(|rule| rule.backends[0].socket_addr.port()),
+            Some(8009)
+        );
+        assert!(rt
+            .find_grpc_route("other.test", "/echo.Echo/Say", &[], 8080)
+            .is_none());
+    }
+
+    /// An exact name is matched as written, never as a pattern.
+    #[test]
+    fn an_exact_grpc_name_is_not_a_pattern() {
+        let config = grpc_and_http(serde_json::json!([
+            {"matches": [{"method": {"service": "a.b"}}], "backendRefs": to(8001)}
+        ]));
+        let rt = config.to_route_table_strict().unwrap();
+        assert!(rt
+            .find_grpc_route("grpc.test", "/a.b/M", &[], 8080)
+            .is_some());
+        assert!(rt
+            .find_grpc_route("grpc.test", "/aXb/M", &[], 8080)
+            .is_none());
+        assert!(rt
+            .find_grpc_route("grpc.test", "/a.b/M/more", &[], 8080)
+            .is_none());
+    }
+
+    /// What a gRPC rule cannot do fails its route, from a file or a
+    /// snapshot alike, rather than be served otherwise than written.
+    #[test]
+    fn a_grpc_rule_refuses_what_it_cannot_do() {
+        let gateway_ref = serde_json::json!([{"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                                              "name": "other.default.gateway", "port": 80}]);
+        let mirror = serde_json::json!([{"type": "RequestMirror",
+                                         "requestMirror": {"backendRef": {"name": "127.0.0.1", "port": 9}}}]);
+        for (rule, why) in [
+            (
+                serde_json::json!({"filters": mirror, "backendRefs": to(8001)}),
+                "cannot mirror",
+            ),
+            (
+                serde_json::json!({"backendRefs": gateway_ref}),
+                "cannot reach a Gateway",
+            ),
+            (
+                serde_json::json!({"matches": [{"method": {"type": "Exact"}}], "backendRefs": to(8001)}),
+                "names a service or a method",
+            ),
+            (
+                serde_json::json!({"matches": [{"method": {"type": "RegularExpression", "service": "("}}],
+                                "backendRefs": to(8001)}),
+                "regex",
+            ),
+        ] {
+            let config = grpc_and_http(serde_json::json!([rule]));
+            let refused = format!("{:#}", config.to_route_table_strict().unwrap_err());
+            assert!(refused.contains(why), "{refused}");
+            let route = &config.grpc_routes[0];
+            assert!(
+                super::super::compile::compile_grpc_route(route).is_err(),
+                "{why}"
+            );
+        }
     }
 }

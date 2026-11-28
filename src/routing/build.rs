@@ -222,6 +222,7 @@ impl RouteTable {
     /// [`Self::add_http_route_for_listener`] for a batch: entries stay
     /// unordered until [`Self::sort_http_routes`] runs once after the last
     /// push.
+    #[cfg(test)]
     pub(crate) fn push_http_route_for_listener(
         &mut self,
         listener_port: u16,
@@ -236,6 +237,11 @@ impl RouteTable {
     /// Order every HTTP host entry by match precedence.
     pub(crate) fn sort_http_routes(&mut self) {
         self.http.sort(match_precedence);
+    }
+
+    /// Order every gRPC host entry by gRPC's precedence.
+    pub(crate) fn sort_grpc_routes(&mut self) {
+        self.grpc.sort(grpc_precedence);
     }
 
     /// Serve the shared (port-0) scopes, HTTP and gRPC, on `ports` only,
@@ -333,6 +339,15 @@ pub(super) fn match_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp
                 .len()
                 .cmp(&a.query_param_matches.len())
         })
+}
+
+/// Which of two gRPC rules matching one request takes it, after their
+/// hostnames: more characters of service, then of method, then more header
+/// matches. `Equal` leaves the tie to route order, then rule order.
+fn grpc_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp::Ordering {
+    b.grpc_rank
+        .cmp(&a.grpc_rank)
+        .then_with(|| b.header_matches.len().cmp(&a.header_matches.len()))
 }
 
 fn insert_first<K: std::hash::Hash + Eq>(

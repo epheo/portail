@@ -593,6 +593,9 @@ pub struct HttpRouteRule {
     /// Within a scope the stable sort keeps it; between a port's scope and
     /// the shared one it breaks a tie.
     pub route_index: u32,
+    /// A gRPC rule's precedence after its hostname: the characters of its
+    /// service and method matches. Zero on an HTTP rule, which has its own.
+    pub grpc_rank: (u16, u16),
 }
 
 impl HttpRouteRule {
@@ -627,6 +630,7 @@ impl HttpRouteRule {
             request_timeout: None,
             backend_request_timeout: None,
             retry: None,
+            grpc_rank: (0, 0),
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],

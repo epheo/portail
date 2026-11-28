@@ -223,6 +223,9 @@ extras: {
     fn hostnames(&self) -> &[String] {
         self.spec.hostnames.as_deref().unwrap_or(&[])
     }
+    fn check(config: &GrpcRouteConfig) -> Result<(), RouteError> {
+        crate::config::compile::compile_grpc_route(config)
+    }
     fn mirror_backend_refs(config: &GrpcRouteConfig) -> Vec<(&str, u16, &str, &str)> {
         config
             .rules

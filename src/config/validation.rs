@@ -100,7 +100,7 @@ impl PortailConfig {
     /// A file asking for a verified TLS that cannot be given is refused
     /// here; from a snapshot only that backend's share fails.
     fn validate_backend_tls(&self) -> Result<()> {
-        for br in self.http_backend_refs() {
+        for br in self.http_backend_refs().chain(self.grpc_backend_refs()) {
             let Some(tls) = &br.tls else { continue };
             if br.is_gateway() {
                 return Err(anyhow!(
@@ -216,6 +216,9 @@ impl PortailConfig {
             .filter(|l| super::core::takes_http_routes(l));
         for (i, r) in self.http_routes.iter().enumerate() {
             check(&r.parent_refs, http_listeners.clone(), "HTTP", i)?;
+        }
+        for (i, r) in self.grpc_routes.iter().enumerate() {
+            check(&r.parent_refs, http_listeners.clone(), "gRPC", i)?;
         }
         for (i, r) in self.tcp_routes.iter().enumerate() {
             check(&r.parent_refs, listeners.clone(), "TCP", i)?;
