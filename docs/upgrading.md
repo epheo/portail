@@ -15,6 +15,7 @@
 - So does a rule's `retry`: until now the stanza was ignored, and a request was sent once. With data planes of this release a rule that has one retries, once by default, as the API defines it.
 - With the experimental Gateway API CRDs, an HTTPRoute rule with `sessionPersistence` was served without it. It is now `Accepted=False`, reason `UnsupportedValue`.
 - So is one with an `ExternalAuth` filter. Until now such a route was never seen: it got no status, or, edited in, its last version went on being served.
+- The backend connect timeout (`backendTimeout`) defaults to 10 s, from 30 s: a backend that does not accept a connection fails over in a third of the time. A backend's answer still has 30 s, or a rule's `timeouts.backendRequest`.
 
 ## From 0.2.1
 

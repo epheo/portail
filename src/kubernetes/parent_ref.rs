@@ -3,6 +3,7 @@
 //! Reduces boilerplate with macros — all four route types (HTTP, TCP, TLS, UDP)
 //! share identical field layouts for parentRefs and backendRefs.
 
+use gateway_api::experimental::grpcroutes::v1::*;
 use gateway_api::experimental::httproutes::v1::*;
 use gateway_api::experimental::tcproutes::v1::*;
 use gateway_api::experimental::tlsroutes::v1::*;
@@ -47,6 +48,7 @@ macro_rules! impl_parent_ref_access {
 }
 
 impl_parent_ref_access!(HttpRouteParentRefs);
+impl_parent_ref_access!(GrpcRouteParentRefs);
 impl_parent_ref_access!(TcpRouteParentRefs);
 impl_parent_ref_access!(TlsRouteParentRefs);
 impl_parent_ref_access!(UdpRouteParentRefs);

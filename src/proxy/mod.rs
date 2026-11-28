@@ -8,6 +8,7 @@ pub mod chunked;
 pub mod cors;
 pub mod data_plane;
 pub(crate) mod deadline;
+pub(crate) mod grpc;
 pub(crate) mod h2_bridge;
 pub mod health;
 pub(crate) mod http1;

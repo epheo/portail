@@ -340,7 +340,14 @@ pub async fn serve(listener: TcpListener, ctx: ListenerCtx, shutdown: Cancellati
                                 drain,
                             );
                             let conn = Connection::Plain { inner: tcp_stream };
-                            let _ = http1::serve(conn, peer, state).await;
+                            if let Ok(Some(h2c)) = http1::serve(conn, peer, state).await {
+                                METRICS.http2_connections_total.inc();
+                                let pool = h2_pool(shared_pool, &cfg);
+                                let (client, ctx) = h2c.into_h2(cfg, pool);
+                                // Boxed: every plain connection's task would
+                                // else be the size of an h2 server.
+                                Box::pin(crate::proxy::h2_bridge::serve(client, ctx)).await;
+                            }
                         });
                     }
                     Err(e) => {
@@ -395,6 +402,20 @@ async fn client_of(
             None
         }
     }
+}
+
+/// One pool per h2 connection: the process pool when set, else a
+/// connection-scoped pool its streams share (h1 keepalive semantics).
+fn h2_pool(
+    shared_pool: Option<Arc<SharedBackendPool>>,
+    cfg: &ServeConfig,
+) -> Arc<SharedBackendPool> {
+    shared_pool.unwrap_or_else(|| {
+        Arc::new(SharedBackendPool::new(
+            cfg.max_idle_per_backend,
+            cfg.connect_timeout,
+        ))
+    })
 }
 
 /// One accepted connection on a TLS port: its SNI selects a listener by
@@ -453,10 +474,20 @@ async fn serve_tls_connection(
             return;
         }
         TlsKind::NoCert => return refuse("its listener's certs failed to load"),
-        TlsKind::Terminate => match &plan.terminate {
-            Some(config) => config.clone(),
-            None => return refuse("its port's certs failed to load"),
-        },
+        TlsKind::Terminate => {
+            // gRPC speaks h2: offered whatever the http2 opt-in to a client
+            // naming a hostname with gRPC routes. Other clients stay on
+            // HTTP/1.1, which the bridge would cost twice.
+            let offer_h2 = !cfg.http2 && routes.load().grpc_serves(server_port, sni.as_deref());
+            match if offer_h2 {
+                &plan.terminate_h2
+            } else {
+                &plan.terminate
+            } {
+                Some(config) => config.clone(),
+                None => return refuse("its port's certs failed to load"),
+            }
+        }
     };
 
     // Bound the handshake: a client that stalls mid-handshake would
@@ -479,17 +510,10 @@ async fn serve_tls_connection(
         }
     };
 
-    // ALPN decided the protocol during the handshake.
-    if cfg.http2 && tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_ref()) {
+    // ALPN decided the protocol during the handshake: h2 only where offered.
+    if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_ref()) {
         METRICS.http2_connections_total.inc();
-        // One pool per h2 connection: the process pool when set, else a
-        // connection-scoped pool its streams share (h1 keepalive semantics).
-        let pool = shared_pool.unwrap_or_else(|| {
-            Arc::new(SharedBackendPool::new(
-                cfg.max_idle_per_backend,
-                cfg.connect_timeout,
-            ))
-        });
+        let pool = h2_pool(shared_pool, &cfg);
         // Boxed, as the engine below: a TLS port's task would else be the
         // size of the largest thing behind it, and a passthrough tunnel
         // carries that for as long as it lives.
@@ -506,6 +530,8 @@ async fn serve_tls_connection(
                 peer,
                 local,
                 drain,
+                is_tls: true,
+                grpc: Default::default(),
             },
         ))
         .await;

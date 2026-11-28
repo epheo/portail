@@ -24,6 +24,9 @@ pub struct Verify {
     key: Box<str>,
     server_name: ServerName<'static>,
     connector: tokio_rustls::TlsConnector,
+    /// The same, offering h2 by ALPN: gRPC's. Its sessions are the same
+    /// store's.
+    connector_h2: tokio_rustls::TlsConnector,
 }
 
 impl std::fmt::Debug for Verify {
@@ -87,10 +90,13 @@ impl Verify {
                 }))
         }
         .with_no_client_auth();
+        let mut config_h2 = config.clone();
+        config_h2.alpn_protocols = vec![b"h2".to_vec()];
         let verify = Arc::new(Self {
             key: key.into(),
             server_name,
             connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            connector_h2: tokio_rustls::TlsConnector::from(Arc::new(config_h2)),
         });
         known.retain(|_, verify| verify.strong_count() > 0);
         known.insert(verify.key.clone(), Arc::downgrade(&verify));
@@ -104,6 +110,13 @@ impl Verify {
     /// The handshake, the backend's certificate checked.
     pub async fn connect(&self, tcp: TcpStream) -> std::io::Result<TlsStream<TcpStream>> {
         self.connector.connect(self.server_name.clone(), tcp).await
+    }
+
+    /// [`Self::connect`], offering h2 by ALPN.
+    pub async fn connect_h2(&self, tcp: TcpStream) -> std::io::Result<TlsStream<TcpStream>> {
+        self.connector_h2
+            .connect(self.server_name.clone(), tcp)
+            .await
     }
 }
 

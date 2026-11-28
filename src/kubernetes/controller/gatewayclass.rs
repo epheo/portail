@@ -193,6 +193,7 @@ fn departed(ctx: &ControllerCtx) -> Vec<Departed> {
     let controller = ctx.controller_name.as_str();
     let mut out = Vec::new();
     routes(&ctx.cache.http_routes, controller, &gone, &mut out);
+    routes(&ctx.cache.grpc_routes, controller, &gone, &mut out);
     routes(&ctx.cache.tcp_routes, controller, &gone, &mut out);
     routes(&ctx.cache.tls_routes, controller, &gone, &mut out);
     routes(&ctx.cache.udp_routes, controller, &gone, &mut out);
@@ -276,6 +277,10 @@ async fn remove_departed(client: &Client, controller: &str, departed: Vec<Depart
         }
         let write = match o.kind {
             "HTTPRoute" => remove!(HttpRoute, "parents"),
+            "GRPCRoute" => remove!(
+                gateway_api::experimental::grpcroutes::v1::GrpcRoute,
+                "parents"
+            ),
             "TCPRoute" => remove!(TcpRoute, "parents"),
             "TLSRoute" => remove!(TlsRoute, "parents"),
             "UDPRoute" => remove!(UdpRoute, "parents"),

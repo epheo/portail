@@ -422,7 +422,7 @@ values; defaults shown):
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `backendTimeout` | `30s` | Backend connect timeout |
+| `backendTimeout` | `10s` | Backend connect timeout: the TCP connect, and for gRPC its TLS and h2 handshakes too. A backend's answer has a budget of its own: a rule's `timeouts.backendRequest`, else 30s |
 | `clientHeaderTimeout` | `30s` | Slow-loris guard: max time for a TLS handshake or a request's header block |
 | `idleBodyTimeout` | `300s` | Reaps peers that stay connected but stop transferring |
 | `tcpKeepaliveTime` | `60s` | Idle time before the kernel probes an accepted client socket or a backend socket; reaps peers that vanished without FIN/RST before they pin fds forever |

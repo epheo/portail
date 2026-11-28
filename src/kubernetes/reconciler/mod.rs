@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use gateway_api::experimental::grpcroutes::v1::*;
 use gateway_api::experimental::httproutes::v1::*;
 use gateway_api::experimental::tcproutes::v1::*;
 use gateway_api::experimental::tlsroutes::v1::*;
@@ -16,8 +17,8 @@ use crate::config::compile::compile_http_route;
 use crate::config::*;
 
 use super::converters::{
-    convert_gateway, convert_http_route, convert_tcp_route, convert_tls_route, convert_udp_route,
-    parse_backend_dns_name, route_namespace, CertData,
+    convert_gateway, convert_grpc_route, convert_http_route, convert_tcp_route, convert_tls_route,
+    convert_udp_route, parse_backend_dns_name, route_namespace, CertData,
 };
 use super::crds::{ExternalNameBackends, RateLimitPolicy};
 use super::parent_ref::{parent_ref_matches_gateway, route_targets_gateway, ParentRefAccess};
@@ -42,6 +43,7 @@ pub(crate) struct ClusterSnapshot {
     pub http_routes: Vec<Arc<HttpRoute>>,
     pub tcp_routes: Vec<Arc<TcpRoute>>,
     pub tls_routes: Vec<Arc<TlsRoute>>,
+    pub grpc_routes: Vec<Arc<GrpcRoute>>,
     pub udp_routes: Vec<Arc<UdpRoute>>,
     /// Read through: a label lookup is a read of that namespace.
     pub namespaces: Recorded<Namespace>,
@@ -203,6 +205,45 @@ extras: {
             .collect()
     }
     fn remove_invalid_mirrors(config: &mut HttpRouteConfig, invalid: &HashSet<(String, u16)>) {
+        for rule in &mut config.rules {
+            rule.filters.retain(|f| match f {
+                HttpRouteFilter::RequestMirror { config: mc } => {
+                    !invalid.contains(&(mc.backend_ref.name.clone(), mc.backend_ref.port))
+                }
+                _ => true,
+            });
+        }
+    }
+});
+
+impl_gateway_route!(GrpcRoute, GrpcRouteParentRefs, GrpcRouteConfig, "GRPCRoute",
+parent_refs: self.spec.parent_refs,
+convert:     convert_grpc_route,
+extras: {
+    fn hostnames(&self) -> &[String] {
+        self.spec.hostnames.as_deref().unwrap_or(&[])
+    }
+    fn check(config: &GrpcRouteConfig) -> Result<(), RouteError> {
+        crate::config::compile::compile_grpc_route(config)
+    }
+    fn mirror_backend_refs(config: &GrpcRouteConfig) -> Vec<(&str, u16, &str, &str)> {
+        config
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config: mc } => Some((
+                        mc.backend_ref.name.as_str(),
+                        mc.backend_ref.port,
+                        mc.backend_ref.group.as_str(),
+                        mc.backend_ref.kind.as_str(),
+                    )),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+    fn remove_invalid_mirrors(config: &mut GrpcRouteConfig, invalid: &HashSet<(String, u16)>) {
         for rule in &mut config.rules {
             rule.filters.retain(|f| match f {
                 HttpRouteFilter::RequestMirror { config: mc } => {
@@ -407,6 +448,8 @@ pub(crate) fn reconcile_to_config(
     };
     let http_route_configs =
         collect_routes::<HttpRoute>(&snapshot.http_routes, &cx, &mut checks, &mut route_status);
+    let grpc_route_configs =
+        collect_routes::<GrpcRoute>(&snapshot.grpc_routes, &cx, &mut checks, &mut route_status);
     let tcp_route_configs =
         collect_routes::<TcpRoute>(&snapshot.tcp_routes, &cx, &mut checks, &mut route_status);
     let tls_route_configs =
@@ -418,6 +461,7 @@ pub(crate) fn reconcile_to_config(
     let mut config = PortailConfig {
         gateway: gateway_config,
         http_routes: http_route_configs,
+        grpc_routes: grpc_route_configs,
         tcp_routes: tcp_route_configs,
         tls_routes: tls_route_configs,
         udp_routes: udp_route_configs,

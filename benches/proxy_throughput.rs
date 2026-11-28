@@ -15,6 +15,7 @@
 //!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
 //!     nf1 nf1_log nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
 //!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade echo_tcp
+//!     grpc_direct grpc_stream_direct grpc_proxied grpc_stream_proxied
 //!   - `PT_SECS`: seconds per scenario, 10 by default
 //!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
 //!     (target/release, then target/debug)
@@ -69,6 +70,21 @@ const ECHO_MESSAGE: usize = 128;
 
 /// The HTTPS listener's hostname: its certificate, the SNI and its route.
 const TLS_HOST: &str = "bench.test";
+
+/// The gRPC backend, on this process's runtime as the echo backend is.
+const GRPC_PORT: u16 = 29_700;
+/// portail's gRPC listener, h2c.
+const PORTAIL_GRPC_PORT: u16 = 29_710;
+/// 8 connections of 8 streams, as `h2_8x8`: a gRPC client multiplexes.
+const GRPC_CONNS: usize = 8;
+const GRPC_STREAMS: usize = 8;
+/// Each message's payload; the frame adds 5 bytes.
+const GRPC_MESSAGE: usize = 128;
+/// The messages a server-streaming call answers with.
+const GRPC_STREAM_MESSAGES: usize = 16;
+const GRPC_HOST: &str = "grpc.test";
+const GRPC_UNARY: &str = "/bench.Echo/Say";
+const GRPC_STREAM: &str = "/bench.Echo/Stream";
 
 /// What a TLS scenario keeps in flight.
 #[derive(Clone, Copy)]
@@ -311,6 +327,57 @@ fn main() {
             proxy.measure(run_echo_bench(PORTAIL_TCP_PORT + 1)).await;
             drop(proxy);
             echo.abort();
+        }
+
+        // gRPC: unary and server-streaming calls over h2c, framed and
+        // trailed as gRPC is, direct and through a GRPCRoute.
+        let grpc = [
+            "grpc_direct",
+            "grpc_stream_direct",
+            "grpc_proxied",
+            "grpc_stream_proxied",
+        ];
+        if grpc.into_iter().any(selected) {
+            let backend = spawn_grpc_backend(GRPC_PORT).await;
+            if selected("grpc_direct") {
+                println!();
+                println!("--- gRPC: unary, direct to the backend (baseline) ---");
+                run_grpc_bench(GRPC_PORT, GRPC_UNARY, 1).await;
+            }
+            if selected("grpc_stream_direct") {
+                println!();
+                println!(
+                    "--- gRPC: server streaming, {} messages, direct to the backend (baseline) ---",
+                    GRPC_STREAM_MESSAGES
+                );
+                run_grpc_bench(GRPC_PORT, GRPC_STREAM, GRPC_STREAM_MESSAGES).await;
+            }
+            if selected("grpc_proxied") || selected("grpc_stream_proxied") {
+                let proxy = spawn_portail_grpc(GRPC_PORT, PORTAIL_GRPC_PORT);
+                if selected("grpc_proxied") {
+                    println!();
+                    println!("--- gRPC: unary, proxy ---");
+                    proxy
+                        .measure(run_grpc_bench(PORTAIL_GRPC_PORT, GRPC_UNARY, 1))
+                        .await;
+                }
+                if selected("grpc_stream_proxied") {
+                    println!();
+                    println!(
+                        "--- gRPC: server streaming, {} messages, proxy ---",
+                        GRPC_STREAM_MESSAGES
+                    );
+                    proxy
+                        .measure(run_grpc_bench(
+                            PORTAIL_GRPC_PORT,
+                            GRPC_STREAM,
+                            GRPC_STREAM_MESSAGES,
+                        ))
+                        .await;
+                }
+                drop(proxy);
+            }
+            backend.abort();
         }
 
         drop(kiss_handles);
@@ -780,6 +847,142 @@ async fn run_echo_bench(port: u16) -> u64 {
     report(loops, wall_start).await
 }
 
+// --- gRPC load: unary and server-streaming calls over h2c ---
+
+/// A gRPC message as it goes on the wire: uncompressed, its length first.
+fn grpc_frame(payload: &[u8]) -> bytes::Bytes {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into()
+}
+
+/// A gRPC backend on this runtime, h2c with prior knowledge: it answers
+/// `GRPC_UNARY` with one message and `GRPC_STREAM` with
+/// `GRPC_STREAM_MESSAGES`, then `grpc-status: 0` in the trailers.
+async fn spawn_grpc_backend(port: u16) -> tokio::task::JoinHandle<()> {
+    async fn answer(
+        request: http::Request<h2::RecvStream>,
+        mut respond: h2::server::SendResponse<bytes::Bytes>,
+    ) -> Result<()> {
+        let replies = match request.uri().path() {
+            GRPC_STREAM => GRPC_STREAM_MESSAGES,
+            _ => 1,
+        };
+        let mut body = request.into_body();
+        while let Some(chunk) = body.data().await {
+            body.flow_control().release_capacity(chunk?.len())?;
+        }
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())?;
+        let mut send = respond.send_response(response, false)?;
+        let message = grpc_frame(&[0x5a; GRPC_MESSAGE]);
+        for _ in 0..replies {
+            send.send_data(message.clone(), false)?;
+        }
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        send.send_trailers(trailers)?;
+        Ok(())
+    }
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind the gRPC backend");
+    tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = conn.set_nodelay(true);
+            tokio::spawn(async move {
+                let Ok(mut h2) = h2::server::handshake(conn).await else {
+                    return;
+                };
+                while let Some(Ok((request, respond))) = h2.accept().await {
+                    tokio::spawn(answer(request, respond));
+                }
+            });
+        }
+    })
+}
+
+/// Calls `path` on `GRPC_CONNS` h2c connections of `GRPC_STREAMS` streams
+/// each to `port`, for `bench_duration()`, each answered with `replies`
+/// messages and an OK status. Returns the calls completed.
+async fn run_grpc_bench(port: u16, path: &'static str, replies: usize) -> u64 {
+    type Sender = h2::client::SendRequest<bytes::Bytes>;
+
+    async fn call(send: Sender, uri: &str, replies: usize) -> Result<Sender> {
+        let mut send = send.ready().await?;
+        let request = http::Request::post(uri)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())?;
+        let (response, mut request_body) = send.send_request(request, false)?;
+        request_body.send_data(grpc_frame(&[0x5a; GRPC_MESSAGE]), true)?;
+        let response = response.await?;
+        anyhow::ensure!(response.status() == 200, "not a 200");
+        let mut body = response.into_body();
+        let mut read = 0;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk?;
+            read += chunk.len();
+            body.flow_control().release_capacity(chunk.len())?;
+        }
+        anyhow::ensure!(
+            read == replies * (5 + GRPC_MESSAGE),
+            "{read} bytes of messages"
+        );
+        let trailers = body
+            .trailers()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no trailers"))?;
+        anyhow::ensure!(
+            trailers.get("grpc-status").is_some_and(|s| s == "0"),
+            "not OK"
+        );
+        Ok(send)
+    }
+
+    async fn calls(mut send: Sender, path: &str, replies: usize, deadline: Instant) -> LoopResult {
+        let uri = format!("http://{GRPC_HOST}{path}");
+        let mut latencies = Vec::new();
+        while Instant::now() < deadline {
+            let sent = Instant::now();
+            send = match call(send, &uri, replies).await {
+                Ok(send) => send,
+                Err(_) => return (latencies, 1),
+            };
+            latencies.push(sent.elapsed().as_micros() as u32);
+        }
+        (latencies, 0)
+    }
+
+    let mut open = Vec::with_capacity(GRPC_CONNS);
+    for _ in 0..GRPC_CONNS {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect for gRPC");
+        tcp.set_nodelay(true).expect("TCP_NODELAY");
+        let (send, connection) = h2::client::handshake(tcp).await.expect("h2c handshake");
+        tokio::spawn(connection);
+        open.push(send);
+    }
+    let wall_start = Instant::now();
+    let deadline = wall_start + bench_duration();
+    let mut loops = Vec::with_capacity(GRPC_CONNS * GRPC_STREAMS);
+    for send in open {
+        for _ in 0..GRPC_STREAMS {
+            loops.push(tokio::spawn(calls(send.clone(), path, replies, deadline)));
+        }
+    }
+    report(loops, wall_start).await
+}
+
 // --- Producer: generates request batches for a fixed duration ---
 
 #[derive(Clone)]
@@ -1107,6 +1310,23 @@ fn spawn_portail_tcp(backend_port: u16, port: u16) -> ProcessHandle {
         backend_refs_json(&[backend_port]),
     );
 
+    spawn_portail_with_config(&config, port, &[])
+}
+
+/// portail with one HTTP listener whose GRPCRoute sends every call to the
+/// gRPC backend: h2c both sides.
+fn spawn_portail_grpc(backend_port: u16, port: u16) -> ProcessHandle {
+    let config = format!(
+        r#"{{
+  "gateway": {{"name":"bench","listeners":[{{"name":"grpc","protocol":"HTTP","port":{}}}]}},
+  "grpcRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"grpc"}}],"hostnames":["{}"],"rules":[{{"backendRefs":[{}]}}]}}],
+  "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
+  "performance": {{}}
+}}"#,
+        port,
+        GRPC_HOST,
+        backend_refs_json(&[backend_port]),
+    );
     spawn_portail_with_config(&config, port, &[])
 }
 

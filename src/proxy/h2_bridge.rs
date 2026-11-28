@@ -22,9 +22,7 @@ use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::debug;
@@ -52,7 +50,7 @@ const MAX_CONCURRENT_STREAMS: u32 = 128;
 /// Decoded header-list cap, kept under the engine's 64 KiB request buffer
 /// so a synthesized head always fits in one engine read and never trips
 /// its 431 path.
-const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
+pub(crate) const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
 
 /// Per-direction duplex buffer; matches the engine's read buffer so a
 /// typical exchange crosses in one hop, and a body that comes whole with its
@@ -62,12 +60,12 @@ const DUPLEX_BUF: usize = 64 * 1024;
 
 /// Upload window per stream: h2's 64 KiB default caps an upload at 64 KiB
 /// per round trip; 2 MiB carries 200 Mbit/s at 80 ms.
-const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 
 /// Upload window per connection: two streams' worth, so one stalled upload
 /// leaves a full window to the connection's other streams.
 /// Two stalled uploads hold all of it: h2 shares one window per connection.
-const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+pub(crate) const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// Size of each response read from the duplex.
 const RESP_READ: usize = 16 * 1024;
@@ -94,6 +92,75 @@ pub(crate) struct H2Ctx {
     pub(crate) local: SocketAddr,
     /// Cancelled when the data plane drains: the connection sends GOAWAY.
     pub(crate) drain: CancellationToken,
+    /// h2 over TLS, else h2c.
+    pub(crate) is_tls: bool,
+    pub(crate) grpc: crate::proxy::grpc::Backends,
+}
+
+/// A stream whose first bytes were already read, by the HTTP/1 engine that
+/// met an h2c preface: they are read again first, and freed once they are.
+pub(crate) struct Replay<S> {
+    read: Vec<u8>,
+    at: usize,
+    inner: S,
+}
+
+impl<S> Replay<S> {
+    pub(crate) fn new(read: Vec<u8>, inner: S) -> Self {
+        Self { read, at: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Replay<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        let left = &this.read[this.at..];
+        if left.is_empty() {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
+        let n = left.len().min(buf.remaining());
+        buf.put_slice(&left[..n]);
+        this.at += n;
+        if this.at == this.read.len() {
+            this.read = Vec::new();
+            this.at = 0;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// The client's stream as h2 drives it, with the two bounds h2 lacks.
@@ -261,10 +328,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
     }
 }
 
-/// Serve one ALPN-negotiated h2 client connection until it closes.
-pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
+/// Serve one h2 client connection until it closes: ALPN-negotiated over
+/// TLS, or h2c with prior knowledge on a port with gRPC routes.
+pub(crate) async fn serve<S>(client: S, ctx: H2Ctx)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = ClientStream::new(
-        tls_stream,
+        client,
         idle_opt(ctx.cfg.idle_body_timeout),
         ctx.cfg.client_header_timeout,
     );
@@ -310,6 +381,19 @@ pub(crate) async fn serve(tls_stream: ServerTlsStream<TcpStream>, ctx: H2Ctx) {
             return;
         };
         let ctx = ctx.clone();
+        // On a port with gRPC routes, gRPC goes to its own table and an h2
+        // backend: trailers do not survive the HTTP/1 replay.
+        if crate::proxy::grpc::is_grpc(req.headers()) {
+            let routes = ctx.routes.load_full();
+            if routes.has_grpc_routes(ctx.server_port) {
+                // Boxed: spawn moves a future by value on its way to the task,
+                // a stream's several times.
+                tokio::spawn(Box::pin(crate::proxy::grpc::serve_stream(
+                    req, respond, ctx, routes,
+                )));
+                continue;
+            }
+        }
         let engines = engines.clone();
         tokio::spawn(async move {
             let _ = serve_stream(req, respond, &ctx, &engines).await;
@@ -355,7 +439,7 @@ async fn serve_stream(
         crate::proxy::backend_pool::PoolHandle::Shared(ctx.pool.clone()),
         ctx.selector.clone(),
         ctx.health.clone(),
-        true,
+        ctx.is_tls,
         false,
         ctx.peer,
         ctx.local,
@@ -427,7 +511,7 @@ async fn serve_stream(
 /// Await `fut` unless the client resets the stream, or its connection dies,
 /// first: h2 frees a reset stream's slot at once, so nothing the exchange
 /// waits on may outlive the reset.
-async fn unless_reset<T, E: Into<anyhow::Error>>(
+pub(crate) async fn unless_reset<T, E: Into<anyhow::Error>>(
     fut: impl Future<Output = Result<T, E>>,
     mut poll_reset: impl FnMut(&mut Context<'_>) -> Poll<Result<h2::Reason, h2::Error>>,
 ) -> Result<T> {
@@ -819,6 +903,8 @@ async fn send_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
+    use tokio_rustls::server::TlsStream as ServerTlsStream;
 
     fn parts(req: http::request::Builder) -> http::request::Parts {
         req.body(()).unwrap().into_parts().0
@@ -1234,6 +1320,8 @@ mod tests {
             peer: "127.0.0.1:40000".parse().unwrap(),
             local: "127.0.0.1:8080".parse().unwrap(),
             drain: CancellationToken::new(),
+            is_tls: true,
+            grpc: Default::default(),
         }
     }
 

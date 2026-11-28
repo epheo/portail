@@ -136,6 +136,152 @@ pub(crate) fn compile_http_route(route: &HttpRouteConfig) -> Result<CompiledRout
     Ok(CompiledRoute { rules })
 }
 
+/// The characters of a gRPC match's service and method: what orders a
+/// gRPC rule after its hostname, as Gateway API's GRPCRoute precedence does.
+pub(crate) type GrpcRank = (u16, u16);
+
+/// A GRPCRoute as the HTTP route it is matched as: each method match a
+/// match on the request's `/{service}/{method}` path. With it, each
+/// match's rank, rule by rule; a rule without matches has one, the lowest.
+pub(crate) fn grpc_as_http(
+    route: &GrpcRouteConfig,
+) -> Result<(HttpRouteConfig, Vec<Vec<GrpcRank>>), RouteError> {
+    let mut ranks = Vec::with_capacity(route.rules.len());
+    let rules = route
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            let at = |e: RouteError| e.at(format_args!("rule {}", i));
+            check_grpc_rule(rule).map_err(at)?;
+            let mut rule_ranks = Vec::with_capacity(rule.matches.len().max(1));
+            let matches = rule
+                .matches
+                .iter()
+                .enumerate()
+                .map(|(j, m)| {
+                    let (path, rank) = grpc_path(m.method.as_ref())
+                        .map_err(|e| e.at(format_args!("rule {} match {}", i, j)))?;
+                    rule_ranks.push(rank);
+                    Ok(HttpRouteMatch {
+                        method: None,
+                        path,
+                        headers: m.headers.clone(),
+                        query_params: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, RouteError>>()?;
+            if matches.is_empty() {
+                rule_ranks.push((0, 0));
+            }
+            ranks.push(rule_ranks);
+            Ok(HttpRouteRule {
+                matches,
+                filters: rule.filters.clone(),
+                backend_refs: rule.backend_refs.clone(),
+                timeouts: None,
+                retry: None,
+            })
+        })
+        .collect::<Result<_, RouteError>>()?;
+    let http = HttpRouteConfig {
+        parent_refs: route.parent_refs.clone(),
+        hostnames: route.hostnames.clone(),
+        rules,
+    };
+    Ok((http, ranks))
+}
+
+/// What the table build checks of a GRPCRoute: all it checks of an HTTP
+/// route, and what a gRPC rule cannot do.
+pub(crate) fn compile_grpc_route(route: &GrpcRouteConfig) -> Result<(), RouteError> {
+    let (http, _) = grpc_as_http(route)?;
+    compile_http_route(&http).map(drop)
+}
+
+fn check_grpc_rule(rule: &GrpcRouteRule) -> Result<(), RouteError> {
+    for (i, filter) in rule.filters.iter().enumerate() {
+        match filter {
+            HttpRouteFilter::RequestHeaderModifier { .. }
+            | HttpRouteFilter::ResponseHeaderModifier { .. } => {}
+            // Mirrors send HTTP/1 bytes, which a gRPC backend cannot read:
+            // copies that fail are no mirror.
+            HttpRouteFilter::RequestMirror { .. } => {
+                return Err(RouteError::unsupported(format!(
+                    "filter {i}: a gRPC rule cannot mirror its requests yet"
+                )))
+            }
+            _ => {
+                return Err(RouteError::unsupported(format!(
+                    "filter {i}: a gRPC rule takes RequestHeaderModifier, \
+                     ResponseHeaderModifier or RequestMirror only"
+                )))
+            }
+        }
+    }
+    // A Gateway is reached over HTTP/1 behind a PROXY header, and gRPC
+    // needs h2 to its backend.
+    if let Some(i) = rule.backend_refs.iter().position(BackendRef::is_gateway) {
+        return Err(RouteError::unsupported(format!(
+            "backendRef {i}: a gRPC rule cannot reach a Gateway backend"
+        )));
+    }
+    Ok(())
+}
+
+/// The path match of a gRPC method match, and its rank. A part left out
+/// matches any service or method: one path segment.
+fn grpc_path(m: Option<&GrpcMethodMatch>) -> Result<(Option<HttpPathMatch>, GrpcRank), RouteError> {
+    let Some(m) = m else {
+        return Ok((None, (0, 0)));
+    };
+    let named = |n: &Option<String>| n.as_deref().filter(|n| !n.is_empty()).map(str::to_string);
+    let (service, method) = (named(&m.service), named(&m.method));
+    let chars = |n: &Option<String>| {
+        n.as_deref()
+            .map_or(0, |n| n.len().min(u16::MAX.into()) as u16)
+    };
+    let rank = (chars(&service), chars(&method));
+    const ANY: &str = "[^/]+";
+    let path = match (&m.match_type, service, method) {
+        (_, None, None) => {
+            return Err(RouteError::unsupported(
+                "a method match names a service or a method",
+            ))
+        }
+        (StringMatchType::Exact, service, method)
+            if [&service, &method]
+                .iter()
+                .any(|n| n.as_deref().is_some_and(|n| n.contains('/'))) =>
+        {
+            return Err(RouteError::unsupported(
+                "an exact service or method has no '/'",
+            ))
+        }
+        (StringMatchType::Exact, Some(service), Some(method)) => HttpPathMatch {
+            match_type: HttpPathMatchType::Exact,
+            value: format!("/{service}/{method}"),
+        },
+        (StringMatchType::Exact, service, method) => HttpPathMatch {
+            match_type: HttpPathMatchType::RegularExpression,
+            value: format!(
+                "/{}/{}",
+                service.as_deref().map_or(ANY.to_string(), regex::escape),
+                method.as_deref().map_or(ANY.to_string(), regex::escape)
+            ),
+        },
+        (StringMatchType::RegularExpression, service, method) => HttpPathMatch {
+            match_type: HttpPathMatchType::RegularExpression,
+            value: format!(
+                "/(?:{})/(?:{})",
+                service.as_deref().unwrap_or(ANY),
+                method.as_deref().unwrap_or(ANY)
+            ),
+        },
+    };
+    Ok((Some(path), rank))
+}
+
 fn compile_rule(rule: &HttpRouteRule) -> Result<CompiledRule<'_>, RouteError> {
     check_filter_combination(&rule.filters)?;
     check_prefix_replacement(rule)?;

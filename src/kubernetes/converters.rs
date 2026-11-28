@@ -11,6 +11,7 @@ use anyhow::{anyhow, Result};
 // ExternalAuth, and one such route failed its decode: unseen, or served at
 // its last version. useDefaultGateways needs no refusal: no Gateway of
 // portail's is a default one.
+use gateway_api::experimental::grpcroutes::v1::*;
 use gateway_api::experimental::httproutes::v1::*;
 use gateway_api::experimental::tcproutes::v1::*;
 use gateway_api::experimental::tlsroutes::v1::*;
@@ -507,37 +508,46 @@ fn convert_url_rewrite_config(ur: &HttpRouteRulesFiltersUrlRewrite) -> URLRewrit
     }
 }
 
+/// A RequestMirror filter, HTTPRoute's or GRPCRoute's: the two generated
+/// types differ in name only.
+macro_rules! convert_mirror {
+    ($rm:expr, $ns:expr) => {{
+        let rm = $rm;
+        let fraction = rm.fraction.as_ref().map(|f| crate::config::MirrorFraction {
+            numerator: f.numerator.max(0) as u32,
+            denominator: f.denominator.map(|d| d.max(1) as u32).unwrap_or(100),
+        });
+        let percent = rm.percent.map(|p| p.clamp(0, 100) as u32);
+        RequestMirrorConfig {
+            backend_ref: BackendRef {
+                name: backend_ref_name(
+                    &rm.backend_ref.name,
+                    rm.backend_ref.namespace.as_deref(),
+                    $ns,
+                    rm.backend_ref.group.as_deref(),
+                    rm.backend_ref.kind.as_deref(),
+                ),
+                port: rm.backend_ref.port.unwrap_or(80) as u16,
+                weight: 1,
+                group: rm.backend_ref.group.clone().unwrap_or_default(),
+                kind: rm
+                    .backend_ref
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| "Service".to_string()),
+                filters: vec![],
+                app_protocol: None,
+                invalid: false,
+                tls: None,
+            },
+            percent,
+            fraction,
+        }
+    }};
+}
+
 fn convert_mirror_config(rm: &HttpRouteRulesFiltersRequestMirror, ns: &str) -> RequestMirrorConfig {
-    let fraction = rm.fraction.as_ref().map(|f| crate::config::MirrorFraction {
-        numerator: f.numerator.max(0) as u32,
-        denominator: f.denominator.map(|d| d.max(1) as u32).unwrap_or(100),
-    });
-    let percent = rm.percent.map(|p| p.clamp(0, 100) as u32);
-    RequestMirrorConfig {
-        backend_ref: BackendRef {
-            name: backend_ref_name(
-                &rm.backend_ref.name,
-                rm.backend_ref.namespace.as_deref(),
-                ns,
-                rm.backend_ref.group.as_deref(),
-                rm.backend_ref.kind.as_deref(),
-            ),
-            port: rm.backend_ref.port.unwrap_or(80) as u16,
-            weight: 1,
-            group: rm.backend_ref.group.clone().unwrap_or_default(),
-            kind: rm
-                .backend_ref
-                .kind
-                .clone()
-                .unwrap_or_else(|| "Service".to_string()),
-            filters: vec![],
-            app_protocol: None,
-            invalid: false,
-            tls: None,
-        },
-        percent,
-        fraction,
-    }
+    convert_mirror!(rm, ns)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +681,210 @@ fn convert_retry(r: &HttpRouteRulesRetry) -> Result<crate::config::HttpRouteRetr
         attempts,
         backoff,
     })
+}
+
+// ---------------------------------------------------------------------------
+// GRPC route conversion
+// ---------------------------------------------------------------------------
+
+/// As [`convert_http_route`]: `Err` names the first part the proxy cannot
+/// represent, left out of a config that keeps every backendRef.
+pub(crate) fn convert_grpc_route(route: &GrpcRoute) -> (GrpcRouteConfig, Result<(), RouteError>) {
+    let ns = route_namespace(&route.metadata);
+    let mut first = None;
+    let rules = route
+        .spec
+        .rules
+        .iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, r)| {
+            let (rule, err) = convert_grpc_rule(r, ns);
+            if let Some(e) = err {
+                first.get_or_insert(e.at(format_args!("rule {}", i)));
+            }
+            rule
+        })
+        .collect();
+    let config = GrpcRouteConfig {
+        parent_refs: Vec::new(),
+        hostnames: route.spec.hostnames.clone().unwrap_or_default(),
+        rules,
+    };
+    (config, first.map_or(Ok(()), Err))
+}
+
+fn convert_grpc_rule(rule: &GrpcRouteRules, ns: &str) -> (GrpcRouteRule, Option<RouteError>) {
+    let mut first = None;
+    if rule.session_persistence.is_some() {
+        first = Some(RouteError::unsupported(
+            "sessionPersistence is not supported",
+        ));
+    }
+    let matches = rule
+        .matches
+        .iter()
+        .flatten()
+        .map(|m| GrpcRouteMatch {
+            method: m.method.as_ref().map(|method| GrpcMethodMatch {
+                match_type: match method.r#type {
+                    Some(GrpcRouteRulesMatchesMethodType::RegularExpression) => {
+                        StringMatchType::RegularExpression
+                    }
+                    _ => StringMatchType::Exact,
+                },
+                service: method.service.clone().filter(|s| !s.is_empty()),
+                method: method.method.clone().filter(|m| !m.is_empty()),
+            }),
+            headers: m
+                .headers
+                .iter()
+                .flatten()
+                .map(|h| HttpHeaderMatch {
+                    name: h.name.clone(),
+                    value: h.value.clone(),
+                    match_type: match h.r#type {
+                        Some(GrpcRouteRulesMatchesHeadersType::RegularExpression) => {
+                            StringMatchType::RegularExpression
+                        }
+                        _ => StringMatchType::Exact,
+                    },
+                })
+                .collect(),
+        })
+        .collect();
+    let filters = rule
+        .filters
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, f)| match convert_grpc_filter(f, ns) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                first.get_or_insert(e.at(format_args!("filter {}", i)));
+                None
+            }
+        })
+        .collect();
+    let backend_refs = rule
+        .backend_refs
+        .iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, br)| {
+            let (backend, err) = convert_grpc_backend_ref(br, ns);
+            if let Some(e) = err {
+                first.get_or_insert(e.at(format_args!("backendRef {}", i)));
+            }
+            backend
+        })
+        .collect();
+    let rule = GrpcRouteRule {
+        matches,
+        filters,
+        backend_refs,
+    };
+    (rule, first)
+}
+
+fn convert_grpc_filter(f: &GrpcRouteRulesFilters, ns: &str) -> Result<HttpRouteFilter, RouteError> {
+    let missing = |what: &str| RouteError::unsupported(format!("{} filter missing config", what));
+    Ok(match f.r#type {
+        GrpcRouteRulesFiltersType::RequestHeaderModifier => {
+            let hm = f
+                .request_header_modifier
+                .as_ref()
+                .ok_or_else(|| missing("RequestHeaderModifier"))?;
+            HttpRouteFilter::RequestHeaderModifier {
+                config: convert_header_mod!(hm),
+            }
+        }
+        GrpcRouteRulesFiltersType::ResponseHeaderModifier => {
+            let hm = f
+                .response_header_modifier
+                .as_ref()
+                .ok_or_else(|| missing("ResponseHeaderModifier"))?;
+            HttpRouteFilter::ResponseHeaderModifier {
+                config: convert_header_mod!(hm),
+            }
+        }
+        GrpcRouteRulesFiltersType::RequestMirror => {
+            let rm = f
+                .request_mirror
+                .as_ref()
+                .ok_or_else(|| missing("RequestMirror"))?;
+            HttpRouteFilter::RequestMirror {
+                config: convert_mirror!(rm, ns),
+            }
+        }
+        GrpcRouteRulesFiltersType::ExtensionRef => {
+            return Err(RouteError::unsupported(
+                "unsupported filter type ExtensionRef",
+            ))
+        }
+    })
+}
+
+/// A backendRef's own filters are header modifiers only, as HTTPRoute's.
+fn convert_grpc_backend_ref(
+    br: &GrpcRouteRulesBackendRefs,
+    ns: &str,
+) -> (BackendRef, Option<RouteError>) {
+    let mut first = None;
+    let missing = |what: &str| RouteError::unsupported(format!("{} filter missing config", what));
+    let filters = br
+        .filters
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let converted = match f.r#type {
+                GrpcRouteRulesBackendRefsFiltersType::RequestHeaderModifier => f
+                    .request_header_modifier
+                    .as_ref()
+                    .map(|hm| HttpRouteFilter::RequestHeaderModifier {
+                        config: convert_header_mod!(hm),
+                    })
+                    .ok_or_else(|| missing("RequestHeaderModifier")),
+                GrpcRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => f
+                    .response_header_modifier
+                    .as_ref()
+                    .map(|hm| HttpRouteFilter::ResponseHeaderModifier {
+                        config: convert_header_mod!(hm),
+                    })
+                    .ok_or_else(|| missing("ResponseHeaderModifier")),
+                ref other => Err(RouteError::unsupported(format!(
+                    "{:?} is not supported on a backendRef",
+                    other
+                ))),
+            };
+            match converted {
+                Ok(filter) => Some(filter),
+                Err(e) => {
+                    first.get_or_insert(e.at(format_args!("filter {}", i)));
+                    None
+                }
+            }
+        })
+        .collect();
+    let backend = BackendRef {
+        name: backend_ref_name(
+            &br.name,
+            br.namespace.as_deref(),
+            ns,
+            br.group.as_deref(),
+            br.kind.as_deref(),
+        ),
+        port: br.port.unwrap_or(80) as u16,
+        weight: br.weight.unwrap_or(1) as u32,
+        group: br.group.clone().unwrap_or_default(),
+        kind: br.kind.clone().unwrap_or_else(|| "Service".to_string()),
+        filters,
+        app_protocol: None,
+        invalid: false,
+        tls: None,
+    };
+    (backend, first)
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1179,100 @@ mod tests {
             let route: HttpRoute = serde_json::from_value(route).unwrap();
             let err = convert_http_route(&route).1.unwrap_err();
             assert_eq!(err.reason.as_str(), "UnsupportedValue", "{err}");
+            assert!(err.to_string().contains(part), "{err}");
+        }
+    }
+
+    /// A GRPCRoute reaches the config as the API writes it: service and
+    /// method matches, one left out matching any, headers, its three
+    /// filters, backendRefs with their header modifiers. ExtensionRef and
+    /// a mirror on a backendRef fail the route, naming the part.
+    #[test]
+    fn a_grpc_route_converts_as_written() {
+        let route: GrpcRoute = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "g", "namespace": "apps"},
+            "spec": {
+                "hostnames": ["grpc.test"],
+                "rules": [{
+                    "matches": [
+                        {"method": {"service": "echo.Echo", "method": "Say"},
+                         "headers": [{"name": "version", "value": "2"}]},
+                        {"method": {"type": "RegularExpression", "method": "Say.*"}},
+                    ],
+                    "filters": [
+                        {"type": "RequestHeaderModifier",
+                         "requestHeaderModifier": {"set": [{"name": "x-a", "value": "1"}]}},
+                        {"type": "RequestMirror",
+                         "requestMirror": {"backendRef": {"name": "shadow", "port": 9000}}},
+                    ],
+                    "backendRefs": [{
+                        "name": "echo", "port": 9000, "weight": 3,
+                        "filters": [{"type": "ResponseHeaderModifier",
+                                     "responseHeaderModifier": {"remove": ["x-b"]}}],
+                    }],
+                }],
+            },
+        }))
+        .unwrap();
+        let (config, result) = convert_grpc_route(&route);
+        result.unwrap();
+        assert_eq!(config.hostnames, ["grpc.test"]);
+        let rule = &config.rules[0];
+        let exact = rule.matches[0].method.as_ref().unwrap();
+        assert_eq!(exact.match_type, StringMatchType::Exact);
+        assert_eq!(
+            (exact.service.as_deref(), exact.method.as_deref()),
+            (Some("echo.Echo"), Some("Say"))
+        );
+        assert_eq!(rule.matches[0].headers[0].name, "version");
+        let regex = rule.matches[1].method.as_ref().unwrap();
+        assert_eq!(regex.match_type, StringMatchType::RegularExpression);
+        assert_eq!(
+            (regex.service.as_deref(), regex.method.as_deref()),
+            (None, Some("Say.*"))
+        );
+        assert!(matches!(
+            rule.filters[0],
+            HttpRouteFilter::RequestHeaderModifier { .. }
+        ));
+        let HttpRouteFilter::RequestMirror { config: mirror } = &rule.filters[1] else {
+            panic!("the mirror filter");
+        };
+        assert_eq!(mirror.backend_ref.name, "shadow.apps.svc");
+        let backend = &rule.backend_refs[0];
+        assert_eq!(
+            (backend.name.as_str(), backend.port, backend.weight),
+            ("echo.apps.svc", 9000, 3)
+        );
+        assert!(matches!(
+            backend.filters[0],
+            HttpRouteFilter::ResponseHeaderModifier { .. }
+        ));
+
+        for (spec, part) in [
+            (
+                serde_json::json!({"rules": [{"filters": [{"type": "ExtensionRef",
+                    "extensionRef": {"group": "x.test", "kind": "X", "name": "x"}}]}]}),
+                "filter 0",
+            ),
+            (
+                serde_json::json!({"rules": [{"backendRefs": [{"name": "echo", "port": 9000,
+                    "filters": [{"type": "RequestMirror",
+                                 "requestMirror": {"backendRef": {"name": "s", "port": 1}}}]}]}]}),
+                "backendRef 0",
+            ),
+            (
+                serde_json::json!({"rules": [{"sessionPersistence": {"type": "Cookie"},
+                    "backendRefs": [{"name": "echo", "port": 9000}]}]}),
+                "sessionPersistence",
+            ),
+        ] {
+            let route: GrpcRoute = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "g", "namespace": "apps"}, "spec": spec,
+            }))
+            .unwrap();
+            let err = convert_grpc_route(&route).1.unwrap_err();
+            assert_eq!(err.reason.as_str(), "UnsupportedValue");
             assert!(err.to_string().contains(part), "{err}");
         }
     }

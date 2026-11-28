@@ -68,12 +68,91 @@ impl ListenerScope {
     }
 }
 
-impl RouteTable {
+impl RuleScopes {
     pub fn new() -> Self {
         Self {
             listener_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
             shared_scopes: Vec::new(),
             shared_on_every_port: true,
+        }
+    }
+
+    /// Append a rule to its scope's host entry, unordered: [`Self::sort`]
+    /// orders every entry once after a batch. Sorting per insert made a
+    /// table build quadratic in rules per host.
+    pub(crate) fn push(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+        route_host: &str,
+        rule: HttpRouteRule,
+    ) -> &mut HostEntry {
+        self.scope_mut(listener_port, listener_hostname)
+            .push_route(route_host, rule)
+    }
+
+    /// Order every host entry by `precedence`. The sort is stable, so
+    /// equal rules keep their push order.
+    pub(crate) fn sort(
+        &mut self,
+        precedence: fn(&HttpRouteRule, &HttpRouteRule) -> std::cmp::Ordering,
+    ) {
+        let own = self
+            .listener_scopes
+            .values_mut()
+            .flat_map(|p| &mut p.scopes);
+        for scope in own.chain(&mut self.shared_scopes) {
+            for host_entry in scope.host_entries_mut() {
+                host_entry.sort_by(precedence);
+            }
+        }
+    }
+
+    fn scope_mut(
+        &mut self,
+        listener_port: u16,
+        listener_hostname: Option<&str>,
+    ) -> &mut ListenerScope {
+        // Scopes store lowercase hostnames (see ListenerScope::new), so
+        // normalize before matching an existing scope.
+        let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
+        let scopes = match listener_port {
+            0 => &mut self.shared_scopes,
+            port => &mut self.listener_scopes.entry(port).or_default().scopes,
+        };
+        match scopes
+            .iter()
+            .position(|s| s.listener_hostname == normalized)
+        {
+            Some(i) => &mut scopes[i],
+            None => {
+                scopes.push(ListenerScope::new(listener_port, normalized));
+                scopes.last_mut().unwrap()
+            }
+        }
+    }
+
+    /// Serve the shared (port-0) scopes on `ports` only, and on no other
+    /// port.
+    fn share_on(&mut self, ports: &[u16]) {
+        self.shared_on_every_port = false;
+        for &port in ports {
+            self.listener_scopes.entry(port).or_default().shared = true;
+        }
+    }
+}
+
+impl Default for RuleScopes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RouteTable {
+    pub fn new() -> Self {
+        Self {
+            http: RuleScopes::new(),
+            grpc: RuleScopes::new(),
             tcp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             udp_routes: FnvHashMap::with_capacity_and_hasher(32, Default::default()),
             tls_scopes: FnvHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -92,7 +171,7 @@ impl RouteTable {
     /// Mirrors count too: a build drops a mirror DNS cannot resolve, and only
     /// a changed signature brings it back once it resolves.
     pub fn dns_signature(&self) -> u64 {
-        let http_rules = self.http_scopes().flat_map(|scope| {
+        let http_rules = self.rule_scopes().flat_map(|scope| {
             scope
                 .http_routes
                 .values()
@@ -135,14 +214,15 @@ impl RouteTable {
         rule: HttpRouteRule,
     ) {
         let host_entry = self
-            .scope_mut(listener_port, listener_hostname)
-            .push_route(route_host, rule);
-        Self::sort_rules(host_entry);
+            .http
+            .push(listener_port, listener_hostname, route_host, rule);
+        host_entry.sort_by(match_precedence);
     }
 
     /// [`Self::add_http_route_for_listener`] for a batch: entries stay
     /// unordered until [`Self::sort_http_routes`] runs once after the last
-    /// push. Sorting per insert made a table build quadratic in rules per host.
+    /// push.
+    #[cfg(test)]
     pub(crate) fn push_http_route_for_listener(
         &mut self,
         listener_port: u16,
@@ -150,55 +230,26 @@ impl RouteTable {
         route_host: &str,
         rule: HttpRouteRule,
     ) {
-        self.scope_mut(listener_port, listener_hostname)
-            .push_route(route_host, rule);
+        self.http
+            .push(listener_port, listener_hostname, route_host, rule);
     }
 
-    /// Order every host entry by match precedence. The sort is stable, so
-    /// equal rules keep their push order.
+    /// Order every HTTP host entry by match precedence.
     pub(crate) fn sort_http_routes(&mut self) {
-        let own = self
-            .listener_scopes
-            .values_mut()
-            .flat_map(|p| &mut p.scopes);
-        for scope in own.chain(&mut self.shared_scopes) {
-            for host_entry in scope.host_entries_mut() {
-                Self::sort_rules(host_entry);
-            }
-        }
+        self.http.sort(match_precedence);
     }
 
-    fn scope_mut(
-        &mut self,
-        listener_port: u16,
-        listener_hostname: Option<&str>,
-    ) -> &mut ListenerScope {
-        // Scopes store lowercase hostnames (see ListenerScope::new), so
-        // normalize before matching an existing scope.
-        let normalized = listener_hostname.map(|s| s.to_ascii_lowercase());
-        let scopes = match listener_port {
-            0 => &mut self.shared_scopes,
-            port => &mut self.listener_scopes.entry(port).or_default().scopes,
-        };
-        match scopes
-            .iter()
-            .position(|s| s.listener_hostname == normalized)
-        {
-            Some(i) => &mut scopes[i],
-            None => {
-                scopes.push(ListenerScope::new(listener_port, normalized));
-                scopes.last_mut().unwrap()
-            }
-        }
+    /// Order every gRPC host entry by gRPC's precedence.
+    pub(crate) fn sort_grpc_routes(&mut self) {
+        self.grpc.sort(grpc_precedence);
     }
 
-    /// Serve the shared (port-0) scopes on `ports` only, and on no other
-    /// port.
+    /// Serve the shared (port-0) scopes, HTTP and gRPC, on `ports` only,
+    /// and on no other port.
     pub(crate) fn share_any_port_scopes_on(&mut self, ports: impl IntoIterator<Item = u16>) {
-        self.shared_on_every_port = false;
-        for port in ports {
-            self.listener_scopes.entry(port).or_default().shared = true;
-        }
+        let ports: Vec<u16> = ports.into_iter().collect();
+        self.http.share_on(&ports);
+        self.grpc.share_on(&ports);
     }
 
     /// Convenience: add an HTTP route to a default catch-all scope on port 0,
@@ -206,10 +257,6 @@ impl RouteTable {
     #[allow(dead_code)]
     pub fn add_http_route(&mut self, host: &str, rule: HttpRouteRule) {
         self.add_http_route_for_listener(0, None, host, rule);
-    }
-
-    fn sort_rules(rules: &mut [HttpRouteRule]) {
-        rules.sort_by(match_precedence);
     }
 
     /// The first registration of a port wins and later ones return false:
@@ -292,6 +339,15 @@ pub(super) fn match_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp
                 .len()
                 .cmp(&a.query_param_matches.len())
         })
+}
+
+/// Which of two gRPC rules matching one request takes it, after their
+/// hostnames: more characters of service, then of method, then more header
+/// matches. `Equal` leaves the tie to route order, then rule order.
+fn grpc_precedence(a: &HttpRouteRule, b: &HttpRouteRule) -> std::cmp::Ordering {
+    b.grpc_rank
+        .cmp(&a.grpc_rank)
+        .then_with(|| b.header_matches.len().cmp(&a.header_matches.len()))
 }
 
 fn insert_first<K: std::hash::Hash + Eq>(

@@ -25,7 +25,7 @@ pub(crate) fn is_route_allowed_by_listener(
     if !super::reconciler::listener_is_served(listener) {
         return false;
     }
-    if super::status::route_kind_for_protocol(&listener.protocol) != Some(route_kind) {
+    if !super::status::route_kinds_for_protocol(&listener.protocol).contains(&route_kind) {
         return false;
     }
 

@@ -70,7 +70,7 @@ impl ListenerScope {
     ) -> Option<(u32, &'a HttpRouteRule)> {
         // Try exact host first
         if let Some(host_entry) = self.http_routes.get(host) {
-            if let Some(rule) = RouteTable::find_best_rule_match(
+            if let Some(rule) = RuleScopes::find_best_rule_match(
                 host_entry,
                 method,
                 path,
@@ -85,7 +85,7 @@ impl ListenerScope {
         // try "bar.example.com", then "example.com") to find *.example.com routes
         for parent in parent_domains(host) {
             if let Some(host_entry) = self.wildcard_http_routes.get(parent) {
-                if let Some(rule) = RouteTable::find_best_rule_match(
+                if let Some(rule) = RuleScopes::find_best_rule_match(
                     host_entry,
                     method,
                     path,
@@ -99,7 +99,7 @@ impl ListenerScope {
 
         // Try catch-all routes (hostname="*", matches any host)
         if let Some(ref host_entry) = self.catch_all_http_routes {
-            if let Some(rule) = RouteTable::find_best_rule_match(
+            if let Some(rule) = RuleScopes::find_best_rule_match(
                 host_entry,
                 method,
                 path,
@@ -116,17 +116,12 @@ impl ListenerScope {
 
 #[derive(Debug, Clone)]
 pub struct RouteTable {
-    /// Per-listener HTTP route scopes, indexed by port for O(1) lookup.
-    pub listener_scopes: FnvHashMap<u16, PortScopes>,
-    /// The scopes ports share, added under port 0: routes without
-    /// parentRefs, or `add_http_route` in tests and benches. Outside the
-    /// map, so a table without them costs a request no second probe.
-    shared_scopes: Vec<ListenerScope>,
-    /// A table built by hand: every port searches `shared_scopes`. One
-    /// built from a config clears it, and only its HTTP and HTTPS listener
-    /// ports do ([`PortScopes::shared`]). A TCP port that searched them
-    /// would wait to sniff, and hang a server-speaks-first client.
-    shared_on_every_port: bool,
+    /// HTTPRoute rules.
+    pub http: RuleScopes,
+    /// GRPCRoute rules, as HTTP rules on the request's `/{service}/{method}`
+    /// path, ordered by gRPC's precedence. Never merged with `http`: a
+    /// request goes to one or the other by its content-type.
+    pub grpc: RuleScopes,
     /// L4 routes remain port-based (no listener scoping needed)
     pub tcp_routes: FnvHashMap<u16, Vec<Backend>>,
     pub udp_routes: FnvHashMap<u16, Vec<Backend>>,
@@ -138,6 +133,23 @@ pub struct RouteTable {
     /// Read once per connection, at accept: a change applies to
     /// connections accepted after it.
     pub proxy_sources: crate::proxy::proxy_protocol::TrustedSources,
+}
+
+/// The rule scopes of one kind of route HTTP carries, by port and
+/// listener hostname.
+#[derive(Debug, Clone)]
+pub struct RuleScopes {
+    /// Per-listener scopes, indexed by port for O(1) lookup.
+    pub listener_scopes: FnvHashMap<u16, PortScopes>,
+    /// The scopes ports share, added under port 0: routes without
+    /// parentRefs, or `add_http_route` in tests and benches. Outside the
+    /// map, so a table without them costs a request no second probe.
+    shared_scopes: Vec<ListenerScope>,
+    /// A table built by hand: every port searches `shared_scopes`. One
+    /// built from a config clears it, and only its HTTP and HTTPS listener
+    /// ports do ([`PortScopes::shared`]). A TCP port that searched them
+    /// would wait to sniff, and hang a server-speaks-first client.
+    shared_on_every_port: bool,
 }
 
 /// One port's HTTP route scopes, one per listener hostname.
@@ -172,7 +184,85 @@ impl TlsScope {
 }
 
 impl RouteTable {
-    /// Find an HTTP route rule scoped by the server port and request's Host header.
+    /// Find an HTTP route rule scoped by the server port and request's Host
+    /// header (see [`RuleScopes::find`]).
+    #[inline(always)]
+    pub fn find_http_route<'a>(
+        &'a self,
+        host: &str,
+        method: &str,
+        path: &str,
+        header_data: &[u8],
+        query_string: &str,
+        server_port: u16,
+    ) -> Option<&'a HttpRouteRule> {
+        self.http
+            .find(host, method, path, header_data, query_string, server_port)
+    }
+
+    /// Find a gRPC route rule by the request's `/{service}/{method}` path.
+    #[inline(always)]
+    pub fn find_grpc_route<'a>(
+        &'a self,
+        host: &str,
+        path: &str,
+        header_data: &[u8],
+        server_port: u16,
+    ) -> Option<&'a HttpRouteRule> {
+        self.grpc
+            .find(host, "POST", path, header_data, "", server_port)
+    }
+
+    /// Whether any HTTP route can match on `server_port`: its own scopes or
+    /// the shared ones it takes, as `find_http_route` searches them.
+    pub fn has_http_routes(&self, server_port: u16) -> bool {
+        self.http.has_routes(server_port)
+    }
+
+    /// Whether a port serves gRPC: it then speaks h2, h2c in the clear.
+    pub fn has_grpc_routes(&self, server_port: u16) -> bool {
+        self.grpc.has_routes(server_port)
+    }
+
+    /// Whether a TLS client naming `sni` (lowercase) may make gRPC calls on
+    /// `server_port`. One naming none, by IP, may wherever the port serves
+    /// gRPC: it gives no name to narrow by.
+    pub fn grpc_serves(&self, server_port: u16, sni: Option<&str>) -> bool {
+        match sni {
+            Some(host) => self.grpc.serves_host(server_port, host),
+            None => self.has_grpc_routes(server_port),
+        }
+    }
+
+    /// Every HTTP route scope: each port's, then the shared ones.
+    pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
+        self.http.scopes()
+    }
+
+    /// Every scope of every kind HTTP carries: what holds a backend or a
+    /// mirror, for the walks that must see them all.
+    pub fn rule_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
+        self.http.scopes().chain(self.grpc.scopes())
+    }
+    ///
+    /// 1. Find all listener scopes matching the server port
+    /// 2. Among those, find scopes matching the Host header (exact > wildcard > catch-all)
+    /// 3. Within the best-matching scope, look up the route rule
+    ///
+    pub fn has_tcp_route(&self, server_port: u16) -> bool {
+        self.tcp_routes.contains_key(&server_port)
+    }
+
+    /// A miss carries nothing, as for `find_http_route`: a port with no
+    /// route meets one per connection.
+    #[inline(always)]
+    pub fn find_tcp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
+        self.tcp_routes.get(&server_port)
+    }
+}
+
+impl RuleScopes {
+    /// Find a rule scoped by the server port and request's Host header.
     ///
     /// 1. Find all listener scopes matching the server port
     /// 2. Among those, find scopes matching the Host header (exact > wildcard > catch-all)
@@ -181,7 +271,7 @@ impl RouteTable {
     /// A miss is a 404 any client can send on every request, so it carries
     /// nothing: a formatted error allocated per request in a 404 flood.
     #[inline(always)]
-    pub fn find_http_route<'a>(
+    pub fn find<'a>(
         &'a self,
         host: &str,
         method: &str,
@@ -256,11 +346,26 @@ impl RouteTable {
         best.map(|(_, rule)| rule)
     }
 
-    /// Whether any HTTP route can match on `server_port`: its own scopes or
-    /// the shared ones it takes, as `find_http_route` searches them.
-    pub fn has_http_routes(&self, server_port: u16) -> bool {
+    /// Whether any rule can match on `server_port`: its own scopes or the
+    /// shared ones it takes, as [`Self::find`] searches them.
+    pub fn has_routes(&self, server_port: u16) -> bool {
         let port = self.listener_scopes.get(&server_port);
         port.is_some_and(|p| !p.scopes.is_empty()) || !self.shared_scopes_of(port).is_empty()
+    }
+
+    /// Whether some rule may match a request for `host` (lowercase) on
+    /// `server_port`: a scope there takes the host, and holds routes for
+    /// it, exact, wildcard or catch-all.
+    pub fn serves_host(&self, server_port: u16, host: &str) -> bool {
+        let port = self.listener_scopes.get(&server_port);
+        let own = port.map_or(&[][..], |p| &p.scopes[..]);
+        own.iter().chain(self.shared_scopes_of(port)).any(|scope| {
+            scope.hostname_match_priority(host).is_some()
+                && (scope.http_routes.contains_key(host)
+                    || parent_domains(host)
+                        .any(|parent| scope.wildcard_http_routes.contains_key(parent))
+                    || scope.catch_all_http_routes.is_some())
+        })
     }
 
     /// The shared scopes a port with `port`'s entry searches: none, unless
@@ -275,23 +380,12 @@ impl RouteTable {
         &self.shared_scopes
     }
 
-    /// Every HTTP route scope: each port's, then the shared ones.
-    pub fn http_scopes(&self) -> impl Iterator<Item = &ListenerScope> {
+    /// Every scope: each port's, then the shared ones.
+    pub fn scopes(&self) -> impl Iterator<Item = &ListenerScope> {
         self.listener_scopes
             .values()
             .flat_map(|p| &p.scopes)
             .chain(&self.shared_scopes)
-    }
-
-    pub fn has_tcp_route(&self, server_port: u16) -> bool {
-        self.tcp_routes.contains_key(&server_port)
-    }
-
-    /// A miss carries nothing, as for `find_http_route`: a port with no
-    /// route meets one per connection.
-    #[inline(always)]
-    pub fn find_tcp_backends(&self, server_port: u16) -> Option<&Vec<Backend>> {
-        self.tcp_routes.get(&server_port)
     }
 
     /// Match rules: method first (fastest reject), then exact path before longest prefix,
@@ -362,7 +456,9 @@ impl RouteTable {
         }
         None
     }
+}
 
+impl RouteTable {
     /// A miss carries nothing: a port with no route meets one per datagram,
     /// spoofed ones included.
     #[inline(always)]
@@ -527,6 +623,9 @@ pub struct HttpRouteRule {
     /// Within a scope the stable sort keeps it; between a port's scope and
     /// the shared one it breaks a tie.
     pub route_index: u32,
+    /// A gRPC rule's precedence after its hostname: the characters of its
+    /// service and method matches. Zero on an HTTP rule, which has its own.
+    pub grpc_rank: (u16, u16),
 }
 
 impl HttpRouteRule {
@@ -561,6 +660,7 @@ impl HttpRouteRule {
             request_timeout: None,
             backend_request_timeout: None,
             retry: None,
+            grpc_rank: (0, 0),
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],

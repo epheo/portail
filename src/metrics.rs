@@ -228,8 +228,9 @@ fn render_sync_auth(out: &mut String) {
 // --- Latency histograms ----------------------------------------------------
 
 /// Bucket bounds shared by every histogram. Log-scale from 10us (a pooled
-/// local-backend hop) to 60s (past every default timeout: backendTimeout 30s,
-/// so a timed-out request lands in a finite bucket, not just +Inf). Nanos for
+/// local-backend hop) to 60s (past every default timeout: a backend's 30s
+/// to answer, so a timed-out request lands in a finite bucket, not just
+/// +Inf). Nanos for
 /// the hot-path compare, the label strings precomputed for the scrape.
 const LE_NANOS: [u64; 21] = [
     10_000,

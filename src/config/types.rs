@@ -181,6 +181,12 @@ pub struct PortailConfig {
     #[serde(default)]
     pub http_routes: Vec<HttpRouteConfig>,
 
+    /// Matched by a request whose content-type is `application/grpc`, and
+    /// only by it; never merged with `http_routes`. Left out when empty, so
+    /// a data plane that does not know them still takes a config without.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_routes: Vec<GrpcRouteConfig>,
+
     #[serde(default)]
     pub tcp_routes: Vec<TcpRouteConfig>,
 
@@ -266,6 +272,34 @@ impl PortailConfig {
             })
     }
 
+    /// The backendRefs of gRPC rules and of their mirrors.
+    pub(crate) fn grpc_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
+        self.grpc_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter().chain(mirrors)
+            })
+    }
+
+    /// The backendRefs of gRPC rules and of their mirrors, to change.
+    pub(crate) fn grpc_backend_refs_mut(&mut self) -> impl Iterator<Item = &mut BackendRef> {
+        self.grpc_routes
+            .iter_mut()
+            .flat_map(|r| &mut r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter_mut().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&mut config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter_mut().chain(mirrors)
+            })
+    }
+
     /// The backendRefs of TCP, UDP and TLS routes.
     pub(crate) fn l4_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
         let tcp = self
@@ -294,6 +328,57 @@ pub struct HttpRouteConfig {
     #[serde(default)]
     pub hostnames: Vec<String>,
     pub rules: Vec<HttpRouteRule>,
+}
+
+/// A GRPCRoute (Gateway API v1). Its backends are spoken h2, whatever
+/// their port's appProtocol: gRPC has no HTTP/1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct GrpcRouteConfig {
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    pub rules: Vec<GrpcRouteRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct GrpcRouteRule {
+    /// Any one matches; none: every gRPC request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<GrpcRouteMatch>,
+    /// RequestHeaderModifier, ResponseHeaderModifier and RequestMirror: what
+    /// a GRPCRoute filter may be.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<HttpRouteFilter>,
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// All of it must hold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct GrpcRouteMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<GrpcMethodMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpHeaderMatch>,
+}
+
+/// The `/{service}/{method}` of a gRPC request's path. At least one of the
+/// two is set; the other unset matches any.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcMethodMatch {
+    #[serde(default, rename = "type")]
+    pub match_type: StringMatchType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 /// Reference to a Gateway that this route attaches to
@@ -953,8 +1038,12 @@ pub enum PoolScope {
     Process,
 }
 
+/// A connect that has not completed in 10 s is given up, so the client's
+/// next request dials a new connection: one whose first SYN left before
+/// kube-proxy's rule for a new Service stays blackholed through every
+/// retransmission. Envoy Gateway and Istio wait as long.
 fn default_backend_timeout() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(10)
 }
 
 fn default_udp_session_timeout() -> Duration {

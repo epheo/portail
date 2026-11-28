@@ -216,6 +216,7 @@ fn observed_routes(
     let owner = (controller, gw_name, gw_ns);
     let mut out = Vec::new();
     push(&mut out, &snapshot.http_routes, &cache.http_routes, owner);
+    push(&mut out, &snapshot.grpc_routes, &cache.grpc_routes, owner);
     push(&mut out, &snapshot.tcp_routes, &cache.tcp_routes, owner);
     push(&mut out, &snapshot.tls_routes, &cache.tls_routes, owner);
     push(&mut out, &snapshot.udp_routes, &cache.udp_routes, owner);
@@ -330,6 +331,7 @@ pub(crate) async fn translate(
     // and Services ride along as `Arc`s.
     let snapshot = ClusterSnapshot {
         http_routes: gateway_routes(&ctx.cache.http_routes, &gw_name, &gw_ns),
+        grpc_routes: gateway_routes(&ctx.cache.grpc_routes, &gw_name, &gw_ns),
         tcp_routes: gateway_routes(&ctx.cache.tcp_routes, &gw_name, &gw_ns),
         tls_routes: gateway_routes(&ctx.cache.tls_routes, &gw_name, &gw_ns),
         udp_routes: gateway_routes(&ctx.cache.udp_routes, &gw_name, &gw_ns),
@@ -416,7 +418,7 @@ pub(crate) async fn translate(
     let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
     let services = &ctx.cache.services;
     let policies = &ctx.cache.backend_tls_policies;
-    let https = crate::kubernetes::services::http_backends(&result.config);
+    let https = crate::kubernetes::services::verifiable_backends(&result.config);
     let wanted = backend_tls::wanted_configmaps(&https, services, policies);
     let cas = match ctx
         .ca_bundles
