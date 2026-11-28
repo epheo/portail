@@ -34,6 +34,8 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestPercentageMirror",
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
+    "HTTPRouteRetryCodes",
+    "HTTPRouteRetryConnectionError",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
     "TLSRoute",
