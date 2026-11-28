@@ -395,7 +395,8 @@ pub(crate) async fn translate(
     let me = GatewayKey::new(gw_ns.clone(), gw_name.clone());
     let services = &ctx.cache.services;
     let policies = &ctx.cache.backend_tls_policies;
-    let wanted = backend_tls::wanted_configmaps(&referenced, services, policies);
+    let https = crate::kubernetes::services::http_backends(&result.config);
+    let wanted = backend_tls::wanted_configmaps(&https, services, policies);
     let cas = match ctx
         .ca_bundles
         .resolve(&ctx.client, &ctx.cache.configmaps, &me, wanted)
@@ -410,7 +411,7 @@ pub(crate) async fn translate(
             }));
         }
     };
-    let backend_tls = backend_tls::for_backends(&referenced, services, policies, |ns, name| {
+    let backend_tls = backend_tls::for_backends(&https, services, policies, |ns, name| {
         let key = (ns.to_string(), name.to_string());
         cas.get(&key)
             .cloned()
@@ -419,7 +420,7 @@ pub(crate) async fn translate(
     backend_tls::warn_unverified(
         &result.config.app_protocol_overrides,
         &backend_tls.decisions,
-        &referenced,
+        &https,
     );
     gateway_backends::resolve(&ctx.hub, &ctx.reports, &mut result.config, &networks);
     let targets = std::mem::take(&mut result.gateway_targets)

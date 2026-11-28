@@ -950,6 +950,45 @@ mod tests {
         assert_eq!(patch["status"]["ancestors"], serde_json::json!([]));
     }
 
+    /// A policy naming a Service the Gateway reaches by a TCPRoute alone
+    /// changes no connection: the Gateway is not its ancestor.
+    #[tokio::test]
+    async fn a_policy_on_a_tcp_backend_has_no_ancestor() {
+        let mut p = Pipeline::new();
+        let mut gw = testkit::gateway("gw", 1);
+        gw.spec.listeners[0].protocol = "TCP".into();
+        apply(&mut p.cluster.gateways, gw.clone());
+        apply(
+            &mut p.cluster.services,
+            testkit::service("web", "tcp", 443, serde_json::json!(8443)),
+        );
+        let route: TcpRoute = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "TCPRoute",
+            "metadata": {"name": "r", "namespace": "default", "generation": 1, "resourceVersion": "1"},
+            "spec": {
+                "parentRefs": [{"name": "gw"}],
+                "rules": [{"backendRefs": [{"name": "web", "port": 443}]}],
+            },
+        }))
+        .unwrap();
+        apply(&mut p.cluster.tcp_routes, route);
+        apply(
+            &mut p.cluster.backend_tls_policies,
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "namespace": "default", "generation": 1},
+                "spec": {
+                    "targetRefs": [{"group": "", "kind": "Service", "name": "web"}],
+                    "validation": {"hostname": "web.test", "wellKnownCACertificates": "System"},
+                },
+            }))
+            .unwrap(),
+        );
+
+        p.pass(&gw).await.unwrap();
+        assert_eq!(p.api.status_patch("backendtlspolicies", "p"), None);
+    }
+
     /// A policy's CA ConfigMap, cached by metadata, is fetched by name and
     /// judged: a CA accepts the policy, a ConfigMap without one refuses it.
     #[tokio::test]
