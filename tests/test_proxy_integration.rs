@@ -1557,6 +1557,31 @@ fn test_access_log_lines_written() {
     );
 }
 
+/// A request answered right before SIGTERM still has its line: the
+/// workers' lines are handed over and written before the process leaves.
+#[test]
+fn test_access_log_line_survives_shutdown() {
+    let backend = TestBackend::spawn("last");
+    let log_file = tempfile::NamedTempFile::new().expect("temp log file");
+    let mut proxy = PortailProcess::spawn_with_access_log(
+        &[("localhost", "/", backend.addr)],
+        proxy_port(64),
+        log_file.path(),
+    );
+    let reply = http_request(
+        proxy.proxy_addr,
+        b"GET /last HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .expect("proxied request");
+    assert_eq!(extract_status(&reply), Some(200));
+    proxy.terminate();
+    proxy
+        .wait_exit(Duration::from_secs(10))
+        .expect("the proxy exits on SIGTERM");
+    let text = std::fs::read_to_string(log_file.path()).expect("read access log");
+    assert!(text.contains("\"path\":\"/last\""), "line lost: {text:?}");
+}
+
 #[test]
 fn test_latency_histograms_exposed_on_metrics() {
     let backend = TestBackend::spawn("timed response");

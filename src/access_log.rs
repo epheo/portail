@@ -10,12 +10,14 @@
 //! The data path never blocks on the log sink: past `QUEUED_MAX` bytes
 //! queued, a buffer is dropped and its lines counted in
 //! `portail_access_log_dropped_total`. Lines keep their order per worker
-//! only; each carries its timestamp.
+//! thread only: a connection's requests may run on different workers, so
+//! even its lines can arrive out of order; each carries its timestamp. At
+//! shutdown, [`finish`] waits for the workers' lines and their write.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,9 +27,22 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::logging::warn;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static SENDER: OnceLock<UnboundedSender<String>> = OnceLock::new();
+static SENDER: OnceLock<UnboundedSender<Message>> = OnceLock::new();
 /// Bytes handed to the writer and not yet taken by it.
 static QUEUED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes in the workers' pending buffers.
+static PENDING_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Set by [`finish`]: from then on a hand-off that empties the workers'
+/// buffers wakes it. Unset, a hand-off pays one load for it.
+static FINISHING: AtomicBool = AtomicBool::new(false);
+static HANDED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+/// What the writer receives.
+enum Message {
+    Lines(String),
+    /// Answered once everything sent before it is written and flushed.
+    Finished(tokio::sync::oneshot::Sender<()>),
+}
 
 /// Bytes queued towards the writer before drops start. Sized for a burst,
 /// not sustained overload: a sink slower than the request rate must shed
@@ -117,6 +132,7 @@ pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<Socket
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     PENDING.with_borrow_mut(|pending| {
+        let before = pending.len();
         write_line(
             pending,
             &cap,
@@ -126,10 +142,35 @@ pub fn emit(cap: Option<Box<AccessCapture>>, status: u16, backend: Option<Socket
             ts.subsec_millis(),
             dur_us,
         );
+        PENDING_BYTES.fetch_add(pending.len() - before, Relaxed);
         if pending.len() >= HANDOFF {
             hand_off(tx, pending);
         }
     });
+}
+
+/// Hand over this thread's lines, wait for every worker's (each hands its
+/// over as it parks, and after the drain they are idle), then for the
+/// writer to have written and flushed them all. Called once, after the
+/// drain: the last requests' lines must not be lost to the exit.
+pub async fn finish() {
+    let Some(tx) = SENDER.get() else { return };
+    FINISHING.store(true, SeqCst);
+    flush();
+    let handed = HANDED.get_or_init(tokio::sync::Notify::new);
+    loop {
+        let notified = handed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if PENDING_BYTES.load(SeqCst) == 0 {
+            break;
+        }
+        notified.await;
+    }
+    let (written, done) = tokio::sync::oneshot::channel();
+    if tx.send(Message::Finished(written)).is_ok() {
+        let _ = done.await;
+    }
 }
 
 /// Hand this thread's pending lines to the writer. The runtime calls it as
@@ -145,17 +186,25 @@ pub fn flush() {
     });
 }
 
-fn hand_off(tx: &UnboundedSender<String>, pending: &mut String) {
-    let lines = std::mem::replace(pending, String::with_capacity(HANDOFF + HANDOFF / 4));
+fn hand_off(tx: &UnboundedSender<Message>, pending: &mut String) {
+    // Sized by what was just handed over: an idle worker that parks after
+    // one line keeps a small buffer.
+    let capacity = pending.len().min(HANDOFF);
+    let lines = std::mem::replace(pending, String::with_capacity(capacity));
     let len = lines.len();
     if QUEUED.fetch_add(len, Relaxed) + len > QUEUED_MAX {
         QUEUED.fetch_sub(len, Relaxed);
         drop_lines(&lines);
-        return;
-    }
-    if let Err(refused) = tx.send(lines) {
+    } else if let Err(refused) = tx.send(Message::Lines(lines)) {
         QUEUED.fetch_sub(len, Relaxed);
-        drop_lines(&refused.0);
+        if let Message::Lines(lines) = refused.0 {
+            drop_lines(&lines);
+        }
+    }
+    if PENDING_BYTES.fetch_sub(len, SeqCst) == len && FINISHING.load(SeqCst) {
+        if let Some(handed) = HANDED.get() {
+            handed.notify_waiters();
+        }
     }
 }
 
@@ -260,20 +309,23 @@ pub fn init(target: &str) -> anyhow::Result<()> {
 /// Drain the channel into batched writes, flushing whenever the queue goes
 /// quiet so lines are visible promptly without a per-line syscall under load.
 async fn writer(
-    mut rx: UnboundedReceiver<String>,
+    mut rx: UnboundedReceiver<Message>,
     mut sink: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 ) {
     let mut batch = String::with_capacity(64 * 1024);
-    while let Some(lines) = rx.recv().await {
-        let mut taken = lines.len();
-        batch.push_str(&lines);
-        while batch.len() < 64 * 1024 {
-            match rx.try_recv() {
-                Ok(more) => {
-                    taken += more.len();
-                    batch.push_str(&more);
+    while let Some(first) = rx.recv().await {
+        let (mut taken, mut finished) = (0, None);
+        let mut next = Some(first);
+        while let Some(message) = next.take() {
+            match message {
+                Message::Lines(lines) => {
+                    taken += lines.len();
+                    batch.push_str(&lines);
                 }
-                Err(_) => break,
+                Message::Finished(written) => finished = Some(written),
+            }
+            if finished.is_none() && batch.len() < 64 * 1024 {
+                next = rx.try_recv().ok();
             }
         }
         QUEUED.fetch_sub(taken, Relaxed);
@@ -285,6 +337,9 @@ async fn writer(
             let _ = sink.flush().await;
         }
         batch.clear();
+        if let Some(written) = finished {
+            let _ = written.send(());
+        }
     }
 }
 
@@ -299,15 +354,20 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let queued = QUEUED.load(Relaxed);
         let mut pending = "a\nb\n".to_string();
+        PENDING_BYTES.fetch_add(4, Relaxed);
         hand_off(&tx, &mut pending);
         assert!(pending.is_empty());
-        assert_eq!(rx.try_recv().unwrap(), "a\nb\n");
+        let Ok(Message::Lines(lines)) = rx.try_recv() else {
+            panic!("the buffer, whole");
+        };
+        assert_eq!(lines, "a\nb\n");
         assert_eq!(QUEUED.load(Relaxed), queued + 4);
         QUEUED.fetch_sub(4, Relaxed);
 
         let dropped = crate::metrics::METRICS.access_log_dropped_total.get();
         QUEUED.fetch_add(QUEUED_MAX, Relaxed);
         let mut pending = "c\nd\ne\n".to_string();
+        PENDING_BYTES.fetch_add(6, Relaxed);
         hand_off(&tx, &mut pending);
         QUEUED.fetch_sub(QUEUED_MAX, Relaxed);
         assert!(pending.is_empty());

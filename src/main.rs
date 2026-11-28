@@ -262,6 +262,7 @@ async fn async_main(args: Args, portail_config: PortailConfig) -> Result<()> {
 
     info!("Shutting down Portail");
     drain.run().await;
+    portail::access_log::finish().await;
 
     info!("Portail shutdown complete");
     Ok(())
