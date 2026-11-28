@@ -132,6 +132,8 @@ pub(crate) fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
         idle_body_timeout: Duration::from_secs(5),
         http2: false,
     };
+    // As the listener decides it.
+    let tcp_route = !is_tls && rt.has_tcp_route(8080);
     ConnectionState::new(
         8080,
         Arc::new(ArcSwap::from_pointee(rt)),
@@ -139,6 +141,7 @@ pub(crate) fn conn_state(rt: RouteTable, is_tls: bool) -> ConnectionState {
         Arc::new(BackendSelector::new()),
         Arc::new(HealthRegistry::new()),
         is_tls,
+        tcp_route,
         "127.0.0.1:40000".parse().unwrap(),
         "127.0.0.1:8080".parse().unwrap(),
         &cfg,
@@ -457,4 +460,38 @@ pub(crate) async fn read_one_reply<R: tokio::io::AsyncRead + Unpin>(client: &mut
         assert!(n > 0, "closed mid reply: {}", String::from_utf8_lossy(&out));
         out.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// Only a TCP route on the served port.
+pub(crate) fn tcp_route(backend: SocketAddr) -> RouteTable {
+    let mut rt = RouteTable::new();
+    rt.add_tcp_route(
+        8080,
+        vec![Backend {
+            socket_addr: backend,
+            weight: 1,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: crate::routing::BackendAction::Forward,
+        }],
+    );
+    rt
+}
+
+/// Sends `banner` on accept, as MySQL or SMTP do, then echoes until EOF.
+pub(crate) async fn banner_backend(banner: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = sock.split();
+                if wr.write_all(banner).await.is_ok() {
+                    let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                }
+            });
+        }
+    });
+    addr
 }

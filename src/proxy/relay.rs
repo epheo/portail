@@ -1,7 +1,6 @@
 //! Opaque bytes both ways: TCP routes, TLS passthrough and upgraded
 //! tunnels.
 
-use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,7 +17,9 @@ use crate::proxy::deadline::idle_opt;
 use crate::proxy::health::HealthRegistry;
 use crate::proxy::listener::{tcp_keepalive, ServeConfig};
 use crate::proxy::proxy_protocol;
-use crate::proxy::request_processor::report_passthrough_miss;
+use crate::proxy::request_processor::{
+    analyze_tcp_request, report_passthrough_miss, RoutingResult,
+};
 use crate::proxy::tls::Connection;
 use crate::routing::{BackendAction, BackendSelector, RouteTable};
 
@@ -60,12 +61,52 @@ pub(super) async fn handle_tls_passthrough(
         Connection::Plain { inner: client },
         backend_addr,
         header,
-        &[],
+        Vec::new(),
         health,
         cfg.connect_timeout,
         &tcp_keepalive(cfg.tcp_keepalive_time),
         idle_opt(cfg.idle_body_timeout),
         "TLS passthrough",
+        stats,
+    )
+    .await
+}
+
+/// A connection on a port with TCP routes and no HTTP route: routed by its
+/// port alone and relayed before the client has sent anything. There is
+/// nothing to sniff, and server-speaks-first protocols (MySQL, SMTP, FTP,
+/// IMAP, POP3) send nothing before the backend's banner: a proxy waiting
+/// for their first bytes would deadlock them.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_tcp_route(
+    client: Connection,
+    (peer, local): (SocketAddr, SocketAddr),
+    server_port: u16,
+    routes: &ArcSwap<RouteTable>,
+    health: Arc<HealthRegistry>,
+    selector: &BackendSelector,
+    cfg: &ServeConfig,
+    stats: &ListenerStats,
+) {
+    // The table is let go before the relay, as for a passthrough.
+    let routed = analyze_tcp_request(&routes.load(), selector, server_port, &health);
+    let Ok(RoutingResult::TcpForward {
+        backend_addr,
+        proxied,
+    }) = routed
+    else {
+        return; // the router logged why
+    };
+    handle_tcp_connection(
+        client,
+        backend_addr,
+        proxied.then(|| proxy_protocol::header(peer, local)),
+        Vec::new(),
+        health,
+        cfg.connect_timeout,
+        &tcp_keepalive(cfg.tcp_keepalive_time),
+        idle_opt(cfg.idle_body_timeout),
+        "TCP",
         stats,
     )
     .await
@@ -81,7 +122,7 @@ pub(super) async fn handle_tcp_connection(
     client: Connection,
     backend_addr: SocketAddr,
     header: Option<Vec<u8>>,
-    initial_data: &[u8],
+    initial_data: Vec<u8>,
     health: Arc<HealthRegistry>,
     connect_timeout: Duration,
     keepalive: &socket2::TcpKeepalive,
@@ -101,16 +142,19 @@ pub(super) async fn handle_tcp_connection(
     health.record_success(backend_addr);
     let first = match header {
         Some(mut first) => {
-            first.extend_from_slice(initial_data);
-            Cow::Owned(first)
+            first.extend_from_slice(&initial_data);
+            first
         }
-        None => Cow::Borrowed(initial_data),
+        None => initial_data,
     };
     if let Err(e) = backend.write_all(&first).await {
         crate::metrics::record_backend_send_error(&backend_addr.to_string());
         stats.upstream_send_errors.inc();
         return fail_l4_backend(health, backend_addr, ctx, "took no first byte", &e);
     }
+    // Not held for the tunnel's life: a sniffed connection's first read is
+    // a whole client buffer.
+    drop(first);
     both_ways(client, backend, idle).await;
 }
 
@@ -269,9 +313,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::testkit::client_hello;
+    use crate::proxy::testkit::{
+        backend, banner_backend, client_hello, conn_state_header, exchange, gateway_backend,
+        l4_backend, read_until_closed, received, refusing_backend, tcp_route, IDLE, REFUSED,
+    };
     use crate::routing::Backend;
     use std::pin::Pin;
+    use tokio::io::DuplexStream;
     use tokio::net::TcpListener;
 
     /// What a relay direction reads next: `Some(n)` bytes, the whole buffer
@@ -435,5 +483,175 @@ mod tests {
             let read = client.read(&mut [0u8; 8]).await;
             assert!(!matches!(read, Ok(n) if n > 0), "{sni}: {read:?}");
         }
+    }
+
+    /// A TCP-only port relaying to `rt`'s route, served in memory: the
+    /// client's end, the relay's task and its listener's counters. The
+    /// addresses are the testkit's, so `conn_state_header` is its header.
+    fn serve_tcp_route(
+        rt: RouteTable,
+        idle: Option<Duration>,
+    ) -> (
+        DuplexStream,
+        tokio::task::JoinHandle<()>,
+        Arc<ListenerStats>,
+    ) {
+        let (client, relayed) = tokio::io::duplex(64 * 1024);
+        let stats = Arc::new(ListenerStats::default());
+        let cfg = ServeConfig {
+            idle_body_timeout: idle.unwrap_or_default(),
+            ..ServeConfig::from_perf(&Default::default(), 4)
+        };
+        let counted = stats.clone();
+        let task = tokio::spawn(async move {
+            handle_tcp_route(
+                Connection::Mem {
+                    inner: relayed,
+                    aborted: Default::default(),
+                },
+                (
+                    "127.0.0.1:40000".parse().unwrap(),
+                    "127.0.0.1:8080".parse().unwrap(),
+                ),
+                8080,
+                &ArcSwap::from_pointee(rt),
+                Arc::default(),
+                &BackendSelector::new(),
+                &cfg,
+                &counted,
+            )
+            .await
+        });
+        (client, task, stats)
+    }
+
+    /// Once one side has finished, a peer that never closes pinned the
+    /// relay, its task and both fds forever.
+    #[tokio::test]
+    async fn half_closed_l4_relay_ends_after_the_idle_budget() {
+        // The client is done; the backend never answers nor closes.
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task, _) = serve_tcp_route(tcp_route(silent), Some(IDLE));
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "relay pinned after the client's FIN");
+
+        // The backend is done; the client never closes.
+        let done = l4_backend(|mut sock| async move {
+            let _ = sock.write_all(b"bye").await;
+            let _ = sock.shutdown().await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task, _) = serve_tcp_route(tcp_route(done), Some(IDLE));
+        client.read_exact(&mut [0u8; 3]).await.unwrap();
+        let ended = tokio::time::timeout(IDLE * 10, task).await;
+        assert!(ended.is_ok(), "relay pinned after the backend's FIN");
+    }
+
+    /// The bound is on a stalled half, not on how long it runs; with both
+    /// sides open, or the budget disabled, the relay stays unbounded.
+    #[tokio::test]
+    async fn l4_relay_bounds_only_a_stalled_half() {
+        let trickle = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            for _ in 0..5 {
+                tokio::time::sleep(IDLE / 2).await;
+                if sock.write_all(b"x").await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        let (mut client, _task, _) = serve_tcp_route(tcp_route(trickle), Some(IDLE));
+        assert_eq!(exchange(&mut client, b"GO").await, "xxxxx");
+
+        let (mut client, task, _) =
+            serve_tcp_route(tcp_route(banner_backend(b"").await), Some(IDLE));
+        tokio::time::sleep(IDLE * 3).await;
+        assert!(!task.is_finished(), "relay cut with both sides open");
+        assert_eq!(exchange(&mut client, b"ping").await, "ping");
+
+        let silent = l4_backend(|mut sock| async move {
+            let _ = sock.read_to_end(&mut Vec::new()).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let (mut client, task, _) = serve_tcp_route(tcp_route(silent), None);
+        client.shutdown().await.unwrap();
+        tokio::time::sleep(IDLE * 3).await;
+        assert!(!task.is_finished(), "relay cut with the budget disabled");
+    }
+
+    /// Raw TCP has no status to answer with. A backend that refuses the
+    /// connect is counted on its listener and by address, as an HTTP
+    /// backend is: for a TCP route, and for TLS passthrough.
+    #[tokio::test]
+    async fn an_l4_backend_that_refuses_is_counted() {
+        let (_held, refused) = refusing_backend();
+        let by_address = || {
+            let metrics = crate::metrics::render(true);
+            let line = format!("backend=\"{refused}\"");
+            metrics
+                .lines()
+                .filter(|l| {
+                    l.starts_with("portail_upstream_connect_errors_total") && l.contains(&line)
+                })
+                .count()
+        };
+        assert_eq!(by_address(), 0);
+
+        let (mut client, task, stats) = serve_tcp_route(tcp_route(refused), None);
+        assert_eq!(read_until_closed(&mut client).await, "");
+        task.await.unwrap();
+        assert_eq!(stats.upstream_connect_errors.get(), 1);
+        assert_eq!(by_address(), 1);
+
+        let mut rt = RouteTable::new();
+        rt.add_tls_route(0, "down.test", vec![gateway_backend(refused)]);
+        let routes = Arc::new(ArcSwap::from_pointee(rt));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let local = server.local_addr().unwrap();
+        let stats = ListenerStats::default();
+        handle_tls_passthrough(
+            server,
+            (peer, local),
+            Some("down.test"),
+            None,
+            8443,
+            routes,
+            Arc::default(),
+            Arc::default(),
+            &ServeConfig::from_perf(&Default::default(), 4),
+            &stats,
+        )
+        .await;
+        assert_eq!(client.read(&mut [0u8; 8]).await.unwrap(), 0);
+        assert_eq!(stats.upstream_connect_errors.get(), 1);
+    }
+
+    /// Raw TCP to a Gateway backend: the header goes before any byte of
+    /// the client's.
+    #[tokio::test]
+    async fn a_gateway_backend_hears_who_connected_before_the_bytes() {
+        let (tcp, mut rx) = backend(REFUSED).await;
+        let mut rt = RouteTable::new();
+        rt.add_tcp_route(8080, vec![gateway_backend(tcp)]);
+        let (mut client, _task, _) = serve_tcp_route(rt, None);
+        client.write_all(b"hello").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            received(&mut rx).await,
+            [conn_state_header(), b"hello".to_vec()].concat()
+        );
     }
 }
