@@ -132,6 +132,7 @@ async fn write_route_statuses(
         }
         writes.record(match o.kind {
             "HTTPRoute" => write_parents!(HttpRoute),
+            "GRPCRoute" => write_parents!(gateway_api::experimental::grpcroutes::v1::GrpcRoute),
             "TCPRoute" => write_parents!(TcpRoute),
             "TLSRoute" => write_parents!(TlsRoute),
             "UDPRoute" => write_parents!(UdpRoute),

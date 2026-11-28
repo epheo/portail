@@ -457,6 +457,7 @@ macro_rules! impl_route_status_reports {
 
 impl_route_status_reports!(
     gateway_api::experimental::httproutes::v1::HttpRoute,
+    gateway_api::experimental::grpcroutes::v1::GrpcRoute,
     gateway_api::experimental::tcproutes::v1::TcpRoute,
     gateway_api::experimental::tlsroutes::v1::TlsRoute,
     gateway_api::experimental::udproutes::v1::UdpRoute

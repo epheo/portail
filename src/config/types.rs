@@ -272,6 +272,34 @@ impl PortailConfig {
             })
     }
 
+    /// The backendRefs of gRPC rules and of their mirrors.
+    pub(crate) fn grpc_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
+        self.grpc_routes
+            .iter()
+            .flat_map(|r| &r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter().chain(mirrors)
+            })
+    }
+
+    /// The backendRefs of gRPC rules and of their mirrors, to change.
+    pub(crate) fn grpc_backend_refs_mut(&mut self) -> impl Iterator<Item = &mut BackendRef> {
+        self.grpc_routes
+            .iter_mut()
+            .flat_map(|r| &mut r.rules)
+            .flat_map(|rule| {
+                let mirrors = rule.filters.iter_mut().filter_map(|f| match f {
+                    HttpRouteFilter::RequestMirror { config } => Some(&mut config.backend_ref),
+                    _ => None,
+                });
+                rule.backend_refs.iter_mut().chain(mirrors)
+            })
+    }
+
     /// The backendRefs of TCP, UDP and TLS routes.
     pub(crate) fn l4_backend_refs(&self) -> impl Iterator<Item = &BackendRef> {
         let tcp = self

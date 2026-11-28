@@ -208,7 +208,7 @@ pub(crate) fn for_backends<'a>(
     out
 }
 
-/// Each HTTP ref of `config` a decision applies to carries it, verified or
+/// Each HTTP or gRPC ref of `config` a decision applies to carries it, verified or
 /// invalid, and the config the CA bundles the verified ones name, by hash:
 /// one bundle travels once however many refs name it.
 pub(crate) fn emit(config: &mut PortailConfig, decisions: &HashMap<(String, u16), Decision>) {
@@ -234,16 +234,18 @@ pub(crate) fn emit(config: &mut PortailConfig, decisions: &HashMap<(String, u16)
             (backend.clone(), tls)
         })
         .collect();
-    for r in config.http_backend_refs_mut() {
+    let decide = |r: &mut crate::config::BackendRef| {
         if r.invalid {
-            continue;
+            return;
         }
         match tls.get(&(r.name.clone(), r.port)) {
             None => {}
             Some(None) => r.invalid = true,
             Some(Some(verify)) => r.tls = Some(verify.clone()),
         }
-    }
+    };
+    config.http_backend_refs_mut().for_each(decide);
+    config.grpc_backend_refs_mut().for_each(decide);
     config.backend_cas = bundles;
 }
 
