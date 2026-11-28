@@ -544,9 +544,12 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
     // The scenario's pacing: each end rests after every burst.
     const REST: Duration = Duration::from_micros(400);
 
-    // Tunnels that have delivered their first bytes, and bytes delivered.
-    let (delivered, mut seen) = tokio::sync::watch::channel((0usize, 0u64));
+    // Tunnels that have delivered their first bytes, bytes delivered, and
+    // senders that could not connect or send: one of those would leave the
+    // waits below waiting.
+    let (delivered, mut seen) = tokio::sync::watch::channel((0usize, 0u64, 0usize));
     let delivered = Arc::new(delivered);
+    let failed = delivered.clone();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Reads a burst, then rests: on threads of its own, as the senders are,
@@ -565,7 +568,7 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
                     // Said a mebibyte at a time: each word wakes the test's
                     // task on the proxy's thread, between two relays.
                     if first || unsaid >= 1024 * 1024 {
-                        delivered.send_modify(|(tunnels, bytes)| {
+                        delivered.send_modify(|(tunnels, bytes, _)| {
                             *tunnels += usize::from(std::mem::take(&mut first));
                             *bytes += std::mem::take(&mut unsaid);
                         });
@@ -607,23 +610,32 @@ fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
         };
         tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
         for _ in 0..TUNNELS {
-            let stop = stop.clone();
+            let (stop, failed) = (stop.clone(), failed.clone());
             std::thread::spawn(move || {
-                let mut sock = std::net::TcpStream::connect(proxy).unwrap();
+                let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
                 let chunk = vec![7u8; 64 * 1024];
-                while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                    && sock.write_all(&chunk).is_ok()
-                {
-                    std::thread::sleep(REST);
+                let sent = std::net::TcpStream::connect(proxy).and_then(|mut sock| {
+                    while !stopped() {
+                        sock.write_all(&chunk)?;
+                        std::thread::sleep(REST);
+                    }
+                    Ok(())
+                });
+                if sent.is_err() && !stopped() {
+                    failed.send_modify(|(_, _, failed)| *failed += 1);
                 }
             });
         }
         // Every tunnel is open, and each direction has borrowed once.
-        let warm = seen.wait_for(|(tunnels, _)| *tunnels == TUNNELS).await;
+        let warm = seen
+            .wait_for(|(tunnels, _, failed)| *tunnels == TUNNELS || *failed > 0)
+            .await;
         let from = warm.unwrap().1;
         let before = ALLOCATIONS.with(Cell::get);
-        let moved = seen.wait_for(|(_, bytes)| *bytes >= from + COUNTED).await;
-        drop(moved);
+        let moved = seen
+            .wait_for(|(_, bytes, failed)| *bytes >= from + COUNTED || *failed > 0)
+            .await;
+        assert_eq!(moved.unwrap().2, 0, "a sender could not connect or send");
         ALLOCATIONS.with(Cell::get) - before
     });
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
