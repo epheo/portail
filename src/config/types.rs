@@ -521,6 +521,36 @@ pub enum HttpRouteFilter {
         #[serde(rename = "requestMirror")]
         config: RequestMirrorConfig,
     },
+    /// A data plane that does not know the type refuses the config and
+    /// serves on what it had, rather than serve the rule without its
+    /// policy.
+    #[serde(rename = "CORS")]
+    Cors {
+        #[serde(rename = "cors")]
+        config: CorsConfig,
+    },
+}
+
+/// HTTPRoute's CORS filter, as Gateway API v1.7 writes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// `*`, or `<scheme>://<host>[:<port>]`, whose host may start with a
+    /// `*` standing for anything before the rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_credentials: bool,
+    /// Seconds a browser may keep a preflight's answer. Absent: 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

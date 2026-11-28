@@ -235,7 +235,7 @@ pub(super) async fn proxy_http_request(
                         backend_addr
                     );
                     state.refused(408);
-                    send_error_response(client, 408).await?;
+                    send_error_response(client, 408, &state.cors_lines).await?;
                     return Ok((false, None));
                 }
             }
@@ -264,7 +264,7 @@ pub(super) async fn proxy_http_request(
             state.refused(400);
             // The client may already be gone (EOF case); the close follows
             // either way.
-            let _ = send_error_response(client, 400).await;
+            let _ = send_error_response(client, 400, &state.cors_lines).await;
             return Ok((false, None));
         }
     };
@@ -305,6 +305,7 @@ pub(super) async fn proxy_http_request(
             &mut state.scratch_buf,
             &mut state.filter_buf,
             resp_mods.as_ref(),
+            &state.cors_lines,
             head_wait,
             meta.is_head,
             meta.is_upgrade && !answered_early,
@@ -348,7 +349,7 @@ pub(super) async fn proxy_http_request(
                     warn!("Backend {} closed without answering", backend_addr);
                 }
                 state.refused(502);
-                send_error_response(client, 502).await?;
+                send_error_response(client, 502, &state.cors_lines).await?;
                 return Ok((false, None));
             }
         }
@@ -765,6 +766,7 @@ async fn forward_response_headers(
     scratch: &mut Vec<u8>,
     filter_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
+    cors: &[u8],
     head_wait: Option<(Pin<&mut tokio::time::Sleep>, Option<tokio::time::Instant>)>,
     is_head_request: bool,
     expect_upgrade: bool,
@@ -781,11 +783,11 @@ async fn forward_response_headers(
         Some(Ok(read)) => read,
         Some(Err(e)) => {
             warn!("Backend response head failed: {}", e);
-            send_error_response(client, 502).await?;
+            send_error_response(client, 502, cors).await?;
             return Ok(HeaderPhase::ErrorSent(502));
         }
         None => {
-            send_error_response(client, 504).await?;
+            send_error_response(client, 504, cors).await?;
             return Ok(HeaderPhase::ErrorSent(504));
         }
     };
@@ -793,7 +795,7 @@ async fn forward_response_headers(
         HeadRead::Head(end, head, cuts) => (end, head, cuts),
         HeadRead::Malformed => {
             warn!("Backend sent a response head with ambiguous framing; rejecting");
-            send_error_response(client, 502).await?;
+            send_error_response(client, 502, cors).await?;
             return Ok(HeaderPhase::ErrorSent(502));
         }
         HeadRead::Unanswered => return Ok(HeaderPhase::Unanswered),
@@ -810,7 +812,7 @@ async fn forward_response_headers(
     // unframed tunnel; refuse it while the client wire is still clean.
     if framing.status == 101 && !expect_upgrade {
         warn!("Backend sent 101 without an upgrade request; rejecting");
-        send_error_response(client, 502).await?;
+        send_error_response(client, 502, cors).await?;
         return Ok(HeaderPhase::ErrorSent(502));
     }
 
@@ -856,6 +858,11 @@ async fn forward_response_headers(
     } else {
         scratch
     };
+    // Last: the rule's CORS filter has the final word on these headers,
+    // over the backend and over a header modifier.
+    if !cors.is_empty() {
+        crate::proxy::cors::set_on(headers, cors);
+    }
     // Hot path: sanitized headers + in-framing tail in a single write when
     // the tail is small enough to append to the scratch.
     let keep_len = headers.len();

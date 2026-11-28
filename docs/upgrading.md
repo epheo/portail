@@ -11,6 +11,7 @@
 - BackendTLSPolicy needs data planes of this release: an older one refuses a configuration carrying one and keeps serving its last. Managed data planes follow the controller's `--dataplane-image`; upgrade Unmanaged ones before writing a policy.
 - The controller's ClusterRole gains BackendTLSPolicy read and status patch, and ConfigMap read: apply this release's `deploy/install`.
 - A request mirror to a port with appProtocol `https` is sent over TLS: it went out in the clear.
+- A `CORS` filter on an HTTPRoute needs data planes of this release, for the same reason: an older one refuses the configuration and keeps serving its last. Until now such a route was `Accepted=False`, reason `UnsupportedValue`.
 
 ## From 0.2.1
 

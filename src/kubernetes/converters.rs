@@ -414,6 +414,20 @@ fn convert_http_filter(f: &HttpRouteRulesFilters, ns: &str) -> Result<HttpRouteF
                 config: convert_mirror_config(rm, ns),
             }
         }
+        HttpRouteRulesFiltersType::Cors => {
+            let cors = f.cors.as_ref().ok_or_else(|| missing("CORS"))?;
+            let list = |names: &Option<Vec<String>>| names.clone().unwrap_or_default();
+            HttpRouteFilter::Cors {
+                config: crate::config::CorsConfig {
+                    allow_origins: list(&cors.allow_origins),
+                    allow_methods: list(&cors.allow_methods),
+                    allow_headers: list(&cors.allow_headers),
+                    expose_headers: list(&cors.expose_headers),
+                    allow_credentials: cors.allow_credentials.unwrap_or(false),
+                    max_age: cors.max_age.and_then(|age| u32::try_from(age).ok()),
+                },
+            }
+        }
         ref other => {
             return Err(RouteError::unsupported(format!(
                 "unsupported filter type {:?}",
@@ -854,6 +868,41 @@ mod tests {
                 Some(b"cert".as_slice()),
                 Some(b"key".as_slice())
             )]
+        );
+    }
+
+    /// The filter reaches the config as the route writes it; what the API
+    /// leaves out is left out, for the data plane's defaults.
+    #[test]
+    fn a_cors_filter_converts_field_for_field() {
+        let filter = |cors: serde_json::Value| -> HttpRouteRulesFilters {
+            serde_json::from_value(serde_json::json!({"type": "CORS", "cors": cors})).unwrap()
+        };
+        let full = filter(serde_json::json!({
+            "allowOrigins": ["https://app.test", "https://*.example.org"],
+            "allowMethods": ["GET", "PUT"],
+            "allowHeaders": ["content-type"],
+            "exposeHeaders": ["x-request-id"],
+            "allowCredentials": true,
+            "maxAge": 600
+        }));
+        let converted = convert_http_filter(&full, "default").unwrap();
+        assert_eq!(
+            serde_json::to_value(&converted).unwrap(),
+            serde_json::json!({"type": "CORS", "cors": {
+                "allowOrigins": ["https://app.test", "https://*.example.org"],
+                "allowMethods": ["GET", "PUT"],
+                "allowHeaders": ["content-type"],
+                "exposeHeaders": ["x-request-id"],
+                "allowCredentials": true,
+                "maxAge": 600
+            }})
+        );
+
+        let bare = convert_http_filter(&filter(serde_json::json!({})), "default").unwrap();
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            serde_json::json!({"type": "CORS", "cors": {}})
         );
     }
 }

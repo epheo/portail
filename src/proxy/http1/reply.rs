@@ -24,7 +24,13 @@ pub(crate) async fn send_local_reply(
     access: Option<Box<crate::access_log::AccessCapture>>,
 ) -> Result<bool> {
     let location = reply.location.as_deref();
-    let bytes = local_reply_bytes(reply.status, location, !reply.reusable, reply.head);
+    let bytes = local_reply_bytes(
+        reply.status,
+        location,
+        !reply.reusable,
+        reply.head,
+        &state.cors_lines,
+    );
     state.client_done = reply.client_done;
     if !reply.reusable {
         state.close_after_reply();
@@ -37,29 +43,38 @@ pub(crate) async fn send_local_reply(
 
 /// Error reply after which the connection always closes (400, 408, 431,
 /// 502, 504): what remains of the request on the wire is unknown or unread.
-pub(crate) async fn send_error_response(client: &mut Connection, error_code: u16) -> Result<()> {
+/// `cors` is the request's CORS lines (see `analyze_request`), empty before
+/// a request is routed: without them a browser reports a CORS failure
+/// where the answer is a gateway error.
+pub(crate) async fn send_error_response(
+    client: &mut Connection,
+    error_code: u16,
+    cors: &[u8],
+) -> Result<()> {
     client
-        .write_all(&local_reply_bytes(error_code, None, true, false))
+        .write_all(&local_reply_bytes(error_code, None, true, false, cors))
         .await?;
     Ok(())
 }
 
 /// A response the proxy writes itself. Only redirects, which carry their
-/// Location, are built per call: 429 under a crawl and 502/504 storms
+/// Location, and the answers of a rule with a CORS filter, which carry
+/// its lines, are built per call: 429 under a crawl and 502/504 storms
 /// answer every request, so their bytes are statics.
 fn local_reply_bytes(
     status: u16,
     location: Option<&str>,
     close: bool,
     head: bool,
+    cors: &[u8],
 ) -> Cow<'static, [u8]> {
-    let fixed = match location {
-        None => static_reply(status),
-        Some(_) => None,
+    let fixed = match (location, cors) {
+        (None, []) => static_reply(status),
+        _ => None,
     };
     match fixed {
         Some(reply) => Cow::Borrowed(reply.bytes(close, head)),
-        None => Cow::Owned(build_local_reply(status, location, close, head)),
+        None => Cow::Owned(build_local_reply(status, location, close, head, cors)),
     }
 }
 
@@ -141,16 +156,24 @@ fn static_reply(status: u16) -> Option<&'static FixedReply> {
 
 /// Serialize a response the proxy writes itself; the body repeats the
 /// status line ("404 Not Found") and is left out for HEAD.
-fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: bool) -> Vec<u8> {
+fn build_local_reply(
+    status: u16,
+    location: Option<&str>,
+    close: bool,
+    head: bool,
+    cors: &[u8],
+) -> Vec<u8> {
     use std::io::Write;
 
     let (status, reason) = match status {
+        204 => (204, "No Content"),
         301 => (301, "Moved Permanently"),
         302 => (302, "Found"),
         303 => (303, "See Other"),
         307 => (307, "Temporary Redirect"),
         308 => (308, "Permanent Redirect"),
         400 => (400, "Bad Request"),
+        403 => (403, "Forbidden"),
         404 => (404, "Not Found"),
         408 => (408, "Request Timeout"),
         429 => (429, "Too Many Requests"),
@@ -161,8 +184,12 @@ fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: boo
         other if location.is_some() => (other, "Found"),
         _ => (500, "Internal Server Error"),
     };
-    let body = format!("{} {}", status, reason);
-    let mut resp = Vec::with_capacity(128 + location.map_or(0, str::len));
+    // A 204 has no body and so no Content-Length (RFC 9110 8.6).
+    let body = match status {
+        204 => String::new(),
+        _ => format!("{} {}", status, reason),
+    };
+    let mut resp = Vec::with_capacity(128 + location.map_or(0, str::len) + cors.len());
     let _ = write!(resp, "HTTP/1.1 {} {}\r\n", status, reason);
     if let Some(location) = location {
         let _ = write!(resp, "Location: {}\r\n", location);
@@ -170,7 +197,10 @@ fn build_local_reply(status: u16, location: Option<&str>, close: bool, head: boo
     if status == 429 {
         resp.extend_from_slice(b"Retry-After: 1\r\n");
     }
-    let _ = write!(resp, "Content-Length: {}\r\n", body.len());
+    if status != 204 {
+        let _ = write!(resp, "Content-Length: {}\r\n", body.len());
+    }
+    resp.extend_from_slice(cors);
     if close {
         resp.extend_from_slice(b"Connection: close\r\n");
     }
@@ -188,7 +218,7 @@ mod tests {
     #[test]
     fn local_reply_announces_close_exactly_when_closing() {
         let bytes = |status, location, close, head| {
-            String::from_utf8(local_reply_bytes(status, location, close, head).into_owned())
+            String::from_utf8(local_reply_bytes(status, location, close, head, &[]).into_owned())
                 .unwrap()
         };
         let keep = bytes(429, None, false, false);
@@ -215,19 +245,22 @@ mod tests {
     fn fixed_replies_match_the_builder() {
         for status in [400, 404, 408, 429, 431, 500, 502, 503, 504, 418] {
             for (close, head) in [(false, false), (false, true), (true, false), (true, true)] {
-                let reply = local_reply_bytes(status, None, close, head);
+                let reply = local_reply_bytes(status, None, close, head, &[]);
                 assert!(matches!(reply, Cow::Borrowed(_)), "{status} allocated");
                 assert_eq!(
                     String::from_utf8_lossy(&reply),
-                    String::from_utf8_lossy(&build_local_reply(status, None, close, head)),
+                    String::from_utf8_lossy(&build_local_reply(status, None, close, head, &[])),
                     "{status} close={close} head={head}"
                 );
             }
         }
         for (status, location) in [(301, Some("https://a/")), (302, None)] {
-            let reply = local_reply_bytes(status, location, false, false);
+            let reply = local_reply_bytes(status, location, false, false, &[]);
             assert!(matches!(reply, Cow::Owned(_)));
-            assert_eq!(*reply, build_local_reply(status, location, false, false));
+            assert_eq!(
+                *reply,
+                build_local_reply(status, location, false, false, &[])
+            );
         }
     }
 }

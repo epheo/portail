@@ -138,6 +138,9 @@ pub fn client_done(sent: ClientSent) -> bool {
     !sent.keepalive && sent.request_in && !sent.seen_past
 }
 
+/// `cors` is left holding the header lines a CORS filter on the request's
+/// rule puts on its response, whoever writes that response: the backend,
+/// or the proxy answering in its place. Empty without such a filter.
 pub fn analyze_request<'a>(
     routes: &'a RouteTable,
     backend_selector: &BackendSelector,
@@ -145,7 +148,9 @@ pub fn analyze_request<'a>(
     server_port: u16,
     health: &HealthRegistry,
     is_tls: bool,
+    cors: &mut Vec<u8>,
 ) -> Result<RoutingResult<'a>> {
+    cors.clear();
     if request_data.is_empty() {
         return Ok(RoutingResult::CloseConnection);
     }
@@ -158,6 +163,7 @@ pub fn analyze_request<'a>(
             health,
             is_tls,
             server_port,
+            cors,
         )
     } else if is_tls {
         // A terminated connection is an HTTPS listener's: its bytes never
@@ -207,6 +213,7 @@ fn analyze_http_request<'a>(
     health: &HealthRegistry,
     is_tls: bool,
     server_port: u16,
+    cors: &mut Vec<u8>,
 ) -> Result<RoutingResult<'a>> {
     // A head the parser cannot represent, or flags as ambiguous (framing
     // conflicts such as TE+CL, malformed lines), is refused rather than
@@ -272,6 +279,18 @@ fn analyze_http_request<'a>(
     ) else {
         return reply(404, None);
     };
+
+    // Before anything else answers: a preflight is the rule's to answer
+    // whatever its backends are, and every other answer to this request,
+    // a redirect or a 500 or a 503 among them, carries the filter's lines.
+    if let Some(filter) = rule.cors() {
+        use crate::proxy::cors::Answer;
+        match filter.answer(request_info.method, request_info.header_data, cors) {
+            Answer::Forward => {}
+            Answer::Preflight(true) => return reply(204, None),
+            Answer::Preflight(false) => return reply(403, None),
+        }
+    }
 
     // Check for redirect filters FIRST — redirect rules often have no backends,
     // so we must handle them before the empty-backends check.
@@ -635,7 +654,15 @@ mod tests {
             b"POST / HTTP/1.1\r\nHost: h.test\r\nContent-Length: 4\r\n\r\n\r\n\r\nGET",
             b"GET http://h.test/x HTTP/1.0\r\n\r\nGET / HTTP/1.1\r\n\r\n",
         ] {
-            let result = analyze_request(&rt, &BackendSelector::new(), req, 80, &health(), false);
+            let result = analyze_request(
+                &rt,
+                &BackendSelector::new(),
+                req,
+                80,
+                &health(),
+                false,
+                &mut Vec::new(),
+            );
             let Ok(RoutingResult::HttpForward { meta, .. }) = result else {
                 panic!("not forwarded: {}", String::from_utf8_lossy(req));
             };
@@ -676,7 +703,8 @@ mod tests {
 
         let sel = BackendSelector::new();
         let req = make_request("GET", "/a", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         match result {
             RoutingResult::LocalReply(LocalReply {
@@ -703,7 +731,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/old", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite =
@@ -731,7 +760,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/users", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite = crate::proxy::http_filters::extract_url_rewrite(
@@ -762,7 +792,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite =
@@ -790,7 +821,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/users", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite = crate::proxy::http_filters::extract_url_rewrite(
@@ -823,7 +855,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let rewrite =
@@ -860,7 +893,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/v1/test", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             assert!(crate::proxy::http_filters::extract_url_rewrite(
@@ -892,7 +926,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let mirrors: Vec<_> = rule
@@ -937,7 +972,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             let mirrors: Vec<_> = rule
@@ -989,7 +1025,8 @@ mod tests {
         );
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         assert!(matches!(
             result,
@@ -1064,7 +1101,8 @@ mod tests {
                 vec![redirect],
             );
             let req = make_request("GET", target, "r.test");
-            match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+            match analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap()
+            {
                 RoutingResult::LocalReply(LocalReply {
                     location: Some(location),
                     ..
@@ -1105,7 +1143,8 @@ mod tests {
             ("/admin/app.min.js", 8002, None),
         ] {
             let req = make_request("GET", target, "example.com");
-            match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+            match analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap()
+            {
                 RoutingResult::HttpForward { backend, meta, .. } => {
                     assert_eq!(backend.socket_addr.port(), port, "{target}");
                     assert_eq!(meta.normalized_path.as_deref(), normalized, "{target}");
@@ -1145,7 +1184,8 @@ mod tests {
             "/a/x.;y",
         ] {
             let req = make_request("GET", target, "example.com");
-            let routed = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+            let routed =
+                analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
             assert!(
                 matches!(routed, RoutingResult::HttpForward { .. }),
                 "{target}"
@@ -1171,7 +1211,7 @@ mod tests {
         );
         let req = make_request("GET", "/x/../old/./a?q", "r.test");
         let sel = BackendSelector::new();
-        match analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap() {
+        match analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap() {
             RoutingResult::LocalReply(LocalReply {
                 location: Some(location),
                 ..
@@ -1185,7 +1225,8 @@ mod tests {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
         let req = make_request("GET", "/", "example.com");
-        let result = analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap();
+        let result =
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap();
 
         if let RoutingResult::HttpForward { rule, .. } = result {
             assert!(!rule.has_filters);
@@ -1236,7 +1277,8 @@ mod tests {
         let rt = build_route_table("cal.example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
         let req = b"PROPFIND /user/ HTTP/1.1\r\nHost: cal.example.com\r\nDepth: 0\r\nContent-Length: 0\r\n\r\n";
-        let result = analyze_request(&rt, &sel, req, 443, &health(), true).unwrap();
+        let result =
+            analyze_request(&rt, &sel, req, 443, &health(), true, &mut Vec::new()).unwrap();
         match result {
             RoutingResult::HttpForward { meta, .. } => {
                 assert!(!meta.is_head);
@@ -1250,7 +1292,7 @@ mod tests {
     /// (status, reusable) of a request the proxy answers itself.
     fn local_reply(rt: &RouteTable, req: &[u8]) -> (u16, bool) {
         let sel = BackendSelector::new();
-        match analyze_request(rt, &sel, req, 8080, &health(), false).unwrap() {
+        match analyze_request(rt, &sel, req, 8080, &health(), false, &mut Vec::new()).unwrap() {
             RoutingResult::LocalReply(r) => (r.status, r.reusable),
             _ => panic!("expected a locally answered request"),
         }
@@ -1261,7 +1303,7 @@ mod tests {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
         let req = b"HEAD / HTTP/1.1\r\nHost: nope.test\r\n\r\n";
-        match analyze_request(&rt, &sel, req, 8080, &health(), false).unwrap() {
+        match analyze_request(&rt, &sel, req, 8080, &health(), false, &mut Vec::new()).unwrap() {
             RoutingResult::LocalReply(r) => assert!(r.status == 404 && r.head && r.reusable),
             _ => panic!("expected a locally answered request"),
         }
@@ -1362,7 +1404,7 @@ mod tests {
         let sel = BackendSelector::new();
         let req = make_request("GET", "/?q=a\\b", "example.com");
         assert!(matches!(
-            analyze_request(&rt, &sel, &req, 8080, &health(), false).unwrap(),
+            analyze_request(&rt, &sel, &req, 8080, &health(), false, &mut Vec::new()).unwrap(),
             RoutingResult::HttpForward { .. }
         ));
         for target in ["/a\\b", "/a\\b?x"] {
@@ -1411,7 +1453,8 @@ mod tests {
                 false,
             ),
         ] {
-            match analyze_request(&rt, &sel, req, 8080, &health(), false).unwrap() {
+            match analyze_request(&rt, &sel, req, 8080, &health(), false, &mut Vec::new()).unwrap()
+            {
                 RoutingResult::HttpForward { meta, .. } => {
                     assert_eq!(meta.local_reply_reusable, reusable);
                     assert_eq!(meta.client_done, client_done);
@@ -1429,8 +1472,15 @@ mod tests {
     fn local_reply_knows_whether_the_client_is_done() {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
-        let client_done = |req: &[u8]| match analyze_request(&rt, &sel, req, 8080, &health(), false)
-        {
+        let client_done = |req: &[u8]| match analyze_request(
+            &rt,
+            &sel,
+            req,
+            8080,
+            &health(),
+            false,
+            &mut Vec::new(),
+        ) {
             Ok(RoutingResult::LocalReply(r)) => r.client_done,
             _ => panic!("expected a locally answered request"),
         };
@@ -1536,7 +1586,16 @@ mod tests {
         let rt = build_route_table("example.com", "/", PathMatchType::Prefix, 8001, vec![]);
         let sel = BackendSelector::new();
         let tls_client_hello = [0x16u8, 0x03, 0x01, 0x00, 0xf4, 0x01, 0x00, 0x00];
-        let result = analyze_request(&rt, &sel, &tls_client_hello, 8080, &health(), false).unwrap();
+        let result = analyze_request(
+            &rt,
+            &sel,
+            &tls_client_hello,
+            8080,
+            &health(),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(matches!(result, RoutingResult::CloseConnection));
     }
 }

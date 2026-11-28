@@ -5,6 +5,7 @@
 
 pub mod backend_pool;
 pub mod chunked;
+pub mod cors;
 pub mod data_plane;
 pub(crate) mod deadline;
 pub(crate) mod h2_bridge;

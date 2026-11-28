@@ -221,6 +221,7 @@ fn filter_type(f: &HttpRouteFilter) -> &'static str {
         HttpRouteFilter::RequestRedirect { .. } => "RequestRedirect",
         HttpRouteFilter::URLRewrite { .. } => "URLRewrite",
         HttpRouteFilter::RequestMirror { .. } => "RequestMirror",
+        HttpRouteFilter::Cors { .. } => "CORS",
     }
 }
 
@@ -477,6 +478,9 @@ fn table_filter(f: &HttpRouteFilter) -> Result<CompiledFilter<'_>, RouteError> {
             hostname: config.hostname.clone(),
             path: config.path.as_ref().map(routing::URLRewritePath::from),
         },
+        HttpRouteFilter::Cors { config } => routing::HttpFilter::Cors(Arc::new(
+            crate::proxy::cors::Cors::new(config).map_err(RouteError::unsupported)?,
+        )),
         HttpRouteFilter::RequestMirror { config } => {
             return Ok(CompiledFilter::Mirror {
                 backend: &config.backend_ref,

@@ -18,6 +18,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteBackendRequestHeaderModification",
     "HTTPRouteBackendTimeout",
+    "HTTPRouteCORS",
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
     "HTTPRouteMethodMatching",

@@ -3771,7 +3771,17 @@ fn invalid_backend_share_answers_500() {
     let request = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n";
     let (mut forwarded, mut failed) = (0, 0);
     for _ in 0..400 {
-        match analyze_request(&table, &selector, request, 80, &health, false).unwrap() {
+        match analyze_request(
+            &table,
+            &selector,
+            request,
+            80,
+            &health,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        {
             RoutingResult::HttpForward { backend, .. } => {
                 assert_eq!(backend.socket_addr.port(), 8001);
                 forwarded += 1;

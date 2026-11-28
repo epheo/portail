@@ -1309,7 +1309,17 @@ mod tests {
         let request = b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let health = crate::proxy::health::HealthRegistry::new();
         let selector = crate::routing::BackendSelector::new();
-        match analyze_request(&rt, &selector, request, 8080, &health, false).unwrap() {
+        match analyze_request(
+            &rt,
+            &selector,
+            request,
+            8080,
+            &health,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        {
             RoutingResult::LocalReply(LocalReply {
                 status: 301,
                 location: Some(location),

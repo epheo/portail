@@ -528,6 +528,17 @@ pub struct HttpRouteRule {
 }
 
 impl HttpRouteRule {
+    /// The rule's CORS filter, when it has one.
+    pub fn cors(&self) -> Option<&crate::proxy::cors::Cors> {
+        if !self.has_filters {
+            return None;
+        }
+        self.filters.iter().find_map(|filter| match filter {
+            HttpFilter::Cors(cors) => Some(&**cors),
+            _ => None,
+        })
+    }
+
     pub fn new(
         path_match_type: PathMatchType,
         path: String,
@@ -624,6 +635,7 @@ pub enum HttpFilter {
         /// How its copies are sent: as requests to that Service port are.
         proto: crate::proxy::backend_pool::BackendProto,
     },
+    Cors(Arc<crate::proxy::cors::Cors>),
 }
 
 /// Share of requests a mirror copies, exact: whole percents turned 1/1000

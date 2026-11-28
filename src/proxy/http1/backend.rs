@@ -75,7 +75,7 @@ async fn fail_backend(
         );
     }
     state.refused(code);
-    send_error_response(client, code).await
+    send_error_response(client, code, &state.cors_lines).await
 }
 
 /// Answer a connect the proxy could not make for want of its own fds or
@@ -90,7 +90,7 @@ pub(super) async fn refuse_locally(
     // Not refused(): a lingering close would hold this connection's fd
     // while the proxy is short of fds or memory.
     state.last_status = 503;
-    send_error_response(client, 503).await
+    send_error_response(client, 503, &state.cors_lines).await
 }
 
 /// Acquire a backend connection by `deadline`, on `timer` (see `within`).
