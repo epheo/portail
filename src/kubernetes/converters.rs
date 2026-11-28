@@ -239,12 +239,21 @@ fn convert_http_rule(rule: &HttpRouteRules, ns: &str) -> (HttpRouteRule, Option<
         .collect();
 
     let timeouts = rule.timeouts.as_ref().map(convert_timeouts);
+    // Like a filter: a retry this proxy cannot follow fails the route.
+    let retry = rule.retry.as_ref().and_then(|r| match convert_retry(r) {
+        Ok(retry) => Some(retry),
+        Err(e) => {
+            first.get_or_insert(e.at(format_args!("retry")));
+            None
+        }
+    });
 
     let rule = HttpRouteRule {
         matches,
         filters,
         backend_refs,
         timeouts,
+        retry,
     };
     (rule, first)
 }
@@ -616,6 +625,43 @@ fn convert_timeouts(t: &HttpRouteRulesTimeouts) -> HttpRouteTimeouts {
     }
 }
 
+/// The API's bounds, checked where its integers become the config's: codes
+/// 400 to 599, attempts at least 0 and one when not written (the CRD's
+/// default, which an older CRD may not have applied), a backoff that is a
+/// duration. The timeouts' silent drop of a bad duration would here mean
+/// retrying with no wait where one was asked for.
+fn convert_retry(r: &HttpRouteRulesRetry) -> Result<crate::config::HttpRouteRetry, RouteError> {
+    let codes = r
+        .codes
+        .iter()
+        .flatten()
+        .map(|&code| match u16::try_from(code) {
+            Ok(code @ 400..=599) => Ok(code),
+            _ => Err(RouteError::unsupported(format!(
+                "retry code {code}: only 400 to 599"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let attempts = match r.attempts {
+        None => 1,
+        Some(n) => u32::try_from(n)
+            .map_err(|_| RouteError::unsupported(format!("retry attempts {n}: at least 0")))?,
+    };
+    let backoff = r
+        .backoff
+        .as_deref()
+        .map(|s| {
+            crate::config::parsing::parse_duration(s)
+                .map_err(|e| RouteError::unsupported(format!("retry backoff {s:?}: {e}")))
+        })
+        .transpose()?;
+    Ok(crate::config::HttpRouteRetry {
+        codes,
+        attempts,
+        backoff,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // L4 route conversion (TCP, TLS, UDP)
 // ---------------------------------------------------------------------------
@@ -869,6 +915,60 @@ mod tests {
                 Some(b"key".as_slice())
             )]
         );
+    }
+
+    /// A rule's retry reaches the config as the API means it: attempts one
+    /// when not written, none at zero; anything outside the API's bounds
+    /// fails the route rather than retry otherwise than asked.
+    #[test]
+    fn a_retry_converts_within_the_apis_bounds() {
+        let convert = |retry: serde_json::Value| {
+            let rule: HttpRouteRules = serde_json::from_value(serde_json::json!({
+                "backendRefs": [{"name": "web", "port": 80}],
+                "retry": retry,
+            }))
+            .unwrap();
+            convert_http_rule(&rule, "default")
+        };
+        let (rule, err) =
+            convert(serde_json::json!({"codes": [500, 502], "attempts": 3, "backoff": "250ms"}));
+        assert!(err.is_none(), "{err:?}");
+        let retry = rule.retry.unwrap();
+        assert_eq!((retry.codes, retry.attempts), (vec![500, 502], 3));
+        assert_eq!(retry.backoff, Some(std::time::Duration::from_millis(250)));
+
+        let (rule, _) = convert(serde_json::json!({}));
+        let retry = rule.retry.unwrap();
+        assert_eq!(
+            (retry.codes.len(), retry.attempts, retry.backoff),
+            (0, 1, None)
+        );
+        assert_eq!(
+            convert(serde_json::json!({"attempts": 0}))
+                .0
+                .retry
+                .unwrap()
+                .attempts,
+            0
+        );
+
+        for bad in [
+            serde_json::json!({"codes": [399]}),
+            serde_json::json!({"codes": [600]}),
+            serde_json::json!({"attempts": -1}),
+            serde_json::json!({"backoff": "soon"}),
+        ] {
+            let (rule, err) = convert(bad.clone());
+            let err = err.unwrap_or_else(|| panic!("{bad} accepted"));
+            assert_eq!(err.reason.as_str(), "UnsupportedValue", "{bad}");
+            assert!(rule.retry.is_none(), "{bad}");
+        }
+
+        let rule: HttpRouteRules = serde_json::from_value(
+            serde_json::json!({"backendRefs": [{"name": "web", "port": 80}]}),
+        )
+        .unwrap();
+        assert!(convert_http_rule(&rule, "default").0.retry.is_none());
     }
 
     /// The filter reaches the config as the route writes it; what the API

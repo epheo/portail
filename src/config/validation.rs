@@ -551,6 +551,7 @@ mod tests {
             filters,
             backend_refs,
             timeouts: None,
+            retry: None,
         }
     }
 
@@ -1048,6 +1049,7 @@ mod tests {
                     tls: None,
                 }],
                 timeouts: None,
+                retry: None,
             }],
         });
         let err = cfg.validate().unwrap_err().to_string();
@@ -1083,6 +1085,7 @@ mod tests {
                     tls: None,
                 }],
                 timeouts: None,
+                retry: None,
             }],
         });
         assert!(cfg.validate().is_ok());

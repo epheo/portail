@@ -24,12 +24,14 @@ use crate::proxy::upstream::connect::{backend_metric_label, connect_proxied};
 use crate::routing::BackendAction;
 
 /// A backend connect that failed (`502`) or timed out (`504`): counted as
-/// one, then answered as [`fail_backend`] does.
+/// one, against the backend's health too, then answered as [`fail_backend`]
+/// does, unless the attempt is to be made again.
 pub(super) async fn fail_connect(
     state: &mut ConnectionState,
     backend_ref: &crate::routing::Backend,
     client: &mut Connection,
     code: u16,
+    again: &mut super::exchange::Again<'_>,
 ) -> Result<()> {
     let label = backend_metric_label(backend_ref);
     match code {
@@ -41,6 +43,14 @@ pub(super) async fn fail_connect(
             crate::metrics::record_backend_connect_error(&label);
             state.listener_stats.upstream_connect_errors.inc();
         }
+    }
+    let asked = match code {
+        504 => again.after_timeout(),
+        _ => again.after_refusal(),
+    };
+    if asked {
+        note_failure(state, backend_ref);
+        return Ok(());
     }
     fail_backend(state, client, backend_ref, code).await
 }
@@ -67,6 +77,14 @@ async fn fail_backend(
     backend_ref: &crate::routing::Backend,
     code: u16,
 ) -> Result<()> {
+    note_failure(state, backend_ref);
+    state.refused(code);
+    send_error_response(client, code, &state.cors_lines).await
+}
+
+/// One more failure against the backend's health, and a probe once that
+/// ejects it.
+fn note_failure(state: &ConnectionState, backend_ref: &crate::routing::Backend) {
     if state.health.record_failure(backend_ref.socket_addr) {
         HealthRegistry::spawn_probe(
             Arc::clone(&state.health),
@@ -74,8 +92,6 @@ async fn fail_backend(
             backend_ref.proto.clone(),
         );
     }
-    state.refused(code);
-    send_error_response(client, code, &state.cors_lines).await
 }
 
 /// Answer a connect the proxy could not make for want of its own fds or
@@ -108,6 +124,7 @@ pub(super) async fn connect_to_backend(
     backend_ref: &crate::routing::Backend,
     timer: Pin<&mut tokio::time::Sleep>,
     deadline: Option<tokio::time::Instant>,
+    again: &mut super::exchange::Again<'_>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     let proto = backend_ref.proto.as_ref();
@@ -147,12 +164,12 @@ pub(super) async fn connect_to_backend(
         }
         Some(Err(e)) => {
             warn!("Backend {} connect failed: {}", backend_addr, e);
-            fail_connect(state, backend_ref, client, 502).await?;
+            fail_connect(state, backend_ref, client, 502, again).await?;
             Ok(None)
         }
         None => {
             warn!("Backend {} connect timeout", backend_addr);
-            fail_connect(state, backend_ref, client, 504).await?;
+            fail_connect(state, backend_ref, client, 504, again).await?;
             Ok(None)
         }
     }

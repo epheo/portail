@@ -459,10 +459,11 @@ impl PortailConfig {
                 let backends = self.rule_backends(rule, &mut resolver)?;
                 let filters = rule_filters(&rule.filters, &mut resolver)?;
                 let timeouts = rule.source.timeouts.as_ref();
+                let retry = rule.retry.as_ref();
                 rules.extend(
                     rule.matches
                         .iter()
-                        .map(|m| m.to_rule(&filters, &backends, timeouts)),
+                        .map(|m| m.to_rule(&filters, &backends, timeouts, retry)),
                 );
             }
 
@@ -2909,6 +2910,72 @@ mod tests {
         let mut unknown = wire;
         unknown["httpRoutes"][0]["rules"][0]["backendRefs"][0]["tls"]["clientCertificate"] =
             serde_json::json!("c");
+        assert!(serde_json::from_value::<PortailConfig>(unknown).is_err());
+    }
+
+    fn retrying(retry: serde_json::Value) -> PortailConfig {
+        serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "httpRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "l"}],
+                "hostnames": ["x.test"],
+                "rules": [{"retry": retry, "backendRefs": [{"name": "127.0.0.1", "port": 8001}]}]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// The stanza as the API writes it reaches the rule; what it leaves
+    /// out is the API's default, and zero attempts is no retry at all.
+    #[test]
+    fn a_rules_retry_stanza_reaches_its_table_rule() {
+        let rule_of = |retry: serde_json::Value| {
+            let rt = retrying(retry).to_route_table_strict().unwrap();
+            let rule = rt.find_http_route("x.test", "GET", "/", &[], "", 8080);
+            rule.unwrap().retry.clone()
+        };
+        let full = serde_json::json!({"codes": [500, 503], "attempts": 3, "backoff": "250ms"});
+        assert_eq!(
+            rule_of(full.clone()),
+            Some(crate::routing::Retry {
+                codes: [500, 503].into(),
+                attempts: 3,
+                backoff: Some(std::time::Duration::from_millis(250)),
+            })
+        );
+        let wire = serde_json::to_value(retrying(full.clone())).unwrap();
+        assert_eq!(wire["httpRoutes"][0]["rules"][0]["retry"], full);
+
+        let bare = rule_of(serde_json::json!({})).unwrap();
+        assert_eq!(
+            (bare.codes.len(), bare.attempts, bare.backoff),
+            (0, 1, None)
+        );
+        assert_eq!(
+            rule_of(serde_json::json!({"codes": [500], "attempts": 0})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_retry_code_that_is_no_failure_rejects_the_route() {
+        for code in [200, 399, 600] {
+            let refused = retrying(serde_json::json!({"codes": [500, code]}))
+                .to_route_table_strict()
+                .unwrap_err();
+            assert!(format!("{refused:#}").contains("400 to 599"), "{refused:#}");
+        }
+        retrying(serde_json::json!({"attempts": 100}))
+            .to_route_table_strict()
+            .unwrap();
+        let refused = retrying(serde_json::json!({"attempts": 101}))
+            .to_route_table_strict()
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("above 100"), "{refused:#}");
+        let unknown = serde_json::json!({
+            "gateway": {"name": "g", "listeners": []},
+            "httpRoutes": [{"rules": [{"retry": {"attempts": 1, "perTryTimeout": "1s"}, "backendRefs": []}]}]
+        });
         assert!(serde_json::from_value::<PortailConfig>(unknown).is_err());
     }
 }

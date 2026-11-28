@@ -341,6 +341,33 @@ filters:
 - One `CORS` filter per rule, none on a backendRef.
 - A value that cannot be a header (an origin that is no `<scheme>://<host>[:<port>]`, a method or header name that is no token) rejects the route, as any filter value portail cannot apply.
 
+## Retries
+
+The `retry` stanza of an HTTPRoute rule, written the same in a config file:
+
+```yaml
+rules:
+  - retry:
+      codes: [502, 503]
+      attempts: 2
+      backoff: 100ms
+    backendRefs:
+      - name: api
+        port: 8080
+```
+
+- A request is attempted again when its backend refuses or resets the connection, or answers one of `codes`.
+- A connect or an answer that takes the whole budget is tried again only when the rule sets `timeouts.backendRequest`, as the API asks. Without it each attempt has the 30 s default, and a backend that never answers gets one.
+- `attempts` counts the tries after the first: one when not written, none at 0, at most 100. The API sets no ceiling; each attempt is a connect a client can ask for, so portail sets one, and a rule above it rejects its route.
+- `codes` are 400 to 599. With none, only a refused connect, or a backend timeout under `backendRequest`, is tried again.
+- Only a request that is whole in portail's hands is tried again: its body arrived with its head, in the connection's read buffer. A request whose body is still arriving, and an upgrade, are never tried again: the first answer is the client's. Nothing is buffered for the sake of a retry.
+- Each attempt chooses its backend again among the rule's healthy ones.
+- `timeouts.request` bounds all the attempts together, `timeouts.backendRequest` each of them.
+- Without `backoff` an attempt follows the failed one at once. With it portail waits before each: the base doubled from one attempt to the next, at most ten times the base, and between half and all of that. A wait the request timeout has no room for is not started: the client gets a 504 at once.
+- The client gets the last attempt's answer, whatever it is. A request mirror is copied once, whatever the attempts.
+- `portail_http_retries_total` counts the attempts made again.
+- The replay of a request on a fresh connection, when a pooled one turns out dead, is apart: it needs no stanza and counts in `portail_pool_stale_retries_total`.
+
 ## Backend Services
 
 In Kubernetes mode, HTTP, TCP, UDP and TLS passthrough backends and `RequestMirror` all reach a Service the same way:

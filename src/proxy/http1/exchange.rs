@@ -2,6 +2,7 @@
 //! and sent, replayed once on a pooled connection that died, and the
 //! response head sent back.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -70,28 +71,107 @@ impl Framing {
             chunked,
         })
     }
+
+    /// Whether the whole body came with the head: the relay then reads
+    /// nothing more from the client, and the request can be sent again
+    /// from the buffer it sits in.
+    fn body_held(&self, meta: &RequestMeta) -> bool {
+        match (meta.content_length, &self.chunked) {
+            (Some(cl), _) => self.read - self.header_end >= cl,
+            (None, Some(stream)) => stream.is_terminated(),
+            (None, None) => true,
+        }
+    }
+}
+
+/// Whether an attempt that fails before the client has been sent a byte of
+/// its answer may be made again, and whether it asks to be.
+pub(super) struct Again<'a> {
+    /// The response statuses to try again after; `None` on the last
+    /// attempt, or the only one.
+    codes: Option<&'a [u16]>,
+    /// The rule sets `timeouts.backendRequest`, the only budget the API
+    /// retries after. Without it each attempt has the 30 s default, and
+    /// 101 of them to a backend that never answers would hold the request
+    /// most of an hour.
+    after_timeouts: bool,
+    asked: bool,
+}
+
+impl Again<'_> {
+    /// After a connect the backend refused or reset.
+    pub(super) fn after_refusal(&mut self) -> bool {
+        self.asked = self.codes.is_some();
+        self.asked
+    }
+
+    /// After a connect, or a response head, that took the whole budget.
+    pub(super) fn after_timeout(&mut self) -> bool {
+        self.asked = self.after_timeouts && self.codes.is_some();
+        self.asked
+    }
+
+    fn after_status(&mut self, status: u16) -> bool {
+        self.asked = self.codes.is_some_and(|codes| codes.contains(&status));
+        self.asked
+    }
+}
+
+/// What an exchange does once, however many attempts it takes.
+#[derive(Default)]
+struct Once {
+    /// The client was told to send its body (`100 Continue`). A client may
+    /// send it without waiting, and a small one then arrives whole with
+    /// the head: such a request is retried, and must not hear `100
+    /// Continue` twice.
+    continued: bool,
+    /// The request went to the rule's mirrors.
+    mirrored: bool,
+}
+
+/// The wait before an attempt is made again, `made` being how many
+/// already were: the base doubled each time, at most ten times the base,
+/// and between half and all of that, so that requests failing together do
+/// not come back together.
+fn backoff(base: Duration, made: u32) -> Duration {
+    let grown = base
+        .saturating_mul(1 << made.saturating_sub(1).min(4))
+        .min(base.saturating_mul(10));
+    grown / 2 + grown.mul_f64(fastrand::f64() / 2.0)
 }
 
 /// Proxy a single HTTP request to a backend and forward the response.
-/// Returns `(keep, leftover)`: `keep` when the response went out whole and
-/// its head announced keep-alive, which the client may already act on;
-/// `leftover` holds any bytes read past this request's body (a pipelined
-/// next request), which the keepalive loop replays instead of reading from
-/// the socket again.
+/// Returns `(keep, leftover, backend)`: `keep` when the response went out
+/// whole and its head announced keep-alive, which the client may already
+/// act on; `leftover` holds any bytes read past this request's body (a
+/// pipelined next request), which the keepalive loop replays instead of
+/// reading from the socket again; `backend` is the one last asked.
 ///
 /// Owns all timing for the request lifecycle. Two timeouts come in from the rule:
 ///
-/// - `backend_request_timeout` — single shared budget covering pool acquire,
-///   TCP/TLS connect, request send, and response time-to-first-byte. On expiry
-///   we are still in the SAFE zone (no client bytes written), so a `504` is
-///   well-formed.
-/// - `request_timeout` — total request lifetime, applied as an absolute
-///   `Instant` deadline. Clamps the SAFE-zone phases too, then bounds the body
-///   stream. On body-phase expiry we are in the UNSAFE zone (response headers
-///   already on the wire); we reset the client connection, since a `504` would
-///   corrupt framing and a synthetic terminator would fake a complete body.
+/// - `backend_request_timeout` — single shared budget per attempt covering
+///   pool acquire, TCP/TLS connect, request send, and response
+///   time-to-first-byte. On expiry we are still in the SAFE zone (no client
+///   bytes written), so a `504` is well-formed.
+/// - `request_timeout` — total request lifetime, every attempt included,
+///   applied as an absolute `Instant` deadline. Clamps the SAFE-zone phases
+///   too, then bounds the body stream. On body-phase expiry we are in the
+///   UNSAFE zone (response headers already on the wire); we reset the client
+///   connection, since a `504` would corrupt framing and a synthetic
+///   terminator would fake a complete body.
 ///
 /// WebSocket upgrades skip the total deadline (long-lived stream).
+///
+/// Under the rule's `retry`, an attempt that fails before the client has
+/// been sent a byte of its answer is made again: after a failed connect, a
+/// listed status, or no answer within the backend's budget. Only while the
+/// whole request is in hand, so never once part of the body is still the
+/// client's to send, and never for an upgrade. Each attempt chooses its
+/// backend again.
+///
+/// One function and one loop, not a loop over an attempt function: an
+/// attempt's future is some 4 KiB, and awaiting one moves it, which cost
+/// every request 300 instructions whether it was retried or not.
 ///
 /// `timer` is the connection's own, for the backend budget (see `within`).
 #[allow(clippy::too_many_arguments)]
@@ -104,14 +184,9 @@ pub(super) async fn proxy_http_request(
     meta: &RequestMeta,
     state: &mut ConnectionState,
     mut timer: Pin<&mut tokio::time::Sleep>,
-) -> Result<(bool, Option<Vec<u8>>)> {
+) -> Result<(bool, Option<Vec<u8>>, SocketAddr)> {
     use std::time::Instant;
 
-    let backend_addr = backend_ref.socket_addr;
-    let backend_budget = rule
-        .backend_request_timeout
-        .filter(|d| !d.is_zero())
-        .unwrap_or(Duration::from_secs(30));
     let total_deadline = if meta.is_upgrade {
         None
     } else {
@@ -119,372 +194,450 @@ pub(super) async fn proxy_http_request(
             .filter(|d| !d.is_zero())
             .map(|d| Instant::now() + d)
     };
-    let backend_phase_start = Instant::now();
-    let backend_deadline = deadline_after(backend_phase_start, backend_budget, total_deadline);
-    // Cleared per request so an Err exit can never surface the previous
-    // keepalive response's status to the access log.
-    state.last_status = 0;
-
-    let Framing {
-        read: request_bytes,
-        header_end: req_header_end,
-        end: request_end,
-        chunked: req_chunked,
-    } = framing;
-    let tail_len = request_bytes - req_header_end;
-    // Capture the held tail now: the response phase reuses `buf` as scratch
-    // for backend reads and would overwrite it.
-    let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
-        Some(buf[request_end..request_bytes].to_vec())
-    } else {
-        None
-    };
-    // The whole body came with the head, so the relay below reads nothing
-    // into `buf`: a replay can still send it from there.
-    let body_held = match (meta.content_length, &req_chunked) {
-        (Some(cl), _) => tail_len >= cl,
-        (None, Some(stream)) => stream.is_terminated(),
-        (None, None) => true,
-    };
-    // Settled again once the relay below is through.
-    state.client_done = client_done(ClientSent {
-        keepalive: meta.keepalive,
-        request_in: body_held && !meta.is_upgrade,
-        seen_past: leftover.is_some(),
-    });
-
-    // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
-    let connect = connect_to_backend(client, state, backend_ref, timer.as_mut(), backend_deadline);
-    let (backend, from_pool) = match connect.await? {
-        Some(b) => b,
-        None => return Ok((false, None)),
-    };
-
-    let has_mirrors = rule
-        .filters
-        .iter()
-        .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
-
-    // Assemble the outgoing header block once — hop-by-hop stripped,
-    // X-Forwarded-* appended, filter modifications applied. The pool-retry
-    // resend and the mirror capture reuse it verbatim.
-    build_outgoing_headers(buf, req_header_end, rule, backend_ref, meta, state);
-    let headers_len = state.scratch_buf.len();
-    let mirror_header_data: Option<Vec<u8>> = has_mirrors.then(|| state.scratch_buf.clone());
-
-    let (mut backend, reused) = match send_request_with_retry(
-        client,
-        state,
-        backend_ref,
-        backend,
-        from_pool,
-        headers_len,
-        &buf[req_header_end..request_end],
-        backend_budget,
-        backend_phase_start,
-        total_deadline,
-    )
-    .await?
-    {
-        Some(b) => b,
-        None => return Ok((false, None)),
-    };
-    // A pooled conn the backend dropped after the probe, as this request
-    // reached it, shows only as a close before any response byte. Sending
-    // the request again is safe only when its method is idempotent (the
-    // backend may have acted before dying) and the proxy still holds it.
-    let mut replayable = reused && meta.idempotent && body_held;
-
-    // Expect: 100-continue — the proxy answers on the backend's behalf. The
-    // Expect header was stripped from the forwarded request (a compliant
-    // backend then never sends its own 100, and a stray one is swallowed by
-    // the response reader), so the client's wait for the interim response
-    // must be satisfied here or uploads deadlock: the client waits for 100,
-    // the proxy waits for body, the backend waits for the request.
-    if meta.expect_continue {
-        client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-        client.flush().await?;
-    }
-
-    // Relay remaining request body + optional mirror tee, clamped to the
-    // rule's total deadline — `request_timeout` covers the request-body phase
-    // too, so a slow client body cannot hold the backend conn open past it.
-    // Expiry is SAFE for the client wire (no response bytes yet) → 408; the
-    // interim 100 above does not spoil that (interim-then-final is legal).
-    // Any bytes read past the body end (pipelined next request) come back as
-    // leftover; mutually exclusive with the initial-read leftover above.
-    let relay_fut = relay_request_body(
-        client,
-        &mut backend,
-        buf,
-        req_header_end,
-        request_end,
-        meta.content_length,
-        req_chunked,
-        has_mirrors,
-        state.idle_body_timeout,
-    );
-    let relay = match total_deadline {
-        Some(deadline) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining, relay_fut).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    warn!(
-                        "Request body relay to backend {} exceeded request timeout",
-                        backend_addr
-                    );
-                    state.refused(408);
-                    send_error_response(client, 408, &state.cors_lines).await?;
-                    return Ok((false, None));
+    let retry = rule
+        .retry
+        .as_ref()
+        .filter(|_| !meta.is_upgrade && framing.body_held(meta));
+    let mut left = retry.map_or(0, |retry| retry.attempts);
+    let (mut backend_ref, mut pending, mut made) = (backend_ref, Some(framing), 0);
+    let mut once = Once::default();
+    // An attempt asked to be made again leaves by `continue 'attempts`,
+    // nothing of an answer written and `buf` holding the request whole;
+    // every other way out returns.
+    'attempts: loop {
+        if let (Some(retry), true) = (retry, made > 0) {
+            left -= 1;
+            METRICS.http_retries_total.inc();
+            let wait = retry.backoff.map(|base| backoff(base, made));
+            // No room left for another attempt, at once or after its wait:
+            // the request timeout answers now. An attempt started past it
+            // would time out before it connects, and count against its
+            // backend.
+            let room = wait.unwrap_or_default();
+            if total_deadline.is_some_and(|deadline| Instant::now() + room >= deadline) {
+                state.refused(504);
+                send_error_response(client, 504, &state.cors_lines).await?;
+                return Ok((false, None, backend_ref.socket_addr));
+            }
+            if let Some(wait) = wait {
+                tokio::time::sleep(wait).await;
+            }
+            let chosen = state
+                .selector
+                .select_healthy_weighted_backend(rule, &state.health)
+                .map(|index| &rule.backends[index]);
+            backend_ref = match chosen.map(|backend| (backend, backend.action)) {
+                Some((backend, BackendAction::Forward | BackendAction::ForwardProxied)) => backend,
+                // A share that answers for itself ends the attempts with
+                // its answer, as it would have answered a first one.
+                refused => {
+                    let code = match refused {
+                        Some((_, BackendAction::Reject)) => 500,
+                        _ => 503,
+                    };
+                    state.refused(code);
+                    send_error_response(client, code, &state.cors_lines).await?;
+                    return Ok((false, None, backend_ref.socket_addr));
                 }
-            }
+            };
         }
-        None => relay_fut.await?,
-    };
-    // An incomplete body drops `backend` on return, never pooling it. No
-    // final response has gone out yet (at most the interim 100), so a 400
-    // is still well-formed.
-    let (mirror_body, relay_leftover, answered_early) = match relay {
-        RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
-        // A backend may answer before it has the whole body (a 413, a 401)
-        // and stop reading it; RFC 9112 9.5 has the client watch for that.
-        // The rest of the client's body stays unread, so the client is not
-        // done: the close reads it off.
-        RequestBody::BackendGone => (None, None, true),
-        incomplete => {
-            if let RequestBody::Broken = incomplete {
-                warn!(
-                    "Rejecting request with malformed chunked body to backend {}",
-                    backend_addr
-                );
-            } else {
-                debug!("Client closed mid request body to backend {}", backend_addr);
-            }
-            state.refused(400);
-            // The client may already be gone (EOF case); the close follows
-            // either way.
-            let _ = send_error_response(client, 400, &state.cors_lines).await;
-            return Ok((false, None));
-        }
-    };
-    if relay_leftover.is_some() {
-        leftover = relay_leftover;
-    }
-    if !answered_early {
-        // All of the request is in, unless it switches protocols.
+        made += 1;
+        // Framed again from the buffer the request still sits in whole.
+        let Some(framing) = pending.take().or_else(|| Framing::of(buf, meta)) else {
+            return Ok((false, None, backend_ref.socket_addr));
+        };
+        let again = &mut Again {
+            codes: retry.filter(|_| left > 0).map(|retry| &*retry.codes),
+            after_timeouts: rule.backend_request_timeout.is_some_and(|d| !d.is_zero()),
+            asked: false,
+        };
+
+        let backend_addr = backend_ref.socket_addr;
+        let backend_budget = rule
+            .backend_request_timeout
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(30));
+        let backend_phase_start = Instant::now();
+        let backend_deadline = deadline_after(backend_phase_start, backend_budget, total_deadline);
+        // Cleared per request so an Err exit can never surface the previous
+        // keepalive response's status to the access log.
+        state.last_status = 0;
+
+        // The whole body came with the head, so the relay below reads nothing
+        // into `buf`: a replay can still send it from there.
+        let body_held = framing.body_held(meta);
+        let Framing {
+            read: request_bytes,
+            header_end: req_header_end,
+            end: request_end,
+            chunked: req_chunked,
+        } = framing;
+        // Capture the held tail now: the response phase reuses `buf` as scratch
+        // for backend reads and would overwrite it.
+        let mut leftover: Option<Vec<u8>> = if request_end < request_bytes {
+            Some(buf[request_end..request_bytes].to_vec())
+        } else {
+            None
+        };
+        // Settled again once the relay below is through.
         state.client_done = client_done(ClientSent {
             keepalive: meta.keepalive,
-            request_in: !meta.is_upgrade,
+            request_in: body_held && !meta.is_upgrade,
             seen_past: leftover.is_some(),
         });
-    }
 
-    // Both are Some iff has_mirrors: pairing them here keeps any fallback to
-    // the raw (unsanitized) client headers structurally impossible.
-    if let (Some(body), Some(header_bytes)) = (&mirror_body, &mirror_header_data) {
-        let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
-        full_request.extend_from_slice(header_bytes);
-        full_request.extend_from_slice(body);
-        dispatch_mirrors(&rule.filters, &full_request);
-    }
-
-    // Forward response headers (SAFE→UNSAFE transition lives inside this call;
-    // on timeout the helper emits a 504 — no client bytes written yet).
-    let resp_mods = extract_response_mods(rule, backend_ref);
-    let (mut framing, keep) = loop {
-        // An early answer is one already here: a backend that only stalled
-        // gets no fresh budget to answer in.
-        let head_wait = (!answered_early).then_some((timer.as_mut(), backend_deadline));
-        // With the body cut short, the connection neither tunnels nor
-        // stays open.
-        match forward_response_headers(
+        // Connect (SAFE: no client bytes yet, helper sends 502/504 on failure).
+        let connect = connect_to_backend(
             client,
-            &mut backend,
-            &mut state.header_buf,
-            &mut state.scratch_buf,
-            &mut state.filter_buf,
-            resp_mods.as_ref(),
-            &state.cors_lines,
-            head_wait,
-            meta.is_head,
-            meta.is_upgrade && !answered_early,
-            meta.keepalive && !answered_early,
-            &state.drain_watch,
+            state,
+            backend_ref,
+            timer.as_mut(),
+            backend_deadline,
+            again,
+        );
+        let (backend, from_pool) = match connect.await? {
+            Some(b) => b,
+            None if again.asked => continue 'attempts,
+            None => return Ok((false, None, backend_addr)),
+        };
+
+        // Copied once, whatever the attempts: a mirror is of the request, not
+        // of each try at it.
+        let has_mirrors = !once.mirrored
+            && rule
+                .filters
+                .iter()
+                .any(|f| matches!(f, HttpFilter::RequestMirror { .. }));
+
+        // Assemble the outgoing header block once — hop-by-hop stripped,
+        // X-Forwarded-* appended, filter modifications applied. The pool-retry
+        // resend and the mirror capture reuse it verbatim.
+        build_outgoing_headers(buf, req_header_end, rule, backend_ref, meta, state);
+        let headers_len = state.scratch_buf.len();
+        let mirror_header_data: Option<Vec<u8>> = has_mirrors.then(|| state.scratch_buf.clone());
+
+        let (mut backend, reused) = match send_request_with_retry(
+            client,
+            state,
+            backend_ref,
+            backend,
+            from_pool,
+            headers_len,
+            &buf[req_header_end..request_end],
+            backend_budget,
+            backend_phase_start,
+            total_deadline,
+            again,
         )
         .await?
         {
-            HeaderPhase::Proxied { framing, keep } => break (framing, keep),
-            HeaderPhase::ErrorSent(code) => {
-                state.refused(code);
-                return Ok((false, None));
-            }
-            HeaderPhase::Unanswered if replayable => {
-                replayable = false;
-                METRICS.pool_stale_retries_total.inc();
-                debug!(
-                    "Backend {} pool conn closed unanswered; replaying on a fresh conn",
-                    backend_addr
-                );
-                backend = match resend_on_fresh(
-                    client,
-                    state,
-                    backend_ref,
-                    headers_len,
-                    &buf[req_header_end..request_end],
-                    backend_budget,
-                    backend_phase_start,
-                    total_deadline,
-                )
-                .await?
-                {
-                    Some(b) => b,
-                    None => return Ok((false, None)),
-                };
-            }
-            HeaderPhase::Unanswered => {
-                if answered_early {
-                    warn!("Backend {} stopped taking the request body", backend_addr);
-                } else {
-                    warn!("Backend {} closed without answering", backend_addr);
+            Some(b) => b,
+            None if again.asked => continue 'attempts,
+            None => return Ok((false, None, backend_addr)),
+        };
+        // A pooled conn the backend dropped after the probe, as this request
+        // reached it, shows only as a close before any response byte. Sending
+        // the request again is safe only when its method is idempotent (the
+        // backend may have acted before dying) and the proxy still holds it.
+        let mut replayable = reused && meta.idempotent && body_held;
+
+        // Expect: 100-continue — the proxy answers on the backend's behalf. The
+        // Expect header was stripped from the forwarded request (a compliant
+        // backend then never sends its own 100, and a stray one is swallowed by
+        // the response reader), so the client's wait for the interim response
+        // must be satisfied here or uploads deadlock: the client waits for 100,
+        // the proxy waits for body, the backend waits for the request.
+        if meta.expect_continue && !std::mem::replace(&mut once.continued, true) {
+            client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            client.flush().await?;
+        }
+
+        // Relay remaining request body + optional mirror tee, clamped to the
+        // rule's total deadline — `request_timeout` covers the request-body phase
+        // too, so a slow client body cannot hold the backend conn open past it.
+        // Expiry is SAFE for the client wire (no response bytes yet) → 408; the
+        // interim 100 above does not spoil that (interim-then-final is legal).
+        // Any bytes read past the body end (pipelined next request) come back as
+        // leftover; mutually exclusive with the initial-read leftover above.
+        let relay_fut = relay_request_body(
+            client,
+            &mut backend,
+            buf,
+            req_header_end,
+            request_end,
+            meta.content_length,
+            req_chunked,
+            has_mirrors,
+            state.idle_body_timeout,
+        );
+        let relay = match total_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, relay_fut).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        warn!(
+                            "Request body relay to backend {} exceeded request timeout",
+                            backend_addr
+                        );
+                        state.refused(408);
+                        send_error_response(client, 408, &state.cors_lines).await?;
+                        return Ok((false, None, backend_addr));
+                    }
                 }
-                state.refused(502);
-                send_error_response(client, 502, &state.cors_lines).await?;
-                return Ok((false, None));
             }
-        }
-    };
-    crate::metrics::UPSTREAM_TTFB.observe(backend_phase_start.elapsed());
-    state.last_status = framing.status;
-
-    // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
-    // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP
-    // framing — tunneling it would let the client's next requests bypass
-    // routing, filters, and timeouts entirely. Only now do the held bytes
-    // become tunnel payload, ahead of anything the tunnel copies; on a
-    // refusal they are returned below as the next request instead.
-    if meta.is_upgrade && framing.status == 101 {
-        if let Some(held) = leftover.take() {
-            if backend.write_all(&held).await.is_err() || backend.flush().await.is_err() {
-                return Ok((false, None));
+            None => relay_fut.await?,
+        };
+        // An incomplete body drops `backend` on return, never pooling it. No
+        // final response has gone out yet (at most the interim 100), so a 400
+        // is still well-formed.
+        let (mirror_body, relay_leftover, answered_early) = match relay {
+            RequestBody::Complete { mirror, leftover } => (mirror, leftover, false),
+            // A backend may answer before it has the whole body (a 413, a 401)
+            // and stop reading it; RFC 9112 9.5 has the client watch for that.
+            // The rest of the client's body stays unread, so the client is not
+            // done: the close reads it off.
+            RequestBody::BackendGone => (None, None, true),
+            incomplete => {
+                if let RequestBody::Broken = incomplete {
+                    warn!(
+                        "Rejecting request with malformed chunked body to backend {}",
+                        backend_addr
+                    );
+                } else {
+                    debug!("Client closed mid request body to backend {}", backend_addr);
+                }
+                state.refused(400);
+                // The client may already be gone (EOF case); the close follows
+                // either way.
+                let _ = send_error_response(client, 400, &state.cors_lines).await;
+                return Ok((false, None, backend_addr));
             }
+        };
+        if relay_leftover.is_some() {
+            leftover = relay_leftover;
         }
-        client.flush().await?;
-        relay::both_ways(&mut *client, &mut backend, state.idle_body_timeout).await;
-        return Ok((false, None));
-    }
+        if !answered_early {
+            // All of the request is in, unless it switches protocols.
+            state.client_done = client_done(ClientSent {
+                keepalive: meta.keepalive,
+                request_in: !meta.is_upgrade,
+                seen_past: leftover.is_some(),
+            });
+        }
 
-    // Stream response body (UNSAFE: headers on wire). Expiry, errors, and
-    // truncation reset the client: no synthetic terminator or 504 may make a
-    // cut-short body look complete.
-    let body_result = match total_deadline {
-        Some(deadline) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(
-                remaining,
+        // Both are Some iff has_mirrors: pairing them here keeps any fallback to
+        // the raw (unsanitized) client headers structurally impossible.
+        if let (Some(body), Some(header_bytes)) = (&mirror_body, &mirror_header_data) {
+            let mut full_request = Vec::with_capacity(header_bytes.len() + body.len());
+            full_request.extend_from_slice(header_bytes);
+            full_request.extend_from_slice(body);
+            dispatch_mirrors(&rule.filters, &full_request);
+            once.mirrored = true;
+        }
+
+        // Forward response headers (SAFE→UNSAFE transition lives inside this call;
+        // on timeout the helper emits a 504 — no client bytes written yet).
+        let resp_mods = extract_response_mods(rule, backend_ref);
+        let (mut framing, keep) = loop {
+            // An early answer is one already here: a backend that only stalled
+            // gets no fresh budget to answer in.
+            let head_wait = (!answered_early).then_some((timer.as_mut(), backend_deadline));
+            // With the body cut short, the connection neither tunnels nor
+            // stays open.
+            match forward_response_headers(
+                client,
+                &mut backend,
+                &mut state.header_buf,
+                &mut state.scratch_buf,
+                &mut state.filter_buf,
+                resp_mods.as_ref(),
+                &state.cors_lines,
+                again,
+                head_wait,
+                meta.is_head,
+                meta.is_upgrade && !answered_early,
+                meta.keepalive && !answered_early,
+                &state.drain_watch,
+            )
+            .await?
+            {
+                HeaderPhase::Proxied { framing, keep } => break (framing, keep),
+                HeaderPhase::ErrorSent(code) => {
+                    state.refused(code);
+                    return Ok((false, None, backend_addr));
+                }
+                // `backend` goes with its answer unread: never pooled.
+                HeaderPhase::Again => continue 'attempts,
+                HeaderPhase::Unanswered if replayable => {
+                    replayable = false;
+                    METRICS.pool_stale_retries_total.inc();
+                    debug!(
+                        "Backend {} pool conn closed unanswered; replaying on a fresh conn",
+                        backend_addr
+                    );
+                    backend = match resend_on_fresh(
+                        client,
+                        state,
+                        backend_ref,
+                        headers_len,
+                        &buf[req_header_end..request_end],
+                        backend_budget,
+                        backend_phase_start,
+                        total_deadline,
+                        again,
+                    )
+                    .await?
+                    {
+                        Some(b) => b,
+                        None if again.asked => continue 'attempts,
+                        None => return Ok((false, None, backend_addr)),
+                    };
+                }
+                HeaderPhase::Unanswered => {
+                    if answered_early {
+                        warn!("Backend {} stopped taking the request body", backend_addr);
+                    } else {
+                        warn!("Backend {} closed without answering", backend_addr);
+                    }
+                    state.refused(502);
+                    send_error_response(client, 502, &state.cors_lines).await?;
+                    return Ok((false, None, backend_addr));
+                }
+            }
+        };
+        crate::metrics::UPSTREAM_TTFB.observe(backend_phase_start.elapsed());
+        state.last_status = framing.status;
+
+        // WebSocket / protocol upgrade: raw bidi only once the backend ACCEPTED
+        // (101). A refused upgrade (e.g. 403 with a body) stays on normal HTTP
+        // framing — tunneling it would let the client's next requests bypass
+        // routing, filters, and timeouts entirely. Only now do the held bytes
+        // become tunnel payload, ahead of anything the tunnel copies; on a
+        // refusal they are returned below as the next request instead.
+        if meta.is_upgrade && framing.status == 101 {
+            if let Some(held) = leftover.take() {
+                if backend.write_all(&held).await.is_err() || backend.flush().await.is_err() {
+                    return Ok((false, None, backend_addr));
+                }
+            }
+            client.flush().await?;
+            relay::both_ways(&mut *client, &mut backend, state.idle_body_timeout).await;
+            return Ok((false, None, backend_addr));
+        }
+
+        // Stream response body (UNSAFE: headers on wire). Expiry, errors, and
+        // truncation reset the client: no synthetic terminator or 504 may make a
+        // cut-short body look complete.
+        let body_result = match total_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(
+                    remaining,
+                    forward_response_body(
+                        &mut backend,
+                        client,
+                        buf,
+                        &mut framing,
+                        state.idle_body_timeout,
+                    ),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!(
+                            "Response body from backend {} exceeded request timeout; resetting client connection",
+                            backend_addr
+                        );
+                        reset_on_drop(client, state);
+                        return Ok((false, None, backend_addr));
+                    }
+                }
+            }
+            None => {
                 forward_response_body(
                     &mut backend,
                     client,
                     buf,
                     &mut framing,
                     state.idle_body_timeout,
-                ),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!(
-                        "Response body from backend {} exceeded request timeout; resetting client connection",
-                        backend_addr
-                    );
-                    reset_on_drop(client, state);
-                    return Ok((false, None));
-                }
+                )
+                .await
+            }
+        };
+
+        match body_result {
+            Ok(BodyEnd::Complete) => {}
+            Ok(BodyEnd::Closed) => {
+                // Close-delimited: the connection's graceful close, which
+                // follows, is how the client learns the body ended.
+                state.close_after_reply();
+                return Ok((false, None, backend_addr));
+            }
+            Ok(BodyEnd::Broken) => {
+                warn!(
+                    "Backend {} sent malformed chunked framing; resetting client connection",
+                    backend_addr
+                );
+                reset_on_drop(client, state);
+                return Ok((false, None, backend_addr));
+            }
+            Ok(BodyEnd::Truncated) => {
+                debug!("Backend {} closed mid response body", backend_addr);
+                reset_on_drop(client, state);
+                return Ok((false, None, backend_addr));
+            }
+            Err(e) => {
+                debug!("Response body from backend {} failed: {}", backend_addr, e);
+                reset_on_drop(client, state);
+                return Ok((false, None, backend_addr));
             }
         }
-        None => {
-            forward_response_body(
-                &mut backend,
-                client,
-                buf,
-                &mut framing,
-                state.idle_body_timeout,
-            )
-            .await
-        }
-    };
 
-    match body_result {
-        Ok(BodyEnd::Complete) => {}
-        Ok(BodyEnd::Closed) => {
-            // Close-delimited: the connection's graceful close, which
-            // follows, is how the client learns the body ended.
+        client.flush().await?;
+        if answered_early {
+            // Never pooled: its request was cut short.
             state.close_after_reply();
-            return Ok((false, None));
+            return Ok((false, None, backend_addr));
         }
-        Ok(BodyEnd::Broken) => {
+
+        // Overshoot (bytes past the framing end) poisons the conn: the excess was
+        // dropped here but whatever else follows would desync the next response.
+        // The client connection stays open: the excess never reached it. Closing
+        // it would let a backend padding with a stray CRLF close every client.
+        if framing.overshoot {
             warn!(
-                "Backend {} sent malformed chunked framing; resetting client connection",
+                "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
                 backend_addr
             );
-            reset_on_drop(client, state);
-            return Ok((false, None));
         }
-        Ok(BodyEnd::Truncated) => {
-            debug!("Backend {} closed mid response body", backend_addr);
-            reset_on_drop(client, state);
-            return Ok((false, None));
+        let framing_clean = !framing.overshoot;
+
+        // Both bodies completed per their framing: every other outcome returned
+        // above, dropping `backend`. The client got a clean response, but the
+        // backend conn returns to the pool only when `backend_conn_poolable`
+        // allows (notably never after HEAD or a refused upgrade) and never when
+        // the backend announced Connection: close.
+        if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade)
+            && !framing.backend_close
+            && backend_ref.action != BackendAction::ForwardProxied
+        {
+            state
+                .pool
+                .release(backend_addr, backend_ref.proto.as_ref(), backend);
+        } else if framing_clean {
+            debug!(
+                "Backend {} conn not pooled (HEAD, refused upgrade, backend Connection: close, or a Gateway backend)",
+                backend_addr
+            );
         }
-        Err(e) => {
-            debug!("Response body from backend {} failed: {}", backend_addr, e);
-            reset_on_drop(client, state);
-            return Ok((false, None));
+
+        if !keep {
+            state.close_after_reply();
         }
+        return Ok((keep, leftover, backend_addr));
     }
-
-    client.flush().await?;
-    if answered_early {
-        // Never pooled: its request was cut short.
-        state.close_after_reply();
-        return Ok((false, None));
-    }
-
-    // Overshoot (bytes past the framing end) poisons the conn: the excess was
-    // dropped here but whatever else follows would desync the next response.
-    // The client connection stays open: the excess never reached it. Closing
-    // it would let a backend padding with a stray CRLF close every client.
-    if framing.overshoot {
-        warn!(
-            "Backend {} sent bytes past the response framing end; excess dropped, not pooling connection",
-            backend_addr
-        );
-    }
-    let framing_clean = !framing.overshoot;
-
-    // Both bodies completed per their framing: every other outcome returned
-    // above, dropping `backend`. The client got a clean response, but the
-    // backend conn returns to the pool only when `backend_conn_poolable`
-    // allows (notably never after HEAD or a refused upgrade) and never when
-    // the backend announced Connection: close.
-    if backend_conn_poolable(framing_clean, meta.is_head, meta.is_upgrade)
-        && !framing.backend_close
-        && backend_ref.action != BackendAction::ForwardProxied
-    {
-        state
-            .pool
-            .release(backend_addr, backend_ref.proto.as_ref(), backend);
-    } else if framing_clean {
-        debug!(
-            "Backend {} conn not pooled (HEAD, refused upgrade, backend Connection: close, or a Gateway backend)",
-            backend_addr
-        );
-    }
-
-    if !keep {
-        state.close_after_reply();
-    }
-    Ok((keep, leftover))
 }
 
 /// Whether a backend connection may be returned to the idle pool after a
@@ -632,6 +785,7 @@ async fn send_request_with_retry(
     backend_budget: Duration,
     backend_phase_start: std::time::Instant,
     total_deadline: Option<std::time::Instant>,
+    again: &mut Again<'_>,
 ) -> Result<Option<(Connection, bool)>> {
     let backend_addr = backend_ref.socket_addr;
     match write_with_tail(&mut backend, &mut state.scratch_buf, headers_len, body).await {
@@ -662,6 +816,7 @@ async fn send_request_with_retry(
         backend_budget,
         backend_phase_start,
         total_deadline,
+        again,
     )
     .await?;
     Ok(fresh.map(|backend| (backend, false)))
@@ -681,6 +836,7 @@ async fn resend_on_fresh(
     backend_budget: Duration,
     backend_phase_start: std::time::Instant,
     total_deadline: Option<std::time::Instant>,
+    again: &mut Again<'_>,
 ) -> Result<Option<Connection>> {
     let backend_addr = backend_ref.socket_addr;
     let fresh_budget = clamp_to_deadline(
@@ -710,7 +866,7 @@ async fn resend_on_fresh(
                 "Backend {} fresh-conn acquire failed after pool retry: {}",
                 backend_addr, e2
             );
-            fail_connect(state, backend_ref, client, 502).await?;
+            fail_connect(state, backend_ref, client, 502, again).await?;
             return Ok(None);
         }
         Err(_) => {
@@ -718,7 +874,7 @@ async fn resend_on_fresh(
                 "Backend {} fresh-conn acquire timeout after pool retry",
                 backend_addr
             );
-            fail_connect(state, backend_ref, client, 504).await?;
+            fail_connect(state, backend_ref, client, 504, again).await?;
             return Ok(None);
         }
     };
@@ -744,6 +900,9 @@ enum HeaderPhase {
         keep: bool,
     },
     ErrorSent(u16),
+    /// Nothing was written to the client, and the attempt asks to be made
+    /// again (see [`Again`]).
+    Again,
     /// No head came, and nothing was written to the client: the backend
     /// closed or reset before its first byte, or held no complete head
     /// where only one already here counts. The caller replays or answers.
@@ -767,6 +926,7 @@ async fn forward_response_headers(
     filter_buf: &mut Vec<u8>,
     resp_mods: Option<&HeaderModifications<'_>>,
     cors: &[u8],
+    again: &mut Again<'_>,
     head_wait: Option<(Pin<&mut tokio::time::Sleep>, Option<tokio::time::Instant>)>,
     is_head_request: bool,
     expect_upgrade: bool,
@@ -786,6 +946,7 @@ async fn forward_response_headers(
             send_error_response(client, 502, cors).await?;
             return Ok(HeaderPhase::ErrorSent(502));
         }
+        None if again.after_timeout() => return Ok(HeaderPhase::Again),
         None => {
             send_error_response(client, 504, cors).await?;
             return Ok(HeaderPhase::ErrorSent(504));
@@ -807,6 +968,12 @@ async fn forward_response_headers(
         is_head_request,
         expect_upgrade,
     );
+
+    // Before any client byte, and before the scratch holding the request's
+    // outgoing head is put to another use.
+    if again.after_status(framing.status) {
+        return Ok(HeaderPhase::Again);
+    }
 
     // A 101 nobody asked for would turn the client connection into an
     // unframed tunnel; refuse it while the client wire is still clean.
@@ -1541,6 +1708,11 @@ mod tests {
                 Duration::from_secs(5),
                 std::time::Instant::now(),
                 None,
+                &mut Again {
+                    codes: None,
+                    after_timeouts: false,
+                    asked: false,
+                },
             )
             .await
             .unwrap();
@@ -2003,5 +2175,284 @@ mod tests {
         // Overshoot is never pooled, HEAD or not.
         assert!(!backend_conn_poolable(false, false, false));
         assert!(!backend_conn_poolable(false, true, false));
+    }
+
+    /// A backend that gives its `n`th request the `n`th of `answers`, the
+    /// last one from then on, and never answers for `None`. Returns its
+    /// address and the count of requests it has read.
+    async fn scripted(answers: Vec<Option<&'static str>>) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (answers, counted) = (answers.clone(), counted.clone());
+                tokio::spawn(async move {
+                    let (mut read, mut chunk) = (Vec::new(), [0u8; 4096]);
+                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
+                        read.extend_from_slice(&chunk[..n]);
+                        while let Some(end) = find_header_end(&read) {
+                            read.drain(..end);
+                            let nth = counted.fetch_add(1, Ordering::SeqCst);
+                            match answers[nth.min(answers.len() - 1)] {
+                                Some(answer) => sock.write_all(answer.as_bytes()).await.unwrap(),
+                                None => std::future::pending().await,
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    const FAILED: &str = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\nno";
+    const BUSY: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\nno";
+
+    /// a.test under `rule`, built as a snapshot or a file gives it.
+    fn retrying(rule: serde_json::Value) -> RouteTable {
+        let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "http", "protocol": "HTTP", "port": 8080}]},
+            "httpRoutes": [{"parentRefs": [{"name": "g", "sectionName": "http"}],
+                            "hostnames": ["a.test"], "rules": [rule]}]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        config.to_route_table_strict().unwrap()
+    }
+
+    fn to(backend: SocketAddr) -> serde_json::Value {
+        serde_json::json!({"name": "127.0.0.1", "port": backend.port()})
+    }
+
+    /// A listed status is tried again while attempts remain, and the last
+    /// attempt's answer is the client's, whatever it is. A status that is
+    /// not listed is the client's at once.
+    #[tokio::test]
+    async fn a_listed_status_is_tried_again_while_attempts_remain() {
+        for (attempts, answers, status, asked) in [
+            (3, vec![FAILED, FAILED, OK], "200 OK", 3),
+            (1, vec![FAILED, FAILED, OK], "500 Internal Server Error", 2),
+            (0, vec![FAILED, OK], "500 Internal Server Error", 1),
+            (3, vec![BUSY, OK], "503 Service Unavailable", 1),
+        ] {
+            let (backend, seen) = scripted(answers.into_iter().map(Some).collect()).await;
+            let rt = retrying(serde_json::json!({
+                "retry": {"codes": [500], "attempts": attempts}, "backendRefs": [to(backend)]
+            }));
+            let (mut client, _engine) = serve(rt);
+            let answer = exchange(&mut client, GET_A).await;
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status}")),
+                "{attempts}: {answer}"
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), asked, "attempts {attempts}");
+        }
+    }
+
+    /// With no status listed, a retry is for the connect that fails: the
+    /// request goes to the rule's other backend, and without the stanza it
+    /// is a 502.
+    #[tokio::test]
+    async fn a_failed_connect_is_tried_on_a_backend_chosen_again() {
+        for (retry, status) in [
+            (serde_json::json!({"attempts": 1}), "200 OK"),
+            (serde_json::json!({"attempts": 0}), "502 Bad Gateway"),
+        ] {
+            let (_held, refusing) = refusing_backend();
+            let (good, seen) = scripted(vec![Some(OK)]).await;
+            let rt = retrying(serde_json::json!({
+                "retry": retry, "backendRefs": [to(refusing), to(good)]
+            }));
+            let (mut client, _engine) = serve(rt);
+            let answer = exchange(&mut client, GET_A).await;
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status}")),
+                "{retry}: {answer}"
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), usize::from(status == "200 OK"));
+        }
+    }
+
+    /// Once part of the body is still the client's to send there is nothing
+    /// whole to send again: the first answer is the client's.
+    #[tokio::test]
+    async fn a_request_still_arriving_is_not_tried_again() {
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 3}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8\r\n\r\nhalf")
+            .await
+            .unwrap();
+        // The rest only once the backend has the head: the request was
+        // sent on with half its body.
+        while seen.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        client.write_all(b"half").await.unwrap();
+        let answer = response(&mut client).await;
+        assert!(answer.starts_with("HTTP/1.1 500 "), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+        // The same request whole is tried again, its body sent each time.
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 3}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let whole = b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8\r\n\r\nhalfhalf";
+        let answer = exchange(&mut client, whole).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    /// The rule's request timeout is for all the attempts together: one
+    /// that hangs after a failed one is cut by it, not given a budget of
+    /// its own.
+    #[tokio::test]
+    async fn the_request_timeout_bounds_the_attempts_together() {
+        let (backend, seen) = scripted(vec![Some(FAILED), None]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 50},
+            "timeouts": {"request": "300ms"},
+            "backendRefs": [to(backend)]
+        }));
+        let state = conn_state(rt, false);
+        let health = state.health.clone();
+        let (mut client, _engine) = serve_state(state);
+        let answer = exchange(&mut client, GET_A).await;
+        assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        // No attempt was started past the timeout: each would have timed
+        // out before connecting, and counted against the backend.
+        assert!(health.is_healthy(&backend));
+    }
+
+    /// A wait the request timeout has no room for is not started: the
+    /// timeout answers at once. Waited out, this test's own five seconds
+    /// would pass first.
+    #[tokio::test]
+    async fn a_wait_past_the_request_timeout_answers_504_at_once() {
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 2, "backoff": "20s"},
+            "timeouts": {"request": "8s"},
+            "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let answer = exchange(&mut client, GET_A).await;
+        assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// A mirror is of the request, not of each attempt at it: one copy,
+    /// and one still when the first attempt never connected.
+    #[tokio::test]
+    async fn a_retried_request_is_mirrored_once() {
+        let (_held, refusing) = refusing_backend();
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(FAILED), Some(OK)]).await;
+        let (mirror, copies) = scripted(vec![Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 5},
+            "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": to(mirror)}}],
+            "backendRefs": [to(refusing), to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let answer = exchange(&mut client, GET_A).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        // The copy is sent from a task of its own: wait for it, then for
+        // the engine to be through, and count.
+        while copies.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        _engine.await.unwrap().unwrap();
+        assert_eq!(copies.load(Ordering::SeqCst), 1);
+    }
+
+    /// Doubled from the base, at most ten times it, and never under half
+    /// of what it grew to.
+    #[test]
+    fn the_wait_between_attempts_grows_from_the_base_to_its_cap() {
+        let base = Duration::from_millis(100);
+        for (made, grown) in [
+            (1, 100),
+            (2, 200),
+            (3, 400),
+            (4, 800),
+            (5, 1000),
+            (40, 1000),
+        ] {
+            let grown = Duration::from_millis(grown);
+            for _ in 0..200 {
+                let wait = backoff(base, made);
+                assert!(grown / 2 <= wait && wait <= grown, "{made}: {wait:?}");
+            }
+        }
+    }
+
+    /// A client may send its body with `Expect: 100-continue` without
+    /// waiting, and a small one arrives whole with the head: retried, it
+    /// hears `100 Continue` once.
+    #[tokio::test]
+    async fn a_retried_request_that_expects_100_continue_hears_it_once() {
+        let (backend, seen) = scripted(vec![Some(FAILED), Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 1}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let request = b"POST / HTTP/1.1\r\nHost: a.test\r\nExpect: 100-continue\r\n\
+                        Content-Length: 4\r\n\r\nbody";
+        let answer = exchange(&mut client, request).await;
+        assert_eq!(answer.matches("100 Continue").count(), 1, "{answer}");
+        assert!(answer.contains("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    /// An attempt that takes the whole budget is tried again under the
+    /// rule's own `backendRequest`.
+    #[tokio::test]
+    async fn a_backend_timeout_the_rule_sets_is_tried_again() {
+        let (backend, seen) = scripted(vec![None, Some(OK)]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"attempts": 1},
+            "timeouts": {"backendRequest": "100ms"},
+            "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let answer = exchange(&mut client, GET_A).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    /// Without it the budget is the 30 s default, and a backend that
+    /// never answers is not given it again: one budget, then the 504.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_backend_timeout_a_silent_backend_is_not_tried_again() {
+        use tokio::io::AsyncWriteExt;
+        let (backend, seen) = scripted(vec![None]).await;
+        let rt = retrying(serde_json::json!({
+            "retry": {"codes": [500], "attempts": 3}, "backendRefs": [to(backend)]
+        }));
+        let (mut client, _engine) = serve(rt);
+        let started = tokio::time::Instant::now();
+        client.write_all(GET_A).await.unwrap();
+        client.shutdown().await.unwrap();
+        // No timeout of the test's own: the paused clock runs to the
+        // engine's next timer at once, so one budget is 30 s of it.
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

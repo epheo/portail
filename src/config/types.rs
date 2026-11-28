@@ -329,6 +329,38 @@ pub struct HttpRouteRule {
     pub backend_refs: Vec<BackendRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<HttpRouteTimeouts>,
+    /// When a request the rule forwards is attempted again. A data plane
+    /// that does not know the field refuses the config and serves on what
+    /// it had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<HttpRouteRetry>,
+}
+
+/// HTTPRoute's retry stanza (Gateway API v1.7), resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteRetry {
+    /// Response statuses, 400 to 599, for which the request is attempted
+    /// again. Empty: only when no connection could be made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codes: Vec<u16>,
+    /// Attempts beyond the first; 0 for none. One when not written, as
+    /// the API defaults it.
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: u32,
+    /// The base of the wait before an attempt, doubled from one to the
+    /// next. Absent: no wait.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "human_duration::opt"
+    )]
+    pub backoff: Option<Duration>,
+}
+
+fn default_retry_attempts() -> u32 {
+    1
 }
 
 impl HttpRouteRule {

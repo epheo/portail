@@ -454,9 +454,8 @@ async fn serve_http(
                     // proxy_http_request owns all timing for the request lifecycle —
                     // backend_request_timeout (connect + TTFB) and request_timeout
                     // (total deadline) are applied phase-aware inside.
-                    let backend_addr = backend.socket_addr;
                     let timer = budget_timer.as_mut();
-                    let (keep, leftover) = proxy_http_request(
+                    let (keep, leftover, backend_addr) = proxy_http_request(
                         client, buf, framing, backend, rule, &meta, state, timer,
                     )
                     .await?;

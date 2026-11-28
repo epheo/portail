@@ -496,6 +496,8 @@ pub struct HttpRouteRule {
     pub backends: Vec<Backend>,
     pub request_timeout: Option<Duration>,
     pub backend_request_timeout: Option<Duration>,
+    /// When a request is attempted again; `None` for never.
+    pub retry: Option<Retry>,
     /// Pre-computed at add_http_route time to skip filter iteration on hot path
     pub has_filters: bool,
     /// Pre-computed sum of backend weights for O(1) access
@@ -558,6 +560,7 @@ impl HttpRouteRule {
             backends,
             request_timeout: None,
             backend_request_timeout: None,
+            retry: None,
             has_filters: false,
             total_weight: 0,
             cumulative_weights: vec![],
@@ -636,6 +639,19 @@ pub enum HttpFilter {
         proto: crate::proxy::backend_pool::BackendProto,
     },
     Cors(Arc<crate::proxy::cors::Cors>),
+}
+
+/// A rule's retries (HTTPRoute `retry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retry {
+    /// Response statuses for which an attempt is made again. A failed
+    /// connect always is.
+    pub codes: Box<[u16]>,
+    /// Attempts beyond the first, at least one.
+    pub attempts: u32,
+    /// The base of the wait before an attempt, doubled from one to the
+    /// next; `None` for no wait.
+    pub backoff: Option<Duration>,
 }
 
 /// Share of requests a mirror copies, exact: whole percents turned 1/1000
