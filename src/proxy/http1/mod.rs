@@ -6,6 +6,7 @@ mod backend;
 mod body;
 mod exchange;
 pub(crate) mod reply;
+mod spare;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -35,16 +36,23 @@ use crate::proxy::tls::Connection;
 use crate::routing::{BackendSelector, RouteTable};
 use exchange::{proxy_http_request, Framing};
 use reply::{send_error_response, send_local_reply};
+use spare::Idle;
 
 /// Read what the client has sent into `buf`'s spare room, as one read with
 /// room up to `CLIENT_BUF` would: a read that fills the room grows the
 /// buffer and goes on with what has already arrived, without waiting.
 /// Returns the bytes read, 0 at EOF. `buf` must be below its cap.
 async fn read_head(client: &mut Connection, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let room = head_room(buf);
+    let read = client.read_buf(&mut (&mut *buf).limit(room)).await?;
+    Ok(read + read_on(client, buf, read, room))
+}
+
+/// After a read of `read` bytes into `room`: what more has already
+/// arrived, read without waiting while each read fills its room.
+fn read_on(client: &mut Connection, buf: &mut Vec<u8>, mut read: usize, mut room: usize) -> usize {
     use futures::FutureExt;
     let start = buf.len();
-    let mut room = head_room(buf);
-    let mut read = client.read_buf(&mut (&mut *buf).limit(room)).await?;
     while read == room && buf.len() < CLIENT_BUF {
         room = head_room(buf);
         match client.read_buf(&mut (&mut *buf).limit(room)).now_or_never() {
@@ -54,7 +62,7 @@ async fn read_head(client: &mut Connection, buf: &mut Vec<u8>) -> std::io::Resul
             None | Some(Err(_)) => break,
         }
     }
-    Ok(buf.len() - start)
+    buf.len() - start
 }
 
 /// Spare room for the next head read, doubling the buffer when it is full,
@@ -121,10 +129,11 @@ pub(crate) struct ConnectionState {
     /// Set on every backend socket this connection opens.
     backend_keepalive: socket2::TcpKeepalive,
     /// Reused across keepalive responses to avoid per-response heap allocation.
-    /// Allocated by the first response read, which sizes it.
+    /// The thread's while the connection waits for a request (see `spare`).
     header_buf: Vec<u8>,
     /// Reused header-assembly scratch: outgoing request block during the send
-    /// phase, sanitized response block during the response phase.
+    /// phase, sanitized response block during the response phase. The
+    /// thread's while the connection waits, as `header_buf`.
     scratch_buf: Vec<u8>,
     /// Second reusable header buffer for filter passes that rewrite the
     /// scratch (mem::swap partner). Empty until a filtered route is hit, so
@@ -195,7 +204,7 @@ impl ConnectionState {
             connect_timeout: cfg.connect_timeout,
             backend_keepalive: tcp_keepalive(cfg.tcp_keepalive_time),
             header_buf: Vec::new(),
-            scratch_buf: Vec::with_capacity(1024),
+            scratch_buf: Vec::new(),
             filter_buf: Vec::new(),
             cors_lines: Vec::new(),
             idle_body_timeout: idle_opt(cfg.idle_body_timeout),
@@ -317,6 +326,12 @@ pub(crate) async fn serve(
         let header = state.proxy_header(proxied);
         // The tunnel keeps nothing of the engine: its state, pool and
         // buffers would otherwise live as long as it does.
+        Idle {
+            read: &mut Vec::new(),
+            head: &mut state.header_buf,
+            scratch: &mut state.scratch_buf,
+        }
+        .park();
         let ConnectionState {
             health,
             connect_timeout,
@@ -341,6 +356,13 @@ pub(crate) async fn serve(
         return Ok(());
     }
     close_connection(&mut client, &mut buf, &state).await;
+    // For the next connection this thread serves, which then allocates none.
+    Idle {
+        read: &mut buf,
+        head: &mut state.header_buf,
+        scratch: &mut state.scratch_buf,
+    }
+    .park();
     served.map(drop)
 }
 
@@ -367,7 +389,12 @@ async fn serve_http(
     // Lives as long as the requests: dropping it ends the wait on the token.
     let drained = std::pin::pin!(state.drain.clone().cancelled_owned());
     DrainWatch::arm(&state.drain_watch, drained);
-    idle_read(client, buf, &state.drain_watch).await?;
+    let idle = Idle {
+        read: buf,
+        head: &mut state.header_buf,
+        scratch: &mut state.scratch_buf,
+    };
+    idle_read(client, idle, &state.drain_watch).await?;
     sniff_first_request(client, buf, state.client_header_timeout, !tcp_route).await;
 
     // If data looks like HTTP but headers aren't complete, accumulate more reads.
@@ -507,7 +534,12 @@ async fn serve_http(
             // came out of `buf`, so they fit its cap.
             buf.extend_from_slice(&bytes);
         } else {
-            idle_read(client, buf, &state.drain_watch).await?;
+            let idle = Idle {
+                read: buf,
+                head: &mut state.header_buf,
+                scratch: &mut state.scratch_buf,
+            };
+            idle_read(client, idle, &state.drain_watch).await?;
         }
         // RFC 9112 2.2: empty lines before a request-line are ignored. An
         // old client ends a POST body with a CRLF its length leaves out.
@@ -519,7 +551,12 @@ async fn serve_http(
             match &buf[..] {
                 // Between requests: as unbounded as the idle wait.
                 [] if skip > 0 => {
-                    idle_read(client, buf, &state.drain_watch).await?;
+                    let idle = Idle {
+                        read: buf,
+                        head: &mut state.header_buf,
+                        scratch: &mut state.scratch_buf,
+                    };
+                    idle_read(client, idle, &state.drain_watch).await?;
                 }
                 // Inside an empty line: as bounded as a request head.
                 [b'\r'] => {
@@ -611,18 +648,38 @@ async fn read_off(client: &mut Connection, buf: &mut Vec<u8>, deadline: tokio::t
 
 /// The wait for a connection's next request, its first included: unbounded,
 /// as long idle is legitimate there, until a drain ends it like an EOF
-/// would (0).
+/// would (0). Its buffers are the thread's while it waits (see `spare`);
+/// a request already there pays nothing for it.
 async fn idle_read(
     client: &mut Connection,
-    buf: &mut Vec<u8>,
+    mut idle: Idle<'_>,
     drain: &DrainWatch,
 ) -> std::io::Result<usize> {
-    tokio::select! {
+    use std::future::Future;
+    use std::task::Poll;
+    // Parking drops what the buffer holds: it must hold nothing yet.
+    debug_assert!(idle.read.is_empty());
+    let first = std::future::poll_fn(|cx| {
+        if idle.read.capacity() == 0 {
+            idle.unpark();
+        }
+        let room = head_room(idle.read);
+        let polled = std::pin::pin!(client.read_buf(&mut (&mut *idle.read).limit(room))).poll(cx);
+        match polled {
+            Poll::Pending => {
+                idle.park();
+                Poll::Pending
+            }
+            Poll::Ready(read) => Poll::Ready(read.map(|read| (read, room))),
+        }
+    });
+    let (read, room) = tokio::select! {
         // A request already sent is served: its reply announces the close.
         biased;
-        read = read_head(client, buf) => read,
-        () = drain.wait() => Ok(0),
-    }
+        read = first => read?,
+        () = drain.wait() => return Ok(0),
+    };
+    Ok(read + read_on(client, idle.read, read, room))
 }
 
 /// Byte length of the empty lines (CRLF pairs) opening `data`.

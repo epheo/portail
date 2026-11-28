@@ -57,6 +57,9 @@ impl ResponseFraming {
 /// instead of a copy that could drift below it.
 pub(crate) const RESPONSE_HEADER_CAP: usize = 65536;
 
+/// The room a response head is read into to start with.
+pub(crate) const RESPONSE_HEAD_INITIAL: usize = 16 * 1024;
+
 /// Interim (1xx) responses tolerated per exchange before the backend is
 /// declared broken. Generous: a compliant exchange has at most a couple
 /// (100, 103), the cap only stops an infinite interim stream.
@@ -136,7 +139,7 @@ pub(crate) async fn read_response_head(
 
         // read_buf with little spare capacity degrades to tiny reads; keep a
         // full read's worth reserved (and spare > 0 makes Ok(0) mean EOF).
-        header_buf.reserve(16 * 1024);
+        header_buf.reserve(RESPONSE_HEAD_INITIAL);
         match backend.read_buf(header_buf).await {
             Ok(1..) => answered = true,
             Ok(0) | Err(_) if !answered => return Ok(HeadRead::Unanswered),

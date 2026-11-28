@@ -165,7 +165,7 @@ Defaults:
 
 - `provisioning: Managed`, `replicas: 1`.
 - `resources`: requests `100m`/`64Mi`, limits `2`/`256Mi`. The data plane runs one worker thread per CPU of its limit, at most 4.
-- Memory per idle connection: 3 to 5 KiB for a TCPRoute or TLS passthrough tunnel; about 16 KiB for an HTTP/1.1 connection or an upgraded one (a WebSocket); 27 KiB for HTTP/1.1 over terminated TLS. The `256Mi` limit holds some ten thousand idle HTTP connections, or several tens of thousands of tunnels: raise `resources` for more.
+- Memory per idle connection: 3 to 5 KiB for a TCPRoute or TLS passthrough tunnel; about 7.5 KiB for an HTTP/1.1 keep-alive connection, 18 KiB over terminated TLS; about 16 KiB for an upgraded one (a WebSocket). The `256Mi` limit holds some thirty thousand idle HTTP connections, over ten thousand over TLS, or several tens of thousands of tunnels: raise `resources` for more.
 - `service.type`: `None` when the Gateway has a Network address or `networks` is set, a network it only dials out on included, else `LoadBalancer`.
 - `controllerTransport: Direct`.
 - `externalNameBackends: Refused`: a backendRef to a Service of type ExternalName is `ResolvedRefs=False`, reason `InvalidKind`, and its share of requests answers 500. Managed and Unmanaged alike.
