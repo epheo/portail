@@ -108,6 +108,16 @@ pub(crate) fn assign(
             // validate_gateway refuses it as UnsupportedAddress.
             continue;
         };
+        // The list matches ::ffff:a.b.c.d as IPv4 and kube-proxy reads it so,
+        // where a holder written as IPv4 would not be found: two Gateways
+        // would carry one address.
+        if ip != ip.to_canonical() {
+            assignment.refused.push((
+                value.to_string(),
+                "is an IPv4-mapped IPv6 address: write it as IPv4".to_string(),
+            ));
+            continue;
+        }
         if ingress.iter().any(|held| held.parse() == Ok(ip)) {
             continue;
         }
@@ -337,6 +347,35 @@ mod tests {
                 "is in use by Gateway first".to_string()
             )]
         );
+    }
+
+    /// An address written as IPv4-mapped IPv6 is refused before the list,
+    /// which would match it as the IPv4 an older Gateway holds.
+    #[tokio::test]
+    async fn a_mapped_address_cannot_take_a_held_one() {
+        let mut cluster = cluster();
+        let holder = asking("a", "first", 100, &["192.0.2.5"]);
+        let mapped = asking("b", "second", 200, &["::ffff:192.0.2.5"]);
+        for gw in [&holder, &mapped] {
+            apply(&mut cluster.gateways, gw.clone());
+        }
+        let ctx = cluster.ctx(MockApi::default().client());
+        let assigned = |gw: &Gateway| {
+            let params = params::resolve(&ctx, gw).unwrap();
+            assign(&ctx, gw, &params)
+        };
+        let (second, asked) = assigned(&mapped);
+        assert!(second.assigned.is_empty());
+        assert_eq!(
+            second.refused,
+            [(
+                "::ffff:192.0.2.5".to_string(),
+                "is an IPv4-mapped IPv6 address: write it as IPv4".to_string()
+            )]
+        );
+        assert!(asked.is_empty(), "nothing claimed");
+        let (first, _) = assigned(&holder);
+        assert_eq!(first.assigned, ["192.0.2.5".parse::<IpAddr>().unwrap()]);
     }
 
     fn ips(list: &[&str]) -> BTreeSet<IpAddr> {

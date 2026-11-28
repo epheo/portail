@@ -201,6 +201,9 @@ spec:
 - An `IPAddress` of a Gateway's `spec.addresses` inside one of those CIDRs goes on its Service's `spec.externalIPs`.
 - One address, one Gateway: of the Gateways asking for an allowed address, the oldest holds it (creationTimestamp, then namespace and name). The others are `Programmed=False`, reason `AddressNotUsable`, "in use", naming the holder only in their own namespace.
 - Outside the list, or with no list: `AddressNotUsable`. The Gateway's listeners still serve on its Service's other addresses.
+- An IPv4 address written in its IPv4-mapped IPv6 form (`::ffff:192.0.2.5`) is `AddressNotUsable`: write it as IPv4.
+- Any Gateway of the class may ask for a listed address, and the oldest asker holds it: a refused asker is next in line if the holder goes. Tenants kept apart need their own GatewayClass and list.
+- A Service that is not a Gateway's is not seen: keep out of the list any address another Service already carries.
 - A malformed entry makes the GatewayClass `Accepted=False`, reason `InvalidParameters`, never a shorter list.
 - Only addresses routed to the nodes for Gateways belong in the list, never a node's or the control plane's: a Service's externalIPs take that address's traffic on every node (CVE-2020-8554).
 - Whoever can edit the GatewayParameters the GatewayClass names can widen the list: keep that namespace the cluster administrator's.
