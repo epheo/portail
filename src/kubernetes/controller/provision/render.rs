@@ -244,6 +244,13 @@ fn render(
                     })
                     .collect(),
             ),
+            external_ips: (!params.external_ips.is_empty()).then(|| {
+                params
+                    .external_ips
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect()
+            }),
             ..Default::default()
         }),
         status: None,
@@ -631,7 +638,12 @@ mod tests {
         }
         apply(&mut cluster.gateway_classes, gc);
         let ctx = cluster.ctx(MockApi::default().client());
-        let params = params::resolve(&ctx, &gw).unwrap();
+        let mut params = params::resolve(&ctx, &gw).unwrap();
+        // As the pass does between the two.
+        params.external_ips =
+            crate::kubernetes::controller::external_ips::assign(&ctx, &gw, &params)
+                .0
+                .assigned;
         let (objects, _) = desired(&gw, &params, &BTreeMap::new(), controller);
         let mut out = vec![
             serde_json::to_value(&objects.service_account).unwrap(),
@@ -775,6 +787,32 @@ resources: {limits: {cpu: 500m, memory: 128Mi}, requests: {cpu: 50m, memory: 32M
             )
             .await,
         );
+    }
+
+    /// An allowed IPAddress goes on the Service's externalIPs; one outside
+    /// the class's list, or any with no list, does not.
+    #[tokio::test]
+    async fn allowed_addresses_become_external_ips() {
+        let gw = gateway(
+            "gw",
+            serde_json::json!([{"name": "http", "port": 8080, "protocol": "HTTP"}]),
+            serde_json::json!([
+                {"type": "IPAddress", "value": "192.0.2.5"},
+                {"type": "IPAddress", "value": "198.51.100.1"},
+            ]),
+        );
+        let external_ips = |objects: &[serde_json::Value]| {
+            objects.iter().find(|o| o["kind"] == "Service").unwrap()["spec"]["externalIPs"].clone()
+        };
+        let allowed = objects_of(
+            &gw,
+            Some("service: {type: ClusterIP, externalIPs: {allowedCIDRs: [192.0.2.0/28]}}"),
+            None,
+        )
+        .await;
+        assert_eq!(external_ips(&allowed), serde_json::json!(["192.0.2.5"]));
+        let none = objects_of(&gw, Some("service: {type: ClusterIP}"), None).await;
+        assert!(external_ips(&none).is_null());
     }
 
     /// accessLog and http2 become the data plane's own flags, as its parser

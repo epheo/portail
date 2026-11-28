@@ -68,6 +68,7 @@ pub(crate) fn gateway_status(
     attached: &HashMap<String, i32>,
     problem: Option<&str>,
     unpublished: Option<&Unpublished>,
+    not_usable: Option<&str>,
 ) -> GatewayStatus {
     let served = ctx.hub.current(key);
     let reports = ctx.reports.live(key);
@@ -81,6 +82,7 @@ pub(crate) fn gateway_status(
         attached,
         problem,
         unpublished,
+        not_usable,
         served: served.as_deref(),
         reports: &reports,
         older: reports
@@ -104,6 +106,8 @@ struct Inputs<'a> {
     /// Why the data plane cannot be provisioned.
     problem: Option<&'a str>,
     unpublished: Option<&'a Unpublished>,
+    /// Why IPAddress values of the spec will not be used.
+    not_usable: Option<&'a str>,
     served: Option<&'a Snapshot>,
     /// The live instances.
     reports: &'a [(InstanceId, InstanceReport)],
@@ -165,6 +169,12 @@ fn decide(i: &Inputs) -> GatewayStatus {
             "Gateway not accepted: {}",
             i.accepted.message
         )))
+    } else if let Some(message) = i.not_usable {
+        Verdict::Fresh(GatewayCondition {
+            ok: false,
+            reason: "AddressNotUsable".to_string(),
+            message: message.to_string(),
+        })
     } else if let Some(message) = service.as_ref().and_then(|s| s.unassigned(i.gateway)) {
         Verdict::Fresh(GatewayCondition {
             ok: false,
@@ -705,6 +715,11 @@ impl ServiceView {
                 .into_iter()
                 .collect()
         };
+        addresses.extend(
+            spec.iter()
+                .flat_map(|s| s.external_ips.iter().flatten())
+                .map(|ip| (IP_ADDRESS, ip.clone())),
+        );
         addresses.sort();
         addresses.dedup();
         Self {
@@ -879,6 +894,7 @@ mod tests {
         accepted: GatewayCondition,
         problem: Option<String>,
         unpublished: Option<Unpublished>,
+        not_usable: Option<String>,
         listeners: HashMap<String, ListenerStatus>,
         published_at: Option<Instant>,
         first_published: Option<Instant>,
@@ -897,6 +913,7 @@ mod tests {
                 accepted: GatewayCondition::ok("Accepted", "ok"),
                 problem: None,
                 unpublished: None,
+                not_usable: None,
                 listeners: programmable(),
                 published_at: None,
                 first_published: None,
@@ -914,6 +931,7 @@ mod tests {
                 attached: &HashMap::new(),
                 problem: self.problem.as_deref(),
                 unpublished: self.unpublished.as_ref(),
+                not_usable: self.not_usable.as_deref(),
                 served: self.served.as_ref(),
                 reports: &self.reports,
                 older: None,
@@ -1680,6 +1698,35 @@ mod tests {
             load_balancer(json!([{"ip": "203.0.113.7"}])),
         );
         assert!(held.programmed, "{}", held.desired);
+    }
+
+    /// A refused IPAddress is AddressNotUsable, ahead of what the Service
+    /// holds; an assigned one is the Service's, held through its
+    /// externalIPs and written among its addresses.
+    #[test]
+    fn a_refused_address_is_not_usable_and_an_external_ip_is_held() {
+        let gw = gateway(1, &[("IPAddress", "192.0.2.5")]);
+        let mut case = Case::new(
+            gw.clone(),
+            snapshot(&gw, &[]),
+            vec![report(V1, &["10.0.0.5"], true)],
+        );
+        case.service = Some(service_of("ClusterIP", json!({})));
+        case.not_usable = Some("IPAddress 192.0.2.5 is in use by another Gateway".into());
+        let out = case.run();
+        let programmed = programmed_of(&out.desired);
+        assert_eq!(programmed["reason"], "AddressNotUsable", "{}", out.desired);
+        assert!(programmed["message"].as_str().unwrap().contains("in use"));
+        assert!(!out.programmed);
+
+        let mut svc = service_of("ClusterIP", json!({}));
+        svc.spec.as_mut().unwrap().external_ips = Some(vec!["192.0.2.5".into()]);
+        let held = with_service(gw, svc);
+        assert!(held.programmed, "{}", held.desired);
+        assert_eq!(
+            addresses(&held.desired),
+            [ip("10.96.0.10"), ip("192.0.2.5")]
+        );
     }
 
     /// A ClusterIP or NodePort Service: its cluster IP.

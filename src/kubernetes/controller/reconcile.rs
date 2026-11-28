@@ -18,6 +18,7 @@ use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
 use gateway_api::httproutes::HttpRoute;
 
+use super::external_ips::{self, Assignment};
 use super::gateway_backends::{self, trusted_addresses};
 use super::provision::Provisioned;
 use super::translate::{translate, Observed, Plan, Rejected, Statuses};
@@ -272,6 +273,7 @@ pub(super) fn forget_deleted_gateways(ctx: &ControllerCtx) {
     ctx.route_verdicts
         .retain(|(ns, name)| live.contains(&GatewayKey::new(ns, name)));
     ctx.reads.retain(|key| live.contains(key));
+    ctx.claims.retain(|key| live.contains(key));
     // Pruning by what is still named: no output of a pass.
     ctx.networks
         .retain_named(&gateways, &ctx.cache.gateway_parameters.all_unrecorded());
@@ -299,6 +301,9 @@ pub(super) struct Pass {
     /// When the snapshot published stops marking anything pending: the
     /// pass that publishes it unmarked is due then.
     pending_until: Option<tokio::time::Instant>,
+    /// Which IPAddress values the Gateway's Service carries, and why not
+    /// the others.
+    addresses: Assignment,
 }
 
 /// The first half of a pass: translate, provision, publish.
@@ -384,6 +389,15 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         },
         (params, _) => params,
     };
+    // Parameters that fail keep their last claims, as their objects stay.
+    let mut addresses = Assignment::default();
+    let params = params.map(|mut p| {
+        let (assignment, asked) = external_ips::assign(ctx, gateway, &p);
+        ctx.claims.record(&key, asked);
+        p.external_ips = assignment.assigned.clone();
+        addresses = assignment;
+        p
+    });
     let mut pending_until = None;
     let (provisioned, published) = match (&params, &mut plan) {
         (Ok(params), Ok(plan)) => {
@@ -512,6 +526,7 @@ pub(super) async fn publish(gateway: &Gateway, ctx: &ControllerCtx) -> Step {
         invalid_parameters: params.err(),
         published,
         pending_until,
+        addresses,
     }))
 }
 
@@ -529,6 +544,7 @@ pub(super) async fn finish(
         invalid_parameters,
         published,
         pending_until,
+        addresses,
     } = pass;
     let (statuses, error): (Statuses, Option<String>) = match plan {
         Ok(plan) => (plan.statuses, None),
@@ -552,6 +568,7 @@ pub(super) async fn finish(
         &listener_route_counts,
         provisioned.problem.as_deref(),
         unpublished.as_ref(),
+        addresses.not_usable().as_deref(),
     );
     let is_programmed = gateway_status.programmed;
     let mut writes = Writes::default();
@@ -2536,6 +2553,7 @@ mod tests {
             invalid_parameters: Some("GatewayParameters default/missing not found".into()),
             published: false,
             pending_until: None,
+            addresses: Assignment::default(),
         };
         finish(&gw, &p.ctx, pass).await.unwrap();
         assert!(p.api.status_patch("httproutes", "r").is_none());
