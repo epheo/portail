@@ -191,7 +191,8 @@ const RELAY_BUF: usize = 8 * 1024;
 
 const RELAY_BUF_MAX: usize = 64 * 1024;
 
-/// The sizes a direction reads at: `RELAY_BUF` doubled up to `RELAY_BUF_MAX`.
+/// How many sizes a direction reads at: `RELAY_BUF` doubled up to
+/// `RELAY_BUF_MAX`.
 const SIZES: usize = (RELAY_BUF_MAX / RELAY_BUF).trailing_zeros() as usize + 1;
 
 /// Buffers of each size a worker thread keeps for its relays.
@@ -200,8 +201,9 @@ const SPARE_PER_SIZE: usize = 4;
 thread_local! {
     /// A direction borrows its buffer for a read and gives it back once the
     /// bytes are written, or at once when the read finds none. A tunnel
-    /// with nothing to move holds no buffer: a pod holds thousands of
-    /// them, and each held two for life.
+    /// with nothing to move holds no buffer: a pod holds thousands of them.
+    /// A size change borrows another size, where a buffer of the tunnel's
+    /// own was reallocated at each.
     static SPARE: std::cell::RefCell<[Vec<Vec<u8>>; SIZES]> =
         const { std::cell::RefCell::new([const { Vec::new() }; SIZES]) };
 }
@@ -462,8 +464,7 @@ mod tests {
     }
 
     /// A direction holds a buffer from a read that found bytes to the end
-    /// of their write, and none while it waits: an idle tunnel held two for
-    /// life, 16 KiB of the 20 it cost.
+    /// of their write, and none while it waits.
     #[tokio::test]
     async fn a_direction_waiting_for_bytes_holds_no_buffer() {
         let (mut client, relayed) = tokio::io::duplex(1024);

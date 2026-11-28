@@ -533,3 +533,88 @@ fn a_full_path_rewrite_borrows_the_rules_values() {
     );
     drop(rewrite);
 }
+
+/// Many tunnels on one worker, each end sending and reading in bursts: the
+/// relay allocates nothing per read. Reads change size with every burst,
+/// and a buffer of the tunnel's own was reallocated at each change: 64
+/// allocations per mebibyte under this very load.
+#[test]
+fn a_relay_under_many_paced_tunnels_does_not_allocate_per_read() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const TUNNELS: usize = 32;
+    const REST: Duration = Duration::from_micros(400);
+    static MOVED: AtomicU64 = AtomicU64::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    // Reads a burst, then rests: on threads of its own, as the senders are,
+    // so only the proxy's allocations are counted.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 256 * 1024];
+                while let Ok(n @ 1..) = sock.read(&mut chunk) {
+                    MOVED.fetch_add(n as u64, Ordering::Relaxed);
+                    std::thread::sleep(REST);
+                }
+            });
+        }
+    });
+
+    let mut table = RouteTable::new();
+    table.add_tcp_route(
+        80,
+        vec![Backend {
+            socket_addr: backend,
+            weight: 1,
+            filters: vec![],
+            use_tls: false,
+            server_name: String::new(),
+            action: BackendAction::Forward,
+        }],
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (allocations, mebibytes) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let ctx = ListenerCtx {
+            server_port: 80,
+            routes: Arc::new(ArcSwap::from_pointee(table)),
+            cfg: ServeConfig::from_perf(&PerformanceConfig::default(), 64),
+            plan: Default::default(),
+            health: Arc::new(HealthRegistry::new()),
+            selector: Arc::new(BackendSelector::new()),
+            active_connections: Default::default(),
+            shared_pool: None,
+        };
+        tokio::spawn(listener::serve(listener, ctx, CancellationToken::new()));
+        for _ in 0..TUNNELS {
+            std::thread::spawn(move || {
+                let mut sock = std::net::TcpStream::connect(proxy).unwrap();
+                let chunk = vec![7u8; 64 * 1024];
+                while !STOP.load(Ordering::Relaxed) && sock.write_all(&chunk).is_ok() {
+                    std::thread::sleep(REST);
+                }
+            });
+        }
+        // Every tunnel is open and has borrowed its first buffers.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (a0, m0) = (ALLOCATIONS.with(Cell::get), MOVED.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (a1, m1) = (ALLOCATIONS.with(Cell::get), MOVED.load(Ordering::Relaxed));
+        STOP.store(true, Ordering::Relaxed);
+        (a1 - a0, (m1 - m0) as f64 / (1024.0 * 1024.0))
+    });
+    assert!(mebibytes > 64.0, "{mebibytes} MiB moved: no load");
+    // A relay that allocates per read makes 16 a mebibyte at the least.
+    let per_mebibyte = allocations as f64 / mebibytes;
+    assert!(
+        per_mebibyte < 1.0,
+        "{allocations} allocations for {mebibytes:.0} MiB: {per_mebibyte:.2} per MiB"
+    );
+}
