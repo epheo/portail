@@ -50,7 +50,7 @@ const MAX_CONCURRENT_STREAMS: u32 = 128;
 /// Decoded header-list cap, kept under the engine's 64 KiB request buffer
 /// so a synthesized head always fits in one engine read and never trips
 /// its 431 path.
-const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
+pub(crate) const MAX_HEADER_LIST_SIZE: u32 = 48 * 1024;
 
 /// Per-direction duplex buffer; matches the engine's read buffer so a
 /// typical exchange crosses in one hop, and a body that comes whole with its
@@ -60,12 +60,12 @@ const DUPLEX_BUF: usize = 64 * 1024;
 
 /// Upload window per stream: h2's 64 KiB default caps an upload at 64 KiB
 /// per round trip; 2 MiB carries 200 Mbit/s at 80 ms.
-const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 
 /// Upload window per connection: two streams' worth, so one stalled upload
 /// leaves a full window to the connection's other streams.
 /// Two stalled uploads hold all of it: h2 shares one window per connection.
-const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+pub(crate) const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// Size of each response read from the duplex.
 const RESP_READ: usize = 16 * 1024;
@@ -94,6 +94,7 @@ pub(crate) struct H2Ctx {
     pub(crate) drain: CancellationToken,
     /// h2 over TLS, else h2c.
     pub(crate) is_tls: bool,
+    pub(crate) grpc: crate::proxy::grpc::Backends,
 }
 
 /// A stream whose first bytes were already read, by the HTTP/1 engine that
@@ -1316,6 +1317,7 @@ mod tests {
             local: "127.0.0.1:8080".parse().unwrap(),
             drain: CancellationToken::new(),
             is_tls: true,
+            grpc: Default::default(),
         }
     }
 

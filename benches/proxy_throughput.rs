@@ -15,7 +15,7 @@
 //!   - `PT_ONLY`: comma-separated scenarios to run, all by default: direct
 //!     nf1 nf1_log nf4 f1 f4 pool4 churn_direct churn_conn churn_proc tls_h1
 //!     h2_64x1 h2_8x8 h2_1x64 bulk_direct bulk_tcp bulk_upgrade echo_tcp
-//!     grpc_direct grpc_stream_direct
+//!     grpc_direct grpc_stream_direct grpc_proxied grpc_stream_proxied
 //!   - `PT_SECS`: seconds per scenario, 10 by default
 //!   - `PORTAIL_BIN`: the portail binary under test, else the one built here
 //!     (target/release, then target/debug)
@@ -73,6 +73,8 @@ const TLS_HOST: &str = "bench.test";
 
 /// The gRPC backend, on this process's runtime as the echo backend is.
 const GRPC_PORT: u16 = 29_700;
+/// portail's gRPC listener, h2c.
+const PORTAIL_GRPC_PORT: u16 = 29_710;
 /// 8 connections of 8 streams, as `h2_8x8`: a gRPC client multiplexes.
 const GRPC_CONNS: usize = 8;
 const GRPC_STREAMS: usize = 8;
@@ -328,9 +330,14 @@ fn main() {
         }
 
         // gRPC: unary and server-streaming calls over h2c, framed and
-        // trailed as gRPC is. The baselines alone until the proxy speaks
-        // h2 to a backend.
-        if selected("grpc_direct") || selected("grpc_stream_direct") {
+        // trailed as gRPC is, direct and through a GRPCRoute.
+        let grpc = [
+            "grpc_direct",
+            "grpc_stream_direct",
+            "grpc_proxied",
+            "grpc_stream_proxied",
+        ];
+        if grpc.into_iter().any(selected) {
             let backend = spawn_grpc_backend(GRPC_PORT).await;
             if selected("grpc_direct") {
                 println!();
@@ -344,6 +351,31 @@ fn main() {
                     GRPC_STREAM_MESSAGES
                 );
                 run_grpc_bench(GRPC_PORT, GRPC_STREAM, GRPC_STREAM_MESSAGES).await;
+            }
+            if selected("grpc_proxied") || selected("grpc_stream_proxied") {
+                let proxy = spawn_portail_grpc(GRPC_PORT, PORTAIL_GRPC_PORT);
+                if selected("grpc_proxied") {
+                    println!();
+                    println!("--- gRPC: unary, proxy ---");
+                    proxy
+                        .measure(run_grpc_bench(PORTAIL_GRPC_PORT, GRPC_UNARY, 1))
+                        .await;
+                }
+                if selected("grpc_stream_proxied") {
+                    println!();
+                    println!(
+                        "--- gRPC: server streaming, {} messages, proxy ---",
+                        GRPC_STREAM_MESSAGES
+                    );
+                    proxy
+                        .measure(run_grpc_bench(
+                            PORTAIL_GRPC_PORT,
+                            GRPC_STREAM,
+                            GRPC_STREAM_MESSAGES,
+                        ))
+                        .await;
+                }
+                drop(proxy);
             }
             backend.abort();
         }
@@ -1278,6 +1310,23 @@ fn spawn_portail_tcp(backend_port: u16, port: u16) -> ProcessHandle {
         backend_refs_json(&[backend_port]),
     );
 
+    spawn_portail_with_config(&config, port, &[])
+}
+
+/// portail with one HTTP listener whose GRPCRoute sends every call to the
+/// gRPC backend: h2c both sides.
+fn spawn_portail_grpc(backend_port: u16, port: u16) -> ProcessHandle {
+    let config = format!(
+        r#"{{
+  "gateway": {{"name":"bench","listeners":[{{"name":"grpc","protocol":"HTTP","port":{}}}]}},
+  "grpcRoutes": [{{"parentRefs":[{{"name":"bench","sectionName":"grpc"}}],"hostnames":["{}"],"rules":[{{"backendRefs":[{}]}}]}}],
+  "observability": {{"logging":{{"level":"error","format":"pretty","output":"stderr"}}}},
+  "performance": {{}}
+}}"#,
+        port,
+        GRPC_HOST,
+        backend_refs_json(&[backend_port]),
+    );
     spawn_portail_with_config(&config, port, &[])
 }
 

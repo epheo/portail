@@ -355,6 +355,7 @@ impl H2c {
             local,
             drain,
             is_tls,
+            grpc: Default::default(),
         };
         (
             crate::proxy::h2_bridge::Replay::new(self.read, self.client),

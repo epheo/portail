@@ -530,6 +530,7 @@ async fn serve_tls_connection(
                 local,
                 drain,
                 is_tls: true,
+                grpc: Default::default(),
             },
         ))
         .await;

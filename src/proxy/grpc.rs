@@ -5,8 +5,8 @@
 //! then matched against the table's gRPC routes only
 //! (`RouteTable::find_grpc_route`): no match is UNIMPLEMENTED, never an
 //! HTTP route. Its backend is spoken h2 whatever its port's appProtocol:
-//! h2c in the clear, ALPN h2 over TLS, one connection per backend for the
-//! process.
+//! h2c in the clear, ALPN h2 over TLS, one connection per backend for each
+//! client connection (see [`Backends`]).
 //!
 //! No timeout of the proxy's bounds a call: gRPC's deadlines are the
 //! client's, which cancels the stream when one passes.
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::Poll;
 
 use anyhow::{anyhow, Result};
@@ -308,24 +308,32 @@ impl Key {
     }
 }
 
-/// A backend's connection, and which of the process's it is: an entry is
-/// removed only by its own connection's end or failure, never a newer one's.
+/// A backend's connection, and which it is: an entry is removed only by
+/// its own connection's end or failure, never a newer one's.
 struct Held {
     id: u64,
     send: h2::client::SendRequest<Bytes>,
 }
 
-/// One h2 connection per backend for the process, its streams shared by
-/// every client stream to that backend. An entry leaves with its
-/// connection's end.
-static CONNECTIONS: LazyLock<Mutex<HashMap<Key, Held>>> = LazyLock::new(Default::default);
+type HeldMap = Mutex<HashMap<Key, Held>>;
 
-fn connections() -> std::sync::MutexGuard<'static, HashMap<Key, Held>> {
-    CONNECTIONS.lock().unwrap_or_else(PoisonError::into_inner)
+/// A client connection's h2 connections to its gRPC backends, one per
+/// backend, its streams sharing it as its HTTP/1 exchanges share its pool.
+/// Per client, not per process: the h2 crate gives a stream's window back
+/// to the connection only as the stream is read, so a client that stops
+/// reading holds the connection's window, and stalls only its own streams.
+/// They close with the client's connection.
+#[derive(Default)]
+pub(crate) struct Backends(Arc<HeldMap>);
+
+impl Backends {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Held>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
-fn forget(key: &Key, id: u64) {
-    let mut held = connections();
+fn forget(held: &HeldMap, key: &Key, id: u64) {
+    let mut held = held.lock().unwrap_or_else(PoisonError::into_inner);
     if held.get(key).is_some_and(|h| h.id == id) {
         held.remove(key);
     }
@@ -338,7 +346,9 @@ async fn ready_connection(
     ctx: &H2Ctx,
 ) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
     let key = Key::of(backend);
-    let held = connections()
+    let held = ctx
+        .grpc
+        .lock()
         .get(&key)
         .map(|held| (held.id, held.send.clone()));
     if let Some((id, send)) = held {
@@ -348,7 +358,7 @@ async fn ready_connection(
             // the stream takes a new one.
             Err(e) => {
                 debug!("gRPC backend {} connection closed: {}", key.addr, e);
-                forget(&key, id);
+                forget(&ctx.grpc.0, &key, id);
             }
         }
     }
@@ -373,7 +383,7 @@ async fn ready_connection(
     ctx.health.record_success(addr);
     // Two streams may have opened one each: the later is kept, the earlier
     // serves its own stream and closes when it is done.
-    connections().insert(
+    ctx.grpc.lock().insert(
         key.clone(),
         Held {
             id,
@@ -382,7 +392,7 @@ async fn ready_connection(
     );
     send.ready().await.map_err(|e| {
         debug!("gRPC backend {} closed a new connection: {}", addr, e);
-        forget(&key, id);
+        forget(&ctx.grpc.0, &key, id);
         "backend closed the connection"
     })
 }
@@ -403,7 +413,7 @@ async fn open(
         ConnectError::Backend(anyhow!("gRPC backend {} handshake failed: {}", addr, e))
     };
     match &backend.proto {
-        BackendProto::Plain => handshake(tcp, key).await.map_err(|e| failed(&e)),
+        BackendProto::Plain => handshake(tcp, key, ctx).await.map_err(|e| failed(&e)),
         BackendProto::Tls(name) => {
             let name =
                 rustls::pki_types::ServerName::try_from(name.to_string()).unwrap_or_else(|_| {
@@ -413,29 +423,44 @@ async fn open(
                 .connect(name, tcp)
                 .await
                 .map_err(|e| failed(&e))?;
-            handshake(tls, key).await.map_err(|e| failed(&e))
+            handshake(tls, key, ctx).await.map_err(|e| failed(&e))
         }
         BackendProto::Verified(verify) => {
             let tls = verify.connect_h2(tcp).await.map_err(|e| failed(&e))?;
-            handshake(tls, key).await.map_err(|e| failed(&e))
+            handshake(tls, key, ctx).await.map_err(|e| failed(&e))
         }
     }
 }
 
 /// The h2 handshake on a new backend connection, which then runs until the
-/// backend or the last stream ends it, and leaves the held ones.
-async fn handshake<S>(io: S, key: Key) -> Result<(u64, h2::client::SendRequest<Bytes>), h2::Error>
+/// backend or the client's connection ends it, and leaves `ctx`'s held ones.
+async fn handshake<S>(
+    io: S,
+    key: Key,
+    ctx: &H2Ctx,
+) -> Result<(u64, h2::client::SendRequest<Bytes>), h2::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     static IDS: AtomicU64 = AtomicU64::new(0);
-    let (send, connection) = h2::client::Builder::new().handshake::<_, Bytes>(io).await?;
+    // The client side's windows: what the backend sends a stream waits
+    // there for its client as the client's upload waits for its backend.
+    let (send, connection) = h2::client::Builder::new()
+        .initial_window_size(crate::proxy::h2_bridge::STREAM_WINDOW)
+        .initial_connection_window_size(crate::proxy::h2_bridge::CONNECTION_WINDOW)
+        .max_header_list_size(crate::proxy::h2_bridge::MAX_HEADER_LIST_SIZE)
+        .handshake::<_, Bytes>(io)
+        .await?;
     let id = IDS.fetch_add(1, Ordering::Relaxed);
+    // Weak: the held connection must not keep its own list alive.
+    let held = Arc::downgrade(&ctx.grpc.0);
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             debug!("gRPC backend {} connection ended: {}", key.addr, e);
         }
-        forget(&key, id);
+        if let Some(held) = held.upgrade() {
+            forget(&held, &key, id);
+        }
     });
     Ok((id, send))
 }
@@ -472,7 +497,9 @@ mod tests {
     /// An h2c gRPC backend. Each message it gets is echoed at once, so a
     /// call's answer goes on while its request does; the call ends with
     /// grpc-status 0 and an `x-trailer`. `/test.Echo/Cancel` is reset with
-    /// CANCEL. With `one_call`, a connection closes after its first stream.
+    /// CANCEL; `/test.Echo/Flood` answers 8 MiB as fast as its windows let
+    /// it, counted in `FLOODED`. With `one_call`, a connection closes after
+    /// its first stream.
     async fn echo_backend(one_call: bool) -> (SocketAddr, UnboundedReceiver<http::request::Parts>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -486,6 +513,7 @@ mod tests {
                     while let Some(Ok((req, mut respond))) = conn.accept().await {
                         let (parts, mut body) = req.into_parts();
                         let cancel = parts.uri.path() == "/test.Echo/Cancel";
+                        let flood = parts.uri.path() == "/test.Echo/Flood";
                         let _ = seen.send(parts);
                         if cancel {
                             respond.send_reset(h2::Reason::CANCEL);
@@ -496,6 +524,22 @@ mod tests {
                                     .body(())
                                     .unwrap();
                                 let mut out = respond.send_response(head, false).unwrap();
+                                let mut flooding = if flood { 8 << 20 } else { 0 };
+                                while flooding > 0 {
+                                    out.reserve_capacity(flooding);
+                                    let Some(Ok(granted)) =
+                                        std::future::poll_fn(|cx| out.poll_capacity(cx)).await
+                                    else {
+                                        return;
+                                    };
+                                    let granted = granted.min(flooding);
+                                    if granted > 0 {
+                                        out.send_data(Bytes::from(vec![7; granted]), false)
+                                            .unwrap();
+                                        FLOODED.fetch_add(granted, Ordering::Relaxed);
+                                        flooding -= granted;
+                                    }
+                                }
                                 while let Some(Ok(chunk)) = body.data().await {
                                     let _ = body.flow_control().release_capacity(chunk.len());
                                     out.send_data(chunk, false).unwrap();
@@ -515,6 +559,8 @@ mod tests {
         });
         (addr, rx)
     }
+
+    static FLOODED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn table(backend: SocketAddr) -> RouteTable {
         let config: crate::config::PortailConfig = serde_json::from_value(serde_json::json!({
@@ -562,6 +608,7 @@ mod tests {
             local: "127.0.0.1:8080".parse().unwrap(),
             drain: CancellationToken::new(),
             is_tls: false,
+            grpc: Default::default(),
         };
         tokio::spawn(crate::proxy::h2_bridge::serve(server_io, ctx));
         let (send, conn) = h2::client::handshake(io).await.unwrap();
@@ -685,5 +732,42 @@ mod tests {
         let (response, _) = send.send_request(call("/test.Echo/Say"), true).unwrap();
         let response = within(response).await.unwrap();
         assert_eq!(response.headers()["grpc-status"], "14");
+    }
+
+    /// A client that stops reading holds its own backend connection only:
+    /// another client's call to the same backend goes through. Three
+    /// streams stalled at the stream window hold more than a connection's
+    /// window, so one connection shared by both would stall the second.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_stalls_no_other() {
+        let (backend, _seen) = echo_backend(false).await;
+        let routes = table(backend);
+        let stalled = client(routes.clone()).await;
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let mut send = stalled.clone().ready().await.unwrap();
+            let (response, _body) = send.send_request(call("/test.Echo/Flood"), false).unwrap();
+            answers.push((within(response).await.unwrap().into_body(), _body));
+        }
+        // Nothing is read: the backend is granted the windows of the proxy's
+        // connection to it once, and no more.
+        let full = crate::proxy::h2_bridge::CONNECTION_WINDOW as usize;
+        within(async {
+            while FLOODED.load(Ordering::Relaxed) < full {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        // Its answer is DATA, which needs window: HEADERS and trailers do not.
+        let other = client(routes).await;
+        let mut other = other.ready().await.unwrap();
+        let (response, mut body) = other.send_request(call("/test.Echo/Say"), false).unwrap();
+        body.send_data(Bytes::from_static(b"hi"), true).unwrap();
+        let mut answer = within(response).await.unwrap().into_body();
+        assert_eq!(&within(answer.data()).await.unwrap().unwrap()[..], b"hi");
+        assert!(within(answer.data()).await.is_none());
+        let trailers = within(answer.trailers()).await.unwrap().unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
     }
 }
