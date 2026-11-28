@@ -149,10 +149,11 @@ async fn churn(proxy: SocketAddr, n: usize, active: &TaskTracker) {
     client.join().unwrap();
 }
 
-/// Ten per connection, setup and teardown and the request it carries:
-/// the task, two socket registrations, the read, scratch and response-head
-/// buffers, the drain token and its watch, and two for the per-connection
-/// pool taking back the backend connection.
+/// Seven per connection, setup and teardown and the request it carries:
+/// the task, two socket registrations, the drain token and its watch, and
+/// two for the per-connection pool taking back the backend connection. The
+/// read, scratch and response-head buffers are the last connection's,
+/// given back to the thread as it closed.
 /// Three more come from this test's setup: tokio boxes the connection
 /// future in debug builds, and with one connection at a time the drain
 /// token's parent and tokio's I/O driver each regrow a list.
@@ -186,7 +187,7 @@ fn a_churned_connection_allocates_a_fixed_few_times() {
         (ALLOCATIONS.with(Cell::get) - before) as f64 / CONNS as f64
     });
     assert!(
-        per_conn.round() <= 13.0,
+        per_conn.round() <= 10.0,
         "{per_conn} allocations per connection"
     );
 }
@@ -394,16 +395,16 @@ fn a_keepalive_request_over_tls_allocates_twice() {
     );
 }
 
-/// Twenty in a debug build and nineteen in release, against two for the
-/// same request over HTTP/1.1. The bridge gives each stream what a
-/// connection gets: a task, an engine with its buffers and drain watch (the
-/// churn count above), and a pipe to it. A ceiling to lower with the
-/// bridge's cost, never to raise.
+/// Seventeen in a debug build, against two for the same request over
+/// HTTP/1.1. The bridge gives each stream what a connection gets: a task,
+/// an engine and its drain watch (the churn count above), and a pipe to
+/// it; the engine's buffers are the last stream's, given back to the
+/// thread. A ceiling to lower with the bridge's cost, never to raise.
 #[test]
 fn an_h2_request_allocates_like_a_connection_of_its_own() {
     let n = per_proxied_request(Client::H2);
     assert!(
-        n <= 20 * EXTRA + STRAY,
+        n <= 17 * EXTRA + STRAY,
         "{n} allocations over {EXTRA} requests"
     );
 }
