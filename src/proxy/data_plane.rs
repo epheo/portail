@@ -1039,16 +1039,20 @@ pub(crate) mod test_ports {
     /// kernel hands ephemeral ports to this process's client sockets, and
     /// one took a wildcard port between its probe and its bind.
     pub(crate) fn wildcard() -> u16 {
+        candidates()
+            .find(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_ok())
+            .expect("a free port below the ephemeral range")
+    }
+
+    /// Every port below the ephemeral range, from a start of its own:
+    /// tests running beside this one start elsewhere.
+    pub(crate) fn candidates() -> impl Iterator<Item = u16> {
         let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
         let first_ephemeral: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
         let unprivileged = 1024..first_ephemeral;
         let len = unprivileged.len();
-        // Tests running beside this one start elsewhere.
         let start = std::hash::RandomState::new().hash_one(()) as usize;
-        (0..len)
-            .map(|i| unprivileged.start + ((start + i) % len) as u16)
-            .find(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_ok())
-            .expect("a free port below the ephemeral range")
+        (0..len).map(move |i| unprivileged.start + ((start + i) % len) as u16)
     }
 }
 
@@ -1247,33 +1251,49 @@ mod tests {
     /// targetPort), not the published `port`, and readiness keys on it.
     #[tokio::test]
     async fn binds_target_port_not_published() {
-        let listeners = vec![ListenerConfig {
-            name: "http".into(),
-            protocol: P::HTTP,
-            port: 21080,
-            target_port: Some(31080),
-            hostname: None,
-            address: None,
-            interface: None,
-            tls: None,
-            rate_limit: None,
-        }];
+        // Held by this test throughout: a data plane that bound the
+        // published port would fail on it. No number is written here: any
+        // process on the host may hold one, and the test then fails for it.
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let published = holder.local_addr().unwrap().port();
         let perf = test_perf();
-        let dp = DataPlane::new(&listeners, &perf, std::path::Path::new("/unused")).unwrap();
+        // The data plane's own bind finds the free target, with no probe
+        // before it: a probe's socket, closed, can still be referenced by a
+        // test running beside this one (see `bind_until`).
+        let mut refused = None;
+        let (dp, target) = test_ports::candidates()
+            .take(64)
+            .find_map(|target| {
+                let listeners = [ListenerConfig {
+                    name: "http".into(),
+                    protocol: P::HTTP,
+                    port: published,
+                    target_port: Some(target),
+                    hostname: None,
+                    address: None,
+                    interface: None,
+                    tls: None,
+                    rate_limit: None,
+                }];
+                DataPlane::new(&listeners, &perf, std::path::Path::new("/unused"))
+                    .map(|dp| (dp, target))
+                    .map_err(|e| refused = Some(e))
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no target port could be bound, or the data plane bound the published port: {refused:?}"
+                )
+            });
 
         // Readiness keys on the bound (target) port, not the published port.
-        assert!(dp.is_ready_for_endpoints(&[tcp(None, 31080)]));
-        assert!(!dp.is_ready_for_endpoints(&[tcp(None, 21080)]));
+        assert!(dp.is_ready_for_endpoints(&[tcp(None, target)]));
+        assert!(!dp.is_ready_for_endpoints(&[tcp(None, published)]));
 
-        // The socket really landed on the target port (held by the data plane)...
+        // The socket really landed on the target port (held by the data plane).
         assert!(
-            std::net::TcpListener::bind(("0.0.0.0", 31080u16)).is_err(),
+            std::net::TcpListener::bind(("0.0.0.0", target)).is_err(),
             "target port must be bound by the data plane"
-        );
-        // ...and the published port was never bound.
-        assert!(
-            std::net::TcpListener::bind(("0.0.0.0", 21080u16)).is_ok(),
-            "published port must not be bound"
         );
 
         drop(dp);
