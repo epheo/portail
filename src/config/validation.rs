@@ -3,6 +3,44 @@ use anyhow::{anyhow, Result};
 use super::types::*;
 use crate::logging::warn;
 
+impl GrpcRouteConfig {
+    /// What the GRPCRoute API admits: its three filters, and a method match
+    /// naming a service or a method, an exact one without a `/`.
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (i, rule) in self.rules.iter().enumerate() {
+            for filter in &rule.filters {
+                if !matches!(
+                    filter,
+                    HttpRouteFilter::RequestHeaderModifier { .. }
+                        | HttpRouteFilter::ResponseHeaderModifier { .. }
+                        | HttpRouteFilter::RequestMirror { .. }
+                ) {
+                    return Err(anyhow!(
+                        "rule {i}: a gRPC rule takes RequestHeaderModifier, \
+                         ResponseHeaderModifier or RequestMirror only"
+                    ));
+                }
+            }
+            for m in rule.matches.iter().filter_map(|m| m.method.as_ref()) {
+                let named = [&m.service, &m.method];
+                if named.iter().all(|n| n.as_deref().is_none_or(str::is_empty)) {
+                    return Err(anyhow!(
+                        "rule {i}: a method match names a service or a method"
+                    ));
+                }
+                let slashed = named
+                    .iter()
+                    .flat_map(|n| n.as_deref())
+                    .any(|n| n.contains('/'));
+                if m.match_type == StringMatchType::Exact && slashed {
+                    return Err(anyhow!("rule {i}: an exact service or method has no '/'"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PortailConfig {
     /// Validate the entire configuration for consistency and correctness
     /// All validation happens once at startup
@@ -24,6 +62,12 @@ impl PortailConfig {
                     i, j
                 );
             }
+        }
+
+        for (i, route) in self.grpc_routes.iter().enumerate() {
+            route
+                .validate()
+                .map_err(|e| anyhow!("gRPC route {}: {}", i, e))?;
         }
 
         for (i, route) in self.tcp_routes.iter().enumerate() {
@@ -543,6 +587,81 @@ mod tests {
             err.contains("trustedSources") && err.contains("host bits"),
             "{err}"
         );
+    }
+
+    fn grpc_config(rule: serde_json::Value) -> PortailConfig {
+        serde_json::from_value(serde_json::json!({
+            "gateway": {"name": "g", "listeners": [{"name": "l", "protocol": "HTTP", "port": 8080}]},
+            "grpcRoutes": [{
+                "parentRefs": [{"name": "g", "sectionName": "l"}],
+                "hostnames": ["grpc.test"],
+                "rules": [rule]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// A GRPCRoute reaches the config as the API writes it, and comes back
+    /// the same; a config without one says nothing of them, which a data
+    /// plane that does not know the field still takes.
+    #[test]
+    fn a_grpc_route_crosses_the_wire_as_written() {
+        let rule = serde_json::json!({
+            "matches": [
+                {"method": {"type": "Exact", "service": "echo.Echo", "method": "Say"},
+                 "headers": [{"name": "version", "value": "2", "type": "Exact"}]},
+                {"method": {"type": "RegularExpression", "service": "echo\\..*"}}
+            ],
+            "filters": [{"type": "RequestHeaderModifier",
+                         "requestHeaderModifier": {"add": [], "set": [{"name": "x-a", "value": "1"}], "remove": []}}],
+            "backendRefs": [{"name": "echo.default.svc.cluster.local", "port": 9000}]
+        });
+        let config = grpc_config(rule.clone());
+        config.validate().unwrap();
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            wire["grpcRoutes"][0]["rules"][0]["matches"],
+            rule["matches"]
+        );
+        let back: PortailConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.grpc_routes[0].rules[0].matches.len(), 2);
+
+        let none = serde_json::to_value(PortailConfig::default()).unwrap();
+        assert!(none.get("grpcRoutes").is_none(), "{none}");
+    }
+
+    /// What the GRPCRoute API does not admit is refused: other filters, a
+    /// method match naming neither, an exact name with a `/`, an unknown
+    /// field.
+    #[test]
+    fn a_grpc_route_takes_what_the_api_admits() {
+        let backend = serde_json::json!([{"name": "127.0.0.1", "port": 9000}]);
+        for (rule, why) in [
+            (
+                serde_json::json!({"filters": [{"type": "RequestRedirect", "requestRedirect": {}}],
+                                   "backendRefs": backend}),
+                "takes RequestHeaderModifier",
+            ),
+            (
+                serde_json::json!({"matches": [{"method": {"type": "Exact"}}], "backendRefs": backend}),
+                "names a service or a method",
+            ),
+            (
+                serde_json::json!({"matches": [{"method": {"service": "a/b"}}], "backendRefs": backend}),
+                "has no '/'",
+            ),
+        ] {
+            let err = grpc_config(rule).validate().unwrap_err().to_string();
+            assert!(err.contains(why), "{err}");
+        }
+        grpc_config(
+            serde_json::json!({"matches": [{"method": {"method": "Say"}}], "backendRefs": backend}),
+        )
+        .validate()
+        .unwrap();
+        let unknown =
+            serde_json::json!({"grpcRoutes": [{"rules": [{"backendRefs": [], "timeouts": {}}]}]});
+        assert!(serde_json::from_value::<PortailConfig>(unknown).is_err());
     }
 
     fn make_rule(filters: Vec<HttpRouteFilter>, backend_refs: Vec<BackendRef>) -> HttpRouteRule {
