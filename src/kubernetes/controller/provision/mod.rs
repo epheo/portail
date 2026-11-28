@@ -1028,6 +1028,8 @@ mod tests {
             trusted_gateways: vec![],
             access_log: crate::kubernetes::crds::AccessLog::Disabled,
             http2: crate::kubernetes::crds::Http2::Disabled,
+            external_ip_cidrs: vec![],
+            external_ips: vec![],
         }
     }
 

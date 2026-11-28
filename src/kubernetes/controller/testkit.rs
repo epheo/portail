@@ -255,6 +255,7 @@ impl TestCluster {
             reports: Arc::default(),
             backends: Arc::default(),
             reads: Arc::default(),
+            claims: Arc::default(),
             leader,
             synced: super::watch::Listings::default(),
             owned: super::provision::Owned::new(

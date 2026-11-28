@@ -109,8 +109,8 @@ A name longer than a label allows is cut and suffixed with a hash of the full na
 
 ### Addresses
 
-- LoadBalancer Service: `status.addresses` is its ingress; an `IPAddress` in `spec.addresses` is not requested from the provider and reports `AddressNotAssigned` unless the provider assigns it anyway.
-- ClusterIP or NodePort Service: the cluster IP.
+- LoadBalancer Service: `status.addresses` is its ingress and its externalIPs. An `IPAddress` in `spec.addresses` is not requested from the provider: one the provider assigns anyway is held as it is; any other goes on the Service's externalIPs when allowed (see [externalIPs](#externalips)), else `Programmed` is `False`, reason `AddressNotUsable`.
+- ClusterIP or NodePort Service: the cluster IP and its externalIPs. An `IPAddress` in `spec.addresses` goes on the Service's externalIPs when allowed, else `AddressNotUsable`.
 - No Service: what the data planes report: the `IPAddress` values of `spec.addresses` found on a pod, resolved Network addresses, else each pod's first interface IP.
 - An address already on a pod interface, or a `portail.epheo.eu/Network` entry, is bound specifically. Other addresses, such as a LoadBalancer VIP, are not bound; with no local address, listeners bind all interfaces.
 - A listener that gains a local address leaves all interfaces for it in the same apply, and goes back when it loses it.
@@ -177,12 +177,34 @@ Defaults:
 Rules:
 
 - `networks[].ips` requires `replicas: 1`: one static IP cannot sit on two pods.
+- `service.externalIPs` is set only in the GatewayClass's parameters; on a Gateway's own, the Gateway is `Accepted=False`, reason `InvalidParameters`.
 - A Network address naming a network `networks` attaches with `listeners: false` is invalid: a Network address binds listeners.
 - An `IPAddress` inside such a network is invalid once its CIDRs are read: it would never bind.
 - A missing or invalid GatewayParameters makes the Gateway `Accepted=False`, reason `InvalidParameters`; on a class, the class and its Gateways.
 - Invalid parameters change nothing that runs: the last configuration and the provisioned objects stay, so a typo never takes a Gateway down.
 
 Multus: the pods get `k8s.v1.cni.cncf.io/networks` with `networks`, then each Network address not already listed.
+
+### externalIPs
+
+Off by default: no Gateway's Service gets an externalIP.
+
+The GatewayClass's parameters allow some, Managed Gateways with a Service only:
+
+```yaml
+spec:
+  service:
+    externalIPs:
+      allowedCIDRs: ["192.0.2.0/28"]   # network addresses only, at most 64
+```
+
+- An `IPAddress` of a Gateway's `spec.addresses` inside one of those CIDRs goes on its Service's `spec.externalIPs`.
+- One address, one Gateway: of the Gateways asking for an allowed address, the oldest holds it (creationTimestamp, then namespace and name). The others are `Programmed=False`, reason `AddressNotUsable`, "in use", naming the holder only in their own namespace.
+- Outside the list, or with no list: `AddressNotUsable`. The Gateway's listeners still serve on its Service's other addresses.
+- A malformed entry makes the GatewayClass `Accepted=False`, reason `InvalidParameters`, never a shorter list.
+- Only addresses routed to the nodes for Gateways belong in the list, never a node's or the control plane's: a Service's externalIPs take that address's traffic on every node (CVE-2020-8554).
+- Whoever can edit the GatewayParameters the GatewayClass names can widen the list: keep that namespace the cluster administrator's.
+- A cluster that refuses externalIPs (the `DenyServiceExternalIPs` admission plugin) refuses the Service: `Programmed=False`, reason `Invalid`, with the apiserver's message.
 
 ### Service backends on attached networks
 

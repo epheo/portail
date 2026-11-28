@@ -235,6 +235,28 @@ spec:
               service:
                 nullable: true
                 properties:
+                  externalIPs:
+                    description: |-
+                      The Service externalIPs Gateways may ask for (Managed), set only in
+                      the GatewayClass's parameters: on a Gateway's own, the Gateway is
+                      Accepted=False InvalidParameters. Unset: none. Only addresses routed
+                      to the nodes for Gateways belong here, never a node's or the control
+                      plane's: a Service's externalIPs take that address's traffic on every
+                      node.
+                    nullable: true
+                    properties:
+                      allowedCIDRs:
+                        description: |-
+                          IPv4 or IPv6 CIDRs, network address only. An IPAddress of a
+                          Gateway's spec.addresses inside one goes on its Service's
+                          externalIPs, unless an older Gateway asks for it too: one address,
+                          one Gateway. Any other IPAddress is AddressNotUsable.
+                        items:
+                          type: string
+                        maxItems: 64
+                        nullable: true
+                        type: array
+                    type: object
                   type:
                     description: |-
                       The Service fronting the data plane; None creates none. Unset:
