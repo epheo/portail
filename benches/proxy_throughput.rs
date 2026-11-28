@@ -939,6 +939,11 @@ impl ProcessHandle {
         // from its closing parenthesis. utime and stime are fields 14 and
         // 15 of the line, in clock ticks.
         let (_, after_name) = stat.rsplit_once(") ").expect("a command name in stat");
+        // Its cost would be read as zero for the rest of the run.
+        assert!(
+            !after_name.starts_with('Z'),
+            "the measured process left during the run"
+        );
         let mut ticks = after_name
             .split(' ')
             .skip(11)
@@ -1000,7 +1005,8 @@ fn child_setup(cpus: Option<libc::cpu_set_t>) -> impl FnMut() -> Result<(), std:
 }
 
 fn spawn_kiss(port: u16, content_dir: &PathBuf) -> ProcessHandle {
-    let child = unsafe {
+    assert_port_free(port);
+    let mut child = unsafe {
         Command::new("kiss")
             .arg("--port")
             .arg(port.to_string())
@@ -1013,7 +1019,7 @@ fn spawn_kiss(port: u16, content_dir: &PathBuf) -> ProcessHandle {
             .expect("spawn kiss (is it installed? cargo install kiss)")
     };
 
-    wait_for_port(port);
+    wait_for_port(port, &mut child);
     ProcessHandle {
         child,
         _cert_dir: None,
@@ -1150,7 +1156,8 @@ fn spawn_portail_with_config(config: &str, port: u16, args: &[&OsStr]) -> Proces
     std::fs::write(config_file.path(), config).expect("write config");
 
     let binary = portail_binary_path();
-    let child = unsafe {
+    assert_port_free(port);
+    let mut child = unsafe {
         Command::new(&binary)
             .arg("--config")
             .arg(config_file.path())
@@ -1165,7 +1172,7 @@ fn spawn_portail_with_config(config: &str, port: u16, args: &[&OsStr]) -> Proces
     // Leak the config file so it lives as long as the process
     std::mem::forget(config_file);
 
-    wait_for_port(port);
+    wait_for_port(port, &mut child);
     ProcessHandle {
         child,
         _cert_dir: None,
@@ -1188,10 +1195,27 @@ fn portail_binary_path() -> PathBuf {
     panic!("portail binary not found — run cargo build --release");
 }
 
-fn wait_for_port(port: u16) {
+/// A process left listening by another run would pass for the one spawned
+/// next, which fails to bind, and be measured in its place.
+fn assert_port_free(port: u16) {
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    assert!(
+        TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err(),
+        "port {} is taken before its process is spawned: one left from another run?",
+        port
+    );
+}
+
+fn wait_for_port(port: u16, child: &mut Child) {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        if let Some(status) = child.try_wait().expect("the spawned process's status") {
+            panic!(
+                "the process for port {} left before listening: {}",
+                port, status
+            );
+        }
         if Instant::now() > deadline {
             panic!("port {} not ready within 5s", port);
         }
